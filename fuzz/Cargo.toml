@@ -1,0 +1,122 @@
+[package]
+name = "luksbox-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+luksbox-core = { path = "../crates/luksbox-core" }
+luksbox-format = { path = "../crates/luksbox-format" }
+luksbox-pq = { path = "../crates/luksbox-pq" }
+# Pure-string parsers in `luksbox_mount::winfsp_path` - no FFI / no
+# winfsp_wrs dependency, compiles on every host. The `winfsp` module
+# itself is gated on `target_os = "windows"` and stays out of Linux
+# fuzz builds.
+luksbox-mount = { path = "../crates/luksbox-mount" }
+luksbox-vfs = { path = "../crates/luksbox-vfs" }
+# Pure-string device-path classifier in `luksbox_fido2::webauthn_paths`.
+# Hardware feature stays off - the classifier is in the unconditionally-
+# compiled module.
+luksbox-fido2 = { path = "../crates/luksbox-fido2" }
+tempfile = "3"
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+serde = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "header_parse"
+path = "fuzz_targets/header_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keyslot_parse"
+path = "fuzz_targets/keyslot_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_parse"
+path = "fuzz_targets/metadata_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "header_roundtrip"
+path = "fuzz_targets/header_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hybrid_sidecar_parse"
+path = "fuzz_targets/hybrid_sidecar_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seed_file_parse"
+path = "fuzz_targets/seed_file_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "auth_then_process"
+path = "fuzz_targets/auth_then_process.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "winfsp_path_parse"
+path = "fuzz_targets/winfsp_path_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "webauthn_device_path"
+path = "fuzz_targets/webauthn_device_path.rs"
+test = false
+doc = false
+bench = false
+
+# VFS mutating operations: feeds attacker-controlled name strings
+# (UTF-8 garbage, embedded NUL, slashes, oversized, control chars,
+# `..`, reserved Windows names) through the real `Vfs::mkdir`,
+# `create`, `rename`, `unlink`, `lookup`, `readdir`, `write`, and
+# `flush` paths. Reuses one Container+Vfs across iterations to
+# amortize the Argon2id startup cost. Goal: NEVER panic on any
+# attacker-controlled name; rejected names hit a typed `Error`.
+[[bin]]
+name = "vfs_ops"
+path = "fuzz_targets/vfs_ops.rs"
+test = false
+doc = false
+bench = false
+
+# Adversarial sidecar entries: builds a structurally-valid v2 sidecar
+# from fuzzer input (count/level/duplicate-slot-idx all attacker-
+# controlled), writes it next to a real hybrid-PQ vault, and tries
+# to open. Goal: NEVER panic, NEVER unlock with wrong shared, and
+# correctly reject duplicates/overruns at parse.
+[[bin]]
+name = "hybrid_sidecar_adversarial"
+path = "fuzz_targets/hybrid_sidecar_adversarial.rs"
+test = false
+doc = false
+bench = false
+
+# Fuzz binaries should not be part of the workspace; cargo-fuzz expects to
+# build them with sanitizers and -C codegen-units=1. Excluding from the
+# workspace lets us keep workspace-wide `cargo build` fast and unsanitized.
+[workspace]

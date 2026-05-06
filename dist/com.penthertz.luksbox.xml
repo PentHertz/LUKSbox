@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+    <mime-type type="application/x-luksbox-vault">
+        <comment>LUKSbox encrypted container</comment>
+        <comment xml:lang="fr">Conteneur chiffré LUKSbox</comment>
+        <icon name="com.penthertz.luksbox"/>
+        <generic-icon name="application-x-encrypted"/>
+        <glob pattern="*.lbx"/>
+        <!-- The container header starts with the 8-byte ASCII magic
+             "LUKSBOX1" at offset 0, defined in
+             crates/luksbox-core/src/header.rs. Anything past that is
+             keyslots and ciphertext. priority="80" beats the default
+             50 so file-roller / Nautilus's "open with" picks LUKSbox
+             over generic encrypted-data heuristics. -->
+        <magic priority="80">
+            <match type="string" offset="0" value="LUKSBOX1"/>
+        </magic>
+    </mime-type>
+</mime-info>

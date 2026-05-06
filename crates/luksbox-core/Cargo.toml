@@ -1,0 +1,52 @@
+[package]
+name = "luksbox-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Cryptographic core for the luksbox encrypted-container format"
+
+[dependencies]
+aes-gcm.workspace = true
+aes-gcm-siv.workspace = true
+chacha20poly1305.workspace = true
+argon2.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+zeroize.workspace = true
+subtle.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+hex = "0.4"
+tempfile = "3"
+# In-repo DudeCT constant-time tester. Statistical side-channel
+# measurement of our wrap / unwrap path; see benches/dudect_*.rs
+# and audit Round 9A in our internal audit log (rounds summarised
+# at https://luksbox.penthertz.com/docs/security/audit/).
+#
+# We previously depended on the external `dudect-bencher 0.7`
+# crate, but it transitively pulled in clap 2.34 + atty +
+# ansi_term, three RUSTSEC-flagged unmaintained crates. The
+# in-repo crate has the same API surface (`Class`, `CtRunner`,
+# `BenchRng`, `ctbench_main!`) and only depends on `rand 0.9`.
+luksbox-ct-bench = { path = "../luksbox-ct-bench" }
+
+[[bench]]
+name = "dudect_hmac_verify"
+harness = false
+
+[[bench]]
+name = "dudect_aead_open"
+harness = false
+
+[[bench]]
+name = "dudect_slot_unlock"
+harness = false
+
+[[bench]]
+name = "dudect_reference_leaky"
+harness = false

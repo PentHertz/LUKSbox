@@ -1,0 +1,14 @@
+[package]
+name = "luksbox-ct-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Tiny constant-time benchmark runner (DudeCT / Welch's t-test) used by luksbox-core's timing-leak benches. Drop-in replacement for the unmaintained dudect-bencher crate (transitively pulls in atty + ansi_term + clap 2 which all carry RUSTSEC advisories)."
+
+[dependencies]
+# We only need an RNG for sampling the per-iteration class
+# assignment. `rand 0.9` is what the existing benches expect
+# (`rng.random::<bool>()` is the 0.9 API); pinning here keeps us
+# off the unmaintained chain that dudect-bencher dragged in.
+rand = "0.9"

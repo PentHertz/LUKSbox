@@ -1,0 +1,64 @@
+LUKSbox
+Copyright 2026 Penthertz (https://penthertz.com, https://x.com/PentHertz)
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or
+implied. See the License for the specific language governing
+permissions and limitations under the License.
+
+"LUKSbox" and the Penthertz name and logo are trademarks of
+Penthertz; see TRADEMARK.md for the trademark policy. The Apache
+License does not grant trademark rights (Section 6 of the
+License); the trademark policy governs use of the name and logo
+independently of the copyright license.
+
+When redistributing the software (including modified versions),
+you must propagate this NOTICE and the LICENSE file along with
+the copy (Apache 2.0 sections 4(a)-(d)).
+
+Export controls
+===============
+
+LUKSbox uses strong cryptography (AES-256, ChaCha20-Poly1305,
+Argon2id, ML-KEM-768 / 1024). The source code is published from
+France under the Apache License 2.0 and is freely available
+online; on that basis it qualifies for the "publicly available"
+exception of EU Dual-Use Regulation (EU) 2021/821 (Annex I,
+General Note 4) and equivalent provisions in other jurisdictions.
+You are responsible for verifying that downloading, using, or
+redistributing LUKSbox is lawful where you are, in particular
+under any sanctions regime you may be subject to. See
+DISCLAIMER.md for the user-facing summary.
+
+Third-party components
+======================
+
+The following components are NOT part of LUKSbox and are licensed
+separately by their respective authors. LUKSbox links against or
+bundles them subject to their own terms; their licenses do not
+affect or override the Apache 2.0 license that governs LUKSbox
+itself.
+
+- WinFsp (Windows portable .zip artifact only):
+  Copyright (c) 2015-present Bill Zissimopoulos / WinFsp project.
+  Licensed under GPLv3 with a special linking exception that permits
+  bundling alongside non-GPL software. The unmodified winfsp-x64.dll
+  is redistributed in luksbox-*-x86_64-windows.zip; full license at
+  LICENSE-WINFSP.txt inside that archive. Source code:
+  https://github.com/winfsp/winfsp. The Windows MSI artifact does NOT
+  bundle WinFsp (users install it separately from
+  https://winfsp.dev/rel/).
+
+- libfido2 + libcbor + OpenSSL + zlib + hidapi:
+  Statically linked into all Windows artifacts (via vcpkg's
+  x64-windows-static-md triplet) and into the macOS artifacts (via
+  Homebrew + dylibbundler). Each retains its own license; consult
+  the upstream projects for full terms. Linux artifacts dynamically
+  link to the distribution-supplied versions of these libraries.

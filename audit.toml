@@ -1,0 +1,34 @@
+# cargo-audit configuration.
+#
+# Run with `cargo audit` from the workspace root. The single ignore
+# below is documented in SECURITY.md "Unmaintained dependencies"
+# and reviewed on each release. If a real CVE is later filed against
+# `registry`, we cut a release that pins `winfsp_wrs` to a fixed
+# upstream version (or vendors a fork) within the SECURITY.md
+# response SLA.
+#
+# Three earlier ignores (RUSTSEC-2021-0139 ansi_term unmaintained,
+# RUSTSEC-2024-0375 atty unmaintained, RUSTSEC-2021-0145 atty unsound)
+# were dropped when we replaced the third-party `dudect-bencher 0.7`
+# constant-time bench runner with the in-repo `luksbox-ct-bench`
+# crate. The new crate has the same API surface and only depends on
+# `rand 0.9`; the old chain was the entire reason those three
+# advisories appeared in the workspace.
+
+[advisories]
+ignore = [
+    # `registry 1.3.0` is pulled in by `winfsp_wrs_sys 0.4.1` which
+    # `luksbox-mount` uses on Windows for the `mount` subcommand
+    # (WinFsp wrapper, https://github.com/Scille/winfsp_wrs).
+    # Non-Windows builds do not link this chain at all (cargo
+    # audit is clean on Linux + macOS). The `registry` crate is
+    # archived; the recommended replacement is `windows-registry`.
+    # winfsp_wrs 0.4.1 (Jan 2026) is the latest published version
+    # and has not migrated yet; tracked at:
+    #   https://github.com/Scille/winfsp_wrs
+    # Until upstream cuts a migrated release we accept the
+    # advisory; non-Windows users are unaffected, Windows users
+    # link the `registry` crate but no exploitable CVE has been
+    # filed against it.
+    "RUSTSEC-2025-0026",
+]

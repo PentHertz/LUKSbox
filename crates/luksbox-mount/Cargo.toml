@@ -1,0 +1,52 @@
+[package]
+name = "luksbox-mount"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Mount adapter for luksbox containers (FUSE3 on Linux/macOS, WinFsp on Windows)"
+
+[dependencies]
+luksbox-vfs = { path = "../luksbox-vfs" }
+thiserror.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+# Optional so the `mount` subcommand can be skipped on macOS CI builds
+# (macFUSE install on github runners is brittle: the kext install needs
+# user approval). Default-on to keep the local Linux/macOS dev path
+# unchanged. Disable with `--no-default-features` to ship a CLI/GUI
+# without mount support.
+fuser = { workspace = true, optional = true }
+libc.workspace = true
+ctrlc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus.workspace = true
+
+[target.'cfg(target_os = "windows")'.dependencies]
+# MIT-licensed Rust binding (Scille/Parsec). Pulls in winfsp_wrs_sys which
+# requires the WinFsp 2.x SDK installed on the BUILD host (headers + .lib)
+# and the WinFsp kernel driver on the RUNTIME host (https://winfsp.dev/rel/).
+# Optional so MinGW cross-builds from Linux (where the SDK can't be apt-
+# installed) can skip the link by building --no-default-features.
+winfsp_wrs = { version = "0.4", optional = true }
+# Used by the WinFsp adapter to catch Ctrl-C and call FileSystem::stop()
+# for a clean unmount; without it the mount holder is killed mid-IO and
+# the kernel driver can leave the drive letter half-attached.
+ctrlc.workspace = true
+
+[dev-dependencies]
+luksbox-core = { path = "../luksbox-core" }
+luksbox-format = { path = "../luksbox-format" }
+tempfile = "3"
+
+[features]
+default = ["fuse", "winfsp"]
+# Pull in fuser and enable the `mount` subcommand on Linux + macOS.
+# Disable on macOS CI builds without macFUSE; mount() then returns
+# MountError::Unsupported on those targets at runtime.
+fuse = ["dep:fuser"]
+# Pull in winfsp_wrs and enable the `mount` subcommand on Windows.
+# Disable on cross-builds without the WinFsp SDK; mount() then returns
+# MountError::Unsupported on Windows targets at runtime.
+winfsp = ["dep:winfsp_wrs"]

@@ -1,0 +1,7 @@
+/target/
+
+# Internal-only directory: audit findings, third-party engagement
+# scope packages, future-product designs not yet announced. NEVER
+# commit this to a public repository. Track outside of git or push
+# only to a private mirror.
+/PRIVATE/

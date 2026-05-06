@@ -1,0 +1,1523 @@
+# Cross-platform release builds.
+#
+# Triggers on tags `v*` (e.g. `v0.1.0`), builds CLI + GUI for Linux,
+# Windows, macOS Intel, macOS Apple Silicon, then publishes a GitHub
+# Release with all four artifacts attached.
+#
+# Manual run: Actions tab -> Release -> "Run workflow" (won't publish a
+# release; just builds artifacts you can download from the run page).
+#
+# System deps:
+#   - Linux:   libfido2-dev + libfuse3-dev (apt). luksbox-fido2 +
+#              luksbox-mount link them via pkg-config at build time.
+#   - macOS:   libfido2 + macFUSE (Homebrew + cask). Same pkg-config
+#              path as Linux.
+#   - Windows: NO libfido2. We talk to FIDO2 via webauthn.dll directly
+#              (see crates/luksbox-fido2/src/webauthn.rs); webauthn.dll
+#              is a system DLL on every supported Windows. WinFsp is
+#              still needed for the mount subcommand.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write       # to create the release + upload assets
+  # The two scopes below enable GitHub Artifact Attestations
+  # (Sigstore-backed). actions/attest-build-provenance asks for an
+  # OIDC token from GitHub (`id-token: write`) so it can prove the
+  # signing call came from this workflow run, then registers the
+  # attestation against the artifact (`attestations: write`).
+  # Anyone can verify with `gh attestation verify <artifact>
+  # --owner penthertz`. No keys to manage on our side; signing
+  # identity is short-lived per run and pinned to the commit SHA.
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: ${{ matrix.target }}${{ matrix.ubuntu_codename && format(' ({0})', matrix.ubuntu_codename) || '' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # ----------------------------------------------------------------
+        # Linux is matrixed twice along an extra `ubuntu_codename`
+        # dimension (jammy vs noble). cargo-deb's `$auto`-derived
+        # `Depends:` line bakes in the BUILD HOST's package names with
+        # `>=` minimums (e.g. `libtss2-mu0 (>= 3.0.1)` on jammy vs
+        # `libtss2-mu-4.0.1-0t64 (>= 3.0.1)` on noble after the t64
+        # transition). A jammy-built .deb refuses to install on noble
+        # because `libtss2-mu0` no longer exists there, and vice versa.
+        # We ship one .deb per release so users pick the matching
+        # codename for their distro.
+        #
+        # The .rpm uses SONAMEs (e.g. `libtss2-mu.so.0()(64bit)`) which
+        # are version-constraint-free and stable across Fedora/RHEL
+        # releases. We build it only on jammy (one per arch); no need
+        # for a noble variant.
+        # ----------------------------------------------------------------
+        include:
+          # Linux x86_64 — Ubuntu 22.04 (jammy). Covers Ubuntu 22.04 +
+          # Debian 11/12 (bullseye/bookworm) + Mint 21.x + most
+          # downstream derivatives that haven't transitioned to t64.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            ubuntu_codename: jammy
+            build_rpm: true
+            archive: luksbox-${{ github.ref_name }}-x86_64-linux-jammy.tar.gz
+          # Linux aarch64 — Ubuntu 22.04 (jammy). Native ARM64 GitHub-
+          # hosted runner. GA for public repos since 2024 and private
+          # repos since 2025; charged at the same minute rate as
+          # x86_64. If your account/org doesn't have ARM64 runner
+          # access, swap for `ubuntu-22.04` and add the cross-toolchain
+          # steps in scripts/build_release.sh.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04-arm
+            ubuntu_codename: jammy
+            build_rpm: true
+            archive: luksbox-${{ github.ref_name }}-aarch64-linux-jammy.tar.gz
+          # Linux x86_64 — Ubuntu 24.04 (noble). Covers Ubuntu 24.04+
+          # and Debian 13 (trixie) where the t64 transition renamed
+          # libssl3 -> libssl3t64, libfido2-1 -> libfido2-1t64,
+          # libtss2-* -> libtss2-*-<ver>-0t64, etc.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            ubuntu_codename: noble
+            build_rpm: false
+            archive: luksbox-${{ github.ref_name }}-x86_64-linux-noble.tar.gz
+          # Linux aarch64 — Ubuntu 24.04 (noble). Native ARM64 noble
+          # runner; GA on GitHub since late 2024.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            ubuntu_codename: noble
+            build_rpm: false
+            archive: luksbox-${{ github.ref_name }}-aarch64-linux-noble.tar.gz
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive: luksbox-${{ github.ref_name }}-x86_64-windows.zip
+          # Intel macOS is disabled, the macos-13 runner is being
+          # phased out by GitHub and the build was blocking the rest of
+          # the matrix. Apple Silicon (aarch64-apple-darwin below) is
+          # the supported macOS target. To re-enable Intel:
+          #   1. uncomment the block below
+          #   2. confirm `runs-on: macos-13` is still available
+          #      (https://github.com/actions/runner-images)
+          # - target: x86_64-apple-darwin
+          #   runner: macos-13         # last Intel macOS runner
+          #   archive: luksbox-${{ github.ref_name }}-x86_64-macos.tar.gz
+          - target: aarch64-apple-darwin
+            runner: macos-14         # Apple Silicon
+            archive: luksbox-${{ github.ref_name }}-aarch64-macos.dmg
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          # cache hit-rate matters most on Windows where vcpkg also
+          # builds OpenSSL from source; the rust-cache covers ~/.cargo.
+          shared-key: release
+
+      # ---- per-OS system deps -------------------------------------------------
+
+      - name: Linux deps (apt)
+        if: runner.os == 'Linux'
+        # Same set on x86_64 and arm64 runners. libgtk-3-dev is here
+        # because luksbox-gui's `rfd` file picker links against GTK3
+        # on Linux. libfuse3-dev is here so the `mount` subcommand
+        # works on the resulting binary. imagemagick is here for
+        # scripts/build_icons.sh.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config \
+            libfido2-dev \
+            libssl-dev \
+            libudev-dev \
+            zlib1g-dev \
+            libfuse3-dev \
+            libgtk-3-dev \
+            libtss2-dev \
+            imagemagick
+
+      - name: macOS deps (Homebrew)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          # imagemagick : scripts/build_icons.sh
+          # iconutil    : ships with Xcode, no install needed
+          # dylibbundler: rewrites @rpath/dylib references inside the
+          #               .app so end users don't need `brew install
+          #               libfido2`. Cheaper than `install_name_tool` by
+          #               hand for the transitive closure (libcbor,
+          #               libcrypto, libssl).
+          # create-dmg  : produces a real .dmg with an Applications drop
+          #               link instead of shipping a raw .tar.gz that
+          #               looks alien to Mac users.
+          brew install libfido2 pkg-config imagemagick dylibbundler create-dmg
+          # macFUSE for the `mount` subcommand. fuser 0.17's build.rs
+          # is hard-coded on macOS: it unconditionally calls
+          # `pkg-config fuse` (>=2.6.0, the libfuse2 API) and links
+          # against libfuse — even with `default-features = false` on
+          # the fuser dep. macFUSE provides exactly that
+          # (`/usr/local/lib/pkgconfig/fuse.pc` + libfuse.2.dylib);
+          # FUSE-T provides only the libfuse3 API under different
+          # filenames (`fuse-t.pc`, `fuse3.pc`) and is NOT a drop-in
+          # at the linker level — fuser's build script would fail to
+          # find `fuse.pc` and the build would error out.
+          #
+          # Trade-off accepted: macFUSE installs a kernel extension
+          # the user must approve in System Settings → Privacy &
+          # Security on first prompt (and on Apple Silicon, also
+          # lower the security policy via Recovery Mode → Startup
+          # Security Utility → Reduced Security). The release notes
+          # walk users through this. If we want a kext-free path on
+          # macOS in the future, we'd need to swap fuser for a
+          # FUSE-T-aware Rust crate (none ships with libfuse3
+          # bindings at the time of writing).
+          #
+          # We FAIL THE BUILD if macFUSE can't be installed. A release
+          # artifact that's supposed to support mount must ship with
+          # mount or not ship at all (silent degradation hides the
+          # problem until end-user runtime).
+          set -e
+          # The cask install drops .kext + libs + .pc. The kext
+          # itself can't load on the CI runner (needs interactive
+          # user approval), but only the build artifacts (libfuse,
+          # fuse.pc, mount_macfuse) need to be present at compile
+          # time.
+          if ! brew list --cask macfuse >/dev/null 2>&1; then
+              brew install --cask macfuse
+          fi
+
+          # macFUSE drops fuse.pc into one of these per-arch paths.
+          MACFUSE_PC=""
+          for cand in /usr/local/lib/pkgconfig \
+                      /opt/homebrew/lib/pkgconfig \
+                      /Library/Frameworks/macFUSE.framework/Versions/A/lib/pkgconfig; do
+              if [ -f "$cand/fuse.pc" ]; then
+                  MACFUSE_PC="$cand"
+                  break
+              fi
+          done
+          if [ -z "$MACFUSE_PC" ]; then
+              echo "::error::macFUSE installed but fuse.pc missing. Checked /usr/local/lib/pkgconfig, /opt/homebrew/lib/pkgconfig, and /Library/Frameworks/macFUSE.framework/Versions/A/lib/pkgconfig"
+              ls -la /usr/local/lib/pkgconfig/ /opt/homebrew/lib/pkgconfig/ \
+                  /Library/Frameworks/macFUSE.framework/Versions/A/lib/pkgconfig/ 2>&1 || true
+              exit 1
+          fi
+          # macFUSE installs mount_macfuse INSIDE its own framework
+          # at /Library/Filesystems/macfuse.fs/Contents/Resources/,
+          # not on PATH. libfuse invokes it via that absolute path
+          # at mount time. So `command -v mount_macfuse` will (and
+          # should) miss it, the canonical install path is what we
+          # verify.
+          MOUNT_MACFUSE="/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"
+          if [ ! -x "$MOUNT_MACFUSE" ]; then
+              echo "::error::macFUSE installed but $MOUNT_MACFUSE missing or not executable"
+              ls -la /Library/Filesystems/macfuse.fs/Contents/Resources/ 2>&1 || true
+              exit 1
+          fi
+          echo "==> macFUSE verified:"
+          echo "    fuse.pc:        $MACFUSE_PC/fuse.pc"
+          echo "    mount_macfuse:  $MOUNT_MACFUSE"
+          PKG_CONFIG_PATH="$MACFUSE_PC" pkg-config --modversion fuse 2>&1 \
+              | sed 's/^/    libfuse:        /' || true
+
+          # Write the env that the cargo build steps read. The
+          # `fuse` cargo feature is what flips luksbox-mount from
+          # the no-op stub (`MountError::Unsupported`) to the real
+          # fuser-backed implementation.
+          {
+            echo "PKG_CONFIG_PATH=$(brew --prefix libfido2)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$MACFUSE_PC"
+            echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix libfido2)/lib"
+            echo "LUKSBOX_FEATURES=hardware,fuse"
+          } >> "$GITHUB_ENV"
+
+      - name: Set Linux feature list
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          # Linux: hardware + fuse (libfido2 + libfuse3 from apt).
+          # winfsp is Windows-only, omit on Linux to avoid cargo
+          # tripping on the target-cfg'd optional dep.
+          echo "LUKSBOX_FEATURES=hardware,fuse" >> "$GITHUB_ENV"
+
+      - name: Set Windows feature list
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # Windows: hardware + winfsp. Fuse is linux/macos-only.
+          echo "LUKSBOX_FEATURES=hardware,winfsp" >> "$GITHUB_ENV"
+
+      - name: Windows deps (WinFsp)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # libfido2 is NO LONGER NEEDED on Windows. We talk to FIDO2
+          # via webauthn.dll directly (see crates/luksbox-fido2/src/
+          # webauthn.rs), dynamically linked through the `windows`
+          # crate at compile time. This avoids the vcpkg dependency
+          # AND the non-elevated USB FIDO2 access problem in one
+          # stroke.
+
+          # WinFsp SDK + driver via Chocolatey (preinstalled on
+          # windows-latest). winfsp_wrs_sys's build.rs reads the
+          # standard registry entry / Program Files install path
+          # that this drops. Fall back to a direct MSI download if
+          # choco's package gets delisted or the install fails.
+          $ErrorActionPreference = 'Continue'
+          choco install winfsp -y --no-progress
+          if (-not (Test-Path "C:\Program Files (x86)\WinFsp\inc\winfsp\winfsp.h") -and
+              -not (Test-Path "C:\Program Files\WinFsp\inc\winfsp\winfsp.h")) {
+              Write-Host "==> choco install didn't drop WinFsp SDK, falling back to direct MSI"
+              $msi = "$env:RUNNER_TEMP\winfsp.msi"
+              Invoke-WebRequest `
+                  -Uri "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi" `
+                  -OutFile $msi
+              Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          }
+          # ImageMagick for scripts/build_icons.sh. Preinstalled on
+          # windows-latest, but we install defensively in case GitHub
+          # ever drops it from the runner image.
+          if (-not (Get-Command magick -ErrorAction SilentlyContinue)) {
+              choco install imagemagick.tool -y --no-progress
+          }
+
+      # ---- generated assets ---------------------------------------------------
+
+      - name: Generate platform icons (.ico + .icns from icon.png)
+        shell: bash
+        run: |
+          # Produces crates/luksbox-gui/assets/icon.ico (consumed by
+          # luksbox-gui's build.rs and embedded into the .exe) and
+          # crates/luksbox-gui/assets/icon.icns (consumed by the macOS
+          # bundle step below). Both files are .gitignored so this step
+          # MUST run before `cargo build` for the Windows .exe icon to
+          # actually appear in Explorer.
+          bash scripts/build_icons.sh
+
+      # ---- build --------------------------------------------------------------
+
+      - name: Build CLI
+        shell: bash
+        run: |
+          # LUKSBOX_FEATURES is set per-OS in the steps above. Always a
+          # subset of {hardware, fuse, winfsp} valid for the target OS.
+          # `release-hardened` (defined in workspace Cargo.toml) turns on
+          # fat LTO + panic=abort + strip=symbols + debug=false so the
+          # shipped binary has no symbol names, no panic strings, and no
+          # DWARF info — see the profile's docstring in Cargo.toml.
+          # Output goes to target/<triple>/release-hardened/ (NOT
+          # target/<triple>/release/), so all subsequent steps must
+          # reference the new path.
+          cargo build --profile release-hardened -p luksbox-cli \
+            --no-default-features --features "$LUKSBOX_FEATURES" \
+            --target ${{ matrix.target }}
+
+      - name: Build GUI
+        shell: bash
+        run: |
+          cargo build --profile release-hardened -p luksbox-gui \
+            --no-default-features --features "$LUKSBOX_FEATURES" \
+            --target ${{ matrix.target }}
+
+      - name: Verify mount feature is actually compiled in (Linux/macOS)
+        if: runner.os == 'Linux' || runner.os == 'macOS'
+        shell: bash
+        run: |
+          # The release.yml has had silent regressions in the past
+          # where LUKSBOX_FEATURES included `fuse` but the binary
+          # ended up with the stub MountError::Unsupported anyway
+          # (fuser feature plumbing is gated on a chain of cargo
+          # `default-features = false` + per-crate re-enables, easy
+          # to break). This step calls `luksbox mount` against
+          # nonexistent paths and inspects the error: a real mount
+          # implementation reports "no such file" / open failure;
+          # the stub reports "mount support was not compiled into
+          # this binary". We fail loud on the latter.
+          BIN="target/${{ matrix.target }}/release-hardened/luksbox"
+          if [ ! -x "$BIN" ]; then
+              echo "::warning::CLI binary not at $BIN; skipping verify"
+              exit 0
+          fi
+          # Probe the mount path. Pass paths that won't exist so we
+          # never actually mount anything. mount needs an unlock so
+          # we feed it a passphrase via stdin, but the open will
+          # fail before any real mount work so the passphrase is
+          # never consulted.
+          OUT=$( (echo "x" | "$BIN" mount /tmp/__luksbox_probe_nonexistent.lbx /tmp/__luksbox_probe_mp 2>&1) || true )
+          if echo "$OUT" | grep -q "mount support was not compiled into this binary"; then
+              echo "::error::Built CLI returns MountError::Unsupported, the fuse feature did NOT make it into the binary. LUKSBOX_FEATURES was '$LUKSBOX_FEATURES' but the build cache may have stale artifacts. Probe output:"
+              echo "$OUT"
+              exit 1
+          fi
+          echo "==> mount path is the real implementation (LUKSBOX_FEATURES=$LUKSBOX_FEATURES)"
+
+      # ---- package ------------------------------------------------------------
+
+      - name: Strip + stage (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p staging
+          cp "target/${{ matrix.target }}/release-hardened/luksbox" staging/
+          cp "target/${{ matrix.target }}/release-hardened/luksbox-gui" staging/
+          strip staging/luksbox || true
+          strip staging/luksbox-gui || true
+          # Bundle the user-visible docs alongside the binaries.
+          # Required files. Fail loud if any go missing from the repo
+          # root, the install.sh + .desktop refer to README/LICENSE etc.
+          for f in README.md LICENSE NOTICE TRADEMARK.md; do
+            if [ ! -f "$f" ]; then
+              echo "Required file '$f' missing from repo root, commit it before tagging." >&2
+              exit 1
+            fi
+            cp "$f" staging/
+          done
+          # Optional docs.
+          for f in SECURITY.md TUTORIAL.md; do
+            [ -f "$f" ] && cp "$f" staging/ || true
+          done
+          # Ship the .desktop launcher + per-size icons + MIME type +
+          # installer so users get a GNOME/KDE menu entry, the right
+          # icon at every DPI, and "Open with LUKSbox" on right-click
+          # of any .lbx file. Filenames use the reverse-DNS app_id
+          # (must match `with_app_id` in luksbox-gui/src/main.rs) so
+          # Wayland compositors resolve the window's app_id back to
+          # the .desktop file's `Name=` field.
+          mkdir -p staging/share/applications \
+                   staging/share/mime/packages
+          cp dist/com.penthertz.luksbox.desktop staging/share/applications/
+          cp dist/com.penthertz.luksbox.xml     staging/share/mime/packages/
+          # Per-size icons. scripts/build_icons.sh produced
+          # crates/luksbox-gui/assets/icons-linux/<N>x<N>.png for each
+          # canonical hicolor size; drop each into its own size dir.
+          for size in 16 24 32 48 64 128 256 512; do
+            src="crates/luksbox-gui/assets/icons-linux/${size}x${size}.png"
+            if [ -f "$src" ]; then
+              dst="staging/share/icons/hicolor/${size}x${size}/apps"
+              mkdir -p "$dst"
+              cp "$src" "$dst/com.penthertz.luksbox.png"
+            fi
+          done
+          cp dist/install.sh staging/install.sh
+          chmod +x staging/install.sh
+          tar -C staging -czf "${{ matrix.archive }}" .
+          ls -lh "${{ matrix.archive }}"
+
+      # ---- Linux native packages (deb + rpm) -------------------------------
+      #
+      # Generates a Debian/Ubuntu .deb and a Fedora/RHEL .rpm from the
+      # release-hardened binaries we just built. Metadata lives in
+      # crates/luksbox-cli/Cargo.toml under [package.metadata.deb] and
+      # [package.metadata.generate-rpm]; this step only invokes the tools.
+      #
+      # We use cargo-deb's `--no-build` so the binaries from the
+      # `cargo build --profile release-hardened` step above are reused
+      # (avoids a 2x build cost). Same for cargo-generate-rpm — it's
+      # post-build only, never invokes cargo.
+      #
+      # Both tools are pinned to specific minor versions: cargo-deb 3.x
+      # is the current stable line (TOML-asset-array syntax we use here
+      # was introduced in 2.x); cargo-generate-rpm 0.16+ understands the
+      # `requires` map syntax we use.
+
+      - name: Install cargo-deb + cargo-generate-rpm
+        if: runner.os == 'Linux'
+        run: |
+          # Locked installs to keep CI deterministic across runs. Both
+          # tools are pure-Rust, no system deps beyond what cargo itself
+          # already requires.
+          cargo install --locked cargo-deb@^3
+          cargo install --locked cargo-generate-rpm@^0.16
+
+      - name: Build .deb (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # --no-build: reuse the binaries the previous step built.
+          # --profile release-hardened: tells cargo-deb where to find
+          #   them (target/<triple>/release-hardened/).
+          # --target: same triple as the build to keep paths consistent.
+          cargo deb \
+            -p luksbox-cli \
+            --no-build \
+            --profile release-hardened \
+            --target ${{ matrix.target }}
+          # cargo-deb produces target/<triple>/debian/luksbox_<ver>_<arch>.deb.
+          # Inject the Ubuntu codename so users can pick the .deb that
+          # matches their distro (jammy vs noble — see the matrix
+          # comment for why this matters). The two parameter expansions
+          # below cover both architectures: only the matching one
+          # rewrites; the other is a no-op.
+          DEB_PATH=$(ls target/${{ matrix.target }}/debian/luksbox_*.deb | head -n1)
+          NEW_DEB_PATH="${DEB_PATH/_amd64.deb/_${{ matrix.ubuntu_codename }}_amd64.deb}"
+          NEW_DEB_PATH="${NEW_DEB_PATH/_arm64.deb/_${{ matrix.ubuntu_codename }}_arm64.deb}"
+          mv "$DEB_PATH" "$NEW_DEB_PATH"
+          DEB_PATH="$NEW_DEB_PATH"
+          echo "DEB_PATH=$DEB_PATH" >> "$GITHUB_ENV"
+          ls -lh "$DEB_PATH"
+          # Quick sanity check: list contents so a missing asset
+          # surfaces in the CI log instead of in user bug reports.
+          dpkg-deb -c "$DEB_PATH" | head -40
+          # Show the resolved Depends so it's visible in the CI log
+          # (this is what determines per-distro compatibility).
+          echo "--- Depends: ---"
+          dpkg-deb -f "$DEB_PATH" Depends
+
+      - name: Build .rpm (Linux)
+        # Only on the jammy matrix entries (one per arch). RPM uses
+        # SONAME-based requires that are version-constraint-free and
+        # work across Fedora / RHEL / openSUSE versions, so a single
+        # .rpm covers every rpm-based distro. We pick the jammy
+        # binaries for their wider glibc compatibility.
+        if: runner.os == 'Linux' && matrix.build_rpm
+        run: |
+          # NB: cargo-generate-rpm's `-p` is a *path* to the package
+          # directory (it opens `<p>/Cargo.toml`), NOT a workspace
+          # package name like cargo's / cargo-deb's `-p`. Pass the
+          # full crates/<name> relative path. The Cargo.toml needs to
+          # be the package's own manifest, not the workspace root.
+          cargo generate-rpm \
+            -p crates/luksbox-cli \
+            --profile release-hardened \
+            --target ${{ matrix.target }}
+          # Output path is target/<triple>/generate-rpm/luksbox-<ver>-1.x86_64.rpm.
+          RPM_PATH=$(ls target/${{ matrix.target }}/generate-rpm/luksbox-*.rpm | head -n1)
+          echo "RPM_PATH=$RPM_PATH" >> "$GITHUB_ENV"
+          ls -lh "$RPM_PATH"
+          # Same sanity probe via rpm -qlp (read-only listing, no
+          # database touch) so we see in the log what shipped.
+          rpm -qlp "$RPM_PATH" | head -40 || true
+
+      # ---- Linux package validation ----------------------------------------
+      #
+      # Catch package-level bugs in CI rather than user bug reports. Three
+      # layers, fastest to slowest:
+      #
+      # 1. `lintian` static-analyses the .deb's control files, mode bits,
+      #    declared deps, and FHS conformance. Catches metadata bugs that
+      #    cargo-deb won't notice (wrong section, missing copyright,
+      #    bad maintainer string).
+      # 2. `rpmlint` does the same for the .rpm.
+      # 3. Real `apt install` of our .deb on the runner, then a vault
+      #    create + reopen round-trip. This is the only test that
+      #    actually exercises the declared runtime dependencies
+      #    (`libfido2-1`, `libfuse3-3`) — a typo in the depends line
+      #    surfaces here as "package installation failed", not in user
+      #    reports.
+      # 4. The same .rpm installed inside a fedora:latest Docker
+      #    container so the Fedora package-name choices (`libfido2`,
+      #    `fuse3-libs`) get checked too. Just `--version` since FUSE
+      #    inside a non-privileged container isn't reliable enough to
+      #    do the full vault round-trip.
+
+      - name: Lint .deb (lintian)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq lintian
+          # `--fail-on error` exits non-zero only on errors, not on
+          # warnings/info/pedantic. cargo-deb output trips a few
+          # benign warnings (no source package, no upstream changelog)
+          # that we accept; real bugs (missing field, bad mode) are
+          # errors and will fail the job.
+          lintian --no-tag-display-limit --info --display-info \
+            --fail-on error "$DEB_PATH"
+
+      - name: Lint .rpm (rpmlint)
+        if: runner.os == 'Linux' && matrix.build_rpm
+        run: |
+          sudo apt-get install -y -qq rpmlint
+          # `-c dist/rpm/rpmlint.toml` filters the small set of
+          # cargo-generate-rpm 0.16.x output limitations + the
+          # unsigned-RPM warning we accept on dev artifacts. Each
+          # filter is documented inline in that file. Without the
+          # config rpmlint would fail on `no-signature`,
+          # `no-packager-tag`, `no-buildhost-tag`,
+          # `no-changelogname-tag`, and `no-manual-page-for-binary`,
+          # none of which are real packaging defects.
+          rpmlint -c dist/rpm/rpmlint.toml "$RPM_PATH"
+
+      - name: Install .deb + smoke test (Ubuntu runner)
+        if: runner.os == 'Linux'
+        run: |
+          # apt resolves transitive deps (libfido2-1 -> libssl3,
+          # libfuse3-3 -> fuse3, etc.) so this is the real test of
+          # whether we declared the right runtime deps.
+          #
+          # apt-get only auto-detects a local .deb when the path is
+          # absolute or begins with `./`; a bare `target/.../foo.deb`
+          # is interpreted as a package NAME (apt error: "Unable to
+          # locate package target/..."). Resolve to absolute first.
+          DEB_ABS="$(realpath "$DEB_PATH")"
+          sudo apt-get install -y "$DEB_ABS"
+
+          # Binary-launchability smoke.
+          which luksbox
+          luksbox --version
+          luksbox --help | head -3
+
+          # Functional smoke: create a real vault, reopen it, list
+          # the (empty) root. Argon2id at interactive defaults takes
+          # ~500 ms in release; LUKSBOX_TEST_FAST_KDF is compiled out
+          # of the release-hardened binary by design (see
+          # crates/luksbox-cli/src/main.rs::test_fast_kdf_enabled).
+          # LUKSBOX_PASSPHRASE / LUKSBOX_NEW_PASSPHRASE / LUKSBOX_ACCEPT_WEAK
+          # are runtime-only and remain available; that's what we use
+          # here.
+          tmpdir=$(mktemp -d)
+          cd "$tmpdir"
+          LUKSBOX_NEW_PASSPHRASE='strongtest!Pass#42' \
+          LUKSBOX_ACCEPT_WEAK=1 \
+            luksbox create v.lbx
+          [ -f v.lbx ] || { echo "::error::vault file not created"; exit 1; }
+          # Reopen with the same passphrase via the existing-vault env.
+          LUKSBOX_PASSPHRASE='strongtest!Pass#42' \
+            luksbox ls v.lbx /
+          echo "==> .deb installs cleanly + vault round-trip OK"
+
+      - name: Install .rpm in Fedora container (cross-distro smoke)
+        if: runner.os == 'Linux' && matrix.build_rpm
+        run: |
+          # Mount the .rpm into the container by absolute path (action
+          # runs at the workspace root, so $RPM_PATH is workspace-
+          # relative and resolves under $GITHUB_WORKSPACE).
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE/$RPM_PATH:/tmp/luksbox.rpm:ro" \
+            fedora:latest \
+            bash -c '
+              set -euo pipefail
+              dnf install -y -q /tmp/luksbox.rpm
+              # Just confirm the binary launches with all its dynamic
+              # deps resolved on Fedora. Full vault round-trip requires
+              # FUSE which is unreliable inside an unprivileged
+              # container; we trust the .deb test above for that.
+              luksbox --version
+              luksbox --help | head -3
+              echo "==> .rpm installs cleanly on Fedora"
+            '
+
+      - name: Upload Linux .deb
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          # Includes ubuntu_codename so jammy + noble entries on the
+          # same target architecture don't collide. The release job's
+          # download-artifact has merge-multiple: true so they all
+          # end up in artifacts/.
+          name: ${{ matrix.target }}-${{ matrix.ubuntu_codename }}-deb
+          path: ${{ env.DEB_PATH }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Linux .rpm
+        if: runner.os == 'Linux' && matrix.build_rpm
+        uses: actions/upload-artifact@v4
+        with:
+          # Only the jammy entries produce an .rpm; noble entries
+          # skip this step entirely. RPM is distro-portable so one
+          # build per arch is enough.
+          name: ${{ matrix.target }}-rpm
+          path: ${{ env.RPM_PATH }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Build macOS .app bundle (with bundled dylibs)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          rm -rf dmg-root
+          mkdir -p dmg-root
+
+          # Hand-rolled .app bundle layout. cargo-bundle would do the
+          # same thing in two steps but pulls in a 50 MB toolchain just
+          # to write three files; we'd rather keep CI deps narrow.
+          APP="dmg-root/LUKSbox.app"
+          mkdir -p "$APP/Contents/MacOS" \
+                   "$APP/Contents/Resources" \
+                   "$APP/Contents/Frameworks"
+
+          cp "target/${{ matrix.target }}/release-hardened/luksbox-gui" \
+             "$APP/Contents/MacOS/luksbox-gui"
+          strip "$APP/Contents/MacOS/luksbox-gui" || true
+
+          # Bare CLI binary inside the .app too, so power users can
+          # symlink /usr/local/bin/luksbox -> the .app's CLI without
+          # needing the .dmg mounted.
+          cp "target/${{ matrix.target }}/release-hardened/luksbox" \
+             "$APP/Contents/MacOS/luksbox"
+          strip "$APP/Contents/MacOS/luksbox" || true
+
+          cp crates/luksbox-gui/assets/icon.icns \
+             "$APP/Contents/Resources/icon.icns"
+
+          # ---- bundle libfido2 + transitive deps into the .app ----
+          # Without this, end users would need `brew install libfido2`
+          # before the binary could even start (dyld resolves dylibs at
+          # process load time, not lazily). dylibbundler walks the
+          # binary's LC_LOAD_DYLIB list, copies non-system dylibs into
+          # Contents/Frameworks/, and rewrites every reference to use
+          # @executable_path/../Frameworks/<libname.dylib>. Recursive,
+          # so libcbor / libcrypto / libssl come along automatically.
+          # -od: overwrite duplicates, -b: bundle, -of: overwrite the
+          # binary itself with the rewritten one, -p: install_name
+          # prefix to use in rewrites.
+          dylibbundler -of -b \
+            -x "$APP/Contents/MacOS/luksbox-gui" \
+            -x "$APP/Contents/MacOS/luksbox" \
+            -d "$APP/Contents/Frameworks/" \
+            -p "@executable_path/../Frameworks/"
+
+          # ---- Info.plist ----
+          # CFBundleIdentifier MUST be a reverse-DNS string and stable
+          # across versions (macOS uses it as the LaunchServices key).
+          # CFBundleIconFile resolves against Contents/Resources/, so
+          # "icon" -> "Resources/icon.icns".
+          # CFBundleDocumentTypes + UTExportedTypeDeclarations make
+          # Finder show "Open with LUKSbox" on right-click of any .lbx,
+          # and double-click opens that file directly (luksbox-gui's
+          # main.rs reads argv[1] and pre-fills the unlock screen).
+          cat > "$APP/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>             <string>LUKSbox</string>
+              <key>CFBundleDisplayName</key>      <string>LUKSbox</string>
+              <key>CFBundleIdentifier</key>       <string>com.penthertz.luksbox</string>
+              <key>CFBundleVersion</key>          <string>${GITHUB_REF_NAME#v}</string>
+              <key>CFBundleShortVersionString</key><string>${GITHUB_REF_NAME#v}</string>
+              <key>CFBundleExecutable</key>       <string>luksbox-gui</string>
+              <key>CFBundleIconFile</key>         <string>icon</string>
+              <key>CFBundlePackageType</key>      <string>APPL</string>
+              <key>CFBundleSignature</key>        <string>????</string>
+              <key>LSMinimumSystemVersion</key>   <string>11.0</string>
+              <key>NSHighResolutionCapable</key>  <true/>
+              <key>NSHumanReadableCopyright</key> <string>Copyright (c) 2026 Penthertz. Apache License 2.0. LUKSbox is a trademark of Penthertz.</string>
+
+              <key>CFBundleDocumentTypes</key>
+              <array>
+                  <dict>
+                      <key>CFBundleTypeName</key>        <string>LUKSbox encrypted vault</string>
+                      <key>CFBundleTypeRole</key>        <string>Editor</string>
+                      <key>LSHandlerRank</key>           <string>Owner</string>
+                      <key>CFBundleTypeExtensions</key>  <array><string>lbx</string></array>
+                      <key>CFBundleTypeIconFile</key>    <string>icon</string>
+                      <key>LSItemContentTypes</key>
+                      <array><string>com.penthertz.luksbox.vault</string></array>
+                  </dict>
+              </array>
+
+              <key>UTExportedTypeDeclarations</key>
+              <array>
+                  <dict>
+                      <key>UTTypeIdentifier</key>        <string>com.penthertz.luksbox.vault</string>
+                      <key>UTTypeDescription</key>       <string>LUKSbox encrypted vault</string>
+                      <key>UTTypeConformsTo</key>        <array><string>public.data</string></array>
+                      <key>UTTypeIconFile</key>          <string>icon</string>
+                      <key>UTTypeTagSpecification</key>
+                      <dict>
+                          <key>public.filename-extension</key><array><string>lbx</string></array>
+                          <key>public.mime-type</key>         <array><string>application/x-luksbox-vault</string></array>
+                      </dict>
+                  </dict>
+              </array>
+          </dict>
+          </plist>
+          EOF
+
+      - name: Code-sign macOS .app (only if Apple secrets present)
+        if: runner.os == 'macOS' && env.APPLE_DEV_ID_CERT_P12_BASE64 != ''
+        env:
+          APPLE_DEV_ID_CERT_P12_BASE64: ${{ secrets.APPLE_DEV_ID_CERT_P12_BASE64 }}
+          APPLE_DEV_ID_CERT_PASSWORD:   ${{ secrets.APPLE_DEV_ID_CERT_PASSWORD }}
+          APPLE_DEV_ID_IDENTITY:        ${{ secrets.APPLE_DEV_ID_IDENTITY }}
+        run: |
+          set -euo pipefail
+          # Import the Developer ID Application cert into a fresh
+          # keychain, then codesign --deep. --options runtime opts in
+          # to the Hardened Runtime which is required for notarization.
+          KEYCHAIN="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security default-keychain -s "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+
+          P12="$RUNNER_TEMP/cert.p12"
+          echo "$APPLE_DEV_ID_CERT_P12_BASE64" | base64 --decode > "$P12"
+          security import "$P12" -k "$KEYCHAIN" \
+            -P "$APPLE_DEV_ID_CERT_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          codesign --deep --force --options runtime --timestamp \
+            --sign "$APPLE_DEV_ID_IDENTITY" \
+            dmg-root/LUKSbox.app
+          codesign --verify --deep --strict --verbose=2 dmg-root/LUKSbox.app
+
+      - name: Build macOS portable tarball (CLI + GUI, no .app)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          # An alternative to the .dmg for users who don't want to deal
+          # with the Gatekeeper quarantine flow that comes with any
+          # downloaded .app. A .tar.gz extracted via `tar xzf` from
+          # Terminal does not propagate the com.apple.quarantine xattr
+          # to the extracted files, so the binaries inside run without
+          # right-click → Open or `xattr -dr` gymnastics.
+          #
+          # Layout matches the .app's internal layout so the same
+          # install_names dylibbundler emitted (@executable_path/../
+          # Frameworks/<lib>) keep working in-place:
+          #
+          #     luksbox-<ver>-aarch64-macos-portable/
+          #     ├── README-MACOS.txt
+          #     ├── bin/
+          #     │   ├── luksbox        # CLI
+          #     │   └── luksbox-gui    # GUI
+          #     └── Frameworks/
+          #         ├── libfido2.*.dylib
+          #         └── ...            # libcbor / libcrypto / libssl
+          #                            # / libfuse if macFUSE was present at build time
+          #
+          # Run in-place: ./bin/luksbox --help, ./bin/luksbox-gui &.
+          # NOT directly symlink-able into /usr/local/bin because the
+          # @executable_path-relative dylib refs only resolve from the
+          # bundled tree; users who want $PATH placement should keep
+          # the layout intact and add an alias / wrapper script instead.
+          PORTABLE="luksbox-${GITHUB_REF_NAME}-aarch64-macos-portable"
+          rm -rf portable-root
+          mkdir -p "portable-root/$PORTABLE/bin" \
+                   "portable-root/$PORTABLE/Frameworks"
+          cp dmg-root/LUKSbox.app/Contents/MacOS/luksbox \
+             dmg-root/LUKSbox.app/Contents/MacOS/luksbox-gui \
+             "portable-root/$PORTABLE/bin/"
+          cp -R dmg-root/LUKSbox.app/Contents/Frameworks/. \
+                "portable-root/$PORTABLE/Frameworks/"
+          # Required files. Fail loud if missing — same reasoning as
+          # the Linux/Windows staging steps, the README-MACOS.txt
+          # below references LICENSE/NOTICE/TRADEMARK.md.
+          for f in README.md LICENSE NOTICE TRADEMARK.md; do
+            if [ ! -f "$f" ]; then
+              echo "Required file '$f' missing from repo root, commit it before tagging." >&2
+              exit 1
+            fi
+            cp "$f" "portable-root/$PORTABLE/"
+          done
+          for f in SECURITY.md TUTORIAL.md; do
+            [ -f "$f" ] && cp "$f" "portable-root/$PORTABLE/" || true
+          done
+          cat > "portable-root/$PORTABLE/README-MACOS.txt" <<'EOF'
+          LUKSbox macOS portable build
+          ============================
+
+          This archive ships the LUKSbox CLI and GUI as plain binaries
+          with their dynamic dependencies bundled alongside under
+          Frameworks/. Use this build if you want to skip the .app /
+          .dmg quarantine flow.
+
+          Layout
+          ------
+              bin/luksbox        the CLI
+              bin/luksbox-gui    the GUI (egui-based)
+              Frameworks/        bundled libfido2 + transitive deps
+                                 (libfuse is NOT bundled; resolved
+                                 at runtime against your installed
+                                 macFUSE)
+
+          Running
+          -------
+              cd luksbox-<ver>-aarch64-macos-portable
+              ./bin/luksbox --help
+              ./bin/luksbox-gui &
+
+          The binaries reference dylibs via @executable_path/../
+          Frameworks/, so they MUST be invoked from within the
+          extracted directory (or an equivalent layout). Moving
+          bin/luksbox alone to /usr/local/bin will break dylib
+          resolution at process load time.
+
+          mount subcommand
+          ----------------
+          The `mount` subcommand requires macFUSE installed system-
+          wide:
+
+              brew install --cask macfuse
+
+          On first install macOS blocks the kext; approve it under
+          System Settings → Privacy & Security and reboot. Apple
+          Silicon also needs Recovery Mode → Startup Security
+          Utility → Reduced Security before the kext can load.
+          One-time per-machine setup. Without macFUSE, `luksbox
+          mount` returns "mount target not supported on this
+          platform". The `fuser` Rust crate we use hard-requires
+          macFUSE's libfuse2 ABI; FUSE-T (libfuse3) is not a
+          drop-in.
+
+          Quarantine
+          ----------
+          A .tar.gz extracted from Terminal does not propagate the
+          com.apple.quarantine xattr. If you downloaded the archive
+          via Safari instead and Safari attached the xattr to the
+          archive itself, clear it once after extraction:
+
+              xattr -dr com.apple.quarantine luksbox-<ver>-aarch64-macos-portable
+          EOF
+          tar -C portable-root -czf "${PORTABLE}.tar.gz" "$PORTABLE"
+          ls -lh "${PORTABLE}.tar.gz"
+          # Surface the path for the upload step.
+          echo "MACOS_PORTABLE_PATH=${PORTABLE}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Build macOS .dmg
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          # create-dmg builds a UDZO-compressed .dmg with an
+          # Applications symlink; the user opens the .dmg, drags the
+          # .app onto Applications, done. Standard Mac install UX.
+          # If signing happened, the .app inside is signed; if not, the
+          # user sees a Gatekeeper warning on first launch.
+          create-dmg \
+            --volname "LUKSbox ${GITHUB_REF_NAME}" \
+            --volicon "crates/luksbox-gui/assets/icon.icns" \
+            --window-pos 200 120 \
+            --window-size 600 320 \
+            --icon-size 96 \
+            --icon "LUKSbox.app" 150 150 \
+            --hide-extension "LUKSbox.app" \
+            --app-drop-link 450 150 \
+            --no-internet-enable \
+            "${{ matrix.archive }}" \
+            "dmg-root/" || {
+              # create-dmg occasionally fails on CI runners with osascript
+              # AppleEvent timeouts; fall back to a plain hdiutil .dmg
+              # which still gives "drag to Applications" UX, just no
+              # custom background.
+              echo "==> create-dmg failed, falling back to hdiutil"
+              hdiutil create -volname "LUKSbox ${GITHUB_REF_NAME}" \
+                -srcfolder dmg-root \
+                -ov -format UDZO \
+                "${{ matrix.archive }}"
+            }
+          ls -lh "${{ matrix.archive }}"
+
+      - name: Notarize macOS .dmg (only if Apple secrets present)
+        if: runner.os == 'macOS' && env.APPLE_NOTARY_USER != ''
+        env:
+          APPLE_NOTARY_USER:     ${{ secrets.APPLE_NOTARY_USER }}
+          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
+          APPLE_NOTARY_TEAM_ID:  ${{ secrets.APPLE_NOTARY_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          # Submit + wait for Apple's verdict (usually <5 min). On
+          # success, staple the ticket so the .dmg works offline (no
+          # round-trip to Apple at first launch).
+          xcrun notarytool submit "${{ matrix.archive }}" \
+            --apple-id "$APPLE_NOTARY_USER" \
+            --password "$APPLE_NOTARY_PASSWORD" \
+            --team-id "$APPLE_NOTARY_TEAM_ID" \
+            --wait
+          xcrun stapler staple "${{ matrix.archive }}"
+          xcrun stapler validate "${{ matrix.archive }}"
+
+      - name: Stage (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release-hardened/luksbox.exe" staging/
+          Copy-Item "target/${{ matrix.target }}/release-hardened/luksbox-gui.exe" staging/
+
+          # Bundle winfsp-x64.dll next to the .exe. The MSI handles
+          # this via PATH manipulation at install time; the portable
+          # .zip has no installer, so without the DLL alongside the
+          # binary, the loader fails with STATUS_DLL_NOT_FOUND on
+          # first launch. The Windows DLL search order checks the
+          # application directory FIRST (before PATH), so a copy here
+          # wins even when the user has WinFsp installed too.
+          # Note: the .sys kernel driver still must be installed via
+          # the WinFsp MSI for `mount` to actually work; bundling the
+          # userland DLL only solves the launch-time link.
+          $winfspRoot = @(
+              "C:\Program Files (x86)\WinFsp",
+              "C:\Program Files\WinFsp"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($winfspRoot -and (Test-Path "$winfspRoot\bin\winfsp-x64.dll")) {
+              Copy-Item "$winfspRoot\bin\winfsp-x64.dll" staging/
+              Write-Host "==> bundled winfsp-x64.dll from $winfspRoot\bin"
+
+              # GPLv3-with-linking-exception requires us to ship
+              # WinFsp's license text alongside the redistributed
+              # DLL. WinFsp's MSI drops it under <root>\License.txt
+              # (and on some versions <root>\licenses\). Try both,
+              # fail loud if neither exists, since stripping the
+              # license would put us out of compliance with the
+              # linking-exception terms.
+              $winfspLicense = @(
+                  "$winfspRoot\License.txt",
+                  "$winfspRoot\licenses\winfsp.txt"
+              ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+              if ($winfspLicense) {
+                  Copy-Item $winfspLicense "staging\LICENSE-WINFSP.txt"
+                  Write-Host "==> bundled WinFsp license from $winfspLicense"
+              } else {
+                  Write-Error "winfsp-x64.dll bundled but WinFsp's license text not found under $winfspRoot; this would put the .zip out of GPLv3 compliance"
+                  exit 1
+              }
+          } else {
+              Write-Error "winfsp-x64.dll not found under WinFsp's bin dir; cannot bundle into portable .zip"
+              exit 1
+          }
+
+          # Required files — the MSI hard-references them via the WiX
+          # ComponentGroup, so a missing one in the repo would surface
+          # as a cryptic WIX0103 several steps later. Fail loudly here
+          # with a clear message instead.
+          foreach ($f in @('README.md', 'LICENSE', 'NOTICE', 'TRADEMARK.md')) {
+            if (-not (Test-Path $f)) {
+                Write-Error "Required file '$f' is missing from repo root; commit it before tagging a release."
+                exit 1
+            }
+            Copy-Item $f staging/
+          }
+          # Optional, nice-to-have docs. Silently skipped if absent.
+          foreach ($f in @('SECURITY.md', 'TUTORIAL.md')) {
+            if (Test-Path $f) { Copy-Item $f staging/ }
+          }
+
+          # README-PORTABLE-WINDOWS.txt: explicit note that the .zip
+          # ships with winfsp-x64.dll for launch resolution but mount
+          # still needs the WinFsp MSI installed (kernel driver).
+          # Built as a string array (one element per line) instead of
+          # a PowerShell here-string, because here-string `"@` must be
+          # at column 0, which breaks YAML's `run: |` indentation.
+          $readme = @(
+            'LUKSbox portable Windows build',
+            '==============================',
+            '',
+            'This .zip ships luksbox.exe + luksbox-gui.exe with',
+            'winfsp-x64.dll bundled alongside. Run from the unzipped',
+            'folder:',
+            '',
+            '    .\luksbox.exe --help',
+            '    .\luksbox-gui.exe',
+            '',
+            'The bundled winfsp-x64.dll lets the binary launch on a',
+            'machine without the WinFsp MSI installed. However, the',
+            '`mount` subcommand needs the WinFsp KERNEL DRIVER, which',
+            'only the official WinFsp installer provides. Install',
+            'WinFsp 2.x from https://winfsp.dev/rel/ if you want to',
+            'use `luksbox mount`.',
+            '',
+            'Every other subcommand (create, open, ls, add, mkdir,',
+            'rotate, ...) works without WinFsp; the bundled DLL only',
+            'needs to load.',
+            '',
+            'Licenses',
+            '--------',
+            'LUKSbox itself is licensed under the Apache License 2.0;',
+            'see LICENSE in this archive.',
+            '',
+            'winfsp-x64.dll is a separate, third-party work bundled',
+            'unmodified for runtime convenience. It is licensed under',
+            'GPLv3 with a special linking exception that explicitly',
+            'permits this kind of bundling alongside non-GPL software.',
+            'The full WinFsp license text is in LICENSE-WINFSP.txt;',
+            'source code at https://github.com/winfsp/winfsp.'
+          )
+          Set-Content -Path "staging\README-PORTABLE-WINDOWS.txt" -Value $readme
+
+          Compress-Archive -Path staging/* -DestinationPath "${{ matrix.archive }}"
+          Get-Item "${{ matrix.archive }}" | Format-List
+
+      - name: Set up MSVC dev environment (for dumpbin)
+        # rustc finds link.exe via a baked-in MSVC search path so the
+        # build itself doesn't need vcvars to be on PATH; dumpbin (used
+        # by the next step to enumerate DLL imports) is only on PATH
+        # after vcvars has been sourced. ilammy/msvc-dev-cmd runs
+        # vcvars64.bat and forwards the resulting PATH/INCLUDE/LIB into
+        # subsequent steps via $GITHUB_ENV.
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Verify Windows binary has no surprise DLL deps
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # FIDO2 access on Windows now goes through webauthn.dll
+          # (a system DLL on every supported Windows), and WinFsp's
+          # winfsp-x64.dll is the only other non-system import. There
+          # are no vcpkg-statically-linked C libraries any more — that
+          # path was only ever used for libfido2, which we replaced
+          # with the WebAuthn API in luksbox-fido2/src/webauthn.rs.
+          #
+          # Blocklist below catches:
+          #   1. Stragglers from a pre-webauthn build accidentally
+          #      shipped (libfido2, libcbor, OpenSSL, zlib as DLL
+          #      imports — should be 0 today).
+          #   2. MinGW/Cygwin runtime that would mean the MSVC release
+          #      job mistakenly built MinGW instead.
+          # Everything else (api-ms-win-*, combase, bcrypt, kernel32,
+          # winfsp-x64, webauthn, ...) is a real Windows system DLL
+          # that ships with the OS, no action required from the user.
+          $deny = @(
+              # Stale libfido2 / vcpkg static-link targets — should
+              # never appear after the webauthn.dll migration.
+              'libfido2-1.dll', 'libfido2.dll',
+              'libcbor.dll', 'libcbor-0.dll',
+              'libcrypto-3-x64.dll', 'libcrypto-1_1-x64.dll',
+              'libcrypto.dll',
+              'libssl-3-x64.dll', 'libssl-1_1-x64.dll', 'libssl.dll',
+              'zlib1.dll', 'zlib.dll',
+              # MinGW / Cygwin runtime, would mean we shipped the
+              # wrong toolchain's binary.
+              'libwinpthread-1.dll', 'libgcc_s_seh-1.dll',
+              'libstdc++-6.dll', 'cygwin1.dll'
+          )
+          # dumpbin lives next to link.exe, both are part of MSVC. The
+          # ilammy/msvc-dev-cmd step above ran vcvars64.bat and pushed
+          # the resulting PATH into $GITHUB_ENV, so it's resolvable here.
+          $bad = $false
+          foreach ($exe in @('staging\luksbox.exe', 'staging\luksbox-gui.exe')) {
+              Write-Host "==> dumpbin /dependents $exe"
+              $out = & dumpbin /dependents $exe 2>&1
+              Write-Host ($out | Out-String)
+              $deps = $out |
+                  Where-Object { $_ -match '^\s+\S+\.dll' } |
+                  ForEach-Object { $_.Trim() }
+              foreach ($dep in $deps) {
+                  $hit = $deny | Where-Object { $_ -ieq $dep }
+                  if ($hit) {
+                      Write-Error "==> $exe depends on blocklisted DLL: $dep"
+                      $bad = $true
+                  }
+              }
+          }
+          if ($bad) {
+              Write-Error "==> Surprise dynamic dep, vcpkg likely picked the wrong triplet (or a MinGW binary leaked into the MSVC release). Bundle the DLL or switch back to x64-windows-static-md."
+              exit 1
+          }
+
+      - name: Smoke-test Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # If a required DLL is missing the loader returns 0xC0000135
+          # (STATUS_DLL_NOT_FOUND) and the process aborts before main()
+          # runs. --version exercises the full link without needing a
+          # YubiKey or container, so it's a cheap canary.
+          #
+          # winfsp-x64.dll lives in WinFsp's bin directory which the
+          # silent MSI install does NOT add to the system PATH (and
+          # ilammy/msvc-dev-cmd above re-arranges PATH on top of that).
+          # Prepend it for this step so the loader can resolve the
+          # DLL. End users never hit this because a normal interactive
+          # WinFsp install registers the DLL search path.
+          $winfspBin = @(
+              "C:\Program Files (x86)\WinFsp\bin",
+              "C:\Program Files\WinFsp\bin"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($winfspBin) {
+              Write-Host "==> prepending $winfspBin to PATH for smoke test"
+              $env:PATH = "$winfspBin;$env:PATH"
+          } else {
+              Write-Warning "WinFsp bin directory not found, smoke test will fail with STATUS_DLL_NOT_FOUND"
+          }
+
+          & .\staging\luksbox.exe --version
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "==> luksbox.exe --version failed with exit $LASTEXITCODE"
+              exit 1
+          }
+
+      - name: Build Windows MSI (WiX v4)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # WiX v4 ships as a .NET tool; install if it's not preinstalled.
+          if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
+              dotnet tool install --global wix --version 4.0.5
+              $env:PATH = "$env:USERPROFILE\.dotnet\tools;" + $env:PATH
+          }
+          # The MSI ProgId references staging\luksbox-installer.ico for
+          # the "Apps & Features" entry + Start menu shortcut. Same .ico
+          # we generated for the .exe resource, just renamed for clarity.
+          if (Test-Path "crates\luksbox-gui\assets\icon.ico") {
+              Copy-Item "crates\luksbox-gui\assets\icon.ico" `
+                        "staging\luksbox-installer.ico"
+          } else {
+              Write-Warning "no icon.ico, MSI will use a default Windows icon"
+              # WiX errors out if the file is missing; create an empty
+              # placeholder so the build doesn't break a clean checkout.
+              # The real icon should always be there in CI thanks to
+              # the "Generate platform icons" step.
+              New-Item -ItemType File -Path "staging\luksbox-installer.ico" -Force | Out-Null
+          }
+          # Strip leading 'v' from the tag (v1.2.3 -> 1.2.3) for MSI's
+          # 4-part version requirement. workflow_dispatch runs have no
+          # tag; fall back to 0.0.0 so the build still completes.
+          $version = if ($env:GITHUB_REF_NAME -match '^v(.+)$') { $Matches[1] } else { '0.0.0' }
+          $msiName = "luksbox-$env:GITHUB_REF_NAME-x86_64-windows.msi"
+          wix build dist\luksbox.wxs `
+              -d "Version=$version" `
+              -d "StagingDir=staging" `
+              -arch x64 `
+              -o $msiName
+          Get-Item $msiName | Format-List
+          # Surface the path so the next step (signing + upload) can
+          # find it without reconstructing the name.
+          echo "MSI_PATH=$msiName" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Code-sign Windows artifacts (only if signing cert present)
+        if: runner.os == 'Windows' && env.WINDOWS_PFX_BASE64 != ''
+        shell: pwsh
+        env:
+          WINDOWS_PFX_BASE64:    ${{ secrets.WINDOWS_PFX_BASE64 }}
+          WINDOWS_PFX_PASSWORD:  ${{ secrets.WINDOWS_PFX_PASSWORD }}
+        run: |
+          # Penthertz code-signing cert (Authenticode). signtool ships
+          # with the Windows SDK; on windows-latest it's at:
+          #   ${env:ProgramFiles(x86)}\Windows Kits\10\bin\<ver>\x64\signtool.exe
+          # WHICHEVER ver is preinstalled; PATH-resolve via vswhere/where.
+          $pfx = "$env:RUNNER_TEMP\codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
+          $signtool = (Get-Command signtool -ErrorAction SilentlyContinue).Source
+          if (-not $signtool) {
+              $candidates = Get-ChildItem -Recurse -Filter signtool.exe `
+                  "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -like '*\x64\*' } |
+                  Sort-Object LastWriteTime -Descending
+              $signtool = $candidates[0].FullName
+          }
+          foreach ($f in @('staging\luksbox.exe', 'staging\luksbox-gui.exe', $env:MSI_PATH)) {
+              & $signtool sign /fd sha256 /td sha256 `
+                  /tr http://timestamp.digicert.com `
+                  /f $pfx /p $env:WINDOWS_PFX_PASSWORD `
+                  $f
+              & $signtool verify /pa /v $f
+          }
+          # Re-zip the .zip artifact since the .exe inside changed.
+          if (Test-Path "${{ matrix.archive }}") { Remove-Item "${{ matrix.archive }}" }
+          Compress-Archive -Path staging/* -DestinationPath "${{ matrix.archive }}"
+
+      - name: Upload Windows MSI
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          # Distinct artifact name so it doesn't collide with the .zip
+          # uploaded under matrix.target below. The release job's
+          # download-artifact has merge-multiple: true so both end up
+          # in artifacts/.
+          name: ${{ matrix.target }}-msi
+          path: ${{ env.MSI_PATH }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload macOS portable tarball
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          # Distinct artifact name so it doesn't collide with the .dmg
+          # uploaded under matrix.target below. The release job's
+          # download-artifact has merge-multiple: true so both end up
+          # in artifacts/.
+          name: ${{ matrix.target }}-portable
+          path: ${{ env.MACOS_PORTABLE_PATH }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh artifacts/
+
+      - name: Compute SHA-256 checksums
+        run: |
+          cd artifacts
+          # Single-file `SHA256SUMS.txt` is what `sha256sum -c` expects
+          # downstream, and gets attached to the release as an asset
+          # alongside the binaries (via `files: artifacts/*` in the
+          # next step).
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+          # Also emit a Markdown-formatted table of (artifact, sha256)
+          # for inclusion in the release notes body. Users who don't
+          # want to download SHA256SUMS.txt can verify by eyeball
+          # against this table on the release page.
+          {
+            echo "| File | SHA-256 |"
+            echo "|---|---|"
+            while read -r sum file; do
+              echo "| \`${file}\` | \`${sum}\` |"
+            done < SHA256SUMS.txt
+          } > sha256_table.md
+          # Persist the table to the env so the body template below
+          # can pick it up via `${{ env.SHA256_TABLE_MD }}`. Multiline
+          # values use the `<<EOF` heredoc syntax that GITHUB_ENV
+          # supports.
+          {
+            echo 'SHA256_TABLE_MD<<__EOF__'
+            cat sha256_table.md
+            echo '__EOF__'
+          } >> "$GITHUB_ENV"
+
+      - name: Generate Sigstore artifact attestations
+        # Signs every release artifact with a short-lived GitHub-issued
+        # certificate keyed to this workflow run, then registers the
+        # signature on the public Sigstore transparency log. End users
+        # verify with:
+        #     gh attestation verify <file> --owner penthertz
+        # This proves the artifact was produced by this exact workflow
+        # run on this exact commit SHA, not silently swapped after the
+        # fact by someone with repo write access. Zero key management
+        # on our side, the OIDC identity is ephemeral.
+        # We attest both the binary artifacts and SHA256SUMS.txt so a
+        # user who only downloads the manifest still has a signed
+        # provenance chain.
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'artifacts/*'
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          draft: false
+          # Treat -rc / -beta / -alpha tags as prereleases automatically.
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') || contains(github.ref_name, '-alpha') }}
+          body: |
+            ## Verify your download
+
+            ### Cryptographic provenance (GitHub / Sigstore attestation)
+
+            Every artifact below is signed via [GitHub Artifact
+            Attestations](https://docs.github.com/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds),
+            which uses Sigstore under the hood. The signature proves
+            the artifact was produced by this exact workflow run on
+            this exact commit SHA, no human had a chance to swap it
+            after the fact.
+
+            Verify with the GitHub CLI (one-liner):
+
+            ```bash
+            # Install gh once if you don't have it:
+            #   sudo apt install gh   |   sudo dnf install gh   |   brew install gh
+            gh attestation verify <downloaded-file> --owner penthertz
+            # Prints "Loaded digest ..." then "PASS" with the
+            # workflow run + commit SHA the artifact came from.
+            ```
+
+            ### Offline check (no `gh` needed)
+
+            Every artifact also has a SHA-256 in `SHA256SUMS.txt`
+            (attached to this release):
+
+            ```bash
+            # Linux / macOS:
+            sha256sum -c SHA256SUMS.txt   # Linux
+            shasum -a 256 -c SHA256SUMS.txt   # macOS
+            ```
+
+            ```powershell
+            # Windows (PowerShell):
+            Get-FileHash luksbox-*.msi -Algorithm SHA256
+            # then compare to the `*.msi` row in SHA256SUMS.txt
+            ```
+
+            ### Trust chain summary
+
+            Artifacts on this release page are uploaded only by the
+            GitHub Actions release workflow that ran on this tagged
+            commit (`.github/workflows/release.yml` in the repo).
+            The commit itself is GPG-signed by the maintainer, the
+            upload uses GitHub's OIDC release token, and the
+            Sigstore attestation above pins the signature to that
+            workflow run. GPG-signed release tarballs
+            (`SHA256SUMS.txt.asc`) and full SLSA L3 provenance are
+            on the roadmap.
+
+            For at-a-glance SHA-256 checking against the published
+            values:
+
+            ${{ env.SHA256_TABLE_MD }}
+
+            ## Install
+
+            **Linux (Ubuntu 22.04, Debian 11/12, Mint 21.x, .deb):**
+              download `luksbox_*_jammy_amd64.deb` (or `_arm64`) and
+              install with `sudo apt install ./luksbox_*_jammy_amd64.deb`.
+              Pulls in `libfido2-1`, `libfuse3-3`, and `libtss2-*`
+              automatically. Registers a `luksbox-gui` desktop
+              launcher and a MIME type for `.lbx` files.
+
+            **Linux (Ubuntu 24.04+, Debian 13+ trixie, .deb):**
+              download `luksbox_*_noble_amd64.deb` (or `_arm64`) and
+              install with `sudo apt install ./luksbox_*_noble_amd64.deb`.
+              Same package layout as the jammy build, but with
+              t64-transitioned dependency names (`libssl3t64`,
+              `libfido2-1t64`, `libtss2-mu-4.0.1-0t64`, etc.). The
+              jammy and noble .deb files cannot be installed
+              interchangeably, the dependency names differ.
+
+            **Linux (Fedora / RHEL / Rocky / Alma, .rpm):** download
+              `luksbox-*.x86_64.rpm` (or `aarch64.rpm`) and install
+              with `sudo dnf install ./luksbox-*.x86_64.rpm` (or
+              `sudo rpm -i`). One .rpm covers every rpm-based
+              distro, RPM uses SONAMEs for shared-library
+              dependencies which are stable across releases.
+              Pulls in `libfido2` and `fuse3-libs` automatically.
+
+            **Linux (x86_64, generic tarball):** `tar xzf luksbox-${{ github.ref_name }}-x86_64-linux-jammy.tar.gz && cd luksbox-${{ github.ref_name }}-x86_64-linux-jammy && ./install.sh`
+              For Arch / NixOS / Alpine / any non-deb non-rpm distro.
+              The jammy variant has the broadest glibc compatibility;
+              if you are on a very recent distro and prefer the noble
+              build, swap `-jammy` for `-noble` in the filename.
+              Installs to `~/.local/bin` and registers a desktop launcher.
+              Use `./install.sh --system` for system-wide install, or
+              `./install.sh --uninstall` to remove. Requires
+              `libfido2-1` (and `libfuse3-3` for `mount`):
+              `sudo apt install libfido2-1 libfuse3-3` (Debian/Ubuntu)
+              or `sudo dnf install libfido2 fuse3-libs` (Fedora/RHEL).
+
+            **Linux (aarch64):** `tar xzf luksbox-${{ github.ref_name }}-aarch64-linux-jammy.tar.gz && cd luksbox-${{ github.ref_name }}-aarch64-linux-jammy && ./install.sh`
+              Same runtime deps and installer as x86_64. Built natively
+              on a GitHub ARM64 runner, no QEMU emulation. Same
+              jammy/noble distinction applies as for the .deb above.
+
+            **macOS (Apple Silicon), .dmg (recommended):** download
+              `luksbox-${{ github.ref_name }}-aarch64-macos.dmg`,
+              double-click, drag `LUKSbox.app` onto the `Applications`
+              link, eject. The .app is self-contained, libfido2 +
+              transitive dependencies are bundled inside, you do NOT
+              need `brew install libfido2`. Double-clicking a `.lbx`
+              file in Finder opens it directly in LUKSbox.
+
+            **macOS (Apple Silicon), portable .tar.gz:** download
+              `luksbox-${{ github.ref_name }}-aarch64-macos-portable.tar.gz`,
+              extract from Terminal with
+              `tar xzf luksbox-${{ github.ref_name }}-aarch64-macos-portable.tar.gz`.
+              Ships the bare CLI + GUI binaries (`bin/luksbox`,
+              `bin/luksbox-gui`) with their dylib closure under
+              `Frameworks/`. Run in place: `./bin/luksbox --help` or
+              `./bin/luksbox-gui &`. No `.app`, no Gatekeeper warning,
+              no quarantine xattr to clear (when extracted via
+              Terminal). See `README-MACOS.txt` inside for the full
+              layout + caveats.
+
+              `mount` (both builds) requires **macFUSE**
+              (https://macfuse.io/). Install with:
+
+                  brew install --cask macfuse
+
+              macFUSE installs a kernel extension. macOS will block
+              it on first install — approve under **System Settings
+              → Privacy & Security**, then reboot. On Apple Silicon
+              you may also need to lower the security policy via
+              **Recovery Mode → Startup Security Utility → Reduced
+              Security** before the kext can load. Both are one-time
+              per-machine setup. Once macFUSE is approved,
+              `luksbox mount` works directly.
+
+              (FUSE-T (https://www.fuse-t.org/) is a kext-free
+              alternative we'd love to support, but the underlying
+              `fuser` Rust crate hard-requires the macFUSE libfuse2
+              ABI on macOS. FUSE-T provides only libfuse3. Switching
+              would require swapping our FUSE wrapper crate.)
+
+              **First-launch workaround (current builds are
+              unsigned):** Penthertz Apple Developer ID enrollment
+              is in progress; until it completes the .dmg is not
+              `codesign`-stamped. macOS Gatekeeper blocks first
+              launch. Pick one:
+
+              - Finder: right-click `LUKSbox.app` -> Open -> Open
+                in the dialog.
+              - Terminal: `sudo xattr -dr com.apple.quarantine
+                /Applications/LUKSbox.app` then double-click as
+                normal.
+
+              You only have to do this once per machine. Verify the
+              .dmg SHA-256 against the table at the top of these
+              release notes for trust in the meantime.
+
+            **macOS (Intel):** not shipped, build from source with
+              `cargo build --profile release-hardened` on an Intel Mac
+              with `brew install libfido2` (the `release-hardened`
+              profile matches the hardening flags used for the shipped
+              Apple-Silicon binary). The CI matrix entry for
+              `x86_64-apple-darwin` is commented out in
+              `.github/workflows/release.yml`, GitHub's `macos-13`
+              runner has been intermittently blocking releases.
+
+            **Windows prerequisite (both flavors below):** install
+              **WinFsp 2.x** first from <https://winfsp.dev/rel/>.
+              The LUKSbox binary statically links against
+              `winfsp-x64.dll` (provided by WinFsp), so without it the
+              binary fails to start with `STATUS_DLL_NOT_FOUND`. The
+              MSI refuses to install if WinFsp is missing and shows a
+              clear message; the portable .zip has no installer to
+              warn you, so install WinFsp first either way.
+
+            **Windows (x86_64), recommended:** download
+              `luksbox-${{ github.ref_name }}-x86_64-windows.msi`,
+              double-click. The MSI installs LUKSbox to
+              `C:\Program Files\LUKSbox\`, prepends both
+              `C:\Program Files\LUKSbox\` and `<WinFspInstall>\bin`
+              to the system PATH (so the loader resolves
+              `winfsp-x64.dll` and `luksbox` works in cmd /
+              PowerShell), drops a Start menu shortcut, and registers
+              the `.lbx` file extension (double-click any `.lbx` in
+              Explorer to open it). Uninstall via Apps & Features.
+
+            **Windows (x86_64), portable:** unzip
+              `luksbox-${{ github.ref_name }}-x86_64-windows.zip`
+              and run the .exe in place. No installation, no Start
+              menu entry, no PATH change. Same binaries as the MSI.
+              Because nothing was added to PATH, you must either
+              (a) run from a shell where `<WinFspInstall>\bin` is on
+              PATH, or (b) drop a copy of `winfsp-x64.dll` next to
+              `luksbox.exe` in the unzipped folder.
+
+              libfido2 is statically linked into the .exe; no runtime
+              install needed for FIDO2.
+
+            See the **Verify your download** section at the top for
+            checksum verification commands.

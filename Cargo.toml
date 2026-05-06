@@ -1,0 +1,101 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/luksbox-core",
+    "crates/luksbox-format",
+    "crates/luksbox-fido2",
+    "crates/luksbox-pq",
+    "crates/luksbox-vfs",
+    "crates/luksbox-mount",
+    "crates/luksbox-cli",
+    "crates/luksbox-gui",
+    "crates/luksbox-tpm",
+    "crates/luksbox-ct-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Apache-2.0 is the SPDX identifier; crates.io and `cargo publish`
+# recognise it directly. Each crate's Cargo.toml inherits this via
+# `license.workspace = true`. The full text lives in the `LICENSE`
+# file at the repo root (per Apache 2.0's redistribution conditions).
+license = "Apache-2.0"
+rust-version = "1.88"
+authors = ["Penthertz <https://penthertz.com>"]
+homepage = "https://penthertz.com"
+repository = "https://github.com/penthertz/LUKSbox"
+
+[workspace.dependencies]
+aes-gcm = "0.10"
+# Nonce-misuse-resistant AEAD (RFC 8452). Same 12-byte nonce + 16-byte
+# tag wire shape as AES-GCM, so on-disk chunk layout is byte-identical;
+# a nonce collision under the same key is detectable rather than
+# catastrophic. Default suite for new vaults from format v1.0.1
+# onward; pre-existing vaults stay on whatever suite their header was
+# stamped with at create time.
+aes-gcm-siv = "0.11"
+chacha20poly1305 = "0.10"
+argon2 = { version = "0.5", features = ["zeroize"] }
+hmac = { version = "0.12", features = ["reset"] }
+sha2 = "0.10"
+hkdf = "0.12"
+zeroize = { version = "1.8", features = ["derive"] }
+subtle = "2.6"
+rand_core = { version = "0.6", features = ["getrandom"] }
+thiserror = "2.0"
+aes = "0.8"
+p256 = { version = "0.13", default-features = false, features = ["ecdh"] }
+serde = { version = "1", features = ["derive"] }
+# Postcard: metadata-blob serializer. Smaller varint encoding than
+# bincode, actively maintained, reads our existing
+# `#[derive(Serialize, Deserialize)]` derives directly. Replaced
+# bincode 2 (RUSTSEC-2025-0141 unmaintained) entirely, luksbox is
+# pre-release so no on-disk-compat constraint applied.
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+fuser = { version = "0.17", default-features = false }
+libc = "0.2"
+pkg-config = "0.3"
+ctrlc = "3"
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+ml-kem = { version = "0.3", features = ["zeroize"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+debug = "line-tables-only"
+
+# `profile.release-hardened`, release with the
+# reverse-engineering / forensics-resistance defaults baked in.
+# Use for shipped binaries. NOT the default `release` profile so
+# day-to-day `cargo build --release` keeps debug-friendly symbols.
+#
+# Build: `cargo build --profile release-hardened -p luksbox-cli`
+# Output: target/release-hardened/luksbox
+#
+# What this turns on (for the rationale, see docs/PROJECT_OVERVIEW.md
+# section 11 "Reverse-engineering resistance"):
+#  - `lto = "fat"`                cross-crate inlining -> fewer named
+#                                 boundaries to grep for
+#  - `codegen-units = 1`          stricter dead-code elim, smaller
+#                                 attack surface in the binary
+#  - `panic = "abort"`            no unwind tables -> no panic strings
+#                                 visible in the binary
+#  - `strip = "symbols"`          remove all symbols + debug info
+#  - `debug = false`              no DWARF info shipped
+#  - `overflow-checks = false`    runtime overflow checks generate
+#                                 panic strings; we audit overflow
+#                                 statically. Same default as `release`.
+#  - `incremental = false`        deterministic per-build artefacts
+#                                 (helps reproducible builds)
+[profile.release-hardened]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"
+strip = "symbols"
+debug = false
+overflow-checks = false
+incremental = false

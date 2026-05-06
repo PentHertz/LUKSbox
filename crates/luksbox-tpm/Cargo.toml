@@ -1,0 +1,66 @@
+[package]
+name = "luksbox-tpm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Linux TPM 2.0-backed wrap/unwrap of the LUKSbox Master Volume Key"
+
+[features]
+# Off by default so a default `cargo build` of the workspace doesn't
+# need libtss2-* installed. CI + Linux release builds enable it via
+# `--features hardware`.
+#
+# `hardware` is a meta-feature: it asks for the real TPM 2.0 backend.
+# It only DOES anything on Linux, because tss-esapi 7.x doesn't
+# support Windows or macOS (build.rs panics with "Compilation target
+# (architecture, OS) tuple is not part of the supported tuples").
+# So tss-esapi is target-gated below; on non-Linux, enabling
+# `hardware` is a no-op and the source code falls back to the same
+# `NotCompiledIn` stub used when the feature is off entirely.
+# Migration to tss-esapi 8.0 (which adds Windows TBS support) is
+# tracked in docs/TPM_FUTURE_IMPROVEMENTS.md section 1.
+default = []
+hardware = ["dep:tss-esapi"]
+
+[dependencies]
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+# rand_core for the in-memory MockTpm2Sealer (tests + adversary
+# scenarios). Not gated on `hardware` because the mock works on
+# every platform without tss-esapi.
+rand_core = { workspace = true }
+
+# tss-esapi pinned to ^7.5 (current stable line). v8 is in development
+# and has shape-breaking API changes around handle types AND a
+# tpm2-tss-floor bump from 2.4.6 to 4.1.3 that breaks Debian 12 +
+# Ubuntu 22.04/24.04 LTS + RHEL 9 default builds; pin to the stable
+# major. To take v8 on, the `hardware` feature needs to be split
+# into `fido2-hardware` (low floor, default-on) + `tpm-hardware`
+# (8.0-floor, opt-in) + a `bundled-tpm` variant for users on older
+# distros.
+#
+# Target-gated: tss-esapi 7.x's -sys crate hard-panics in build.rs
+# on every non-Linux target, so we restrict the dep to Linux. The
+# `hardware` cargo feature still references it via `dep:tss-esapi`,
+# but on non-Linux that dep simply doesn't exist for the target —
+# the feature flag stays settable (no error from parents that turn
+# it on unconditionally) but the optional dep is not pulled.
+[target.'cfg(target_os = "linux")'.dependencies]
+tss-esapi = { version = "7.5", optional = true }
+
+[dev-dependencies]
+# Software TPM emulator integration tests live in tests/swtpm.rs and
+# are gated on `--features hardware`. They spawn `swtpm socket` if
+# the binary is on PATH; otherwise they `eprintln!` a skip notice
+# and exit Ok so unprivileged contributors without the emulator can
+# still run `cargo test`.
+tempfile = "3"
+# Container-level end-to-end test (tests/swtpm_container.rs) drives
+# the full enroll_tpm2 -> persist -> reopen-via-Tpm2-unlock loop
+# against the emulator. luksbox-format itself doesn't depend on
+# luksbox-tpm (kept TPM-agnostic via the closure-based
+# UnlockMaterial::Tpm2 design); this dev-only edge runs in the
+# opposite direction.
+luksbox-core = { path = "../luksbox-core" }
+luksbox-format = { path = "../luksbox-format" }

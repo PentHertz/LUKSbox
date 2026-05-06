@@ -1,0 +1,43 @@
+# Out-of-workspace crate: AFL++ harnesses for sustained server-side
+# fuzzing. Keeps `cargo build`/`cargo test` of the main workspace
+# unaffected (AFL builds need extra instrumentation flags).
+#
+# Install AFL toolchain once on the server:
+#   apt install build-essential clang llvm
+#   cargo install --version 0.15 afl    # afl.rs == cargo-afl wrapper of AFL++
+#
+# Build all harnesses:
+#   cd fuzz-afl && cargo afl build --release
+#
+# Run one harness for an hour with 8 cores:
+#   ./scripts/fuzz_server.sh header_parse 8 3600
+#
+# See FUZZING.md for the full server playbook.
+
+[package]
+name = "luksbox-fuzz-afl"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.85"
+
+[dependencies]
+afl = "0.15"
+luksbox-core = { path = "../crates/luksbox-core" }
+luksbox-format = { path = "../crates/luksbox-format" }
+luksbox-pq = { path = "../crates/luksbox-pq" }
+tempfile = "3"
+bincode = { version = "2.0", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+# AFL needs branch coverage instrumentation; opt-level 3 is fine but
+# debug-assertions catch overflow bugs the optimizer otherwise hides.
+debug-assertions = true
+overflow-checks = true
+lto = false             # AFL's instrumentation pass is incompatible with LTO
+codegen-units = 1       # better instrumentation density
+
+# This crate is intentionally NOT in the workspace, AFL build flags
+# would otherwise contaminate the main `cargo build`.
+[workspace]

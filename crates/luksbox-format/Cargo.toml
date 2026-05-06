@@ -1,0 +1,25 @@
+[package]
+name = "luksbox-format"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "On-disk container format I/O for luksbox (.lbx files)"
+
+[dependencies]
+luksbox-core = { path = "../luksbox-core" }
+luksbox-pq = { path = "../luksbox-pq" }
+rand_core.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+# Cross-platform advisory file lock (flock on POSIX, LockFileEx on
+# Windows). Used by Container::open / create to prevent concurrent
+# write corruption, see SECURITY.md §3.3 and round-6 audit notes.
+fs2 = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+libc = "0.2"

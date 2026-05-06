@@ -1,0 +1,357 @@
+# Push + PR CI for luksbox.
+#
+# Runs on every push to main and every PR. Designed for fast feedback
+# (~5 min wall-clock for the full matrix), NOT a substitute for the
+# longer fuzz campaigns under scripts/fuzz_server.sh, which run on a
+# dedicated server. See FUZZING.md.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0       # smaller, more reproducible CI builds
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---- Format + clippy gate (fast, ~30s) -----------------------------------
+  lint:
+    name: fmt + clippy
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-lint
+      - name: Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev \
+            libtss2-dev
+      - run: cargo fmt --all -- --check
+      # Workspace-wide clippy. NOT `-D warnings` yet, there's a backlog of
+      # too_many_arguments / auto_deref nits we don't want to gate on. Run
+      # without `-D` so the CI signal is informational; tighten as warnings
+      # are fixed.
+      - run: cargo clippy --workspace --all-targets
+
+  # ---- Full test matrix ---------------------------------------------------
+  test:
+    name: test (${{ matrix.profile }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: workspace
+            features: ""
+            cmd: "cargo test --workspace --exclude luksbox-gui --exclude luksbox-fuzz --exclude luksbox-fuzz-afl"
+          - profile: workspace-hardware
+            features: "luksbox-cli/hardware"
+            cmd: "cargo test --workspace --features luksbox-cli/hardware --exclude luksbox-gui --exclude luksbox-fuzz --exclude luksbox-fuzz-afl"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-${{ matrix.profile }}
+      - name: Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev \
+            libtss2-dev
+      - name: Run ${{ matrix.profile }} tests
+        run: ${{ matrix.cmd }}
+
+  # ---- Windows mount integration tests (WinFsp kernel mount) -------------
+  # Mounts a real luksbox vault on a free drive letter via the WinFsp
+  # kernel driver, exercises it through Win32, then tears it down. Catches
+  # the class of bug that motivated writing them: `FileSystem::start`
+  # returning Ok while Win32 still reports the volume as unrecognized
+  # (the OVERWRITE_DEFINED regression). See
+  # crates/luksbox-mount/src/winfsp.rs top-of-file gotcha catalogue.
+  #
+  # Stays in its own job because:
+  #   1. It needs a `windows-latest` runner (3x more expensive than
+  #      ubuntu-latest minutes, so we keep it off the per-PR critical
+  #      path and re-evaluate cost after a few months of data).
+  #   2. WinFsp install via choco takes ~30 s on a cold runner -
+  #      unrelated to anything Linux jobs do, so parallelizing it out
+  #      keeps the rest of the matrix snappy.
+  #   3. `--test-threads=1` is required (the tests share the global
+  #      drive-letter pool) - running them alongside Linux jobs would
+  #      not have helped throughput anyway.
+  windows-mount:
+    name: WinFsp mount integration tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-windows-mount
+      - name: Install WinFsp (kernel driver + SDK)
+        shell: pwsh
+        run: |
+          # Same install pattern as release.yml: chocolatey first, MSI
+          # fallback if the choco package is delisted or fails. The
+          # silent MSI install registers the kernel driver AND drops the
+          # SDK headers/libs winfsp_wrs_sys's build script reads from
+          # HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir.
+          $ErrorActionPreference = 'Continue'
+          choco install winfsp -y --no-progress
+          if (-not (Test-Path "C:\Program Files (x86)\WinFsp\inc\winfsp\winfsp.h") -and
+              -not (Test-Path "C:\Program Files\WinFsp\inc\winfsp\winfsp.h")) {
+              Write-Host "==> choco install didn't drop WinFsp SDK, falling back to direct MSI"
+              $msi = "$env:RUNNER_TEMP\winfsp.msi"
+              Invoke-WebRequest `
+                  -Uri "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-2.0.23075.msi" `
+                  -OutFile $msi
+              Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          }
+      - name: Verify WinFsp install
+        shell: pwsh
+        run: |
+          # Surfaces a clear error early if the install above silently
+          # failed - the integration tests would otherwise just print
+          # `[skip]` and pass, defeating the point of running them in CI.
+          $sdk = @(
+              "C:\Program Files (x86)\WinFsp\inc\winfsp\winfsp.h",
+              "C:\Program Files\WinFsp\inc\winfsp\winfsp.h"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $drv = @(
+              "C:\Program Files (x86)\WinFsp\bin\winfsp-x64.sys",
+              "C:\Program Files\WinFsp\bin\winfsp-x64.sys"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $sdk) { Write-Error "WinFsp SDK headers missing"; exit 1 }
+          if (-not $drv) { Write-Error "WinFsp kernel driver missing"; exit 1 }
+          Write-Host "==> WinFsp ok (sdk=$sdk, driver=$drv)"
+      - name: Run WinFsp integration tests
+        shell: pwsh
+        # --test-threads=1 because the tests share the host's drive-letter
+        # pool (D:..Z:) and parallel runs would race on the same letter.
+        # --release because debug builds of winfsp_wrs_sys take ~3x longer
+        # to link, and we don't need debug symbols here.
+        #
+        # PATH munging: luksbox-mount is statically linked against
+        # winfsp-x64.lib, so the produced test exe needs winfsp-x64.dll
+        # to be reachable by the Windows loader at startup. WinFsp ships
+        # the DLL under <install>\bin\ but does NOT add that directory
+        # to system PATH. Without this prepend, the loader fails with
+        # STATUS_DLL_NOT_FOUND (0xC0000135) before main() runs and the
+        # test process exits with that NTSTATUS as its exit code.
+        # The verify step above already established that the bin dir
+        # exists in one of the two standard locations.
+        run: |
+          $winfspBin = if (Test-Path "C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll") {
+              "C:\Program Files (x86)\WinFsp\bin"
+          } elseif (Test-Path "C:\Program Files\WinFsp\bin\winfsp-x64.dll") {
+              "C:\Program Files\WinFsp\bin"
+          } else {
+              Write-Error "winfsp-x64.dll not found in either standard install location"
+              exit 1
+          }
+          Write-Host "==> prepending WinFsp bin dir to PATH: $winfspBin"
+          $env:PATH = "$winfspBin;$env:PATH"
+          cargo test --release -p luksbox-mount --test winfsp_mount -- --test-threads=1 --nocapture
+
+  # ---- Security regression spotlight (always-green gate) ------------------
+  # Runs JUST the 26 security regression tests added during the audit
+  # rounds. Any failure here is a serious regression, these tests
+  # encode the safe envelope of the three vulnerabilities we already
+  # found (argon2 DoS, cred_id OOM, bincode-decode OOM). Surfacing
+  # them as their own job makes the green/red signal unambiguous.
+  security-regressions:
+    name: security regressions (must stay green)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-security-regressions
+      - name: Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev \
+            libtss2-dev
+      - name: Argon2id DoS guard (luksbox-core)
+        run: cargo test -p luksbox-core --test argon2_dos_guard
+      - name: Seed-file DoS guard (luksbox-pq)
+        run: cargo test -p luksbox-pq --test seed_file_dos_guard
+      - name: Rogue / MITM FIDO2 authenticator (luksbox-fido2)
+        run: cargo test -p luksbox-fido2 --test rogue_authenticator
+      - name: Postcard oversize-payload guard (luksbox-vfs)
+        # Replaces the old `bincode_oom_guard` test, the codec moved
+        # bincode to postcard. Same intent: reject attacker-controlled
+        # length prefixes that would balloon allocation before
+        # validation. Lives in metadata_format_v2.rs as
+        # postcard_decoder_rejects_oversized_payload.
+        run: cargo test -p luksbox-vfs --test metadata_format_v2 -- postcard_decoder_rejects_oversized_payload
+      - name: FIPS 203 (ML-KEM-768/1024) conformance (luksbox-pq)
+        run: cargo test -p luksbox-pq --test fips203_conformance
+      - name: Hybrid-FIDO end-to-end (luksbox-pq)
+        run: cargo test -p luksbox-pq --test end_to_end_hybrid
+      - name: HKDF info-string uniqueness + slot-AAD coverage (luksbox-core, round 6)
+        run: cargo test -p luksbox-core --test security_invariants
+      - name: Header tamper coverage + concurrent open (luksbox-format, round 6)
+        run: cargo test -p luksbox-format --test security_invariants
+      - name: Cross-file chunk substitution + generation rollback (luksbox-vfs, round 6)
+        run: cargo test -p luksbox-vfs --test security_invariants
+      - name: AES-NI startup warning (luksbox-cli, round 6 item I)
+        run: cargo test -p luksbox-cli --test functional -- aes
+
+  # ---- Workspace builds (no tests, just ensure binaries link) -------------
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: cli-no-hardware
+            cmd: "cargo build --release -p luksbox-cli"
+            extra_apt: ""
+          - target: cli-hardware
+            cmd: "cargo build --release -p luksbox-cli --features hardware"
+            extra_apt: ""
+          - target: gui
+            cmd: "cargo build --release -p luksbox-gui"
+            extra_apt: ""
+          # luksbox-tpm hardware feature: real link against libtss2-*
+          # for the build, plus `swtpm` (software TPM emulator) at
+          # test time so the integration tests in tests/swtpm_*.rs
+          # exercise actual seal/unseal against a TCG-compliant chip.
+          # Stub-only build is verified by the workspace default
+          # build above; this matrix entry is the only one that
+          # exercises the real tss-esapi-sys link AND the live TPM
+          # round-trip. swtpm comes with swtpm_setup which is what
+          # initialises the EK certificate before swtpm starts.
+          # libtss2-tcti-swtpm0 provides the tcti library for the
+          # `swtpm:path=...` TCTI string the tests use.
+          - target: tpm-hardware
+            cmd: "cargo build --release -p luksbox-tpm --features hardware && cargo test --release -p luksbox-tpm --features hardware"
+            extra_apt: "swtpm swtpm-tools libtss2-tcti-swtpm0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-build-${{ matrix.target }}
+      - name: Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev \
+            libtss2-dev \
+            ${{ matrix.extra_apt }}
+      - name: Build
+        run: ${{ matrix.cmd }}
+
+  # ---- Quick fuzz smoke (5 min per target) --------------------------------
+  # Runs the libFuzzer harnesses with the persistent corpus + 5 min
+  # wall-clock cap per target. Surfaces any trivially-reachable new
+  # crash introduced by a PR. The longer AFL++ campaigns live in
+  # scripts/fuzz_server.sh and are server-side.
+  #
+  # Runs on:
+  #   - PRs           : catch parser regressions before merge
+  #   - manual dispatch: ad-hoc smoke
+  #   - tag pushes    : gate releases on a fresh fuzz pass
+  # Skipped on plain push to main (PR was already fuzzed at review time).
+  fuzz-smoke:
+    # No `${{ matrix.target }}` in the name, GitHub auto-appends the
+    # matrix value to the display anyway ("fuzz smoke (header_parse)"
+    # etc.). Hard-coding the placeholder here makes skipped jobs show
+    # the raw template literally because the matrix isn't expanded
+    # when the job-level `if:` evaluates false.
+    name: fuzz smoke
+    runs-on: ubuntu-22.04
+    if: >-
+      github.event_name == 'pull_request' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/'))
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - header_parse
+          - keyslot_parse
+          - metadata_parse
+          - hybrid_sidecar_parse
+          - seed_file_parse
+          - auth_then_process
+          - header_roundtrip
+          - winfsp_path_parse
+          - webauthn_device_path
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-fuzz-smoke
+          workspaces: "fuzz"
+      - name: Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev clang
+      # NB: no `--locked`. cargo-fuzz 0.13.x ships a Cargo.lock that
+      # pins `rustix = 0.36.5`, which uses internal rustc attributes
+      # (`rustc_layout_scalar_valid_range_*`) without enabling the
+      # `feature(rustc_attrs)` gate. Recent nightly rejects this with
+      # "attributes starting with `rustc` are reserved", breaking the
+      # install. Dropping `--locked` lets cargo resolve to a newer
+      # rustix patch in the 0.36.x line that fixed the issue.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Fuzz ${{ matrix.target }} for 5 minutes
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} \
+            -- -max_total_time=300
+      - name: Upload any crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # cargo-audit walks Cargo.lock against the RustSec advisory DB and
+  # fails on any non-ignored advisory. The single accepted ignore
+  # (RUSTSEC-2025-0026, `registry` unmaintained, transitive via
+  # winfsp_wrs on Windows) is documented in audit.toml at the repo
+  # root and in SECURITY.md "Unmaintained dependencies". A new
+  # advisory landing on a real (non-dev, non-Windows) dep makes
+  # this job fail and the PR red.
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-audit
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit@^0.21
+      - name: Run cargo audit
+        run: cargo audit

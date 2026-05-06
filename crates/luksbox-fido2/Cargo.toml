@@ -1,0 +1,64 @@
+[package]
+name = "luksbox-fido2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "FIDO2 hmac-secret authenticator interface for luksbox"
+
+[dependencies]
+luksbox-core = { path = "../luksbox-core" }
+sha2.workspace = true
+hmac.workspace = true
+zeroize.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true
+aes.workspace = true
+p256.workspace = true
+
+# On Windows, the `hardware` feature uses Microsoft's WebAuthn API
+# (webauthn.dll) directly instead of libfido2's HID enumeration. This
+# is the only path that works for non-elevated processes (the FIDO HID
+# class is reserved for the WebAuthn system service since Windows 10
+# 1903). webauthn.dll routes both Windows Hello and USB security keys
+# without admin, and matches the UX of every other security-key-using
+# app on Windows. See `src/webauthn.rs` for the full rationale.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WindowsWebServices",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-core = "0.58"
+
+[build-dependencies]
+pkg-config.workspace = true
+vcpkg = "0.2"
+# Used to regenerate the libfido2 FFI bindings from the actually-linked
+# C headers at build time. Replaces the hand-rolled `unsafe extern "C"`
+# block that lived in `src/ffi.rs` before round 7C of the audit.
+bindgen = "0.72"
+
+[features]
+# Link against libfido2 (Yubico's reference C library) and provide a
+# `HidAuthenticator: Fido2Authenticator` impl that talks to real FIDO2
+# hardware. Off by default so the workspace builds without libfido2-dev.
+hardware = []
+
+[dev-dependencies]
+# For the `full_probe` example: real Container::create + Container::open
+# roundtrip against a temporary .lbx file using a hardware FIDO2 device.
+luksbox-format = { path = "../luksbox-format" }
+tempfile = "3"
+
+[[example]]
+name = "full_probe"
+required-features = ["hardware"]
+
+[[example]]
+name = "multidev_probe"
+required-features = ["hardware"]
+
+[[example]]
+name = "probe"
+required-features = ["hardware"]

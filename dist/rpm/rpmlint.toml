@@ -1,0 +1,60 @@
+# rpmlint configuration for the LUKSbox RPM produced by
+# cargo-generate-rpm. Used by the release workflow:
+#   rpmlint -c dist/rpm/rpmlint.toml "$RPM_PATH"
+#
+# Each filter below is a permanent limitation of either our build
+# pipeline or cargo-generate-rpm 0.16.x; the *fixable* rpmlint
+# errors (license string, explicit-lib-dependency, group tag) are
+# fixed in the [package.metadata.generate-rpm] section of
+# crates/luksbox-cli/Cargo.toml.
+
+Filters = [
+    # We don't GPG-sign dev / preview / nightly RPMs. Production
+    # release RPMs would be signed via `rpmsign --addsign` in a
+    # dedicated signing step with a key that lives in a CI secret.
+    # Until that pipeline ships, every artifact is unsigned and
+    # this would otherwise fail every build.
+    "no-signature",
+
+    # cargo-generate-rpm 0.16.x does not emit the PACKAGER,
+    # BUILDHOST, or CHANGELOG* RPM tags. The semantically-
+    # equivalent information is already exposed:
+    #   * Packager       -> [package.metadata.generate-rpm].vendor +
+    #                        the maintainer in the .deb's debian/control
+    #                        and the upstream README.
+    #   * BuildHost      -> set by the CI runner; we deliberately don't
+    #                        leak the github-runner hostname into the
+    #                        package metadata.
+    #   * Changelog      -> shipped as /usr/share/doc/luksbox/CHANGELOG.md
+    #                        (and on the website at /changelog/).
+    "no-packager-tag",
+    "no-buildhost-tag",
+    "no-changelogname-tag",
+
+    # luksbox is a CLI + GUI without per-binary man pages yet.
+    # Tracked as a tier-3 polish gap; until a manpage ships,
+    # rpmlint warns once per binary. Warnings (W:) don't fail
+    # the lint anyway, but listing them here makes the intent
+    # explicit and reduces noise in the CI log.
+    "no-manual-page-for-binary",
+
+    # cargo-generate-rpm 0.16.1 ignores the `group` field in
+    # `[package.metadata.generate-rpm]` and writes `GROUP =
+    # 'Unspecified'` regardless of what we set. rpmlint flags
+    # that as `no-group-tag` (treats "Unspecified" as missing).
+    # Tracked upstream at:
+    #   https://github.com/cat-in-136/cargo-generate-rpm
+    # When that's fixed we set group = "Applications/System" and
+    # drop this filter. Modern Fedora actually deprecates Group
+    # tags entirely, so this is a no-op semantically.
+    "no-group-tag",
+
+    # SPDX license identifiers (e.g. "Apache-2.0") and the older
+    # Fedora-traditional names (e.g. "ASL 2.0") are both rejected
+    # by rpmlint 2.2.0's whitelist on Ubuntu. We keep the SPDX
+    # identifier (matches Cargo.toml's `license = "Apache-2.0"`
+    # and what crates.io / cargo publish expect) and filter the
+    # warning here. Modern rpmlint installations (Fedora 39+) ship
+    # the SPDX list and accept Apache-2.0 without complaint.
+    "invalid-license",
+]

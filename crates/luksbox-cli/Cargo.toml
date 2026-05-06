@@ -1,0 +1,218 @@
+[package]
+name = "luksbox-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Command-line interface for the luksbox encrypted-container tool"
+
+[[bin]]
+name = "luksbox"
+path = "src/main.rs"
+
+[dependencies]
+luksbox-core = { path = "../luksbox-core" }
+luksbox-format = { path = "../luksbox-format" }
+luksbox-vfs = { path = "../luksbox-vfs" }
+# default-features = false so `--no-default-features` on the cli also
+# disables luksbox-mount's `winfsp` default. We re-enable it via the
+# `winfsp = ["luksbox-mount/winfsp"]` feature below.
+luksbox-mount = { path = "../luksbox-mount", default-features = false }
+luksbox-fido2 = { path = "../luksbox-fido2" }
+luksbox-pq = { path = "../luksbox-pq" }
+# default-features = false so `--no-default-features` on the cli also
+# disables luksbox-tpm's `hardware` default. Re-enabled below via the
+# `hardware = ["luksbox-tpm/hardware", "luksbox-fido2/hardware"]`
+# feature wiring.
+luksbox-tpm = { path = "../luksbox-tpm", default-features = false }
+clap = { version = "4", features = ["derive"] }
+rpassword = "7"
+rand_core.workspace = true
+zeroize.workspace = true
+dialoguer = "0.11"
+zxcvbn = "3"
+# JSON output for the forensic subcommands (`header dump`, `check
+# --json`, `extract --report`). Already in the workspace via the
+# GUI crate; reused here.
+serde_json = "1"
+serde = { workspace = true }
+
+[features]
+default = ["hardware", "fuse", "winfsp"]
+# Enables the FIDO2 hardware path (libfido2 link) AND the TPM 2.0
+# hardware path (libtss2-* link). Disable with `--no-default-features`
+# to build on systems without the dev headers for either library.
+# luksbox-tpm gracefully no-ops on non-Linux so the same CLI build
+# works on macOS / Windows; only `enroll --tpm2` errors at runtime.
+hardware = ["luksbox-fido2/hardware", "luksbox-tpm/hardware"]
+# Enables FUSE-backed `mount` on Linux + macOS. Disable on macOS CI
+# builds without macFUSE; mount() then returns Unsupported.
+fuse = ["luksbox-mount/fuse"]
+# Enables the WinFsp link on Windows for the `mount` subcommand.
+# Off-by-default disables it; mount() then returns Unsupported on
+# Windows. Useful for MinGW cross-builds from Linux that don't have
+# the WinFsp SDK installed.
+winfsp = ["luksbox-mount/winfsp"]
+
+[dev-dependencies]
+tempfile = "3"
+# Used by Unix integration tests that need to set umask in spawned
+# child processes via `Command::pre_exec` (e.g.
+# `cmd_get_writes_extracted_plaintext_as_0600_under_022_umask` in
+# tests/functional.rs).
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
+# Wordlist passphrase brute-forcer for measuring crack resistance of a
+# LUKSbox vault on the user's hardware. Lives under examples/ rather
+# than as a bin so it's clearly a research / pentesting tool, not part
+# of the production CLI surface. Internal cracking-cost analysis is available on request to security@penthertz.com.
+[[example]]
+name = "passphrase_crack"
+path = "examples/passphrase_crack.rs"
+
+# ---------------------------------------------------------------------------
+# Distro packaging metadata (cargo-deb + cargo-generate-rpm).
+#
+# `cargo deb -p luksbox-cli --no-build --profile release-hardened` reads
+# `[package.metadata.deb]` and produces `target/debian/luksbox_<ver>_amd64.deb`.
+# `cargo generate-rpm -p luksbox-cli --profile release-hardened` reads
+# `[package.metadata.generate-rpm]` and produces
+# `target/generate-rpm/luksbox-<ver>-1.x86_64.rpm`.
+#
+# The CLI crate is the "umbrella" package: it contains the metadata
+# for both binaries (CLI + GUI), the desktop integration (.desktop,
+# MIME, icons), and the doc files. The GUI binary is added as an
+# asset because cargo-deb's binary auto-discovery only sees the
+# current crate's [[bin]].
+#
+# Asset paths are resolved relative to the workspace target dir for
+# binaries (cargo-deb / cargo-generate-rpm look in
+# target/<profile>/<binary>) and relative to the workspace ROOT for
+# everything else (because cargo-deb invokes from there with `-p`).
+# Run these tools from the workspace root.
+# ---------------------------------------------------------------------------
+
+[package.metadata.deb]
+name = "luksbox"
+maintainer = "Penthertz <sebastien.dudek@penthertz.com>"
+copyright = "2026, Penthertz <https://penthertz.com>"
+# No `license-file` on purpose. The workspace SPDX id
+# `Apache-2.0` (in [workspace.package].license) lets cargo-deb 3.x
+# emit a DEP-5 copyright file that references
+# /usr/share/common-licenses/Apache-2.0 instead of inlining the
+# full text. Inlining trips lintian errors
+# copyright-file-contains-full-apache-2-license and
+# copyright-not-using-common-license-for-apache2.
+#
+# Debian-format changelog. cargo-deb compresses + installs at
+# /usr/share/doc/luksbox/changelog.Debian.gz, satisfying lintian
+# no-changelog for non-native packages.
+changelog = "../../dist/debian/changelog"
+extended-description = """\
+LUKSbox is a userspace encrypted-container manager written in memory-safe
+Rust. Supports AES-256-GCM-SIV authenticated encryption (default), \
+AES-256-GCM, and ChaCha20-Poly1305; Argon2id passphrase KDF; FIDO2 \
+authenticator unlock via libfido2 (YubiKey, SoloKey, Nitrokey, Titan, etc.); \
+and hybrid post-quantum keyslots using ML-KEM-768 / 1024 (FIPS 203). \
+Detached headers, anchor sidecars for rollback detection, and FUSE mount \
+of decrypted vaults as regular directories.\
+"""
+section = "utils"
+priority = "optional"
+# Runtime dependencies. libfido2-1 + libfuse3-3 are the names on
+# Debian 12 / Ubuntu 22.04+ ; older releases may name them
+# differently and need a different artifact. libssl3 is pulled in
+# transitively by libfido2 but listed explicitly so apt can satisfy
+# it before libfido2's postinst.
+depends = "$auto, libfido2-1, libfuse3-3"
+recommends = "fuse3"
+assets = [
+    # Binaries. The literal `target/release/` prefix is a cargo-deb
+    # sentinel: it auto-rewrites to `target/<triple>/<profile>/<bin>`
+    # at packaging time (here `target/<triple>/release-hardened/`).
+    # Don't expand it manually — the literal expanded path is NOT
+    # detected as a Cargo build artifact and the asset lookup fails.
+    ["target/release/luksbox",     "usr/bin/luksbox",     "755"],
+    ["target/release/luksbox-gui", "usr/bin/luksbox-gui", "755"],
+    # Desktop integration.
+    ["../../dist/com.penthertz.luksbox.desktop",  "usr/share/applications/com.penthertz.luksbox.desktop",  "644"],
+    ["../../dist/com.penthertz.luksbox.xml",      "usr/share/mime/packages/com.penthertz.luksbox.xml",     "644"],
+    # Icons (one entry per hicolor size).
+    ["../../crates/luksbox-gui/assets/icons-linux/16x16.png",   "usr/share/icons/hicolor/16x16/apps/com.penthertz.luksbox.png",   "644"],
+    ["../../crates/luksbox-gui/assets/icons-linux/24x24.png",   "usr/share/icons/hicolor/24x24/apps/com.penthertz.luksbox.png",   "644"],
+    ["../../crates/luksbox-gui/assets/icons-linux/32x32.png",   "usr/share/icons/hicolor/32x32/apps/com.penthertz.luksbox.png",   "644"],
+    ["../../crates/luksbox-gui/assets/icons-linux/48x48.png",   "usr/share/icons/hicolor/48x48/apps/com.penthertz.luksbox.png",   "644"],
+    ["../../crates/luksbox-gui/assets/icons-linux/64x64.png",   "usr/share/icons/hicolor/64x64/apps/com.penthertz.luksbox.png",   "644"],
+    ["../../crates/luksbox-gui/assets/icons-linux/128x128.png", "usr/share/icons/hicolor/128x128/apps/com.penthertz.luksbox.png", "644"],
+    ["../../crates/luksbox-gui/assets/icons-linux/256x256.png", "usr/share/icons/hicolor/256x256/apps/com.penthertz.luksbox.png", "644"],
+    ["../../crates/luksbox-gui/assets/icons-linux/512x512.png", "usr/share/icons/hicolor/512x512/apps/com.penthertz.luksbox.png", "644"],
+    # User-visible docs at the standard /usr/share/doc/<pkg>/ location.
+    ["../../README.md",     "usr/share/doc/luksbox/README.md",     "644"],
+    ["../../NOTICE",        "usr/share/doc/luksbox/NOTICE",        "644"],
+    ["../../TRADEMARK.md",  "usr/share/doc/luksbox/TRADEMARK.md",  "644"],
+    ["../../SECURITY.md",   "usr/share/doc/luksbox/SECURITY.md",   "644"],
+    ["../../DISCLAIMER.md", "usr/share/doc/luksbox/DISCLAIMER.md", "644"],
+    # Hand-written DEP-5 copyright file. Overrides cargo-deb's
+    # auto-generation (which emits a bare `License: Apache-2.0`
+    # line with no body) so we get the
+    # /usr/share/common-licenses/Apache-2.0 reference text lintian
+    # requires (copyright-not-using-common-license-for-apache2).
+    ["../../dist/debian/copyright", "usr/share/doc/luksbox/copyright", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "luksbox"
+# SPDX identifier, same as `[workspace.package].license`. rpmlint
+# 2.2.0 on Ubuntu doesn't ship the SPDX license whitelist and emits
+# a `W: invalid-license` warning for either "Apache-2.0" or the
+# old Fedora-traditional "ASL 2.0", neither word it accepts. The
+# warning is filtered in dist/rpm/rpmlint.toml; modern rpmlint
+# installations (Fedora 39+) accept SPDX without complaint.
+license = "Apache-2.0"
+summary = "FIDO2 + post-quantum encrypted container manager"
+url = "https://github.com/penthertz/LUKSbox"
+# rpmlint requires both Group (no-group-tag) and Packager
+# (no-packager-tag). "Applications/System" is the closest standard
+# Fedora group for system-utility CLIs / file-system managers.
+group = "Applications/System"
+packager = "Penthertz <sebastien.dudek@penthertz.com>"
+vendor = "Penthertz"
+# No `requires` line. cargo-generate-rpm's default `--auto-req auto`
+# scans the ELF binaries for DT_NEEDED entries and emits the
+# distro-correct shared-library dependencies (libfido2.so.1,
+# libfuse3.so.3, etc.) automatically. Listing them by package name
+# here trips rpmlint's `explicit-lib-dependency` rule.
+assets = [
+    # Same sentinel convention as cargo-deb above: cargo-generate-rpm
+    # rewrites `target/release/<bin>` to the real `target/<triple>/<profile>/<bin>`
+    # path under `--target` / `--profile`. Spelling out the actual
+    # directory ourselves breaks the rewrite.
+    { source = "target/release/luksbox",     dest = "/usr/bin/luksbox",     mode = "755" },
+    { source = "target/release/luksbox-gui", dest = "/usr/bin/luksbox-gui", mode = "755" },
+    { source = "dist/com.penthertz.luksbox.desktop",  dest = "/usr/share/applications/com.penthertz.luksbox.desktop", mode = "644" },
+    { source = "dist/com.penthertz.luksbox.xml",      dest = "/usr/share/mime/packages/com.penthertz.luksbox.xml",    mode = "644" },
+    { source = "crates/luksbox-gui/assets/icons-linux/16x16.png",   dest = "/usr/share/icons/hicolor/16x16/apps/com.penthertz.luksbox.png",   mode = "644" },
+    { source = "crates/luksbox-gui/assets/icons-linux/24x24.png",   dest = "/usr/share/icons/hicolor/24x24/apps/com.penthertz.luksbox.png",   mode = "644" },
+    { source = "crates/luksbox-gui/assets/icons-linux/32x32.png",   dest = "/usr/share/icons/hicolor/32x32/apps/com.penthertz.luksbox.png",   mode = "644" },
+    { source = "crates/luksbox-gui/assets/icons-linux/48x48.png",   dest = "/usr/share/icons/hicolor/48x48/apps/com.penthertz.luksbox.png",   mode = "644" },
+    { source = "crates/luksbox-gui/assets/icons-linux/64x64.png",   dest = "/usr/share/icons/hicolor/64x64/apps/com.penthertz.luksbox.png",   mode = "644" },
+    { source = "crates/luksbox-gui/assets/icons-linux/128x128.png", dest = "/usr/share/icons/hicolor/128x128/apps/com.penthertz.luksbox.png", mode = "644" },
+    { source = "crates/luksbox-gui/assets/icons-linux/256x256.png", dest = "/usr/share/icons/hicolor/256x256/apps/com.penthertz.luksbox.png", mode = "644" },
+    { source = "crates/luksbox-gui/assets/icons-linux/512x512.png", dest = "/usr/share/icons/hicolor/512x512/apps/com.penthertz.luksbox.png", mode = "644" },
+    { source = "README.md",     dest = "/usr/share/doc/luksbox/README.md",     mode = "644", doc = true },
+    { source = "NOTICE",        dest = "/usr/share/doc/luksbox/NOTICE",        mode = "644", doc = true },
+    { source = "TRADEMARK.md",  dest = "/usr/share/doc/luksbox/TRADEMARK.md",  mode = "644", doc = true },
+    { source = "SECURITY.md",   dest = "/usr/share/doc/luksbox/SECURITY.md",   mode = "644", doc = true },
+    { source = "DISCLAIMER.md", dest = "/usr/share/doc/luksbox/DISCLAIMER.md", mode = "644", doc = true },
+    { source = "LICENSE",       dest = "/usr/share/doc/luksbox/LICENSE",       mode = "644", doc = true },
+]
+
+# rpmlint requires every RPM to ship at least one %changelog entry
+# (no-changelogname-tag). cargo-generate-rpm 0.16+ accepts an array
+# of these tables and writes them into the CHANGELOG_* RPM tags.
+# Date format is RPM's "%a %b %d %Y" (e.g. "Wed May 06 2026").
+[[package.metadata.generate-rpm.changelog]]
+author = "Penthertz <sebastien.dudek@penthertz.com>"
+time = "Wed May 06 2026"
+text = "- 0.1.0-1: initial public release."

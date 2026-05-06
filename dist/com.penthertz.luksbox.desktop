@@ -1,0 +1,25 @@
+[Desktop Entry]
+Type=Application
+Name=LUKSbox
+GenericName=Encrypted Container Manager
+Comment=Open and manage post-quantum + FIDO2 encrypted containers
+# %f passes a single file path when the user double-clicks a .lbx in
+# the file manager (Nautilus, Dolphin, Thunar). luksbox-gui treats
+# any positional arg as a vault to open at startup.
+Exec=luksbox-gui %f
+Icon=com.penthertz.luksbox
+Terminal=false
+Categories=Utility;Security;FileTools;
+Keywords=encryption;crypto;luks;vault;fido2;yubikey;post-quantum;mlkem;
+# Wired up to dist/com.penthertz.luksbox.xml so .lbx files get an
+# "Open with LUKSbox" entry in the file-manager context menu.
+MimeType=application/x-luksbox-vault;
+StartupNotify=true
+# MUST match `with_app_id(...)` in luksbox-gui/src/main.rs. On Wayland
+# the compositor reads the window's app_id, looks for a .desktop file
+# of the same name (this one), and uses its `Name=` field for the
+# title bar / Activities / Dock. On X11 the WM compares the window's
+# WM_CLASS against StartupWMClass to map it back to this entry.
+# Mismatch here is what causes "com.penthertz.luksbox" to leak into
+# the title bar instead of "LUKSbox".
+StartupWMClass=com.penthertz.luksbox

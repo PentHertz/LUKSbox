@@ -1,0 +1,26 @@
+[package]
+name = "luksbox-pq"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Post-quantum key-encapsulation (ML-KEM-768) and seed-file format for luksbox hybrid keyslots"
+
+[dependencies]
+ml-kem = { workspace = true, features = ["getrandom"] }
+luksbox-core = { path = "../luksbox-core" }
+aes-gcm.workspace = true
+argon2.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+hkdf.workspace = true
+zeroize.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true
+subtle.workspace = true
+
+[dev-dependencies]
+luksbox-format = { path = "../luksbox-format" }
+luksbox-vfs = { path = "../luksbox-vfs" }
+tempfile = "3"
+hex = "0.4"

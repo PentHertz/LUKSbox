@@ -1,0 +1,19 @@
+[package]
+name = "luksbox-vfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "In-memory VFS layer over a luksbox container"
+
+[dependencies]
+luksbox-core = { path = "../luksbox-core" }
+luksbox-format = { path = "../luksbox-format" }
+serde.workspace = true
+postcard.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

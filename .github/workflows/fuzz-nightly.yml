@@ -1,0 +1,133 @@
+# Nightly libFuzzer pass, 30 min per target. Catches the regression
+# class that takes longer than the per-PR 5-min smoke to surface.
+# Sustained AFL++ campaigns (hours-to-days) still live on a dedicated
+# server via scripts/fuzz_server.sh, see FUZZING.md.
+#
+# Crashes get uploaded as workflow artifacts (30-day retention) AND
+# auto-opened as issues (labelled "fuzz-crash"). Triage:
+#   1. Download the artifact.
+#   2. Reproduce: cargo +nightly fuzz run <target> <crash> -- -runs=1
+#   3. Minimize: cargo +nightly fuzz tmin <target> <crash>
+#   4. Patch.
+#   5. Promote the minimized input to fuzz/corpus/<target>/regression_X.
+
+name: fuzz-nightly
+
+on:
+  schedule:
+    - cron: '17 3 * * *'   # daily at 03:17 UTC, off-peak for shared runners
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write             # to file fuzz-crash issues automatically
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }} (30 min)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45     # 30 min fuzz + ~10 min build/setup overhead
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - header_parse
+          - keyslot_parse
+          - metadata_parse
+          - header_roundtrip
+          - hybrid_sidecar_parse
+          - seed_file_parse
+          - auth_then_process
+          - winfsp_path_parse
+          - webauthn_device_path
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fuzz-nightly
+          workspaces: "fuzz"
+      - name: Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev clang
+      # NB: no `--locked`. cargo-fuzz 0.13.x ships a Cargo.lock pinning
+      # rustix 0.36.5, which uses internal `rustc_*` attributes without
+      # the `feature(rustc_attrs)` gate. Recent nightly rejects this
+      # ("attributes starting with `rustc` are reserved"). Dropping
+      # `--locked` lets cargo pick a newer rustix patch that fixed the
+      # issue. See ci.yml fuzz-smoke job for the same comment.
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Fuzz ${{ matrix.target }} for 30 minutes
+        id: fuzz
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          cargo +nightly fuzz run ${{ matrix.target }} \
+            fuzz/corpus/${{ matrix.target }} \
+            -- -max_total_time=1800
+      - name: Upload any crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes-${{ matrix.target }}-${{ github.run_id }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Auto-file an issue if crash found
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const target = "${{ matrix.target }}";
+            const runId  = "${{ github.run_id }}";
+            const url    = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${runId}`;
+            const title  = `fuzz crash: ${target} (run ${runId})`;
+            const body   = [
+              `Nightly fuzz pass discovered a crash in **${target}**.`,
+              ``,
+              `Run: ${url}`,
+              `Crash artifact: download \`fuzz-crashes-${target}-${runId}\` from the run artifacts (30-day retention).`,
+              ``,
+              `### Triage`,
+              ``,
+              `\`\`\`bash`,
+              `# 1. Download the artifact and unzip into fuzz/artifacts/${target}/`,
+              `# 2. Reproduce`,
+              `cargo +nightly fuzz run ${target} fuzz/artifacts/${target}/<crash> -- -runs=1`,
+              `# 3. Minimize`,
+              `cargo +nightly fuzz tmin ${target} fuzz/artifacts/${target}/<crash>`,
+              `# 4. Patch the bug, then promote the minimized input as a regression seed:`,
+              `mv fuzz/artifacts/${target}/<crash> fuzz/corpus/${target}/regression_<short-name>`,
+              `\`\`\``,
+            ].join('\n');
+            // Avoid duplicate issues for the same target.
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              state: 'open',
+              labels: 'fuzz-crash',
+              per_page: 100,
+            });
+            const dup = existing.data.find(i => i.title.startsWith(`fuzz crash: ${target}`));
+            if (dup) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                issue_number: dup.number,
+                body: `New crash on ${target}: ${url}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                title,
+                body,
+                labels: ['fuzz-crash', 'security'],
+              });
+            }

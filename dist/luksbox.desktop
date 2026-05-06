@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=LUKSbox
+GenericName=Encrypted Container Manager
+Comment=Open and manage post-quantum + FIDO2 encrypted containers
+Exec=luksbox-gui
+Icon=luksbox
+Terminal=false
+Categories=Utility;Security;FileTools;
+Keywords=encryption;crypto;luks;vault;fido2;yubikey;post-quantum;mlkem;
+StartupNotify=true
+StartupWMClass=LUKSbox

@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    WiX v4 source for the LUKSbox Windows MSI.
+
+    Build (CI does this in release.yml):
+        wix build dist/luksbox.wxs ^
+            -d Version=1.2.3 ^
+            -d StagingDir=staging ^
+            -o luksbox-1.2.3-x86_64-windows.msi
+
+    What the MSI does:
+      - installs luksbox.exe + luksbox-gui.exe under
+        %ProgramFiles%\LUKSbox\
+      - adds that directory to the system PATH so `luksbox` works
+        from cmd / PowerShell without setup
+      - drops a Start menu shortcut for the GUI
+      - registers application/x-luksbox-vault for the .lbx extension
+        so double-clicking a .lbx in Explorer launches the GUI with
+        the vault pre-selected (luksbox-gui's main.rs reads argv[1])
+      - shows up in "Apps & Features" / "Programs and Features" as
+        a real entry, so uninstall is a one-click affair
+
+    Required upgrade-safety: the UpgradeCode GUID is permanent.
+    Generating a new one would break in-place upgrades from a prior
+    MSI install.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+    <Package
+        Name="LUKSbox"
+        Manufacturer="Penthertz"
+        Version="$(var.Version)"
+        UpgradeCode="6c41e8a4-3d2a-4b5f-9e1c-7c2b1a5f9e4b"
+        Scope="perMachine"
+        InstallerVersion="500"
+        Compressed="yes">
+
+        <SummaryInformation
+            Description="LUKSbox encrypted-container manager (CLI + GUI)"
+            Manufacturer="Penthertz" />
+
+        <!-- Block downgrades, allow same-version reinstall. -->
+        <MajorUpgrade
+            DowngradeErrorMessage="A newer version of LUKSbox is already installed."
+            AllowSameVersionUpgrades="yes" />
+
+        <MediaTemplate EmbedCab="yes" />
+
+        <!-- ===== WinFsp prerequisite check ======================== -->
+        <!-- WinFsp installs winfsp-x64.dll under its own bin dir,
+             which the Windows loader CANNOT find by default (the dir
+             is not on PATH). luksbox.exe was linked statically against
+             winfsp-x64.lib (no delay-load shim), so without WinFsp
+             present the loader returns STATUS_DLL_NOT_FOUND
+             (0xC0000135) and the binary aborts before main(). Two
+             defenses below: (a) refuse to install if WinFsp isn't
+             present so the user gets a clear message instead of a
+             cryptic crash; (b) WinFspBin RegistrySearch pulls the
+             actual install location and the WinFspPathEntry component
+             below appends its bin dir to system PATH so DLL
+             resolution actually works post-install.
+
+             WinFsp 1.x and 2.x both write `InstallDir` (REG_SZ) into
+             HKLM\SOFTWARE\WOW6432Node\WinFsp. The value ends in a
+             backslash, e.g. "C:\Program Files (x86)\WinFsp\". -->
+        <Property Id="WINFSPINSTALLDIR" Secure="yes">
+            <RegistrySearch Id="WinFspRegSearch"
+                            Root="HKLM"
+                            Key="SOFTWARE\WOW6432Node\WinFsp"
+                            Name="InstallDir"
+                            Type="raw" />
+        </Property>
+        <Launch Condition="Installed OR WINFSPINSTALLDIR"
+                Message="LUKSbox requires WinFsp 2.x to be installed first (it provides winfsp-x64.dll for the mount subcommand). Download from https://winfsp.dev/rel/ and run the WinFsp MSI, then re-run this installer." />
+
+        <!-- Single feature, the user has nothing to choose, all-or-nothing. -->
+        <Feature Id="Main" Title="LUKSbox" Level="1">
+            <ComponentGroupRef Id="LuksboxFiles" />
+            <ComponentRef Id="StartMenuShortcut" />
+            <ComponentRef Id="PathEntry" />
+            <ComponentRef Id="WinFspPathEntry" />
+            <ComponentRef Id="LbxAssociation" />
+        </Feature>
+
+        <!-- Install layout: %ProgramFiles%\LUKSbox\ -->
+        <StandardDirectory Id="ProgramFiles64Folder">
+            <Directory Id="INSTALLFOLDER" Name="LUKSbox" />
+        </StandardDirectory>
+
+        <StandardDirectory Id="ProgramMenuFolder">
+            <Directory Id="ApplicationProgramsFolder" Name="LUKSbox" />
+        </StandardDirectory>
+
+        <!-- ===== files ============================================ -->
+        <ComponentGroup Id="LuksboxFiles" Directory="INSTALLFOLDER">
+            <Component Id="LuksboxExe">
+                <File Id="LuksboxExe"
+                      Source="$(var.StagingDir)\luksbox.exe"
+                      KeyPath="yes" />
+            </Component>
+            <Component Id="LuksboxGuiExe">
+                <File Id="LuksboxGuiExe"
+                      Source="$(var.StagingDir)\luksbox-gui.exe"
+                      KeyPath="yes" />
+            </Component>
+            <Component Id="License">
+                <File Id="LicenseFile"
+                      Source="$(var.StagingDir)\LICENSE"
+                      KeyPath="yes" />
+            </Component>
+            <Component Id="Notice">
+                <File Id="NoticeFile"
+                      Source="$(var.StagingDir)\NOTICE"
+                      KeyPath="yes" />
+            </Component>
+            <Component Id="Trademark">
+                <File Id="TrademarkFile"
+                      Source="$(var.StagingDir)\TRADEMARK.md"
+                      KeyPath="yes" />
+            </Component>
+            <Component Id="Readme">
+                <File Id="ReadmeFile"
+                      Source="$(var.StagingDir)\README.md"
+                      KeyPath="yes" />
+            </Component>
+        </ComponentGroup>
+
+        <!-- ===== Start menu shortcut ============================== -->
+        <Component Id="StartMenuShortcut" Directory="ApplicationProgramsFolder" Guid="*">
+            <Shortcut
+                Id="LuksboxGuiShortcut"
+                Name="LUKSbox"
+                Description="LUKSbox encrypted-container manager"
+                Target="[INSTALLFOLDER]luksbox-gui.exe"
+                WorkingDirectory="INSTALLFOLDER"
+                Icon="LuksboxIcon" />
+            <RemoveFolder Id="RemoveAppMenuFolder"
+                          Directory="ApplicationProgramsFolder"
+                          On="uninstall" />
+            <RegistryValue
+                Root="HKCU"
+                Key="Software\Penthertz\LUKSbox"
+                Name="installed"
+                Type="integer"
+                Value="1"
+                KeyPath="yes" />
+        </Component>
+
+        <!-- ===== add INSTALLFOLDER to system PATH ================ -->
+        <Component Id="PathEntry" Directory="INSTALLFOLDER" Guid="7a3b4c5d-9e2f-4a1b-8c5d-1e2f3a4b5c6d">
+            <Environment
+                Id="PathSet"
+                Name="PATH"
+                Value="[INSTALLFOLDER]"
+                Permanent="no"
+                Part="last"
+                Action="set"
+                System="yes" />
+            <RegistryValue
+                Root="HKLM"
+                Key="Software\Penthertz\LUKSbox"
+                Name="path_added"
+                Type="integer"
+                Value="1"
+                KeyPath="yes" />
+        </Component>
+
+        <!-- ===== add WinFsp\bin to system PATH ==================== -->
+        <!-- The OS DLL loader's default search order does NOT include
+             the WinFsp installation directory; absent this Environment
+             entry, luksbox.exe fails to start with STATUS_DLL_NOT_FOUND
+             on winfsp-x64.dll. WINFSPINSTALLDIR comes from the
+             RegistrySearch above and ends in a backslash, so the bin
+             subdir is "[WINFSPINSTALLDIR]bin". Part="last" appends
+             without disturbing other PATH entries; Permanent="no" lets
+             our uninstaller cleanly remove it. -->
+        <Component Id="WinFspPathEntry"
+                   Directory="INSTALLFOLDER"
+                   Guid="b4f8c2e1-7a3d-4e5f-9b1c-3d8e7a2c4f6b"
+                   Condition="WINFSPINSTALLDIR">
+            <Environment
+                Id="WinFspPathSet"
+                Name="PATH"
+                Value="[WINFSPINSTALLDIR]bin"
+                Permanent="no"
+                Part="last"
+                Action="set"
+                System="yes" />
+            <RegistryValue
+                Root="HKLM"
+                Key="Software\Penthertz\LUKSbox"
+                Name="winfsp_path_added"
+                Type="integer"
+                Value="1"
+                KeyPath="yes" />
+        </Component>
+
+        <!-- ===== .lbx file association =========================== -->
+        <!-- Maps Explorer's right-click "Open with" + double-click on
+             .lbx to luksbox-gui.exe. The GUI accepts a positional
+             arg and pre-selects the vault. -->
+        <Component Id="LbxAssociation" Directory="INSTALLFOLDER" Guid="*">
+            <!-- ProgId.Icon in WiX v4 resolves to a File Id (the file
+                 whose icon resource Explorer should display), NOT an
+                 <Icon> element Id like in v3. Pointing at LuksboxGuiExe
+                 reuses the .ico that winresource already embedded into
+                 luksbox-gui.exe at build time, so .lbx files in
+                 Explorer get our icon without the MSI shipping a
+                 separate .ico. The standalone <Icon Id="LuksboxIcon">
+                 below is still used by the Start menu Shortcut and
+                 ARPPRODUCTICON, both of which DO take an Icon ref. -->
+            <ProgId Id="LUKSbox.Vault.1"
+                    Description="LUKSbox encrypted vault"
+                    Icon="LuksboxGuiExe">
+                <Extension Id="lbx" ContentType="application/x-luksbox-vault">
+                    <Verb Id="open"
+                          Command="Open"
+                          TargetFile="LuksboxGuiExe"
+                          Argument="&quot;%1&quot;" />
+                </Extension>
+            </ProgId>
+            <RegistryValue
+                Root="HKLM"
+                Key="Software\Penthertz\LUKSbox"
+                Name="lbx_assoc"
+                Type="integer"
+                Value="1"
+                KeyPath="yes" />
+        </Component>
+
+        <!-- Embedded icon for shortcut + ProgId. The build script
+             copies dist/luksbox-installer.ico from the generated
+             icon.ico, the same one winresource embeds in the .exe. -->
+        <Icon Id="LuksboxIcon" SourceFile="$(var.StagingDir)\luksbox-installer.ico" />
+        <Property Id="ARPPRODUCTICON" Value="LuksboxIcon" />
+        <Property Id="ARPHELPLINK"    Value="https://github.com/penthertz/LUKSbox" />
+        <Property Id="ARPURLINFOABOUT" Value="https://penthertz.com" />
+    </Package>
+</Wix>
