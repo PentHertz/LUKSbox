@@ -95,17 +95,17 @@ flowchart TD
     classDef transient fill:#4a3211,stroke:#f59e0b,color:#fff3d6,stroke-width:1.5px,stroke-dasharray:4 3;
     classDef state fill:#1e2a4a,stroke:#60a5fa,color:#dbeafe,stroke-width:1.5px;
 
-    Vault["my-vault.lbx<br/>vault file<br/>header + metadata + chunks<br/>(or: metadata + chunks only,<br/>if --header is set)"]:::durable
-    Hdr["my-vault.lbx.hdr<br/>OPTIONAL detached header<br/>--header /path/to/file.hdr"]:::durable
-    Anchor["my-vault.lbx.anchor<br/>OPTIONAL rollback detector<br/>separate storage"]:::durable
-    Hybrid["my-vault.lbx.hybrid<br/>OPTIONAL PQ sidecar<br/>encap key + ciphertext"]:::durable
-    Kyber["my-vault.kyber<br/>OPTIONAL PQ decapsulation seed<br/>separate storage"]:::durable
+    Vault["my-vault.lbx<br>vault file<br>header + metadata + chunks<br>(or: metadata + chunks only,<br>if --header is set)"]:::durable
+    Hdr["my-vault.lbx.hdr<br>OPTIONAL detached header<br>--header /path/to/file.hdr"]:::durable
+    Anchor["my-vault.lbx.anchor<br>OPTIONAL rollback detector<br>separate storage"]:::durable
+    Hybrid["my-vault.lbx.hybrid<br>OPTIONAL PQ sidecar<br>encap key + ciphertext"]:::durable
+    Kyber["my-vault.kyber<br>OPTIONAL PQ decapsulation seed<br>separate storage"]:::durable
 
-    Tmp["&lt;file&gt;.tmp.&lt;16hex&gt;<br/>TRANSIENT atomic_secure_write<br/>mode 0600, renamed on commit"]:::transient
-    Rotating["my-vault.lbx.rotating<br/>TRANSIENT MVK rotation<br/>full vault copy, mode 0600"]:::transient
+    Tmp["&lt;file&gt;.tmp.&lt;16hex&gt;<br>TRANSIENT atomic_secure_write<br>mode 0600, renamed on commit"]:::transient
+    Rotating["my-vault.lbx.rotating<br>TRANSIENT MVK rotation<br>full vault copy, mode 0600"]:::transient
 
-    Recent["$XDG_DATA_HOME/luksbox/recent.json<br/>GUI ONLY: recent vault list,<br/>mode 0700 dir + 0600 file"]:::state
-    Prefs["$XDG_DATA_HOME/luksbox/preferences.json<br/>GUI ONLY: preference flags,<br/>mode 0700 dir + 0600 file"]:::state
+    Recent["$XDG_DATA_HOME/luksbox/recent.json<br>GUI ONLY: recent vault list,<br>mode 0700 dir + 0600 file"]:::state
+    Prefs["$XDG_DATA_HOME/luksbox/preferences.json<br>GUI ONLY: preference flags,<br>mode 0700 dir + 0600 file"]:::state
 
     Vault -.- Hdr
     Vault -.- Anchor
@@ -275,29 +275,20 @@ Everything in the vault traces back to the MVK by HKDF-SHA256 with a
 unique `info` label per purpose. Different label = different key,
 guaranteed by HKDF's design.
 
-```
-                       OS RNG
-                         |
-                         v
-                  +-------------+
-                  |     MVK     |  (32 random bytes,
-                  | memfd_secret|   in-memory only)
-                  +------+------+
-                         |
-        +----------------+-----------------+--------------+
-        |                |                 |              |
-        v                v                 v              v
-  HKDF "lbx:           HKDF              HKDF           HKDF
-   header-mac/v1"     "lbx:metadata-    "lbx:file/    "lbx:anchor-
-                       key/v1"           v1:" + fid    mac/v1"
-        |                |                 |              |
-        v                v                 v              v
-  +---------+      +-----------+    +-----------+   +-----------+
-  | mac_key |      | meta_key  |    | file_key  |   | anchor_key|
-  | for     |      | for whole |    | per file  |   | for       |
-  | header  |      | metadata  |    | (one per  |   | rollback  |
-  | HMAC    |      | blob AEAD |    | file_id)  |   | counter   |
-  +---------+      +-----------+    +-----------+   +-----------+
+```mermaid
+flowchart TD
+    RNG["OS RNG (getrandom / getentropy / BCryptGenRandom)"] --> MVK
+    MVK["Master Volume Key (MVK)<br>32 random bytes<br>in-memory only<br>(Linux: memfd_secret)"]
+
+    MVK -->|HKDF info = lbx:header-mac/v1| MAC["mac_key<br>HMAC over the 8 KiB header"]
+    MVK -->|HKDF info = lbx:metadata-key/v1| META["meta_key<br>AEAD over the metadata blob"]
+    MVK -->|HKDF info = lbx:file/v1: + file_id| FK["file_key, one per file<br>AEAD over each chunk"]
+    MVK -->|HKDF info = lbx:anchor-mac/v1| ANC["anchor_key<br>HMAC over the rollback anchor"]
+
+    classDef root fill:#fff4e6,stroke:#d97706,stroke-width:2px;
+    classDef leaf fill:#ecfdf5,stroke:#059669;
+    class MVK root;
+    class MAC,META,FK,ANC leaf;
 ```
 
 The MVK itself is wrapped under per-keyslot KEKs (one per unlock
@@ -361,16 +352,16 @@ replacement using the standard temp-file + rename pattern:
 sequenceDiagram
     participant App as caller
     participant FS as filesystem
-    participant Tmp as <file>.tmp.<16hex>
-    participant Final as <file>
+    participant Tmp as file.tmp.16hex
+    participant Final as file
 
-    App->>FS: secure_create_new(<file>.tmp.<16hex>, mode 0600)
-    Note over Tmp: O_RDWR | O_CREAT | O_EXCL | mode 0600<br/>(atomic; refuses if a stale temp exists)
+    App->>FS: secure_create_new file.tmp.16hex, mode 0600
+    Note over Tmp: O_RDWR plus O_CREAT plus O_EXCL plus mode 0600.<br>Atomic: refuses if a stale temp exists.
     App->>Tmp: write payload
     App->>Tmp: fsync
-    App->>FS: rename(<file>.tmp.<16hex>, <file>)
-    Note over Final: rename(2) is atomic on POSIX<br/>and Windows (MoveFileExW + REPLACE_EXISTING)
-    App->>FS: sync_parent_dir(<file>), POSIX dir fsync<br/>or Windows FILE_FLAG_BACKUP_SEMANTICS + FlushFileBuffers
+    App->>FS: rename file.tmp.16hex to file
+    Note over Final: rename(2) is atomic on POSIX.<br>On Windows we use MoveFileExW with REPLACE_EXISTING.
+    App->>FS: sync_parent_dir file. POSIX dir fsync,<br>or Windows FILE_FLAG_BACKUP_SEMANTICS plus FlushFileBuffers.
 ```
 
 The 16-hex random suffix (8 bytes from `OsRng`) prevents two
@@ -522,24 +513,24 @@ luksbox create my-vault.lbx
 ```mermaid
 flowchart TD
     User([User passphrase]) --> Argon
-    OSRNG[OS RNG] -->|32 B| MVK[MVK<br/>memfd_secret]
+    OSRNG[OS RNG] -->|32 B| MVK[MVK<br>memfd_secret]
     OSRNG -->|32 B| HSalt[header_salt]
     OSRNG -->|32 B| KSalt[kdf_salt]
     OSRNG -->|12 B| Nonce[aead_nonce]
 
-    KSalt --> Argon[Argon2id<br/>m=256MiB t=3 p=4]
+    KSalt --> Argon[Argon2id<br>m=256MiB t=3 p=4]
     Argon -->|32 B| KEK[KEK]
 
-    MVK --> Wrap{AES-256-GCM-SIV<br/>seal}
+    MVK --> Wrap{AES-256-GCM-SIV<br>seal}
     KEK --> Wrap
     Nonce --> Wrap
-    AAD["AAD = slot[0..76] ||<br/>slot[124..288] || header_salt"] --> Wrap
-    Wrap --> Stored[wrapped_ct + tag<br/>-> keyslot]
+    AAD["AAD = slot[0..76] ||<br>slot[124..288] || header_salt"] --> Wrap
+    Wrap --> Stored[wrapped_ct + tag<br>-> keyslot]
 
-    MVK --> HKDF["HKDF MVK header_salt<br/>'lbx:header-mac/v1'"]
+    MVK --> HKDF["HKDF MVK header_salt<br>'lbx:header-mac/v1'"]
     HKDF -->|32 B| MacKey[mac_key]
-    MacKey --> HMAC[HMAC-SHA256<br/>over header bytes 0..8160]
-    HMAC --> Tag[Header HMAC tag<br/>-> offset 8160]
+    MacKey --> HMAC[HMAC-SHA256<br>over header bytes 0..8160]
+    HMAC --> Tag[Header HMAC tag<br>-> offset 8160]
 
     style MVK fill:#ffe4e1,stroke:#c00
     style KEK fill:#ffe4e1,stroke:#c00
@@ -621,23 +612,23 @@ sequenceDiagram
     participant Disk as .lbx file
 
     User->>LBX: luksbox create --fido2-only
-    LBX->>LBX: Generate fido2_hmac_salt (32 random B)
+    LBX->>LBX: Generate fido2_hmac_salt, 32 random bytes
 
-    LBX->>Auth: makeCredential(rp=luksbox.local,<br/>hmac-secret extension=true)
+    LBX->>Auth: makeCredential rp=luksbox.local,<br>hmac-secret extension=true
     Auth->>User: please touch
     User->>Auth: touch + PIN
-    Auth-->>LBX: cred_id (16-256 B)
+    Auth-->>LBX: cred_id, 16 to 256 bytes
 
-    LBX->>Auth: getAssertion(cred_id, salt=fido2_hmac_salt)
+    LBX->>Auth: getAssertion cred_id, salt=fido2_hmac_salt
     Auth->>User: please touch
     User->>Auth: touch + PIN
-    Note over Auth: device computes<br/>hmac_secret = HMAC(device_secret, salt)
-    Auth-->>LBX: hmac_secret (32 B, encrypted on USB)
+    Note over Auth: device computes<br>hmac_secret = HMAC device_secret, salt
+    Auth-->>LBX: hmac_secret, 32 bytes, encrypted on USB
 
-    Note over LBX: MVK = HKDF(salt=fido2_hmac_salt,<br/>ikm=hmac_secret,<br/>info='lbx:mvk-fido/v1')
+    Note over LBX: MVK = HKDF salt=fido2_hmac_salt,<br>ikm=hmac_secret,<br>info='lbx:mvk-fido/v1'
     Note over LBX: NO WRAP. MVK is the HKDF output.
 
-    LBX->>Disk: write keyslot {kind=Fido2DerivedMvk,<br/>cred_id, fido2_hmac_salt}
+    LBX->>Disk: write keyslot:<br>kind=Fido2DerivedMvk,<br>cred_id, fido2_hmac_salt
     LBX->>Disk: write header HMAC under MVK-derived mac_key
 ```
 
@@ -693,11 +684,11 @@ in a second `Passphrase` slot for emergency recovery.
 ```mermaid
 flowchart TD
     User1([User passphrase]) --> Concat
-    Auth([FIDO2 device:<br/>hmac_secret 32 B]) --> Concat
+    Auth([FIDO2 device:<br>hmac_secret 32 B]) --> Concat
 
-    Concat["kdf_input =<br/>'lbx:fido' || passphrase ||<br/>0xff || hmac_secret"] --> Argon
-    KSalt[kdf_salt 32 B<br/>OS RNG] --> Argon
-    Argon[Argon2id<br/>m=256MiB t=3 p=4] --> KEK[KEK 32 B]
+    Concat["kdf_input =<br>'lbx:fido' || passphrase ||<br>0xff || hmac_secret"] --> Argon
+    KSalt[kdf_salt 32 B<br>OS RNG] --> Argon
+    Argon[Argon2id<br>m=256MiB t=3 p=4] --> KEK[KEK 32 B]
 
     OSRNG[OS RNG] -->|32 B| MVK[MVK]
     OSRNG -->|12 B| Nonce[aead_nonce]
@@ -705,9 +696,9 @@ flowchart TD
     MVK --> Wrap[AES-256-GCM-SIV seal]
     KEK --> Wrap
     Nonce --> Wrap
-    AAD[AAD includes cred_id<br/>+ fido2_hmac_salt + header_salt] --> Wrap
+    AAD[AAD includes cred_id<br>+ fido2_hmac_salt + header_salt] --> Wrap
 
-    Wrap --> Stored[wrapped_ct + tag<br/>-> keyslot]
+    Wrap --> Stored[wrapped_ct + tag<br>-> keyslot]
 
     style MVK fill:#ffe4e1,stroke:#c00
     style KEK fill:#ffe4e1,stroke:#c00
@@ -832,21 +823,21 @@ flowchart TD
     OSRNG -->|32 B| KSalt[kdf_salt]
 
     Seed --> Keygen[ML-KEM-768.from_seed]
-    Keygen --> EK[encap_key<br/>1184 B]
-    Keygen --> DK[decap_key<br/>derived on demand]
+    Keygen --> EK[encap_key<br>1184 B]
+    Keygen --> DK[decap_key<br>derived on demand]
 
-    EK --> Encap[encapsulate against<br/>own pubkey]
-    Encap --> CT[pq_ciphertext<br/>1088 B]
-    Encap --> Shared[pq_shared 32 B<br/>EPHEMERAL]
+    EK --> Encap[encapsulate against<br>own pubkey]
+    Encap --> CT[pq_ciphertext<br>1088 B]
+    Encap --> Shared[pq_shared 32 B<br>EPHEMERAL]
 
     User([User passphrase]) --> Argon
-    KSalt --> Argon[Argon2id<br/>m=256MiB t=3 p=4]
+    KSalt --> Argon[Argon2id<br>m=256MiB t=3 p=4]
     Argon --> Classical[classical 32 B]
 
-    Classical --> IKM["ikm = classical || pq_shared<br/>(64 B)"]
+    Classical --> IKM["ikm = classical || pq_shared<br>(64 B)"]
     Shared --> IKM
 
-    IKM --> HKDF["HKDF-SHA256<br/>info='lbx:hybrid-kek/v1'"]
+    IKM --> HKDF["HKDF-SHA256<br>info='lbx:hybrid-kek/v1'"]
     KSalt --> HKDF
     HKDF --> KEK[Hybrid KEK 32 B]
 
@@ -854,9 +845,9 @@ flowchart TD
     KEK --> Wrap
     Wrap --> Wrapped[wrapped_ct -> keyslot]
 
-    EK --> Sidecar[(.lbx.hybrid<br/>encap_key + ct)]
+    EK --> Sidecar[(.lbx.hybrid<br>encap_key + ct)]
     CT --> Sidecar
-    Seed --> KyberFile[(my-vault.kyber<br/>SEPARATE STORAGE)]
+    Seed --> KyberFile[(my-vault.kyber<br>SEPARATE STORAGE)]
 
     style MVK fill:#ffe4e1,stroke:#c00
     style KEK fill:#ffe4e1,stroke:#c00
@@ -927,24 +918,24 @@ passphrase was.
 ```mermaid
 flowchart TD
     Start([User: open vault + passphrase]) --> Read[Read header 8192 B]
-    Read --> Parse[Parse magic, version, suite,<br/>header_salt, 8 keyslots]
+    Read --> Parse[Parse magic, version, suite,<br>header_salt, 8 keyslots]
 
-    Parse --> Loop{For each<br/>non-empty slot}
+    Parse --> Loop{For each<br>non-empty slot}
 
-    Loop --> KEK[Derive KEK from<br/>passphrase + slot.kdf_salt<br/>via Argon2id]
-    KEK --> AEAD{AEAD open<br/>wrapped_ct + tag}
+    Loop --> KEK[Derive KEK from<br>passphrase + slot.kdf_salt<br>via Argon2id]
+    KEK --> AEAD{AEAD open<br>wrapped_ct + tag}
 
     AEAD -->|tag fails| Loop
     AEAD -->|tag passes| Cand[MVK candidate]
 
     Loop -->|all 8 slots failed| Fail([UnlockFailed])
 
-    Cand --> VK[Derive mac_key<br/>= HKDF MVK 'lbx:header-mac/v1']
-    VK --> VHMAC{ConstantTimeEq<br/>recomputed HMAC<br/>vs on-disk tag}
+    Cand --> VK[Derive mac_key<br>= HKDF MVK 'lbx:header-mac/v1']
+    VK --> VHMAC{ConstantTimeEq<br>recomputed HMAC<br>vs on-disk tag}
     VHMAC -->|differ| Fail
-    VHMAC -->|match| Conf[MVK confirmed,<br/>moved to memfd_secret]
+    VHMAC -->|match| Conf[MVK confirmed,<br>moved to memfd_secret]
 
-    Conf --> DM[Decrypt metadata blob<br/>under metadata_key]
+    Conf --> DM[Decrypt metadata blob<br>under metadata_key]
     DM --> Open([vault open])
 
     style Cand fill:#ffe4e1,stroke:#c00
@@ -1150,16 +1141,16 @@ plaintext.
 ```mermaid
 flowchart LR
     Req([read /docs/notes.txt]) --> Inode[Lookup inode in metadata]
-    Inode --> Refs[chunk references:<br/>id, generation, idx]
+    Inode --> Refs[chunk references:<br>id, generation, idx]
 
-    Inode --> FK[file_key = HKDF MVK<br/>'lbx:file/v1:' + file_id]
+    Inode --> FK[file_key = HKDF MVK<br>'lbx:file/v1:' + file_id]
 
-    Refs --> RD[Read 4124 B from disk<br/>at chunk_offset]
-    RD --> Split[Split: nonce 12 B<br/>+ ct 4096 B<br/>+ tag 16 B]
+    Refs --> RD[Read 4124 B from disk<br>at chunk_offset]
+    RD --> Split[Split: nonce 12 B<br>+ ct 4096 B<br>+ tag 16 B]
 
     Split --> Open{AEAD open}
     FK --> Open
-    AAD["AAD = file_id + chunk_idx<br/>+ generation<br/>(20 B)"] --> Open
+    AAD["AAD = file_id + chunk_idx<br>+ generation<br>(20 B)"] --> Open
 
     Open -->|tag fails| Err([ChunkAuthFailed])
     Open -->|tag passes| Plain[plaintext 4096 B]
@@ -1233,22 +1224,22 @@ per file).
 ```mermaid
 flowchart LR
     Plain([4096 B plaintext]) --> Seal
-    FK[file_key from HKDF MVK<br/>'lbx:file/v1:' + file_id] --> Seal
+    FK[file_key from HKDF MVK<br>'lbx:file/v1:' + file_id] --> Seal
 
     OSRNG[OS RNG] -->|12 B| Nonce[fresh nonce]
     Nonce --> Seal
 
-    Gen[generation =<br/>vault.alloc_chunk_gen<br/>monotonic u64] --> AAD
+    Gen[generation =<br>vault.alloc_chunk_gen<br>monotonic u64] --> AAD
     FID[file_id] --> AAD
     Idx[chunk_idx] --> AAD
-    AAD["AAD = file_id + chunk_idx<br/>+ generation (20 B)"] --> Seal
+    AAD["AAD = file_id + chunk_idx<br>+ generation (20 B)"] --> Seal
 
-    Seal{AEAD seal<br/>under suite} --> CT[ct 4096 B + tag 16 B]
+    Seal{AEAD seal<br>under suite} --> CT[ct 4096 B + tag 16 B]
 
-    Nonce --> OnDisk[Write to disk:<br/>nonce 12 + ct 4096 + tag 16<br/>= 4124 B per slot]
+    Nonce --> OnDisk[Write to disk:<br>nonce 12 + ct 4096 + tag 16<br>= 4124 B per slot]
     CT --> OnDisk
 
-    Gen --> Meta[Update metadata blob<br/>chunk gen for this slot]
+    Gen --> Meta[Update metadata blob<br>chunk gen for this slot]
 
     style FK fill:#ffe4e1,stroke:#c00
     style Plain fill:#ffe4e1,stroke:#c00
@@ -1297,18 +1288,18 @@ attacker's data anyway" code path.
 
 ```mermaid
 flowchart TD
-    Vault[(.lbx file<br/>tampered)] --> Q{Which bytes?}
+    Vault[(".lbx file<br>tampered")] --> Q{Which bytes?}
 
-    Q -->|magic / version / suite /<br/>kdf_id / header_salt /<br/>any field in header[0..8160]| HHMAC[Header HMAC fails<br/>at open time]
-    Q -->|wrapped_ct or wrapped_tag<br/>in any keyslot| SAEAD[Per-slot AEAD fails<br/>during MVK unwrap]
-    Q -->|kind / aad_version / kdf_salt /<br/>aead_nonce in any keyslot| SAEAD
-    Q -->|cred_id or fido2_hmac_salt<br/>in V2 or V3 slot| SAEAD
-    Q -->|encrypted metadata blob| MAEAD[Metadata AEAD fails<br/>after MVK recovered]
-    Q -->|any chunk's nonce / ct / tag| CAEAD[Chunk AEAD fails<br/>at read time]
+    Q -->|magic / version / suite / kdf_id / header_salt / any field in bytes 0..8160 of header| HHMAC[Header HMAC fails<br>at open time]
+    Q -->|wrapped_ct or wrapped_tag in any keyslot| SAEAD[Per-slot AEAD fails<br>during MVK unwrap]
+    Q -->|kind / aad_version / kdf_salt / aead_nonce in any keyslot| SAEAD
+    Q -->|cred_id or fido2_hmac_salt in V2 or V3 slot| SAEAD
+    Q -->|encrypted metadata blob| MAEAD[Metadata AEAD fails<br>after MVK recovered]
+    Q -->|any chunk nonce / ct / tag| CAEAD[Chunk AEAD fails<br>at read time]
     Q -->|chunk swapped between files| CAEAD
     Q -->|chunk position swapped| CAEAD
     Q -->|chunk reverted to older version| CAEAD
-    Q -->|whole vault rolled back<br/>to old snapshot| Anchor[Anchor file<br/>generation mismatch<br/>if anchor on separate storage]
+    Q -->|whole vault rolled back to old snapshot| Anchor[Anchor file<br>generation mismatch<br>if anchor on separate storage]
 
     HHMAC --> Refused([open refused])
     SAEAD --> Refused
@@ -1372,7 +1363,7 @@ co-located.
 ```mermaid
 flowchart TD
     Open([open vault]) --> ReadAnchor[Read .anchor file 48 B]
-    ReadAnchor --> CheckMAC{Verify HMAC under<br/>anchor_key = HKDF MVK<br/>'lbx:anchor-mac/v1'}
+    ReadAnchor --> CheckMAC{Verify HMAC under<br>anchor_key = HKDF MVK<br>'lbx:anchor-mac/v1'}
     CheckMAC -->|fails| AC([anchor corrupt -> error])
     CheckMAC -->|passes| ExtractGen[anchor_gen]
 
@@ -1382,9 +1373,9 @@ flowchart TD
     ExtractGen --> Compare{Compare}
     MetaGen --> Compare
 
-    Compare -->|anchor_gen ==<br/>metadata_gen| OK([all good, proceed])
-    Compare -->|anchor_gen ><br/>metadata_gen| Rollback([ROLLBACK DETECTED<br/>refuse to open])
-    Compare -->|anchor_gen <<br/>metadata_gen| Stale([anchor stale,<br/>warn but proceed])
+    Compare -->|anchor_gen ==<br>metadata_gen| OK([all good, proceed])
+    Compare -->|anchor_gen ><br>metadata_gen| Rollback([ROLLBACK DETECTED<br>refuse to open])
+    Compare -->|anchor_gen <<br>metadata_gen| Stale([anchor stale,<br>warn but proceed])
 
     style Rollback fill:#ffcccc,stroke:#c00
     style AC fill:#ffcccc,stroke:#c00
@@ -1530,31 +1521,31 @@ sequenceDiagram
     participant Auth as FIDO2 Authenticator
     participant Disk as .lbx file
 
-    LBX->>LBX: Generate fido2_hmac_salt (32 random B from OS RNG)
-    LBX->>LBX: Generate user_handle (16 random B)
+    LBX->>LBX: Generate fido2_hmac_salt, 32 random bytes from OS RNG
+    LBX->>LBX: Generate user_handle, 16 random bytes
 
     rect rgba(64, 96, 64, 0.2)
-    note over LBX,Auth: Phase 1: makeCredential (creates the credential)
-    LBX->>Auth: makeCredential(rp=luksbox.local,<br/>user_handle, hmac-secret extension=true,<br/>requireResidentKey=false, requireUserVerification=true)
+    Note over LBX,Auth: Phase 1, makeCredential: create the credential
+    LBX->>Auth: makeCredential rp=luksbox.local, user_handle,<br>hmac-secret extension=true,<br>requireResidentKey=false, requireUserVerification=true
     Auth->>User: please touch + enter PIN
     User->>Auth: touch + PIN
-    Note over Auth: device generates per-credential master,<br/>encrypts/wraps it into the cred_id,<br/>or stores it indexed by cred_id
-    Auth-->>LBX: cred_id (typically 64-300 B; see Sec.19.6)
+    Note over Auth: device generates per-credential master,<br>encrypts/wraps it into the cred_id,<br>or stores it indexed by cred_id
+    Auth-->>LBX: cred_id, typically 64 to 300 bytes, see Sec.19.6
     end
 
     rect rgba(96, 64, 64, 0.2)
-    note over LBX,Auth: Phase 2: getAssertion (derive the wrap KEK)
-    LBX->>Auth: getAssertion(rp_id, allow_list=[cred_id],<br/>hmac-secret salt=fido2_hmac_salt)
+    Note over LBX,Auth: Phase 2, getAssertion: derive the wrap KEK
+    LBX->>Auth: getAssertion rp_id, allow_list=cred_id,<br>hmac-secret salt=fido2_hmac_salt
     Auth->>User: please touch
-    User->>Auth: touch + PIN (or PIN-cached)
-    Note over Auth: hmac_secret =<br/>HMAC(per_credential_secret, salt)
-    Auth-->>LBX: hmac_secret (32 B, encrypted on the<br/>USB wire under pinUvAuthProtocol v1)
+    User->>Auth: touch + PIN, or PIN-cached
+    Note over Auth: hmac_secret =<br>HMAC per_credential_secret, salt
+    Auth-->>LBX: hmac_secret, 32 bytes, encrypted on the<br>USB wire under pinUvAuthProtocol v1
     end
 
-    Note over LBX: KEK = Argon2id(<br/>"lbx:fido" || passphrase || 0xff || hmac_secret,<br/>kdf_salt, kdf_params)
-    Note over LBX: wrap MVK under KEK -> wrapped_ct + wrapped_tag
+    Note over LBX: KEK = Argon2id<br>"lbx:fido" then passphrase then 0xff then hmac_secret,<br>kdf_salt, kdf_params
+    Note over LBX: wrap MVK under KEK to wrapped_ct + wrapped_tag
 
-    LBX->>Disk: write keyslot {<br/>kind=Fido2HmacSecret,<br/>aad_version=V3,<br/>cred_id, fido2_hmac_salt,<br/>wrapped_ct, wrapped_tag,<br/>kdf_salt, aead_nonce, kdf_params }
+    LBX->>Disk: write keyslot:<br>kind=Fido2HmacSecret, aad_version=V3,<br>cred_id, fido2_hmac_salt,<br>wrapped_ct, wrapped_tag,<br>kdf_salt, aead_nonce, kdf_params
     LBX->>Disk: write header HMAC under MVK-derived mac_key
 ```
 
@@ -1572,23 +1563,23 @@ sequenceDiagram
     participant Disk as .lbx file
 
     LBX->>Disk: read header + every non-empty keyslot
-    LBX->>LBX: pick FIDO2 slot (kind == Fido2HmacSecret)
+    LBX->>LBX: pick FIDO2 slot, kind = Fido2HmacSecret
 
-    LBX->>Auth: getAssertion(rp_id,<br/>allow_list=[slot.cred_id],<br/>hmac-secret salt=slot.fido2_hmac_salt)
+    LBX->>Auth: getAssertion rp_id, allow_list=slot.cred_id,<br>hmac-secret salt=slot.fido2_hmac_salt
     Auth->>User: please touch + PIN if not cached
     User->>Auth: touch + PIN
-    Note over Auth: same per-credential secret + same salt<br/>=> same hmac_secret as enrollment
-    Auth-->>LBX: hmac_secret (32 B, identical to enrollment)
+    Note over Auth: same per-credential secret + same salt<br>same hmac_secret as enrollment
+    Auth-->>LBX: hmac_secret, 32 bytes, identical to enrollment
 
-    Note over LBX: KEK = Argon2id(<br/>"lbx:fido" || passphrase || 0xff || hmac_secret,<br/>slot.kdf_salt, slot.kdf_params)
-    Note over LBX: try to unwrap wrapped_ct under KEK<br/>(AES-256-GCM-SIV with AAD = V3 AAD)
+    Note over LBX: KEK = Argon2id<br>"lbx:fido" then passphrase then 0xff then hmac_secret,<br>slot.kdf_salt, slot.kdf_params
+    Note over LBX: try to unwrap wrapped_ct under KEK,<br>AES-256-GCM-SIV with AAD = V3 AAD
 
     alt AEAD tag verifies
         Note over LBX: MVK recovered
         LBX->>LBX: verify header HMAC under mac_key derived from MVK
         Note over LBX: vault is unlocked
     else AEAD tag fails
-        Note over LBX: wrong device, or wrong PIN, or<br/>tampered slot. Try the next slot,<br/>or fail with WrongCredentials.
+        Note over LBX: wrong device, or wrong PIN, or<br>tampered slot. Try the next slot,<br>or fail with WrongCredentials.
     end
 ```
 
