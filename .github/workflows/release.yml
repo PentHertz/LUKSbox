@@ -325,12 +325,64 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain    -p "$MACOS_CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
+          # Pre-verify the .p12 with OpenSSL BEFORE handing to
+          # `security import`. macOS's `security import` only accepts
+          # PKCS12 envelopes encrypted with the legacy PBES1 algorithm
+          # set (3DES); modern OpenSSL 3.x defaults to PBES2 (AES-256)
+          # which `security` rejects with a generic "MAC verification
+          # failed" that is identical to the wrong-password error.
+          # OpenSSL accepts both, so a successful OpenSSL verify here
+          # combined with a `security import` failure proves the
+          # .p12 is in the wrong format (re-export with `-legacy`).
+          # Also surfaces the password length so a hidden trailing
+          # newline / quote becomes visible without leaking the value.
+          PW_LEN=${#APPLE_DEVELOPER_ID_CERT_PASSWORD}
+          P12_SHA=$(shasum -a 256 "$P12_PATH" | awk '{print $1}')
+          echo "==> .p12 sha256: $P12_SHA"
+          echo "==> APPLE_DEVELOPER_ID_CERT_PASSWORD length: $PW_LEN chars"
+          if openssl pkcs12 -in "$P12_PATH" \
+              -password "pass:$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
+              -nokeys -noout 2>/dev/null
+          then
+              echo "==> OpenSSL pre-verify: .p12 + password OK"
+          else
+              echo "::error::OpenSSL pre-verify FAILED. The .p12 password"
+              echo "         does not match the .p12 file. Either:"
+              echo "           1. The APPLE_DEVELOPER_ID_CERT_PASSWORD secret"
+              echo "              contains hidden characters (trailing newline,"
+              echo "              quotes, leading whitespace), OR"
+              echo "           2. The .p12 was re-exported with a different"
+              echo "              password and the new one wasn't pushed to"
+              echo "              the GitHub secret yet."
+              echo "         Re-export locally and verify before re-uploading:"
+              echo "             openssl pkcs12 -export -legacy -out devid.p12 \\"
+              echo "                 -inkey devid.key -in devid.pem"
+              echo "             openssl pkcs12 -in devid.p12 \\"
+              echo "                 -password \"pass:THE_PASSWORD\" -nokeys -noout"
+              exit 1
+          fi
+
           # Import .p12 into the new keychain. -A allows any tool to
           # use the key (codesign needs this); -t cert + -f pkcs12
           # tells security how to parse the input.
-          security import "$P12_PATH" \
-            -P "$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
-            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          if ! security import "$P12_PATH" \
+              -P "$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
+              -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          then
+              echo "::error::OpenSSL accepted the .p12 + password, but macOS"
+              echo "         'security import' rejected it. This is the"
+              echo "         classic symptom of a PBES2 (AES-encrypted)"
+              echo "         PKCS12, which OpenSSL accepts but pre-Sonoma-14.4"
+              echo "         'security import' does not. Re-export the .p12"
+              echo "         with the legacy PBES1 algorithms:"
+              echo "             openssl pkcs12 -export -legacy \\"
+              echo "                 -out devid.p12 \\"
+              echo "                 -inkey devid.key -in devid.pem \\"
+              echo "                 -name 'Developer ID Application'"
+              echo "         Then re-encode + replace the secret:"
+              echo "             openssl base64 -A -in devid.p12 | pbcopy"
+              exit 1
+          fi
 
           # Without this, codesign prompts the user (impossible on a
           # CI runner) for permission to use the private key. The
