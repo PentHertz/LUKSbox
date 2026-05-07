@@ -267,6 +267,66 @@ jobs:
             echo "LUKSBOX_FEATURES=hardware,fuse"
           } >> "$GITHUB_ENV"
 
+      - name: Import Developer ID certificate (macOS)
+        # Only fires when the .p12 secret is present. PR builds and
+        # forks without the secret fall through to unsigned artifacts
+        # (the codesign step below also gates on the same secret).
+        if: runner.os == 'macOS' && env.APPLE_DEVELOPER_ID_CERT_P12_B64 != ''
+        env:
+          APPLE_DEVELOPER_ID_CERT_P12_B64:  ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_B64 }}
+          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+          MACOS_CI_KEYCHAIN_PASSWORD:       ${{ secrets.MACOS_CI_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Decode the base64-armored .p12 into a temp file. The .p12
+          # holds the Developer ID Application certificate + its private
+          # key, exported from Keychain Access (or assembled with
+          # openssl pkcs12). Lives only for the duration of this CI
+          # run, then the runner cleans up.
+          P12_PATH="$RUNNER_TEMP/devid.p12"
+          echo "$APPLE_DEVELOPER_ID_CERT_P12_B64" | base64 --decode > "$P12_PATH"
+
+          # Create a brand-new keychain dedicated to this build. We
+          # do NOT touch the runner's login keychain because:
+          #   1. concurrent jobs on the same runner would race on it
+          #   2. the runner's login keychain is destroyed at job end
+          #      anyway, but a fresh keychain makes ownership obvious
+          #   3. set-key-partition-list on the login keychain would
+          #      prompt for the runner's interactive password
+          KEYCHAIN_PATH="$RUNNER_TEMP/luksbox-build.keychain-db"
+          security create-keychain -p "$MACOS_CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain    -p "$MACOS_CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Import .p12 into the new keychain. -A allows any tool to
+          # use the key (codesign needs this); -t cert + -f pkcs12
+          # tells security how to parse the input.
+          security import "$P12_PATH" \
+            -P "$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+
+          # Without this, codesign prompts the user (impossible on a
+          # CI runner) for permission to use the private key. The
+          # partition list grants programmatic access keyed to the
+          # keychain password we just set.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$MACOS_CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add to the search list so codesign and notarytool find the
+          # identity. Preserves whatever was already there (the runner's
+          # login keychain etc.) by appending rather than replacing.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | tr -d '" ' | tr '\n' ' ')
+
+          # Sanity: print the resolved signing identity. Should match
+          # "Developer ID Application: Sebastien Dudek (XXXXXXXXXX)".
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+          # Surface the keychain path for downstream codesign steps.
+          echo "MACOS_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          rm -f "$P12_PATH"
+
       - name: Set Linux feature list
         if: runner.os == 'Linux'
         shell: bash
@@ -759,36 +819,79 @@ jobs:
           </plist>
           EOF
 
-      - name: Code-sign macOS .app (only if Apple secrets present)
-        if: runner.os == 'macOS' && env.APPLE_DEV_ID_CERT_P12_BASE64 != ''
+      - name: Code-sign macOS .app (only if Apple cert was imported)
+        # Gates on `MACOS_KEYCHAIN_PATH`, which the earlier
+        # `Import Developer ID certificate` step set ONLY when the
+        # APPLE_DEVELOPER_ID_CERT_P12_B64 secret was present. PR builds
+        # / forks without the secret therefore skip this step and ship
+        # an unsigned .app (which Gatekeeper will warn about; that's
+        # the trade-off for not exposing signing material to forks).
+        if: runner.os == 'macOS' && env.MACOS_KEYCHAIN_PATH != ''
         env:
-          APPLE_DEV_ID_CERT_P12_BASE64: ${{ secrets.APPLE_DEV_ID_CERT_P12_BASE64 }}
-          APPLE_DEV_ID_CERT_PASSWORD:   ${{ secrets.APPLE_DEV_ID_CERT_PASSWORD }}
-          APPLE_DEV_ID_IDENTITY:        ${{ secrets.APPLE_DEV_ID_IDENTITY }}
+          MACOS_KEYCHAIN_PATH: ${{ env.MACOS_KEYCHAIN_PATH }}
         run: |
           set -euo pipefail
-          # Import the Developer ID Application cert into a fresh
-          # keychain, then codesign --deep. --options runtime opts in
-          # to the Hardened Runtime which is required for notarization.
-          KEYCHAIN="$RUNNER_TEMP/build.keychain"
-          KEYCHAIN_PASSWORD="$(uuidgen)"
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security default-keychain -s "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          APP="dmg-root/LUKSbox.app"
 
-          P12="$RUNNER_TEMP/cert.p12"
-          echo "$APPLE_DEV_ID_CERT_P12_BASE64" | base64 --decode > "$P12"
-          security import "$P12" -k "$KEYCHAIN" \
-            -P "$APPLE_DEV_ID_CERT_PASSWORD" \
-            -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple: \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          # Resolve the signing identity dynamically out of our
+          # imported keychain. The expected line looks like:
+          #   1) ABC123... "Developer ID Application: Sebastien Dudek (XXXXXXXXXX)"
+          # Hard-coding the team-ID-bracketed form into a secret would
+          # work but means rotating the secret on every cert renewal;
+          # discovery is simpler and avoids one moving part.
+          IDENTITY=$(security find-identity -v -p codesigning "$MACOS_KEYCHAIN_PATH" \
+              | awk -F '"' '/Developer ID Application/ { print $2; exit }')
+          if [ -z "$IDENTITY" ]; then
+              echo "::error::No 'Developer ID Application' identity found in $MACOS_KEYCHAIN_PATH"
+              security find-identity -v "$MACOS_KEYCHAIN_PATH"
+              exit 1
+          fi
+          echo "==> signing identity: $IDENTITY"
 
-          codesign --deep --force --options runtime --timestamp \
-            --sign "$APPLE_DEV_ID_IDENTITY" \
-            dmg-root/LUKSbox.app
-          codesign --verify --deep --strict --verbose=2 dmg-root/LUKSbox.app
+          # Sign innermost-first, in topological order: every dylib /
+          # .so / framework binary inside Contents/Frameworks/ before
+          # the .app bundle itself. `codesign --deep` (used here
+          # historically) is officially deprecated by Apple since
+          # Big Sur and produces brittle results when the bundle
+          # contains nested frameworks or subdirs; explicit per-file
+          # signing is the modern correct approach.
+          if [ -d "$APP/Contents/Frameworks" ]; then
+              find "$APP/Contents/Frameworks" -type f \
+                  \( -name "*.dylib" -o -name "*.so" \) -print0 \
+                  | xargs -0 -n1 -I{} codesign \
+                      --force \
+                      --timestamp \
+                      --options runtime \
+                      --keychain "$MACOS_KEYCHAIN_PATH" \
+                      --sign "$IDENTITY" \
+                      "{}"
+          fi
+
+          # Sign the bundled binaries (CLI + GUI). Both get the
+          # hardened-runtime entitlements so libfido2 (bundled,
+          # signed by us) can load and USB FIDO2 access works.
+          for bin in "$APP/Contents/MacOS/luksbox" "$APP/Contents/MacOS/luksbox-gui"; do
+              codesign --force --timestamp --options runtime \
+                  --entitlements dist/macos/entitlements.plist \
+                  --keychain "$MACOS_KEYCHAIN_PATH" \
+                  --sign "$IDENTITY" "$bin"
+          done
+
+          # Sign the .app bundle itself. Same entitlements; this is
+          # the signature Gatekeeper looks at on launch.
+          codesign --force --timestamp --options runtime \
+              --entitlements dist/macos/entitlements.plist \
+              --keychain "$MACOS_KEYCHAIN_PATH" \
+              --sign "$IDENTITY" \
+              "$APP"
+
+          # Verify the chain end-to-end. --strict catches missing
+          # nested signatures; --deep ensures every Mach-O inside the
+          # bundle was actually signed (the find-loop above SHOULD
+          # have covered it; this is the belt-and-suspenders check).
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          # Print the resulting signature shape for the CI log.
+          codesign -dv --verbose=4 "$APP" 2>&1 | head -20
 
       - name: Build macOS portable tarball (CLI + GUI, no .app)
         if: runner.os == 'macOS'
@@ -935,6 +1038,31 @@ jobs:
                 "${{ matrix.archive }}"
             }
           ls -lh "${{ matrix.archive }}"
+
+      - name: Code-sign macOS .dmg (only if Apple cert was imported)
+        # The .dmg itself must be signed for notarytool to accept it.
+        # Without this, notarisation will reject the submission with
+        # "The signature does not include a secure timestamp."
+        # Same gating logic as the .app codesign step above.
+        if: runner.os == 'macOS' && env.MACOS_KEYCHAIN_PATH != ''
+        env:
+          MACOS_KEYCHAIN_PATH: ${{ env.MACOS_KEYCHAIN_PATH }}
+        run: |
+          set -euo pipefail
+          IDENTITY=$(security find-identity -v -p codesigning "$MACOS_KEYCHAIN_PATH" \
+              | awk -F '"' '/Developer ID Application/ { print $2; exit }')
+          if [ -z "$IDENTITY" ]; then
+              echo "::error::No 'Developer ID Application' identity found"
+              exit 1
+          fi
+          # No --options runtime on the .dmg itself (hardened-runtime
+          # only applies to executables, not container files), but the
+          # --timestamp flag is mandatory for notarytool acceptance.
+          codesign --force --timestamp \
+              --keychain "$MACOS_KEYCHAIN_PATH" \
+              --sign "$IDENTITY" \
+              "${{ matrix.archive }}"
+          codesign --verify --verbose=2 "${{ matrix.archive }}"
 
       - name: Notarize macOS .dmg (only if Apple secrets present)
         if: runner.os == 'macOS' && env.APPLE_NOTARY_USER != ''
