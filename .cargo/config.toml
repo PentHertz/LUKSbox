@@ -1,0 +1,41 @@
+# Workspace-wide cargo / rustc tweaks.
+#
+# Picked up automatically by every `cargo build` / `cargo test` /
+# `cargo run` invocation from the workspace root. The configuration
+# is per-target so it only affects the matching `--target=<triple>`
+# builds; everything else is unchanged.
+
+# Statically link the MSVC C runtime on Windows.
+#
+# Default Rust-on-Windows behavior is to dynamically link
+# `VCRUNTIME140.dll`, `MSVCP140.dll`, plus the Universal CRT chain
+# (`api-ms-win-crt-*.dll`). VCRUNTIME requires the user to install
+# Microsoft's "Visual C++ Redistributable" (or have Visual Studio /
+# the Build Tools present). The api-ms-win-crt-* DLLs ship with
+# Windows 10 1709+ and Server 2019+ but are missing on older
+# images; users without them get the infamous
+#     "0xC0000135 / The application was unable to start correctly"
+# launch failure with no actionable message.
+#
+# `target-feature=+crt-static` tells rustc to emit `/MT` (instead
+# of `/MD`) on the `link.exe` invocation; the resulting .exe
+# bundles the MSVC runtime directly and resolves the UCRT statically
+# too. The cost is a larger executable (~+1-2 MiB on a typical Rust
+# binary) and slightly more memory per process; the benefit is a
+# truly portable Windows binary that runs on any supported Windows
+# version with no installer / redistributable / extra DLLs.
+#
+# Same flag for both ARM64 and x86_64 Windows targets so future
+# `aarch64-pc-windows-msvc` builds inherit the policy.
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Optional: also catch `gnu` Windows targets if anyone ever cross-
+# builds with the MinGW toolchain (we don't ship `*-windows-gnu`
+# but the flag is harmless if the target isn't built).
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]
