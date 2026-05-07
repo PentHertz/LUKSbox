@@ -2,47 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <!--
-      Hardened-runtime entitlements for codesign + Apple notarisation.
-
-      Apple's notary service rejects any binary that is not signed
-      with `--options runtime` (hardened runtime) since 2019. Hardened
-      runtime in turn locks down a number of behaviours by default;
-      we re-enable only the ones LUKSbox actually needs.
-    -->
-
-    <!--
-      LUKSbox bundles libfido2 + its transitive dylibs (libcbor,
-      libcrypto, libssl) into Contents/Frameworks/ via dylibbundler.
-      Those bundled dylibs are signed by us (Developer ID Application),
-      not by Apple. Without this entitlement, dyld refuses to load any
-      dylib whose Team ID does not match the main binary's Team ID,
-      which here means it refuses to load every dylib we bundled and
-      the app fails to launch with `Library Validation failed`.
-    -->
     <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
-
-    <!--
-      USB device class access for FIDO2 authenticators. libfido2 talks
-      to YubiKey / Google Titan / Solo / Nitrokey via USB-HID; without
-      this entitlement, hidd refuses the open() and the device list is
-      empty. Required for the FIDO2 keyslot kinds.
-    -->
     <key>com.apple.security.device.usb</key>
     <true/>
-
-    <!--
-      DELIBERATELY NOT SET (smaller attack surface = faster Apple
-      notarisation review):
-        com.apple.security.cs.allow-jit
-        com.apple.security.cs.allow-unsigned-executable-memory
-        com.apple.security.cs.allow-jit-write-execute
-        com.apple.security.cs.allow-dyld-environment-variables
-        com.apple.security.cs.disable-executable-page-protection
-
-      LUKSbox is pure Rust; no JIT, no W^X-violating mmap, no
-      DYLD_* dependency.
-    -->
 </dict>
 </plist>
