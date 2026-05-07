@@ -283,8 +283,35 @@ jobs:
           # key, exported from Keychain Access (or assembled with
           # openssl pkcs12). Lives only for the duration of this CI
           # run, then the runner cleans up.
+          #
+          # `tr -d '\n\r '` defensively strips any line-wrapping or
+          # stray whitespace that may survive the GitHub-secrets
+          # round-trip (`base64 -i foo` on macOS line-wraps at 76
+          # columns by default; `printf '%s'` preserves that, then
+          # `base64 --decode` on some BSD-base64 builds chokes on
+          # multi-line input). Single-line input is universally
+          # accepted.
           P12_PATH="$RUNNER_TEMP/devid.p12"
-          echo "$APPLE_DEVELOPER_ID_CERT_P12_B64" | base64 --decode > "$P12_PATH"
+          printf '%s' "$APPLE_DEVELOPER_ID_CERT_P12_B64" \
+            | tr -d '\n\r ' \
+            | base64 --decode > "$P12_PATH"
+          # Sanity-check the decoded bytes look like a PKCS12 envelope
+          # before handing to `security`. PKCS12 starts with the
+          # ASN.1 SEQUENCE tag 0x30 followed by a length descriptor;
+          # a corrupted base64 transport typically yields random
+          # bytes here. The `file` magic check is cheap and turns a
+          # cryptic `MAC verification failed` later into a clear
+          # `decoded blob is not a PKCS12 envelope` here.
+          DECODED_HEAD=$(xxd -l 8 "$P12_PATH" | head -1 | awk '{print $2$3$4$5}')
+          if ! [[ "$DECODED_HEAD" =~ ^30[0-9a-f]{2,4} ]]; then
+              echo "::error::APPLE_DEVELOPER_ID_CERT_P12_B64 decoded to non-PKCS12 bytes."
+              echo "         First 8 decoded bytes: $DECODED_HEAD (expected 30xx... ASN.1 SEQUENCE)."
+              echo "         Likely cause: the secret was pasted with line-wrapping or"
+              echo "         truncated. Re-encode locally with a single-line form:"
+              echo "             openssl base64 -A -in devid.p12 | pbcopy"
+              echo "         and replace the secret value."
+              exit 1
+          fi
 
           # Create a brand-new keychain dedicated to this build. We
           # do NOT touch the runner's login keychain because:
