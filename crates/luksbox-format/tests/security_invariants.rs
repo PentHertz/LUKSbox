@@ -16,10 +16,28 @@
 //!      changes are visible.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use luksbox_core::{Argon2idParams, CipherSuite, HEADER_SIZE};
 use luksbox_format::{Container, UnlockMaterial};
 use tempfile::TempDir;
+
+/// Process-wide mutex serialising every test that reads OR writes
+/// `LUKSBOX_NO_FOLLOW_SYMLINKS`. cargo-test runs tests on a thread
+/// pool inside a single process; `std::env::set_var` / `remove_var`
+/// mutate process-global state visible to all threads, so a test
+/// that sets the env var leaks into any parallel test that reads
+/// it (e.g. via `Container::open`'s symlink-handling branch). Every
+/// test that reaches the symlink code path acquires this lock first;
+/// the env-var-toggling test sets the var only while holding it.
+fn symlink_env_lock() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        // Tests are allowed to panic; recover from poisoning so the
+        // first test's panic doesn't poison the whole suite.
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 const PASS: &[u8] = b"correct horse battery staple";
 
@@ -225,6 +243,13 @@ fn symlink_to_real_vault_opens_cleanly() {
     // follows the symlink, captures the underlying inode. Subsequent
     // re-opens (lock acquisition, r/w fd) follow the same symlink to
     // the same inode, no mismatch, open succeeds.
+    //
+    // Holds the symlink-env lock for the duration of the open: the
+    // sibling `nofollow_symlinks_env_var_refuses_symlinked_vault`
+    // test toggles `LUKSBOX_NO_FOLLOW_SYMLINKS=1` for a short window
+    // and a parallel-thread leak would make this open spuriously
+    // fail with `SymlinkRefused`.
+    let _env_lock = symlink_env_lock();
     let dir = TempDir::new().unwrap();
     let real = dir.path().join("real.lbx");
     let link = dir.path().join("link.lbx");
@@ -239,6 +264,10 @@ fn symlink_to_real_vault_opens_cleanly() {
 #[test]
 #[cfg(unix)]
 fn symlink_swap_between_opens_is_detected() {
+    // Same env-var-leak guard as `symlink_to_real_vault_opens_cleanly`:
+    // a parallel `LUKSBOX_NO_FOLLOW_SYMLINKS=1` would refuse the
+    // baseline open here too.
+    let _env_lock = symlink_env_lock();
     // Construct two real vault files A and B (different inodes,
     // different MVKs). Make `link` point to A. Open `link` -> first
     // open captures A's inode. Atomically swap `link` to point to B
@@ -294,12 +323,15 @@ fn nofollow_symlinks_env_var_refuses_symlinked_vault() {
     // any vault whose path is a symlink. Used on shared filesystems
     // where TOCTOU is a real concern.
     //
-    // NOTE: this test mutates a process-wide env var. It's the only
-    // test in this file that does so, the LUKSBOX_NO_LOCK bypass
-    // test was removed precisely because env-var leakage broke
-    // parallel tests. We accept that risk here because the var is
-    // set/unset within a small window and other tests in this file
-    // don't exercise the no-follow-symlinks branch.
+    // This test mutates a process-wide env var. cargo-test runs
+    // tests on a thread pool inside one process, so any leak of
+    // the var into a parallel thread would corrupt the sibling
+    // `symlink_to_real_vault_opens_cleanly` and
+    // `symlink_swap_between_opens_is_detected` tests, which open
+    // symlinks expecting success. We hold `symlink_env_lock()`
+    // for the entire body so the set / read / remove cycle is
+    // visible only inside this test's critical section.
+    let _env_lock = symlink_env_lock();
     let dir = TempDir::new().unwrap();
     let _ = build_vault(&dir);
     let real = dir.path().join("real.lbx");
