@@ -157,6 +157,19 @@ jobs:
 
       - name: macOS deps (Homebrew)
         if: runner.os == 'macOS'
+        # `HOMEBREW_NO_INSTALL_FROM_API=1` forces brew to read formula
+        # and cask metadata from the locally-cloned `homebrew/core` and
+        # `homebrew/cask` taps (.rb files on disk) instead of the
+        # JSON-formatted API at formulae.brew.sh. Recent Homebrew
+        # releases shipped a regression in the cask API parser
+        # (`undefined method 'to_sym' for nil` inside
+        # `cask_struct_generator.rb`) that crashes `brew install` on
+        # certain cask `depends_on` shapes returned by the API. The
+        # local-tap path runs the regular Ruby DSL eval and isn't
+        # affected. Set at the step level so both this command AND
+        # the macFUSE cask install below benefit.
+        env:
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
         run: |
           brew update
           # imagemagick : scripts/build_icons.sh
@@ -169,7 +182,12 @@ jobs:
           # create-dmg  : produces a real .dmg with an Applications drop
           #               link instead of shipping a raw .tar.gz that
           #               looks alien to Mac users.
-          brew install libfido2 pkg-config imagemagick dylibbundler create-dmg
+          #
+          # `--formula` is belt-and-suspenders alongside the env var
+          # above: forces resolution against the formula tap only and
+          # skips any chance of touching the cask API code path. All
+          # five names here are formulas (no casks).
+          brew install --formula libfido2 pkg-config imagemagick dylibbundler create-dmg
           # macFUSE for the `mount` subcommand. fuser 0.17's build.rs
           # is hard-coded on macOS: it unconditionally calls
           # `pkg-config fuse` (>=2.6.0, the libfuse2 API) and links
