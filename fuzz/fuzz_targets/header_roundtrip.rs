@@ -45,7 +45,10 @@ fuzz_target!(|data: &[u8]| {
         // (480..512). A regression that read V3 but wrote V2 (or vice
         // versa) would corrupt these on round-trip without changing
         // kind / uuid. Check them explicitly.
-        assert_eq!(a.aad_version, b.aad_version, "aad_version must round-trip");
+        assert_eq!(
+            a.aad_version, b.aad_version,
+            "aad_version must round-trip"
+        );
         assert_eq!(
             a.fido2_cred_id, b.fido2_cred_id,
             "fido2_cred_id must round-trip byte-identical"

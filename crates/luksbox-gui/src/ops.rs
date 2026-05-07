@@ -1247,11 +1247,19 @@ fn unlock_with_hybrid_pq_tpm2(
     f.read_exact(&mut header_bytes).map_err(estr)?;
     drop(f);
     let header = Header::from_bytes(&header_bytes).map_err(estr)?;
-    if !header
-        .keyslots
-        .iter()
-        .any(|s| s.kind == SlotKind::HybridPqKemTpm2)
-    {
+    // Match BOTH the ML-KEM-768 and ML-KEM-1024 hybrid TPM slots.
+    // The wrap-KEK derivation is identical for both KEM sizes (the
+    // 32-byte shared secret enters HKDF the same way); the on-disk
+    // SlotKind is the only thing that differs, and the actual KEM
+    // level used per slot is encoded in the .hybrid sidecar's
+    // `entry.level` so decapsulate_with picks the correct cipher
+    // automatically.
+    if !header.keyslots.iter().any(|s| {
+        matches!(
+            s.kind,
+            SlotKind::HybridPqKemTpm2 | SlotKind::HybridPqKem1024Tpm2
+        )
+    }) {
         return Err(
             "this vault has no hybrid TPM + ML-KEM keyslot. Use a different unlock \
              method or enroll one via Manage Keyslots."
@@ -1267,7 +1275,10 @@ fn unlock_with_hybrid_pq_tpm2(
 
     let mut last_err: Option<String> = None;
     for (slot_idx_usize, slot) in header.keyslots.iter().enumerate() {
-        if slot.kind != SlotKind::HybridPqKemTpm2 {
+        if !matches!(
+            slot.kind,
+            SlotKind::HybridPqKemTpm2 | SlotKind::HybridPqKem1024Tpm2
+        ) {
             continue;
         }
         let slot_idx = slot_idx_usize as u8;
@@ -1340,11 +1351,16 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
     f.read_exact(&mut header_bytes).map_err(estr)?;
     drop(f);
     let header = Header::from_bytes(&header_bytes).map_err(estr)?;
-    if !header
-        .keyslots
-        .iter()
-        .any(|s| s.kind == SlotKind::HybridPqKemTpm2Fido2)
-    {
+    // Match BOTH 768 and 1024 hybrid-PQ-TPM-FIDO2 slot kinds. See
+    // the comment in unlock_with_hybrid_pq_tpm2 above for why the
+    // KEM size is auto-detected from the sidecar `entry.level`
+    // rather than carried in the SlotKind for unwrap purposes.
+    if !header.keyslots.iter().any(|s| {
+        matches!(
+            s.kind,
+            SlotKind::HybridPqKemTpm2Fido2 | SlotKind::HybridPqKem1024Tpm2Fido2
+        )
+    }) {
         return Err("this vault has no hybrid TPM + FIDO2 + ML-KEM keyslot.".into());
     }
     let seed = seed_file::read(kyber_path, seed_pw.as_bytes())
@@ -1356,7 +1372,10 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
     let mut auth = make_fido2_authenticator();
     let mut last_err: Option<String> = None;
     for (slot_idx_usize, slot) in header.keyslots.iter().enumerate() {
-        if slot.kind != SlotKind::HybridPqKemTpm2Fido2 {
+        if !matches!(
+            slot.kind,
+            SlotKind::HybridPqKemTpm2Fido2 | SlotKind::HybridPqKem1024Tpm2Fido2
+        ) {
             continue;
         }
         let slot_idx = slot_idx_usize as u8;

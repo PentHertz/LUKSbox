@@ -73,24 +73,14 @@ fn entries_from_fuzz(data: &[u8]) -> Option<Vec<HybridEntry>> {
             if ct_take > 0 {
                 ct[..ct_take].copy_from_slice(&data[cursor + pk_len..cursor + pk_len + ct_take]);
             }
-            entries.push(HybridEntry {
-                slot_idx,
-                level,
-                pubkey,
-                ciphertext: ct,
-            });
+            entries.push(HybridEntry { slot_idx, level, pubkey, ciphertext: ct });
             return Some(entries);
         }
         let pubkey = data[cursor..cursor + pk_len].to_vec();
         cursor += pk_len;
         let ct = data[cursor..cursor + ct_len].to_vec();
         cursor += ct_len;
-        entries.push(HybridEntry {
-            slot_idx,
-            level,
-            pubkey,
-            ciphertext: ct,
-        });
+        entries.push(HybridEntry { slot_idx, level, pubkey, ciphertext: ct });
     }
     Some(entries)
 }
@@ -127,7 +117,11 @@ fuzz_target!(|data: &[u8]| {
     // Round-trip property: parsed entries match what we wrote (modulo
     // the input being internally consistent, which the writer's
     // length-check already enforced).
-    assert_eq!(parsed.len(), entries.len(), "parsed entry count != written");
+    assert_eq!(
+        parsed.len(),
+        entries.len(),
+        "parsed entry count != written"
+    );
     for (a, b) in parsed.iter().zip(entries.iter()) {
         assert_eq!(a.slot_idx, b.slot_idx);
         assert_eq!(a.level, b.level);

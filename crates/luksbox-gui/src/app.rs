@@ -251,6 +251,12 @@ struct CreateForm {
     hide_sizes: bool,
     /// Path to write the .kyber seed file when kind == HybridPq.
     hybrid_kyber_path: String,
+    /// Optional at-rest password that encrypts the .kyber seed file
+    /// for hybrid-PQ kinds. The unlock form prompts for this
+    /// separately as "Seed-file passphrase". Leave empty to reuse
+    /// the slot-0 backup passphrase (the legacy default that the
+    /// previous wizard / GUI used unconditionally).
+    hybrid_seed_pw: Zeroizing<String>,
     kdf: KdfStrength,
 }
 
@@ -270,6 +276,7 @@ impl Default for CreateForm {
             pad_files: false,
             hide_sizes: false,
             hybrid_kyber_path: String::new(),
+            hybrid_seed_pw: Zeroizing::default(),
             kdf: KdfStrength::Interactive,
         }
     }
@@ -2571,7 +2578,7 @@ impl LuksboxApp {
                     };
                     section(ui, title, |ui| {
                         ui.label(
-                            RichText::new("Backup passphrase (slot 0; recovery path)")
+                            RichText::new("Backup passphrase (slot 0; recovery path if the TPM dies)")
                                 .color(theme::WARN).size(12.0),
                         );
                         let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
@@ -2585,6 +2592,17 @@ impl LuksboxApp {
                         {
                             self.open_passgen(PassgenTarget::CreatePrimary);
                         }
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(
+                                "Seed-file passphrase (encrypts the .kyber seed file at rest. \
+                                 Leave empty to reuse the backup passphrase above.)",
+                            )
+                            .color(theme::DIM).size(12.0),
+                        );
+                        let te = egui::TextEdit::singleline(&mut *self.create.hybrid_seed_pw)
+                            .password(true);
+                        ui.add_sized([form_width(ui), CONTROL_H], te);
                         ui.add_space(10.0);
                         ui.label(
                             RichText::new(
@@ -2631,6 +2649,17 @@ impl LuksboxApp {
                         ui.add_space(8.0);
                         ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
                         let te = egui::TextEdit::singleline(&mut *self.create.pin).password(true);
+                        ui.add_sized([form_width(ui), CONTROL_H], te);
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(
+                                "Seed-file passphrase (encrypts the .kyber seed file at rest. \
+                                 Leave empty to reuse the backup passphrase above.)",
+                            )
+                            .color(theme::DIM).size(12.0),
+                        );
+                        let te = egui::TextEdit::singleline(&mut *self.create.hybrid_seed_pw)
+                            .password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         ui.add_space(10.0);
                         ui.label(
@@ -2925,15 +2954,22 @@ impl LuksboxApp {
                 } else {
                     768
                 };
-                // Reuse the backup passphrase as the seed-file
-                // passphrase: it's a recovery secret the user already
-                // committed to typing every unlock. Clone from the
-                // already-moved opts.passphrase.
-                let seed_pw = opts
-                    .passphrase
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| zeroize::Zeroizing::new(String::new()));
+                // Seed-file passphrase: prefer the explicit
+                // `hybrid_seed_pw` field if the user filled it; fall
+                // back to the backup passphrase from `opts.passphrase`
+                // otherwise (the legacy default before we exposed the
+                // separate field).
+                let seed_pw = {
+                    let explicit = std::mem::take(&mut self.create.hybrid_seed_pw);
+                    if !explicit.is_empty() {
+                        explicit
+                    } else {
+                        opts.passphrase
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(|| zeroize::Zeroizing::new(String::new()))
+                    }
+                };
                 Some(ops::TpmBootstrapKind::HybridPqTpm2 {
                     kyber_path: PathBuf::from(self.create.hybrid_kyber_path.trim()),
                     seed_pw,
@@ -2955,11 +2991,17 @@ impl LuksboxApp {
                 } else {
                     768
                 };
-                let seed_pw = opts
-                    .passphrase
-                    .as_ref()
-                    .cloned()
-                    .unwrap_or_else(|| zeroize::Zeroizing::new(String::new()));
+                let seed_pw = {
+                    let explicit = std::mem::take(&mut self.create.hybrid_seed_pw);
+                    if !explicit.is_empty() {
+                        explicit
+                    } else {
+                        opts.passphrase
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(|| zeroize::Zeroizing::new(String::new()))
+                    }
+                };
                 Some(ops::TpmBootstrapKind::HybridPqTpm2Fido2 {
                     kyber_path: PathBuf::from(self.create.hybrid_kyber_path.trim()),
                     seed_pw,
@@ -3240,17 +3282,20 @@ impl LuksboxApp {
                 ui.radio_value(
                     &mut self.unlock.method,
                     UnlockMethod::HybridPqTpm2,
-                    "Hybrid TPM 2.0 + ML-KEM-768 (PQ + machine-bound)",
+                    "Hybrid TPM 2.0 + ML-KEM (PQ + machine-bound)",
                 );
                 ui.radio_value(
                     &mut self.unlock.method,
                     UnlockMethod::HybridPqTpm2Fido2,
-                    "Hybrid TPM 2.0 + FIDO2 + ML-KEM-768 (3 factors)",
+                    "Hybrid TPM 2.0 + FIDO2 + ML-KEM (3 factors)",
                 );
             }
             if matches!(
                 self.unlock.method,
-                UnlockMethod::HybridPq | UnlockMethod::HybridPqFido2
+                UnlockMethod::HybridPq
+                    | UnlockMethod::HybridPqFido2
+                    | UnlockMethod::HybridPqTpm2
+                    | UnlockMethod::HybridPqTpm2Fido2
             ) {
                 ui.label(
                     RichText::new(
@@ -3385,7 +3430,7 @@ impl LuksboxApp {
                 });
             }
             UnlockMethod::HybridPqTpm2 => {
-                section(ui, "Hybrid TPM 2.0 + ML-KEM-768", |ui| {
+                section(ui, "Hybrid TPM 2.0 + ML-KEM", |ui| {
                     ui.label(
                         RichText::new("Seed-file passphrase (encrypts the .kyber seed)")
                             .color(theme::DIM)
@@ -3429,7 +3474,7 @@ impl LuksboxApp {
                 });
             }
             UnlockMethod::HybridPqTpm2Fido2 => {
-                section(ui, "Hybrid TPM 2.0 + FIDO2 + ML-KEM-768", |ui| {
+                section(ui, "Hybrid TPM 2.0 + FIDO2 + ML-KEM", |ui| {
                     ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
                     let te = egui::TextEdit::singleline(&mut *self.unlock.pin).password(true);
                     ui.add_sized([form_width(ui), CONTROL_H], te);
