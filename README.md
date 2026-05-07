@@ -381,5 +381,5 @@ information.
 Maintained by **Sébastien Dudek**, Penthertz
 ([penthertz.com](https://penthertz.com),
 [@PentHertz](https://x.com/PentHertz),
-`security@penthertz.com` / `sebastien.dudek@penthertz.com`).
+`security@penthertz.com`).
 See [`SECURITY.md`](SECURITY.md) §1 for the responsible-disclosure flow.
