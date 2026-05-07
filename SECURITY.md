@@ -20,8 +20,7 @@ The companion documents are:
 
 **Please do not open a public GitHub issue for security-relevant findings.**
 
-Send a report to **`security@penthertz.com`**, or directly to the maintainer at
-**`sebastien.dudek@penthertz.com`**.
+Send a report to **`contact@penthertz.com`**.
 
 If your finding contains exploit details, sample vault files, or anything else
 you'd rather not send in cleartext, request our PGP key first by asking on the
