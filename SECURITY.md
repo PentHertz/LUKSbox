@@ -205,6 +205,23 @@ how strong the cryptography is.
   you may be locked out (kyber) or lose rollback detection (anchor). Back
   them up *separately* and on different trusted storage.
 
+- **Operator-explicit safety bypasses.** A small number of escape-hatch
+  flags exist for recovery / debugging scenarios. Each is opt-in (never
+  default), each is logged at the operator's terminal, and each is
+  documented in the CLI help. They are NOT silent vulnerabilities, but
+  an operator who runs them blindly can compromise the vault. The set
+  today:
+    - `LUKSBOX_NO_LOCK=1` — disables advisory `flock(LOCK_EX)`. Allows
+      concurrent writers and the metadata corruption that follows.
+    - `LUKSBOX_NO_FOLLOW_SYMLINKS=1` — refuses to open vaults whose
+      path is a symlink (paranoid mode; failure-closed, not unsafe).
+    - `luksbox header restore --no-verify` — skips the HMAC pre-check
+      that prevents an attacker-substituted backup header from being
+      installed under their MVK. Required ONLY when the on-disk header
+      is too damaged to unlock with; using it on a backup file from
+      an untrusted source silently installs the attacker's keyslot
+      table.
+
 ---
 
 ## 4. Cryptographic primitives

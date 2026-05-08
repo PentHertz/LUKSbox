@@ -309,6 +309,23 @@ impl Fido2Authenticator for HidAuthenticator {
                      refusing to allocate (cap {MAX_CRED_ID_FROM_DEVICE})"
                 )));
             }
+            // Sanity-check the FFI pointer before constructing a slice.
+            // libfido2's contract is that `fido_cred_id_ptr` returns
+            // either a valid pointer with `fido_cred_id_len` bytes
+            // readable, or NULL on no-credential. A buggy / hostile-
+            // firmware authenticator that returns a non-null but
+            // dangling pointer would otherwise cause `from_raw_parts`
+            // to read uninitialised memory. Realistic exploitation
+            // requires both libfido2 misbehaviour AND a hostile USB
+            // device, but the check is cheap and keeps the unsafe
+            // block honest.
+            if id_ptr.is_null() {
+                return Err(Error::Other(
+                    "libfido2 returned (id_len > 0, id_ptr = NULL); \
+                     refusing to construct slice from null pointer"
+                        .into(),
+                ));
+            }
             let id = std::slice::from_raw_parts(id_ptr, id_len).to_vec();
             Ok(EnrollResult {
                 credential: Credential { id },

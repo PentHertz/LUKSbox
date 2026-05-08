@@ -525,6 +525,22 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
                 ));
             }
             let s = &*assertion.pHmacSecret;
+            // Validate the FFI contract before trusting either pointer
+            // or length. webauthn.dll's documented behaviour is that
+            // `pbFirst` is a non-null pointer to `cbFirst` bytes for
+            // the duration of the assertion. We additionally enforce
+            // `cbFirst == 32` since hmac-secret per CTAP2 §6.5 is a
+            // fixed 32-byte HMAC-SHA256 output.
+            //
+            // FFI trust note: we do not range-check `pbFirst` further
+            // because webauthn.dll is part of Windows itself — same
+            // trust boundary as `kernel32.dll` or `bcrypt.dll`. If
+            // webauthn.dll is compromised the entire process is
+            // already owned. By contrast, the libfido2-on-Linux/macOS
+            // path (hid.rs) defends against compromised USB devices
+            // via libfido2 and adds its own pointer-not-null check
+            // because the trust boundary there is "C library +
+            // attacker-controlled USB peripheral", which is weaker.
             if s.pbFirst.is_null() || s.cbFirst != 32 {
                 WebAuthNFreeAssertion(assertion_ptr);
                 return Err(Error::Other(format!(

@@ -171,10 +171,21 @@ pub fn read(path: &Path, passphrase: &[u8]) -> Result<Zeroizing<[u8; SEED_LEN]>,
     // shared USB stick, tampered backup) could otherwise set
     // m_cost_kib = u32::MAX -> 4 TiB allocation request -> OOM on every
     // unlock attempt, locking the user out of their own vault without
-    // ever knowing the passphrase. Bounds match
-    // `luksbox_core::Argon2idParams::SAFE_*_MAX` (4 GiB / 16 / 16,
-    // 3x Sensitive's t=5 preset, still well above any sane config).
-    const SAFE_M_COST_KIB_MAX: u32 = 4 * 1024 * 1024;
+    // ever knowing the passphrase.
+    //
+    // Bounds:
+    //   m_cost_kib <= 512 MiB. Sensitive preset is 1 GiB, but Argon2's
+    //   peak memory is m_cost * p_cost * 128 B; with our p_cost cap of
+    //   16 a 512 MiB m_cost still allows 1 TiB peak (which Argon2-id
+    //   refuses anyway above ~64 GiB on most platforms, but we cap
+    //   here as the first line of defence). Lower than a previous
+    //   4 GiB cap that combined with p_cost = 16 would have permitted
+    //   16 TiB peak requests; ground-truth audit findings.
+    //   t_cost <= 16. 3x sensitive's t=5; comfortably above realistic
+    //   configs.
+    //   p_cost <= 16. Argon2id parallelism cap; we only ever ship
+    //   p_cost <= 4 in any preset.
+    const SAFE_M_COST_KIB_MAX: u32 = 512 * 1024;
     const SAFE_T_COST_MAX: u8 = 16;
     const SAFE_P_COST_MAX: u8 = 16;
     if !(8..=SAFE_M_COST_KIB_MAX).contains(&m_cost_kib)
