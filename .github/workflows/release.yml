@@ -1687,21 +1687,33 @@ jobs:
               ABI on macOS. FUSE-T provides only libfuse3. Switching
               would require swapping our FUSE wrapper crate.)
 
-              **First-launch workaround (current builds are
-              unsigned):** Penthertz Apple Developer ID enrollment
-              is in progress; until it completes the .dmg is not
-              `codesign`-stamped. macOS Gatekeeper blocks first
-              launch. Pick one:
+              **First launch:** the .dmg is **codesigned with the
+              Penthertz Apple Developer ID Application certificate
+              (team `456J2U7HQL`) and Apple-notarised**, with the
+              notarisation ticket stapled to the bundle. macOS shows
+              the standard "downloaded from internet, are you sure?"
+              prompt that every Mac shows for any downloaded app -
+              click Open and you're set. Subsequent launches are
+              silent. No Gatekeeper override and no
+              `xattr -dr com.apple.quarantine` workaround needed.
 
-              - Finder: right-click `LUKSbox.app` -> Open -> Open
-                in the dialog.
-              - Terminal: `sudo xattr -dr com.apple.quarantine
-                /Applications/LUKSbox.app` then double-click as
-                normal.
+              Verify the signature and notarisation locally:
 
-              You only have to do this once per machine. Verify the
-              .dmg SHA-256 against the table at the top of these
-              release notes for trust in the meantime.
+              ```
+              # Signature: identity + chain trust
+              codesign --verify --deep --strict --verbose=2 \
+                  /Applications/LUKSbox.app
+
+              # Notarisation: ticket present + valid
+              spctl --assess --type execute --verbose \
+                  /Applications/LUKSbox.app
+              # expects: "accepted, source=Notarized Developer ID"
+              ```
+
+              You can additionally verify the .dmg SHA-256 against
+              the table at the top of these release notes for an
+              independent integrity check that doesn't depend on
+              Apple's PKI.
 
             **macOS (Intel):** not shipped, build from source with
               `cargo build --profile release-hardened` on an Intel Mac

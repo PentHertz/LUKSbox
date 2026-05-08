@@ -72,9 +72,12 @@ Researchers will be credited in the advisory unless they ask not to be.
 | Previous tagged release | maintenance | yes, until 6 months after the next release |
 | Older tagged releases | end-of-life | no, please upgrade |
 
-LUKSbox does not currently ship GPG-signed binary release tarballs
-(`SHA256SUMS.txt.asc`). The trust chain for an artifact downloaded
-from [GitHub Releases](https://github.com/penthertz/LUKSbox/releases) is:
+The trust chain for an artifact downloaded from
+[GitHub Releases](https://github.com/penthertz/LUKSbox/releases)
+combines platform-native signing (where shipped) with Sigstore-
+backed provenance (every artifact, every platform). LUKSbox does
+not yet ship a GPG-signed `SHA256SUMS.txt.asc`; that is on the
+v0.2 roadmap alongside Linux package signing. The current chain is:
 
 1. The release workflow file (`.github/workflows/release.yml`) is in
    the source tree and reviewable.
@@ -340,9 +343,27 @@ get in touch.
 
 - **No reproducible builds.** Bit-for-bit reproducibility is not yet in
   place; build artifacts are not deterministic across machines.
-- **No signed releases.** Tagged releases are not currently signed with a
-  release key. Build from source against the tagged commit and verify the
-  commit signature instead.
+- **Per-platform signing posture (v0.1.1):**
+  - **macOS:** `.dmg` and the bundled `.app` are codesigned with the
+    Penthertz Apple Developer ID Application certificate (team
+    `456J2U7HQL`) under the hardened-runtime profile, and the bundle
+    is Apple-notarised with the ticket stapled. Verifiable locally
+    with `codesign --verify --deep --strict` and
+    `spctl --assess --type execute`.
+  - **Windows:** the `.exe` and `.msi` are **not yet** signed with an
+    EV Authenticode certificate; SmartScreen warns on first launch.
+    EV signing is on the v0.2 roadmap. The static-CRT linking added
+    in v0.1.1 means no Visual C++ Redistributable is needed, but
+    does not address the SmartScreen prompt.
+  - **Linux:** `.deb` / `.rpm` packages are not yet GPG-signed by a
+    Penthertz release key. Apt / dnf trust currently relies on
+    `SHA256SUMS.txt` + the GitHub Artifact Attestation. A
+    distro-style release key is on the v0.2 roadmap.
+- **GitHub Artifact Attestations cover every artifact on every
+  platform.** Sigstore-backed; verify with
+  `gh attestation verify <file> --owner penthertz`. The attestation
+  proves the artifact came from the exact tagged workflow run on a
+  GPG-signed commit.
 - **macOS thread enumeration for the daemonize fork-guard is not
   implemented.** The Linux path uses `/proc/self/task`; macOS would need
   `task_threads()` from Mach. Tracked.
