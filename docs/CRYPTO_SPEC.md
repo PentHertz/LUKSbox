@@ -130,12 +130,14 @@ my-vault.lbx.hybrid    <- OPTIONAL: PQ sidecar (encap key + ciphertext)
 my-vault.kyber         <- OPTIONAL: PQ decapsulation seed (separate storage)
 ```
 
-Subsections 3.4-3.8 below cover, in order: **detached headers**
+Subsections 3.4-3.9 below cover, in order: **detached headers**
 (§3.4), the **`<file>.tmp.<16hex>` transient temp-file convention**
 that every atomic update uses (§3.5), the **`<vault>.rotating`
 MVK-rotation temp file** (§3.6), the GUI's **`$XDG_DATA_HOME/luksbox/`
-state files** (§3.7), and the **crash-orphan classification policy**
-that tells the user what each leftover file means (§3.8).
+state files** (§3.7), the **crash-orphan classification policy**
+that tells the user what each leftover file means (§3.8), and the
+**per-chunk encryption layering** (random nonce + binding AAD +
+per-file derived key) that protects the chunk array (§3.9).
 
 The `.lbx` itself is laid out as:
 
@@ -451,6 +453,106 @@ for what each suffix means and what the operator should do:
 `luksbox info` surfaces a warning if it detects an orphan in the
 vault's directory at open time. The CLI / GUI / wizard never
 silently delete an orphan, operator action is required.
+
+### 3.9 Per-chunk encryption layering
+
+Every 4 KiB plaintext chunk that hits the chunk array (§3.1) is
+protected by **three independent layers**: a fresh random nonce, a
+binding AAD, and a per-file derived key. Each layer addresses a
+different failure mode, and removing any one of them would weaken
+a property the others can't recover:
+
+```mermaid
+flowchart LR
+    classDef per_vault fill:#1e2a4a,stroke:#60a5fa,color:#dbeafe;
+    classDef per_file fill:#1f5d3a,stroke:#34d399,color:#e5fff0;
+    classDef per_chunk fill:#4a3211,stroke:#f59e0b,color:#fff3d6;
+
+    MVK[Master Volume Key<br>32 B, vault-wide]:::per_vault
+    MVK -->|HKDF info=lbx:file/v1: + file_id| FK[file_key<br>32 B, per file_id]:::per_file
+
+    Plain([4 KiB plaintext])
+    OSRNG[OsRng] -->|12 B fresh| Nonce[nonce]:::per_chunk
+    Gen[generation<br>vault-wide monotonic u64] --> AAD
+    FID[file_id u64] --> AAD
+    Idx[chunk_idx u32] --> AAD
+    AAD["AAD = file_id ‖ chunk_idx ‖ generation<br>20 B, never on disk"]:::per_chunk
+
+    Plain --> Seal{aead::seal<br>under cipher_suite}
+    FK --> Seal
+    Nonce --> Seal
+    AAD --> Seal
+    Seal --> Slot["chunk slot on disk<br>nonce 12 ‖ ct 4096 ‖ tag 16<br>= 4124 B"]
+```
+
+The three layers are:
+
+| Layer | Width | Where it lives | Failure mode it defends against |
+|---|---|---|---|
+| **Random nonce** | 96 bits | Prepended to ciphertext on disk; fresh `OsRng` draw on every `write_chunk` (`crates/luksbox-vfs/src/chunk.rs:88-91`). | Two encryptions of the same chunk slot at different times use independent nonces. Without this, AES-GCM nonce reuse leaks the keystream and the GHASH key — a catastrophic break of confidentiality and integrity. |
+| **Binding AAD** | 20 bytes (never on disk) | Reconstructed at read time from `file_id ‖ chunk_idx ‖ generation` (`crates/luksbox-vfs/src/chunk.rs:35-44`). The AAD itself isn't stored, only its effect on the AEAD tag is. | Cut-and-paste / chunk-shuffling: an attacker swapping chunk 7 of file A onto chunk 12 of file B fails the AEAD tag because `file_id` and `chunk_idx` no longer match. Replay of an older version of the *same* slot fails because the inode now records a higher `generation` than the saved AAD bytes. |
+| **Per-file derived key** | 256 bits | `file_key = HKDF-Expand(MVK, info = "lbx:file/v1:" ‖ file_id_le, len = 32)` (`crates/luksbox-vfs/src/chunk.rs:125-130`). | The MVK never directly encrypts user data. Even a hypothetical nonce collision *within* one file leaves every other file untouched, and the same file_key is structurally never derivable for two distinct `file_id` values. |
+
+**Why three layers and not two:**
+
+- Removing the **per-file key** would let a within-vault nonce
+  collision affect every file at once. With it, the birthday bound
+  on random 96-bit nonces (≈ 2⁴⁸ writes for 2⁻³² collision
+  probability under AES-GCM) is **per file**, not vault-wide. The
+  default cipher suite, AES-256-GCM-SIV, makes this even safer:
+  GCM-SIV is misuse-resistant — a nonce collision under GCM-SIV
+  reveals only that two messages had the same plaintext, never the
+  keystream or the GHASH key. Vaults created with the legacy
+  `Aes256Gcm` suite still inherit the original NIST bound (2³² writes
+  per file) and benefit from the per-file partition.
+
+- Removing the **AAD** would let an attacker rearrange chunks
+  without breaking the cipher: any chunk's ciphertext+nonce+tag
+  would decrypt under the correct file_key regardless of where it
+  was placed in the data area, and an attacker who saved the
+  vault's bytes before a write could roll a single chunk back
+  without rolling back the metadata. The `generation` field in the
+  AAD is what closes the per-chunk replay window; the
+  `file_id ‖ chunk_idx` fields close the cross-position swap window.
+
+- Removing the **per-chunk random nonce** isn't an option for
+  AES-GCM family ciphers at all: deterministic nonces under AES-GCM
+  are catastrophic (the second use of a nonce reveals the keystream
+  XOR of the two messages and lets the attacker forge arbitrary
+  ciphertexts under that key).
+
+**What this combination does and does not protect:**
+
+- **Does protect:** confidentiality of every chunk's content,
+  authenticity of every chunk's ciphertext, position-binding
+  (`file_id ‖ chunk_idx`), per-chunk freshness (`generation`).
+
+- **Does not protect against vault-wide rollback:** an attacker
+  with read+write access to the `.lbx` who saves a snapshot at time
+  T0 and restores it wholesale at time T1 sees every chunk, every
+  AAD field, and every generation counter consistent with T0 — by
+  design. The `.anchor` sidecar (§3 listing, §17) closes this gap
+  by storing the current vault generation under a separate MAC and
+  having `Container::open` cross-check it. Without the anchor, the
+  per-chunk layering above is **strictly weaker** than rollback-
+  detected mode by the difference between "T0 was a valid state"
+  and "T0 is not the current state."
+
+- **Does not hide chunk presence/count:** the chunk array's size
+  reveals the on-disk byte count, so an observer can compute the
+  number of allocated chunk slots. Logical file sizes are inside
+  the encrypted metadata blob and not directly observable, but
+  total occupancy of the data area is. The optional
+  `--hide-size-header` flag obfuscates the boundary between
+  metadata and chunk array but not the total file size.
+
+**Cross-references:**
+- §14 "Read a file" walks the operational read path (open the
+  chunk slot, split nonce+ct+tag, compute the AAD, AEAD-open).
+- §15 "Write a file" walks the write path (allocate or reuse
+  slot, bump generation, fresh nonce, AEAD-seal, write back).
+- §17 "Rollback" explains why anchor-based detection is the only
+  defence the per-chunk layering can't provide on its own.
 
 ---
 
@@ -1170,6 +1272,11 @@ chunk (same position, same file), the older chunk's saved AAD has a
 lower generation than the metadata-recorded one for this slot, so
 the AEAD tag mismatches.
 
+For the consolidated breakdown of the three-layer property
+(per-chunk random nonce, binding AAD, per-file derived key) and
+what each layer does and does not defend against, see **§3.9
+Per-chunk encryption layering**.
+
 ---
 
 ## 15. Scenario: write a file
@@ -1218,6 +1325,12 @@ GCM-SIV reveals only that two messages had the same plaintext, never
 the keystream or the GHASH key. Vaults created with the legacy
 `Aes256Gcm` suite still inherit the original NIST bound (2^32 writes
 per file).
+
+For the consolidated breakdown of why the chunk layer combines a
+random nonce, a binding AAD, **and** a per-file derived key, see
+**§3.9 Per-chunk encryption layering** — that's the canonical
+reference for the three-layer property and what each layer does
+and does not defend against.
 
 **Schema:**
 
