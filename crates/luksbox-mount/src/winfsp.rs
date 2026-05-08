@@ -292,6 +292,21 @@ impl LuksboxFs {
     }
 }
 
+impl Drop for LuksboxFs {
+    /// Final flush on filesystem teardown. `FileSystem::stop()` drops
+    /// the owned `LuksboxFs`, which lands here. Belt-and-suspenders
+    /// behind the per-handle `cleanup` flush: if Windows ever skips a
+    /// cleanup (e.g. process forced-killed mid-copy, kernel-mode
+    /// abandonment) the dirty metadata still gets persisted before the
+    /// underlying `Container` is dropped. `Vfs::flush()` is a no-op
+    /// when nothing is dirty, so this is free in the happy path.
+    fn drop(&mut self) {
+        if let Ok(mut vfs) = self.inner.lock() {
+            let _ = vfs.flush();
+        }
+    }
+}
+
 impl FileSystemInterface for LuksboxFs {
     type FileContext = Arc<OpenContext>;
 
@@ -431,6 +446,21 @@ impl FileSystemInterface for LuksboxFs {
     }
 
     fn cleanup(&self, ctx: Self::FileContext, file_name: Option<&U16CStr>, flags: CleanupFlags) {
+        // WinFsp `Cleanup` is the analogue of FUSE `release`: it fires
+        // when the user-mode handle closes (CloseHandle). With
+        // `set_post_cleanup_when_modified_only(true)` set in `mount()`,
+        // it is dispatched only when the file was modified or marked for
+        // delete - exactly the cases where we MUST persist the in-memory
+        // metadata + chunk index onto the underlying .lbx, otherwise the
+        // newly-written chunks have no inode entry pointing at them and
+        // get reaped as garbage on the next mount. Symptom: "I copied a
+        // file into the mounted volume in Explorer, unmounted, and on
+        // remount the file is gone."
+        //
+        // Flush is unconditional within cleanup because the gating
+        // (modified-or-delete) is done by WinFsp itself before we get
+        // here. It's also cheap for non-mutating cases: Vfs::flush() is
+        // a no-op when `dirty == false`.
         if flags.is(CleanupFlags::DELETE) {
             // Triggered after can_delete + actual delete decision.
             let Some(name) = file_name else { return };
@@ -450,6 +480,13 @@ impl FileSystemInterface for LuksboxFs {
                 vfs.unlink(parent_id, leaf)
             };
             let _ = vfs.flush();
+        } else {
+            // Non-delete cleanup: a write/truncate/set-size happened on
+            // this handle; persist it now so an unmount or process exit
+            // immediately afterwards doesn't lose the data.
+            if let Ok(mut vfs) = self.inner.lock() {
+                let _ = vfs.flush();
+            }
         }
     }
 

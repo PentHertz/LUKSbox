@@ -301,6 +301,118 @@ fn three_mount_unmount_cycles_in_one_process() {
     }
 }
 
+/// Files copied into the mounted volume must survive unmount and be
+/// visible on the next open. This is the regression test for the
+/// "write a file in Explorer, unmount, remount, file is gone" bug:
+/// the WinFsp `cleanup` callback only flushed the VFS on the DELETE
+/// path, so normal write+close handles never persisted the metadata
+/// blob (chunk index + directory tree). Chunks landed on disk but no
+/// inode pointed at them, and they got reaped on next open.
+///
+/// Verification path is "open the .lbx directly via Vfs::open after
+/// unmount" rather than a second kernel remount, because:
+///   * Vfs::open reads exactly the bits that were on disk at unmount;
+///     if the cleanup-flush is missing, the directory tree reverts to
+///     "empty root" and `lookup_path("/persist.txt")` returns
+///     `NotFound`. That's the exact failure mode of the bug.
+///   * It avoids a second 2-3s kernel mount dance, keeping the test
+///     under 5 seconds total.
+///
+/// A regression of either the cleanup-flush OR the Drop-flush would
+/// trip this test.
+#[test]
+fn file_written_via_win32_survives_unmount() {
+    require_winfsp!();
+    let Some(mp) = pick_free_drive_letter() else {
+        eprintln!("[skip] no free drive letter D:-Z:");
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let (vfs, vault) = fresh_vfs(dir.path(), "persist");
+
+    let mp_thr = mp.clone();
+    let mount_join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false));
+
+    // Wait for the kernel mount to be visible to Win32.
+    thread::sleep(Duration::from_secs(3));
+
+    // Write a file to the root of the mounted volume. Going through
+    // `std::fs` exercises the same NT IRP path Explorer uses (CreateFile
+    // -> WriteFile -> CloseHandle), which is what triggers Cleanup
+    // dispatch on handle close.
+    let mp_str = mp.to_str().unwrap();
+    let on_volume = PathBuf::from(format!("{mp_str}\\persist.txt"));
+    let payload: &[u8] = b"survive-unmount-please";
+    let write_result = std::fs::write(&on_volume, payload);
+
+    // Also create a subdirectory + nested file: directory metadata
+    // lives in the same tree blob, so a regression that drops file
+    // chunks but keeps directory entries (or vice versa) is caught.
+    let nested_dir = PathBuf::from(format!("{mp_str}\\sub"));
+    let mkdir_result = std::fs::create_dir(&nested_dir);
+    let nested_file = PathBuf::from(format!("{mp_str}\\sub\\nested.bin"));
+    let nested_payload: Vec<u8> = (0u8..200).cycle().take(8192).collect();
+    let nested_write_result = std::fs::write(&nested_file, &nested_payload);
+
+    // Tear down. After this returns, the kernel mount is gone and the
+    // .lbx is closed; whatever's on disk is what we'll see on reopen.
+    luksbox_mount::unmount(&mp).expect("unmount");
+    let _ = mount_join.join().expect("mount thread");
+
+    // Surface the Win32 errors AFTER unmount so the test's main fault
+    // line ("did the data persist?") prints whatever the kernel-side
+    // copy reported as a hint.
+    write_result.expect("write to mounted volume");
+    mkdir_result.expect("mkdir on mounted volume");
+    nested_write_result.expect("write nested file on mounted volume");
+
+    // Reopen the underlying vault and verify the data is actually
+    // persisted. If the cleanup-flush is missing, lookup_path here
+    // returns NotFound (no inode), even though the encrypted chunks
+    // are physically present on disk - the metadata blob never got
+    // updated to reference them.
+    let mut vfs = reopen_vfs(&vault);
+
+    let id = vfs
+        .lookup_path("/persist.txt")
+        .expect("persist.txt should exist after unmount + reopen");
+    let stat = vfs.stat(id).expect("stat persist.txt");
+    assert_eq!(
+        stat.size,
+        payload.len() as u64,
+        "persist.txt size mismatch after reopen"
+    );
+    let mut readback = vec![0u8; payload.len()];
+    let n = vfs.read(id, 0, &mut readback).expect("read persist.txt");
+    assert_eq!(n, payload.len());
+    assert_eq!(
+        readback, payload,
+        "persist.txt content mismatch after reopen"
+    );
+
+    let nested_id = vfs
+        .lookup_path("/sub/nested.bin")
+        .expect("nested file should exist after unmount + reopen");
+    let nested_stat = vfs.stat(nested_id).expect("stat nested file");
+    assert_eq!(nested_stat.size, nested_payload.len() as u64);
+    let mut nested_readback = vec![0u8; nested_payload.len()];
+    let mut got = 0usize;
+    while got < nested_readback.len() {
+        let n = vfs
+            .read(nested_id, got as u64, &mut nested_readback[got..])
+            .expect("read nested file");
+        if n == 0 {
+            break;
+        }
+        got += n;
+    }
+    assert_eq!(got, nested_payload.len());
+    assert_eq!(
+        nested_readback, nested_payload,
+        "nested file content mismatch after reopen"
+    );
+}
+
 /// Cross-process unmount (the user opening a second terminal and
 /// running `luksbox umount Y:`) must NOT silently succeed - WinFsp
 /// has no out-of-band unmount IPC and pretending we honored the
