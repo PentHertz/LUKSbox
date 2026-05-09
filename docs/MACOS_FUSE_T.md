@@ -65,6 +65,78 @@ high-level header that FUSE-T ships) and exposes a safe Rust
 `Filesystem` trait that `crates/luksbox-mount/src/fuse_t.rs`
 implements against `luksbox_vfs::Vfs`.
 
+### Subprocess isolation (GUI mount on macOS+FUSE-T)
+
+When the LUKSbox GUI mounts a vault on a FUSE-T build, it does NOT
+call `luksbox_mount::mount` directly on a worker thread. Instead it
+spawns the bundled CLI binary as a child process:
+
+```
+GUI process                                Child process
+-----------                                -------------
+1. user clicks "Mount as volume"
+2. mvk = vfs.container().mvk_clone()
+3. drop vfs (release file lock)
+4. spawn child:
+     LUKSbox.app/Contents/MacOS/luksbox \
+       mount-fuse-t-helper \
+       <vault.lbx> [--header HDR] <mountpoint>
+5. write 32 bytes of mvk to child.stdin
+6. zeroize parent's mvk copy
+                                          1. read 32 bytes from stdin
+                                          2. mvk = MasterVolumeKey::from_bytes(bytes)
+                                          3. zeroize stdin buffer
+                                          4. Container::open_with_mvk(...)
+                                          5. Vfs::open(container)
+                                          6. luksbox_mount::mount(vfs, mp, false)
+                                             -> blocks in fuse_main_real
+7. poll child status via try_wait()
+   each frame
+8. user clicks "Unmount":
+     /sbin/umount <mountpoint>
+                                          7. fuse_main_real returns
+                                             (or libfuse-t aborts the
+                                              child - GUI doesn't care)
+                                          8. exit(N)
+9. try_wait() -> Some(status):
+     view = Welcome, toast based on status
+```
+
+**Why this is necessary**: libfuse-t.dylib's mount-teardown path
+calls `_exit()` / `abort()` / sends an uncatchable signal to the
+process during unmount. We diagnosed this with full trace logging
+(panic hook + per-callback eprintlns) and confirmed no Rust panic
+fires; the abort is C-side, deep inside FUSE-T or its closed-source
+`go-nfsv4` helper. Running libfuse-t in the same process as the GUI
+meant the GUI silently closed every time the user unmounted a
+vault. Subprocess isolation contains the abort to a child whose
+exit status the GUI observes calmly.
+
+**MVK transport security**:
+- The 32-byte MVK is piped over the child's stdin (anonymous
+  inherited pipe; no other process can read it; macOS pipe pages
+  are not swappable to disk).
+- Both processes hold the MVK in `[u8; 32]` stack buffers only
+  long enough to construct a `MasterVolumeKey` (~microseconds);
+  buffers are `Zeroize`d immediately after.
+- The `MasterVolumeKey`'s long-lived storage is the existing
+  `SecretBox` wrapper (memfd_secret on Linux, mlock'd on macOS).
+- Wrong MVK fails fast with `Error::Crypto(HeaderAuthFailed)` from
+  `Container::open_with_mvk`'s HMAC verification - no garbled
+  metadata reads downstream.
+
+**No re-authentication**: the user does NOT re-enter their
+passphrase / re-touch their FIDO2 device when mounting. The MVK
+travels from parent to child via the pipe; user experience is
+identical to the in-process mount path.
+
+**This affects only macOS+FUSE-T builds.** macFUSE on macOS, libfuse3
+on Linux, and WinFsp on Windows all use the legacy in-process
+worker-thread path (none of them have the close-on-unmount bug
+FUSE-T has). Backend dispatch lives in
+`crates/luksbox-gui/src/app.rs::start_mount_picker`, gated on
+`luksbox_mount::FUSE_BACKEND == "fuse-t"`.
+
 ## Why we don't just use the existing `fuser` crate
 
 `fuser = "0.17"` (`workspace.dependencies` in `Cargo.toml`) hard-codes
@@ -309,6 +381,29 @@ the common path". Items that need attention before Phase 2 / v0.2:
   time; Phase 2 adds an integration-test job mirroring the WinFsp
   test on Windows.
 
+## Troubleshooting / diagnostic logging
+
+`LUKSBOX_FUSE_T_TRACE=1` enables per-callback trace logging to
+both stderr and `~/Library/Logs/LUKSbox/fuse-t.log`. Default off so
+production users don't accumulate disk footprint after the
+close-on-unmount bug was contained via subprocess isolation. When
+enabled:
+
+```bash
+export LUKSBOX_FUSE_T_TRACE=1
+open /Applications/LUKSbox.app
+# ...mount, unmount, then:
+tail -100 ~/Library/Logs/LUKSbox/fuse-t.log
+```
+
+Each line is `[t=<unix-time>.<ms>]: luksbox-fuse-t: <message>`. You
+should see entry / op_destroy / fuse_main_real-returned / signal-
+handlers-restored bracketing the mount session. If the log truncates
+at "entering fuse_main_real" with no follow-on lines, the FUSE-T
+helper aborted the child process - exactly the bug subprocess
+isolation is meant to contain. The GUI will surface this as a toast
+"mount helper exited abnormally" instead of closing.
+
 ## Where the code lives
 
 | File | What it is |
@@ -323,8 +418,11 @@ the common path". Items that need attention before Phase 2 / v0.2:
 | `crates/luksbox-mount/Cargo.toml` | Adds the `fuse-t` Cargo feature and a macOS-only optional `luksbox-fuse-t` dep. |
 | `crates/luksbox-mount/src/lib.rs` | `mount()`/`unmount()` dispatch with the `fuse-t` > `fuse` precedence on macOS. |
 | `crates/luksbox-mount/src/fuse_t.rs` | The adapter, implements `luksbox_fuse_t::Filesystem` against `luksbox_vfs::Vfs`. |
+| `crates/luksbox-format/src/container.rs::open_with_mvk` | Subprocess-isolation entry: opens a vault from a precomputed MVK (no passphrase derivation), with header HMAC verification against the supplied MVK. |
+| `crates/luksbox-cli/src/main.rs::cmd_mount_fuse_t_helper` | Hidden CLI subcommand `mount-fuse-t-helper`: reads MVK from stdin, runs the FUSE event loop. Spawned by the GUI on macOS+FUSE-T builds. |
+| `crates/luksbox-gui/src/app.rs::start_mount_subprocess + locate_helper_binary` | GUI's parent-side spawn of the helper subprocess + MVK pipe + zeroize discipline. |
 | `scripts/build_release.sh` | `fuse_t_for_target()` probe and the FUSE-T-preferred backend selection. |
-| `.github/workflows/release.yml` | macOS deps step: try FUSE-T cask first, fall back to macFUSE. |
+| `.github/workflows/release.yml` | macOS deps step: dual matrix (FUSE-T + macFUSE) builds two .dmgs per release. |
 | `BUILDING.md` macOS section | User-facing install instructions for both providers. |
 
 ## When to reconsider

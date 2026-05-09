@@ -10,7 +10,7 @@
 //!   View::Browser -> manages cwd, file list, keyslots, lock
 //!   PendingOp     -> in-flight background work; UI shows a "waiting..." overlay
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::Duration;
 
@@ -727,14 +727,36 @@ struct RenameTarget {
     is_dir: bool,
 }
 
-/// Live FUSE/WinFsp mount. While present, the Vfs has been moved into
-/// the mount thread and the browser shows a "mounted" placeholder.
-/// The receiver fires when the mount thread exits (clean unmount or
-/// crash); on either we drop back to Welcome.
+/// Live FUSE/WinFsp mount. While present, the Vfs has been moved
+/// out of `self.vault` (either into a same-process mount thread or
+/// into a child process via stdin pipe) and the browser shows a
+/// "mounted" placeholder. The backend flips when the mount session
+/// ends (clean unmount or crash); on either we drop back to Welcome.
 struct MountStatus {
     mountpoint: PathBuf,
-    rx: std::sync::mpsc::Receiver<Result<(), String>>,
+    backend: MountBackend,
     unmount_requested: bool,
+}
+
+/// Backend-specific transport for the running mount session.
+///
+/// `InProcess` is the legacy (and current default for every backend
+/// except FUSE-T) path: a worker thread calls `luksbox_mount::mount`
+/// directly and signals completion through a channel.
+///
+/// `Subprocess` is FUSE-T-only on macOS: libfuse-t lives in a child
+/// process so when its NFS helper aborts the helper-process during
+/// teardown, only the child dies. Parent polls `child.try_wait()`
+/// every frame to detect completion. See
+/// `docs/MACOS_FUSE_T.md` -> "Subprocess isolation" for the full
+/// rationale.
+enum MountBackend {
+    InProcess {
+        rx: std::sync::mpsc::Receiver<Result<(), String>>,
+    },
+    Subprocess {
+        child: std::process::Child,
+    },
 }
 
 #[derive(Clone)]
@@ -4048,15 +4070,41 @@ impl LuksboxApp {
         let Some(opened) = self.vault.take() else {
             return;
         };
-        let mp_clone = mountpoint.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let r = luksbox_mount::mount(opened.vfs, &mp_clone, false).map_err(|e| e.to_string());
-            let _ = tx.send(r);
-        });
+
+        // Backend dispatch:
+        //   FUSE-T (macOS, kext-free): spawn the CLI helper subprocess
+        //     so libfuse-t lives in its own process. When libfuse-t
+        //     aborts itself during teardown (which it does, see
+        //     docs/MACOS_FUSE_T.md), only the child dies; the GUI
+        //     keeps running.
+        //   Everything else (macFUSE, Linux libfuse3, Windows WinFsp):
+        //     in-process worker thread, the legacy path. None of these
+        //     have the close-on-unmount bug FUSE-T has.
+        let backend = if luksbox_mount::FUSE_BACKEND == "fuse-t" {
+            match start_mount_subprocess(opened, &mountpoint) {
+                Ok(child) => MountBackend::Subprocess { child },
+                Err(e) => {
+                    self.toast_err(format!("could not start mount helper: {e}"));
+                    // OpenedVault was consumed; user must reopen the
+                    // vault from Welcome. Bounce back to Welcome.
+                    self.view = View::Welcome;
+                    return;
+                }
+            }
+        } else {
+            let mp_clone = mountpoint.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let r =
+                    luksbox_mount::mount(opened.vfs, &mp_clone, false).map_err(|e| e.to_string());
+                let _ = tx.send(r);
+            });
+            MountBackend::InProcess { rx }
+        };
+
         self.mount_status = Some(MountStatus {
             mountpoint,
-            rx,
+            backend,
             unmount_requested: false,
         });
     }
@@ -4192,32 +4240,72 @@ impl LuksboxApp {
         });
     }
 
-    /// Polled from the main update loop. If the mount thread has
-    /// finished (clean unmount or crash), drop back to Welcome since
-    /// the Vfs has been consumed and there's nothing to browse.
+    /// Polled from the main update loop. If the mount session
+    /// (in-process thread or out-of-process child) has finished -
+    /// clean unmount or crash - drop back to Welcome since the Vfs
+    /// has been consumed/released and there's nothing to browse.
+    ///
+    /// The two backends report completion differently:
+    ///   - InProcess: receiver fires with the worker thread's
+    ///     `Result<(), String>`.
+    ///   - Subprocess: child.try_wait() returns Some(ExitStatus).
+    /// Both translate into the same view transition.
     fn poll_mount(&mut self) {
-        let Some(ms) = self.mount_status.as_ref() else {
+        let Some(ms) = self.mount_status.as_mut() else {
             return;
         };
-        match ms.rx.try_recv() {
-            Ok(Ok(())) => {
-                self.mount_status = None;
-                self.view = View::Welcome;
-                self.cwd = "/".into();
-                self.listing.clear();
-                self.toast_ok("vault unmounted");
-            }
-            Ok(Err(e)) => {
-                self.mount_status = None;
-                self.view = View::Welcome;
-                self.toast_err(format!("mount error: {e}"));
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(_) => {
-                self.mount_status = None;
-                self.view = View::Welcome;
-                self.toast_err("mount thread terminated unexpectedly");
-            }
+        match &mut ms.backend {
+            MountBackend::InProcess { rx } => match rx.try_recv() {
+                Ok(Ok(())) => {
+                    self.mount_status = None;
+                    self.view = View::Welcome;
+                    self.cwd = "/".into();
+                    self.listing.clear();
+                    self.toast_ok("vault unmounted");
+                }
+                Ok(Err(e)) => {
+                    self.mount_status = None;
+                    self.view = View::Welcome;
+                    self.toast_err(format!("mount error: {e}"));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                Err(_) => {
+                    self.mount_status = None;
+                    self.view = View::Welcome;
+                    self.toast_err("mount thread terminated unexpectedly");
+                }
+            },
+            MountBackend::Subprocess { child } => match child.try_wait() {
+                Ok(None) => {
+                    // Child still running, nothing to do.
+                }
+                Ok(Some(status)) => {
+                    self.mount_status = None;
+                    self.view = View::Welcome;
+                    self.cwd = "/".into();
+                    self.listing.clear();
+                    if status.success() {
+                        self.toast_ok("vault unmounted");
+                    } else {
+                        // Non-zero exit can mean libfuse-t aborted
+                        // itself during teardown (the original FUSE-T
+                        // bug we're isolating), the kernel killed the
+                        // child, or a real error. We can't always
+                        // tell which from just the exit code, so the
+                        // message is deliberately neutral.
+                        self.toast_err(format!(
+                            "mount helper exited abnormally ({status}); the mount has \
+                             been torn down. Check ~/Library/Logs/LUKSbox/fuse-t.log \
+                             if you set LUKSBOX_FUSE_T_TRACE=1.",
+                        ));
+                    }
+                }
+                Err(e) => {
+                    self.mount_status = None;
+                    self.view = View::Welcome;
+                    self.toast_err(format!("could not poll mount helper: {e}"));
+                }
+            },
         }
     }
 }
@@ -6730,6 +6818,121 @@ fn resolved_default_app_opener() -> Option<std::path::PathBuf> {
 /// rather than relying on `$PATH` (CVE-2024-54187 class). On platforms
 /// where no helper resolves, surfaces the failure via the existing
 /// `eprintln!` channel - caller is fire-and-forget.
+/// Spawn the FUSE-T mount-helper subprocess and pipe the MVK to its
+/// stdin. Used only when `luksbox_mount::FUSE_BACKEND == "fuse-t"`.
+///
+/// The flow:
+/// 1. Locate the sibling `luksbox` CLI binary in the same .app
+///    bundle (or development target dir).
+/// 2. Extract the MVK from the open Vfs.
+/// 3. Drop the OpenedVault so its Container's flock(LOCK_EX) is
+///    released, otherwise the child's `Container::open_with_mvk`
+///    would fail with `Error::VaultLocked`.
+/// 4. Spawn the child with stdin piped, write 32 bytes of MVK,
+///    zeroize the local copy, close stdin so the child sees EOF.
+/// 5. Return the [`std::process::Child`] for the caller to poll.
+///
+/// Takes `OpenedVault` by value so the lock-release ordering is
+/// enforced by the type system: the `drop(opened)` call below MUST
+/// run before `cmd.spawn()` for the child to be able to acquire
+/// the flock.
+fn start_mount_subprocess(
+    opened: OpenedVault,
+    mountpoint: &Path,
+) -> Result<std::process::Child, String> {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    use zeroize::Zeroize as _;
+
+    let helper = locate_helper_binary().ok_or_else(|| {
+        "could not find the `luksbox` CLI binary alongside the GUI \
+         (expected at the same directory as the running luksbox-gui \
+          executable; on macOS this is LUKSbox.app/Contents/MacOS/)"
+            .to_string()
+    })?;
+
+    // 1. Pull out everything we'll need AFTER the OpenedVault drops.
+    let vault_path = opened.vault_path.clone();
+    let header_path = opened.header_path.clone();
+    let mvk = opened.vfs.container().mvk_clone();
+
+    // 2. Drop the OpenedVault now to release the file lock. After
+    // this point the .lbx file has no flock holder; the child can
+    // acquire it.
+    drop(opened);
+
+    // 3. Spawn the child.
+    let mut cmd = Command::new(&helper);
+    cmd.arg("mount-fuse-t-helper");
+    if let Some(hp) = &header_path {
+        cmd.arg("--header").arg(hp);
+    }
+    cmd.arg(&vault_path).arg(mountpoint);
+    cmd.stdin(Stdio::piped());
+    // Inherit stdout/stderr so the child's diagnostic eprintlns
+    // (and any panic output) end up in the parent's terminal when
+    // the GUI was launched from Terminal, or in the system log
+    // otherwise.
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn {} mount-fuse-t-helper: {e}", helper.display()))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "child stdin was not piped".to_string())?;
+
+    // 4. Local copy on the stack so we can zeroize after writing.
+    // `mvk.as_bytes()` returns &[u8; 32] borrowed from the
+    // SecretBox; the dereference + array copy is the brief
+    // exposure documented in docs/MACOS_FUSE_T.md.
+    let mut bytes: [u8; 32] = *mvk.as_bytes();
+    let write_res = stdin.write_all(&bytes);
+    bytes.zeroize();
+    // Close stdin so the child's read_exact completes; without
+    // this the child would block forever waiting for more bytes.
+    drop(stdin);
+    write_res.map_err(|e| format!("could not write MVK to child stdin: {e}"))?;
+
+    // The MVK drops here at end-of-function; SecretBox's Drop runs
+    // and zeroizes its inner storage. The child now has its own
+    // copy, will reconstruct a MasterVolumeKey from it, and zeroize
+    // its stdin buffer.
+    Ok(child)
+}
+
+/// Find the sibling `luksbox` CLI binary that the GUI's mount-helper
+/// subprocess invocation needs.
+///
+/// Production layout (.app bundle on macOS):
+///   /Applications/LUKSbox.app/Contents/MacOS/luksbox-gui   <- this binary
+///   /Applications/LUKSbox.app/Contents/MacOS/luksbox       <- helper
+///
+/// Dev layout (cargo run):
+///   target/release/luksbox-gui    <- this binary
+///   target/release/luksbox        <- helper
+///
+/// Both layouts have the helper binary at `<self_dir>/luksbox`
+/// (`luksbox.exe` on Windows, but FUSE-T is macOS-only so we don't
+/// hit that path here). Returns `None` if no such file exists; the
+/// caller surfaces a clear error.
+fn locate_helper_binary() -> Option<PathBuf> {
+    let me = std::env::current_exe().ok()?;
+    let dir = me.parent()?;
+    let candidate = dir.join(if cfg!(windows) {
+        "luksbox.exe"
+    } else {
+        "luksbox"
+    });
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 fn open_in_file_manager(path: impl AsRef<std::path::Path>) {
     let path = path.as_ref();
 

@@ -605,18 +605,35 @@ fn build_operations() -> sys::fuse_operations {
     ops
 }
 
+/// Returns true if the user has opted into FUSE-T diagnostic
+/// tracing via the `LUKSBOX_FUSE_T_TRACE` env var. Default off so
+/// production users don't accumulate `~/Library/Logs/LUKSbox/`
+/// footprint after the close-on-unmount bug was fixed via subprocess
+/// isolation. Re-evaluated on every check (no caching) so the user
+/// can `export LUKSBOX_FUSE_T_TRACE=1` mid-session and start
+/// capturing without restarting.
+fn tracing_enabled() -> bool {
+    matches!(
+        std::env::var("LUKSBOX_FUSE_T_TRACE").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
 /// Diagnostic log target for FUSE-T mount lifecycle events.
 ///
-/// Writes to BOTH stderr (visible if launched from Terminal) AND
+/// Gated on `LUKSBOX_FUSE_T_TRACE=1`. When enabled, writes to BOTH
+/// stderr (visible if launched from Terminal) AND
 /// `~/Library/Logs/LUKSbox/fuse-t.log` (visible regardless of launch
-/// method, so a Finder-double-click of LUKSbox.app produces a
-/// readable trace of the mount session). The file is opened in
-/// append mode and timestamped per-line so a user reporting a bug
-/// can include the most recent session.
+/// method). When disabled (the default), this is a no-op - no
+/// stderr output, no file written, no `~/Library/Logs/LUKSbox/`
+/// directory created.
 ///
 /// Falls back to stderr-only on any I/O error so the diagnostic
 /// path never causes its own failures.
 fn trace(msg: &str) {
+    if !tracing_enabled() {
+        return;
+    }
     let line = format!("{}: luksbox-fuse-t: {}", chrono_like_now(), msg);
     eprintln!("{line}");
     if let Some(path) = trace_log_path() {
@@ -658,15 +675,19 @@ fn chrono_like_now() -> String {
 
 /// Install a process-wide panic hook that mirrors panics into the
 /// FUSE-T trace log BEFORE chaining to the previously-installed
-/// hook (default or user-set). Diagnostic only: tells us whether a
-/// disappearing-GUI-on-unmount is caused by a Rust panic somewhere
-/// in the mount worker thread (in which case we'll see "PANIC: ..."
-/// in `~/Library/Logs/LUKSbox/fuse-t.log`) or by a C-level abort /
-/// signal from libfuse-t.dylib (no PANIC line, just an abrupt end
-/// of the trace).
+/// hook (default or user-set). Diagnostic only: when
+/// `LUKSBOX_FUSE_T_TRACE=1` is set, panics anywhere in the process
+/// get logged to `~/Library/Logs/LUKSbox/fuse-t.log` with location
+/// info. Useful for diagnosing mount-related crashes on macOS hosts
+/// where signal-driven aborts in libfuse-t can otherwise be opaque.
 ///
 /// Once-guarded so multiple mount cycles don't accumulate hooks.
+/// No-op when tracing is disabled (the default), so we don't
+/// pollute the process's panic-hook chain in production.
 fn install_panic_hook_once() {
+    if !tracing_enabled() {
+        return;
+    }
     static HOOK: Once = Once::new();
     HOOK.call_once(|| {
         let prev = std::panic::take_hook();

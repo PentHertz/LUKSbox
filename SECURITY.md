@@ -409,6 +409,32 @@ get in touch.
     [`docs/MACOS_FUSE_T.md`](docs/MACOS_FUSE_T.md#threat-model-differences-vs-macfuse-read-this-before-picking).
     On macOS 26+ the FSKit backend (Unix domain socket, no TCP
     loopback) closes this hole.
+- **macOS+FUSE-T GUI mounts use subprocess isolation with MVK
+  passed over an inherited stdin pipe.** When the GUI mounts a
+  vault on a FUSE-T build, it spawns the bundled `luksbox` CLI
+  binary as a child process (subcommand `mount-fuse-t-helper`)
+  and pipes the 32-byte Master Volume Key over the child's
+  stdin. This is necessary because libfuse-t.dylib's teardown
+  path issues an uncatchable abort that would kill the GUI
+  otherwise; isolating it to a child contains the abort. The
+  trade-off is a brief MVK exposure during pipe transit:
+  - The pipe is a kernel-anonymous inherited file descriptor;
+    no process other than the spawned child can read it.
+  - macOS pipe pages are not swappable to disk.
+  - Both processes hold the MVK in `[u8; 32]` stack buffers
+    only long enough to construct the `MasterVolumeKey`
+    (microseconds) and `Zeroize` the buffers immediately
+    after.
+  - The child's `Container::open_with_mvk` verifies the header
+    HMAC against the supplied MVK, so a wrong MVK fails fast
+    with `HeaderAuthFailed` instead of producing garbled
+    metadata reads.
+  - Full architectural detail in
+    [`docs/MACOS_FUSE_T.md` § Subprocess isolation](docs/MACOS_FUSE_T.md#subprocess-isolation-gui-mount-on-macosfuse-t).
+  This pathway exists ONLY for GUI mounts on macOS+FUSE-T
+  builds. CLI mounts (`luksbox mount ...`) and all other
+  backends keep the legacy in-process flow with no MVK
+  IPC.
 
 ### Cryptographic gaps
 
