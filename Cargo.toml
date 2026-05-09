@@ -88,8 +88,30 @@ debug = "line-tables-only"
 #                                 boundaries to grep for
 #  - `codegen-units = 1`          stricter dead-code elim, smaller
 #                                 attack surface in the binary
-#  - `panic = "abort"`            no unwind tables -> no panic strings
-#                                 visible in the binary
+#  - `panic = "unwind"`           was `abort`, switched 2026-05-09
+#                                 because `abort` makes a panic in
+#                                 ANY thread (including the GUI's
+#                                 mount-worker thread that calls
+#                                 libfuse-t's blocking `fuse_main_real`)
+#                                 SIGABRT the whole process. Symptom
+#                                 was the GUI app silently closing on
+#                                 unmount because something during
+#                                 fuse_main_real teardown panicked
+#                                 (Rust-side or C-side aborting through
+#                                 the panic=abort path) and there was
+#                                 no way to recover. With unwind, a
+#                                 worker-thread panic unwinds that
+#                                 thread only; the GUI stays alive and
+#                                 the user sees an unmount error toast
+#                                 instead of a vanishing app. Cost:
+#                                 unwind tables ship in the binary and
+#                                 panic strings are visible. We accept
+#                                 that trade-off; `strip = "symbols"`
+#                                 below removes the function-name
+#                                 portion of the unwind tables and
+#                                 the binary is open-source anyway so
+#                                 panic-string analysis adds little
+#                                 attacker leverage.
 #  - `strip = "symbols"`          remove all symbols + debug info
 #  - `debug = false`              no DWARF info shipped
 #  - `overflow-checks = false`    runtime overflow checks generate
@@ -102,7 +124,7 @@ inherits = "release"
 lto = "fat"
 codegen-units = 1
 opt-level = 3
-panic = "abort"
+panic = "unwind"
 strip = "symbols"
 debug = false
 overflow-checks = false

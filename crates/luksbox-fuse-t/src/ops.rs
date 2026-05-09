@@ -32,8 +32,8 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Once};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sys;
@@ -656,6 +656,40 @@ fn chrono_like_now() -> String {
     format!("[t={secs}.{millis:03}]")
 }
 
+/// Install a process-wide panic hook that mirrors panics into the
+/// FUSE-T trace log BEFORE chaining to the previously-installed
+/// hook (default or user-set). Diagnostic only: tells us whether a
+/// disappearing-GUI-on-unmount is caused by a Rust panic somewhere
+/// in the mount worker thread (in which case we'll see "PANIC: ..."
+/// in `~/Library/Logs/LUKSbox/fuse-t.log`) or by a C-level abort /
+/// signal from libfuse-t.dylib (no PANIC line, just an abrupt end
+/// of the trace).
+///
+/// Once-guarded so multiple mount cycles don't accumulate hooks.
+fn install_panic_hook_once() {
+    static HOOK: Once = Once::new();
+    HOOK.call_once(|| {
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let payload = info
+                .payload()
+                .downcast_ref::<&'static str>()
+                .map(|s| s.to_string())
+                .or_else(|| info.payload().downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            trace(&format!("PANIC at {location}: {payload}"));
+            // Chain to whatever was previously installed (default
+            // panic-handler prints to stderr, etc.).
+            prev(info);
+        }));
+        trace("panic hook installed");
+    });
+}
+
 // ---------------------------------------------------------------
 // Mount entry point
 // ---------------------------------------------------------------
@@ -672,6 +706,7 @@ pub(crate) fn run_mount<F: Filesystem + 'static>(
     mountpoint: &Path,
     options: &MountOptions,
 ) -> Result<(), MountError> {
+    install_panic_hook_once();
     // Runtime ABI check: the libfuse-t.dylib we're about to call
     // might have been built against a different libfuse header
     // version than our bindings. fuse_version() reports MAJOR*10+MINOR
