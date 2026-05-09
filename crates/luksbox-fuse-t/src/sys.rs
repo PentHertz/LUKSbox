@@ -21,28 +21,14 @@
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
-// `fuse_main_real` is the canonical libfuse 2.x entry point. It
-// handles arg parsing, mount, signal handlers, and the event loop in
-// one call. bindgen sees it through the `fuse_main(...)` macro that
-// expands to `fuse_main_real(... , sizeof(struct fuse_operations))`,
-// re-declare it explicitly so we can call it without the macro.
-//
-// Signature per `fuse.h` (libfuse 2.9):
-//   int fuse_main_real(int argc, char *argv[],
-//                      const struct fuse_operations *op,
-//                      size_t op_size, void *user_data);
-unsafe extern "C" {
-    pub fn fuse_main_real(
-        argc: ::core::ffi::c_int,
-        argv: *mut *mut ::core::ffi::c_char,
-        op: *const fuse_operations,
-        op_size: usize,
-        user_data: *mut ::core::ffi::c_void,
-    ) -> ::core::ffi::c_int;
-
-    /// libfuse 2.x ABI version probe. Returns `MAJOR * 10 + MINOR`,
-    /// e.g. 29 for libfuse 2.9. FUSE-T's compat layer reports the
-    /// libfuse version it emulates, which we want to be `>= 29`.
-    /// Used by `ops::run_mount` for a startup ABI sanity check.
-    pub fn fuse_version() -> ::core::ffi::c_int;
-}
+// NOTE: an earlier version of this file hand-declared
+// `fuse_main_real` and `fuse_version` here because libfuse 2.x
+// historically exposes them only behind the `fuse_main()` /
+// `FUSE_MAJOR_VERSION` macros (which bindgen can't see through).
+// FUSE-T's `<fuse_t/fuse.h>` declares both functions directly in
+// the public header, so bindgen picks them up and includes them in
+// the generated `bindings.rs`. Hand-declaring them here would
+// duplicate-define the symbols and fail to compile (E0428). We
+// rely on the bindgen output exclusively. If a future libfuse-t
+// release hides one of these behind a macro again, restore the
+// hand-decl below it (with appropriate cfg guards if needed).

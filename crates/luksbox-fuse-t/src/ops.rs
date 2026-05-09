@@ -185,7 +185,15 @@ fn n_to_c_int(n: usize) -> c_int {
 // Trampolines
 // ---------------------------------------------------------------
 
-unsafe extern "C" fn op_getattr(path: *const c_char, stbuf: *mut libc::stat) -> c_int {
+// libfuse 2.x callbacks take `struct stat *` / `struct statvfs *`
+// from the system headers. bindgen generates Rust mirrors of those
+// structs (`sys::stat`, `sys::statvfs`) and uses them in the
+// `fuse_operations` function pointer signatures. They have the same
+// memory layout as `libc::stat` / `libc::statvfs` on macOS but are
+// distinct Rust types, so the trampolines below MUST use the
+// bindgen-generated names or the `Some(op_getattr)` assignment in
+// `build_operations` won't type-check (E0308: fn pointer mismatch).
+unsafe extern "C" fn op_getattr(path: *const c_char, stbuf: *mut sys::stat) -> c_int {
     with_fs(|holder| {
         let Some(p) = cstr_to_path(path) else {
             return -libc::EINVAL;
@@ -207,32 +215,46 @@ unsafe extern "C" fn op_getattr(path: *const c_char, stbuf: *mut libc::stat) -> 
     })
 }
 
-fn fill_stat(s: &mut libc::stat, a: &FileAttr) {
-    s.st_mode = a.mode as libc::mode_t;
-    // size: u64 -> off_t (i64 on macOS). A vault size > 2^63-1 is
-    // not physically realisable but the cast itself would wrap; clamp
-    // to i64::MAX so a corrupted stat returns "huge" rather than
-    // a negative value the kernel would interpret as garbage.
-    s.st_size = libc::off_t::try_from(a.size).unwrap_or(libc::off_t::MAX);
-    s.st_uid = a.uid;
-    s.st_gid = a.gid;
-    s.st_nlink = a.nlink as libc::nlink_t;
+fn fill_stat(s: &mut sys::stat, a: &FileAttr) {
+    // Field types come from bindgen's view of `<sys/stat.h>`, which
+    // are NOT the same as libc's convenience-flattened equivalents
+    // (libc collapses st_atimespec etc. into separate st_atime /
+    // st_atime_nsec fields; bindgen preserves the nested timespec
+    // shape that the C header actually uses on macOS).
+    //
+    // Cast everything through `as` to whichever unsigned/signed
+    // integer the bindgen output requires; `try_from` for the
+    // potentially-overflowing conversions (u64 -> i64 etc.) so a
+    // corrupt FileAttr clamps instead of wrapping silently.
+    s.st_mode = a.mode as _;
+    s.st_size = i64::try_from(a.size).unwrap_or(i64::MAX) as _;
+    s.st_uid = a.uid as _;
+    s.st_gid = a.gid as _;
+    s.st_nlink = a.nlink as _;
     s.st_blksize = 4096;
-    // div_ceil avoids the (size + 511) overflow path; clamp the
-    // outer cast for the same reason as st_size above.
-    s.st_blocks = libc::blkcnt_t::try_from(a.size.div_ceil(512)).unwrap_or(libc::blkcnt_t::MAX);
-    // mtime: u128 nanos -> (time_t seconds, i64 nsec). Clamp seconds
-    // at time_t::MAX so a corrupt mtime can't roll into the past.
+    s.st_blocks = i64::try_from(a.size.div_ceil(512)).unwrap_or(i64::MAX) as _;
     let secs_u = a.mtime_ns / 1_000_000_000;
-    let secs = libc::time_t::try_from(secs_u).unwrap_or(libc::time_t::MAX);
+    let secs = i64::try_from(secs_u).unwrap_or(i64::MAX);
     let nsec = (a.mtime_ns % 1_000_000_000) as i64; // <1e9, always fits
-    // macOS spells these *_atimespec / *_mtimespec / *_ctimespec.
-    s.st_atime = secs;
-    s.st_atime_nsec = nsec;
-    s.st_mtime = secs;
-    s.st_mtime_nsec = nsec;
-    s.st_ctime = secs;
-    s.st_ctime_nsec = nsec;
+    // macOS struct stat uses nested timespec sub-structs:
+    //   struct timespec st_atimespec, st_mtimespec, st_ctimespec, st_birthtimespec;
+    // Write through the nested form. bindgen's timespec has
+    // `tv_sec` and `tv_nsec` fields; cast through `as _` to absorb
+    // platform-typedef differences (e.g. __darwin_time_t).
+    s.st_atimespec.tv_sec = secs as _;
+    s.st_atimespec.tv_nsec = nsec as _;
+    s.st_mtimespec.tv_sec = secs as _;
+    s.st_mtimespec.tv_nsec = nsec as _;
+    s.st_ctimespec.tv_sec = secs as _;
+    s.st_ctimespec.tv_nsec = nsec as _;
+    // st_birthtimespec is intentionally left at the memset-zero
+    // initialised value (epoch). bindgen only emits the field when
+    // the FUSE-T headers were compiled with `_DARWIN_USE_64_BIT_INODE`
+    // visible to clang; the FUSE wrapper.h doesn't force that macro,
+    // so the field's presence depends on the SDK headers picked up at
+    // bindgen time. Skipping the assignment keeps the binding portable
+    // across macOS SDK versions; Finder shows the file's birth time as
+    // 1970-01-01 instead of mtime, which is harmless for a vault.
 }
 
 unsafe extern "C" fn op_readdir(
@@ -453,7 +475,7 @@ unsafe extern "C" fn op_release(path: *const c_char, _fi: *mut sys::fuse_file_in
     })
 }
 
-unsafe extern "C" fn op_statfs(path: *const c_char, sv: *mut libc::statvfs) -> c_int {
+unsafe extern "C" fn op_statfs(path: *const c_char, sv: *mut sys::statvfs) -> c_int {
     with_fs(|holder| {
         let Some(p) = cstr_to_path(path) else {
             return -libc::EINVAL;
@@ -465,14 +487,22 @@ unsafe extern "C" fn op_statfs(path: *const c_char, sv: *mut libc::statvfs) -> c
                 }
                 unsafe { ptr::write_bytes(sv, 0, 1) };
                 let out = unsafe { &mut *sv };
-                out.f_blocks = s.blocks;
-                out.f_bfree = s.bfree;
-                out.f_bavail = s.bavail;
-                out.f_files = s.files;
-                out.f_ffree = s.ffree;
-                out.f_bsize = s.bsize as libc::c_ulong;
-                out.f_frsize = s.frsize as libc::c_ulong;
-                out.f_namemax = s.namemax as libc::c_ulong;
+                // macOS's `fsblkcnt_t` / `fsfilcnt_t` are `unsigned int`
+                // (u32) for POSIX legacy reasons - Linux uses u64. Our
+                // `StatVfs` uses u64 to match the wider Linux shape;
+                // clamp to the destination width via try_from so a
+                // spuriously huge value reports "u32::MAX blocks free"
+                // rather than wrapping to a small/zero number.
+                // `as _` defers the bindgen-generated typedef name
+                // (might be `__darwin_fsblkcnt_t` etc.).
+                out.f_blocks = u32::try_from(s.blocks).unwrap_or(u32::MAX) as _;
+                out.f_bfree = u32::try_from(s.bfree).unwrap_or(u32::MAX) as _;
+                out.f_bavail = u32::try_from(s.bavail).unwrap_or(u32::MAX) as _;
+                out.f_files = u32::try_from(s.files).unwrap_or(u32::MAX) as _;
+                out.f_ffree = u32::try_from(s.ffree).unwrap_or(u32::MAX) as _;
+                out.f_bsize = s.bsize as _;
+                out.f_frsize = s.frsize as _;
+                out.f_namemax = s.namemax as _;
                 0
             }
             Err(e) => -e.0,
