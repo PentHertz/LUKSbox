@@ -32,6 +32,49 @@ mod winfsp;
 // the full rationale.
 pub mod winfsp_path;
 
+/// Compile-time identifier of the FUSE backend wired into this build.
+///
+/// Resolved by the same `cfg` precedence as `mount()` / `unmount()`:
+///
+/// - macOS + `fuse-t` feature: `"fuse-t"`
+/// - macOS + `fuse` feature (no `fuse-t`): `"macfuse"`
+/// - Linux + `fuse` feature: `"libfuse3"`
+/// - Windows + `winfsp` feature: `"winfsp"`
+/// - none of the above: `"none"` (mount returns `MountError::Unsupported`)
+///
+/// Used by `luksbox --version` so a user who downloads a release
+/// artifact can immediately tell which FUSE provider their binary
+/// expects on the host (and which provider to install if they're
+/// missing it). Also surfaced in the GUI's "About" if/when one
+/// gets added.
+pub const FUSE_BACKEND: &str = {
+    #[cfg(all(target_os = "macos", feature = "fuse-t"))]
+    {
+        "fuse-t"
+    }
+    #[cfg(all(target_os = "macos", feature = "fuse", not(feature = "fuse-t"),))]
+    {
+        "macfuse"
+    }
+    #[cfg(all(target_os = "linux", feature = "fuse"))]
+    {
+        "libfuse3"
+    }
+    #[cfg(all(target_os = "windows", feature = "winfsp"))]
+    {
+        "winfsp"
+    }
+    #[cfg(any(
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+        all(target_os = "linux", not(feature = "fuse")),
+        all(target_os = "macos", not(feature = "fuse"), not(feature = "fuse-t")),
+        all(target_os = "windows", not(feature = "winfsp")),
+    ))]
+    {
+        "none"
+    }
+};
+
 #[derive(Debug, Error)]
 pub enum MountError {
     #[error("io: {0}")]

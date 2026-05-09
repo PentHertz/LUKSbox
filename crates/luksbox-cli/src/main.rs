@@ -19,8 +19,55 @@ mod wizard;
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn StdError>>;
 
+/// Extended `--version` output. `-V` still prints the bare version
+/// (clap's default short-version behaviour); `--version` prints
+/// version + the FUSE backend baked in at build time, so a user who
+/// downloaded the wrong .dmg variant for their installed FUSE
+/// provider can immediately see the mismatch instead of waiting for
+/// the cryptic dyld error at first mount.
+///
+/// `concat!()` requires string literals, so we cfg-gate the whole
+/// const per backend. Exactly one of these blocks is active per
+/// build (mutual exclusion enforced by the same cfg pattern as
+/// `luksbox_mount::FUSE_BACKEND`).
+#[cfg(all(target_os = "macos", feature = "fuse-t"))]
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nFUSE backend: fuse-t (kext-free, requires `brew install --cask fuse-t`)"
+);
+#[cfg(all(target_os = "macos", feature = "fuse", not(feature = "fuse-t"),))]
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nFUSE backend: macfuse (kext-based, requires `brew install --cask macfuse`)"
+);
+#[cfg(all(target_os = "linux", feature = "fuse"))]
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nFUSE backend: libfuse3 (requires `apt install libfuse3-3` or distro equivalent)"
+);
+#[cfg(all(target_os = "windows", feature = "winfsp"))]
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nFUSE backend: winfsp (requires WinFsp from https://winfsp.dev/)"
+);
+#[cfg(any(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    all(target_os = "linux", not(feature = "fuse")),
+    all(target_os = "macos", not(feature = "fuse"), not(feature = "fuse-t")),
+    all(target_os = "windows", not(feature = "winfsp")),
+))]
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nFUSE backend: none (mount support not compiled in)"
+);
+
 #[derive(Parser)]
-#[command(name = "luksbox", version, about = "Encrypted container tool")]
+#[command(
+    name = "luksbox",
+    version,
+    long_version = LONG_VERSION,
+    about = "Encrypted container tool",
+)]
 struct Cli {
     /// libfido2 device path to bind every FIDO2 op to. Optional.
     /// Without this flag, luksbox uses the first authenticator

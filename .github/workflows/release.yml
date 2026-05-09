@@ -114,9 +114,31 @@ jobs:
           # - target: x86_64-apple-darwin
           #   runner: macos-13         # last Intel macOS runner
           #   archive: luksbox-${{ github.ref_name }}-x86_64-macos.tar.gz
+          # macOS Apple Silicon, two parallel builds — one per FUSE
+          # backend. Each runner installs ONLY the matching provider
+          # (no fallback) and produces a backend-suffixed .dmg + .tar.gz.
+          # End users on the download page pick the variant matching
+          # the FUSE provider they want to install.
+          #
+          # Why two builds and not one universal:
+          #   - libfuse-t.dylib (FUSE-T) and libfuse.2.dylib (macFUSE)
+          #     define the same C symbols. They cannot coexist in the
+          #     same Mach-O binary; the linker would either reject or
+          #     silently pick one.
+          #   - The FUSE-T variant has no MFMount.framework dependency
+          #     and works cleanly on any Mac without prior FUSE install.
+          #   - The macFUSE variant transitively links MFMount and
+          #     REQUIRES macFUSE installed at the system path; without
+          #     it the .app crashes at launch (dyld kills the process
+          #     before main() runs). Documented in the release notes.
           - target: aarch64-apple-darwin
-            runner: macos-14         # Apple Silicon
-            archive: luksbox-${{ github.ref_name }}-aarch64-macos.dmg
+            runner: macos-14
+            fuse_backend: fuset
+            archive: luksbox-${{ github.ref_name }}-aarch64-macos-fuset.dmg
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            fuse_backend: macfuse
+            archive: luksbox-${{ github.ref_name }}-aarch64-macos-macfuse.dmg
 
     steps:
       - uses: actions/checkout@v4
@@ -128,10 +150,69 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          # Include fuse_backend so the two macOS variants (fuset /
+          # macfuse) don't share a cache slot — they link different
+          # libfuse families so cached artifacts would poison each
+          # other. Empty for non-macOS targets, no behavior change.
+          key: ${{ matrix.target }}-${{ matrix.fuse_backend }}
           # cache hit-rate matters most on Windows where vcpkg also
           # builds OpenSSL from source; the rust-cache covers ~/.cargo.
           shared-key: release
+
+      - name: Derive LUKSBOX_VERSION
+        # On a tag push (`refs/tags/vX.Y.Z`), GITHUB_REF_NAME is the tag
+        # ("vX.Y.Z") and we strip the leading `v`. On any other ref
+        # (workflow_dispatch from a branch, scheduled runs), the
+        # ref_name is the BRANCH NAME, NOT a version - so we fall back
+        # to the workspace version baked into Cargo.toml. This prevents
+        # the bug where dispatching from a branch called "fuse-t" gave
+        # CFBundleShortVersionString="fuse-t" in the .app's Info.plist.
+        # Cross-platform implementation: bash on Linux/macOS, the
+        # Windows job (PowerShell) does the same logic inline since we
+        # can't easily share a step interpreter.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="${GITHUB_REF_NAME:-}"
+          if [[ "$REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+              VERSION="${REF#v}"
+          else
+              # Fallback: read [workspace.package].version from Cargo.toml
+              VERSION="$(awk '
+                /^\[workspace\.package\]/ { in_wp = 1; next }
+                /^\[/                       { in_wp = 0 }
+                in_wp && /^version[[:space:]]*=/ {
+                    gsub(/.*= *"|".*/, ""); print; exit
+                }' Cargo.toml)"
+              if [[ -z "$VERSION" ]]; then
+                  echo "::error::could not derive version: GITHUB_REF_NAME=$REF doesnt match vX.Y.Z and Cargo.toml [workspace.package].version is empty"
+                  exit 1
+              fi
+              echo "==> non-tag build (ref=$REF), using Cargo.toml version $VERSION"
+          fi
+          echo "LUKSBOX_VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "==> LUKSBOX_VERSION=$VERSION"
+
+      - name: Derive LUKSBOX_VERSION (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ref = $env:GITHUB_REF_NAME
+          if ($ref -match '^v(\d+\.\d+\.\d+.*)$') {
+              $version = $Matches[1]
+          } else {
+              $line = (Get-Content Cargo.toml | Select-String -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1)
+              if ($line -and $line.Matches[0].Groups[1].Value) {
+                  $version = $line.Matches[0].Groups[1].Value
+                  Write-Host "==> non-tag build (ref=$ref), using Cargo.toml version $version"
+              } else {
+                  Write-Error "could not derive version from ref=$ref or Cargo.toml"
+                  exit 1
+              }
+          }
+          "LUKSBOX_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "==> LUKSBOX_VERSION=$version"
 
       # ---- per-OS system deps -------------------------------------------------
 
@@ -188,138 +269,127 @@ jobs:
           # skips any chance of touching the cask API code path. All
           # five names here are formulas (no casks).
           brew install --formula libfido2 pkg-config imagemagick dylibbundler create-dmg
-          # FUSE backend selection for the `mount` subcommand.
-          # luksbox-mount supports two backends on macOS:
+          # FUSE backend selection: deterministic per matrix entry.
+          # The matrix exposes `fuse_backend: fuset|macfuse`; this step
+          # installs ONLY that backend (no fallback) and fails the
+          # build if it can't be installed. Two parallel matrix runs
+          # produce one .dmg per backend; users on the download page
+          # pick whichever matches the FUSE provider they want.
           #
-          #   1. FUSE-T (preferred, kext-free). Uses an
-          #      NFS-over-loopback transport, no kernel extension,
-          #      no Privacy & Security prompt, no Apple-Silicon
-          #      Reduced-Security dance. Bound via the in-tree
-          #      luksbox-fuse-t crate which bindgens against
-          #      <fuse_t/fuse.h> at build time. Cargo feature: `fuse-t`.
-          #
-          #   2. macFUSE (fallback, kext-based). Bound via the upstream
-          #      `fuser` crate. Requires kext approval on first install.
-          #      Cargo feature: `fuse`. We keep this as a fallback so
-          #      hosts that already have macFUSE wired up don't lose
-          #      mount support if the FUSE-T install path breaks.
-          #
-          # Both backends produce the same binary surface from the
-          # caller's perspective (`luksbox mount`/`umount`), the
-          # provider underneath is invisible to users.
-          #
-          # We FAIL THE BUILD if NEITHER provider can be installed.
-          # A release artifact that's supposed to support mount must
-          # ship with mount or not ship at all (silent degradation
-          # hides the problem until end-user runtime).
+          # See docs/MACOS_FUSE_T.md "Threat model differences vs
+          # macFUSE" for the user-facing tradeoffs that drive this
+          # split (FUSE-T = no kext, weaker local-attacker resistance;
+          # macFUSE = kext, stronger local-attacker resistance).
           set -e
 
           FUSE_BACKEND=""
           FUSE_PC_PATH=""
 
-          # --- Step 1: try FUSE-T first (kext-free) -----------------
-          if ! brew list --cask fuse-t >/dev/null 2>&1; then
-              # FUSE-T isn't a Homebrew-mainline cask, it lives in
-              # the macos-fuse-t/homebrew-cask tap. Tap-then-install
-              # is idempotent.
-              brew tap macos-fuse-t/homebrew-cask 2>/dev/null || true
-              brew install --cask fuse-t || true
-          fi
-
-          for cand in /usr/local/lib/pkgconfig /opt/homebrew/lib/pkgconfig; do
-              if [ -f "$cand/fuse-t.pc" ]; then
-                  FUSE_BACKEND="fuse-t"
-                  FUSE_PC_PATH="$cand"
-                  break
-              fi
-          done
-
-          if [ "$FUSE_BACKEND" = "fuse-t" ]; then
-              echo "==> FUSE-T detected (kext-free backend):"
-              echo "    fuse-t.pc:      $FUSE_PC_PATH/fuse-t.pc"
-              PKG_CONFIG_PATH="$FUSE_PC_PATH" pkg-config --modversion fuse-t 2>&1 \
-                  | sed 's/^/    libfuse-t:      /' || true
-
-              # Security gate: assert libfuse-t.dylib's LC_ID_DYLIB
-              # install_name is an absolute path. macOS resolves
-              # `@rpath/...`, `@loader_path/...`, and `@executable_path/...`
-              # by searching DYLD_LIBRARY_PATH / DYLD_FALLBACK_LIBRARY_PATH
-              # / runpath entries - any of which an attacker who can set
-              # env vars could redirect to a malicious dylib. An absolute
-              # install_name pins the load address in the binary's
-              # LC_LOAD_DYLIB record so DYLD has nothing to search.
-              # If FUSE-T ever ships with a relative install_name, fail
-              # the build loudly: shipping a binary that links such a
-              # dylib would mean every LUKSbox user inherits the DYLD-
-              # injection vector.
-              FUSE_T_DYLIB=""
-              for cand in $(brew --prefix)/lib/libfuse-t.dylib \
-                          /usr/local/lib/libfuse-t.dylib \
-                          /opt/homebrew/lib/libfuse-t.dylib; do
-                  if [ -f "$cand" ]; then
-                      FUSE_T_DYLIB="$cand"
-                      break
+          case "${{ matrix.fuse_backend }}" in
+              fuset)
+                  echo "==> Installing FUSE-T (kext-free backend)"
+                  if ! brew list --cask fuse-t >/dev/null 2>&1; then
+                      # FUSE-T lives in the macos-fuse-t tap, not core.
+                      brew tap macos-fuse-t/homebrew-cask
+                      brew install --cask fuse-t
                   fi
-              done
-              if [ -z "$FUSE_T_DYLIB" ]; then
-                  echo "::error::libfuse-t.dylib not found at any of: \$(brew --prefix)/lib, /usr/local/lib, /opt/homebrew/lib"
-                  exit 1
-              fi
-              FUSE_T_INSTALL_NAME="$(otool -D "$FUSE_T_DYLIB" 2>/dev/null \
-                                     | tail -n1 | tr -d '[:space:]')"
-              echo "    libfuse-t path: $FUSE_T_DYLIB"
-              echo "    install_name:   $FUSE_T_INSTALL_NAME"
-              case "$FUSE_T_INSTALL_NAME" in
-                  /*)
-                      echo "    install_name is absolute - safe to link"
-                      ;;
-                  @rpath/*|@loader_path/*|@executable_path/*)
-                      echo "::error::libfuse-t.dylib's install_name is '$FUSE_T_INSTALL_NAME' (relative). Linking against it would let DYLD_LIBRARY_PATH / DYLD_FALLBACK_LIBRARY_PATH redirect to a malicious dylib at runtime. Refusing to build until upstream FUSE-T is fixed or this gate is consciously waived."
+                  for cand in /usr/local/lib/pkgconfig /opt/homebrew/lib/pkgconfig; do
+                      if [ -f "$cand/fuse-t.pc" ]; then
+                          FUSE_BACKEND="fuse-t"
+                          FUSE_PC_PATH="$cand"
+                          break
+                      fi
+                  done
+                  if [ -z "$FUSE_BACKEND" ]; then
+                      echo "::error::FUSE-T install reported success but fuse-t.pc not found at /usr/local/lib/pkgconfig or /opt/homebrew/lib/pkgconfig"
+                      ls -la /usr/local/lib/pkgconfig/ /opt/homebrew/lib/pkgconfig/ 2>&1 || true
                       exit 1
-                      ;;
-                  "")
-                      echo "::error::otool -D returned no install_name for $FUSE_T_DYLIB. Cannot verify it's safe to link."
-                      exit 1
-                      ;;
-                  *)
-                      echo "::error::libfuse-t.dylib's install_name '$FUSE_T_INSTALL_NAME' is neither absolute nor a known relative form. Refusing to build."
-                      exit 1
-                      ;;
-              esac
-          else
-              echo "==> FUSE-T not available, falling back to macFUSE"
-              # --- Step 2: macFUSE fallback ------------------------
-              if ! brew list --cask macfuse >/dev/null 2>&1; then
-                  brew install --cask macfuse
-              fi
-              for cand in /usr/local/lib/pkgconfig \
-                          /opt/homebrew/lib/pkgconfig \
-                          /Library/Frameworks/macFUSE.framework/Versions/A/lib/pkgconfig; do
-                  if [ -f "$cand/fuse.pc" ]; then
-                      FUSE_BACKEND="fuse"
-                      FUSE_PC_PATH="$cand"
-                      break
                   fi
-              done
-              if [ -z "$FUSE_BACKEND" ]; then
-                  echo "::error::Neither FUSE-T nor macFUSE could be installed. Checked: fuse-t cask, macfuse cask, fuse-t.pc and fuse.pc in standard pkgconfig dirs."
-                  ls -la /usr/local/lib/pkgconfig/ /opt/homebrew/lib/pkgconfig/ 2>&1 || true
+                  echo "    fuse-t.pc:      $FUSE_PC_PATH/fuse-t.pc"
+                  PKG_CONFIG_PATH="$FUSE_PC_PATH" pkg-config --modversion fuse-t 2>&1 \
+                      | sed 's/^/    libfuse-t:      /' || true
+
+                  # Security gate: assert libfuse-t.dylib's LC_ID_DYLIB
+                  # install_name is an absolute path. macOS resolves
+                  # `@rpath/...`, `@loader_path/...`, and
+                  # `@executable_path/...` by searching DYLD_LIBRARY_PATH
+                  # / DYLD_FALLBACK_LIBRARY_PATH / runpath entries - any
+                  # of which an attacker who can set env vars could
+                  # redirect to a malicious dylib. An absolute
+                  # install_name pins the load address in the binary's
+                  # LC_LOAD_DYLIB record so DYLD has nothing to search.
+                  FUSE_T_DYLIB=""
+                  for cand in $(brew --prefix)/lib/libfuse-t.dylib \
+                              /usr/local/lib/libfuse-t.dylib \
+                              /opt/homebrew/lib/libfuse-t.dylib; do
+                      if [ -f "$cand" ]; then
+                          FUSE_T_DYLIB="$cand"
+                          break
+                      fi
+                  done
+                  if [ -z "$FUSE_T_DYLIB" ]; then
+                      echo "::error::libfuse-t.dylib not found at any of: \$(brew --prefix)/lib, /usr/local/lib, /opt/homebrew/lib"
+                      exit 1
+                  fi
+                  FUSE_T_INSTALL_NAME="$(otool -D "$FUSE_T_DYLIB" 2>/dev/null \
+                                         | tail -n1 | tr -d '[:space:]')"
+                  echo "    libfuse-t path: $FUSE_T_DYLIB"
+                  echo "    install_name:   $FUSE_T_INSTALL_NAME"
+                  case "$FUSE_T_INSTALL_NAME" in
+                      /*)
+                          echo "    install_name is absolute - safe to link"
+                          ;;
+                      @rpath/*|@loader_path/*|@executable_path/*)
+                          echo "::error::libfuse-t.dylib's install_name is '$FUSE_T_INSTALL_NAME' (relative). Linking against it would let DYLD_LIBRARY_PATH / DYLD_FALLBACK_LIBRARY_PATH redirect to a malicious dylib at runtime. Refusing to build."
+                          exit 1
+                          ;;
+                      "")
+                          echo "::error::otool -D returned no install_name for $FUSE_T_DYLIB. Cannot verify it's safe to link."
+                          exit 1
+                          ;;
+                      *)
+                          echo "::error::libfuse-t.dylib's install_name '$FUSE_T_INSTALL_NAME' is neither absolute nor a known relative form. Refusing to build."
+                          exit 1
+                          ;;
+                  esac
+                  ;;
+
+              macfuse)
+                  echo "==> Installing macFUSE (kext-based backend)"
+                  if ! brew list --cask macfuse >/dev/null 2>&1; then
+                      brew install --cask macfuse
+                  fi
+                  for cand in /usr/local/lib/pkgconfig \
+                              /opt/homebrew/lib/pkgconfig \
+                              /Library/Frameworks/macFUSE.framework/Versions/A/lib/pkgconfig; do
+                      if [ -f "$cand/fuse.pc" ]; then
+                          FUSE_BACKEND="fuse"
+                          FUSE_PC_PATH="$cand"
+                          break
+                      fi
+                  done
+                  if [ -z "$FUSE_BACKEND" ]; then
+                      echo "::error::macFUSE install reported success but fuse.pc not found"
+                      ls -la /usr/local/lib/pkgconfig/ /opt/homebrew/lib/pkgconfig/ 2>&1 || true
+                      exit 1
+                  fi
+                  MOUNT_MACFUSE="/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"
+                  if [ ! -x "$MOUNT_MACFUSE" ]; then
+                      echo "::error::macFUSE installed but $MOUNT_MACFUSE missing or not executable"
+                      ls -la /Library/Filesystems/macfuse.fs/Contents/Resources/ 2>&1 || true
+                      exit 1
+                  fi
+                  echo "    fuse.pc:        $FUSE_PC_PATH/fuse.pc"
+                  echo "    mount_macfuse:  $MOUNT_MACFUSE"
+                  PKG_CONFIG_PATH="$FUSE_PC_PATH" pkg-config --modversion fuse 2>&1 \
+                      | sed 's/^/    libfuse:        /' || true
+                  ;;
+
+              *)
+                  echo "::error::matrix.fuse_backend must be 'fuset' or 'macfuse'; got '${{ matrix.fuse_backend }}'"
                   exit 1
-              fi
-              # macFUSE installs mount_macfuse INSIDE its own framework
-              # at /Library/Filesystems/macfuse.fs/Contents/Resources/.
-              MOUNT_MACFUSE="/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse"
-              if [ ! -x "$MOUNT_MACFUSE" ]; then
-                  echo "::error::macFUSE fallback selected but $MOUNT_MACFUSE missing or not executable"
-                  ls -la /Library/Filesystems/macfuse.fs/Contents/Resources/ 2>&1 || true
-                  exit 1
-              fi
-              echo "==> macFUSE verified (fallback):"
-              echo "    fuse.pc:        $FUSE_PC_PATH/fuse.pc"
-              echo "    mount_macfuse:  $MOUNT_MACFUSE"
-              PKG_CONFIG_PATH="$FUSE_PC_PATH" pkg-config --modversion fuse 2>&1 \
-                  | sed 's/^/    libfuse:        /' || true
-          fi
+                  ;;
+          esac
 
           # Write the env that the cargo build steps read. The
           # selected feature flag flips luksbox-mount from the no-op
@@ -921,8 +991,8 @@ jobs:
               <key>CFBundleName</key>             <string>LUKSbox</string>
               <key>CFBundleDisplayName</key>      <string>LUKSbox</string>
               <key>CFBundleIdentifier</key>       <string>com.penthertz.luksbox</string>
-              <key>CFBundleVersion</key>          <string>${GITHUB_REF_NAME#v}</string>
-              <key>CFBundleShortVersionString</key><string>${GITHUB_REF_NAME#v}</string>
+              <key>CFBundleVersion</key>          <string>${LUKSBOX_VERSION}</string>
+              <key>CFBundleShortVersionString</key><string>${LUKSBOX_VERSION}</string>
               <key>CFBundleExecutable</key>       <string>luksbox-gui</string>
               <key>CFBundleIconFile</key>         <string>icon</string>
               <key>CFBundlePackageType</key>      <string>APPL</string>
@@ -1066,7 +1136,7 @@ jobs:
           # @executable_path-relative dylib refs only resolve from the
           # bundled tree; users who want $PATH placement should keep
           # the layout intact and add an alias / wrapper script instead.
-          PORTABLE="luksbox-${GITHUB_REF_NAME}-aarch64-macos-portable"
+          PORTABLE="luksbox-v${LUKSBOX_VERSION}-aarch64-macos-${{ matrix.fuse_backend }}-portable"
           rm -rf portable-root
           mkdir -p "portable-root/$PORTABLE/bin" \
                    "portable-root/$PORTABLE/Frameworks"
@@ -1173,7 +1243,7 @@ jobs:
           # If signing happened, the .app inside is signed; if not, the
           # user sees a Gatekeeper warning on first launch.
           create-dmg \
-            --volname "LUKSbox ${GITHUB_REF_NAME}" \
+            --volname "LUKSbox v${LUKSBOX_VERSION}" \
             --volicon "crates/luksbox-gui/assets/icon.icns" \
             --window-pos 200 120 \
             --window-size 600 320 \
@@ -1189,7 +1259,7 @@ jobs:
               # which still gives "drag to Applications" UX, just no
               # custom background.
               echo "==> create-dmg failed, falling back to hdiutil"
-              hdiutil create -volname "LUKSbox ${GITHUB_REF_NAME}" \
+              hdiutil create -volname "LUKSbox v${LUKSBOX_VERSION}" \
                 -srcfolder dmg-root \
                 -ov -format UDZO \
                 "${{ matrix.archive }}"
@@ -1475,11 +1545,14 @@ jobs:
               # the "Generate platform icons" step.
               New-Item -ItemType File -Path "staging\luksbox-installer.ico" -Force | Out-Null
           }
-          # Strip leading 'v' from the tag (v1.2.3 -> 1.2.3) for MSI's
-          # 4-part version requirement. workflow_dispatch runs have no
-          # tag; fall back to 0.0.0 so the build still completes.
-          $version = if ($env:GITHUB_REF_NAME -match '^v(.+)$') { $Matches[1] } else { '0.0.0' }
-          $msiName = "luksbox-$env:GITHUB_REF_NAME-x86_64-windows.msi"
+          # MSI requires a 4-part version. The earlier "Derive
+          # LUKSBOX_VERSION (Windows)" step already resolved this from
+          # the tag (or Cargo.toml on dispatch builds) and exported it
+          # to $env:LUKSBOX_VERSION. Use that uniformly so the MSI
+          # ProductVersion always matches the .app's CFBundleVersion
+          # and the .deb / .rpm metadata for the same workflow run.
+          $version = $env:LUKSBOX_VERSION
+          $msiName = "luksbox-v$version-x86_64-windows.msi"
           wix build dist\luksbox.wxs `
               -d "Version=$version" `
               -d "StagingDir=staging" `
@@ -1619,6 +1692,17 @@ jobs:
           subject-path: 'artifacts/*'
 
       - name: Create GitHub Release
+        # ONLY for tag pushes matching `v*`. workflow_dispatch can run
+        # the same matrix to test build hygiene, but it must NOT
+        # publish a public release: the artifacts produced from a
+        # branch-named workflow_dispatch (e.g. on a branch called
+        # `fuse-t`) have broken internal version metadata
+        # (CFBundleShortVersionString = the branch name) and would
+        # confuse end users. Workflow-run artifacts (via
+        # actions/upload-artifact, the small "Artifacts" panel on the
+        # run page) are still produced for testing and ARE downloadable
+        # by maintainers from the run page.
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
@@ -1725,54 +1809,69 @@ jobs:
               on a GitHub ARM64 runner, no QEMU emulation. Same
               jammy/noble distinction applies as for the .deb above.
 
-            **macOS (Apple Silicon), .dmg (recommended):** download
-              `luksbox-${{ github.ref_name }}-aarch64-macos.dmg`,
-              double-click, drag `LUKSbox.app` onto the `Applications`
-              link, eject. The .app is self-contained, libfido2 +
-              transitive dependencies are bundled inside, you do NOT
-              need `brew install libfido2`. Double-clicking a `.lbx`
-              file in Finder opens it directly in LUKSbox.
+            **macOS (Apple Silicon):** two .dmg variants, one per
+              FUSE backend. Pick one based on which FUSE provider you
+              want to install. Both .dmgs are otherwise identical
+              (same crypto, same on-disk format, same UI); the
+              difference is what `luksbox mount` calls under the hood
+              and whether you need a kernel extension.
 
-            **macOS (Apple Silicon), portable .tar.gz:** download
-              `luksbox-${{ github.ref_name }}-aarch64-macos-portable.tar.gz`,
-              extract from Terminal with
-              `tar xzf luksbox-${{ github.ref_name }}-aarch64-macos-portable.tar.gz`.
-              Ships the bare CLI + GUI binaries (`bin/luksbox`,
-              `bin/luksbox-gui`) with their dylib closure under
-              `Frameworks/`. Run in place: `./bin/luksbox --help` or
-              `./bin/luksbox-gui &`. No `.app`, no Gatekeeper warning,
-              no quarantine xattr to clear (when extracted via
-              Terminal). See `README-MACOS.txt` inside for the full
-              layout + caveats.
+              **FUSE-T variant (recommended for personal laptops):**
 
-              `mount` (both builds) needs a FUSE provider on the
-              host. Two are supported, pick one:
+                  download: luksbox-${{ github.ref_name }}-aarch64-macos-fuset.dmg
+                  install FUSE-T first:
+                      brew tap macos-fuse-t/homebrew-cask
+                      brew install --cask fuse-t
+                  then drag LUKSbox.app onto Applications.
 
-              **FUSE-T** (https://www.fuse-t.org/) - recommended,
-              kext-free. Uses an NFS-over-loopback transport so it
-              doesn't need a kernel extension, no Privacy & Security
-              prompt, no Apple-Silicon Reduced-Security dance. Just:
+              No kernel extension, no Privacy & Security prompt, no
+              Apple-Silicon Reduced-Security dance. The .app launches
+              cleanly even if FUSE-T isn't installed yet (you just
+              can't use `mount` until you install it). Uses an NFS-
+              over-loopback transport with **NO authentication on the
+              loopback port** - on a multi-user Mac, any other local
+              process can connect to the mount via NFSv4 and bypass
+              LUKSbox's permission model. Documented in
+              [`docs/MACOS_FUSE_T.md`](https://github.com/penthertz/LUKSbox/blob/${{ github.ref_name }}/docs/MACOS_FUSE_T.md).
+              Fine for the common single-user-laptop case.
 
-                  brew tap macos-fuse-t/homebrew-cask
-                  brew install --cask fuse-t
+              **macFUSE variant (recommended for shared machines or
+              audit-required deployments):**
 
-              **macFUSE** (https://macfuse.io/) - legacy fallback,
-              kext-based. Use this only if you already have macFUSE
-              wired up or have a specific reason to prefer it:
+                  download: luksbox-${{ github.ref_name }}-aarch64-macos-macfuse.dmg
+                  install macFUSE FIRST (REQUIRED, see warning below):
+                      brew install --cask macfuse
+                      # then approve the kext under System Settings
+                      # -> Privacy & Security and reboot. On Apple
+                      # Silicon also: Recovery Mode -> Startup Security
+                      # Utility -> Reduced Security.
+                  then drag LUKSbox.app onto Applications.
 
-                  brew install --cask macfuse
+              IMPORTANT: this variant transitively links macFUSE's
+              MFMount.framework. If macFUSE is NOT installed when you
+              try to launch LUKSbox.app, **macOS kills the process
+              before it can show any UI** (dyld: Library not loaded
+              error). Install macFUSE first, then the LUKSbox.app.
+              Uses macFUSE's `/dev/macfuse*` device-node permissions
+              for the kernel<->FS channel, which restricts access to
+              the mounting UID - the better local-attacker model.
 
-              macFUSE installs a kernel extension. macOS will block
-              it on first install - approve under **System Settings
-              -> Privacy & Security**, then reboot. On Apple Silicon
-              you may also need to lower the security policy via
-              **Recovery Mode -> Startup Security Utility -> Reduced
-              Security** before the kext can load. Both are one-time
-              per-machine setup.
+              **Verify which backend a given .app uses:**
 
-              The shipped binary picks whichever provider was
-              available at build time (FUSE-T preferred). Once
-              installed, `luksbox mount` works directly.
+                  /Applications/LUKSbox.app/Contents/MacOS/luksbox --version
+                  # luksbox X.Y.Z
+                  # FUSE backend: fuse-t (...)   <- FUSE-T variant
+                  # FUSE backend: macfuse (...)  <- macFUSE variant
+
+              **macOS (Apple Silicon), portable .tar.gz:** also two
+              variants, `-fuset-portable.tar.gz` and `-macfuse-portable.tar.gz`,
+              same backend split as the .dmgs. Ships the bare CLI +
+              GUI binaries (`bin/luksbox`, `bin/luksbox-gui`) with
+              their dylib closure under `Frameworks/`. Run in place:
+              `./bin/luksbox --help` or `./bin/luksbox-gui &`. No
+              `.app`, no Gatekeeper warning, no quarantine xattr to
+              clear (when extracted via Terminal). See
+              `README-MACOS.txt` inside for the full layout + caveats.
 
               **First launch:** the .dmg is **codesigned with the
               Penthertz Apple Developer ID Application certificate
