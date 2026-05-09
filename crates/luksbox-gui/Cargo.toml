@@ -70,6 +70,13 @@ luksbox-vfs = { path = "../luksbox-vfs" }
 # `winfsp = ["luksbox-mount/winfsp"]` feature above.
 luksbox-mount = { path = "../luksbox-mount", default-features = false }
 
+# SIGPIPE constant for exit_status_is_clean_unmount on macOS
+# (FUSE-T helper subprocess sometimes exits with signal 13 during
+# unmount; we classify that as a clean unmount). Cheap to compile
+# in on every Unix.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile = "3"
 # Used by the recents-permissions test (Unix-only) which sets

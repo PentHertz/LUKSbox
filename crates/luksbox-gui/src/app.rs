@@ -4284,7 +4284,7 @@ impl LuksboxApp {
                     self.view = View::Welcome;
                     self.cwd = "/".into();
                     self.listing.clear();
-                    if status.success() {
+                    if exit_status_is_clean_unmount(status) {
                         self.toast_ok("vault unmounted");
                     } else {
                         // Non-zero exit can mean libfuse-t aborted
@@ -6897,6 +6897,49 @@ fn start_mount_subprocess(
     // copy, will reconstruct a MasterVolumeKey from it, and zeroize
     // its stdin buffer.
     Ok(child)
+}
+
+/// True if the helper subprocess's exit status represents a clean
+/// unmount, even if it's not strictly `status.success()`.
+///
+/// Specifically: SIGPIPE (signal 13) on the helper at exit time is
+/// treated as clean. Background:
+///
+/// - libfuse-t.dylib's teardown path involves writing through
+///   internal pipes/sockets to its `go-nfsv4` helper-process.
+/// - During unmount the kernel-side NFS connection drops; one of
+///   those internal endpoints closes mid-write.
+/// - We `signal(SIGPIPE, SIG_IGN)` at helper startup, but
+///   libfuse-t's own `fuse_set_signal_handlers` re-installs handlers
+///   for SIGPIPE during fuse_main_real, and there's a teardown
+///   window where the handler state is in flux. Under
+///   `LUKSBOX_SANDBOX_HELPER=1` this window seems to be hit more
+///   reliably (the sandbox blocks some operation that delays the
+///   teardown enough for SIGPIPE to land in the wrong frame).
+/// - The result: helper exits with signal 13 even though the
+///   mount and unmount completed successfully.
+///
+/// Treating SIGPIPE as clean unmount is correct because in this
+/// context "the pipe closed" IS what unmount means. We're not
+/// hiding a real error - the mount worked, the user's data is on
+/// disk, the mountpoint is detached. The signal is just the
+/// teardown's last gasp.
+///
+/// Other signals (SIGSEGV, SIGABRT, SIGKILL, etc.) are still
+/// reported as abnormal so a real crash isn't silently swept
+/// under "vault unmounted".
+fn exit_status_is_clean_unmount(status: std::process::ExitStatus) -> bool {
+    if status.success() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if status.signal() == Some(libc::SIGPIPE) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Construct the `Command` that will spawn the FUSE-T mount helper.
