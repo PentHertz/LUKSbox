@@ -150,8 +150,9 @@ impl Errno {
 pub struct FileAttr {
     /// `S_IFDIR | 0o700` for directories, `S_IFREG | 0o600` for files.
     /// The trampoline does NOT set the type bits for you, callers must
-    /// OR them in. `libc::S_IFREG` and `libc::S_IFDIR` are exposed
-    /// for convenience via the re-export below.
+    /// OR them in. `S_IFREG` and `S_IFDIR` are exposed as `u32`
+    /// constants below (we don't `pub use` libc's because libc gives
+    /// them as `mode_t`, which is `u16` on macOS).
     pub mode: u32,
     pub size: u64,
     pub uid: u32,
@@ -164,7 +165,14 @@ pub struct FileAttr {
     pub nlink: u32,
 }
 
-pub use libc::{S_IFDIR, S_IFREG};
+// File-type bits exposed as u32 constants. We can't `pub use libc::{
+// S_IFDIR, S_IFREG }` because libc gives them as `mode_t`, and
+// `mode_t` is `u16` on macOS but `u32` on Linux - a caller who
+// composes `S_IFDIR | 0o700u32` would get a type-mismatch on macOS
+// only. Re-exposing as u32 (the type used by `FileAttr::mode`)
+// keeps the math consistent across platforms.
+pub const S_IFDIR: u32 = libc::S_IFDIR as u32;
+pub const S_IFREG: u32 = libc::S_IFREG as u32;
 
 /// One entry as fed into the readdir callback's filler function.
 #[derive(Debug)]
