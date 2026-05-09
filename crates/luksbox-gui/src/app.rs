@@ -3696,8 +3696,9 @@ impl LuksboxApp {
                 } else {
                     "Mount the vault as a virtual filesystem at a directory you \
                      pick (must exist and be empty). Files you copy in are \
-                     encrypted on the fly. Requires macFUSE (macOS, \
-                     approve kext on first install) or libfuse3 (Linux)."
+                     encrypted on the fly. Requires FUSE-T (macOS, kext-free, \
+                     `brew install --cask fuse-t`) or macFUSE (macOS, kext-based, \
+                     approve on first install) or libfuse3 (Linux)."
                 };
                 if ui
                     .add(ghost_button("Mount as volume..."))

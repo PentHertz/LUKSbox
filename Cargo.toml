@@ -6,6 +6,7 @@ members = [
     "crates/luksbox-fido2",
     "crates/luksbox-pq",
     "crates/luksbox-vfs",
+    "crates/luksbox-fuse-t",
     "crates/luksbox-mount",
     "crates/luksbox-cli",
     "crates/luksbox-gui",
@@ -56,6 +57,13 @@ postcard = { version = "1", default-features = false, features = ["alloc"] }
 fuser = { version = "0.17", default-features = false }
 libc = "0.2"
 pkg-config = "0.3"
+# bindgen is a build-script dep for luksbox-fuse-t to generate Rust
+# declarations from FUSE-T's <fuse_t/fuse.h> at build time. Pinned
+# to a current line so we can rely on the `clang` API stability
+# guarantees in the 0.71+ family. Only pulled in when the
+# `luksbox-fuse-t` crate's macOS path actually compiles its
+# build.rs (Linux/Windows builds skip the bindgen entirely).
+bindgen = "0.71"
 ctrlc = "3"
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 ml-kem = { version = "0.3", features = ["zeroize"] }
