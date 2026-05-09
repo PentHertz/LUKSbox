@@ -52,11 +52,7 @@ pub const FUSE_BACKEND: &str = {
     {
         "fuse-t"
     }
-    #[cfg(all(
-        target_os = "macos",
-        feature = "fuse",
-        not(feature = "fuse-t"),
-    ))]
+    #[cfg(all(target_os = "macos", feature = "fuse", not(feature = "fuse-t"),))]
     {
         "macfuse"
     }
@@ -163,15 +159,8 @@ pub fn mount<P: AsRef<Path>>(
 
 #[cfg(any(
     not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
-    all(
-        target_os = "linux",
-        not(feature = "fuse"),
-    ),
-    all(
-        target_os = "macos",
-        not(feature = "fuse"),
-        not(feature = "fuse-t"),
-    ),
+    all(target_os = "linux", not(feature = "fuse"),),
+    all(target_os = "macos", not(feature = "fuse"), not(feature = "fuse-t"),),
     all(target_os = "windows", not(feature = "winfsp")),
 ))]
 pub fn mount<P: AsRef<Path>>(
@@ -213,15 +202,8 @@ pub fn unmount<P: AsRef<Path>>(mountpoint: P) -> Result<(), MountError> {
 
 #[cfg(any(
     not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
-    all(
-        target_os = "linux",
-        not(feature = "fuse"),
-    ),
-    all(
-        target_os = "macos",
-        not(feature = "fuse"),
-        not(feature = "fuse-t"),
-    ),
+    all(target_os = "linux", not(feature = "fuse"),),
+    all(target_os = "macos", not(feature = "fuse"), not(feature = "fuse-t"),),
     all(target_os = "windows", not(feature = "winfsp")),
 ))]
 pub fn unmount<P: AsRef<Path>>(_mountpoint: P) -> Result<(), MountError> {

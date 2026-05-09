@@ -156,7 +156,8 @@ impl Filesystem for LuksboxFuseTFs {
         let (parent, name) = Self::split_parent_name(path)?;
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
         let parent_id = self.lookup_id(&vfs, &parent)?;
-        vfs.create(parent_id, &name).map_err(|e| Self::vfs_errno(&e))?;
+        vfs.create(parent_id, &name)
+            .map_err(|e| Self::vfs_errno(&e))?;
         let _ = vfs.flush();
         Ok(())
     }
@@ -165,7 +166,8 @@ impl Filesystem for LuksboxFuseTFs {
         let (parent, name) = Self::split_parent_name(path)?;
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
         let parent_id = self.lookup_id(&vfs, &parent)?;
-        vfs.mkdir(parent_id, &name).map_err(|e| Self::vfs_errno(&e))?;
+        vfs.mkdir(parent_id, &name)
+            .map_err(|e| Self::vfs_errno(&e))?;
         // Empty dirs create no chunks; flush now or the metadata
         // change won't survive a subsequent unmount. Same reasoning
         // as fuse.rs:mkdir.
@@ -177,7 +179,8 @@ impl Filesystem for LuksboxFuseTFs {
         let (parent, name) = Self::split_parent_name(path)?;
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
         let parent_id = self.lookup_id(&vfs, &parent)?;
-        vfs.unlink(parent_id, &name).map_err(|e| Self::vfs_errno(&e))?;
+        vfs.unlink(parent_id, &name)
+            .map_err(|e| Self::vfs_errno(&e))?;
         let _ = vfs.flush();
         Ok(())
     }
@@ -186,7 +189,8 @@ impl Filesystem for LuksboxFuseTFs {
         let (parent, name) = Self::split_parent_name(path)?;
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
         let parent_id = self.lookup_id(&vfs, &parent)?;
-        vfs.rmdir(parent_id, &name).map_err(|e| Self::vfs_errno(&e))?;
+        vfs.rmdir(parent_id, &name)
+            .map_err(|e| Self::vfs_errno(&e))?;
         let _ = vfs.flush();
         Ok(())
     }

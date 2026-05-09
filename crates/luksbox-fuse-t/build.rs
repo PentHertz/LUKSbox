@@ -97,6 +97,17 @@ fn main() {
                 .iter()
                 .map(|p| format!("-I{}", p.display())),
         )
+        // Rust 2024 edition (which the workspace uses) promotes the
+        // `unsafe_op_in_unsafe_fn` lint to a hard error: every unsafe
+        // operation inside an `unsafe fn` body must be wrapped in an
+        // explicit `unsafe { ... }` block. bindgen's default output
+        // relies on the 2021 behaviour (the `unsafe fn` body was
+        // implicitly unsafe, no inner block needed). `wrap_unsafe_ops`
+        // makes bindgen emit the explicit blocks, which compiles
+        // under both editions. Without it, the bitfield helper code
+        // bindgen generates for `struct fuse_operations`'s flag bits
+        // fails to build on 2024 with E0133.
+        .wrap_unsafe_ops(true)
         // FUSE protocol version macros. libfuse 2.x checks
         // FUSE_USE_VERSION at compile time and reshapes
         // `struct fuse_operations` accordingly. We pin to 29 (libfuse
@@ -134,11 +145,11 @@ fn main() {
         builder = builder.clang_arg(format!("-I{dir}"));
     }
 
-    let bindings = builder
-        .generate()
-        .expect("bindgen failed to generate FUSE-T bindings; \
+    let bindings = builder.generate().expect(
+        "bindgen failed to generate FUSE-T bindings; \
                  check that fuse_t/fuse.h or fuse.h is reachable via \
-                 the include paths printed above");
+                 the include paths printed above",
+    );
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
@@ -157,7 +168,10 @@ fn main() {
         bindings
             .write_to_file(&snapshot)
             .expect("failed to write FUSE-T bindings snapshot");
-        println!("cargo:warning=wrote bindings snapshot to {}", snapshot.display());
+        println!(
+            "cargo:warning=wrote bindings snapshot to {}",
+            snapshot.display()
+        );
     }
 }
 
