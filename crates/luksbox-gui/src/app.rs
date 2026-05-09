@@ -4083,6 +4083,58 @@ impl LuksboxApp {
                 .color(theme::DIM),
         );
         ui.add_space(18.0);
+
+        // FUSE-T security notice. Only shown when the build is wired
+        // against the FUSE-T backend (kext-free macOS path). FUSE-T's
+        // NFS server binds to 127.0.0.1 with NO authentication on the
+        // bound port - on shared machines, any other local process can
+        // connect via NFSv4 and read/write this mount, bypassing the
+        // mounter UID. Loud-but-not-blocking notice so a user on a
+        // single-user laptop (the common case) isn't pestered while
+        // a user on a shared machine sees it before sensitive data
+        // hits the mount. macFUSE doesn't have this issue (kext gates
+        // the channel by /dev/macfuse* device-node permissions).
+        if luksbox_mount::FUSE_BACKEND == "fuse-t" {
+            egui::Frame::none()
+                .fill(theme::WARN.linear_multiply(0.12))
+                .stroke(egui::Stroke::new(1.0, theme::WARN))
+                .rounding(6.0)
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new("FUSE-T mount: local-attacker exposure")
+                            .strong()
+                            .color(theme::WARN)
+                            .size(13.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "FUSE-T binds an NFS server to 127.0.0.1 (loopback) \
+                             with no authentication. On a SHARED Mac, any other \
+                             local user or unprivileged process can connect to \
+                             that port and read/write this mount, bypassing \
+                             LUKSbox's permission model. Safe on a single-user \
+                             laptop. For shared machines, prefer the macFUSE \
+                             variant of LUKSbox (kext-based, mounter-UID gated).",
+                        )
+                        .color(theme::DIM)
+                        .size(12.0),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(
+                            "Full threat model: docs/MACOS_FUSE_T.md \
+                             #threat-model-differences-vs-macfuse",
+                        )
+                        .color(theme::FAINT)
+                        .size(11.0)
+                        .monospace(),
+                    );
+                });
+            ui.add_space(14.0);
+        }
+
         ui.label(
             RichText::new(
                 "Open the mountpoint in your file manager to read and write \

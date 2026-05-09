@@ -692,10 +692,50 @@ pub(crate) fn run_mount<F: Filesystem + 'static>(
     let mut argv: Vec<*mut c_char> = owned.iter().map(|cs| cs.as_ptr() as *mut c_char).collect();
     let argc = argv.len() as c_int;
 
+    // Save the current process-wide signal dispositions for the
+    // signals libfuse 2.x's high-level API installs handlers for
+    // (SIGTERM, SIGINT, SIGHUP, SIGPIPE). `fuse_main_real` calls
+    // `fuse_set_signal_handlers` internally, which writes new
+    // sigaction entries; `fuse_teardown` calls
+    // `fuse_remove_signal_handlers` to restore them. In practice
+    // (observed on FUSE-T 1.x with the GUI host process) the
+    // restore path is unreliable: handlers can be left in a state
+    // where a SIGTERM from the FUSE-T helper-process exit kills the
+    // GUI process the next time anything triggers it. We
+    // belt-and-suspenders this by saving + restoring ourselves
+    // around the call. Same approach used by other host apps that
+    // embed libfuse (sshfs's macOS GUI fork etc.).
+    //
+    // SIGCHLD is NOT in the list: libfuse doesn't install a handler
+    // for it, but FUSE-T's go-nfsv4 helper IS a child of our
+    // process and exits at unmount time. Default SIGCHLD action is
+    // SIG_DFL = ignore; leaving it alone is correct.
+    const SAVED_SIGS: &[i32] = &[libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGPIPE];
+    let mut saved: Vec<libc::sigaction> = Vec::with_capacity(SAVED_SIGS.len());
+    for &sig in SAVED_SIGS {
+        // SAFETY: zeroed sigaction is a valid initial value;
+        // sigaction with a NULL new-action and a non-NULL oldact
+        // queries the current handler without modifying it.
+        let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::sigaction(sig, std::ptr::null(), &mut old) };
+        if r != 0 {
+            // Don't fail the mount over this - just log and continue
+            // without restore for that specific signal. Safer to mount
+            // than to bail out for a diagnostic-grade defense.
+            eprintln!(
+                "luksbox-fuse-t: warning: sigaction({sig}, query) failed; \
+                 won't be able to restore the original handler after unmount"
+            );
+        }
+        saved.push(old);
+    }
+
+    eprintln!("luksbox-fuse-t: entering fuse_main_real (mount session begins)");
+
     // SAFETY: argv and ops are valid for the call. user_data is a
-    // boxed pointer; libfuse hands ownership back to op_destroy where
-    // we Box::from_raw to drop. The `&ops` borrow is alive for the
-    // call. fuse_main_real blocks until unmount.
+    // raw pointer derived from Arc::as_ptr; the owning Arc on this
+    // stack frame outlives the call. The `&ops` borrow is alive for
+    // the call. fuse_main_real blocks until unmount.
     let rc = unsafe {
         sys::fuse_main_real(
             argc,
@@ -705,6 +745,24 @@ pub(crate) fn run_mount<F: Filesystem + 'static>(
             user_data,
         )
     };
+
+    eprintln!("luksbox-fuse-t: fuse_main_real returned (rc={rc}); restoring signal handlers");
+
+    // Restore the saved signal dispositions. Use SA_RESTART /
+    // SA_NOCLDSTOP flags as set in `saved`.
+    for (sig, old) in SAVED_SIGS.iter().zip(saved.iter()) {
+        // SAFETY: `old` was populated by the query above; its layout
+        // is a valid sigaction struct.
+        let r = unsafe { libc::sigaction(*sig, old as *const _, std::ptr::null_mut()) };
+        if r != 0 {
+            eprintln!(
+                "luksbox-fuse-t: warning: sigaction({sig}, restore) failed; \
+                 default handler will be used for this signal"
+            );
+        }
+    }
+
+    eprintln!("luksbox-fuse-t: signal handlers restored, mount session ended cleanly");
 
     // Belt-and-suspenders: mark destroyed even if libfuse never
     // called op_destroy (early failure paths). Any stray callback
