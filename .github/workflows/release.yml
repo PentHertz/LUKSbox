@@ -960,22 +960,42 @@ jobs:
           cp crates/luksbox-gui/assets/icon.icns \
              "$APP/Contents/Resources/icon.icns"
 
-          # ---- bundle libfido2 + transitive deps into the .app ----
+          # ---- bundle libfido2 + libfuse-t + transitive deps ----
           # Without this, end users would need `brew install libfido2`
-          # before the binary could even start (dyld resolves dylibs at
-          # process load time, not lazily). dylibbundler walks the
-          # binary's LC_LOAD_DYLIB list, copies non-system dylibs into
-          # Contents/Frameworks/, and rewrites every reference to use
-          # @executable_path/../Frameworks/<libname.dylib>. Recursive,
-          # so libcbor / libcrypto / libssl come along automatically.
-          # -od: overwrite duplicates, -b: bundle, -of: overwrite the
-          # binary itself with the rewritten one, -p: install_name
-          # prefix to use in rewrites.
+          # (etc.) before the binary could even start. dylibbundler
+          # walks the binary's LC_LOAD_DYLIB list, copies non-system
+          # dylibs into Contents/Frameworks/, and rewrites every
+          # reference to use @executable_path/../Frameworks/<libname>.
+          # Recursive, so libcbor / libcrypto / libssl follow
+          # automatically.
+          #
+          # -of  : overwrite output (the binary itself with rewritten
+          #        load commands)
+          # -b   : bundle libraries
+          # -d   : destination dir for the bundled dylibs
+          # -p   : prefix for the new install names
+          # -s   : extra search paths used to RESOLVE @rpath references
+          #        before bundling. FUSE-T 1.x ships
+          #        libfuse-t.dylib with `@rpath/libfuse-t.dylib` as its
+          #        install name; without -s, dylibbundler doesn't know
+          #        where to look and falls back to an INTERACTIVE
+          #        prompt that hangs CI forever ("Please specify the
+          #        directory where this library is located"). The two
+          #        -s paths cover Intel-Homebrew (/usr/local/lib) and
+          #        Apple-Silicon-Homebrew (/opt/homebrew/lib).
+          # </dev/null : defence-in-depth so dylibbundler can NEVER
+          #        hang on an interactive prompt; if it ever can't
+          #        find a dylib, it gets EOF on stdin and aborts,
+          #        which CI sees as a clear failure instead of a
+          #        90-minute timeout.
           dylibbundler -of -b \
             -x "$APP/Contents/MacOS/luksbox-gui" \
             -x "$APP/Contents/MacOS/luksbox" \
             -d "$APP/Contents/Frameworks/" \
-            -p "@executable_path/../Frameworks/"
+            -p "@executable_path/../Frameworks/" \
+            -s /usr/local/lib \
+            -s /opt/homebrew/lib \
+            </dev/null
 
           # ---- Post-bundle DYLD security verification ----
           # The actual security gate for the @rpath / DYLD-injection
