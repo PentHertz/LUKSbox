@@ -35,7 +35,11 @@ const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\nFUSE backend: fuse-t (kext-free, requires `brew install --cask fuse-t`)"
 );
-#[cfg(all(target_os = "macos", feature = "fuse", not(feature = "fuse-t"),))]
+#[cfg(all(
+    target_os = "macos",
+    feature = "fuse",
+    not(feature = "fuse-t"),
+))]
 const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     "\nFUSE backend: macfuse (kext-based, requires `brew install --cask macfuse`)"

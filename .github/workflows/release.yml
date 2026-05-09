@@ -309,15 +309,31 @@ jobs:
                   PKG_CONFIG_PATH="$FUSE_PC_PATH" pkg-config --modversion fuse-t 2>&1 \
                       | sed 's/^/    libfuse-t:      /' || true
 
-                  # Security gate: assert libfuse-t.dylib's LC_ID_DYLIB
-                  # install_name is an absolute path. macOS resolves
-                  # `@rpath/...`, `@loader_path/...`, and
-                  # `@executable_path/...` by searching DYLD_LIBRARY_PATH
-                  # / DYLD_FALLBACK_LIBRARY_PATH / runpath entries - any
-                  # of which an attacker who can set env vars could
-                  # redirect to a malicious dylib. An absolute
-                  # install_name pins the load address in the binary's
-                  # LC_LOAD_DYLIB record so DYLD has nothing to search.
+                  # Inspect (not gate) libfuse-t.dylib's upstream
+                  # install_name. FUSE-T 1.x ships with
+                  # `@rpath/libfuse-t.dylib` (relative). On its own
+                  # that would be an injection vector via
+                  # DYLD_LIBRARY_PATH / DYLD_FALLBACK_LIBRARY_PATH,
+                  # BUT the shipped .app neutralises this via two
+                  # later steps:
+                  #   (a) dylibbundler (run during the .app build
+                  #       below) copies libfuse-t.dylib into
+                  #       Contents/Frameworks/ AND rewrites every
+                  #       LC_LOAD_DYLIB reference in our binaries
+                  #       from `@rpath/libfuse-t.dylib` to
+                  #       `@executable_path/../Frameworks/libfuse-t.dylib`.
+                  #       After bundling, no @rpath reference to
+                  #       libfuse-t remains in the shipped binary.
+                  #   (b) hardened runtime (applied during codesign
+                  #       below) strips DYLD_LIBRARY_PATH /
+                  #       DYLD_FALLBACK_LIBRARY_PATH from the
+                  #       process environment at exec time, so even
+                  #       if @rpath had survived, env-var-based
+                  #       injection would be blocked at the OS level.
+                  # The actual security check is the post-build
+                  # verification step ("Verify shipped binary has no
+                  # unsafe @rpath references") below, which inspects
+                  # the FINAL binary after both (a) and (b).
                   FUSE_T_DYLIB=""
                   for cand in $(brew --prefix)/lib/libfuse-t.dylib \
                               /usr/local/lib/libfuse-t.dylib \
@@ -334,24 +350,11 @@ jobs:
                   FUSE_T_INSTALL_NAME="$(otool -D "$FUSE_T_DYLIB" 2>/dev/null \
                                          | tail -n1 | tr -d '[:space:]')"
                   echo "    libfuse-t path: $FUSE_T_DYLIB"
-                  echo "    install_name:   $FUSE_T_INSTALL_NAME"
-                  case "$FUSE_T_INSTALL_NAME" in
-                      /*)
-                          echo "    install_name is absolute - safe to link"
-                          ;;
-                      @rpath/*|@loader_path/*|@executable_path/*)
-                          echo "::error::libfuse-t.dylib's install_name is '$FUSE_T_INSTALL_NAME' (relative). Linking against it would let DYLD_LIBRARY_PATH / DYLD_FALLBACK_LIBRARY_PATH redirect to a malicious dylib at runtime. Refusing to build."
-                          exit 1
-                          ;;
-                      "")
-                          echo "::error::otool -D returned no install_name for $FUSE_T_DYLIB. Cannot verify it's safe to link."
-                          exit 1
-                          ;;
-                      *)
-                          echo "::error::libfuse-t.dylib's install_name '$FUSE_T_INSTALL_NAME' is neither absolute nor a known relative form. Refusing to build."
-                          exit 1
-                          ;;
-                  esac
+                  echo "    install_name:   $FUSE_T_INSTALL_NAME (informational)"
+                  if [ -z "$FUSE_T_INSTALL_NAME" ]; then
+                      echo "::error::otool -D returned no install_name for $FUSE_T_DYLIB. Cannot inspect."
+                      exit 1
+                  fi
                   ;;
 
               macfuse)
@@ -973,6 +976,38 @@ jobs:
             -x "$APP/Contents/MacOS/luksbox" \
             -d "$APP/Contents/Frameworks/" \
             -p "@executable_path/../Frameworks/"
+
+          # ---- Post-bundle DYLD security verification ----
+          # The actual security gate for the @rpath / DYLD-injection
+          # concern flagged at deps-step time. After dylibbundler, the
+          # shipped binaries should reference every non-system dylib
+          # via @executable_path/../Frameworks/... (which resolves
+          # uniquely against the bundle and isn't influenced by env
+          # vars). Walk the load commands and refuse to ship if any
+          # @rpath reference survived for our known FUSE / FIDO deps,
+          # which would mean dylibbundler missed something and the
+          # binary would be vulnerable to dylib-search-path injection
+          # at user-runtime.
+          for bin in "$APP/Contents/MacOS/luksbox" \
+                     "$APP/Contents/MacOS/luksbox-gui"; do
+              echo "==> Verifying load commands of $bin"
+              otool -L "$bin" | sed 's/^/    /'
+              # Look for @rpath references to dylibs we expected
+              # dylibbundler to bundle. System dylibs (those in
+              # /usr/lib or /System) are fine, dyld resolves those
+              # against the dyld_shared_cache. @rpath is fine ONLY
+              # for system frameworks (e.g. SwiftUI), never for our
+              # third-party deps.
+              UNSAFE_RPATH="$(otool -L "$bin" \
+                  | grep -E '^[[:space:]]+@rpath/(libfuse|libfido|libcbor|libcrypto|libssl|libtss)' \
+                  || true)"
+              if [ -n "$UNSAFE_RPATH" ]; then
+                  echo "::error::$bin still has @rpath references to third-party dylibs after dylibbundler. dylibbundler should have rewritten these to @executable_path/../Frameworks/<lib>. Refusing to ship a binary vulnerable to DYLD search-path injection."
+                  echo "$UNSAFE_RPATH" | sed 's/^/    /'
+                  exit 1
+              fi
+              echo "    OK: no unsafe @rpath references to third-party dylibs"
+          done
 
           # ---- Info.plist ----
           # CFBundleIdentifier MUST be a reverse-DNS string and stable

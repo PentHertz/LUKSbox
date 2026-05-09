@@ -134,11 +134,11 @@ fn main() {
         builder = builder.clang_arg(format!("-I{dir}"));
     }
 
-    let bindings = builder.generate().expect(
-        "bindgen failed to generate FUSE-T bindings; \
+    let bindings = builder
+        .generate()
+        .expect("bindgen failed to generate FUSE-T bindings; \
                  check that fuse_t/fuse.h or fuse.h is reachable via \
-                 the include paths printed above",
-    );
+                 the include paths printed above");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
@@ -157,10 +157,7 @@ fn main() {
         bindings
             .write_to_file(&snapshot)
             .expect("failed to write FUSE-T bindings snapshot");
-        println!(
-            "cargo:warning=wrote bindings snapshot to {}",
-            snapshot.display()
-        );
+        println!("cargo:warning=wrote bindings snapshot to {}", snapshot.display());
     }
 }
 

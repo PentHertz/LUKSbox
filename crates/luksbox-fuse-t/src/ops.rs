@@ -161,11 +161,7 @@ fn to_errno(r: Result<(), Errno>) -> c_int {
 /// or "succeeded with 0 bytes" with no diagnostic. Better to refuse
 /// up front.
 fn off_to_u64(off: libc::off_t) -> Result<u64, c_int> {
-    if off < 0 {
-        Err(-libc::EINVAL)
-    } else {
-        Ok(off as u64)
-    }
+    if off < 0 { Err(-libc::EINVAL) } else { Ok(off as u64) }
 }
 
 /// Convert a Rust-side byte count back to libfuse's positive-int
@@ -220,7 +216,8 @@ fn fill_stat(s: &mut libc::stat, a: &FileAttr) {
     s.st_blksize = 4096;
     // div_ceil avoids the (size + 511) overflow path; clamp the
     // outer cast for the same reason as st_size above.
-    s.st_blocks = libc::blkcnt_t::try_from(a.size.div_ceil(512)).unwrap_or(libc::blkcnt_t::MAX);
+    s.st_blocks =
+        libc::blkcnt_t::try_from(a.size.div_ceil(512)).unwrap_or(libc::blkcnt_t::MAX);
     // mtime: u128 nanos -> (time_t seconds, i64 nsec). Clamp seconds
     // at time_t::MAX so a corrupt mtime can't roll into the past.
     let secs_u = a.mtime_ns / 1_000_000_000;
@@ -527,7 +524,8 @@ unsafe extern "C" fn op_destroy(_priv: *mut c_void) {
 // re-audit `build_operations` before silencing.
 const _ASSERT_OPTION_FN_PTR_NICHE: () = {
     assert!(
-        core::mem::size_of::<Option<unsafe extern "C" fn()>>() == core::mem::size_of::<*const ()>(),
+        core::mem::size_of::<Option<unsafe extern "C" fn()>>()
+            == core::mem::size_of::<*const ()>(),
         "Option<unsafe extern \"C\" fn()> must be niche-optimized to a pointer; \
          build_operations's zero-init relies on this. If this fails, switch to \
          explicit per-field initialization in build_operations."
@@ -689,7 +687,9 @@ pub(crate) fn run_mount<F: Filesystem + 'static>(
     drop(owned);
 
     if rc != 0 {
-        return Err(MountError::Mount(format!("fuse_main_real returned {rc}")));
+        return Err(MountError::Mount(format!(
+            "fuse_main_real returned {rc}"
+        )));
     }
     Ok(())
 }

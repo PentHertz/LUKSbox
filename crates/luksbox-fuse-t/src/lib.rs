@@ -47,9 +47,9 @@ use std::path::Path;
 use thiserror::Error;
 
 #[cfg(target_os = "macos")]
-mod ops;
-#[cfg(target_os = "macos")]
 mod sys;
+#[cfg(target_os = "macos")]
+mod ops;
 
 /// Errors surfaced by the FUSE-T binding. Users of the binding only
 /// see [`MountError`], [`Errno`] is for callbacks back from the
@@ -89,9 +89,7 @@ pub enum MountError {
     /// strings to libfuse, so a buggy or attacker-influenced caller
     /// can't smuggle options like `nosuid` -> `nosuid,allow_other`
     /// through `volname` injection.
-    #[error(
-        "invalid mount option {field}: contains forbidden character (one of `,`, `=`, `\\0`, or a control byte)"
-    )]
+    #[error("invalid mount option {field}: contains forbidden character (one of `,`, `=`, `\\0`, or a control byte)")]
     InvalidOption { field: &'static str },
 }
 
