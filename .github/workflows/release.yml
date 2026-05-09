@@ -960,6 +960,17 @@ jobs:
           cp crates/luksbox-gui/assets/icon.icns \
              "$APP/Contents/Resources/icon.icns"
 
+          # FUSE-T helper sandbox profile. Only meaningful on
+          # builds with the fuse-t backend (the GUI's spawn path
+          # looks for Contents/Resources/fuse-t-helper.sb when the
+          # user opts into LUKSBOX_SANDBOX_HELPER=1). Ship it on
+          # every macOS .app variant for symmetry; on the macFUSE
+          # variant the file is unused but harmless.
+          if [ -f dist/macos/sandbox/fuse-t-helper.sb ]; then
+              cp dist/macos/sandbox/fuse-t-helper.sb \
+                 "$APP/Contents/Resources/fuse-t-helper.sb"
+          fi
+
           # ---- bundle libfido2 + libfuse-t + transitive deps ----
           # Without this, end users would need `brew install libfido2`
           # (etc.) before the binary could even start. dylibbundler
@@ -1160,6 +1171,47 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "$APP"
           # Print the resulting signature shape for the CI log.
           codesign -dv --verbose=4 "$APP" 2>&1 | head -20
+
+          # ---- Hardened-runtime entitlements assertion ----
+          # The FUSE-T mount-helper subprocess receives the 32-byte
+          # MasterVolumeKey on its inherited stdin pipe. The ONLY
+          # sound mitigation against a same-UID process attaching
+          # via task_for_pid() and snooping that pipe (or reading
+          # the helper's memory after the MVK is constructed) is the
+          # hardened runtime's get-task-allow=false posture, which
+          # blocks task_for_pid from non-platform-binary callers.
+          # Verify both binaries actually ship with that entitlement
+          # absent or false; refuse to release if either has
+          # get-task-allow=true (which would let any local same-UID
+          # debugger attach and steal the MVK).
+          for bin in "$APP/Contents/MacOS/luksbox" \
+                     "$APP/Contents/MacOS/luksbox-gui"; do
+              echo "==> Checking entitlements of $bin"
+              # `codesign -d --entitlements - <bin>` prints the
+              # entitlements plist on stdout (XML or binary plist
+              # depending on macOS version). Convert to XML via
+              # plutil so the grep below is reliable.
+              ENTITLEMENTS_XML="$(codesign -d --entitlements - "$bin" 2>/dev/null \
+                                  | plutil -convert xml1 -o - - 2>/dev/null \
+                                  || echo '')"
+              # If the entitlement is absent OR explicitly false, the
+              # signed binary blocks task_for_pid from non-platform
+              # callers - safe. If present AND true, fail the build.
+              # First grep prints the key line + next line (the value);
+              # second grep checks whether the value is <true/>.
+              if echo "$ENTITLEMENTS_XML" \
+                  | grep -A1 '<key>com.apple.security.get-task-allow</key>' \
+                  | grep -q '<true/>'; then
+                  echo "::error::$bin has com.apple.security.get-task-allow=true. \
+                  This would let any same-UID process attach via task_for_pid and \
+                  read the FUSE-T mount-helper's MVK from memory or the inherited \
+                  stdin pipe. Refusing to ship a binary with this entitlement."
+                  echo "Full entitlements:"
+                  echo "$ENTITLEMENTS_XML" | sed 's/^/  /'
+                  exit 1
+              fi
+              echo "    OK: get-task-allow is absent or false"
+          done
 
       - name: Build macOS portable tarball (CLI + GUI, no .app)
         if: runner.os == 'macOS'

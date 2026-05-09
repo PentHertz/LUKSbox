@@ -4294,9 +4294,8 @@ impl LuksboxApp {
                         // tell which from just the exit code, so the
                         // message is deliberately neutral.
                         self.toast_err(format!(
-                            "mount helper exited abnormally ({status}); the mount has \
-                             been torn down. Check ~/Library/Logs/LUKSbox/fuse-t.log \
-                             if you set LUKSBOX_FUSE_T_TRACE=1.",
+                            "mount helper exited abnormally ({status}); \
+                             the mount has been torn down."
                         ));
                     }
                 }
@@ -6841,7 +6840,7 @@ fn start_mount_subprocess(
     mountpoint: &Path,
 ) -> Result<std::process::Child, String> {
     use std::io::Write as _;
-    use std::process::{Command, Stdio};
+    use std::process::Stdio;
     use zeroize::Zeroize as _;
 
     let helper = locate_helper_binary().ok_or_else(|| {
@@ -6861,13 +6860,10 @@ fn start_mount_subprocess(
     // acquire it.
     drop(opened);
 
-    // 3. Spawn the child.
-    let mut cmd = Command::new(&helper);
-    cmd.arg("mount-fuse-t-helper");
-    if let Some(hp) = &header_path {
-        cmd.arg("--header").arg(hp);
-    }
-    cmd.arg(&vault_path).arg(mountpoint);
+    // 3. Spawn the child. Optionally wrap with macOS sandbox-exec
+    // for defense-in-depth (opt-in via LUKSBOX_SANDBOX_HELPER=1
+    // until validated end-to-end on macOS hosts).
+    let mut cmd = build_helper_command(&helper, &vault_path, header_path.as_deref(), mountpoint);
     cmd.stdin(Stdio::piped());
     // Inherit stdout/stderr so the child's diagnostic eprintlns
     // (and any panic output) end up in the parent's terminal when
@@ -6903,6 +6899,124 @@ fn start_mount_subprocess(
     Ok(child)
 }
 
+/// Construct the `Command` that will spawn the FUSE-T mount helper.
+///
+/// By default this is a direct invocation:
+///
+///   /Applications/LUKSbox.app/Contents/MacOS/luksbox \
+///     mount-fuse-t-helper [--header HDR] <vault> <mountpoint>
+///
+/// When `LUKSBOX_SANDBOX_HELPER=1` is set in the environment, the
+/// invocation is wrapped with macOS `sandbox-exec` using the
+/// profile shipped at `dist/macos/sandbox/fuse-t-helper.sb`. The
+/// sandbox restricts the helper to:
+/// - File I/O on the vault file's parent directory + the
+///   mountpoint's parent directory only.
+/// - Network bind/connect on `127.0.0.1` only (FUSE-T's NFS
+///   loopback transport).
+/// - Process exec only of binaries under FUSE-T's install paths
+///   and `/sbin/mount{,_nfs,_nfs4}` / `/sbin/umount`.
+/// - No reads outside system dylibs, FUSE-T paths, vault dir,
+///   mountpoint dir, and our own .app bundle.
+///
+/// Defense in depth against a future libfuse-t.dylib vulnerability
+/// (e.g. an RCE in its NFS RPC parser) trying to fork shells,
+/// exfiltrate data, or read other files under the user's UID.
+///
+/// Opt-in until validated on real macOS hosts. The sandbox profile
+/// language is undocumented (TinyScheme-based, only public examples
+/// are in `/System/Library/Sandbox/Profiles/`), so a too-tight rule
+/// could break mount in subtle ways. Default off ships safe; we'll
+/// flip the default once we have confirmation from CI + manual
+/// macOS testing that the profile permits everything libfuse-t
+/// actually needs.
+///
+/// On non-macOS targets the sandbox-wrapping branch is dead code
+/// (FUSE-T is macOS-only), but we keep the function platform-portable
+/// so the build compiles unchanged on Linux/Windows.
+fn build_helper_command(
+    helper: &Path,
+    vault: &Path,
+    header: Option<&Path>,
+    mountpoint: &Path,
+) -> std::process::Command {
+    use std::process::Command;
+
+    // Sandbox opt-in. Re-read on every spawn so a user can flip the
+    // env var without restarting the GUI.
+    let sandbox_enabled = matches!(
+        std::env::var("LUKSBOX_SANDBOX_HELPER").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    );
+
+    if cfg!(target_os = "macos") && sandbox_enabled {
+        if let Some(profile_path) = locate_sandbox_profile() {
+            let mut cmd = Command::new("/usr/bin/sandbox-exec");
+            // -D <KEY=VAL> injects parameters into the profile,
+            // available via (param "KEY") in Scheme.
+            let vault_dir = vault.parent().unwrap_or_else(|| Path::new("/"));
+            let mp_dir = mountpoint.parent().unwrap_or_else(|| Path::new("/"));
+            let bundle_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.canonicalize().ok())
+                .and_then(|p| p.parent().map(|q| q.to_path_buf()))
+                .unwrap_or_else(|| PathBuf::from("/"));
+            cmd.arg("-D")
+                .arg(format!("VAULT_DIR={}", vault_dir.display()));
+            cmd.arg("-D")
+                .arg(format!("MOUNTPOINT_DIR={}", mp_dir.display()));
+            cmd.arg("-D").arg(format!(
+                "HOME={}",
+                std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+            ));
+            cmd.arg("-D")
+                .arg(format!("BUNDLE_DIR={}", bundle_dir.display()));
+            cmd.arg("-f").arg(profile_path);
+            cmd.arg(helper);
+            cmd.arg("mount-fuse-t-helper");
+            if let Some(hp) = header {
+                cmd.arg("--header").arg(hp);
+            }
+            cmd.arg(vault).arg(mountpoint);
+            return cmd;
+        }
+        // Fall through to unsandboxed invocation if the profile is
+        // missing - log a warning to stderr but don't refuse to
+        // mount. The user opted in for hardening; if the profile
+        // is gone, they at least get the mount working.
+        eprintln!(
+            "luksbox: LUKSBOX_SANDBOX_HELPER=1 set but sandbox profile not found \
+             at <bundle>/Contents/Resources/fuse-t-helper.sb; spawning helper \
+             unsandboxed."
+        );
+    }
+
+    // Default path: direct invocation of the helper, no sandbox wrap.
+    let mut cmd = Command::new(helper);
+    cmd.arg("mount-fuse-t-helper");
+    if let Some(hp) = header {
+        cmd.arg("--header").arg(hp);
+    }
+    cmd.arg(vault).arg(mountpoint);
+    cmd
+}
+
+/// Find the sandbox profile file that ships in the .app bundle's
+/// Resources directory. Returns `None` if not present (e.g., on a
+/// dev `cargo run` build where Resources isn't populated).
+fn locate_sandbox_profile() -> Option<PathBuf> {
+    let me = std::env::current_exe().ok()?.canonicalize().ok()?;
+    // .app/Contents/MacOS/luksbox-gui -> .app/Contents/Resources/
+    let macos_dir = me.parent()?;
+    let contents_dir = macos_dir.parent()?;
+    let candidate = contents_dir.join("Resources").join("fuse-t-helper.sb");
+    if candidate.is_file() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
 /// Find the sibling `luksbox` CLI binary that the GUI's mount-helper
 /// subprocess invocation needs.
 ///
@@ -6918,8 +7032,20 @@ fn start_mount_subprocess(
 /// (`luksbox.exe` on Windows, but FUSE-T is macOS-only so we don't
 /// hit that path here). Returns `None` if no such file exists; the
 /// caller surfaces a clear error.
+///
+/// Security: `current_exe()` is canonicalised BEFORE we compute
+/// `parent()`. Without this step, a user who symlinked the GUI
+/// into a directory the user has write access to (e.g.,
+/// `~/bin/luksbox-gui -> /Applications/LUKSbox.app/Contents/MacOS/luksbox-gui`)
+/// would have the GUI look for the helper next to the symlink
+/// (`~/bin/luksbox`). An attacker who could write to that
+/// directory could plant a malicious `luksbox` there, the GUI
+/// would spawn it on next mount, and the attacker would receive
+/// the 32-byte MVK on the spawned process's stdin. Canonicalising
+/// resolves the symlink to the real `.app` path so the helper
+/// always comes from the same signed bundle as the GUI.
 fn locate_helper_binary() -> Option<PathBuf> {
-    let me = std::env::current_exe().ok()?;
+    let me = std::env::current_exe().ok()?.canonicalize().ok()?;
     let dir = me.parent()?;
     let candidate = dir.join(if cfg!(windows) {
         "luksbox.exe"

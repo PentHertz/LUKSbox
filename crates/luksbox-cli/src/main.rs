@@ -4236,6 +4236,39 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
     use std::io::Read;
     use zeroize::Zeroize;
 
+    // Ignore SIGPIPE for the entire helper process lifetime.
+    //
+    // libfuse-t.dylib (and its closed-source `go-nfsv4` companion)
+    // writes through internal pipes/sockets during the mount session
+    // and, more importantly, during teardown. When the kernel side of
+    // the NFS connection drops at unmount, one of those endpoints
+    // closes mid-write inside libfuse-t and the kernel delivers
+    // SIGPIPE to our process. Default disposition for SIGPIPE is to
+    // terminate the process - that's how `head`-piped pipelines end
+    // their producer cleanly, and it's the wrong behaviour for any
+    // long-running server. With SIG_IGN, the write that would have
+    // generated SIGPIPE returns EPIPE instead; libfuse-t handles that
+    // gracefully and the helper exits cleanly with status 0.
+    //
+    // Without this, the GUI sees the helper exit with "signal: 13
+    // (SIGPIPE)" on every unmount and surfaces a misleading
+    // "mount helper exited abnormally" toast, even though the mount
+    // and unmount themselves succeeded.
+    //
+    // SAFETY: signal() with SIG_IGN is async-signal-safe and has no
+    // preconditions. We do this BEFORE reading the MVK so that even
+    // a SIGPIPE during the stdin-read path (pipe writer in parent
+    // dies between spawn and our read) doesn't kill us silently.
+    //
+    // `cfg(unix)`: SIGPIPE doesn't exist on Windows. The helper
+    // subcommand isn't reachable on Windows in practice (FUSE-T is
+    // macOS-only) but we keep the cfg gate so a Windows build of
+    // the CLI binary doesn't need libc.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
     // Mountpoint validation matches `cmd_mount`'s POSIX branch
     // (this subcommand is macOS-only at the runtime level, but we
     // gate identically for safety).

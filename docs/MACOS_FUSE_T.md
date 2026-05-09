@@ -137,6 +137,102 @@ FUSE-T has). Backend dispatch lives in
 `crates/luksbox-gui/src/app.rs::start_mount_picker`, gated on
 `luksbox_mount::FUSE_BACKEND == "fuse-t"`.
 
+### Optional sandbox-exec hardening (`LUKSBOX_SANDBOX_HELPER=1`)
+
+The mount-helper subprocess can be wrapped with macOS
+`sandbox-exec` for defense in depth against a future
+`libfuse-t.dylib` vulnerability. The profile lives at
+`Contents/Resources/fuse-t-helper.sb` inside the .app bundle and
+is the same one shipped at `dist/macos/sandbox/fuse-t-helper.sb`
+in the source tree.
+
+Opt-in via env var, default off:
+
+```bash
+export LUKSBOX_SANDBOX_HELPER=1
+open /Applications/LUKSbox.app
+```
+
+When enabled, the helper child process can only:
+- Read system dylibs and FUSE-T install paths.
+- Read/write the vault file's parent directory and the
+  mountpoint's parent directory.
+- Bind/connect on `127.0.0.1` only (FUSE-T's NFS loopback). NO
+  internet egress — if libfuse-t tried to phone home, this
+  blocks it.
+- Exec FUSE-T's helper binaries + `/sbin/mount{,_nfs,_nfs4}` /
+  `/sbin/umount`. NO arbitrary shell execution.
+
+If a too-tight rule breaks mount in your environment, unset the
+env var to fall back to unsandboxed invocation, and please file
+an issue with the sandbox profile's blocked-syscall log so we can
+loosen it. The opt-in default ships safe; we'll flip to default-on
+once the profile is validated across a broader set of macOS
+versions.
+
+The profile's full text is heavily commented at
+`dist/macos/sandbox/fuse-t-helper.sb`; the syntax is the same
+TinyScheme-like DSL Apple uses for its own `/System/Library/Sandbox/Profiles/`
+profiles (no public reference docs, those are the only example
+source).
+
+### The `mount-fuse-t-helper` CLI subcommand
+
+The child process the GUI spawns is the same `luksbox` CLI binary
+that ships in `LUKSbox.app/Contents/MacOS/`, invoked with the
+hidden subcommand `mount-fuse-t-helper`. This subcommand exists
+solely as the GUI's IPC counterparty; it is intentionally absent
+from `luksbox --help` because there is no sensible workflow for
+typing 32 raw MVK bytes into stdin by hand. Documented here so a
+sophisticated user who reverse-engineers the binary and discovers
+it understands the design intent (rather than thinking they found
+something to exploit).
+
+**Signature**:
+
+```
+luksbox mount-fuse-t-helper [--header HDR] <vault.lbx> <mountpoint>
+```
+
+**Behaviour**:
+
+1. Sets `SIGPIPE` to `SIG_IGN` (so libfuse-t's internal pipe
+   teardown writes don't kill the helper - see
+   `cmd_mount_fuse_t_helper`).
+2. Reads exactly 32 bytes from stdin. Treats them as the
+   Master Volume Key. Zeroizes the input buffer immediately
+   after the `MasterVolumeKey` takes ownership.
+3. Opens the vault via [`Container::open_with_mvk`](https://github.com/penthertz/LUKSbox/blob/main/crates/luksbox-format/src/container.rs)
+   - which verifies the header HMAC against the supplied MVK
+   before construction. A wrong MVK fails fast with
+   `Error::Crypto(HeaderAuthFailed)`.
+4. Builds the Vfs and runs `luksbox_mount::mount(vfs, mp, false)`
+   in foreground. Blocks until unmount.
+5. Exits 0 on clean unmount, non-zero on any error (which the
+   parent GUI translates into an error toast).
+
+**What if a user runs it directly?**
+
+`echo -n 'some 32 bytes' | luksbox mount-fuse-t-helper /path/to/vault /mountpoint`
+will work if the bytes are the actual MVK. But getting the right
+32 bytes requires already having unlocked the vault somewhere - so
+this is equivalent to "the user has the MVK", which is "the user
+has access to the vault". No new capability is exposed by the
+hidden subcommand existing.
+
+**What an attacker who finds this subcommand cannot do**:
+
+- They cannot mount a vault without the MVK (the HMAC check
+  inside `Container::open_with_mvk` rejects every other 32-byte
+  input).
+- They cannot use it to extract a key from a running GUI - the
+  MVK pipe is the parent's stdin handle to a NEW child it just
+  spawned, not a globally-readable resource.
+- They cannot replace the helper invoked by the GUI - the GUI
+  uses `current_exe().canonicalize()` to resolve to its sibling
+  `luksbox` inside the same signed `.app` bundle, blocking
+  symlink-redirect attacks (see `locate_helper_binary`).
+
 ## Why we don't just use the existing `fuser` crate
 
 `fuser = "0.17"` (`workspace.dependencies` in `Cargo.toml`) hard-codes
@@ -380,29 +476,6 @@ the common path". Items that need attention before Phase 2 / v0.2:
   practice. Phase 1 ships the binding green at compile / link
   time; Phase 2 adds an integration-test job mirroring the WinFsp
   test on Windows.
-
-## Troubleshooting / diagnostic logging
-
-`LUKSBOX_FUSE_T_TRACE=1` enables per-callback trace logging to
-both stderr and `~/Library/Logs/LUKSbox/fuse-t.log`. Default off so
-production users don't accumulate disk footprint after the
-close-on-unmount bug was contained via subprocess isolation. When
-enabled:
-
-```bash
-export LUKSBOX_FUSE_T_TRACE=1
-open /Applications/LUKSbox.app
-# ...mount, unmount, then:
-tail -100 ~/Library/Logs/LUKSbox/fuse-t.log
-```
-
-Each line is `[t=<unix-time>.<ms>]: luksbox-fuse-t: <message>`. You
-should see entry / op_destroy / fuse_main_real-returned / signal-
-handlers-restored bracketing the mount session. If the log truncates
-at "entering fuse_main_real" with no follow-on lines, the FUSE-T
-helper aborted the child process - exactly the bug subprocess
-isolation is meant to contain. The GUI will surface this as a toast
-"mount helper exited abnormally" instead of closing.
 
 ## Where the code lives
 

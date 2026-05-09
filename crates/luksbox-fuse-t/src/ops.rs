@@ -26,14 +26,12 @@
 //! benchmarks show single-thread mode bottlenecking on large reads.
 
 use std::ffi::{CStr, CString};
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::os::raw::{c_char, c_int, c_void};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sys;
@@ -528,23 +526,19 @@ unsafe extern "C" fn op_destroy(_priv: *mut c_void) {
     // touching the user's destroy logic again. We do NOT free the
     // FsHolder here, the owning Arc lives on `run_mount`'s stack and
     // is dropped when fuse_main_real returns.
-    trace("op_destroy entered (libfuse is tearing down the session)");
     let Some(holder_ptr) = NonNull::new(_priv as *mut FsHolder) else {
-        trace("op_destroy: NULL private_data, returning");
         return;
     };
     // SAFETY: holder_ptr came from Arc::as_ptr in run_mount; the Arc
     // on run_mount's stack outlives this call.
     let holder = unsafe { holder_ptr.as_ref() };
     if holder.destroyed.swap(true, Ordering::AcqRel) {
-        trace("op_destroy: already destroyed flag was set; this is a repeat call");
         return;
     }
     // Catch panics so a buggy Filesystem::destroy can't take down
     // libfuse's teardown thread; we still mark destroyed above so
     // subsequent callbacks fast-fail.
     let _ = catch_unwind(AssertUnwindSafe(|| holder.fs.destroy()));
-    trace("op_destroy: Filesystem::destroy completed");
 }
 
 // ---------------------------------------------------------------
@@ -605,112 +599,6 @@ fn build_operations() -> sys::fuse_operations {
     ops
 }
 
-/// Returns true if the user has opted into FUSE-T diagnostic
-/// tracing via the `LUKSBOX_FUSE_T_TRACE` env var. Default off so
-/// production users don't accumulate `~/Library/Logs/LUKSbox/`
-/// footprint after the close-on-unmount bug was fixed via subprocess
-/// isolation. Re-evaluated on every check (no caching) so the user
-/// can `export LUKSBOX_FUSE_T_TRACE=1` mid-session and start
-/// capturing without restarting.
-fn tracing_enabled() -> bool {
-    matches!(
-        std::env::var("LUKSBOX_FUSE_T_TRACE").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    )
-}
-
-/// Diagnostic log target for FUSE-T mount lifecycle events.
-///
-/// Gated on `LUKSBOX_FUSE_T_TRACE=1`. When enabled, writes to BOTH
-/// stderr (visible if launched from Terminal) AND
-/// `~/Library/Logs/LUKSbox/fuse-t.log` (visible regardless of launch
-/// method). When disabled (the default), this is a no-op - no
-/// stderr output, no file written, no `~/Library/Logs/LUKSbox/`
-/// directory created.
-///
-/// Falls back to stderr-only on any I/O error so the diagnostic
-/// path never causes its own failures.
-fn trace(msg: &str) {
-    if !tracing_enabled() {
-        return;
-    }
-    let line = format!("{}: luksbox-fuse-t: {}", chrono_like_now(), msg);
-    eprintln!("{line}");
-    if let Some(path) = trace_log_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(f, "{line}");
-        }
-    }
-}
-
-/// `~/Library/Logs/LUKSbox/fuse-t.log` on macOS, `None` elsewhere
-/// (the binding is macOS-only at the runtime level, the file path
-/// follows Apple's per-user log directory convention).
-fn trace_log_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let mut p = PathBuf::from(home);
-    p.push("Library");
-    p.push("Logs");
-    p.push("LUKSbox");
-    p.push("fuse-t.log");
-    Some(p)
-}
-
-/// Return a timestamp string for the trace log. We avoid pulling in
-/// the `chrono` crate just for this; SystemTime + a hand-formatter
-/// is enough for log-correlation purposes.
-fn chrono_like_now() -> String {
-    let dur = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let secs = dur.as_secs();
-    let millis = dur.subsec_millis();
-    // ISO-ish but Unix-time-based; good enough to correlate with
-    // `Console.app`'s timestamps when needed.
-    format!("[t={secs}.{millis:03}]")
-}
-
-/// Install a process-wide panic hook that mirrors panics into the
-/// FUSE-T trace log BEFORE chaining to the previously-installed
-/// hook (default or user-set). Diagnostic only: when
-/// `LUKSBOX_FUSE_T_TRACE=1` is set, panics anywhere in the process
-/// get logged to `~/Library/Logs/LUKSbox/fuse-t.log` with location
-/// info. Useful for diagnosing mount-related crashes on macOS hosts
-/// where signal-driven aborts in libfuse-t can otherwise be opaque.
-///
-/// Once-guarded so multiple mount cycles don't accumulate hooks.
-/// No-op when tracing is disabled (the default), so we don't
-/// pollute the process's panic-hook chain in production.
-fn install_panic_hook_once() {
-    if !tracing_enabled() {
-        return;
-    }
-    static HOOK: Once = Once::new();
-    HOOK.call_once(|| {
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(move |info| {
-            let location = info
-                .location()
-                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-                .unwrap_or_else(|| "<unknown>".to_string());
-            let payload = info
-                .payload()
-                .downcast_ref::<&'static str>()
-                .map(|s| s.to_string())
-                .or_else(|| info.payload().downcast_ref::<String>().cloned())
-                .unwrap_or_else(|| "<non-string panic payload>".to_string());
-            trace(&format!("PANIC at {location}: {payload}"));
-            // Chain to whatever was previously installed (default
-            // panic-handler prints to stderr, etc.).
-            prev(info);
-        }));
-        trace("panic hook installed");
-    });
-}
-
 // ---------------------------------------------------------------
 // Mount entry point
 // ---------------------------------------------------------------
@@ -727,7 +615,6 @@ pub(crate) fn run_mount<F: Filesystem + 'static>(
     mountpoint: &Path,
     options: &MountOptions,
 ) -> Result<(), MountError> {
-    install_panic_hook_once();
     // Runtime ABI check: the libfuse-t.dylib we're about to call
     // might have been built against a different libfuse header
     // version than our bindings. fuse_version() reports MAJOR*10+MINOR
@@ -830,22 +717,12 @@ pub(crate) fn run_mount<F: Filesystem + 'static>(
         // queries the current handler without modifying it.
         let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
         let r = unsafe { libc::sigaction(sig, std::ptr::null(), &mut old) };
-        if r != 0 {
-            // Don't fail the mount over this - just log and continue
-            // without restore for that specific signal. Safer to mount
-            // than to bail out for a diagnostic-grade defense.
-            trace(&format!(
-                "warning: sigaction({sig}, query) failed; \
-                 won't be able to restore the original handler after unmount"
-            ));
-        }
+        // sigaction(query) failures are silently tolerated: we'd
+        // rather mount with the wrong handler than refuse to mount
+        // over a defensive measure.
+        let _ = r;
         saved.push(old);
     }
-
-    trace(&format!(
-        "entering fuse_main_real (mountpoint={}, abi={runtime_abi})",
-        mountpoint.display()
-    ));
 
     // SAFETY: argv and ops are valid for the call. user_data is a
     // raw pointer derived from Arc::as_ptr; the owning Arc on this
@@ -861,25 +738,12 @@ pub(crate) fn run_mount<F: Filesystem + 'static>(
         )
     };
 
-    trace(&format!(
-        "fuse_main_real returned (rc={rc}); restoring signal handlers"
-    ));
-
-    // Restore the saved signal dispositions. Use SA_RESTART /
-    // SA_NOCLDSTOP flags as set in `saved`.
+    // Restore the saved signal dispositions.
     for (sig, old) in SAVED_SIGS.iter().zip(saved.iter()) {
         // SAFETY: `old` was populated by the query above; its layout
         // is a valid sigaction struct.
-        let r = unsafe { libc::sigaction(*sig, old as *const _, std::ptr::null_mut()) };
-        if r != 0 {
-            trace(&format!(
-                "warning: sigaction({sig}, restore) failed; \
-                 default handler will be used for this signal"
-            ));
-        }
+        let _ = unsafe { libc::sigaction(*sig, old as *const _, std::ptr::null_mut()) };
     }
-
-    trace("signal handlers restored, mount session ended cleanly");
 
     // Belt-and-suspenders: mark destroyed even if libfuse never
     // called op_destroy (early failure paths). Any stray callback
