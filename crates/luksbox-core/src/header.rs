@@ -251,7 +251,15 @@ impl Header {
         // combined with a non-zero metadata_size could wrap the seek
         // arithmetic in `read_metadata`. checked_add catches it
         // before any allocation/seek happens.
-        if metadata_offset.checked_add(metadata_size).is_none() {
+        let metadata_end = metadata_offset
+            .checked_add(metadata_size)
+            .ok_or(Error::InvalidField)?;
+        // The encrypted metadata region and encrypted chunk area must
+        // not overlap. These offsets are authenticated, but an MVK
+        // holder can still produce a valid HMAC over a structurally
+        // invalid layout. Reject that before VFS chunk writes can alias
+        // the metadata blob.
+        if data_offset < metadata_end {
             return Err(Error::InvalidField);
         }
         let keyslot_count = u32::from_le_bytes(
@@ -456,6 +464,25 @@ mod tests {
         bytes[OFF_METADATA_OFFSET..OFF_METADATA_OFFSET + 8]
             .copy_from_slice(&u64::MAX.to_le_bytes());
         bytes[OFF_METADATA_SIZE..OFF_METADATA_SIZE + 8].copy_from_slice(&1u64.to_le_bytes());
+        assert!(matches!(
+            Header::from_bytes(&bytes),
+            Err(Error::InvalidField)
+        ));
+    }
+
+    #[test]
+    fn header_rejects_data_offset_inside_metadata_region() {
+        // Authenticated fields still need semantic validation. A
+        // malicious MVK holder can produce a valid header HMAC where
+        // chunk slot 0 starts inside the encrypted metadata region.
+        let mut bytes = well_formed_header_bytes();
+        let metadata_offset = u64::from_le_bytes(
+            bytes[OFF_METADATA_OFFSET..OFF_METADATA_OFFSET + 8]
+                .try_into()
+                .unwrap(),
+        );
+        bytes[OFF_METADATA_SIZE..OFF_METADATA_SIZE + 8].copy_from_slice(&4096u64.to_le_bytes());
+        bytes[OFF_DATA_OFFSET..OFF_DATA_OFFSET + 8].copy_from_slice(&metadata_offset.to_le_bytes());
         assert!(matches!(
             Header::from_bytes(&bytes),
             Err(Error::InvalidField)
