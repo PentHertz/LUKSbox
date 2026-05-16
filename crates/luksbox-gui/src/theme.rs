@@ -19,6 +19,22 @@ pub const WARN: Color32 = Color32::from_rgb(0xff, 0xb4, 0x54);
 pub const DANGER: Color32 = Color32::from_rgb(0xff, 0x6f, 0x6f);
 
 pub fn install(ctx: &egui::Context) {
+    // Force LUKSbox to use the dark theme slot regardless of the OS
+    // theme. egui's default `ThemePreference::System` reads the host
+    // theme each frame and routes `set_visuals`/`set_global_style`
+    // writes to whichever slot is "active" (dark_style or light_style).
+    // On Windows in light mode that meant our custom-colored visuals
+    // were being written into the LIGHT slot, while the framework still
+    // asked Windows DWM for a light title bar + light scrollbars, which
+    // mismatched our dark body. Locking to Dark here is what makes the
+    // app look the same on every OS / system-theme combo.
+    ctx.set_theme(egui::ThemePreference::Dark);
+    // Push the same hint to the windowing system so Windows DWM paints
+    // the title bar + caption buttons in dark mode and Linux/Wayland
+    // window managers that honour preferred-color-scheme follow suit.
+    // No-op on backends that don't expose a theme channel.
+    ctx.send_viewport_cmd(egui::ViewportCommand::SetTheme(egui::SystemTheme::Dark));
+
     let mut v = Visuals::dark();
     v.window_fill = PANEL;
     v.panel_fill = BG;
