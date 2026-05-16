@@ -23,6 +23,16 @@ mod fuse;
 #[cfg(all(target_os = "macos", feature = "fuse-t"))]
 mod fuse_t;
 
+// Shared `statvfs(2)` helper used by both Unix mount adapters above
+// to report honest host-disk free space to the FUSE/FUSE-T layer.
+// Gated on whichever Unix adapter is active so non-Unix targets and
+// adapter-less builds don't pull libc::statvfs into the link.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "fuse"),
+    all(target_os = "macos", feature = "fuse-t"),
+))]
+mod unix_statvfs;
+
 #[cfg(all(target_os = "windows", feature = "winfsp"))]
 mod winfsp;
 

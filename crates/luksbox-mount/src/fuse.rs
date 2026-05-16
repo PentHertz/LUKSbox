@@ -14,6 +14,8 @@ use fuser::{
 
 use luksbox_vfs::{Error as VfsError, FileId, InodeKind, Vfs};
 
+use crate::unix_statvfs::host_fs_statvfs;
+
 const TTL: Duration = Duration::from_secs(1);
 
 pub fn mount(vfs: Vfs, mountpoint: &Path, daemonize: bool) -> std::io::Result<()> {
@@ -899,42 +901,6 @@ impl Filesystem for LuksboxFs {
     ) {
         reply.error(Errno::EACCES);
     }
-}
-
-struct HostFsInfo {
-    blocks: u64,
-    bfree: u64,
-    bavail: u64,
-    files: u64,
-    ffree: u64,
-    bsize: u32,
-    frsize: u32,
-}
-
-fn host_fs_statvfs(path: &Path) -> Option<HostFsInfo> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    // SAFETY: statvfs is signal-safe and the pointer is valid for the
-    // call; the buffer is fully written by the syscall on success.
-    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut buf) };
-    if rc != 0 {
-        return None;
-    }
-    // statvfs field widths differ across platforms (u64 on Linux, varies
-    // on macOS); cast through u64 then clamp the block-size fields to
-    // u32 for fuser's ReplyStatfs. The block counts (blocks/bfree/bavail)
-    // are reported as u64 to fuser and can address the full host disk.
-    Some(HostFsInfo {
-        blocks: buf.f_blocks as u64,
-        bfree: buf.f_bfree as u64,
-        bavail: buf.f_bavail as u64,
-        files: buf.f_files as u64,
-        ffree: buf.f_ffree as u64,
-        bsize: u32::try_from(buf.f_bsize as u64).unwrap_or(4096),
-        frsize: u32::try_from(buf.f_frsize as u64).unwrap_or(4096),
-    })
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]

@@ -272,9 +272,14 @@ pub trait Filesystem: Send + Sync {
     fn destroy(&self) {}
 }
 
-/// Result of [`Filesystem::statfs`]. All fields default to 0, which
-/// libfuse renders as "unknown", that's fine for an in-memory or
-/// encrypted-container FS where free-space accounting is meaningless.
+/// Result of [`Filesystem::statfs`]. All fields default to 0. Note
+/// that returning zeros on macOS FUSE-T is NOT safe: the kernel NFS
+/// client gates `WRITE3` on the server's reported `f_bavail` and
+/// returns ENOSPC (visible as "not enough space" in Finder, blocking
+/// every file copy) if it's zero. Adapters MUST override the default
+/// and surface real numbers, typically by calling `statvfs(2)` on the
+/// directory that backs the volume. See `crates/luksbox-mount/src/
+/// fuse_t.rs` for the LUKSbox reference impl.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StatVfs {
     pub blocks: u64,

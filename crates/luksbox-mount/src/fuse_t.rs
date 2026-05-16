@@ -20,9 +20,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use luksbox_fuse_t::{
-    DirEntry as FtDirEntry, Errno, FileAttr, Filesystem, MountOptions, S_IFDIR, S_IFREG,
+    DirEntry as FtDirEntry, Errno, FileAttr, Filesystem, MountOptions, S_IFDIR, S_IFREG, StatVfs,
 };
 use luksbox_vfs::{Error as VfsError, FileId, InodeKind, Vfs};
+
+use crate::unix_statvfs::host_fs_statvfs;
 
 pub fn mount(vfs: Vfs, mountpoint: &Path, _daemonize: bool) -> Result<(), super::MountError> {
     // FUSE-T's high-level API blocks the calling thread until unmount,
@@ -47,16 +49,30 @@ struct LuksboxFuseTFs {
     vfs: Mutex<Vfs>,
     uid: u32,
     gid: u32,
+    /// Directory containing the .lbx vault file, cached at construction
+    /// time so `statfs` can probe the host filesystem for real free-space
+    /// numbers. macOS's NFS-bridge that FUSE-T runs through takes the
+    /// statfs reply literally and refuses WRITE3 RPCs (Finder shows "not
+    /// enough space" and blocks file copy) if we surface `f_bavail == 0`,
+    /// which is what the default trait impl returns. Mirrors the same
+    /// pattern in fuse.rs for libfuse/macFUSE.
+    vault_parent: Option<PathBuf>,
 }
 
 impl LuksboxFuseTFs {
     fn new(vfs: Vfs) -> Self {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
+        let vault_parent = vfs
+            .container()
+            .vault_path()
+            .parent()
+            .map(|p| p.to_path_buf());
         Self {
             vfs: Mutex::new(vfs),
             uid,
             gid,
+            vault_parent,
         }
     }
 
@@ -247,6 +263,42 @@ impl Filesystem for LuksboxFuseTFs {
         // out.
         if let Ok(mut vfs) = self.vfs.lock() {
             let _ = vfs.flush();
+        }
+    }
+
+    fn statfs(&self, _path: &Path) -> Result<StatVfs, Errno> {
+        // FUSE-T routes through the macOS NFS client, which gates
+        // WRITE3 on the server's reported `f_bavail`. The default
+        // trait impl returns zeros and breaks every Finder copy
+        // ("not enough space" - even for a small file - while mkdir
+        // still works because it does not pass through WRITE3).
+        // Query the host filesystem so growth is bounded by real disk
+        // space and Finder lets the user write.
+        let host = self.vault_parent.as_deref().and_then(host_fs_statvfs);
+        match host {
+            Some(s) => Ok(StatVfs {
+                blocks: s.blocks,
+                bfree: s.bfree,
+                bavail: s.bavail,
+                files: s.files,
+                ffree: s.ffree,
+                bsize: s.bsize,
+                frsize: s.frsize,
+                namemax: 255,
+            }),
+            // Conservative fallback: 1 TiB worth of 4 KiB blocks so
+            // writes aren't rejected when statvfs is unavailable.
+            // Matches the libfuse fallback in fuse.rs.
+            None => Ok(StatVfs {
+                blocks: 256 * 1024 * 1024,
+                bfree: 256 * 1024 * 1024,
+                bavail: 256 * 1024 * 1024,
+                files: 1_000_000,
+                ffree: 1_000_000,
+                bsize: 4096,
+                frsize: 4096,
+                namemax: 255,
+            }),
         }
     }
 }
