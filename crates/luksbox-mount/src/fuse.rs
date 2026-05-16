@@ -346,6 +346,12 @@ struct LuksboxFs {
     vfs: Mutex<Vfs>,
     uid: u32,
     gid: u32,
+    /// Directory containing the .lbx vault file, cached at construction
+    /// time so `statfs` can probe the host filesystem for real free-space
+    /// numbers without re-locking the Vfs on every request. `None` only
+    /// if the vault path has no parent (root-level path, never the case
+    /// in practice). Used exclusively by `statfs`.
+    vault_parent: Option<PathBuf>,
 }
 
 impl LuksboxFs {
@@ -353,10 +359,16 @@ impl LuksboxFs {
         // SAFETY: getuid/getgid are signal-safe and always succeed.
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
+        let vault_parent = vfs
+            .container()
+            .vault_path()
+            .parent()
+            .map(|p| p.to_path_buf());
         Self {
             vfs: Mutex::new(vfs),
             uid,
             gid,
+            vault_parent,
         }
     }
 
@@ -836,7 +848,34 @@ impl Filesystem for LuksboxFs {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: fuser::ReplyStatfs) {
-        reply.statfs(0, 0, 0, 0, 0, 4096, 255, 4096);
+        // FUSE-T on macOS bridges through the kernel NFS client, which
+        // refuses writes when the FS reports `f_bavail == 0` (returns
+        // ENOSPC, and Finder shows a "low allocation size" warning that
+        // blocks drag-and-drop into the mounted volume). Reporting zeros
+        // worked on macFUSE / libfuse-on-Linux because their kernels
+        // don't gate writes on statfs, but it breaks every Finder copy
+        // under FUSE-T. Query the underlying host filesystem (where the
+        // .lbx vault lives) and surface its real numbers so growth is
+        // bounded by actual disk space and Finder lets the user write.
+        let host = self.vault_parent.as_deref().and_then(host_fs_statvfs);
+        let (blocks, bfree, bavail, files, ffree, bsize, frsize) = match host {
+            Some(s) => (
+                s.blocks, s.bfree, s.bavail, s.files, s.ffree, s.bsize, s.frsize,
+            ),
+            // Conservative fallback: present as a roomy 1 TiB filesystem
+            // so writes are not rejected when statvfs is unavailable.
+            // Matches the practice in fuser's own example FS.
+            None => (
+                256 * 1024 * 1024,
+                256 * 1024 * 1024,
+                256 * 1024 * 1024,
+                1_000_000,
+                1_000_000,
+                4096,
+                4096,
+            ),
+        };
+        reply.statfs(blocks, bfree, bavail, files, ffree, bsize, 255, frsize);
     }
 
     fn symlink(
@@ -860,6 +899,42 @@ impl Filesystem for LuksboxFs {
     ) {
         reply.error(Errno::EACCES);
     }
+}
+
+struct HostFsInfo {
+    blocks: u64,
+    bfree: u64,
+    bavail: u64,
+    files: u64,
+    ffree: u64,
+    bsize: u32,
+    frsize: u32,
+}
+
+fn host_fs_statvfs(path: &Path) -> Option<HostFsInfo> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    // SAFETY: statvfs is signal-safe and the pointer is valid for the
+    // call; the buffer is fully written by the syscall on success.
+    let mut buf: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut buf) };
+    if rc != 0 {
+        return None;
+    }
+    // statvfs field widths differ across platforms (u64 on Linux, varies
+    // on macOS); cast through u64 then clamp the block-size fields to
+    // u32 for fuser's ReplyStatfs. The block counts (blocks/bfree/bavail)
+    // are reported as u64 to fuser and can address the full host disk.
+    Some(HostFsInfo {
+        blocks: buf.f_blocks as u64,
+        bfree: buf.f_bfree as u64,
+        bavail: buf.f_bavail as u64,
+        files: buf.f_files as u64,
+        ffree: buf.f_ffree as u64,
+        bsize: u32::try_from(buf.f_bsize as u64).unwrap_or(4096),
+        frsize: u32::try_from(buf.f_frsize as u64).unwrap_or(4096),
+    })
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]

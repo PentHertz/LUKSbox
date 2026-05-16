@@ -269,6 +269,12 @@ pub struct LuksboxFs {
     /// can reallocate; the pointer we hand to WinFsp must stay
     /// valid for the FS lifetime, so we pin it via `Box`.
     default_security: Box<SecurityDescriptor>,
+    /// Directory containing the .lbx vault file, cached at construction
+    /// time so `get_volume_info` can probe the host disk for real
+    /// total/free numbers (via `GetDiskFreeSpaceExW`) instead of lying.
+    /// Mirrors the same pattern used on Linux/macOS in `fuse.rs` so all
+    /// three platforms surface honest space numbers to file managers.
+    vault_parent: Option<PathBuf>,
 }
 
 impl LuksboxFs {
@@ -278,9 +284,15 @@ impl LuksboxFs {
         let sddl_str = U16CString::from_str("O:SYG:SYD:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;FA;;;WD)")
             .expect("SDDL string is ASCII, no NUL");
         let sd = SecurityDescriptor::from_wstr(&sddl_str).expect("hardcoded SDDL must parse");
+        let vault_parent = vfs
+            .container()
+            .vault_path()
+            .parent()
+            .map(|p| p.to_path_buf());
         Self {
             inner: Mutex::new(vfs),
             default_security: Box::new(sd),
+            vault_parent,
         }
     }
 
@@ -347,11 +359,18 @@ impl FileSystemInterface for LuksboxFs {
 
     fn get_volume_info(&self) -> Result<VolumeInfo, NTSTATUS> {
         winfsp_trace!("get_volume_info", "");
-        // Total size: arbitrary "lots of room"; WinFsp uses this only for
-        // the file-properties "Capacity" column. luksbox vaults grow as
-        // chunks are appended and don't have a hard cap.
-        let total: u64 = 1 << 40; // 1 TiB nominal
-        let free: u64 = 1 << 39; // half-full looking
+        // Query the host disk for real total/free numbers when possible.
+        // Without this, Windows Explorer cannot warn the user before
+        // they drop a file bigger than the underlying disk can hold
+        // (the write would then fail mid-copy when the host .lbx file
+        // can't grow). Falls back to a roomy 1 TiB nominal when the
+        // query fails, matching the historical behaviour and the
+        // Linux/macOS fallback in `fuse.rs`.
+        let (total, free) = self
+            .vault_parent
+            .as_deref()
+            .and_then(host_disk_space)
+            .unwrap_or((1 << 40, 1 << 39));
         // VolumeInfo::new takes &U16Str (no NUL terminator), not &U16CStr.
         let label_owned: Vec<u16> = VOLUME_LABEL.encode_utf16().collect();
         let label = U16Str::from_slice(&label_owned);
@@ -894,6 +913,45 @@ fn normalize_mountpoint(mountpoint: &Path) -> Result<String, MountError> {
 /// specific mount without touching the others, and by the Ctrl-C
 /// handler to tear down all of them at once.
 ///
+/// Return `(total_bytes, free_bytes_available_to_caller)` for the host
+/// drive that holds `path`. Returns `None` on any failure so the caller
+/// can fall back to a roomy nominal value. Used by `get_volume_info`
+/// to surface honest disk space to Windows Explorer instead of a
+/// hardcoded 1 TiB lie. Counterpart to `host_fs_statvfs` on Linux/macOS.
+fn host_disk_space(path: &Path) -> Option<(u64, u64)> {
+    use std::os::windows::ffi::OsStrExt;
+    // GetDiskFreeSpaceExW takes a wide-string path; convert and NUL-terminate.
+    let mut wpath: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wpath.push(0);
+
+    // Direct extern decl avoids pulling in windows-sys / winapi just for
+    // one syscall. The signature is stable since Windows 2000.
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            lp_directory_name: *const u16,
+            lp_free_bytes_available_to_caller: *mut u64,
+            lp_total_number_of_bytes: *mut u64,
+            lp_total_number_of_free_bytes: *mut u64,
+        ) -> i32;
+    }
+
+    let mut free_avail: u64 = 0;
+    let mut total: u64 = 0;
+    let mut total_free: u64 = 0;
+    // SAFETY: wpath is a valid NUL-terminated UTF-16 string; the three
+    // output pointers are valid for writes of u64. Win32 BOOL is 0 on
+    // failure, nonzero on success.
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(wpath.as_ptr(), &mut free_avail, &mut total, &mut total_free)
+    };
+    if ok == 0 {
+        None
+    } else {
+        Some((total, free_avail))
+    }
+}
+
 /// Stored as a global because mount and unmount are called from
 /// independent threads (and on the GUI side, from completely
 /// independent egui worker threads): the sender HAS to outlive the
