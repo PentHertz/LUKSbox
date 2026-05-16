@@ -98,13 +98,20 @@
                  InstallWinFsp=0. Vital="no" so a WinFsp install
                  failure doesn't roll back the LUKSbox install
                  (the user can install WinFsp later and mount will
-                 start working without a LUKSbox reinstall). -->
+                 start working without a LUKSbox reinstall).
+
+                 NB MsiPackage in WiX v4 Burn has no DetectCondition
+                 attribute (that's ExePackage-only) - Burn auto-
+                 detects MSI install state via the inner MSI's
+                 ProductCode. The InstallCondition below handles
+                 the "WinFsp already installed by some other route
+                 (choco / portable)" case via the util:RegistrySearch
+                 variable defined above. -->
             <MsiPackage
                 Id="WinFspMsi"
                 SourceFile="$(var.WinFspMsiPath)"
                 DisplayName="WinFsp 2.0.23075 (required for the mount feature)"
                 InstallCondition="InstallWinFsp = 1 AND NOT WinFspAlreadyInstalled"
-                DetectCondition="WinFspAlreadyInstalled"
                 Vital="no"
                 Cache="keep"
                 ForcePerMachine="yes" />
