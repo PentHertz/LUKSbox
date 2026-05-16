@@ -84,10 +84,17 @@
              separate WinFsp EULA page because the linking
              exception explicitly permits this kind of bundled
              distribution and a second EULA would confuse users
-             into thinking LUKSbox is GPL-licensed. -->
+             into thinking LUKSbox is GPL-licensed.
+
+             NB the `hyperlinkLicense` theme requires `LicenseUrl`
+             (a clickable hyperlink), NOT `LicenseFile`. The
+             `Rtf*License` themes require `LicenseFile` instead
+             and need an RTF, not the plaintext Apache LICENSE we
+             ship. Linking to apache.org is the most authoritative
+             reference and avoids the build-time RTF conversion. -->
         <BootstrapperApplication>
             <bal:WixStandardBootstrapperApplication
-                LicenseFile="$(var.StagingDir)\LICENSE"
+                LicenseUrl="https://www.apache.org/licenses/LICENSE-2.0"
                 Theme="hyperlinkLicense"
                 LogoFile="$(var.StagingDir)\luksbox-installer.ico" />
         </BootstrapperApplication>

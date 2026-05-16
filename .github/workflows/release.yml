@@ -157,7 +157,13 @@ jobs:
           key: ${{ matrix.target }}-${{ matrix.fuse_backend }}
           # cache hit-rate matters most on Windows where vcpkg also
           # builds OpenSSL from source; the rust-cache covers ~/.cargo.
-          shared-key: release
+          # The `-vN` suffix is a manual cache-bust knob: when a feature
+          # set / dep version / workspace member changes shape, stale
+          # restored artifacts can produce `error[E0463]: can't find
+          # crate for X` even though Cargo.toml looks correct. Bumping
+          # the suffix forces a clean rebuild across every matrix entry.
+          # Last bump: 2026-05-16 (statvfs module split + WinFsp bundle).
+          shared-key: release-v2
 
       - name: Derive LUKSBOX_VERSION
         # On a tag push (`refs/tags/vX.Y.Z`), GITHUB_REF_NAME is the tag
