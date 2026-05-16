@@ -1762,7 +1762,14 @@ jobs:
           }
           $subj = $sig.SignerCertificate.Subject
           Write-Host "==> signer subject: $subj"
-          if ($subj -notmatch 'Zissimopoulos|WinFsp') {
+          # WinFsp's MSI is Authenticode-signed by Bill Zissimopoulos's
+          # company NAVIMATICS LLC (Kirkland, WA) with an EV code-signing
+          # cert. The other names are kept as fallback in case a future
+          # WinFsp release rotates to a personal cert or a project-named
+          # cert. CN-only match is fine, the cert is also EV-checked
+          # implicitly via the Authenticode status above (a self-signed
+          # cert with the same CN would have Status != Valid).
+          if ($subj -notmatch 'NAVIMATICS|Zissimopoulos|WinFsp') {
               throw "WinFsp MSI signed by unexpected party: $subj"
           }
 
