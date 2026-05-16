@@ -122,6 +122,21 @@
                       Source="$(var.StagingDir)\README.md"
                       KeyPath="yes" />
             </Component>
+            <!-- WinFsp's GPLv3 + non-GPL-app linking exception.
+                 Shipped in every Windows artifact because LUKSbox
+                 statically links against winfsp-x64.dll at runtime,
+                 so WinFsp's terms apply regardless of whether the
+                 user got WinFsp from the Burn bundle's chained
+                 install or from a separate winfsp.dev download.
+                 Fetched verbatim from upstream at build time by
+                 the "Stage upstream WinFsp license text" workflow
+                 step; see dist/LICENSE-WINFSP.txt.template for
+                 the rationale on not committing the file. -->
+            <Component Id="LicenseWinFsp">
+                <File Id="LicenseWinFspFile"
+                      Source="$(var.StagingDir)\LICENSE-WINFSP.txt"
+                      KeyPath="yes" />
+            </Component>
         </ComponentGroup>
 
         <!-- ===== Start menu shortcut ============================== -->

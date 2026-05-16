@@ -1,0 +1,17 @@
+LUKSbox build-time placeholder. The real LICENSE-WINFSP.txt is fetched
+verbatim from the WinFsp upstream repository at release-build time and
+written next to LUKSbox.msi + LUKSboxSetup.exe. See the
+"Fetch upstream WinFsp license text" step in .github/workflows/release.yml.
+
+Why fetched-not-committed:
+  - WinFsp is GPLv3 with a non-GPL-app linking exception. The full
+    license text is owned by upstream and any divergence in this repo
+    (typos, formatting drift) would be a misrepresentation of their
+    terms. Fetching at build time guarantees byte-identical text from
+    the WinFsp tag we are bundling (currently v2.0).
+  - Source URL (pinned to the same tag the bundled MSI comes from):
+        https://raw.githubusercontent.com/winfsp/winfsp/v2.0/License.txt
+
+If you are reading this template in a built artifact, something went
+wrong with the release pipeline. The .exe / .zip would not normally
+ship this file; only the upstream-verbatim LICENSE-WINFSP.txt.

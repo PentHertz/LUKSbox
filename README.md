@@ -201,7 +201,7 @@ walkthroughs.
 | Debian / Ubuntu / Mint | `.deb` from [Releases](https://github.com/penthertz/LUKSbox/releases), `sudo apt install ./luksbox_*_amd64.deb` |
 | Fedora / RHEL / Rocky | `.rpm` from Releases, `sudo dnf install ./luksbox-*.x86_64.rpm` |
 | macOS | `.dmg` from Releases, drag to /Applications, install macFUSE on first run |
-| Windows | `.msi` from Releases, installs WinFsp automatically |
+| Windows | `LUKSboxSetup.exe` from Releases (bundles WinFsp); IT admins can use the bare `.msi` and install WinFsp separately |
 | From source | `cargo build --release -p luksbox-cli -p luksbox-gui` after the deps in [`BUILDING.md`](BUILDING.md) |
 
 The Linux release tarball's `dist/install.sh` optionally configures
