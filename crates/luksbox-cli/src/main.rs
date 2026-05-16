@@ -9,7 +9,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use luksbox_core::secret_mem;
-use luksbox_core::{Argon2idParams, CipherSuite, HEADER_SIZE, Header, SlotKind};
+use luksbox_core::{Argon2idParams, CipherSuite, HEADER_SIZE, Header, MasterVolumeKey, SlotKind};
 use luksbox_format::{Container, UnlockMaterial};
 use luksbox_vfs::{FileId, InodeKind, Vfs};
 use zeroize::Zeroizing;
@@ -19,8 +19,55 @@ mod wizard;
 
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn StdError>>;
 
+/// Extended `--version` output. `-V` still prints the bare version
+/// (clap's default short-version behaviour); `--version` prints
+/// version + the FUSE backend baked in at build time, so a user who
+/// downloaded the wrong .dmg variant for their installed FUSE
+/// provider can immediately see the mismatch instead of waiting for
+/// the cryptic dyld error at first mount.
+///
+/// `concat!()` requires string literals, so we cfg-gate the whole
+/// const per backend. Exactly one of these blocks is active per
+/// build (mutual exclusion enforced by the same cfg pattern as
+/// `luksbox_mount::FUSE_BACKEND`).
+#[cfg(all(target_os = "macos", feature = "fuse-t"))]
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nFUSE backend: fuse-t (kext-free, requires `brew install --cask fuse-t`)"
+);
+#[cfg(all(target_os = "macos", feature = "fuse", not(feature = "fuse-t"),))]
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nFUSE backend: macfuse (kext-based, requires `brew install --cask macfuse`)"
+);
+#[cfg(all(target_os = "linux", feature = "fuse"))]
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nFUSE backend: libfuse3 (requires `apt install libfuse3-3` or distro equivalent)"
+);
+#[cfg(all(target_os = "windows", feature = "winfsp"))]
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nFUSE backend: winfsp (requires WinFsp from https://winfsp.dev/)"
+);
+#[cfg(any(
+    not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+    all(target_os = "linux", not(feature = "fuse")),
+    all(target_os = "macos", not(feature = "fuse"), not(feature = "fuse-t")),
+    all(target_os = "windows", not(feature = "winfsp")),
+))]
+const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nFUSE backend: none (mount support not compiled in)"
+);
+
 #[derive(Parser)]
-#[command(name = "luksbox", version, about = "Encrypted container tool")]
+#[command(
+    name = "luksbox",
+    version,
+    long_version = LONG_VERSION,
+    about = "Encrypted container tool",
+)]
 struct Cli {
     /// libfido2 device path to bind every FIDO2 op to. Optional.
     /// Without this flag, luksbox uses the first authenticator
@@ -402,6 +449,26 @@ enum Command {
         /// Run in the foreground instead of daemonizing.
         #[arg(short = 'f', long)]
         foreground: bool,
+        mountpoint: PathBuf,
+    },
+    /// Subprocess-isolated FUSE-T mount helper. Reads a 32-byte
+    /// MasterVolumeKey from stdin and uses it to open the vault
+    /// without re-running the unlock derivation, then runs the FUSE
+    /// event loop in foreground until unmount. Spawned by the GUI on
+    /// macOS+FUSE-T builds so libfuse-t lives in its own process and
+    /// can't take down the GUI when it aborts itself during teardown.
+    /// Hidden from --help because it's not intended for direct
+    /// invocation: there's no UX for typing 32 bytes into stdin and
+    /// the same effect is achieved by `luksbox mount` on every other
+    /// backend.
+    #[command(name = "mount-fuse-t-helper", hide = true)]
+    MountFuseTHelper {
+        /// Path to the .lbx vault.
+        vault: PathBuf,
+        /// Optional detached header path.
+        #[arg(long)]
+        header: Option<PathBuf>,
+        /// Where to mount the vault.
         mountpoint: PathBuf,
     },
     /// Unmount a luksbox mountpoint (wraps fusermount3 -u on Linux, umount on macOS).
@@ -858,6 +925,11 @@ fn dispatch(cli: Cli) -> Result<()> {
             foreground,
             mountpoint,
         } => cmd_mount(&path, &unlock, foreground, &mountpoint),
+        Command::MountFuseTHelper {
+            vault,
+            header,
+            mountpoint,
+        } => cmd_mount_fuse_t_helper(&vault, header.as_deref(), &mountpoint),
         Command::Umount { mountpoint } => cmd_umount(&mountpoint),
         Command::Wizard => wizard::run(),
         Command::Genpass => {
@@ -4138,6 +4210,99 @@ fn cmd_mount(path: &Path, unlock: &UnlockArgs, foreground: bool, mountpoint: &Pa
         );
     }
     luksbox_mount::mount(vfs, &mp_abs, !foreground)?;
+    Ok(())
+}
+
+/// Subprocess-isolated FUSE-T mount entry point.
+///
+/// Reads exactly 32 bytes from stdin (the Master Volume Key piped
+/// from the parent GUI process), reconstructs the
+/// [`MasterVolumeKey`], and opens the vault via the no-derivation
+/// [`Container::open_with_mvk`] path. Then builds the Vfs and runs
+/// the FUSE event loop in foreground until unmount.
+///
+/// The parent's `spawn_mount_helper` invokes us with stdin set to
+/// a pipe whose writer it controls. After writing 32 bytes, the
+/// parent closes its end of the pipe, which causes our
+/// `read_exact` to complete. The pipe is anonymous and only
+/// accessible to this subprocess (POSIX guarantee), so the MVK
+/// bytes never touch a path other process can read.
+///
+/// Discipline: the on-stack [u8; 32] buffer is zeroed via
+/// [`Zeroize`] immediately after the [`MasterVolumeKey`] takes
+/// ownership of the bytes. Brief stack exposure (microseconds)
+/// is the security trade-off documented in `docs/MACOS_FUSE_T.md`.
+fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Path) -> Result<()> {
+    use std::io::Read;
+    use zeroize::Zeroize;
+
+    // Ignore SIGPIPE for the entire helper process lifetime.
+    //
+    // libfuse-t.dylib (and its closed-source `go-nfsv4` companion)
+    // writes through internal pipes/sockets during the mount session
+    // and, more importantly, during teardown. When the kernel side of
+    // the NFS connection drops at unmount, one of those endpoints
+    // closes mid-write inside libfuse-t and the kernel delivers
+    // SIGPIPE to our process. Default disposition for SIGPIPE is to
+    // terminate the process - that's how `head`-piped pipelines end
+    // their producer cleanly, and it's the wrong behaviour for any
+    // long-running server. With SIG_IGN, the write that would have
+    // generated SIGPIPE returns EPIPE instead; libfuse-t handles that
+    // gracefully and the helper exits cleanly with status 0.
+    //
+    // Without this, the GUI sees the helper exit with "signal: 13
+    // (SIGPIPE)" on every unmount and surfaces a misleading
+    // "mount helper exited abnormally" toast, even though the mount
+    // and unmount themselves succeeded.
+    //
+    // SAFETY: signal() with SIG_IGN is async-signal-safe and has no
+    // preconditions. We do this BEFORE reading the MVK so that even
+    // a SIGPIPE during the stdin-read path (pipe writer in parent
+    // dies between spawn and our read) doesn't kill us silently.
+    //
+    // `cfg(unix)`: SIGPIPE doesn't exist on Windows. The helper
+    // subcommand isn't reachable on Windows in practice (FUSE-T is
+    // macOS-only) but we keep the cfg gate so a Windows build of
+    // the CLI binary doesn't need libc.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+    }
+
+    // Mountpoint validation matches `cmd_mount`'s POSIX branch
+    // (this subcommand is macOS-only at the runtime level, but we
+    // gate identically for safety).
+    if !mountpoint.is_dir() {
+        return Err(format!("mountpoint {} is not a directory", mountpoint.display()).into());
+    }
+    let mp_abs = mountpoint
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", mountpoint.display()))?;
+    let vault_abs = vault
+        .canonicalize()
+        .map_err(|e| format!("cannot resolve {}: {e}", vault.display()))?;
+
+    // Read MVK from stdin. Block until exactly 32 bytes arrive or
+    // the parent closes the pipe early (which would be a parent
+    // bug; surface as an io::Error from read_exact).
+    let mut mvk_bytes = [0u8; 32];
+    std::io::stdin()
+        .read_exact(&mut mvk_bytes)
+        .map_err(|e| format!("could not read MVK from stdin: {e}"))?;
+    let mvk = MasterVolumeKey::from_bytes(mvk_bytes);
+    mvk_bytes.zeroize();
+
+    // Open with the supplied MVK (no passphrase / FIDO2 derivation).
+    // A wrong MVK fails fast with HeaderAuthFailed via the HMAC
+    // check inside open_with_mvk - never silently produces a Vfs
+    // backed by garbled metadata.
+    let container = Container::open_with_mvk(&vault_abs, header, mvk)?;
+    let vfs = Vfs::open(container)?;
+
+    // Run the FUSE event loop in foreground (no daemonize). The
+    // parent process polls our exit status; daemonizing here would
+    // leave the parent unable to detect mount-end.
+    luksbox_mount::mount(vfs, &mp_abs, false)?;
     Ok(())
 }
 

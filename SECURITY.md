@@ -214,11 +214,11 @@ how strong the cryptography is.
   documented in the CLI help. They are NOT silent vulnerabilities, but
   an operator who runs them blindly can compromise the vault. The set
   today:
-    - `LUKSBOX_NO_LOCK=1` — disables advisory `flock(LOCK_EX)`. Allows
+    - `LUKSBOX_NO_LOCK=1` - disables advisory `flock(LOCK_EX)`. Allows
       concurrent writers and the metadata corruption that follows.
-    - `LUKSBOX_NO_FOLLOW_SYMLINKS=1` — refuses to open vaults whose
+    - `LUKSBOX_NO_FOLLOW_SYMLINKS=1` - refuses to open vaults whose
       path is a symlink (paranoid mode; failure-closed, not unsafe).
-    - `luksbox header restore --no-verify` — skips the HMAC pre-check
+    - `luksbox header restore --no-verify` - skips the HMAC pre-check
       that prevents an attacker-substituted backup header from being
       installed under their MVK. Required ONLY when the on-disk header
       is too damaged to unlock with; using it on a backup file from
@@ -384,6 +384,57 @@ get in touch.
   { path }` variant. Lock enforcement IS working - the second open
   fails - but the error message is less actionable than on POSIX.
   No security impact; UX bug.
+- **macOS FUSE-T backend has weaker local-attacker resistance than
+  macFUSE.** On macOS, LUKSbox's `mount` subcommand can use either
+  FUSE-T (default-preferred, kext-free) or macFUSE (legacy
+  fallback). The two backends are NOT security-equivalent:
+  - FUSE-T's NFS server binds to `127.0.0.1` (loopback only) but
+    has **no authentication** on the bound port - any local
+    process running on the same Mac can connect via NFSv4 and
+    impersonate the kernel-side mount via plain AUTH_SYS UIDs.
+    The FUSE-T project's own wiki acknowledges this. macFUSE
+    gates the equivalent channel via kernel permissions on the
+    `/dev/macfuse*` device node, which restricts access to the
+    mounting UID.
+  - The actual NFS server inside FUSE-T (`go-nfsv4`) ships
+    closed-source as a Mach-O binary; we cannot audit the RPC
+    parsing or auth-decision paths in the data flow.
+  - For a single-user laptop (the modal LUKSbox user) the
+    distinction is moot; for a shared workstation, lab machine,
+    or any environment where untrusted local processes might
+    coexist with the mount, prefer macFUSE explicitly via
+    `cargo build --no-default-features --features
+    hardware,fuse,winfsp`.
+  - Full threat-model analysis with source citations:
+    [`docs/MACOS_FUSE_T.md`](docs/MACOS_FUSE_T.md#threat-model-differences-vs-macfuse-read-this-before-picking).
+    On macOS 26+ the FSKit backend (Unix domain socket, no TCP
+    loopback) closes this hole.
+- **macOS+FUSE-T GUI mounts use subprocess isolation with MVK
+  passed over an inherited stdin pipe.** When the GUI mounts a
+  vault on a FUSE-T build, it spawns the bundled `luksbox` CLI
+  binary as a child process (subcommand `mount-fuse-t-helper`)
+  and pipes the 32-byte Master Volume Key over the child's
+  stdin. This is necessary because libfuse-t.dylib's teardown
+  path issues an uncatchable abort that would kill the GUI
+  otherwise; isolating it to a child contains the abort. The
+  trade-off is a brief MVK exposure during pipe transit:
+  - The pipe is a kernel-anonymous inherited file descriptor;
+    no process other than the spawned child can read it.
+  - macOS pipe pages are not swappable to disk.
+  - Both processes hold the MVK in `[u8; 32]` stack buffers
+    only long enough to construct the `MasterVolumeKey`
+    (microseconds) and `Zeroize` the buffers immediately
+    after.
+  - The child's `Container::open_with_mvk` verifies the header
+    HMAC against the supplied MVK, so a wrong MVK fails fast
+    with `HeaderAuthFailed` instead of producing garbled
+    metadata reads.
+  - Full architectural detail in
+    [`docs/MACOS_FUSE_T.md` § Subprocess isolation](docs/MACOS_FUSE_T.md#subprocess-isolation-gui-mount-on-macosfuse-t).
+  This pathway exists ONLY for GUI mounts on macOS+FUSE-T
+  builds. CLI mounts (`luksbox mount ...`) and all other
+  backends keep the legacy in-process flow with no MVK
+  IPC.
 
 ### Cryptographic gaps
 
@@ -574,7 +625,7 @@ risk first.
       `TctiNameConf::Tbs` variant added in `tss-esapi 8.0.0-alpha.2`**.
       The Linux `Tpm2Sealer` implementation works against `Tcti::Tbs`
       with a one-line cfg branch + an import rename
-      (`resource_handles` → `reserved_handles`). On-disk slot bytes
+      (`resource_handles` -> `reserved_handles`). On-disk slot bytes
       are byte-identical between Linux and Windows TPM, so a vault
       sealed with the same chip would unseal on either OS. Trade-off
       blocking immediate adoption: tss-esapi 8.0 is alpha (alpha line
@@ -611,7 +662,7 @@ risk first.
       Hello use) was considered as an alternative but rejected: it
       uses a different on-disk wire format (NCrypt PCP key blobs ≠
       TPM2B blobs), so a vault sealed on Windows would not unseal on
-      Linux even with the same chip — that breaks the cross-platform
+      Linux even with the same chip - that breaks the cross-platform
       vault-portability principle. See
       `docs/TPM_FUTURE_IMPROVEMENTS.md` for the full evaluation.
 

@@ -1,9 +1,14 @@
 # macOS FUSE-T support - analysis and roadmap
 
-**Status as of 2026-05-03**: LUKSbox uses **macFUSE** on macOS for the
-`mount` subcommand. FUSE-T is NOT supported. This document captures
-why, what would have to change, and at what point it becomes worth
-revisiting.
+> **OUTDATED (2026-05-09).** FUSE-T is now supported. The current
+> documentation lives at [`MACOS_FUSE_T.md`](./MACOS_FUSE_T.md).
+> This file is kept for historical context - it captured the
+> pre-implementation analysis that drove the design.
+
+**Status as of 2026-05-03 (historical)**: LUKSbox uses **macFUSE**
+on macOS for the `mount` subcommand. FUSE-T is NOT supported. This
+document captures why, what would have to change, and at what point
+it becomes worth revisiting.
 
 ## tl;dr
 

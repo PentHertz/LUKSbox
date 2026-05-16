@@ -722,6 +722,77 @@ impl Container {
         header_path: Option<&Path>,
         mut material: UnlockMaterial<'_>,
     ) -> Result<Self, Error> {
+        let (file, header_storage, header_bytes, header) =
+            Self::load_locked_header(path, header_path)?;
+        let mvk = try_unlock(&header, &mut material)?;
+        header.verify_hmac(&header_bytes, &mvk)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            header_storage,
+            header,
+            mvk,
+            header_dirty: false,
+            anchor_path: None,
+            rotation: None,
+        })
+    }
+
+    /// Open a Container with a pre-derived Master Volume Key.
+    ///
+    /// Used by the FUSE-T mount-helper subprocess: the parent (GUI)
+    /// process unlocks the vault normally via `Container::open`,
+    /// extracts the MVK with [`Container::mvk_clone`], spawns this
+    /// process, and pipes the 32-byte MVK over its stdin. The child
+    /// then constructs the Container directly from the MVK without
+    /// re-running the unlock derivation. This is what makes FUSE-T
+    /// subprocess isolation viable without forcing the user to
+    /// re-authenticate on every mount.
+    ///
+    /// Security:
+    /// - The header HMAC is verified against the supplied MVK, so a
+    ///   wrong MVK fails fast with `Error::Crypto(HeaderAuthFailed)`
+    ///   instead of producing garbled metadata reads downstream.
+    /// - The file is opened, locked, and TOCTOU-verified using the
+    ///   same machinery as [`Container::open`]; nothing about the
+    ///   on-disk integrity story is weakened by skipping the unlock
+    ///   derivation.
+    /// - The provided MVK is moved into the returned Container, no
+    ///   copies are made beyond the field assignment. The caller's
+    ///   `MasterVolumeKey` is consumed.
+    pub fn open_with_mvk(
+        path: &Path,
+        header_path: Option<&Path>,
+        mvk: MasterVolumeKey,
+    ) -> Result<Self, Error> {
+        let (file, header_storage, header_bytes, header) =
+            Self::load_locked_header(path, header_path)?;
+        // Verify HMAC FIRST. If the supplied MVK is wrong, surface a
+        // clean error instead of going on to read garbled metadata.
+        header.verify_hmac(&header_bytes, &mvk)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            header_storage,
+            header,
+            mvk,
+            header_dirty: false,
+            anchor_path: None,
+            rotation: None,
+        })
+    }
+
+    /// Shared file-open + lock + TOCTOU re-verification + header read +
+    /// header parse path used by both `open` and `open_with_mvk`. Stops
+    /// just before the MVK source is needed (HMAC verification).
+    ///
+    /// Returns `(file, header_storage, header_bytes, header)` so the
+    /// caller can run HMAC verification with whatever MVK they have
+    /// (derived or supplied).
+    fn load_locked_header(
+        path: &Path,
+        header_path: Option<&Path>,
+    ) -> Result<(File, HeaderStorage, [u8; HEADER_SIZE], Header), Error> {
         // Open the actual handles that will back the Container, lock them,
         // and only then read or authenticate the header. This serializes
         // header read/modify/write sequences so a second opener cannot keep
@@ -786,20 +857,7 @@ impl Container {
             }
         }
         let header = Header::from_bytes(&header_bytes)?;
-
-        let mvk = try_unlock(&header, &mut material)?;
-        header.verify_hmac(&header_bytes, &mvk)?;
-
-        Ok(Self {
-            file,
-            path: path.to_path_buf(),
-            header_storage,
-            header,
-            mvk,
-            header_dirty: false,
-            anchor_path: None,
-            rotation: None,
-        })
+        Ok((file, header_storage, header_bytes, header))
     }
 
     /// Read and decrypt the metadata blob. Returned plaintext is
@@ -1912,6 +1970,85 @@ mod tests {
 
         let r = Container::open(&path, None, UnlockMaterial::Passphrase(b"wrong"));
         assert!(matches!(r, Err(Error::UnlockFailed)));
+    }
+
+    /// Validates the FUSE-T mount-helper subprocess unlock path:
+    /// parent opens with passphrase, extracts MVK, child opens with
+    /// MVK directly, both see identical metadata. If this test ever
+    /// regresses, the subprocess-isolated FUSE-T mount on macOS
+    /// breaks (the child can't open the vault the parent unlocked).
+    #[test]
+    fn open_with_mvk_round_trip_matches_passphrase_unlock() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.lbx");
+
+        // Parent process: create + write metadata via passphrase.
+        {
+            let mut c = Container::create_with_passphrase(
+                &path,
+                None,
+                CipherSuite::Aes256Gcm,
+                test_params(),
+                b"correct horse",
+            )
+            .unwrap();
+            c.write_metadata(b"shared between parent and helper")
+                .unwrap();
+        }
+
+        // Parent re-opens, extracts MVK (this is what the GUI does
+        // before spawning the mount-helper subprocess), drops the
+        // Container so the file lock is released.
+        let mvk = {
+            let c =
+                Container::open(&path, None, UnlockMaterial::Passphrase(b"correct horse")).unwrap();
+            c.mvk_clone()
+        };
+
+        // Child process: opens with the MVK directly (no passphrase
+        // derivation), should read identical metadata.
+        let mut c = Container::open_with_mvk(&path, None, mvk).unwrap();
+        let blob = c.read_metadata().unwrap();
+        assert_eq!(&**blob, b"shared between parent and helper");
+    }
+
+    /// A wrong MVK must produce a clean Crypto(HeaderAuthFailed)
+    /// instead of proceeding to read garbled metadata. This is the
+    /// safety guarantee that lets us trust open_with_mvk's downstream
+    /// callers; without it a corrupted MVK pipe transfer would
+    /// silently produce a Container that fails later at metadata-
+    /// decrypt with an opaque AEAD error.
+    #[test]
+    fn open_with_mvk_rejects_wrong_mvk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.lbx");
+        Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"right",
+        )
+        .unwrap();
+
+        // Construct a fixed MVK that is NOT the one derived from the
+        // real passphrase. Any constant 32 bytes is fine, the
+        // probability of a random salt deriving exactly this is
+        // 2^-256.
+        let wrong_mvk = MasterVolumeKey::from_bytes([0u8; 32]);
+        let r = Container::open_with_mvk(&path, None, wrong_mvk);
+        let is_header_auth_failed = matches!(
+            &r,
+            Err(Error::Crypto(luksbox_core::Error::HeaderAuthFailed))
+        );
+        assert!(
+            is_header_auth_failed,
+            "expected Crypto(HeaderAuthFailed), got {}",
+            match &r {
+                Ok(_) => "Ok(...)".to_string(),
+                Err(e) => format!("{e:?}"),
+            }
+        );
     }
 
     #[test]

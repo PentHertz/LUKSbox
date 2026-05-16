@@ -1,0 +1,52 @@
+[package]
+name = "luksbox-fuse-t"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "FUSE-T (kext-free macOS FUSE) binding crate for luksbox-mount"
+
+# luksbox-fuse-t binds against FUSE-T's libfuse-t.dylib, the kext-free
+# FUSE provider for macOS (https://www.fuse-t.org/). FUSE-T ships a
+# libfuse 2.x-compatible API on top of an NFS-over-loopback transport,
+# so we get a libfuse-style `struct fuse_operations` callback surface
+# without macFUSE's kernel extension. The crate is macOS-only at the
+# binding level, on Linux/Windows it compiles to an empty stub so the
+# rest of the workspace builds unchanged.
+#
+# This is Phase 1 of the FUSE-T support tracked in
+# `docs/MACOS_FUSE_T.md`, opt-in via the `fuse-t` feature on
+# `luksbox-mount`. Phase 2 will harden lifecycle / signal handling
+# against a real FUSE-T install (the `cargo check` here only verifies
+# the binding compiles; end-to-end mount has to be exercised on a
+# macOS host with `brew install --cask fuse-t`).
+
+[dependencies]
+libc.workspace = true
+thiserror.workspace = true
+
+[features]
+# Regenerate the libfuse-t Rust bindings from <fuse_t/fuse.h> at
+# build time AND copy the result to `src/bindings_generated.rs` so a
+# developer can `git diff` and commit the snapshot. Off by default;
+# the regular build always invokes bindgen but only writes to
+# OUT_DIR. When a committed snapshot exists, Phase 2 will flip this
+# feature's polarity (snapshot becomes default; opt into bindgen
+# only when regenerating).
+#
+# Workflow for shipping a new snapshot:
+#   1. On a macOS+FUSE-T host:
+#        cargo build -p luksbox-fuse-t --features regenerate-bindings
+#   2. Inspect `git diff crates/luksbox-fuse-t/src/bindings_generated.rs`.
+#   3. Commit if the diff is consistent with the FUSE-T version
+#      bumped (verify struct field changes against the upstream
+#      header changelog).
+regenerate-bindings = []
+
+[target.'cfg(target_os = "macos")'.build-dependencies]
+# bindgen needs libclang on the build host. macOS ships clang in the
+# Xcode CLT (xcode-select --install), which the build_release.sh and
+# CI host already provision for the rest of the workspace. pkg-config
+# is also already a workspace dep used by other crates' build.rs.
+bindgen.workspace = true
+pkg-config.workspace = true

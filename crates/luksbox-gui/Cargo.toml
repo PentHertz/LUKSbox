@@ -23,9 +23,14 @@ default = ["hardware", "fuse", "winfsp"]
 # only build (both hardware paths are then disabled at runtime;
 # luksbox-tpm's stub gracefully no-ops on every platform).
 hardware = ["luksbox-fido2/hardware", "luksbox-tpm/hardware"]
-# Enables FUSE-backed `mount` on Linux + macOS. Disable on macOS CI
-# builds without macFUSE.
+# Enables FUSE-backed `mount` on Linux + macOS via the libfuse2 /
+# macFUSE path. Disable on macOS CI builds without macFUSE.
 fuse = ["luksbox-mount/fuse"]
+# Enables the kext-free FUSE-T backend on macOS. Mutually exclusive
+# with `fuse` on macOS at link time. The GUI re-exposes this feature
+# so the release workflow can pass `--features fuse-t` to the gui
+# crate the same way it does to the CLI.
+fuse-t = ["luksbox-mount/fuse-t"]
 # Pulls in WinFsp on Windows so the GUI's mount feature works.
 # Disable for MinGW cross-builds without the WinFsp SDK.
 winfsp = ["luksbox-mount/winfsp"]
@@ -64,6 +69,13 @@ luksbox-vfs = { path = "../luksbox-vfs" }
 # disables luksbox-mount's `winfsp` default. Re-enabled via the
 # `winfsp = ["luksbox-mount/winfsp"]` feature above.
 luksbox-mount = { path = "../luksbox-mount", default-features = false }
+
+# SIGPIPE constant for exit_status_is_clean_unmount on macOS
+# (FUSE-T helper subprocess sometimes exits with signal 13 during
+# unmount; we classify that as a clean unmount). Cheap to compile
+# in on every Unix.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

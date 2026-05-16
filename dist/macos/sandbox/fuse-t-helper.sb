@@ -1,0 +1,160 @@
+;; LUKSbox FUSE-T mount-helper sandbox profile (sandbox-exec).
+;;
+;; Restricts what the GUI-spawned `luksbox mount-fuse-t-helper`
+;; subprocess can do at the syscall level. Defense in depth against
+;; a future libfuse-t.dylib vulnerability that tries to read other
+;; files, fork shells, exfiltrate data over the network, etc.
+;;
+;; Status: opt-in via `LUKSBOX_SANDBOX_HELPER=1`. Default off until
+;; validated end-to-end on macOS hosts. If you set the env var and
+;; mount/unmount works for several cycles, please file an issue
+;; confirming so we can flip the default in v0.2.
+;;
+;; Variables interpolated by the spawning code:
+;;   ${VAULT_DIR}       parent directory of the .lbx file
+;;   ${MOUNTPOINT_DIR}  parent directory of the mountpoint
+;;   ${HOME}            user's home directory
+;;
+;; Profile syntax: the macOS sandbox profile language is a
+;; TinyScheme-like DSL; see /System/Library/Sandbox/Profiles/ for
+;; system examples (those are the only public reference).
+
+(version 1)
+
+;; Default deny - everything not explicitly allowed below fails.
+(deny default)
+
+;; Don't log every denial to syslog (the FUSE event loop generates
+;; millions of operations, most of which we do allow but the few we
+;; don't allow shouldn't spam Console.app). Toggle to (with report)
+;; to debug a profile that blocks something the helper actually needs.
+(deny default (with no-log))
+
+;; ------------------------------------------------------------------
+;; Process introspection - the helper needs to look at its own state
+;; ------------------------------------------------------------------
+(allow process-info-pidinfo (target self))
+(allow process-info-codesignature (target self))
+(allow process-info-listpids)
+(allow signal (target self))
+
+;; ------------------------------------------------------------------
+;; mach: the basic IPC primitives we use to talk to the kernel and
+;; libfuse-t's own helper processes
+;; ------------------------------------------------------------------
+(allow mach-lookup
+    (global-name "com.apple.system.notification_center")
+    (global-name "com.apple.distributed_notifications@Uv3")
+    (global-name "com.apple.windowserver.active")
+    (global-name "com.apple.coreservicesd")
+    (global-name "com.apple.opendirectoryd.api")
+    (global-name "com.apple.system.logger")
+    ;; FUSE-T's launchd-managed services.
+    (regex #"^org\.fuse-t\.")
+    (regex #"^io\.macos-fuse-t\."))
+
+;; ------------------------------------------------------------------
+;; File reads: system dylibs + FUSE-T install + our own bundle
+;; ------------------------------------------------------------------
+(allow file-read*
+    (subpath "/usr/lib")
+    (subpath "/usr/local/lib")
+    (subpath "/opt/homebrew/lib")
+    (subpath "/System/Library")
+    (subpath "/System/Volumes/Preboot/Cryptexes/OS")
+    (subpath "/Library/Application Support/fuse-t")
+    (subpath "/Library/Frameworks")
+    ;; FUSE-T's helper binaries
+    (subpath "/usr/local/bin")
+    (subpath "/opt/homebrew/bin")
+    ;; The vault file (resolved at parent-side spawn time)
+    (subpath "${VAULT_DIR}")
+    ;; The mountpoint
+    (subpath "${MOUNTPOINT_DIR}")
+    ;; Our own .app bundle (so the binary can find adjacent resources)
+    (subpath (param "BUNDLE_DIR")))
+
+;; ------------------------------------------------------------------
+;; File writes: vault file (we need to write encrypted chunks back),
+;; mountpoint (the FUSE filesystem itself), and a few system locations
+;; FUSE-T's helper writes to.
+;; ------------------------------------------------------------------
+(allow file-write*
+    (subpath "${VAULT_DIR}")
+    (subpath "${MOUNTPOINT_DIR}")
+    ;; FUSE-T's helper sometimes writes to /tmp for its IPC sockets.
+    (subpath "/tmp")
+    (subpath "/private/tmp")
+    (subpath "/private/var/folders")
+    ;; macOS resolves ~/Library/Application Support/... via a symlink
+    ;; at /private/var/folders/.../com.penthertz.luksbox/, allow that.
+    (subpath "${HOME}/Library/Application Support"))
+
+;; Reading our own pipe (stdin = MVK from parent) is implicitly
+;; allowed because of the inherited-fd path, but explicit allow
+;; for the related read primitives.
+(allow file-read-data file-read-metadata
+    (literal "/dev/stdin")
+    (literal "/dev/null")
+    (literal "/dev/random")
+    (literal "/dev/urandom"))
+
+(allow file-write-data file-write-metadata
+    (literal "/dev/stdout")
+    (literal "/dev/stderr")
+    (literal "/dev/null"))
+
+;; ------------------------------------------------------------------
+;; Network: ONLY localhost (FUSE-T's NFS-loopback transport).
+;; Explicitly DENY internet egress - if libfuse-t tries to phone
+;; home or exfil data, this stops it cold.
+;; ------------------------------------------------------------------
+(allow network-bind
+    (local ip "localhost:*")
+    (local ip "127.0.0.1:*"))
+(allow network-inbound
+    (local ip "localhost:*")
+    (local ip "127.0.0.1:*"))
+(allow network-outbound
+    (remote ip "localhost:*")
+    (remote ip "127.0.0.1:*"))
+;; macOS uses Unix-domain sockets internally for some libfuse-t
+;; operations. Allow them.
+(allow network-bind (local unix-socket))
+(allow network-outbound (remote unix-socket))
+
+;; ------------------------------------------------------------------
+;; Process spawning: libfuse-t's NFS server (`go-nfsv4`) is forked
+;; by libfuse-t.dylib at mount time. Allow exec only of binaries
+;; under FUSE-T's install path.
+;; ------------------------------------------------------------------
+(allow process-fork)
+(allow process-exec
+    (subpath "/usr/local/lib")  ;; libfuse-t and friends
+    (subpath "/Library/Application Support/fuse-t")
+    ;; mount and umount tools
+    (literal "/sbin/mount")
+    (literal "/sbin/umount")
+    (literal "/sbin/mount_nfs")
+    (literal "/sbin/mount_nfs4"))
+
+;; Mount syscall: needed for FUSE-T to attach the NFS-loopback
+;; filesystem to the mountpoint. Without this allow, the mount
+;; obviously fails; with it, FUSE-T can mount anywhere it has
+;; file access (already constrained above).
+(allow system-fsctl)
+(allow file-mount-export)
+(allow system-mount)
+
+;; ------------------------------------------------------------------
+;; Things we deliberately DO NOT allow (defense in depth):
+;;
+;; - Internet network access (already blocked above by only
+;;   allowing 127.0.0.1)
+;; - Reading /Users (other than the vault and mountpoint paths)
+;; - Reading /Library/Keychains, /Library/Preferences for other apps
+;; - Writing to /Applications, /Library, /System
+;; - Spawning shells (/bin/sh, /bin/bash, /bin/zsh)
+;; - Loading kernel extensions
+;; - IOKit access beyond what FUSE-T needs for its NFS bridge
+;; ------------------------------------------------------------------
