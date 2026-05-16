@@ -37,6 +37,13 @@ zxcvbn = "3"
 serde_json = "1"
 serde = { workspace = true }
 
+# Used by the FUSE-T mount-helper subprocess to set SIGPIPE = SIG_IGN
+# at startup so libfuse-t's internal pipe writes during teardown don't
+# kill us with signal 13. Only matters on macOS (FUSE-T is macOS-only)
+# but cheap to compile in on every Unix.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [features]
 default = ["hardware", "fuse", "winfsp"]
 # Enables the FIDO2 hardware path (libfido2 link) AND the TPM 2.0
@@ -45,9 +52,14 @@ default = ["hardware", "fuse", "winfsp"]
 # luksbox-tpm gracefully no-ops on non-Linux so the same CLI build
 # works on macOS / Windows; only `enroll --tpm2` errors at runtime.
 hardware = ["luksbox-fido2/hardware", "luksbox-tpm/hardware"]
-# Enables FUSE-backed `mount` on Linux + macOS. Disable on macOS CI
-# builds without macFUSE; mount() then returns Unsupported.
+# Enables FUSE-backed `mount` on Linux + macOS via the libfuse2 /
+# macFUSE path. Disable on macOS CI builds without macFUSE; mount()
+# then returns Unsupported.
 fuse = ["luksbox-mount/fuse"]
+# Enables the kext-free FUSE-T backend on macOS. Mutually exclusive
+# with `fuse` on macOS at link time. The CLI re-exposes this feature
+# so `cargo build --features fuse-t` from the workspace root works.
+fuse-t = ["luksbox-mount/fuse-t"]
 # Enables the WinFsp link on Windows for the `mount` subcommand.
 # Off-by-default disables it; mount() then returns Unsupported on
 # Windows. Useful for MinGW cross-builds from Linux that don't have

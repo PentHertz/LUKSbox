@@ -345,21 +345,19 @@ winfsp_for_target() {
     esac
 }
 
-# Decide whether the FUSE link can be enabled for this target.
+# Decide whether the macFUSE FUSE backend (`fuse` Cargo feature)
+# can be enabled for this target.
 #
 # - linux-*  : on (libfuse3 from apt, system-wide).
-# - macos-*  : on iff a FUSE provider's fuse.pc is detectable on the
-#              host. Two providers are recognized in priority order:
-#                1. FUSE-T (https://www.fuse-t.org/), kext-free FUSE
-#                   over NFS; the recommended modern path. Drops
-#                   fuse.pc into Homebrew's standard pkgconfig dir.
-#                2. macFUSE (legacy), drops fuse.pc into either
-#                   Homebrew's pkgconfig or its own framework path.
-#              fuser 0.17 with default-features=false spawns
-#              `mount_macfuse` from PATH at runtime, both providers
-#              ship a binary by that name so the built artifact is
-#              identical either way.
+# - macos-*  : on iff macFUSE's `fuse.pc` is detectable on the host
+#              (Homebrew's pkgconfig dir or macFUSE's own framework).
+#              fuser 0.17 hard-requires the libfuse2 ABI on macOS
+#              and macFUSE is the only provider that ships it.
 # - windows-*: never (winfsp is the analogous feature, separately gated).
+#
+# NOTE: this returns 1 even if FUSE-T is also detectable; the actual
+# backend selection happens in build_target(), which prefers FUSE-T
+# over macFUSE when both are present (kext-free is the better default).
 fuse_for_target() {
     local logical="$1"
     case "$logical" in
@@ -370,11 +368,36 @@ fuse_for_target() {
             # Probe for macFUSE's pkg-config file. fuser 0.17's
             # build.rs hard-requires the libfuse2 ABI on macOS
             # (`pkg-config fuse >= 2.6.0`), which only macFUSE
-            # provides. FUSE-T's libfuse3 API is NOT a drop-in here;
-            # we'd have to swap fuser for a libfuse3-aware crate.
+            # provides.
             for cand in /usr/local/lib/pkgconfig /opt/homebrew/lib/pkgconfig \
                         /Library/Frameworks/macFUSE.framework/Versions/A/lib/pkgconfig; do
                 if [[ -f "$cand/fuse.pc" ]]; then echo 1; return; fi
+            done
+            echo 0
+            ;;
+        *)
+            echo 0
+            ;;
+    esac
+}
+
+# Decide whether the FUSE-T backend (`fuse-t` Cargo feature) can be
+# enabled for this target.
+#
+# - macos-* : on iff FUSE-T's `fuse-t.pc` is detectable on the host.
+#             FUSE-T installs to /usr/local on Intel and Apple Silicon
+#             (Homebrew --cask installs go to /usr/local/Caskroom but
+#             expose the .pc at /usr/local/lib/pkgconfig).
+# - else    : never (FUSE-T is macOS-only).
+#
+# When both this AND `fuse_for_target` return 1, build_target picks
+# FUSE-T (kext-free is the better default for end users).
+fuse_t_for_target() {
+    local logical="$1"
+    case "$logical" in
+        macos-*)
+            for cand in /usr/local/lib/pkgconfig /opt/homebrew/lib/pkgconfig; do
+                if [[ -f "$cand/fuse-t.pc" ]]; then echo 1; return; fi
             done
             echo 0
             ;;
@@ -457,6 +480,31 @@ build_one() {
     with_winfsp_eff="$(winfsp_for_target "$logical")"
     local with_fuse_eff
     with_fuse_eff="$(fuse_for_target "$logical")"
+    local with_fuse_t_eff
+    with_fuse_t_eff="$(fuse_t_for_target "$logical")"
+
+    # Backend selection: on macOS, if FUSE-T is detected, prefer it
+    # over macFUSE. The two backends are mutually exclusive at
+    # link-time (incompatible libfuse versions in the same binary),
+    # and FUSE-T is the kext-free option which gives the better UX
+    # for the modal user (single-user laptop).
+    #
+    # NOTE: this is NOT a "FUSE-T is more secure" recommendation.
+    # FUSE-T's NFS-loopback transport is gated only by 127.0.0.1
+    # binding (no per-connection auth), while macFUSE gates the
+    # equivalent channel by `/dev/macfuse*` device-node permissions.
+    # On a shared / multi-user / untrusted-local-process Mac,
+    # macFUSE is the safer pick. See `docs/MACOS_FUSE_T.md`'s
+    # "Threat model differences vs macFUSE" section for full
+    # analysis and the override invocation. If you change this
+    # preference, also update SECURITY.md and that doc.
+    #
+    # If only macFUSE is present, fall back to it. If neither, mount
+    # support is disabled for this target (mount() returns Unsupported
+    # at runtime, the rest of the binary still works).
+    if [[ "$with_fuse_t_eff" == "1" ]]; then
+        with_fuse_eff="0"
+    fi
 
     # --- decide builder ----------------------------------------------------
     local builder="cargo"
@@ -492,6 +540,7 @@ build_one() {
     local features=()
     [[ "$with_fido2_eff"  == "1" ]] && features+=("hardware")
     [[ "$with_fuse_eff"   == "1" ]] && features+=("fuse")
+    [[ "$with_fuse_t_eff" == "1" ]] && features+=("fuse-t")
     [[ "$with_winfsp_eff" == "1" ]] && features+=("winfsp")
     local feat_flag="--no-default-features"
     if [[ "${#features[@]}" -gt 0 ]]; then
@@ -503,11 +552,10 @@ build_one() {
     local gui_pkg=""
     [[ "$WITH_GUI" == "1" ]] && gui_pkg="-p luksbox-gui"
 
-    # macOS host + fuse: feed macFUSE's pkg-config path to the
-    # fuser crate (it hard-requires libfuse2 here, see
-    # fuse_for_target() comment for why FUSE-T doesn't substitute).
-    # Only takes effect on a native macOS host (cross builds use
-    # osxcross's pkg-config setup elsewhere).
+    # macOS host + macFUSE backend: feed macFUSE's pkg-config path
+    # to the fuser crate (it hard-requires libfuse2). Only takes
+    # effect on a native macOS host; cross builds use osxcross's
+    # pkg-config setup elsewhere.
     if [[ "$with_fuse_eff" == "1" && "$logical" == macos-* && "$triple" == "$HOST_TRIPLE" ]]; then
         for cand in /usr/local/lib/pkgconfig /opt/homebrew/lib/pkgconfig \
                     /Library/Frameworks/macFUSE.framework/Versions/A/lib/pkgconfig; do
@@ -518,7 +566,20 @@ build_one() {
         done
     fi
 
-    echo "==> $logical ($triple) via $builder  fido2=$with_fido2_eff fuse=$with_fuse_eff winfsp=$with_winfsp_eff"
+    # macOS host + FUSE-T backend: feed FUSE-T's pkg-config path to
+    # luksbox-fuse-t's build.rs (which probes for fuse-t.pc and
+    # bindgens against <fuse_t/fuse.h>). Same logic as macFUSE
+    # above, just looking for a different .pc file.
+    if [[ "$with_fuse_t_eff" == "1" && "$logical" == macos-* && "$triple" == "$HOST_TRIPLE" ]]; then
+        for cand in /usr/local/lib/pkgconfig /opt/homebrew/lib/pkgconfig; do
+            if [[ -f "$cand/fuse-t.pc" ]]; then
+                export PKG_CONFIG_PATH="$cand:${PKG_CONFIG_PATH:-}"
+                break
+            fi
+        done
+    fi
+
+    echo "==> $logical ($triple) via $builder  fido2=$with_fido2_eff fuse=$with_fuse_eff fuse-t=$with_fuse_t_eff winfsp=$with_winfsp_eff"
     rustup target add "$triple" >/dev/null 2>&1 || true
 
     if ! $builder build --profile "$PROFILE" --target "$triple" \

@@ -100,9 +100,124 @@ pub fn enable_memory_lock() -> Result<(), String> {
                  /etc/security/limits.conf and re-login, or run as root)"
                 .to_string());
         }
+        // On macOS, mlockall(2) is documented as "the implementation
+        // may be incomplete" and frequently returns ENOSYS even
+        // without sandbox restrictions. The per-allocation `mlock`
+        // calls inside `SecretBox` still succeed, so the MVK and
+        // other explicit secrets are protected. The remaining gap
+        // is "everything else in the process" - buffers, intermediate
+        // values, the directory tree - which COULD swap.
+        //
+        // macOS encrypts swap by default (since 10.7) with a
+        // per-boot ephemeral key, which neutralises the "swap reveals
+        // plaintext after reboot" attack even when our pages get
+        // swapped. Surface different messages based on whether swap
+        // encryption is on, off, or undetectable, so a user with
+        // swap encryption disabled (rare but possible via
+        // `sudo nvram boot-args=...`) sees the warning while typical
+        // users see an informational note.
+        if err.raw_os_error() == Some(libc::ENOSYS) && cfg!(target_os = "macos") {
+            #[cfg(target_os = "macos")]
+            {
+                return Err(macos_mlockall_message());
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err("mlockall not implemented on this host \
+                     (best-effort; per-secret mlock for the MVK still applies)"
+                    .to_string());
+            }
+        }
         return Err(format!("mlockall failed: {err}"));
     }
     Ok(())
+}
+
+/// macOS swap-encryption state, derived from `sysctl vm.swapusage`.
+///
+/// macOS prints a line like:
+///   `vm.swapusage: total = 0.00M  used = 0.00M  free = 0.00M  (encrypted)`
+///
+/// The trailing `(encrypted)` is present iff swap encryption is on
+/// (the default since macOS 10.7). Absence means swap is unencrypted.
+/// If `sysctl` itself can't be run (sandbox denial, missing binary,
+/// unexpected output format) we report Unknown rather than asserting
+/// either way.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MacosSwapEncryption {
+    /// `(encrypted)` token present in `sysctl vm.swapusage` output.
+    Encrypted,
+    /// Output looks well-formed but `(encrypted)` is missing. Swap
+    /// is on but unencrypted - sensitive data swapped to disk could
+    /// be recovered by an attacker with raw disk access.
+    Unencrypted,
+    /// `sysctl` failed, gave no output, or output didn't match the
+    /// expected shape. Conservative: surface as warning.
+    Unknown,
+}
+
+#[cfg(target_os = "macos")]
+fn detect_macos_swap_encryption() -> MacosSwapEncryption {
+    // /usr/sbin/sysctl is on every macOS install since forever.
+    // Resolve to absolute path so a poisoned $PATH can't divert
+    // (CVE-2024-54187 class) - same defensive pattern we use in
+    // the FUSE umount-helper resolver.
+    let out = std::process::Command::new("/usr/sbin/sysctl")
+        .arg("-n")
+        .arg("vm.swapusage")
+        .output();
+    let stdout = match out {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return MacosSwapEncryption::Unknown,
+    };
+    let s = match std::str::from_utf8(&stdout) {
+        Ok(s) => s,
+        Err(_) => return MacosSwapEncryption::Unknown,
+    };
+    if s.contains("(encrypted)") {
+        MacosSwapEncryption::Encrypted
+    } else if s.contains("total =") {
+        // Output looks well-formed (sysctl produced its expected
+        // shape) but the (encrypted) token isn't there.
+        MacosSwapEncryption::Unencrypted
+    } else {
+        MacosSwapEncryption::Unknown
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_mlockall_message() -> String {
+    match detect_macos_swap_encryption() {
+        MacosSwapEncryption::Encrypted => "mlockall not implemented on this macOS host. \
+             Swap encryption is ON (sysctl vm.swapusage reports \
+             '(encrypted)'), so any pages that do swap to disk \
+             are protected by the kernel's per-boot swap key. \
+             Per-secret mlock for the MVK applies regardless. \
+             No action required."
+            .to_string(),
+        MacosSwapEncryption::Unencrypted => "mlockall not implemented on this macOS host AND swap \
+             encryption is OFF (sysctl vm.swapusage does not report \
+             '(encrypted)'). Sensitive data that gets swapped to \
+             disk could be recovered by an attacker with raw disk \
+             access after shutdown. The MVK itself is still locked \
+             via per-secret mlock, but other in-process buffers can \
+             swap unencrypted. Mitigations: enable FileVault \
+             (encrypts the disk including swap), or re-enable swap \
+             encryption via `sudo nvram boot-args=` (clear the \
+             vm_compressor=4 / disable-swap-encryption args), or \
+             disable swap entirely with `sudo launchctl unload -w \
+             /System/Library/LaunchDaemons/com.apple.dynamic_pager.plist`."
+            .to_string(),
+        MacosSwapEncryption::Unknown => "mlockall not implemented on this macOS host. Could not \
+             determine swap-encryption state (sysctl vm.swapusage \
+             failed or returned an unexpected format). Per-secret \
+             mlock for the MVK still applies. If you have FileVault \
+             enabled, you are fully covered; if not, consider \
+             enabling it so any swapped pages are protected by the \
+             disk encryption."
+            .to_string(),
+    }
 }
 
 /// On Windows there is no `mlockall` equivalent (no process-wide

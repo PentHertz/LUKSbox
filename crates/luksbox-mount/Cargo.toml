@@ -20,6 +20,15 @@ fuser = { workspace = true, optional = true }
 libc.workspace = true
 ctrlc.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# FUSE-T (kext-free macOS FUSE) backend. Optional so a build that
+# only wants macFUSE doesn't pull in libfuse-t.dylib (the two
+# providers can't coexist in the same process). Activated by the
+# `fuse-t` feature; mount() then dispatches to fuse_t::mount() on
+# macOS instead of fuse::mount(). See crate docstring for the
+# Cargo-feature-vs-runtime-detection rationale.
+luksbox-fuse-t = { path = "../luksbox-fuse-t", optional = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 zbus.workspace = true
 
@@ -42,10 +51,23 @@ tempfile = "3"
 
 [features]
 default = ["fuse", "winfsp"]
-# Pull in fuser and enable the `mount` subcommand on Linux + macOS.
-# Disable on macOS CI builds without macFUSE; mount() then returns
-# MountError::Unsupported on those targets at runtime.
+# Pull in fuser and enable the `mount` subcommand on Linux + macOS
+# via libfuse2 / macFUSE. Disable on macOS CI builds without macFUSE;
+# mount() then returns MountError::Unsupported on those targets at
+# runtime. Mutually exclusive with `fuse-t` on macOS (the two providers
+# install incompatible libfuse versions and can't link into the same
+# binary). On Linux only `fuse` is meaningful, `fuse-t` is a macOS-only
+# concept.
 fuse = ["dep:fuser"]
+# Pull in luksbox-fuse-t and route the macOS mount() / unmount() path
+# to FUSE-T (https://www.fuse-t.org/) instead of macFUSE. FUSE-T uses
+# an NFS-over-loopback transport so it doesn't need a kernel
+# extension. Build on a host that has `brew install --cask fuse-t`,
+# the dependent crate's build.rs probes for FUSE-T's headers and fails
+# the build with a clear message if it can't find them. NOT compatible
+# with the `fuse` feature on macOS (link-level conflict, see comment
+# above), pick one. On Linux the feature is accepted but inert.
+fuse-t = ["dep:luksbox-fuse-t"]
 # Pull in winfsp_wrs and enable the `mount` subcommand on Windows.
 # Disable on cross-builds without the WinFsp SDK; mount() then returns
 # MountError::Unsupported on Windows targets at runtime.

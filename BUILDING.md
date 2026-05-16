@@ -130,7 +130,21 @@ Works on both Intel (`x86_64-apple-darwin`) and Apple Silicon
    brew install libfido2 pkg-config
    ```
 
-3. **macFUSE** (required for the `mount` subcommand):
+3. **A FUSE provider** (required for the `mount` subcommand). Pick one:
+
+   **FUSE-T (recommended, kext-free):**
+   ```bash
+   brew tap macos-fuse-t/homebrew-cask
+   brew install --cask fuse-t
+   ```
+   FUSE-T (https://www.fuse-t.org/) uses an NFS-over-loopback
+   transport so it doesn't need a kernel extension - no Privacy &
+   Security prompt, no Apple-Silicon Reduced-Security dance. Just
+   install and `luksbox mount` works directly. Bound from Rust via
+   the in-tree `luksbox-fuse-t` crate which bindgens against
+   `<fuse_t/fuse.h>` at build time. **Cargo feature: `fuse-t`.**
+
+   **macFUSE (legacy fallback):**
    ```bash
    brew install --cask macfuse
    ```
@@ -141,30 +155,29 @@ Works on both Intel (`x86_64-apple-darwin`) and Apple Silicon
    first (boot holding the power button, -> Options ->
    Startup Security Utility -> Reduced Security -> check "Allow user
    management of kernel extensions from identified developers").
-   Both are one-time per-machine setup. Without macFUSE the CLI
-   still builds and every subcommand *except* `mount` works.
+   Both are one-time per-machine setup. Bound via the upstream
+   `fuser` crate (libfuse2 ABI). **Cargo feature: `fuse`.**
 
-   FUSE-T (https://www.fuse-t.org/) is a tempting alternative
-   because it's kext-free (uses NFS internally), but the underlying
-   `fuser` Rust crate we use hard-requires the libfuse2 ABI on macOS
-   that only macFUSE provides; FUSE-T provides only libfuse3.
-   Switching to FUSE-T would mean swapping `fuser` for a
-   libfuse3-aware Rust crate (no widely-used one ships today).
+   The two backends are mutually exclusive at link time (incompatible
+   libfuse versions in the same binary). Without either provider the
+   CLI still builds and every subcommand *except* `mount` works.
 
-   **The `fuse` feature is gated on macFUSE being detectable at
-   build time.** `scripts/build_release.sh` and
-   `.github/workflows/release.yml` probe for `fuse.pc` in
-   `/usr/local/lib/pkgconfig`, `/opt/homebrew/lib/pkgconfig`, and
-   `/Library/Frameworks/macFUSE.framework/Versions/A/lib/pkgconfig`,
-   and only enable the `fuse` feature when one is found. If you
-   build the CLI/GUI before installing macFUSE, the resulting binary
-   will compile fine but `luksbox mount ...` returns
-   `mount target not supported on this platform` - install macFUSE,
-   then `cargo clean -p luksbox-mount` and rebuild. A plain
-   `cargo build --release -p luksbox-cli` (no `--no-default-features`)
-   uses the workspace defaults `["hardware", "fuse", "winfsp"]` and
-   pulls in `fuse` automatically as long as `pkg-config libfuse`
-   resolves.
+   **Backend auto-selection at build time.** `scripts/build_release.sh`
+   and `.github/workflows/release.yml` probe in this order:
+   1. FUSE-T (`fuse-t.pc` in `/usr/local/lib/pkgconfig` or
+      `/opt/homebrew/lib/pkgconfig`) -> enables the `fuse-t` feature.
+   2. macFUSE (`fuse.pc` in those dirs or
+      `/Library/Frameworks/macFUSE.framework/Versions/A/lib/pkgconfig`)
+      -> enables the `fuse` feature.
+   3. Neither -> mount support compiled out.
+
+   For plain `cargo build`: the workspace defaults
+   `["hardware", "fuse", "winfsp"]` give you the macFUSE path
+   automatically. To opt into FUSE-T:
+   ```bash
+   cargo build --release -p luksbox-cli \
+       --no-default-features --features hardware,fuse-t,winfsp
+   ```
 
 ### Plumb pkg-config
 
@@ -564,13 +577,21 @@ transitive deps are bundled under the extracted `Frameworks/`
 directory next to `bin/`. Run from the extracted tree
 (`./bin/luksbox`); no Homebrew install needed for FIDO2 to work.
 
-For `luksbox mount` (either release flavor), you need **macFUSE**
-installed system-wide:
+For `luksbox mount` (either release flavor), you need a FUSE
+provider installed system-wide. Pick one:
 
+**FUSE-T (recommended, kext-free):**
+```bash
+brew tap macos-fuse-t/homebrew-cask
+brew install --cask fuse-t
+```
+No kernel extension, no Privacy & Security prompt, no Apple-Silicon
+Reduced-Security dance. Just install and mount works.
+
+**macFUSE (legacy):**
 ```bash
 brew install --cask macfuse
 ```
-
 macFUSE installs a kernel extension. Approve it under **System
 Settings -> Privacy & Security** on first prompt and reboot. Apple
 Silicon also requires lowering the security policy to "Reduced
@@ -581,12 +602,14 @@ If you built from source, or want the bare CLI on PATH:
 
 ```bash
 brew install libfido2
-brew install --cask macfuse        # only for `luksbox mount`
+# Pick one:
+brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t   # kext-free
+brew install --cask macfuse                                         # kext-based
 ```
 
-(FUSE-T is a kext-free alternative we'd love to use but the
-underlying `fuser` Rust crate hard-requires macFUSE's libfuse2
-ABI on macOS. See the build instructions for details.)
+The shipped binary auto-detects whichever provider is installed at
+build time (FUSE-T preferred). See the build-from-source section
+above for the Cargo feature matrix.
 
 ### Windows
 
@@ -635,7 +658,7 @@ The full security-regression matrix runs as 10 named gate suites in
 |---|---|
 | `error: linking with cc failed: cannot find -lfido2` | libfido2 not installed for the build target. Linux: `apt install libfido2-dev`. macOS: `brew install libfido2` + export `PKG_CONFIG_PATH`. Windows: `vcpkg install libfido2:x64-windows-static-md` + set `VCPKG_ROOT`. |
 | `bindgen ... cannot find libclang.so` | Install `clang`/LLVM: Linux `apt install clang`; Windows `winget install LLVM.LLVM` + `LIBCLANG_PATH=C:\Program Files\LLVM\bin`. |
-| `no such file or directory: fuse3.h` | Linux: `apt install libfuse3-dev`. macOS: `brew install --cask macfuse` (build *and* runtime). |
+| `no such file or directory: fuse3.h` | Linux: `apt install libfuse3-dev`. macOS: install a FUSE provider (`brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t` for kext-free, or `brew install --cask macfuse` for the legacy kext-based path) - needed at build *and* runtime. |
 | `the WinFsp driver is not present` at runtime | Install WinFsp 2.x from <https://winfsp.dev/rel/>. |
 | Cross-build for arm64 errors `pkg-config has not been configured to support cross-compilation` | The build script handles this for you, set `PKG_CONFIG_ALLOW_CROSS=1` if invoking cargo by hand. |
 | osxcross compile fails with `gen_sdk_package.sh` errors | You're missing the SDK tarball under `tarballs/`. Apple license forbids us from shipping it; see the macOS cross section. |
