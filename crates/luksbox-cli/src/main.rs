@@ -544,22 +544,12 @@ enum Command {
         /// Credential type. Must match init.
         #[arg(long, default_value = "passphrase")]
         credential: String,
-        /// `.kyber` seed file path (pq-* combos).
+        /// `.kyber` seed file path (pq-* combos). The ML-KEM seed
+        /// is the one remaining sidecar in v2; FIDO2 cred-id /
+        /// hmac-salt and TPM sealed blobs are now embedded inside
+        /// the slot envelope.
         #[arg(long)]
         kyber_path: Option<PathBuf>,
-        /// `.tpm-blob` sidecar path (tpm-* combos).
-        #[arg(long)]
-        tpm_blob_path: Option<PathBuf>,
-        /// FIDO2 credential ID as hex (fido2-bearing combos).
-        /// From the recovery card shown at create time. Reading
-        /// from $LUKSBOX_FIDO2_CRED_ID env var is also accepted.
-        #[arg(long)]
-        fido2_cred_id: Option<String>,
-        /// FIDO2 hmac-secret salt as hex, 64 chars / 32 bytes
-        /// (fido2-bearing combos). $LUKSBOX_FIDO2_HMAC_SALT also
-        /// accepted.
-        #[arg(long)]
-        fido2_hmac_salt: Option<String>,
         /// Stay in the foreground (don't daemonize). Default is to
         /// daemonize on Unix; ignored on Windows where WinFsp is
         /// always foreground.
@@ -590,18 +580,10 @@ enum Command {
         /// Credential type. Must match init.
         #[arg(long, default_value = "passphrase")]
         credential: String,
-        /// `.kyber` seed file path (pq-* combos).
+        /// `.kyber` seed file path (pq-* combos). The only sidecar
+        /// remaining in v2; FIDO2 / TPM material lives in the slot.
         #[arg(long)]
         kyber_path: Option<PathBuf>,
-        /// `.tpm-blob` sidecar path (tpm-* combos).
-        #[arg(long)]
-        tpm_blob_path: Option<PathBuf>,
-        /// FIDO2 credential ID as hex (fido2-bearing combos).
-        #[arg(long)]
-        fido2_cred_id: Option<String>,
-        /// FIDO2 hmac-secret salt as hex (fido2-bearing combos).
-        #[arg(long)]
-        fido2_hmac_salt: Option<String>,
     },
     /// Interactive wizard. Walks you through create / open / mount / keyslot
     /// management with prompts. Supports every option the regular subcommands
@@ -1088,9 +1070,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             argon2_p,
             credential,
             kyber_path,
-            tpm_blob_path,
-            fido2_cred_id,
-            fido2_hmac_salt,
             foreground,
             mountpoint,
         } => cmd_deniable_mount(
@@ -1101,9 +1080,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             argon2_p,
             &credential,
             kyber_path.as_deref(),
-            tpm_blob_path.as_deref(),
-            fido2_cred_id.as_deref(),
-            fido2_hmac_salt.as_deref(),
             foreground,
             &mountpoint,
         ),
@@ -1115,9 +1091,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             argon2_p,
             credential,
             kyber_path,
-            tpm_blob_path,
-            fido2_cred_id,
-            fido2_hmac_salt,
         } => cmd_deniable_info(
             &path,
             &cipher,
@@ -1126,9 +1099,6 @@ fn dispatch(cli: Cli) -> Result<()> {
             argon2_p,
             &credential,
             kyber_path.as_deref(),
-            tpm_blob_path.as_deref(),
-            fido2_cred_id.as_deref(),
-            fido2_hmac_salt.as_deref(),
         ),
         Command::Wizard => wizard::run(),
         Command::Genpass => {
@@ -4584,26 +4554,10 @@ fn parse_cli_den_cred(s: &str) -> Result<CliDenCred> {
     }
 }
 
-/// Decode user-supplied hex (or read from env var if the flag is
-/// absent). Used for fido2_cred_id + fido2_hmac_salt at unlock.
-fn flag_or_env(flag: Option<&str>, env_var: &str) -> Result<String> {
-    match flag {
-        Some(v) => Ok(v.to_string()),
-        None => std::env::var(env_var).map_err(|_| {
-            cli_err!("--fido2-cred-id (or ${env_var}) required for fido2-bearing combos")
-        }),
-    }
-}
-
-fn decode_hex_32(s: &str, label: &str) -> Result<[u8; 32]> {
-    let bytes = hex::decode(s.trim()).map_err(|_| cli_err!("{label} must be hex"))?;
-    if bytes.len() != 32 {
-        return Err(cli_err!("{label} must be 32 bytes ({} given)", bytes.len()));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
+// v1 helpers `flag_or_env` and `decode_hex_32` were removed in v2:
+// FIDO2 `cred_id` and `hmac_salt` are now embedded in the slot
+// envelope at create time and recovered from the envelope at unlock
+// time; no CLI / env-var ingestion path remains.
 
 fn cmd_deniable_init(
     path: &Path,
@@ -4626,68 +4580,49 @@ fn cmd_deniable_init(
         ));
     }
 
-    let mut fido2_recovery: Option<(Vec<u8>, [u8; 32])> = None;
-    let mut tpm_sidecar: Option<std::path::PathBuf> = None;
-
     match cred {
         CliDenCred::Passphrase => {
-            let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-            luksbox_format::Container::create_with_passphrase_deniable(
-                path,
-                None,
-                cipher_suite,
-                argon2_params,
-                0,
-                pass.as_bytes(),
-            )?;
+            cli_create_passphrase_deniable_v2(path, cipher_suite, argon2_params)?;
         }
         CliDenCred::Fido2 => {
             #[cfg(feature = "hardware")]
-            {
-                let rec = cli_create_fido2_deniable(path, cipher_suite, argon2_params)?;
-                fido2_recovery = Some(rec);
-            }
+            cli_create_fido2_deniable_v2(path, cipher_suite, argon2_params)?;
             #[cfg(not(feature = "hardware"))]
             return Err(cli_err!("FIDO2 hardware support not compiled in"));
         }
         CliDenCred::PqPassphrase => {
             let kp =
                 kyber_path.ok_or_else(|| cli_err!("--kyber-path required for pq-passphrase"))?;
-            cli_create_pq_passphrase_deniable(path, cipher_suite, argon2_params, kp, pq_1024)?;
+            cli_create_pq_passphrase_deniable_v2(path, cipher_suite, argon2_params, kp, pq_1024)?;
         }
         CliDenCred::PqFido2 => {
             #[cfg(feature = "hardware")]
             {
                 let kp =
                     kyber_path.ok_or_else(|| cli_err!("--kyber-path required for pq-fido2"))?;
-                let rec = cli_create_pq_fido2_deniable(path, cipher_suite, kp, pq_1024)?;
-                fido2_recovery = Some(rec);
+                cli_create_pq_fido2_deniable_v2(path, cipher_suite, argon2_params, kp, pq_1024)?;
             }
             #[cfg(not(feature = "hardware"))]
             return Err(cli_err!("FIDO2 hardware support not compiled in"));
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         CliDenCred::Tpm => {
-            tpm_sidecar = Some(cli_create_tpm_deniable(path, cipher_suite, argon2_params)?);
+            cli_create_tpm_deniable_v2(path, cipher_suite, argon2_params)?;
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         CliDenCred::TpmFido2 => {
-            let (sidecar, rec) = cli_create_tpm_fido2_deniable(path, cipher_suite)?;
-            tpm_sidecar = Some(sidecar);
-            fido2_recovery = Some(rec);
+            cli_create_tpm_fido2_deniable_v2(path, cipher_suite, argon2_params)?;
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         CliDenCred::PqTpm => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required for pq-tpm"))?;
-            tpm_sidecar = Some(cli_create_pq_tpm_deniable(path, cipher_suite, kp, pq_1024)?);
+            cli_create_pq_tpm_deniable_v2(path, cipher_suite, argon2_params, kp, pq_1024)?;
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         CliDenCred::PqTpmFido2 => {
             let kp =
                 kyber_path.ok_or_else(|| cli_err!("--kyber-path required for pq-tpm-fido2"))?;
-            let (sidecar, rec) = cli_create_pq_tpm_fido2_deniable(path, cipher_suite, kp, pq_1024)?;
-            tpm_sidecar = Some(sidecar);
-            fido2_recovery = Some(rec);
+            cli_create_pq_tpm_fido2_deniable_v2(path, cipher_suite, argon2_params, kp, pq_1024)?;
         }
         #[cfg(not(all(feature = "hardware", target_os = "linux")))]
         CliDenCred::Tpm | CliDenCred::TpmFido2 | CliDenCred::PqTpm | CliDenCred::PqTpmFido2 => {
@@ -4701,21 +4636,12 @@ fn cmd_deniable_init(
     println!("  cipher:     {:?}", cipher_suite);
     println!("  argon2:     m={m}KiB t={t} p={p}");
     println!("  credential: {credential}");
-    if let Some((cid, salt)) = fido2_recovery {
-        println!();
-        println!("============================================================");
-        println!("SAVE THIS FIDO2 RECOVERY INFO - without it the vault is LOST");
-        println!("============================================================");
-        println!("  fido2-cred-id   (hex): {}", hex::encode(&cid));
-        println!("  fido2-hmac-salt (hex): {}", hex::encode(salt));
-        println!("============================================================");
-    }
-    if let Some(p) = tpm_sidecar {
-        println!();
-        println!("TPM sealed-blob sidecar: {}", p.display());
-        println!("(The file is on disk; move it to USB/paper for extra at-rest");
-        println!(" deniability. Anyone finding it next to the vault learns 'TPM'.)");
-    }
+    println!();
+    println!("Deniable mode: cred_id / hmac_salt / TPM sealed blob are");
+    println!("now embedded in the slot envelope. The passphrase + Argon2");
+    println!("params above are the only things you must remember; lose");
+    println!("them or the FIDO2 device / TPM chip and the vault is");
+    println!("unrecoverable. ML-KEM seed (if pq-*) lives in --kyber-path.");
     Ok(())
 }
 
@@ -4727,24 +4653,12 @@ fn cmd_deniable_info(
     p: u32,
     credential: &str,
     kyber_path: Option<&Path>,
-    tpm_blob_path: Option<&Path>,
-    fido2_cred_id: Option<&str>,
-    fido2_hmac_salt: Option<&str>,
 ) -> Result<()> {
     let cipher_suite = parse_deniable_cipher(cipher)?;
     let argon2_params = parse_deniable_argon2(m, t, p)?;
     let cred = parse_cli_den_cred(credential)?;
 
-    let container = cli_open_deniable(
-        path,
-        cipher_suite,
-        argon2_params,
-        cred,
-        kyber_path,
-        tpm_blob_path,
-        fido2_cred_id,
-        fido2_hmac_salt,
-    )?;
+    let container = cli_open_deniable_v2(path, cipher_suite, argon2_params, cred, kyber_path)?;
     println!("✓ deniable vault opened");
     println!("  cipher suite:   {:?}", container.header.cipher_suite);
     println!("  kdf id:         {:?}", container.header.kdf);
@@ -4766,9 +4680,6 @@ fn cmd_deniable_mount(
     p: u32,
     credential: &str,
     kyber_path: Option<&Path>,
-    tpm_blob_path: Option<&Path>,
-    fido2_cred_id: Option<&str>,
-    fido2_hmac_salt: Option<&str>,
     foreground: bool,
     mountpoint: &Path,
 ) -> Result<()> {
@@ -4792,16 +4703,7 @@ fn cmd_deniable_mount(
     #[cfg(target_os = "windows")]
     let mp_abs: std::path::PathBuf = mountpoint.to_path_buf();
 
-    let container = cli_open_deniable(
-        path,
-        cipher_suite,
-        argon2_params,
-        cred,
-        kyber_path,
-        tpm_blob_path,
-        fido2_cred_id,
-        fido2_hmac_salt,
-    )?;
+    let container = cli_open_deniable_v2(path, cipher_suite, argon2_params, cred, kyber_path)?;
     let vfs = Vfs::open(container)?;
     luksbox_mount::mount(vfs, &mp_abs, !foreground)?;
     Ok(())
@@ -4827,37 +4729,81 @@ fn prompt_pass_twice(p1: &str, p2: &str) -> Result<zeroize::Zeroizing<String>> {
     Ok(zeroize::Zeroizing::new(a))
 }
 
-fn cli_open_deniable(
+/// v2 deniable open. Always passphrase-driven (envelope discovery
+/// requires it); FIDO2 cred_id / hmac_salt / TPM sealed blob come
+/// out of the slot envelope after phase 1 trial-decrypt succeeds.
+/// `cred` is the user's choice of variant; if it does not match
+/// what the matched slot actually carries, phase 2 fails opaquely.
+fn cli_open_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
     argon2: luksbox_core::Argon2idParams,
     cred: CliDenCred,
     kyber_path: Option<&Path>,
-    tpm_blob_path: Option<&Path>,
-    fido2_cred_id: Option<&str>,
-    fido2_hmac_salt: Option<&str>,
 ) -> Result<luksbox_format::Container> {
-    use luksbox_core::deniable::DeniableCredential;
+    use luksbox_core::deniable::{DeniableCredential, DeniableKindTag};
+
+    // Phase 1: passphrase-only credential for envelope discovery.
+    let pass = rpassword::prompt_password("Passphrase: ")?;
+    let pass_zeroizing = zeroize::Zeroizing::new(pass);
+    let env_cred = DeniableCredential::Passphrase {
+        passphrase: pass_zeroizing.as_bytes(),
+        argon2,
+    };
+    let envelope =
+        luksbox_format::Container::try_open_envelope_v2_deniable(path, None, &env_cred, cipher)?;
+
+    // Sanity-check the slot's actual kind tag against the variant
+    // the user asked for. If they don't match, fail with the same
+    // opaque error as a wrong passphrase rather than leaking which
+    // mismatch happened.
+    let expected_tag = match cred {
+        CliDenCred::Passphrase => DeniableKindTag::Passphrase,
+        CliDenCred::Fido2 => DeniableKindTag::Fido2Passphrase,
+        CliDenCred::PqPassphrase => DeniableKindTag::HybridPqPassphrase,
+        CliDenCred::PqFido2 => DeniableKindTag::HybridPqFido2Passphrase,
+        CliDenCred::Tpm => DeniableKindTag::TpmPassphrase,
+        CliDenCred::TpmFido2 => DeniableKindTag::TpmFido2Passphrase,
+        CliDenCred::PqTpm => DeniableKindTag::HybridPqTpmPassphrase,
+        CliDenCred::PqTpmFido2 => DeniableKindTag::HybridPqTpmFido2Passphrase,
+    };
+    if envelope.payload().kind != expected_tag {
+        return Err(cli_err!(
+            "credential kind mismatch (vault expects a different variant)"
+        ));
+    }
+
+    // Phase 2: drive secondaries based on payload material, then
+    // build the full credential and complete the open.
+    // Borrow buffers live for the rest of the function so the
+    // DeniableCredential::*Passphrase reference borrows survive.
+    let payload_cred_id = envelope.payload().cred_id.clone();
+    let payload_hmac_salt = envelope.payload().hmac_salt;
+    let payload_tpm_blob = envelope.payload().tpm_blob.clone();
+
     match cred {
         CliDenCred::Passphrase => {
-            let pass = rpassword::prompt_password("Passphrase: ")?;
             let cred = DeniableCredential::Passphrase {
-                passphrase: pass.as_bytes(),
+                passphrase: pass_zeroizing.as_bytes(),
                 argon2,
             };
-            Ok(luksbox_format::Container::open_with_credential_deniable(
-                path, None, &cred, None, cipher,
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
             )?)
         }
         CliDenCred::Fido2 => {
             #[cfg(feature = "hardware")]
             {
-                let hmac = cli_fido2_hmac(fido2_cred_id, fido2_hmac_salt)?;
-                let cred = DeniableCredential::Fido2 {
+                let salt = payload_hmac_salt
+                    .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
+                let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt)?;
+                let cred = DeniableCredential::Fido2Passphrase {
+                    passphrase: pass_zeroizing.as_bytes(),
+                    argon2,
                     hmac_secret_output: &hmac,
                 };
-                Ok(luksbox_format::Container::open_with_credential_deniable(
-                    path, None, &cred, None, cipher,
+                Ok(luksbox_format::Container::complete_open_v2_deniable(
+                    envelope, &cred,
                 )?)
             }
             #[cfg(not(feature = "hardware"))]
@@ -4866,14 +4812,13 @@ fn cli_open_deniable(
         CliDenCred::PqPassphrase => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
             let shared = cli_pq_decap(kp, path)?;
-            let pass = rpassword::prompt_password("Passphrase: ")?;
             let cred = DeniableCredential::HybridPqPassphrase {
-                passphrase: pass.as_bytes(),
+                passphrase: pass_zeroizing.as_bytes(),
                 argon2,
                 mlkem_shared: &shared,
             };
-            Ok(luksbox_format::Container::open_with_credential_deniable(
-                path, None, &cred, None, cipher,
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
             )?)
         }
         CliDenCred::PqFido2 => {
@@ -4881,13 +4826,17 @@ fn cli_open_deniable(
             {
                 let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
                 let shared = cli_pq_decap(kp, path)?;
-                let hmac = cli_fido2_hmac(fido2_cred_id, fido2_hmac_salt)?;
-                let cred = DeniableCredential::HybridPqFido2 {
+                let salt = payload_hmac_salt
+                    .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
+                let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt)?;
+                let cred = DeniableCredential::HybridPqFido2Passphrase {
+                    passphrase: pass_zeroizing.as_bytes(),
+                    argon2,
                     mlkem_shared: &shared,
                     hmac_secret_output: &hmac,
                 };
-                Ok(luksbox_format::Container::open_with_credential_deniable(
-                    path, None, &cred, None, cipher,
+                Ok(luksbox_format::Container::complete_open_v2_deniable(
+                    envelope, &cred,
                 )?)
             }
             #[cfg(not(feature = "hardware"))]
@@ -4895,56 +4844,64 @@ fn cli_open_deniable(
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         CliDenCred::Tpm => {
-            let bp = tpm_blob_path.ok_or_else(|| cli_err!("--tpm-blob-path required"))?;
-            let unsealed = cli_tpm_unseal(bp, None)?;
-            let cred = DeniableCredential::Tpm {
+            let unsealed = cli_tpm_unseal_from_bytes(&payload_tpm_blob, None)?;
+            let cred = DeniableCredential::TpmPassphrase {
+                passphrase: pass_zeroizing.as_bytes(),
+                argon2,
                 unsealed: &unsealed,
             };
-            Ok(luksbox_format::Container::open_with_credential_deniable(
-                path, None, &cred, None, cipher,
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
             )?)
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         CliDenCred::TpmFido2 => {
-            let bp = tpm_blob_path.ok_or_else(|| cli_err!("--tpm-blob-path required"))?;
-            let unsealed = cli_tpm_unseal(bp, None)?;
-            let hmac = cli_fido2_hmac(fido2_cred_id, fido2_hmac_salt)?;
-            let cred = DeniableCredential::TpmFido2 {
+            let unsealed = cli_tpm_unseal_from_bytes(&payload_tpm_blob, None)?;
+            let salt = payload_hmac_salt
+                .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
+            let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt)?;
+            let cred = DeniableCredential::TpmFido2Passphrase {
+                passphrase: pass_zeroizing.as_bytes(),
+                argon2,
                 unsealed: &unsealed,
                 hmac_secret_output: &hmac,
             };
-            Ok(luksbox_format::Container::open_with_credential_deniable(
-                path, None, &cred, None, cipher,
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
             )?)
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         CliDenCred::PqTpm => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
-            let bp = tpm_blob_path.ok_or_else(|| cli_err!("--tpm-blob-path required"))?;
             let shared = cli_pq_decap(kp, path)?;
-            let unsealed = cli_tpm_unseal(bp, None)?;
-            let cred = DeniableCredential::HybridPqTpm {
+            let unsealed = cli_tpm_unseal_from_bytes(&payload_tpm_blob, None)?;
+            let cred = DeniableCredential::HybridPqTpmPassphrase {
+                passphrase: pass_zeroizing.as_bytes(),
+                argon2,
                 mlkem_shared: &shared,
                 unsealed: &unsealed,
             };
-            Ok(luksbox_format::Container::open_with_credential_deniable(
-                path, None, &cred, None, cipher,
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
             )?)
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         CliDenCred::PqTpmFido2 => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
-            let bp = tpm_blob_path.ok_or_else(|| cli_err!("--tpm-blob-path required"))?;
             let shared = cli_pq_decap(kp, path)?;
-            let unsealed = cli_tpm_unseal(bp, None)?;
-            let hmac = cli_fido2_hmac(fido2_cred_id, fido2_hmac_salt)?;
-            let cred = DeniableCredential::HybridPqTpmFido2 {
+            let unsealed = cli_tpm_unseal_from_bytes(&payload_tpm_blob, None)?;
+            let salt = payload_hmac_salt
+                .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
+            let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt)?;
+            let cred = DeniableCredential::HybridPqTpmFido2Passphrase {
+                passphrase: pass_zeroizing.as_bytes(),
+                argon2,
                 mlkem_shared: &shared,
                 unsealed: &unsealed,
                 hmac_secret_output: &hmac,
             };
-            Ok(luksbox_format::Container::open_with_credential_deniable(
-                path, None, &cred, None, cipher,
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
             )?)
         }
         #[cfg(not(all(feature = "hardware", target_os = "linux")))]
@@ -4954,22 +4911,38 @@ fn cli_open_deniable(
     }
 }
 
+/// Drive the FIDO2 authenticator using cred_id + hmac_salt taken
+/// from the envelope payload. v2 unlock no longer reads these from
+/// the CLI / env: they were embedded at create time.
 #[cfg(feature = "hardware")]
-fn cli_fido2_hmac(
-    cred_id_hex: Option<&str>,
-    hmac_salt_hex: Option<&str>,
+fn cli_fido2_hmac_from_payload(
+    cred_id: &[u8],
+    salt: &[u8; 32],
 ) -> Result<luksbox_fido2::HmacSecret> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID};
-    let cid = flag_or_env(cred_id_hex, "LUKSBOX_FIDO2_CRED_ID")?;
-    let hs = flag_or_env(hmac_salt_hex, "LUKSBOX_FIDO2_HMAC_SALT")?;
-    let cred_id = hex::decode(cid.trim()).map_err(|_| cli_err!("fido2-cred-id must be hex"))?;
     if cred_id.is_empty() {
-        return Err(cli_err!("fido2-cred-id is required"));
+        return Err(cli_err!("envelope cred_id is empty for FIDO2 variant"));
     }
-    let salt = decode_hex_32(&hs, "fido2-hmac-salt")?;
     let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
     let mut auth = make_fido2_authenticator();
-    Ok(auth.hmac_secret(RP_ID, &cred_id, &salt, Some(&pin))?)
+    Ok(auth.hmac_secret(RP_ID, cred_id, salt, Some(&pin))?)
+}
+
+/// Drive the TPM to unseal a blob taken from the envelope payload.
+/// v2 unlock no longer needs `--tpm-blob-path`.
+#[cfg(all(feature = "hardware", target_os = "linux"))]
+fn cli_tpm_unseal_from_bytes(blob_bytes: &[u8], pin: Option<&[u8]>) -> Result<[u8; 32]> {
+    use luksbox_tpm::{SealedBlob, Tpm2Sealer};
+    if blob_bytes.is_empty() {
+        return Err(cli_err!("envelope tpm_blob is empty for TPM variant"));
+    }
+    let blob = SealedBlob::from_bytes(blob_bytes)?;
+    let mut sealer = Tpm2Sealer::new()?;
+    let unsealed = match pin {
+        Some(p) => sealer.unseal_with_pin(&blob, Some(p))?,
+        None => sealer.unseal(&blob)?,
+    };
+    Ok(*unsealed)
 }
 
 fn cli_pq_decap(kyber_path: &Path, vault: &Path) -> Result<[u8; 32]> {
@@ -4986,27 +4959,47 @@ fn cli_pq_decap(kyber_path: &Path, vault: &Path) -> Result<[u8; 32]> {
     Ok(*shared)
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
-fn cli_tpm_unseal(blob_path: &Path, pin: Option<&[u8]>) -> Result<[u8; 32]> {
-    use luksbox_tpm::{SealedBlob, Tpm2Sealer};
-    let bytes = std::fs::read(blob_path)?;
-    let blob = SealedBlob::from_bytes(&bytes)?;
-    let mut sealer = Tpm2Sealer::new()?;
-    let unsealed = match pin {
-        Some(p) => sealer.unseal_with_pin(&blob, Some(p))?,
-        None => sealer.unseal(&blob)?,
+// v1 `cli_tpm_unseal(path, pin)` removed in v2; replaced by
+// `cli_tpm_unseal_from_bytes` which takes the sealed blob recovered
+// from the slot envelope rather than reading a `.tpm-blob` sidecar.
+
+// ============================================================
+// v2 create helpers: embed material in slot, no .tpm-blob sidecar
+// ============================================================
+
+fn cli_create_passphrase_deniable_v2(
+    path: &Path,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+) -> Result<()> {
+    use luksbox_format::deniable_header::DeniableMaterial;
+    let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
+    let cred = luksbox_core::deniable::DeniableCredential::Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
     };
-    Ok(*unsealed)
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path,
+        None,
+        cipher,
+        0,
+        0,
+        &cred,
+        &DeniableMaterial::passphrase_only(),
+    )?;
+    Ok(())
 }
 
 #[cfg(feature = "hardware")]
-fn cli_create_fido2_deniable(
+fn cli_create_fido2_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
-    _argon2: luksbox_core::Argon2idParams,
-) -> Result<(Vec<u8>, [u8; 32])> {
+    argon2: luksbox_core::Argon2idParams,
+) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::deniable_header::DeniableMaterial;
     use rand_core::RngCore;
+    let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
     let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
@@ -5017,20 +5010,30 @@ fn cli_create_fido2_deniable(
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| cli_err!("OS RNG: {e}"))?;
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
-    let cred = luksbox_core::deniable::DeniableCredential::Fido2 {
+    let cred = luksbox_core::deniable::DeniableCredential::Fido2Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
         hmac_secret_output: &hmac_secret,
     };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
-    Ok((cred_id, hmac_salt))
+    let material = DeniableMaterial {
+        cred_id,
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: Vec::new(),
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
+    Ok(())
 }
 
-fn cli_create_pq_passphrase_deniable(
+fn cli_create_pq_passphrase_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
     argon2: luksbox_core::Argon2idParams,
     kyber_path: &Path,
     use_1024: bool,
 ) -> Result<()> {
+    use luksbox_format::deniable_header::DeniableMaterial;
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
     let params = if use_1024 {
@@ -5046,7 +5049,15 @@ fn cli_create_pq_passphrase_deniable(
         argon2,
         mlkem_shared: &shared,
     };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path,
+        None,
+        cipher,
+        0,
+        0,
+        &cred,
+        &DeniableMaterial::passphrase_only(),
+    )?;
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -5066,13 +5077,15 @@ fn cli_create_pq_passphrase_deniable(
 }
 
 #[cfg(feature = "hardware")]
-fn cli_create_pq_fido2_deniable(
+fn cli_create_pq_fido2_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
     kyber_path: &Path,
     use_1024: bool,
-) -> Result<(Vec<u8>, [u8; 32])> {
+) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::deniable_header::DeniableMaterial;
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
     use rand_core::RngCore;
@@ -5081,6 +5094,7 @@ fn cli_create_pq_fido2_deniable(
     } else {
         PqParams::Ml768
     };
+    let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
     let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
     let seed_pw = prompt_pass_twice("Seed-file passphrase: ", "Confirm:               ")?;
     let mut auth = make_fido2_authenticator();
@@ -5094,11 +5108,20 @@ fn cli_create_pq_fido2_deniable(
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
-    let cred = luksbox_core::deniable::DeniableCredential::HybridPqFido2 {
+    let cred = luksbox_core::deniable::DeniableCredential::HybridPqFido2Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
         mlkem_shared: &shared,
         hmac_secret_output: &hmac_secret,
     };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
+    let material = DeniableMaterial {
+        cred_id,
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: Vec::new(),
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -5114,14 +5137,11 @@ fn cli_create_pq_fido2_deniable(
         seed_pw.as_bytes(),
         seed_file::KdfParams::default(),
     )?;
-    Ok((cred_id, hmac_salt))
+    Ok(())
 }
 
 #[cfg(all(feature = "hardware", target_os = "linux"))]
-fn cli_tpm_seal_sidecar(
-    vault: &Path,
-    pin: Option<&[u8]>,
-) -> Result<(zeroize::Zeroizing<[u8; 32]>, std::path::PathBuf)> {
+fn cli_tpm_seal_to_bytes(pin: Option<&[u8]>) -> Result<(zeroize::Zeroizing<[u8; 32]>, Vec<u8>)> {
     use luksbox_tpm::Tpm2Sealer;
     use rand_core::RngCore;
     let mut sealer = Tpm2Sealer::new()?;
@@ -5133,41 +5153,46 @@ fn cli_tpm_seal_sidecar(
         Some(p) => sealer.seal_with_pin(&secret, Some(p))?,
         None => sealer.seal(&secret)?,
     };
-    let mut sidecar = vault.to_path_buf();
-    let new_name = match sidecar.file_name() {
-        Some(n) => format!("{}.tpm-blob", n.to_string_lossy()),
-        None => "vault.tpm-blob".to_string(),
+    Ok((secret, blob.to_bytes()))
+}
+
+#[cfg(all(feature = "hardware", target_os = "linux"))]
+fn cli_create_tpm_deniable_v2(
+    path: &Path,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+) -> Result<()> {
+    use luksbox_format::deniable_header::DeniableMaterial;
+    let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
+    let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
+    let cred = luksbox_core::deniable::DeniableCredential::TpmPassphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+        unsealed: &*secret,
     };
-    sidecar.set_file_name(new_name);
-    std::fs::write(&sidecar, blob.to_bytes())?;
-    Ok((secret, sidecar))
+    let material = DeniableMaterial {
+        cred_id: Vec::new(),
+        hmac_salt: None,
+        tpm_blob: blob,
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
+    Ok(())
 }
 
 #[cfg(all(feature = "hardware", target_os = "linux"))]
-fn cli_create_tpm_deniable(
+fn cli_create_tpm_fido2_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
-    _argon2: luksbox_core::Argon2idParams,
-) -> Result<std::path::PathBuf> {
-    // Single-factor TPM: vault is openable only with the TPM-unsealed
-    // secret. No passphrase factor; chip dies = vault gone. This is
-    // the user's chosen B-mode for deniable: avoids the
-    // invisible-second-slot foot-gun (see docs/DENIABLE_HEADER.md).
-    let (secret, sidecar) = cli_tpm_seal_sidecar(path, None)?;
-    let cred = luksbox_core::deniable::DeniableCredential::Tpm { unsealed: &*secret };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
-    Ok(sidecar)
-}
-
-#[cfg(all(feature = "hardware", target_os = "linux"))]
-fn cli_create_tpm_fido2_deniable(
-    path: &Path,
-    cipher: luksbox_core::CipherSuite,
-) -> Result<(std::path::PathBuf, (Vec<u8>, [u8; 32]))> {
+    argon2: luksbox_core::Argon2idParams,
+) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::deniable_header::DeniableMaterial;
     use rand_core::RngCore;
-    let (secret, sidecar) = cli_tpm_seal_sidecar(path, None)?;
+    let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
     let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
+    let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
     let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
@@ -5177,21 +5202,32 @@ fn cli_create_tpm_fido2_deniable(
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| cli_err!("OS RNG: {e}"))?;
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
-    let cred = luksbox_core::deniable::DeniableCredential::TpmFido2 {
+    let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
         unsealed: &*secret,
         hmac_secret_output: &hmac_secret,
     };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
-    Ok((sidecar, (cred_id, hmac_salt)))
+    let material = DeniableMaterial {
+        cred_id,
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: blob,
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
+    Ok(())
 }
 
 #[cfg(all(feature = "hardware", target_os = "linux"))]
-fn cli_create_pq_tpm_deniable(
+fn cli_create_pq_tpm_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
     kyber_path: &Path,
     use_1024: bool,
-) -> Result<std::path::PathBuf> {
+) -> Result<()> {
+    use luksbox_format::deniable_header::DeniableMaterial;
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
     let params = if use_1024 {
@@ -5199,15 +5235,25 @@ fn cli_create_pq_tpm_deniable(
     } else {
         PqParams::Ml768
     };
-    let (secret, sidecar) = cli_tpm_seal_sidecar(path, None)?;
+    let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
+    let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
     let seed_pw = prompt_pass_twice("Seed-file passphrase: ", "Confirm:               ")?;
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
-    let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpm {
+    let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpmPassphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
         mlkem_shared: &shared,
         unsealed: &*secret,
     };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
+    let material = DeniableMaterial {
+        cred_id: Vec::new(),
+        hmac_salt: None,
+        tpm_blob: blob,
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -5223,17 +5269,19 @@ fn cli_create_pq_tpm_deniable(
         seed_pw.as_bytes(),
         seed_file::KdfParams::default(),
     )?;
-    Ok(sidecar)
+    Ok(())
 }
 
 #[cfg(all(feature = "hardware", target_os = "linux"))]
-fn cli_create_pq_tpm_fido2_deniable(
+fn cli_create_pq_tpm_fido2_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
     kyber_path: &Path,
     use_1024: bool,
-) -> Result<(std::path::PathBuf, (Vec<u8>, [u8; 32]))> {
+) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::deniable_header::DeniableMaterial;
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
     use rand_core::RngCore;
@@ -5242,9 +5290,10 @@ fn cli_create_pq_tpm_fido2_deniable(
     } else {
         PqParams::Ml768
     };
-    let (secret, sidecar) = cli_tpm_seal_sidecar(path, None)?;
+    let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
     let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
     let seed_pw = prompt_pass_twice("Seed-file passphrase: ", "Confirm:               ")?;
+    let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
     let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
@@ -5256,12 +5305,21 @@ fn cli_create_pq_tpm_fido2_deniable(
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
-    let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpmFido2 {
+    let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpmFido2Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
         mlkem_shared: &shared,
         unsealed: &*secret,
         hmac_secret_output: &hmac_secret,
     };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
+    let material = DeniableMaterial {
+        cred_id,
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: blob,
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -5277,7 +5335,7 @@ fn cli_create_pq_tpm_fido2_deniable(
         seed_pw.as_bytes(),
         seed_file::KdfParams::default(),
     )?;
-    Ok((sidecar, (cred_id, hmac_salt)))
+    Ok(())
 }
 
 fn cmd_rotate_mvk(path: &Path, unlock: &UnlockArgs) -> Result<()> {
@@ -5569,12 +5627,12 @@ fn cmd_panic(
 
     if !skip_confirm {
         eprintln!(
-            "⚠  PANIC: about to overwrite the header of {} with random bytes.",
+            "PANIC: about to overwrite the header of {} with random bytes.",
             header_target.display()
         );
         if wipe_data {
             eprintln!(
-                "⚠       ALSO overwriting the entire vault file ({} bytes).",
+                "       ALSO overwriting the entire vault file ({} bytes).",
                 std::fs::metadata(vault).map(|m| m.len()).unwrap_or(0)
             );
         }

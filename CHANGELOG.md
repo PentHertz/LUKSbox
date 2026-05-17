@@ -20,6 +20,205 @@ Slot-policy revisit for the multi-factor combos. Existing v0.1.1
 vaults open unchanged; the behavior change is entirely at create
 time.
 
+### Deniable header v2
+
+v2 design landed in [docs/DENIABLE_HEADER.md](docs/DENIABLE_HEADER.md).
+Full implementation shipped this revision:
+
+- **Format constants bumped.** `DENIABLE_SLOT_SIZE` 512 → 4096,
+  `DENIABLE_HEADER_SIZE` 8192 → 36864. AAD prefix
+  `luksbox-deniable-v1` → `luksbox-deniable-v2`. v1 was never
+  released publicly so this is a clean break.
+
+- **Two-layer envelope encryption.** Each v2 slot is `AEAD(KEK_envelope,
+  payload)` where the payload contains `kind`, embedded `cred_id` /
+  `hmac_salt` / `tpm_blob` (per variant), and an inner `wrapped_mvk =
+  AEAD(KEK_factors, MVK)`. `KEK_envelope = Argon2id(passphrase, salt)`
+  is the discovery key; `KEK_factors = HKDF(per_vault_salt, envelope_kek
+  || <secondaries>, info-label)` combines the envelope with the
+  per-variant secondary factor outputs. Distinct AADs on the outer
+  envelope and inner MVK prevent cross-slot ciphertext reuse.
+
+- **Passphrase mandatory for every deniable credential.** Pure-FIDO2,
+  pure-TPM, and non-passphrase multi-factor deniable variants from v1
+  are removed from the user-facing flows (chicken-and-egg constraint:
+  no slot envelope key exists without a discovery factor). New
+  `*Passphrase` variants ship in `DeniableCredential`:
+  `TpmFido2Passphrase`, `HybridPqFido2Passphrase`,
+  `HybridPqTpmPassphrase`, `HybridPqTpmFido2Passphrase`. v1 variants
+  (`Fido2`, `Tpm`, `TpmFido2`, `HybridPqFido2`, `HybridPqTpm`,
+  `HybridPqTpmFido2`) are retained as v1-compat enum members so the
+  enroll-slot administrative paths (which haven't migrated to v2 yet)
+  continue to compile; they are no longer reachable through the
+  deniable-create or deniable-open user paths.
+
+- **`.tpm-blob` sidecar eliminated for deniable mode.** TPM sealed
+  blobs (typically 1.5-3 KB) now live inside the slot envelope. The
+  `.lbx.tpm` file is no longer written at create time. The
+  `.kyber` / `.hybrid` sidecars for hybrid-PQ are retained (the
+  ML-KEM seed + ciphertext have their own passphrase wrapper and
+  don't benefit from in-envelope embedding).
+
+- **External-material CLI flags removed.** `deniable-mount` and
+  `deniable-info` no longer accept `--tpm-blob-path`,
+  `--fido2-cred-id`, or `--fido2-hmac-salt` - those values are
+  recovered from the slot envelope automatically once the
+  passphrase opens it. `--kyber-path` is retained (PQ sidecar
+  stays).
+
+- **TUI wizard simplified.** `DeniableRecoveryInfo` collapses to an
+  empty marker; the post-create "save this recovery info now" page
+  no longer prints hex `cred_id` / `hmac_salt` / sidecar path. The
+  open-deniable flow drops the "type your cred_id (hex)" /
+  "type your hmac_salt (hex)" / ".tpm-blob path" prompts.
+
+- **GUI create + open migrated to v2.** `Container::create_vault`
+  routes deniable mode through `create_with_credential_v2_deniable`
+  with `DeniableMaterial`; `Container::unlock_vault` uses the
+  two-phase `try_open_envelope_v2_deniable` + `complete_open_v2_deniable`
+  pattern. Recovery-card modal no longer surfaces FIDO2 hex values.
+
+- **New format-crate API.** `Container::create_with_credential_v2_deniable`,
+  `Container::try_open_envelope_v2_deniable`,
+  `Container::complete_open_v2_deniable`, and
+  `Container::enroll_credential_v2_deniable` are the canonical v2
+  surface. `DeniableMaterial { cred_id, hmac_salt, tpm_blob }`
+  encapsulates what gets embedded.
+
+- **Slot-payload encoder/decoder.** New
+  `luksbox_core::deniable::slot_payload` module: `SlotPayload::new` +
+  `encode` + `decode`. Length-capped at `CRED_ID_MAX_LEN = 1024`,
+  `HMAC_SALT_LEN = 32`, `TPM_BLOB_MAX_LEN = 3500`, joint budget
+  4000 B. 9 round-trip / rejection tests cover encode-then-decode,
+  per-kind shape, over-budget rejection, unknown-kind rejection,
+  bad-length rejection.
+
+- **v2 round-trip tests.** New tests in
+  `crates/luksbox-format/src/deniable_header.rs`:
+  `v2_create_then_open_round_trips_passphrase_only`,
+  `v2_round_trip_with_fido2_material_embedded`,
+  `v2_round_trip_with_tpm_blob_embedded`,
+  `v2_wrong_passphrase_returns_opaque_error`,
+  `v2_complete_open_rejects_variant_mismatch`.
+
+- **Admin enroll-into-deniable migrated to v2.** All
+  `enroll_*_deniable` functions in `crates/luksbox-gui/src/ops.rs`
+  now take `passphrase: &str` + `argon2: Argon2idParams` and route
+  through `Container::enroll_credential_v2_deniable` with embedded
+  material. Affected: `enroll_fido2_deniable`,
+  `enroll_tpm2_deniable`, `enroll_tpm2_fido2_deniable`,
+  `enroll_hybrid_pq_tpm2_deniable`,
+  `enroll_hybrid_pq_tpm2_fido2_deniable`. The dead
+  `enroll_tpm2_pin_deniable` (which always errored with "not yet
+  wired") is removed; the v2 envelope passphrase subsumes the
+  TPM-side PIN. The bootstrap-deniable dispatch in
+  `create_vault_with_tpm_bootstrap` reuses the create-time
+  passphrase for the new TPM slot's envelope.
+
+- **`AddFido2Form` (GUI) gains `deniable_passphrase` +
+  `deniable_kdf`** fields. The "Add FIDO2 keyslot" modal surfaces
+  them when the open vault is in deniable mode; ignored otherwise.
+
+- **v1 dead-code cleanup.** Removed the now-unreachable v1
+  standalone helpers `fido2_hmac_salt`, `fido2_kek`,
+  `tpm_fido2_kek`, `pq_hybrid_kek` from
+  `crates/luksbox-core/src/deniable.rs`; removed the HKDF labels
+  `FIDO2_SALT`, `FIDO2_KEK`, `TPM_FIDO2_KEK`, `PQ_CLASSICAL`,
+  `PQ_HYBRID_KEK` that only they used; removed
+  `tpm_seal_for_deniable` + `tpm_blob_sidecar_path` from
+  `crates/luksbox-gui/src/ops.rs` (no caller after the enroll
+  migration above).
+
+- **v1 surface fully stripped.** Container tests migrated to the
+  v2 API (17 deniable container tests now exercise
+  `create_with_credential_v2_deniable` +
+  `try_open_envelope_v2_deniable` + `complete_open_v2_deniable`).
+  After the test migration the following were removed:
+  - v1 `DeniableCredential` variants `Fido2`, `Tpm`, `TpmFido2`,
+    `HybridPqFido2`, `HybridPqTpm`, `HybridPqTpmFido2`
+  - v1 single-step `DeniableCredential::derive_kek` wrapper
+  - v1-compat HKDF labels (`KEK_FIDO2`, `KEK_TPM`,
+    `KEK_TPM_FIDO2`, `KEK_PQ_FIDO2`, `KEK_PQ_TPM`,
+    `KEK_PQ_TPM_FIDO2`)
+  - v1 `deniable_header::{create_with_passphrase,
+    open_with_passphrase, create_with_credential,
+    open_with_credential, install_slot_with_credential,
+    install_slot, rotate_mvk}`
+  - v1 `Container::{create_with_credential_deniable,
+    open_with_credential_deniable, enroll_credential_deniable}`
+  - All v1 deniable_header tests (`create_then_open_round_trips`,
+    `install_slot_*`, `clear_slot_makes_the_credential_unusable`,
+    `invariant_4_rotation_rerandomises_every_slot_byte`,
+    `rotate_mvk_*`) - equivalent coverage in v2 round-trip and
+    container tests.
+  - GUI workers `deniable_create_worker` /
+    `deniable_verify_worker` rewritten to go through the v2
+    Container API instead of poking the raw header functions.
+
+  `Container::create_with_passphrase_deniable` /
+  `open_with_passphrase_deniable` / `enroll_passphrase_deniable`
+  are retained as thin convenience wrappers that delegate to the
+  v2 two-layer API (same on-disk format).
+
+- **v2 rotation API shipped.** `deniable_header::rotate_mvk_v2`
+  generates a fresh `per_vault_salt` + MVK, re-installs each kept
+  slot as a v2 envelope under the new salt (re-derived
+  `KEK_envelope` + `KEK_factors`), re-randomises non-kept slots,
+  and atomically commits the new 36864-byte header (failure leaves
+  the input untouched). `Container::rotate_mvk_v2_deniable` wraps
+  it at the container layer, swaps the cached MVK + salt + header
+  bytes on success, marks `header_dirty`. 4 format-level tests +
+  2 container-level tests cover round-trip / drop-slot /
+  duplicate-idx / atomic-failure / persist-after-rotate.
+
+- **Variant-aware envelope discovery.** When a deniable vault has
+  multiple slots whose envelopes decrypt under the same passphrase
+  (e.g. a passphrase slot at 0 + an enrolled FIDO2-passphrase slot
+  at 4 with the same envelope passphrase), `try_open_envelope_v2`
+  now picks the slot whose `kind` matches the credential variant
+  the caller is requesting. Falls back to the first match if no
+  kind-matching candidate exists, so the variant-mismatch error
+  path in `complete_open_v2` still surfaces for genuine
+  credential-type mistakes. Constant-time envelope discovery is
+  preserved (always iterates all 8 slots regardless of which
+  matches).
+
+- **Optional separate `.kyber` seed-file passphrase.** All HybridPq
+  deniable variants (HybridPq, HybridPqFido2, HybridPqTpm2,
+  HybridPqTpm2Fido2 + 1024 variants) now accept either a single
+  passphrase that doubles as envelope + seed-file (the default,
+  matches the existing one-passphrase UX) OR distinct passphrases
+  for each role. `CreateOpts.hybrid_seed_pw` /
+  `UnlockOpts.hybrid_seed_pw` carry the optional second passphrase;
+  empty falls back to the envelope passphrase. The GUI create +
+  open forms surface both fields with strength meter + "Generate
+  strong passphrase" button + clear hints explaining the
+  reuse-vs-distinct choice. The TUI wizard mirrors this with
+  `ask_optional_seed_pw` (offers the generator + asks for confirm
+  on the distinct path) and `ask_pq_decap_for_deniable` taking the
+  envelope passphrase as a fallback parameter.
+
+- **Fuzz target retargeted to v2.** `fuzz/fuzz_targets/deniable_header_parse.rs`
+  now exercises `try_open_envelope_v2` (phase 1 envelope discovery)
+  and, on the rare phase-1 success, `complete_open_v2` (phase 2
+  inner MVK unwrap + inner-header decrypt). Same invariants: no
+  panic, no leaked failure-mode variant.
+
+- **GUI add-keyslot modals deniable-aware.** The five TPM-family
+  add buttons (TPM-only, TPM+PIN, TPM+FIDO2, hybrid TPM+ML-KEM,
+  3-factor hybrid TPM+FIDO2+ML-KEM) and the FIDO2 add modal each
+  branch on `Container::is_deniable()`. In deniable mode they
+  open a modal with the shared `DeniableEnrollExtras` block
+  (envelope passphrase + Argon2id strength + target slot index)
+  and dispatch to the matching `enroll_*_deniable` op. The new
+  TPM-only deniable modal (`AddTpm2DeniableForm`) covers the
+  case where the standard TPM-only enroll has no modal at all.
+
+- **User-facing strings cleaned.** Removed the `v2` version
+  prefix from GUI / TUI / CLI labels and toasts (internal API
+  names and code comments keep it). Replaced em-dashes and the
+  warning emoji with plain ASCII in all user-visible strings.
+
 ### Changed (defaults at vault creation)
 
 - **FIDO2-direct: backup passphrase is now opt-in.** The create

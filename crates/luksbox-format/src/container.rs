@@ -383,6 +383,30 @@ struct RotationState {
 /// fast access (it's used as the metadata-region KDF salt). `inner`
 /// caches the parsed inner-header fields so `Container.header` can
 /// expose the standard accessors without re-parsing.
+/// Intermediate handle returned by phase 1 of v2 deniable open
+/// (`Container::try_open_envelope_v2_deniable`). Holds the
+/// authenticator material the caller needs to drive secondary
+/// factors plus the locked file handle, header buffer, and envelope
+/// KEK that phase 2 will use to finish the open. Hand it back to
+/// `Container::complete_open_v2_deniable` with a fully-populated
+/// `DeniableCredential`.
+pub struct DeniableV2EnvelopeHandle {
+    file: File,
+    path: PathBuf,
+    header_buf: Vec<u8>,
+    pub opened: crate::deniable_header::OpenedDeniableEnvelope,
+    cipher: CipherSuite,
+}
+
+impl DeniableV2EnvelopeHandle {
+    /// Recovered slot payload: `kind`, `cred_id`, `hmac_salt`,
+    /// `tpm_blob`. Caller reads these to know what secondaries to
+    /// drive (FIDO2 `get_assertion`, TPM `Unseal`, ML-KEM `decap`).
+    pub fn payload(&self) -> &luksbox_core::deniable::slot_payload::SlotPayload {
+        &self.opened.payload
+    }
+}
+
 struct DeniableState {
     bytes: Box<[u8; luksbox_core::deniable::DENIABLE_HEADER_SIZE]>,
     salt: [u8; luksbox_core::deniable::DENIABLE_SALT_SIZE],
@@ -881,98 +905,96 @@ impl Container {
         flags: u32,
         passphrase: &[u8],
     ) -> Result<Self, Error> {
-        use crate::deniable_header::{DeniableInnerHeader, create_with_passphrase};
-        use luksbox_core::deniable::DENIABLE_HEADER_SIZE;
-
-        let metadata_region_size = DEFAULT_METADATA_REGION_SIZE;
-        // Deniable mode REQUIRES inline header today: the on-disk
-        // 8 KiB lives at offset 0 of the .lbx file. A detached
-        // deniable header is a clean future extension (the .lbx
-        // would start at offset 0 with metadata; the sidecar holds
-        // the 8 KiB random-looking header). Not yet supported.
-        if header_path.is_some() {
-            return Err(Error::Crypto(luksbox_core::Error::InvalidField));
-        }
-        let metadata_offset = DENIABLE_HEADER_SIZE as u64;
-        let data_offset = metadata_offset + metadata_region_size;
-
-        let inner = DeniableInnerHeader {
-            format_version_minor: 0,
-            cipher_suite: cipher,
-            kdf_id: KdfId::Argon2id,
-            flags,
-            metadata_offset,
-            metadata_size: metadata_region_size,
-            data_offset,
-            chunk_size: 4096,
+        // v2 delegate: wrap the passphrase into a
+        // `DeniableCredential::Passphrase` and route through the v2
+        // create path so the on-disk layout matches everything else
+        // produced by the v2-only user paths (CLI / TUI / GUI).
+        let cred = luksbox_core::deniable::DeniableCredential::Passphrase {
+            passphrase,
+            argon2: kdf_params,
         };
-
-        let (header_bytes, mvk) = create_with_passphrase(passphrase, kdf_params, cipher, inner)?;
-        debug_assert_eq!(header_bytes.len(), DENIABLE_HEADER_SIZE);
-
-        // Extract the per-vault salt from offset 0 of the deniable
-        // header. Reused as `header.header_salt` so the metadata
-        // region's HKDF input matches between deniable and standard
-        // modes (the metadata code just calls `derive_subkey(salt,
-        // info)`; it doesn't care where the salt came from).
-        let mut salt = [0u8; 32];
-        salt.copy_from_slice(&header_bytes[..32]);
-
-        // Synthesise the standard Header struct from the deniable
-        // inner fields. The keyslots stay Empty - slot mutation
-        // ops are gated separately because the real wrapped MVK
-        // lives inside the opaque deniable slot bytes, not in this
-        // Header's keyslots array.
-        let mut synth_header = Header::try_new(cipher, KdfId::Argon2id, 4096, data_offset)?;
-        synth_header.flags = flags;
-        synth_header.metadata_offset = metadata_offset;
-        synth_header.metadata_size = metadata_region_size;
-        synth_header.header_salt = salt;
-        // keyslots already all-Empty via `Header::try_new`.
-
-        let mut file = secure_create_new(path)?;
-        file.write_all(&header_bytes)?;
-        let mut region = vec![0u8; metadata_region_size as usize];
-        metadata::write_metadata(cipher, &mvk, &salt, b"", &mut region)?;
-        file.write_all(&region)?;
-        file.flush()?;
-
-        lock_handles(&[(&file, path)])?;
-
-        let mut header_bytes_arr = Box::new([0u8; DENIABLE_HEADER_SIZE]);
-        header_bytes_arr.copy_from_slice(&header_bytes);
-
-        Ok(Self {
-            file,
-            path: path.to_path_buf(),
-            header_storage: HeaderStorage::Inline,
-            header: synth_header,
-            mvk,
-            header_dirty: false,
-            anchor_path: None,
-            rotation: None,
-            deniable: Some(DeniableState {
-                bytes: header_bytes_arr,
-                salt,
-                inner,
-                unlocked_slot_idx: 0,
-            }),
-        })
+        Self::create_with_credential_v2_deniable(
+            path,
+            header_path,
+            cipher,
+            flags,
+            0,
+            &cred,
+            &crate::deniable_header::DeniableMaterial::passphrase_only(),
+        )
     }
 
-    /// Credential-agnostic deniable create. Supersedes
-    /// `create_with_passphrase_deniable` (which now delegates here).
-    /// Accepts any `DeniableCredential` variant + an explicit
-    /// `slot_idx` (0..7) for the initial credential.
-    pub fn create_with_credential_deniable(
+    // v1 `create_with_credential_deniable`, `open_with_credential_deniable`,
+    // and `enroll_credential_deniable` were removed in v2. All
+    // callers (CLI, TUI wizard, GUI, container tests) now use the v2
+    // two-phase API: `create_with_credential_v2_deniable`,
+    // `try_open_envelope_v2_deniable` + `complete_open_v2_deniable`,
+    // and `enroll_credential_v2_deniable`.
+
+    /// Open an existing deniable-mode container. Caller must supply
+    /// the cipher + Argon2 params + passphrase that was used at
+    /// create time. All failure modes (wrong cipher, wrong params,
+    /// wrong passphrase, truncated file) collapse to
+    /// `Error::OpaqueUnlockFailed`.
+    pub fn open_with_passphrase_deniable(
+        path: &Path,
+        header_path: Option<&Path>,
+        passphrase: &[u8],
+        kdf_params: Argon2idParams,
+        cipher: CipherSuite,
+    ) -> Result<Self, Error> {
+        // v2 delegate: wrap the passphrase into a
+        // `DeniableCredential::Passphrase` and route through the v2
+        // two-phase open (envelope discovery + complete unlock).
+        let cred = luksbox_core::deniable::DeniableCredential::Passphrase {
+            passphrase,
+            argon2: kdf_params,
+        };
+        let envelope = Self::try_open_envelope_v2_deniable(path, header_path, &cred, cipher)?;
+        Self::complete_open_v2_deniable(envelope, &cred)
+    }
+
+    /// Slot index whose credential opened this Container, or 0 if
+    /// the vault was just created. Only meaningful for deniable-mode
+    /// containers; `None` for standard mode (which uses
+    /// `header.keyslots[idx].kind` instead).
+    pub fn deniable_unlocked_slot(&self) -> Option<usize> {
+        self.deniable.as_ref().map(|d| d.unlocked_slot_idx)
+    }
+
+    // ============================================================
+    // v2 deniable container API: embedded material, no sidecar
+    // ============================================================
+
+    /// v2 deniable create. Same role as
+    /// `create_with_credential_deniable` but embeds `cred_id`,
+    /// `hmac_salt`, and the TPM sealed blob inside the slot envelope
+    /// instead of demanding a `.tpm-blob` sidecar / external `cred_id`
+    /// storage.
+    ///
+    /// Caller must have already enrolled the relevant device (FIDO2
+    /// `MakeCredential`, TPM `TPM2_Create`+`Load`+`PolicyAuthorize`,
+    /// ML-KEM encap) and supplies both the resulting secondaries (in
+    /// `credential`) and the on-disk material (in `material`).
+    ///
+    /// Hard requirements:
+    /// - `credential` must be a v2 `*Passphrase` variant. Passing a
+    ///   v1 passphraseless variant returns `Error::InvalidField`.
+    /// - `material` must match the variant: FIDO2 variants need
+    ///   non-empty `cred_id` + `Some(hmac_salt)`, TPM variants need
+    ///   non-empty `tpm_blob`, Passphrase needs nothing.
+    /// - `header_path` must be `None` (deniable v2 mode keeps the
+    ///   header inline; sidecar headers are a separate feature).
+    pub fn create_with_credential_v2_deniable(
         path: &Path,
         header_path: Option<&Path>,
         cipher: CipherSuite,
         flags: u32,
         slot_idx: usize,
         credential: &luksbox_core::deniable::DeniableCredential,
+        material: &crate::deniable_header::DeniableMaterial,
     ) -> Result<Self, Error> {
-        use crate::deniable_header::{DeniableInnerHeader, create_with_credential};
+        use crate::deniable_header::{DeniableInnerHeader, create_with_credential_v2};
         use luksbox_core::deniable::DENIABLE_HEADER_SIZE;
 
         let metadata_region_size = DEFAULT_METADATA_REGION_SIZE;
@@ -993,7 +1015,8 @@ impl Container {
             chunk_size: 4096,
         };
 
-        let (header_bytes, mvk) = create_with_credential(credential, slot_idx, cipher, inner)?;
+        let (header_bytes, mvk) =
+            create_with_credential_v2(credential, material, slot_idx, cipher, inner)?;
         debug_assert_eq!(header_bytes.len(), DENIABLE_HEADER_SIZE);
 
         let mut salt = [0u8; 32];
@@ -1035,19 +1058,25 @@ impl Container {
         })
     }
 
-    /// Credential-agnostic deniable open. Supersedes
-    /// `open_with_passphrase_deniable`. `slot_idx`:
-    /// - `Some(idx)`: fast path, only attempt slot `idx`. User must
-    ///   know which slot their credential lives in.
-    /// - `None`: discovery path, trial-decrypt all 8 slots constant-time.
-    pub fn open_with_credential_deniable(
+    /// v2 deniable open, phase 1. Returns the matched slot's payload
+    /// (kind tag + `cred_id` + `hmac_salt` + `tpm_blob`) plus the
+    /// envelope KEK that the caller needs to pass back into
+    /// `complete_open_v2_deniable` once it has driven the secondary
+    /// factors.
+    ///
+    /// `credential` only needs the passphrase + Argon2 params; any
+    /// secondaries on it are ignored at this phase. In practice the
+    /// caller passes `DeniableCredential::Passphrase { passphrase,
+    /// argon2 }` here, learns the kind tag from the returned payload,
+    /// drives the device, then constructs the full credential for
+    /// phase 2.
+    pub fn try_open_envelope_v2_deniable(
         path: &Path,
         header_path: Option<&Path>,
         credential: &luksbox_core::deniable::DeniableCredential,
-        slot_idx: Option<usize>,
         cipher: CipherSuite,
-    ) -> Result<Self, Error> {
-        use crate::deniable_header::open_with_credential;
+    ) -> Result<DeniableV2EnvelopeHandle, Error> {
+        use crate::deniable_header::try_open_envelope_v2;
         use luksbox_core::deniable::DENIABLE_HEADER_SIZE;
 
         if header_path.is_some() {
@@ -1061,47 +1090,144 @@ impl Container {
         file.read_exact(&mut header_buf)
             .map_err(|_| Error::OpaqueUnlockFailed)?;
 
-        let opened = open_with_credential(&header_buf, credential, slot_idx, cipher)?;
+        let opened = try_open_envelope_v2(&header_buf, credential, cipher)?;
+
+        Ok(DeniableV2EnvelopeHandle {
+            file,
+            path: path.to_path_buf(),
+            header_buf,
+            opened,
+            cipher,
+        })
+    }
+
+    /// v2 deniable open, phase 2. Caller has driven the secondary
+    /// factors based on the payload exposed by phase 1 and now
+    /// supplies a fully-populated `DeniableCredential` (one whose
+    /// `kind_tag()` matches the envelope's payload kind).
+    pub fn complete_open_v2_deniable(
+        envelope: DeniableV2EnvelopeHandle,
+        credential: &luksbox_core::deniable::DeniableCredential,
+    ) -> Result<Self, Error> {
+        use crate::deniable_header::complete_open_v2;
+        use luksbox_core::deniable::DENIABLE_HEADER_SIZE;
+
+        let DeniableV2EnvelopeHandle {
+            file,
+            path,
+            header_buf,
+            opened,
+            cipher,
+        } = envelope;
+
+        let result = complete_open_v2(opened, credential, cipher)?;
 
         let mut synth_header = Header::try_new(
-            opened.inner.cipher_suite,
-            opened.inner.kdf_id,
-            opened.inner.chunk_size,
-            opened.inner.data_offset,
+            result.inner.cipher_suite,
+            result.inner.kdf_id,
+            result.inner.chunk_size,
+            result.inner.data_offset,
         )?;
-        synth_header.flags = opened.inner.flags;
-        synth_header.metadata_offset = opened.inner.metadata_offset;
-        synth_header.metadata_size = opened.inner.metadata_size;
-        synth_header.header_salt = opened.per_vault_salt;
+        synth_header.flags = result.inner.flags;
+        synth_header.metadata_offset = result.inner.metadata_offset;
+        synth_header.metadata_size = result.inner.metadata_size;
+        synth_header.header_salt = result.per_vault_salt;
 
         let mut header_bytes_arr = Box::new([0u8; DENIABLE_HEADER_SIZE]);
         header_bytes_arr.copy_from_slice(&header_buf);
 
         Ok(Self {
             file,
-            path: path.to_path_buf(),
+            path,
             header_storage: HeaderStorage::Inline,
             header: synth_header,
-            mvk: opened.mvk,
+            mvk: result.mvk,
             header_dirty: false,
             anchor_path: None,
             rotation: None,
             deniable: Some(DeniableState {
                 bytes: header_bytes_arr,
-                salt: opened.per_vault_salt,
-                inner: opened.inner,
-                unlocked_slot_idx: opened.matched_slot_idx,
+                salt: result.per_vault_salt,
+                inner: result.inner,
+                unlocked_slot_idx: result.matched_slot_idx,
             }),
         })
     }
 
-    /// Credential-agnostic deniable enrollment. Wraps the existing
-    /// MVK with the supplied credential at `slot_idx`. Refuses
-    /// `slot_idx == unlocked_slot_idx` (footgun guard).
-    pub fn enroll_credential_deniable(
+    /// v2 deniable MVK rotation. Generates a fresh per-vault salt
+    /// and MVK, re-installs each kept slot under the new salt as a
+    /// v2 two-layer envelope. Slots not in `keep_slots` get fresh
+    /// `OsRng` bytes so a before/after diff of the on-disk header
+    /// reveals nothing about which slots were occupied (security
+    /// invariant #4).
+    ///
+    /// `keep_slots = [(slot_idx, credential, material)]`. Caller is
+    /// responsible for re-supplying every credential's secondary
+    /// outputs (e.g. re-running FIDO2 assertion to get
+    /// `hmac_secret_output`, re-running `TPM2_Unseal` to get
+    /// `unsealed`, re-running ML-KEM decap to get `mlkem_shared`).
+    /// `material` is re-embedded byte-for-byte; rotation re-keys the
+    /// envelope, not the underlying authenticator material.
+    ///
+    /// On success, mutates the Container's MVK + salt + cached
+    /// deniable header bytes to match the new state and marks
+    /// `header_dirty`. Call `persist_header` to commit to disk.
+    ///
+    /// On error the Container is left untouched.
+    pub fn rotate_mvk_v2_deniable(
+        &mut self,
+        keep_slots: &[(
+            usize,
+            &luksbox_core::deniable::DeniableCredential,
+            &crate::deniable_header::DeniableMaterial,
+        )],
+    ) -> Result<MasterVolumeKey, Error> {
+        use crate::deniable_header::rotate_mvk_v2;
+        use luksbox_core::deniable::{self, DENIABLE_SALT_SIZE};
+
+        let den = self
+            .deniable
+            .as_mut()
+            .ok_or(Error::Crypto(luksbox_core::Error::InvalidField))?;
+
+        let mut new_salt = [0u8; DENIABLE_SALT_SIZE];
+        deniable::fill_random(&mut new_salt).map_err(Error::Crypto)?;
+
+        // rotate_mvk_v2 takes a temp copy and only commits on
+        // success, so a mid-rotation failure leaves the cached
+        // header bytes untouched. We mirror that at this layer by
+        // running rotation against a clone and only swapping into
+        // `den.bytes` on success.
+        let mut work = den.bytes.clone();
+        let new_mvk = rotate_mvk_v2(
+            &mut work,
+            den.inner,
+            self.header.cipher_suite,
+            new_salt,
+            keep_slots,
+        )?;
+
+        // Commit the new state.
+        *den.bytes = *work;
+        den.salt = new_salt;
+        self.mvk = new_mvk.clone();
+        // Sync the synthetic Header's salt so any downstream
+        // metadata-region code derives subkeys against the new
+        // per-vault salt.
+        self.header.header_salt = new_salt;
+        self.header_dirty = true;
+        Ok(new_mvk)
+    }
+
+    /// v2 deniable enroll: install a new credential at `slot_idx`
+    /// using the v2 two-layer envelope + embedded material flow.
+    /// Same footgun guard as the v1 enroll (refuses
+    /// `slot_idx == unlocked_slot_idx`).
+    pub fn enroll_credential_v2_deniable(
         &mut self,
         slot_idx: usize,
         credential: &luksbox_core::deniable::DeniableCredential,
+        material: &crate::deniable_header::DeniableMaterial,
     ) -> Result<usize, Error> {
         use luksbox_core::deniable::DENIABLE_SLOT_COUNT;
         let den = self
@@ -1116,86 +1242,17 @@ impl Container {
         if slot_idx == den.unlocked_slot_idx {
             return Err(Error::Crypto(luksbox_core::Error::InvalidField));
         }
-        crate::deniable_header::install_slot_with_credential(
+        crate::deniable_header::install_slot_v2(
             &mut den.bytes,
             slot_idx,
             credential,
+            material,
             &self.mvk,
             self.header.cipher_suite,
             &den.salt,
         )?;
         self.header_dirty = true;
         Ok(slot_idx)
-    }
-
-    /// Open an existing deniable-mode container. Caller must supply
-    /// the cipher + Argon2 params + passphrase that was used at
-    /// create time. All failure modes (wrong cipher, wrong params,
-    /// wrong passphrase, truncated file) collapse to
-    /// `Error::OpaqueUnlockFailed`.
-    pub fn open_with_passphrase_deniable(
-        path: &Path,
-        header_path: Option<&Path>,
-        passphrase: &[u8],
-        kdf_params: Argon2idParams,
-        cipher: CipherSuite,
-    ) -> Result<Self, Error> {
-        use crate::deniable_header::open_with_passphrase;
-        use luksbox_core::deniable::DENIABLE_HEADER_SIZE;
-
-        if header_path.is_some() {
-            // See note in create_with_passphrase_deniable; symmetric
-            // restriction at open time.
-            return Err(Error::Crypto(luksbox_core::Error::InvalidField));
-        }
-
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        lock_handles(&[(&file, path)])?;
-
-        let mut header_buf = vec![0u8; DENIABLE_HEADER_SIZE];
-        file.read_exact(&mut header_buf)
-            .map_err(|_| Error::OpaqueUnlockFailed)?;
-
-        let opened = open_with_passphrase(&header_buf, passphrase, kdf_params, cipher)?;
-
-        let mut synth_header = Header::try_new(
-            opened.inner.cipher_suite,
-            opened.inner.kdf_id,
-            opened.inner.chunk_size,
-            opened.inner.data_offset,
-        )?;
-        synth_header.flags = opened.inner.flags;
-        synth_header.metadata_offset = opened.inner.metadata_offset;
-        synth_header.metadata_size = opened.inner.metadata_size;
-        synth_header.header_salt = opened.per_vault_salt;
-
-        let mut header_bytes_arr = Box::new([0u8; DENIABLE_HEADER_SIZE]);
-        header_bytes_arr.copy_from_slice(&header_buf);
-
-        Ok(Self {
-            file,
-            path: path.to_path_buf(),
-            header_storage: HeaderStorage::Inline,
-            header: synth_header,
-            mvk: opened.mvk,
-            header_dirty: false,
-            anchor_path: None,
-            rotation: None,
-            deniable: Some(DeniableState {
-                bytes: header_bytes_arr,
-                salt: opened.per_vault_salt,
-                inner: opened.inner,
-                unlocked_slot_idx: opened.matched_slot_idx,
-            }),
-        })
-    }
-
-    /// Slot index whose credential opened this Container, or 0 if
-    /// the vault was just created. Only meaningful for deniable-mode
-    /// containers; `None` for standard mode (which uses
-    /// `header.keyslots[idx].kind` instead).
-    pub fn deniable_unlocked_slot(&self) -> Option<usize> {
-        self.deniable.as_ref().map(|d| d.unlocked_slot_idx)
     }
 
     /// Enroll an additional passphrase credential at a specific
@@ -1218,31 +1275,19 @@ impl Container {
         passphrase: &[u8],
         kdf_params: Argon2idParams,
     ) -> Result<usize, Error> {
-        use luksbox_core::deniable::{self, DENIABLE_SLOT_COUNT};
-        let den = self
-            .deniable
-            .as_mut()
-            .ok_or(Error::Crypto(luksbox_core::Error::InvalidField))?;
-        if slot_idx >= DENIABLE_SLOT_COUNT {
-            return Err(Error::Crypto(luksbox_core::Error::InvalidKeyslotIndex(
-                slot_idx,
-            )));
-        }
-        if slot_idx == den.unlocked_slot_idx {
-            return Err(Error::Crypto(luksbox_core::Error::InvalidField));
-        }
-        let kek =
-            deniable::passphrase_kek(passphrase, &den.salt, kdf_params).map_err(Error::Crypto)?;
-        crate::deniable_header::install_slot(
-            &mut den.bytes,
+        // v2 delegate: wrap the passphrase into a
+        // `DeniableCredential::Passphrase` and route through the v2
+        // enroll path so the new slot uses the same two-layer
+        // envelope encoding as everything else.
+        let cred = luksbox_core::deniable::DeniableCredential::Passphrase {
+            passphrase,
+            argon2: kdf_params,
+        };
+        self.enroll_credential_v2_deniable(
             slot_idx,
-            &kek,
-            &self.mvk,
-            self.header.cipher_suite,
-            &den.salt,
-        )?;
-        self.header_dirty = true;
-        Ok(slot_idx)
+            &cred,
+            &crate::deniable_header::DeniableMaterial::passphrase_only(),
+        )
     }
 
     /// Overwrite a slot with fresh random bytes so the credential
@@ -3694,129 +3739,143 @@ mod tests {
 
     #[test]
     fn deniable_container_fido2_round_trip() {
-        // FIDO2-only deniable slot: simulate the device's hmac-secret
-        // output as a fixed 32-byte array. Real flows do this through
-        // luksbox_fido2; here we test the Container layer in isolation.
+        // v2: FIDO2 deniable slot must be FIDO2 + envelope passphrase
+        // (Fido2Passphrase). cred_id + hmac_salt are embedded in the
+        // slot envelope; passphrase opens the envelope, hmac_secret
+        // unwraps the inner MVK.
+        use crate::deniable_header::DeniableMaterial;
         use luksbox_core::deniable::DeniableCredential;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("vault.lbx");
         let hmac = [0xaau8; 32];
-        let cred = DeniableCredential::Fido2 {
+        let cred = DeniableCredential::Fido2Passphrase {
+            passphrase: b"hunter2",
+            argon2: cheap_argon2(),
             hmac_secret_output: &hmac,
         };
-
-        let c = Container::create_with_credential_deniable(
+        let material = DeniableMaterial {
+            cred_id: vec![0xcd; 64],
+            hmac_salt: Some([0xef; 32]),
+            tpm_blob: Vec::new(),
+        };
+        let c = Container::create_with_credential_v2_deniable(
             &path,
             None,
             CipherSuite::Aes256GcmSiv,
             0,
-            2, // arbitrary slot index
+            2,
             &cred,
+            &material,
         )
         .unwrap();
         let mvk_before = c.mvk_clone();
         assert_eq!(c.deniable_unlocked_slot(), Some(2));
         drop(c);
 
-        // Fast path: user knows slot
-        let c_fast = Container::open_with_credential_deniable(
-            &path,
-            None,
-            &cred,
-            Some(2),
-            CipherSuite::Aes256GcmSiv,
-        )
-        .unwrap();
-        assert_eq!(c_fast.mvk_clone().as_bytes(), mvk_before.as_bytes());
-        drop(c_fast);
-
-        // Discovery path: user doesn't know slot
-        let c_disc = Container::open_with_credential_deniable(
-            &path,
-            None,
-            &cred,
-            None,
-            CipherSuite::Aes256GcmSiv,
-        )
-        .unwrap();
-        assert_eq!(c_disc.mvk_clone().as_bytes(), mvk_before.as_bytes());
-        assert_eq!(c_disc.deniable_unlocked_slot(), Some(2));
+        // v2 open: two-phase. The matched slot index is recovered
+        // from the envelope payload, not supplied by the caller.
+        let env =
+            Container::try_open_envelope_v2_deniable(&path, None, &cred, CipherSuite::Aes256GcmSiv)
+                .unwrap();
+        assert_eq!(env.opened.matched_slot_idx, 2);
+        // Material round-trips through the envelope.
+        assert_eq!(env.payload().cred_id, material.cred_id);
+        assert_eq!(env.payload().hmac_salt, material.hmac_salt);
+        let c_open = Container::complete_open_v2_deniable(env, &cred).unwrap();
+        assert_eq!(c_open.mvk_clone().as_bytes(), mvk_before.as_bytes());
+        assert_eq!(c_open.deniable_unlocked_slot(), Some(2));
     }
 
     #[test]
     fn deniable_container_tpm_round_trip() {
+        // v2: TPM + envelope passphrase. The TPM sealed blob is
+        // embedded in the slot envelope (no .tpm-blob sidecar).
+        use crate::deniable_header::DeniableMaterial;
         use luksbox_core::deniable::DeniableCredential;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("vault.lbx");
         let unsealed = [0xbcu8; 32];
-        let cred = DeniableCredential::Tpm {
+        let cred = DeniableCredential::TpmPassphrase {
+            passphrase: b"vault-pass",
+            argon2: cheap_argon2(),
             unsealed: &unsealed,
         };
-
-        let c = Container::create_with_credential_deniable(
+        // Realistic ~1.8 KiB TPM blob.
+        let blob = vec![0x77; 1800];
+        let material = DeniableMaterial {
+            cred_id: Vec::new(),
+            hmac_salt: None,
+            tpm_blob: blob.clone(),
+        };
+        let c = Container::create_with_credential_v2_deniable(
             &path,
             None,
             CipherSuite::Aes256GcmSiv,
             0,
             5,
             &cred,
+            &material,
         )
         .unwrap();
         let mvk_before = c.mvk_clone();
         drop(c);
 
-        let c = Container::open_with_credential_deniable(
-            &path,
-            None,
-            &cred,
-            Some(5),
-            CipherSuite::Aes256GcmSiv,
-        )
-        .unwrap();
+        let env =
+            Container::try_open_envelope_v2_deniable(&path, None, &cred, CipherSuite::Aes256GcmSiv)
+                .unwrap();
+        assert_eq!(env.payload().tpm_blob, blob);
+        let c = Container::complete_open_v2_deniable(env, &cred).unwrap();
         assert_eq!(c.mvk_clone().as_bytes(), mvk_before.as_bytes());
     }
 
     #[test]
     fn deniable_container_hybrid_pq_tpm_fido2_round_trip() {
+        // v2: 4-factor hybrid-PQ + TPM + FIDO2 + passphrase.
+        use crate::deniable_header::DeniableMaterial;
         use luksbox_core::deniable::DeniableCredential;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("vault.lbx");
         let mlkem = [0x01u8; 32];
         let unsealed = [0x02u8; 32];
         let hmac = [0x03u8; 32];
-        let cred = DeniableCredential::HybridPqTpmFido2 {
+        let cred = DeniableCredential::HybridPqTpmFido2Passphrase {
+            passphrase: b"vault-pass",
+            argon2: cheap_argon2(),
             mlkem_shared: &mlkem,
             unsealed: &unsealed,
             hmac_secret_output: &hmac,
         };
-
-        let c = Container::create_with_credential_deniable(
+        let material = DeniableMaterial {
+            cred_id: vec![0x10; 80],
+            hmac_salt: Some([0x20; 32]),
+            tpm_blob: vec![0x30; 1500],
+        };
+        let c = Container::create_with_credential_v2_deniable(
             &path,
             None,
             CipherSuite::Aes256GcmSiv,
             0,
             7,
             &cred,
+            &material,
         )
         .unwrap();
         let mvk_before = c.mvk_clone();
         drop(c);
 
-        let c = Container::open_with_credential_deniable(
-            &path,
-            None,
-            &cred,
-            Some(7),
-            CipherSuite::Aes256GcmSiv,
-        )
-        .unwrap();
+        let env =
+            Container::try_open_envelope_v2_deniable(&path, None, &cred, CipherSuite::Aes256GcmSiv)
+                .unwrap();
+        let c = Container::complete_open_v2_deniable(env, &cred).unwrap();
         assert_eq!(c.mvk_clone().as_bytes(), mvk_before.as_bytes());
     }
 
     #[test]
     fn deniable_container_enroll_mixed_credentials() {
-        // Real-world flow: admin creates with passphrase, enrolls
-        // FIDO2 in another slot, both can unlock independently.
+        // v2 real-world flow: admin creates with a passphrase slot,
+        // enrolls a Fido2Passphrase slot at index 4, both can unlock
+        // the same MVK independently.
+        use crate::deniable_header::DeniableMaterial;
         use luksbox_core::deniable::DeniableCredential;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("vault.lbx");
@@ -3824,46 +3883,57 @@ mod tests {
             passphrase: b"admin",
             argon2: cheap_argon2(),
         };
-        let mut c = Container::create_with_credential_deniable(
+        let mut c = Container::create_with_credential_v2_deniable(
             &path,
             None,
             CipherSuite::Aes256GcmSiv,
             0,
             0,
             &admin_cred,
+            &DeniableMaterial::passphrase_only(),
         )
         .unwrap();
         let mvk_admin = c.mvk_clone();
 
         let hmac = [0x42u8; 32];
-        let fido2_cred = DeniableCredential::Fido2 {
+        let fido2_cred = DeniableCredential::Fido2Passphrase {
+            passphrase: b"bob",
+            argon2: cheap_argon2(),
             hmac_secret_output: &hmac,
         };
-        c.enroll_credential_deniable(4, &fido2_cred).unwrap();
+        let fido2_material = DeniableMaterial {
+            cred_id: vec![0x99; 64],
+            hmac_salt: Some([0x88; 32]),
+            tpm_blob: Vec::new(),
+        };
+        c.enroll_credential_v2_deniable(4, &fido2_cred, &fido2_material)
+            .unwrap();
         c.persist_header().unwrap();
         drop(c);
 
-        // Open with FIDO2 cred at slot 4
-        let c_fido = Container::open_with_credential_deniable(
+        // Open with FIDO2+passphrase cred -> lands at slot 4.
+        let env = Container::try_open_envelope_v2_deniable(
             &path,
             None,
             &fido2_cred,
-            Some(4),
             CipherSuite::Aes256GcmSiv,
         )
         .unwrap();
+        assert_eq!(env.opened.matched_slot_idx, 4);
+        let c_fido = Container::complete_open_v2_deniable(env, &fido2_cred).unwrap();
         assert_eq!(c_fido.mvk_clone().as_bytes(), mvk_admin.as_bytes());
         drop(c_fido);
 
-        // Admin still works at slot 0
-        let c_admin = Container::open_with_credential_deniable(
+        // Admin still works at slot 0.
+        let env_admin = Container::try_open_envelope_v2_deniable(
             &path,
             None,
             &admin_cred,
-            Some(0),
             CipherSuite::Aes256GcmSiv,
         )
         .unwrap();
+        assert_eq!(env_admin.opened.matched_slot_idx, 0);
+        let c_admin = Container::complete_open_v2_deniable(env_admin, &admin_cred).unwrap();
         assert_eq!(c_admin.mvk_clone().as_bytes(), mvk_admin.as_bytes());
     }
 
@@ -3872,6 +3942,7 @@ mod tests {
         // End-to-end: create deniable vault, init anchor, drop,
         // reopen, attach anchor via set_anchor, verify generation
         // matches.
+        use crate::deniable_header::DeniableMaterial;
         use luksbox_core::deniable::DeniableCredential;
         let tmp = tempfile::tempdir().unwrap();
         let vault = tmp.path().join("vault.lbx");
@@ -3880,13 +3951,14 @@ mod tests {
             passphrase: b"admin",
             argon2: cheap_argon2(),
         };
-        let mut c = Container::create_with_credential_deniable(
+        let mut c = Container::create_with_credential_v2_deniable(
             &vault,
             None,
             CipherSuite::Aes256GcmSiv,
             0,
             0,
             &cred,
+            &DeniableMaterial::passphrase_only(),
         )
         .unwrap();
         c.init_anchor(anchor.clone(), 42).unwrap();
@@ -3897,14 +3969,14 @@ mod tests {
         let sz = std::fs::metadata(&anchor).unwrap().len();
         assert_eq!(sz, crate::anchor::DENIABLE_ANCHOR_SIZE as u64);
 
-        let mut c = Container::open_with_credential_deniable(
+        let env = Container::try_open_envelope_v2_deniable(
             &vault,
             None,
             &cred,
-            Some(0),
             CipherSuite::Aes256GcmSiv,
         )
         .unwrap();
+        let mut c = Container::complete_open_v2_deniable(env, &cred).unwrap();
         let gen_from_anchor = c.set_anchor(Some(anchor.clone())).unwrap();
         assert_eq!(gen_from_anchor, Some(42));
     }
@@ -3914,6 +3986,7 @@ mod tests {
         // Attach an anchor from vault A to vault B. The deniable
         // anchor's AAD binds to per_vault_salt, so the read fails
         // with OpaqueUnlockFailed.
+        use crate::deniable_header::DeniableMaterial;
         use luksbox_core::deniable::DeniableCredential;
         let tmp = tempfile::tempdir().unwrap();
         let vault_a = tmp.path().join("a.lbx");
@@ -3924,74 +3997,203 @@ mod tests {
             passphrase: b"shared",
             argon2: cheap_argon2(),
         };
-        let mut ca = Container::create_with_credential_deniable(
+        let mut ca = Container::create_with_credential_v2_deniable(
             &vault_a,
             None,
             CipherSuite::Aes256GcmSiv,
             0,
             0,
             &cred,
+            &DeniableMaterial::passphrase_only(),
         )
         .unwrap();
         ca.init_anchor(anchor_a.clone(), 5).unwrap();
         drop(ca);
 
-        let _cb = Container::create_with_credential_deniable(
+        let _cb = Container::create_with_credential_v2_deniable(
             &vault_b,
             None,
             CipherSuite::Aes256GcmSiv,
             0,
             0,
             &cred,
+            &DeniableMaterial::passphrase_only(),
         )
         .unwrap();
         drop(_cb);
 
         // Open vault B, try to attach anchor_a -> must fail
         // because the per_vault_salt differs (random per create).
-        let mut cb = Container::open_with_credential_deniable(
+        let env_b = Container::try_open_envelope_v2_deniable(
             &vault_b,
             None,
             &cred,
-            Some(0),
             CipherSuite::Aes256GcmSiv,
         )
         .unwrap();
+        let mut cb = Container::complete_open_v2_deniable(env_b, &cred).unwrap();
         let err = cb.set_anchor(Some(anchor_a)).err().unwrap();
         assert!(matches!(err, Error::OpaqueUnlockFailed));
     }
 
     #[test]
     fn deniable_container_wrong_credential_type_returns_opaque() {
-        // Creator used FIDO2, opener tries TPM with the same secret
-        // bytes. KEKs diverge via domain separation → opaque fail.
+        // v2: Creator used Fido2Passphrase, opener tries
+        // TpmPassphrase with the same passphrase + same secret. The
+        // envelope opens (same passphrase) but the kind-tag mismatch
+        // at complete_open_v2 surfaces OpaqueUnlockFailed.
+        use crate::deniable_header::DeniableMaterial;
         use luksbox_core::deniable::DeniableCredential;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("vault.lbx");
         let secret = [0x5au8; 32];
 
-        Container::create_with_credential_deniable(
+        let create_cred = DeniableCredential::Fido2Passphrase {
+            passphrase: b"pp",
+            argon2: cheap_argon2(),
+            hmac_secret_output: &secret,
+        };
+        Container::create_with_credential_v2_deniable(
             &path,
             None,
             CipherSuite::Aes256GcmSiv,
             0,
             3,
-            &DeniableCredential::Fido2 {
-                hmac_secret_output: &secret,
+            &create_cred,
+            &DeniableMaterial {
+                cred_id: vec![0xaa; 32],
+                hmac_salt: Some([0xbb; 32]),
+                tpm_blob: Vec::new(),
             },
         )
         .unwrap();
 
-        // Wrong variant with same bytes — must fail
-        let err = Container::open_with_credential_deniable(
+        // Try to open with the wrong variant — envelope opens (same
+        // passphrase) but the kind-tag check in complete_open_v2
+        // rejects the mismatch.
+        let wrong_cred = DeniableCredential::TpmPassphrase {
+            passphrase: b"pp",
+            argon2: cheap_argon2(),
+            unsealed: &secret,
+        };
+        let env = Container::try_open_envelope_v2_deniable(
             &path,
             None,
-            &DeniableCredential::Tpm { unsealed: &secret },
-            Some(3),
+            &wrong_cred,
             CipherSuite::Aes256GcmSiv,
         )
-        .err()
         .unwrap();
+        let err = Container::complete_open_v2_deniable(env, &wrong_cred)
+            .err()
+            .unwrap();
+        assert!(matches!(err, Error::OpaqueUnlockFailed));
+    }
+
+    #[test]
+    fn deniable_container_rotate_mvk_v2_round_trip() {
+        // Create a v2 deniable vault with two slots, rotate keeping
+        // both, confirm both still open and yield the new MVK,
+        // confirm persist_header writes the rotated bytes back.
+        use crate::deniable_header::DeniableMaterial;
+        use luksbox_core::deniable::DeniableCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let admin = DeniableCredential::Passphrase {
+            passphrase: b"admin",
+            argon2: cheap_argon2(),
+        };
+        let bob = DeniableCredential::Passphrase {
+            passphrase: b"bob",
+            argon2: cheap_argon2(),
+        };
+        let mut c = Container::create_with_credential_v2_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            0,
+            &admin,
+            &DeniableMaterial::passphrase_only(),
+        )
+        .unwrap();
+        c.enroll_credential_v2_deniable(3, &bob, &DeniableMaterial::passphrase_only())
+            .unwrap();
+        c.persist_header().unwrap();
+        let mvk_before = c.mvk_clone();
+
+        // Rotate keeping both slots.
+        let new_mvk = c
+            .rotate_mvk_v2_deniable(&[
+                (0, &admin, &DeniableMaterial::passphrase_only()),
+                (3, &bob, &DeniableMaterial::passphrase_only()),
+            ])
+            .unwrap();
+        assert_ne!(new_mvk.as_bytes(), mvk_before.as_bytes());
+        c.persist_header().unwrap();
+        drop(c);
+
+        // Both credentials open the rotated vault and yield new_mvk.
+        let env_admin = Container::try_open_envelope_v2_deniable(
+            &path,
+            None,
+            &admin,
+            CipherSuite::Aes256GcmSiv,
+        )
+        .unwrap();
+        assert_eq!(env_admin.opened.matched_slot_idx, 0);
+        let c_admin = Container::complete_open_v2_deniable(env_admin, &admin).unwrap();
+        assert_eq!(c_admin.mvk_clone().as_bytes(), new_mvk.as_bytes());
+        drop(c_admin);
+
+        let env_bob =
+            Container::try_open_envelope_v2_deniable(&path, None, &bob, CipherSuite::Aes256GcmSiv)
+                .unwrap();
+        assert_eq!(env_bob.opened.matched_slot_idx, 3);
+        let c_bob = Container::complete_open_v2_deniable(env_bob, &bob).unwrap();
+        assert_eq!(c_bob.mvk_clone().as_bytes(), new_mvk.as_bytes());
+    }
+
+    #[test]
+    fn deniable_container_rotate_mvk_v2_drops_credential() {
+        // Rotate keeping only one of two slots — the dropped one
+        // must no longer open the vault.
+        use crate::deniable_header::DeniableMaterial;
+        use luksbox_core::deniable::DeniableCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let admin = DeniableCredential::Passphrase {
+            passphrase: b"admin",
+            argon2: cheap_argon2(),
+        };
+        let bob = DeniableCredential::Passphrase {
+            passphrase: b"bob",
+            argon2: cheap_argon2(),
+        };
+        let mut c = Container::create_with_credential_v2_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            0,
+            &admin,
+            &DeniableMaterial::passphrase_only(),
+        )
+        .unwrap();
+        c.enroll_credential_v2_deniable(2, &bob, &DeniableMaterial::passphrase_only())
+            .unwrap();
+        c.persist_header().unwrap();
+
+        c.rotate_mvk_v2_deniable(&[(0, &admin, &DeniableMaterial::passphrase_only())])
+            .unwrap();
+        c.persist_header().unwrap();
+        drop(c);
+
+        // Bob's slot is now random noise; opening with Bob's
+        // credential fails opaquely.
+        let err =
+            Container::try_open_envelope_v2_deniable(&path, None, &bob, CipherSuite::Aes256GcmSiv)
+                .err()
+                .unwrap();
         assert!(matches!(err, Error::OpaqueUnlockFailed));
     }
 

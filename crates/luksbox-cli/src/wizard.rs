@@ -292,54 +292,20 @@ fn available_den_kinds() -> Vec<DenCredKind> {
 
 /// Recovery info surfaced to the user after a deniable create /
 /// enroll that produced material the deniable header doesn't store
-/// on disk (FIDO2 cred_id + hmac_salt, TPM .tpm-blob path). Both
-/// fields are optional; the printer is a no-op if neither is set.
+/// v2 deniable mode embeds FIDO2 cred_id / hmac_salt / TPM sealed
+/// blobs inside the slot envelope, so there is no longer any
+/// "recovery info" the user must copy out at create time. The
+/// passphrase + Argon2id params they entered + presence of the
+/// FIDO2 device / TPM chip is everything they need to remember.
+/// `DeniableRecoveryInfo` is retained as an empty marker so the
+/// wizard's surrounding flow stays unchanged; `print_deniable_recovery`
+/// is a no-op.
 #[derive(Default)]
-struct DeniableRecoveryInfo {
-    fido2_cred_id: Option<Vec<u8>>,
-    fido2_hmac_salt: Option<[u8; 32]>,
-    tpm_blob_path: Option<PathBuf>,
-}
+struct DeniableRecoveryInfo;
 
-/// Print the post-create recovery info the user MUST save. The
-/// terminal output is the wizard's equivalent of the GUI's
-/// recovery modal. Blocks on Enter so the user has to actively
-/// acknowledge before continuing.
-fn print_deniable_recovery(info: &DeniableRecoveryInfo) {
-    if info.fido2_cred_id.is_none()
-        && info.fido2_hmac_salt.is_none()
-        && info.tpm_blob_path.is_none()
-    {
-        return;
-    }
-    println!();
-    println!("============================================================");
-    println!("SAVE THIS RECOVERY INFO NOW - without it the vault is LOST");
-    println!("============================================================");
-    if let (Some(cred_id), Some(hmac_salt)) =
-        (info.fido2_cred_id.as_ref(), info.fido2_hmac_salt.as_ref())
-    {
-        println!("FIDO2 credential ID (hex):");
-        println!("  {}", hex::encode(cred_id));
-        println!();
-        println!("FIDO2 hmac-secret salt (hex, 32 bytes):");
-        println!("  {}", hex::encode(hmac_salt));
-        println!();
-    }
-    if let Some(p) = &info.tpm_blob_path {
-        println!("TPM sealed-blob sidecar path:");
-        println!("  {}", p.display());
-        println!("(The file is already on disk at the path above; move it elsewhere if");
-        println!("you want extra at-rest deniability. Anyone who finds it next to the");
-        println!("vault learns the vault uses TPM.)");
-        println!();
-    }
-    println!("Press Enter when you have saved the values above.");
-    let _ = dialoguer::Input::<String>::new()
-        .allow_empty(true)
-        .interact_text();
-    println!("============================================================");
-    println!();
+fn print_deniable_recovery(_info: &DeniableRecoveryInfo) {
+    // No external material to print in v2; the slot envelope carries
+    // it. The cipher / Argon2id summary is printed by the caller.
 }
 
 /// Wizard flow for creating a deniable-header file (8 KiB where every
@@ -392,24 +358,23 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
 
     match kind {
         DenCredKind::Passphrase => {
-            let pass = ask_new_passphrase(theme, "Passphrase for the deniable vault")?;
-            let _container = luksbox_format::Container::create_with_passphrase_deniable(
-                &path,
-                None,
-                cipher_suite,
-                argon2_params,
-                0,
-                pass.as_bytes(),
-            )?;
+            create_den_passphrase_v2(theme, &path, cipher_suite, argon2_params)?;
         }
         DenCredKind::Fido2 => {
-            create_den_fido2(theme, &path, cipher_suite, &mut recovery)?;
+            create_den_fido2(theme, &path, cipher_suite, argon2_params, &mut recovery)?;
         }
         DenCredKind::HybridPqPassphrase => {
             create_den_pq_passphrase(theme, &path, cipher_suite, argon2_params, false)?;
         }
         DenCredKind::HybridPqFido2 => {
-            create_den_pq_fido2(theme, &path, cipher_suite, false, &mut recovery)?;
+            create_den_pq_fido2(
+                theme,
+                &path,
+                cipher_suite,
+                argon2_params,
+                false,
+                &mut recovery,
+            )?;
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         DenCredKind::Tpm2 => {
@@ -468,14 +433,41 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
 // can show what the user needs to save.
 // ============================================================
 
+fn create_den_passphrase_v2(
+    theme: &ColorfulTheme,
+    path: &Path,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+) -> Result<()> {
+    use luksbox_format::deniable_header::DeniableMaterial;
+    let pass = ask_new_passphrase(theme, "Passphrase for the deniable vault")?;
+    let cred = luksbox_core::deniable::DeniableCredential::Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path,
+        None,
+        cipher,
+        0,
+        0,
+        &cred,
+        &DeniableMaterial::passphrase_only(),
+    )?;
+    Ok(())
+}
+
 #[cfg(feature = "hardware")]
 fn create_den_fido2(
     theme: &ColorfulTheme,
     path: &Path,
     cipher: luksbox_core::CipherSuite,
-    recovery: &mut DeniableRecoveryInfo,
+    argon2: luksbox_core::Argon2idParams,
+    _recovery: &mut DeniableRecoveryInfo,
 ) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::deniable_header::DeniableMaterial;
+    let pass = ask_new_passphrase(theme, "Passphrase (outer envelope of the FIDO2 slot)")?;
     let pin = Password::with_theme(theme)
         .with_prompt("FIDO2 PIN")
         .interact()?;
@@ -493,12 +485,19 @@ fn create_den_fido2(
     }
     println!("{}", crate::auth_prompt("derive the unlock key"));
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
-    let cred = luksbox_core::deniable::DeniableCredential::Fido2 {
+    let cred = luksbox_core::deniable::DeniableCredential::Fido2Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
         hmac_secret_output: &hmac_secret,
     };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
-    recovery.fido2_cred_id = Some(cred_id);
-    recovery.fido2_hmac_salt = Some(hmac_salt);
+    let material = DeniableMaterial {
+        cred_id,
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: Vec::new(),
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
     Ok(())
 }
 #[cfg(not(feature = "hardware"))]
@@ -506,6 +505,7 @@ fn create_den_fido2(
     _theme: &ColorfulTheme,
     _path: &Path,
     _cipher: luksbox_core::CipherSuite,
+    _argon2: luksbox_core::Argon2idParams,
     _recovery: &mut DeniableRecoveryInfo,
 ) -> Result<()> {
     Err("FIDO2 hardware support not compiled in".into())
@@ -518,6 +518,7 @@ fn create_den_pq_passphrase(
     argon2: luksbox_core::Argon2idParams,
     use_1024: bool,
 ) -> Result<()> {
+    use luksbox_format::deniable_header::DeniableMaterial;
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
     let params = if use_1024 {
@@ -525,7 +526,8 @@ fn create_den_pq_passphrase(
     } else {
         PqParams::Ml768
     };
-    let pass = ask_new_passphrase(theme, "Passphrase (also encrypts the .kyber seed file)")?;
+    let envelope_pw = ask_new_passphrase(theme, "Envelope passphrase (deniable - required)")?;
+    let seed_pw = ask_optional_seed_pw(theme, &envelope_pw)?;
     let kyber_path = ask_path(
         theme,
         "Path for the .kyber seed file (keep on separate storage)",
@@ -533,11 +535,19 @@ fn create_den_pq_passphrase(
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
     let cred = luksbox_core::deniable::DeniableCredential::HybridPqPassphrase {
-        passphrase: pass.as_bytes(),
+        passphrase: envelope_pw.as_bytes(),
         argon2,
         mlkem_shared: &shared,
     };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path,
+        None,
+        cipher,
+        0,
+        0,
+        &cred,
+        &DeniableMaterial::passphrase_only(),
+    )?;
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -550,7 +560,7 @@ fn create_den_pq_passphrase(
     seed_file::write(
         &kyber_path,
         &seed,
-        pass.as_bytes(),
+        seed_pw.as_bytes(),
         seed_file::KdfParams::default(),
     )?;
     Ok(())
@@ -561,10 +571,12 @@ fn create_den_pq_fido2(
     theme: &ColorfulTheme,
     path: &Path,
     cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
     use_1024: bool,
-    recovery: &mut DeniableRecoveryInfo,
+    _recovery: &mut DeniableRecoveryInfo,
 ) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::deniable_header::DeniableMaterial;
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
     let params = if use_1024 {
@@ -572,10 +584,11 @@ fn create_den_pq_fido2(
     } else {
         PqParams::Ml768
     };
+    let envelope_pw = ask_new_passphrase(theme, "Envelope passphrase (deniable - required)")?;
     let pin = Password::with_theme(theme)
         .with_prompt("FIDO2 PIN")
         .interact()?;
-    let seed_pw = ask_new_passphrase(theme, "Seed-file passphrase (encrypts the .kyber file)")?;
+    let seed_pw = ask_optional_seed_pw(theme, &envelope_pw)?;
     let kyber_path = ask_path(theme, "Path for the .kyber seed file")?;
 
     let mut auth = crate::make_fido2_authenticator();
@@ -593,11 +606,20 @@ fn create_den_pq_fido2(
 
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
-    let cred = luksbox_core::deniable::DeniableCredential::HybridPqFido2 {
+    let cred = luksbox_core::deniable::DeniableCredential::HybridPqFido2Passphrase {
+        passphrase: envelope_pw.as_bytes(),
+        argon2,
         mlkem_shared: &shared,
         hmac_secret_output: &hmac_secret,
     };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
+    let material = DeniableMaterial {
+        cred_id,
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: Vec::new(),
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -613,8 +635,6 @@ fn create_den_pq_fido2(
         seed_pw.as_bytes(),
         seed_file::KdfParams::default(),
     )?;
-    recovery.fido2_cred_id = Some(cred_id);
-    recovery.fido2_hmac_salt = Some(hmac_salt);
     Ok(())
 }
 #[cfg(not(feature = "hardware"))]
@@ -622,6 +642,7 @@ fn create_den_pq_fido2(
     _theme: &ColorfulTheme,
     _path: &Path,
     _cipher: luksbox_core::CipherSuite,
+    _argon2: luksbox_core::Argon2idParams,
     _use_1024: bool,
     _recovery: &mut DeniableRecoveryInfo,
 ) -> Result<()> {
@@ -630,19 +651,28 @@ fn create_den_pq_fido2(
 
 #[cfg(all(feature = "hardware", target_os = "linux"))]
 fn create_den_tpm(
-    _theme: &ColorfulTheme,
+    theme: &ColorfulTheme,
     path: &Path,
     cipher: luksbox_core::CipherSuite,
-    _argon2: luksbox_core::Argon2idParams,
-    recovery: &mut DeniableRecoveryInfo,
+    argon2: luksbox_core::Argon2idParams,
+    _recovery: &mut DeniableRecoveryInfo,
 ) -> Result<()> {
-    // Single-factor TPM deniable: no passphrase, no recovery if the
-    // chip dies. User's B-mode choice (avoids the invisible-second-
-    // slot foot-gun documented in docs/DENIABLE_HEADER.md).
-    let (secret, sidecar) = tpm_seal_blob_sidecar(path, None)?;
-    let cred = luksbox_core::deniable::DeniableCredential::Tpm { unsealed: &*secret };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
-    recovery.tpm_blob_path = Some(sidecar);
+    use luksbox_format::deniable_header::DeniableMaterial;
+    let pass = ask_new_passphrase(theme, "Passphrase (outer envelope of the TPM slot)")?;
+    let (secret, blob) = tpm_seal_blob_to_bytes(None)?;
+    let cred = luksbox_core::deniable::DeniableCredential::TpmPassphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+        unsealed: &*secret,
+    };
+    let material = DeniableMaterial {
+        cred_id: Vec::new(),
+        hmac_salt: None,
+        tpm_blob: blob,
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
     Ok(())
 }
 
@@ -651,11 +681,13 @@ fn create_den_tpm_fido2(
     theme: &ColorfulTheme,
     path: &Path,
     cipher: luksbox_core::CipherSuite,
-    _argon2: luksbox_core::Argon2idParams,
-    recovery: &mut DeniableRecoveryInfo,
+    argon2: luksbox_core::Argon2idParams,
+    _recovery: &mut DeniableRecoveryInfo,
 ) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
-    let (secret, sidecar) = tpm_seal_blob_sidecar(path, None)?;
+    use luksbox_format::deniable_header::DeniableMaterial;
+    let pass = ask_new_passphrase(theme, "Passphrase (outer envelope)")?;
+    let (secret, blob) = tpm_seal_blob_to_bytes(None)?;
     let pin = Password::with_theme(theme)
         .with_prompt("FIDO2 PIN")
         .interact()?;
@@ -671,14 +703,20 @@ fn create_den_tpm_fido2(
             .map_err(|e| format!("OS RNG failure: {e}"))?;
     }
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
-    let cred = luksbox_core::deniable::DeniableCredential::TpmFido2 {
+    let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
         unsealed: &*secret,
         hmac_secret_output: &hmac_secret,
     };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
-    recovery.tpm_blob_path = Some(sidecar);
-    recovery.fido2_cred_id = Some(cred_id);
-    recovery.fido2_hmac_salt = Some(hmac_salt);
+    let material = DeniableMaterial {
+        cred_id,
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: blob,
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
     Ok(())
 }
 
@@ -687,10 +725,11 @@ fn create_den_pq_tpm(
     theme: &ColorfulTheme,
     path: &Path,
     cipher: luksbox_core::CipherSuite,
-    _argon2: luksbox_core::Argon2idParams,
+    argon2: luksbox_core::Argon2idParams,
     use_1024: bool,
-    recovery: &mut DeniableRecoveryInfo,
+    _recovery: &mut DeniableRecoveryInfo,
 ) -> Result<()> {
+    use luksbox_format::deniable_header::DeniableMaterial;
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
     let params = if use_1024 {
@@ -698,16 +737,26 @@ fn create_den_pq_tpm(
     } else {
         PqParams::Ml768
     };
-    let (tpm_secret, sidecar) = tpm_seal_blob_sidecar(path, None)?;
-    let seed_pw = ask_new_passphrase(theme, "Seed-file passphrase (encrypts the .kyber file)")?;
+    let envelope_pw = ask_new_passphrase(theme, "Envelope passphrase (deniable - required)")?;
+    let (tpm_secret, blob) = tpm_seal_blob_to_bytes(None)?;
+    let seed_pw = ask_optional_seed_pw(theme, &envelope_pw)?;
     let kyber_path = ask_path(theme, "Path for the .kyber seed file")?;
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
-    let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpm {
+    let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpmPassphrase {
+        passphrase: envelope_pw.as_bytes(),
+        argon2,
         mlkem_shared: &shared,
         unsealed: &*tpm_secret,
     };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
+    let material = DeniableMaterial {
+        cred_id: Vec::new(),
+        hmac_salt: None,
+        tpm_blob: blob,
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -723,7 +772,6 @@ fn create_den_pq_tpm(
         seed_pw.as_bytes(),
         seed_file::KdfParams::default(),
     )?;
-    recovery.tpm_blob_path = Some(sidecar);
     Ok(())
 }
 
@@ -732,11 +780,12 @@ fn create_den_pq_tpm_fido2(
     theme: &ColorfulTheme,
     path: &Path,
     cipher: luksbox_core::CipherSuite,
-    _argon2: luksbox_core::Argon2idParams,
+    argon2: luksbox_core::Argon2idParams,
     use_1024: bool,
-    recovery: &mut DeniableRecoveryInfo,
+    _recovery: &mut DeniableRecoveryInfo,
 ) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::deniable_header::DeniableMaterial;
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
     let params = if use_1024 {
@@ -744,11 +793,12 @@ fn create_den_pq_tpm_fido2(
     } else {
         PqParams::Ml768
     };
-    let (tpm_secret, sidecar) = tpm_seal_blob_sidecar(path, None)?;
+    let envelope_pw = ask_new_passphrase(theme, "Envelope passphrase (deniable - required)")?;
+    let (tpm_secret, blob) = tpm_seal_blob_to_bytes(None)?;
     let pin = Password::with_theme(theme)
         .with_prompt("FIDO2 PIN")
         .interact()?;
-    let seed_pw = ask_new_passphrase(theme, "Seed-file passphrase")?;
+    let seed_pw = ask_optional_seed_pw(theme, &envelope_pw)?;
     let kyber_path = ask_path(theme, "Path for the .kyber seed file")?;
 
     let mut auth = crate::make_fido2_authenticator();
@@ -766,12 +816,21 @@ fn create_den_pq_tpm_fido2(
 
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
-    let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpmFido2 {
+    let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpmFido2Passphrase {
+        passphrase: envelope_pw.as_bytes(),
+        argon2,
         mlkem_shared: &shared,
         unsealed: &*tpm_secret,
         hmac_secret_output: &hmac_secret,
     };
-    luksbox_format::Container::create_with_credential_deniable(path, None, cipher, 0, 0, &cred)?;
+    let material = DeniableMaterial {
+        cred_id,
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: blob,
+    };
+    luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -787,21 +846,14 @@ fn create_den_pq_tpm_fido2(
         seed_pw.as_bytes(),
         seed_file::KdfParams::default(),
     )?;
-    recovery.tpm_blob_path = Some(sidecar);
-    recovery.fido2_cred_id = Some(cred_id);
-    recovery.fido2_hmac_salt = Some(hmac_salt);
     Ok(())
 }
 
-/// TPM-seal a random 32-byte secret and write the sealed blob to
-/// `<vault>.tpm-blob`. Returns the secret (for KEK derivation) +
-/// the sidecar path (for the recovery card). Mirrors the GUI's
-/// `tpm_seal_for_deniable` helper.
+/// TPM-seal a random 32-byte secret and return the blob bytes for
+/// embedding inside the v2 slot envelope. v2 replacement for the
+/// v1 `tpm_seal_blob_sidecar` (which wrote a `.tpm-blob` file).
 #[cfg(all(feature = "hardware", target_os = "linux"))]
-fn tpm_seal_blob_sidecar(
-    vault: &Path,
-    pin: Option<&[u8]>,
-) -> Result<(zeroize::Zeroizing<[u8; 32]>, PathBuf)> {
+fn tpm_seal_blob_to_bytes(pin: Option<&[u8]>) -> Result<(zeroize::Zeroizing<[u8; 32]>, Vec<u8>)> {
     use luksbox_tpm::Tpm2Sealer;
     let mut sealer = Tpm2Sealer::new()?;
     let mut secret = zeroize::Zeroizing::new([0u8; 32]);
@@ -815,14 +867,7 @@ fn tpm_seal_blob_sidecar(
         Some(p) => sealer.seal_with_pin(&secret, Some(p))?,
         None => sealer.seal(&secret)?,
     };
-    let mut sidecar = vault.to_path_buf();
-    let new_name = match sidecar.file_name() {
-        Some(n) => format!("{}.tpm-blob", n.to_string_lossy()),
-        None => "vault.tpm-blob".to_string(),
-    };
-    sidecar.set_file_name(new_name);
-    std::fs::write(&sidecar, blob.to_bytes())?;
-    Ok((secret, sidecar))
+    Ok((secret, blob.to_bytes()))
 }
 
 /// Wizard flow for opening (and printing the inner-header fields of) a
@@ -889,10 +934,12 @@ fn mount_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
     Ok(())
 }
 
-/// Shared deniable-open driver used by mount_deniable_wizard +
-/// info_deniable_wizard + open_loop's deniable-aware paths. Asks
-/// for the type-specific material (cred_id/.kyber path/etc.) and
-/// returns the opened Container.
+/// Shared deniable-open driver (v2): two-phase open. Phase 1
+/// derives the envelope KEK from passphrase + Argon2id params and
+/// trial-decrypts the 8 slot envelopes; phase 2 reads the
+/// recovered (cred_id, hmac_salt, tpm_blob) out of the envelope
+/// payload and drives the secondary factors (FIDO2 assertion, TPM
+/// unseal, ML-KEM decap) before completing the open.
 fn open_deniable_by_kind(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -900,59 +947,98 @@ fn open_deniable_by_kind(
     argon2: luksbox_core::Argon2idParams,
     kind: DenCredKind,
 ) -> Result<luksbox_format::Container> {
+    use luksbox_core::deniable::{DeniableCredential, DeniableKindTag};
     println!("Running operations (Argon2 / device touch may take a few seconds)...");
+
+    let pass = Password::with_theme(theme)
+        .with_prompt("Passphrase")
+        .interact()?;
+
+    // Phase 1.
+    let env_cred = DeniableCredential::Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+    };
+    let envelope =
+        luksbox_format::Container::try_open_envelope_v2_deniable(vault, None, &env_cred, cipher)?;
+
+    // Cross-check kind vs payload.
+    let expected = match kind {
+        DenCredKind::Passphrase => DeniableKindTag::Passphrase,
+        DenCredKind::Fido2 => DeniableKindTag::Fido2Passphrase,
+        DenCredKind::HybridPqPassphrase => DeniableKindTag::HybridPqPassphrase,
+        DenCredKind::HybridPqFido2 => DeniableKindTag::HybridPqFido2Passphrase,
+        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        DenCredKind::Tpm2 => DeniableKindTag::TpmPassphrase,
+        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        DenCredKind::Tpm2Fido2 => DeniableKindTag::TpmFido2Passphrase,
+        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        DenCredKind::HybridPqTpm2 => DeniableKindTag::HybridPqTpmPassphrase,
+        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        DenCredKind::HybridPqTpmFido2 => DeniableKindTag::HybridPqTpmFido2Passphrase,
+    };
+    if envelope.payload().kind != expected {
+        return Err("credential kind mismatch (vault expects a different variant)".into());
+    }
+
+    let cred_id = envelope.payload().cred_id.clone();
+    let salt_opt = envelope.payload().hmac_salt;
+    let tpm_blob = envelope.payload().tpm_blob.clone();
+
     match kind {
         DenCredKind::Passphrase => {
-            let pass = Password::with_theme(theme)
-                .with_prompt("Passphrase")
-                .interact()?;
-            Ok(luksbox_format::Container::open_with_passphrase_deniable(
-                vault,
-                None,
-                pass.as_bytes(),
+            let cred = DeniableCredential::Passphrase {
+                passphrase: pass.as_bytes(),
                 argon2,
-                cipher,
+            };
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
             )?)
         }
         DenCredKind::Fido2 => {
             #[cfg(feature = "hardware")]
             {
-                let hmac_secret = ask_fido2_hmac_for_deniable(theme)?;
-                let cred = luksbox_core::deniable::DeniableCredential::Fido2 {
+                let salt = salt_opt
+                    .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
+                let hmac_secret = wizard_fido2_hmac_from_payload(theme, &cred_id, &salt)?;
+                let cred = DeniableCredential::Fido2Passphrase {
+                    passphrase: pass.as_bytes(),
+                    argon2,
                     hmac_secret_output: &hmac_secret,
                 };
-                Ok(luksbox_format::Container::open_with_credential_deniable(
-                    vault, None, &cred, None, cipher,
+                Ok(luksbox_format::Container::complete_open_v2_deniable(
+                    envelope, &cred,
                 )?)
             }
             #[cfg(not(feature = "hardware"))]
             Err("FIDO2 hardware support not compiled in".into())
         }
         DenCredKind::HybridPqPassphrase => {
-            let shared = ask_pq_decap_for_deniable(theme, vault)?;
-            let pass = Password::with_theme(theme)
-                .with_prompt("Passphrase")
-                .interact()?;
-            let cred = luksbox_core::deniable::DeniableCredential::HybridPqPassphrase {
+            let shared = ask_pq_decap_for_deniable(theme, vault, &pass)?;
+            let cred = DeniableCredential::HybridPqPassphrase {
                 passphrase: pass.as_bytes(),
                 argon2,
                 mlkem_shared: &shared,
             };
-            Ok(luksbox_format::Container::open_with_credential_deniable(
-                vault, None, &cred, None, cipher,
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
             )?)
         }
         DenCredKind::HybridPqFido2 => {
             #[cfg(feature = "hardware")]
             {
-                let shared = ask_pq_decap_for_deniable(theme, vault)?;
-                let hmac_secret = ask_fido2_hmac_for_deniable(theme)?;
-                let cred = luksbox_core::deniable::DeniableCredential::HybridPqFido2 {
+                let shared = ask_pq_decap_for_deniable(theme, vault, &pass)?;
+                let salt = salt_opt
+                    .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
+                let hmac_secret = wizard_fido2_hmac_from_payload(theme, &cred_id, &salt)?;
+                let cred = DeniableCredential::HybridPqFido2Passphrase {
+                    passphrase: pass.as_bytes(),
+                    argon2,
                     mlkem_shared: &shared,
                     hmac_secret_output: &hmac_secret,
                 };
-                Ok(luksbox_format::Container::open_with_credential_deniable(
-                    vault, None, &cred, None, cipher,
+                Ok(luksbox_format::Container::complete_open_v2_deniable(
+                    envelope, &cred,
                 )?)
             }
             #[cfg(not(feature = "hardware"))]
@@ -960,102 +1046,138 @@ fn open_deniable_by_kind(
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         DenCredKind::Tpm2 => {
-            let unsealed = ask_tpm_unseal_for_deniable(theme, None)?;
-            let cred = luksbox_core::deniable::DeniableCredential::Tpm {
+            let unsealed = wizard_tpm_unseal_from_bytes(&tpm_blob, None)?;
+            let cred = DeniableCredential::TpmPassphrase {
+                passphrase: pass.as_bytes(),
+                argon2,
                 unsealed: &unsealed,
             };
-            Ok(luksbox_format::Container::open_with_credential_deniable(
-                vault, None, &cred, None, cipher,
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
             )?)
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         DenCredKind::Tpm2Fido2 => {
-            let unsealed = ask_tpm_unseal_for_deniable(theme, None)?;
-            let hmac_secret = ask_fido2_hmac_for_deniable(theme)?;
-            let cred = luksbox_core::deniable::DeniableCredential::TpmFido2 {
+            let unsealed = wizard_tpm_unseal_from_bytes(&tpm_blob, None)?;
+            let salt = salt_opt
+                .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
+            let hmac_secret = wizard_fido2_hmac_from_payload(theme, &cred_id, &salt)?;
+            let cred = DeniableCredential::TpmFido2Passphrase {
+                passphrase: pass.as_bytes(),
+                argon2,
                 unsealed: &unsealed,
                 hmac_secret_output: &hmac_secret,
             };
-            Ok(luksbox_format::Container::open_with_credential_deniable(
-                vault, None, &cred, None, cipher,
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
             )?)
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         DenCredKind::HybridPqTpm2 => {
-            let shared = ask_pq_decap_for_deniable(theme, vault)?;
-            let unsealed = ask_tpm_unseal_for_deniable(theme, None)?;
-            let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpm {
+            let shared = ask_pq_decap_for_deniable(theme, vault, &pass)?;
+            let unsealed = wizard_tpm_unseal_from_bytes(&tpm_blob, None)?;
+            let cred = DeniableCredential::HybridPqTpmPassphrase {
+                passphrase: pass.as_bytes(),
+                argon2,
                 mlkem_shared: &shared,
                 unsealed: &unsealed,
             };
-            Ok(luksbox_format::Container::open_with_credential_deniable(
-                vault, None, &cred, None, cipher,
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
             )?)
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         DenCredKind::HybridPqTpmFido2 => {
-            let shared = ask_pq_decap_for_deniable(theme, vault)?;
-            let unsealed = ask_tpm_unseal_for_deniable(theme, None)?;
-            let hmac_secret = ask_fido2_hmac_for_deniable(theme)?;
-            let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpmFido2 {
+            let shared = ask_pq_decap_for_deniable(theme, vault, &pass)?;
+            let unsealed = wizard_tpm_unseal_from_bytes(&tpm_blob, None)?;
+            let salt = salt_opt
+                .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
+            let hmac_secret = wizard_fido2_hmac_from_payload(theme, &cred_id, &salt)?;
+            let cred = DeniableCredential::HybridPqTpmFido2Passphrase {
+                passphrase: pass.as_bytes(),
+                argon2,
                 mlkem_shared: &shared,
                 unsealed: &unsealed,
                 hmac_secret_output: &hmac_secret,
             };
-            Ok(luksbox_format::Container::open_with_credential_deniable(
-                vault, None, &cred, None, cipher,
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
             )?)
         }
     }
 }
 
-/// Prompt for FIDO2 cred_id (hex) + hmac_salt (hex) and call the
-/// device to derive the hmac_secret output. Used by all deniable
-/// FIDO2 unlock variants.
+/// v2 wizard helper: drive the FIDO2 device with cred_id + hmac_salt
+/// recovered from the slot envelope (no longer prompts the user for
+/// hex strings).
 #[cfg(feature = "hardware")]
-fn ask_fido2_hmac_for_deniable(theme: &ColorfulTheme) -> Result<luksbox_fido2::HmacSecret> {
+fn wizard_fido2_hmac_from_payload(
+    theme: &ColorfulTheme,
+    cred_id: &[u8],
+    salt: &[u8; 32],
+) -> Result<luksbox_fido2::HmacSecret> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID};
-    let cred_id_hex: String = Input::with_theme(theme)
-        .with_prompt("FIDO2 credential ID (hex, from recovery card)")
-        .interact_text()?;
-    let cred_id = hex::decode(cred_id_hex.trim())
-        .map_err(|_| "FIDO2 credential ID must be hex".to_string())?;
     if cred_id.is_empty() {
-        return Err("FIDO2 credential ID is required".into());
+        return Err("envelope cred_id is empty for FIDO2 variant".into());
     }
-    let hmac_salt_hex: String = Input::with_theme(theme)
-        .with_prompt("FIDO2 hmac salt (hex, 64 chars = 32 bytes)")
-        .interact_text()?;
-    let hmac_salt_bytes =
-        hex::decode(hmac_salt_hex.trim()).map_err(|_| "hmac_salt must be hex".to_string())?;
-    if hmac_salt_bytes.len() != 32 {
-        return Err(format!(
-            "hmac_salt must be 32 bytes ({} given)",
-            hmac_salt_bytes.len()
-        )
-        .into());
-    }
-    let mut hmac_salt = [0u8; 32];
-    hmac_salt.copy_from_slice(&hmac_salt_bytes);
     let pin = Password::with_theme(theme)
         .with_prompt("FIDO2 PIN")
         .interact()?;
     let mut auth = crate::make_fido2_authenticator();
-    Ok(auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?)
+    Ok(auth.hmac_secret(RP_ID, cred_id, salt, Some(&pin))?)
 }
+
+/// v2 wizard helper: unseal the TPM blob recovered from the slot
+/// envelope (no longer asks the user for a sidecar path).
+#[cfg(all(feature = "hardware", target_os = "linux"))]
+fn wizard_tpm_unseal_from_bytes(blob_bytes: &[u8], pin: Option<&[u8]>) -> Result<[u8; 32]> {
+    use luksbox_tpm::{SealedBlob, Tpm2Sealer};
+    if blob_bytes.is_empty() {
+        return Err("envelope tpm_blob is empty for TPM variant".into());
+    }
+    let blob = SealedBlob::from_bytes(blob_bytes)?;
+    let mut sealer = Tpm2Sealer::new()?;
+    let unsealed = match pin {
+        Some(p) => sealer.unseal_with_pin(&blob, Some(p))?,
+        None => sealer.unseal(&blob)?,
+    };
+    Ok(*unsealed)
+}
+
+// v1 helper `ask_fido2_hmac_for_deniable` removed in v2; FIDO2
+// `cred_id` and `hmac_salt` are recovered from the slot envelope at
+// open time, so callers use `wizard_fido2_hmac_from_payload` above.
 
 /// Prompt for the .kyber seed file path + seed passphrase and run
 /// ML-KEM decapsulation against the .hybrid sidecar next to the
 /// vault. Returns the 32-byte shared secret for the deniable
 /// hybrid-PQ credential.
-fn ask_pq_decap_for_deniable(theme: &ColorfulTheme, vault: &Path) -> Result<[u8; 32]> {
+///
+/// `envelope_pw_for_fallback` is the envelope passphrase the caller
+/// already collected; if the user leaves the seed-file passphrase
+/// blank we reuse it (matches the v2 deniable create-time default
+/// where one passphrase opens both roles).
+fn ask_pq_decap_for_deniable(
+    theme: &ColorfulTheme,
+    vault: &Path,
+    envelope_pw_for_fallback: &str,
+) -> Result<[u8; 32]> {
     use luksbox_format::hybrid_sidecar;
     use luksbox_pq::seed_file;
     let kyber_path = ask_path(theme, "Path to the .kyber seed file")?;
+    println!("  Hint: leave the next field BLANK if you used the same passphrase for the envelope");
+    println!("  AND the .kyber seed at create time (the common default). Fill it only if you set");
+    println!("  a DISTINCT seed-file passphrase at create time.");
     let seed_pw = Password::with_theme(theme)
-        .with_prompt("Seed-file passphrase (encrypts the .kyber)")
+        .with_prompt("Seed-file passphrase (leave blank to reuse envelope passphrase)")
+        .allow_empty_password(true)
         .interact()?;
-    let seed = seed_file::read(&kyber_path, seed_pw.as_bytes())?;
+    let pw_bytes: &[u8] = if seed_pw.is_empty() {
+        envelope_pw_for_fallback.as_bytes()
+    } else {
+        seed_pw.as_bytes()
+    };
+    let seed = seed_file::read(&kyber_path, pw_bytes)?;
     let sidecar = hybrid_sidecar::sidecar_path(vault);
     let entries = hybrid_sidecar::read(&sidecar)?;
     let entry = entries
@@ -1065,24 +1187,60 @@ fn ask_pq_decap_for_deniable(theme: &ColorfulTheme, vault: &Path) -> Result<[u8;
     Ok(*shared)
 }
 
-/// Prompt for the `.tpm-blob` sidecar path and unseal it via the
-/// local TPM. Returns the 32-byte unsealed secret for the deniable
-/// TPM credential. The pin parameter is the TPM PIN (chip-side
-/// userAuth) when the blob was sealed with one; None for
-/// pin-less blobs.
-#[cfg(all(feature = "hardware", target_os = "linux"))]
-fn ask_tpm_unseal_for_deniable(theme: &ColorfulTheme, pin: Option<&[u8]>) -> Result<[u8; 32]> {
-    use luksbox_tpm::{SealedBlob, Tpm2Sealer};
-    let blob_path = ask_path(theme, "Path to the .tpm-blob sidecar")?;
-    let blob_bytes = std::fs::read(&blob_path)?;
-    let blob = SealedBlob::from_bytes(&blob_bytes)?;
-    let mut sealer = Tpm2Sealer::new()?;
-    let unsealed = match pin {
-        Some(p) => sealer.unseal_with_pin(&blob, Some(p))?,
-        None => sealer.unseal(&blob)?,
-    };
-    Ok(*unsealed)
+/// Prompt for an optional .kyber seed-file passphrase at CREATE
+/// time. Blank ⇒ reuse the envelope passphrase (one passphrase
+/// opens both roles). Mirrors the GUI's seed-file passphrase
+/// field. Offers the strong-passphrase generator if the user wants
+/// a distinct one.
+fn ask_optional_seed_pw(
+    theme: &ColorfulTheme,
+    envelope_pw_for_fallback: &zeroize::Zeroizing<String>,
+) -> Result<zeroize::Zeroizing<String>> {
+    println!();
+    println!("  Optional separate .kyber seed-file passphrase.");
+    println!("  - Leave BLANK to use the envelope passphrase for both roles");
+    println!("    (one passphrase opens the vault AND decrypts the .kyber).");
+    println!("  - Fill it to set a DISTINCT seed-file passphrase. You'll then need");
+    println!("    to type both at every unlock.");
+    if Confirm::with_theme(theme)
+        .with_prompt("Use a separate seed-file passphrase?")
+        .default(false)
+        .interact()?
+    {
+        if Confirm::with_theme(theme)
+            .with_prompt("Generate a strong random seed-file passphrase?")
+            .default(false)
+            .interact()?
+        {
+            let pw = crate::passphrase::generate()?;
+            println!("  generated seed-file passphrase: {}", &*pw);
+            println!("  WRITE THIS DOWN. It is shown only once.");
+            if !Confirm::with_theme(theme)
+                .with_prompt("I have stored the seed-file passphrase safely. Continue?")
+                .default(false)
+                .interact()?
+            {
+                return Err("aborted (seed-file passphrase not saved)".into());
+            }
+            Ok(pw)
+        } else {
+            let s = Password::with_theme(theme)
+                .with_prompt("Seed-file passphrase (distinct from envelope)")
+                .with_confirmation("Confirm", "passphrases don't match")
+                .interact()?;
+            Ok(zeroize::Zeroizing::new(s))
+        }
+    } else {
+        // Reuse the envelope passphrase. Clone so the caller can
+        // independently zeroize on drop without affecting the
+        // envelope value.
+        Ok(envelope_pw_for_fallback.clone())
+    }
 }
+
+// v1 helper `ask_tpm_unseal_for_deniable` removed in v2; the TPM
+// sealed blob is recovered from the slot envelope at open time, so
+// callers use `wizard_tpm_unseal_from_bytes` above.
 
 /// Destroy a vault without first unlocking it. Useful for emergency wipes
 /// where you don't want to (or can't) authenticate first. Asks for the
@@ -1111,7 +1269,7 @@ fn panic_by_path(theme: &ColorfulTheme) -> Result<()> {
         .default(false)
         .interact()?;
     eprintln!(
-        "⚠ PANIC: about to overwrite the {} of {} with random bytes.",
+        "PANIC: about to overwrite the {} of {} with random bytes.",
         if header_target == vault {
             "first 8 KB"
         } else {
@@ -3316,7 +3474,7 @@ fn panic_action(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Result<
     drop(cont);
 
     eprintln!(
-        "⚠ PANIC: about to overwrite the {} of {} with random bytes.",
+        "PANIC: about to overwrite the {} of {} with random bytes.",
         if inline {
             "first 8 KB"
         } else {

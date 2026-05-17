@@ -1954,6 +1954,18 @@ regardless of UI state. The deniable second-slot foot-gun (invisible
 and unrevokable) is worse than the lost-vault-if-factor-lost
 trade-off; see `docs/DENIABLE_HEADER.md`.
 
+**Deniable v2 also makes a passphrase mandatory for every credential
+combo** (envelope discovery factor). The pure-`Fido2`, pure-`Tpm`,
+and non-passphrase multi-factor combos that existed in v1 are
+removed from the deniable path: all v2 deniable slots are encoded as
+`*Passphrase` variants (`Passphrase`, `Fido2Passphrase`,
+`TpmPassphrase`, `TpmFido2Passphrase`, `HybridPq*Passphrase`). The
+v1 enum variants are retained for the standard (non-deniable) Container
+API and for backwards compatibility wrappers; they are no longer
+reachable through deniable create / open. See
+`docs/DENIABLE_HEADER.md` for the slot envelope layout and the
+chicken-and-egg constraint that forces the passphrase requirement.
+
 ---
 
 ## 20. Quick reference: what an attacker would need

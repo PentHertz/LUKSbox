@@ -3,12 +3,12 @@
 
 #![no_main]
 
-//! Adversarial deniable-header parse target. Feed the open path
-//! arbitrary bytes (passphrase, header buffer, cipher choice) and
-//! ensure it NEVER panics, indexes out of bounds, allocates wildly,
-//! or distinguishes failure modes.
+//! Adversarial deniable-header parse target (v2). Feed the v2
+//! envelope-open path arbitrary bytes (passphrase, header buffer,
+//! cipher choice) and ensure it NEVER panics, indexes out of bounds,
+//! allocates wildly, or distinguishes failure modes.
 //!
-//! Threat model: attacker writes any 8 KiB-or-larger blob to the
+//! Threat model: attacker writes any 36 KiB-or-larger blob to the
 //! header position of a `.lbx` file, attacker also controls the
 //! passphrase the GUI sends (e.g., a confused-deputy scenario). The
 //! crate's parser is the last line of defence; it MUST be robust.
@@ -16,17 +16,23 @@
 //! Invariants checked:
 //! 1. Never panic.
 //! 2. Never allocate more than a few KiB on hostile input (we cap
-//!    Argon2 cost via `is_sane_for_disk`; the parser additionally
-//!    rejects out-of-envelope inner-header fields BEFORE allocating
-//!    against them).
+//!    Argon2 cost via `is_sane_for_disk`; the slot-payload decoder
+//!    additionally caps cred_id / hmac_salt / tpm_blob lengths and
+//!    rejects out-of-budget combinations BEFORE allocating against
+//!    them; the inner-header parser rejects out-of-envelope offsets
+//!    on a tag-forged decryption).
 //! 3. ALWAYS return `Error::OpaqueUnlockFailed` on any failure
 //!    (single error variant; no oracle leakage about which step
 //!    rejected the input).
+//!
+//! Both phases are exercised: phase 1 (envelope discovery via
+//! passphrase) and, when the fuzzer lucky-generates a passing
+//! envelope, phase 2 (inner MVK unwrap + inner-header decrypt).
 
 use libfuzzer_sys::fuzz_target;
+use luksbox_core::deniable::{DENIABLE_HEADER_SIZE, DeniableCredential};
 use luksbox_core::{Argon2idParams, CipherSuite};
-use luksbox_core::deniable::DENIABLE_HEADER_SIZE;
-use luksbox_format::deniable_header::open_with_passphrase;
+use luksbox_format::deniable_header::{complete_open_v2, try_open_envelope_v2};
 use luksbox_format::error::Error;
 
 fuzz_target!(|data: &[u8]| {
@@ -38,15 +44,14 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    // First 8 KiB go to the header buffer; remaining bytes
-    // pseudo-randomly source the passphrase + cipher choice + Argon2
-    // params. This lets one fuzzer run sweep across the {header,
-    // passphrase, params, cipher} cartesian product without
-    // duplicating loops.
+    // First 36 KiB go to the header buffer; remaining bytes
+    // pseudo-randomly source the passphrase + cipher choice. This
+    // lets one fuzzer run sweep across the {header, passphrase,
+    // cipher} cartesian product without duplicating loops.
     let header = &data[..DENIABLE_HEADER_SIZE];
     let rest = &data[DENIABLE_HEADER_SIZE..];
 
-    // Passphrase from up to 256 bytes of remaining input. Including
+    // Passphrase from up to 256 bytes of remaining input. Includes
     // empty + zero-length + binary garbage.
     let pass_len = (rest[0] as usize).min(rest.len() - 1).min(256);
     let passphrase = &rest[1..1 + pass_len];
@@ -69,25 +74,45 @@ fuzz_target!(|data: &[u8]| {
         p_cost: 1,
     };
 
-    // Single allowed outcome: `OpaqueUnlockFailed`, OR a successful
-    // open (which can happen if the fuzzer happens to generate a
-    // valid header + passphrase combination - effectively impossible
-    // by chance but technically allowed and not a bug).
-    match open_with_passphrase(header, passphrase, params, cipher) {
-        Ok(_) => {
-            // Fuzzer hit a valid open by chance, that's fine. Don't
-            // panic; just return.
-        }
+    let cred = DeniableCredential::Passphrase {
+        passphrase,
+        argon2: params,
+    };
+
+    // Phase 1: envelope discovery. Must collapse every failure into
+    // OpaqueUnlockFailed.
+    let envelope = match try_open_envelope_v2(header, &cred, cipher) {
+        Ok(env) => env,
         Err(Error::OpaqueUnlockFailed) => {
-            // Expected outcome for the overwhelming majority of inputs.
+            // Expected outcome for the overwhelming majority of
+            // inputs. Done for this iteration.
+            return;
         }
         Err(other) => {
-            // Any other error variant is a leak: the open path is
-            // supposed to collapse all failure modes into
-            // OpaqueUnlockFailed. If something else surfaces it's a
-            // real bug worth investigating.
             panic!(
-                "deniable open returned a non-opaque error, leaking the failure mode: {:?}",
+                "v2 envelope-open returned a non-opaque error, leaking the failure mode: {:?}",
+                other
+            );
+        }
+    };
+
+    // Phase 1 succeeded by chance (effectively impossible without a
+    // valid header + passphrase combination, but technically allowed
+    // and not a bug). Run phase 2 too to exercise the inner-header
+    // decryption + parse path. complete_open_v2 must also collapse
+    // every failure into OpaqueUnlockFailed.
+    match complete_open_v2(envelope, &cred, cipher) {
+        Ok(_) => {
+            // Fuzzer hit a valid full open by chance.
+        }
+        Err(Error::OpaqueUnlockFailed) => {
+            // Phase 2 rejected an envelope that phase 1 accepted -
+            // valid path (e.g. inner-header parse rejects
+            // tag-forged garbage). Single opaque error preserved.
+        }
+        Err(other) => {
+            panic!(
+                "v2 complete_open returned a non-opaque error, leaking the failure mode: {:?}",
                 other
             );
         }

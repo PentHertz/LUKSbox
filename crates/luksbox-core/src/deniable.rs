@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Penthertz <https://penthertz.com> (https://x.com/PentHertz)
 
-//! Deniable header v1 - opt-in container header where every on-disk
+//! Deniable header v2 - opt-in container header where every on-disk
 //! byte is computationally indistinguishable from uniform random output.
 //!
 //! See `docs/DENIABLE_HEADER.md` for the full design specification
@@ -10,10 +10,21 @@
 //! higher-level container ops (init/open/add-user/remove-user) live in
 //! `luksbox-format::container`.
 //!
+//! ## v2 vs v1
+//!
+//! v1 (8 KiB header, 512 B slots wrapping only the MVK, external
+//! `cred_id` / `hmac_salt` / `.tpm-blob` sidecars) was paused mid-impl
+//! and never shipped publicly. v2 bumps the slot to 4 KiB and embeds
+//! all authenticator-bound material (`cred_id`, `hmac_salt`, TPM
+//! sealed blob) inside the slot envelope, eliminating the TPM
+//! sidecar. v2 makes a passphrase mandatory for every deniable
+//! credential (it's the only discovery factor that can decrypt the
+//! envelope without itself being inside the envelope).
+//!
 //! ## Security invariants enforced here
 //!
 //! 1. **AAD binding** - every slot AEAD computation includes
-//!    `b"luksbox-deniable-v1" || per_vault_salt || slot_idx`, preventing
+//!    `b"luksbox-deniable-v2" || per_vault_salt || slot_idx`, preventing
 //!    slot-shuffling attacks across vaults or across slots.
 //! 2. **Constant-time trial decryption** - `trial_decrypt` always
 //!    iterates all 8 slots regardless of which (if any) matches; the
@@ -38,20 +49,27 @@ use crate::error::Error;
 use crate::kdf::{Argon2idParams, derive_kek};
 use crate::key::{KEY_LEN, KeyEncryptionKey, MasterVolumeKey};
 
-/// Total deniable header size. Identical to the standard 8 KiB header
-/// so deniable mode introduces no new file-size tell.
-pub const DENIABLE_HEADER_SIZE: usize = 8192;
+/// Total deniable header size. v2 = salt + 8 * 4 KiB slot table +
+/// inner header = 36864 bytes. Larger than v1's 8 KiB and larger than
+/// the standard 8 KiB header, but still trivial in absolute terms and
+/// pays for the embedded credential material that eliminates the v1
+/// `.tpm-blob` sidecar + the external `cred_id` / `hmac_salt`
+/// requirement.
+pub const DENIABLE_HEADER_SIZE: usize = 36864;
 
 /// Number of slots in a deniable header. Matches `MAX_KEYSLOTS` from
 /// the standard format for shared muscle memory. Bumping is a format
 /// version bump baked into the binary; the slot count is NOT on disk.
 pub const DENIABLE_SLOT_COUNT: usize = 8;
 
-/// Per-slot size (bytes). 60 bytes hold the AEAD nonce + wrapped MVK
-/// + tag (12 + 32 + 16); the remaining 452 bytes are random padding so
-/// every slot has the same wire layout regardless of how much per-slot
-/// metadata a future format might want.
-pub const DENIABLE_SLOT_SIZE: usize = 512;
+/// Per-slot size (bytes). v2 bumped this from 512 to 4096 so the
+/// AEAD envelope can carry every authenticator-bound piece of
+/// material (`cred_id` up to ~1 KiB, `hmac_salt` 32 B, TPM sealed
+/// blob up to ~3 KiB, inner `wrapped_mvk` 48 B, random padding for
+/// the rest). The exact in-envelope layout is encoded by
+/// `slot_payload::SlotPayload`; this constant just guarantees the
+/// envelope has room for any combination of those fields.
+pub const DENIABLE_SLOT_SIZE: usize = 4096;
 
 /// Per-vault salt size at offset 0 of the deniable header.
 pub const DENIABLE_SALT_SIZE: usize = 32;
@@ -63,7 +81,9 @@ pub const DENIABLE_SLOT_TABLE_OFFSET: usize = DENIABLE_SALT_SIZE;
 pub const DENIABLE_INNER_OFFSET: usize =
     DENIABLE_SLOT_TABLE_OFFSET + DENIABLE_SLOT_COUNT * DENIABLE_SLOT_SIZE;
 
-/// Size of the encrypted inner header (bytes).
+/// Size of the encrypted inner header (bytes). Unchanged from v1 at
+/// 4064 - the inner header structure didn't grow; only the slot table
+/// did.
 pub const DENIABLE_INNER_SIZE: usize = DENIABLE_HEADER_SIZE - DENIABLE_INNER_OFFSET;
 
 /// Per-slot AEAD nonce length (bytes).
@@ -80,41 +100,53 @@ pub const SLOT_CT_AND_TAG_LEN: usize = KEY_LEN + SLOT_TAG_LEN;
 // construction.
 const _: () =
     assert!(DENIABLE_SALT_SIZE + DENIABLE_SLOT_COUNT * DENIABLE_SLOT_SIZE < DENIABLE_HEADER_SIZE);
-const _: () = assert!(DENIABLE_INNER_OFFSET == 32 + 8 * 512);
+const _: () = assert!(DENIABLE_INNER_OFFSET == 32 + 8 * 4096);
 const _: () = assert!(DENIABLE_INNER_SIZE == 4064);
 const _: () = assert!(SLOT_NONCE_LEN + SLOT_CT_AND_TAG_LEN < DENIABLE_SLOT_SIZE);
 
-/// AAD prefix bound into every slot AEAD computation. A bump implies
-/// a format version bump that the binary must learn.
-pub const DENIABLE_AAD_PREFIX: &[u8] = b"luksbox-deniable-v1";
+/// AAD prefix bound into every slot AEAD computation. v2 bump means
+/// any stray v1 bytes cannot accidentally decrypt under v2 keying.
+pub const DENIABLE_AAD_PREFIX: &[u8] = b"luksbox-deniable-v2";
 
 /// HKDF info labels for per-credential KEK derivation. Each credential
 /// type uses a distinct label so a bug in one derivation cannot
 /// contaminate another (security invariant #5). The `KEK_*` labels
 /// below correspond 1:1 to `DeniableCredential` variants.
+///
+/// Two layers of KEKs in v2:
+///
+/// - `KEK_ENVELOPE` derives the outer slot envelope key from the
+///   passphrase. There is only one of these because the envelope is
+///   always passphrase-keyed in v2 (the discovery factor).
+/// - `KEK_*_PASSPHRASE` (one per variant) derive the inner
+///   `wrapped_mvk` key from `KEK_envelope || <secondary factors>`.
+///
+/// The v1 labels (without the `+passphrase` suffix) are retained for
+/// the v1 single-step `derive_kek` API used by code that has not yet
+/// migrated to the v2 two-step envelope/factors API. New code should
+/// not reference them.
 pub mod hkdf_info {
-    pub const PASSPHRASE: &[u8] = b"luksbox-deniable-v1/passphrase";
-    pub const FIDO2_SALT: &[u8] = b"luksbox-deniable-v1/fido2-salt";
-    pub const FIDO2_KEK: &[u8] = b"luksbox-deniable-v1/fido2";
-    pub const TPM_FIDO2_KEK: &[u8] = b"luksbox-deniable-v1/tpm-fido2";
-    pub const PQ_CLASSICAL: &[u8] = b"luksbox-deniable-v1/pq-classical";
-    pub const PQ_HYBRID_KEK: &[u8] = b"luksbox-deniable-v1/pq-hybrid";
-    pub const INNER_HEADER: &[u8] = b"luksbox-deniable-v1/inner-header";
+    pub const INNER_HEADER: &[u8] = b"luksbox-deniable-v2/inner-header";
 
-    // New (v1.1): one label per DeniableCredential variant. Each one
-    // uniquely identifies the credential combination so an adversary
-    // who guesses the wrong combo derives a KEK in an independent
-    // space.
-    pub const KEK_PASSPHRASE: &[u8] = b"luksbox-deniable-v1/kek/passphrase";
-    pub const KEK_FIDO2: &[u8] = b"luksbox-deniable-v1/kek/fido2";
-    pub const KEK_FIDO2_PASSPHRASE: &[u8] = b"luksbox-deniable-v1/kek/fido2+passphrase";
-    pub const KEK_TPM: &[u8] = b"luksbox-deniable-v1/kek/tpm";
-    pub const KEK_TPM_PASSPHRASE: &[u8] = b"luksbox-deniable-v1/kek/tpm+passphrase";
-    pub const KEK_TPM_FIDO2: &[u8] = b"luksbox-deniable-v1/kek/tpm+fido2";
-    pub const KEK_PQ_PASSPHRASE: &[u8] = b"luksbox-deniable-v1/kek/pq+passphrase";
-    pub const KEK_PQ_FIDO2: &[u8] = b"luksbox-deniable-v1/kek/pq+fido2";
-    pub const KEK_PQ_TPM: &[u8] = b"luksbox-deniable-v1/kek/pq+tpm";
-    pub const KEK_PQ_TPM_FIDO2: &[u8] = b"luksbox-deniable-v1/kek/pq+tpm+fido2";
+    /// Outer-envelope KEK label. Always passphrase-derived (Argon2id
+    /// directly, no HKDF), so this constant is only used as a domain
+    /// separator if a future variant needs a non-Argon2id outer
+    /// derivation. Reserved.
+    pub const KEK_ENVELOPE: &[u8] = b"luksbox-deniable-v2/kek/envelope";
+
+    // v2 labels: one per DeniableCredential variant that carries a
+    // passphrase. Each one uniquely identifies the credential
+    // combination so an adversary who guesses the wrong combo
+    // derives a KEK in an independent space.
+    pub const KEK_PASSPHRASE: &[u8] = b"luksbox-deniable-v2/kek/passphrase";
+    pub const KEK_FIDO2_PASSPHRASE: &[u8] = b"luksbox-deniable-v2/kek/fido2+passphrase";
+    pub const KEK_TPM_PASSPHRASE: &[u8] = b"luksbox-deniable-v2/kek/tpm+passphrase";
+    pub const KEK_TPM_FIDO2_PASSPHRASE: &[u8] = b"luksbox-deniable-v2/kek/tpm+fido2+passphrase";
+    pub const KEK_PQ_PASSPHRASE: &[u8] = b"luksbox-deniable-v2/kek/pq+passphrase";
+    pub const KEK_PQ_FIDO2_PASSPHRASE: &[u8] = b"luksbox-deniable-v2/kek/pq+fido2+passphrase";
+    pub const KEK_PQ_TPM_PASSPHRASE: &[u8] = b"luksbox-deniable-v2/kek/pq+tpm+passphrase";
+    pub const KEK_PQ_TPM_FIDO2_PASSPHRASE: &[u8] =
+        b"luksbox-deniable-v2/kek/pq+tpm+fido2+passphrase";
 }
 
 /// Build the AAD bound into a slot's AEAD computation:
@@ -310,236 +342,276 @@ pub fn passphrase_kek(
     derive_kek(passphrase, per_vault_salt, params)
 }
 
-/// Derive the FIDO2 hmac-secret salt from per-vault salt + credential ID.
-/// Each vault gives the SAME credential a different hmac-secret output,
-/// so a single FIDO2 device can be used across vaults without key reuse.
-pub fn fido2_hmac_salt(
-    per_vault_salt: &[u8; DENIABLE_SALT_SIZE],
-    credential_id: &[u8],
-) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    let hk = Hkdf::<Sha256>::new(Some(per_vault_salt), credential_id);
-    hk.expand(hkdf_info::FIDO2_SALT, &mut out)
-        .expect("32 <= 255*HashLen");
-    out
-}
-
-/// Derive a FIDO2-credential KEK from the device's hmac-secret output.
-pub fn fido2_kek(
-    hmac_output: &[u8; 32],
-    per_vault_salt: &[u8; DENIABLE_SALT_SIZE],
-) -> KeyEncryptionKey {
-    let mut out = Zeroizing::new([0u8; KEY_LEN]);
-    let hk = Hkdf::<Sha256>::new(Some(per_vault_salt), hmac_output);
-    hk.expand(hkdf_info::FIDO2_KEK, out.as_mut_slice())
-        .expect("32 <= 255*HashLen");
-    KeyEncryptionKey::from_bytes(*out)
-}
-
-/// Derive a TPM+FIDO2 fused-credential KEK. Both factors are required
-/// to unlock; either alone yields a different KEK that fails AEAD.
-pub fn tpm_fido2_kek(
-    tpm_unsealed: &[u8; 32],
-    fido2_hmac_output: &[u8; 32],
-    per_vault_salt: &[u8; DENIABLE_SALT_SIZE],
-) -> KeyEncryptionKey {
-    // IKM is `tpm_unsealed || fido2_hmac_output`. Wrapped in `Zeroizing`
-    // so the combined keying material is wiped on every drop path.
-    let mut ikm = Zeroizing::new([0u8; 64]);
-    ikm[..32].copy_from_slice(tpm_unsealed);
-    ikm[32..].copy_from_slice(fido2_hmac_output);
-    let hk = Hkdf::<Sha256>::new(Some(per_vault_salt), ikm.as_ref());
-    let mut out = Zeroizing::new([0u8; KEY_LEN]);
-    hk.expand(hkdf_info::TPM_FIDO2_KEK, out.as_mut_slice())
-        .expect("32 <= 255*HashLen");
-    KeyEncryptionKey::from_bytes(*out)
-}
-
-/// Derive a PQ-hybrid + FIDO2 KEK. Combines a classical contribution
-/// (Argon2id of passphrase against per-vault salt), the ML-KEM
-/// decapsulation result, and the FIDO2 hmac-secret output.
-pub fn pq_hybrid_kek(
-    classical_argon2_output: &[u8; 32],
-    mlkem_shared_secret: &[u8; 32],
-    fido2_hmac_output: &[u8; 32],
-    per_vault_salt: &[u8; DENIABLE_SALT_SIZE],
-) -> KeyEncryptionKey {
-    let mut ikm = Zeroizing::new([0u8; 96]);
-    ikm[..32].copy_from_slice(classical_argon2_output);
-    ikm[32..64].copy_from_slice(mlkem_shared_secret);
-    ikm[64..].copy_from_slice(fido2_hmac_output);
-    let hk = Hkdf::<Sha256>::new(Some(per_vault_salt), ikm.as_ref());
-    let mut out = Zeroizing::new([0u8; KEY_LEN]);
-    hk.expand(hkdf_info::PQ_HYBRID_KEK, out.as_mut_slice())
-        .expect("32 <= 255*HashLen");
-    KeyEncryptionKey::from_bytes(*out)
-}
+// v1 standalone helpers `fido2_hmac_salt`, `fido2_kek`,
+// `tpm_fido2_kek`, `pq_hybrid_kek` were removed in v2. v2 derives
+// FIDO2 hmac_salt as fresh random at enroll time (stored inside the
+// slot envelope), and per-variant KEK derivation goes through
+// `DeniableCredential::derive_envelope_kek` +
+// `derive_factors_kek` so the two-layer envelope semantics are
+// enforced by the type system.
 
 /// Credential combination supplied by the user at create / open /
-/// enroll time for a deniable-mode slot. The variant chosen at
-/// create time MUST match the variant supplied at open time;
-/// otherwise the KEK derives in a different space and unlock fails
-/// with `OpaqueUnlockFailed`.
+/// enroll time for a deniable-mode slot. v2 makes the passphrase
+/// mandatory for every variant: it derives `KEK_envelope` which is
+/// the only key that can open the slot envelope (without itself
+/// being inside the slot).
 ///
-/// The variant identity itself is NOT stored anywhere on disk -
-/// this is the "user supplies everything not-in-the-file" principle
-/// that makes the deniable vault file pure ciphertext. The user is
-/// responsible for remembering which variant + parameters they used.
+/// The variant identity itself is NOT stored anywhere on disk in
+/// plaintext - it's encoded as a 1-byte kind tag INSIDE the
+/// envelope, only visible after `KEK_envelope` decrypts the
+/// envelope. This means the user is responsible for remembering
+/// which variant + parameters they used (the same as v1).
+///
+/// Pure-FIDO2 / pure-TPM / non-passphrase variants from v1 are
+/// removed - they were the variants that required external
+/// material (`.tpm-blob` sidecar, hex `cred_id` / `hmac_salt`) and
+/// caused the deniability tells v2 set out to fix.
 ///
 /// All variant inputs are by-reference so the caller controls
 /// allocation + zeroize discipline.
 pub enum DeniableCredential<'a> {
-    /// Passphrase only. KEK = `Argon2id(passphrase, salt, params)`.
+    /// Passphrase only. `KEK_envelope = Argon2id(passphrase, salt,
+    /// params)`; `KEK_factors = HKDF(salt, envelope_kek, label)` so
+    /// the inner `wrapped_mvk` is keyed independently of the envelope.
     Passphrase {
         passphrase: &'a [u8],
         argon2: Argon2idParams,
     },
-    /// FIDO2 authenticator only (no passphrase). Caller has
-    /// already invoked the device (discoverable cred lookup +
-    /// PIN + hmac-secret extension) and supplies the 32-byte
-    /// output.
-    Fido2 { hmac_secret_output: &'a [u8; 32] },
-    /// FIDO2 + passphrase. Both factors required.
+    /// Passphrase + FIDO2. `cred_id` and `hmac_salt` live inside the
+    /// slot envelope; `hmac_secret_output` is the 32-byte response
+    /// the device produces when the host calls
+    /// `get_assertion(cred_id, hmac_salt)`.
     Fido2Passphrase {
         passphrase: &'a [u8],
         argon2: Argon2idParams,
         hmac_secret_output: &'a [u8; 32],
     },
-    /// TPM only. Caller has unsealed the sealed blob (from NVRAM
-    /// or sidecar) and supplies the 32-byte unsealed secret.
-    Tpm { unsealed: &'a [u8; 32] },
-    /// TPM + passphrase. Both factors required.
+    /// Passphrase + TPM. The TPM sealed blob lives inside the slot
+    /// envelope; `unsealed` is the 32-byte secret the TPM returns
+    /// from `TPM2_Unseal(tpm_blob)`.
     TpmPassphrase {
         passphrase: &'a [u8],
         argon2: Argon2idParams,
         unsealed: &'a [u8; 32],
     },
-    /// TPM + FIDO2. Both factors required.
-    TpmFido2 {
+    /// 3-factor: passphrase + TPM + FIDO2. All three required.
+    TpmFido2Passphrase {
+        passphrase: &'a [u8],
+        argon2: Argon2idParams,
         unsealed: &'a [u8; 32],
         hmac_secret_output: &'a [u8; 32],
     },
-    /// PQ-hybrid (ML-KEM) + passphrase. Caller has done the ML-KEM
-    /// decapsulation and supplies the 32-byte shared secret.
+    /// Passphrase + PQ-hybrid (ML-KEM). Caller has done the ML-KEM
+    /// decapsulation (using the `.kyber` sidecar) and supplies the
+    /// 32-byte shared secret.
     HybridPqPassphrase {
         passphrase: &'a [u8],
         argon2: Argon2idParams,
         mlkem_shared: &'a [u8; 32],
     },
-    /// PQ-hybrid + FIDO2.
-    HybridPqFido2 {
+    /// Passphrase + PQ + FIDO2.
+    HybridPqFido2Passphrase {
+        passphrase: &'a [u8],
+        argon2: Argon2idParams,
         mlkem_shared: &'a [u8; 32],
         hmac_secret_output: &'a [u8; 32],
     },
-    /// PQ-hybrid + TPM.
-    HybridPqTpm {
+    /// Passphrase + PQ + TPM.
+    HybridPqTpmPassphrase {
+        passphrase: &'a [u8],
+        argon2: Argon2idParams,
         mlkem_shared: &'a [u8; 32],
         unsealed: &'a [u8; 32],
     },
-    /// 3-factor: PQ-hybrid + TPM + FIDO2. All three required.
-    HybridPqTpmFido2 {
+    /// 4-factor: passphrase + PQ + TPM + FIDO2. All four required.
+    HybridPqTpmFido2Passphrase {
+        passphrase: &'a [u8],
+        argon2: Argon2idParams,
         mlkem_shared: &'a [u8; 32],
         unsealed: &'a [u8; 32],
         hmac_secret_output: &'a [u8; 32],
     },
 }
 
+/// Numeric tag stored inside the slot envelope as `kind`. The
+/// variant identity is recoverable from the tag without needing to
+/// re-derive any KEK; this is what lets the open path "discover" the
+/// variant after envelope decryption succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum DeniableKindTag {
+    Passphrase = 1,
+    Fido2Passphrase = 2,
+    TpmPassphrase = 3,
+    TpmFido2Passphrase = 4,
+    HybridPqPassphrase = 5,
+    HybridPqFido2Passphrase = 6,
+    HybridPqTpmPassphrase = 7,
+    HybridPqTpmFido2Passphrase = 8,
+}
+
+impl DeniableKindTag {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            1 => Some(Self::Passphrase),
+            2 => Some(Self::Fido2Passphrase),
+            3 => Some(Self::TpmPassphrase),
+            4 => Some(Self::TpmFido2Passphrase),
+            5 => Some(Self::HybridPqPassphrase),
+            6 => Some(Self::HybridPqFido2Passphrase),
+            7 => Some(Self::HybridPqTpmPassphrase),
+            8 => Some(Self::HybridPqTpmFido2Passphrase),
+            _ => None,
+        }
+    }
+}
+
 impl DeniableCredential<'_> {
-    /// Derive the slot's KEK from this credential + the per-vault
-    /// salt. Each variant uses a distinct HKDF info label so the
-    /// resulting KEKs are cryptographically independent (security
-    /// invariant #5).
-    pub fn derive_kek(
+    /// Return the per-variant kind tag for embedding in the slot
+    /// envelope's `kind` byte. Every v2 variant has one by
+    /// construction (the type system enforces it).
+    pub fn kind_tag(&self) -> DeniableKindTag {
+        match self {
+            Self::Passphrase { .. } => DeniableKindTag::Passphrase,
+            Self::Fido2Passphrase { .. } => DeniableKindTag::Fido2Passphrase,
+            Self::TpmPassphrase { .. } => DeniableKindTag::TpmPassphrase,
+            Self::TpmFido2Passphrase { .. } => DeniableKindTag::TpmFido2Passphrase,
+            Self::HybridPqPassphrase { .. } => DeniableKindTag::HybridPqPassphrase,
+            Self::HybridPqFido2Passphrase { .. } => DeniableKindTag::HybridPqFido2Passphrase,
+            Self::HybridPqTpmPassphrase { .. } => DeniableKindTag::HybridPqTpmPassphrase,
+            Self::HybridPqTpmFido2Passphrase { .. } => DeniableKindTag::HybridPqTpmFido2Passphrase,
+        }
+    }
+
+    /// Return the variant's passphrase + Argon2id params. Every v2
+    /// variant has them by construction.
+    pub fn passphrase_inputs(&self) -> (&[u8], Argon2idParams) {
+        match self {
+            Self::Passphrase { passphrase, argon2 }
+            | Self::Fido2Passphrase {
+                passphrase, argon2, ..
+            }
+            | Self::TpmPassphrase {
+                passphrase, argon2, ..
+            }
+            | Self::TpmFido2Passphrase {
+                passphrase, argon2, ..
+            }
+            | Self::HybridPqPassphrase {
+                passphrase, argon2, ..
+            }
+            | Self::HybridPqFido2Passphrase {
+                passphrase, argon2, ..
+            }
+            | Self::HybridPqTpmPassphrase {
+                passphrase, argon2, ..
+            }
+            | Self::HybridPqTpmFido2Passphrase {
+                passphrase, argon2, ..
+            } => (passphrase, *argon2),
+        }
+    }
+
+    /// Derive the outer slot envelope KEK. v2 invariant: the
+    /// envelope key is always the passphrase-Argon2id output - it is
+    /// what makes the envelope discoverable without an oracle.
+    pub fn derive_envelope_kek(
         &self,
         per_vault_salt: &[u8; DENIABLE_SALT_SIZE],
     ) -> Result<KeyEncryptionKey, Error> {
+        let (passphrase, argon2) = self.passphrase_inputs();
+        derive_kek(passphrase, per_vault_salt, argon2)
+    }
+
+    /// Derive the inner `wrapped_mvk` KEK from the envelope KEK +
+    /// per-variant secondary factors. Each variant uses a distinct
+    /// HKDF info label so the resulting KEKs are cryptographically
+    /// independent (security invariant #5).
+    pub fn derive_factors_kek(
+        &self,
+        per_vault_salt: &[u8; DENIABLE_SALT_SIZE],
+        envelope_kek: &KeyEncryptionKey,
+    ) -> KeyEncryptionKey {
         match self {
-            Self::Passphrase { passphrase, argon2 } => {
-                derive_kek(passphrase, per_vault_salt, *argon2)
-            }
-            Self::Fido2 { hmac_secret_output } => Ok(hkdf_kek(
+            Self::Passphrase { .. } => hkdf_combine(
                 per_vault_salt,
-                hmac_secret_output.as_slice(),
-                hkdf_info::KEK_FIDO2,
-            )),
+                &[envelope_kek.as_bytes().as_slice()],
+                hkdf_info::KEK_PASSPHRASE,
+            ),
             Self::Fido2Passphrase {
-                passphrase,
-                argon2,
-                hmac_secret_output,
-            } => {
-                let pp = derive_kek(passphrase, per_vault_salt, *argon2)?;
-                Ok(hkdf_combine(
-                    per_vault_salt,
-                    &[pp.as_bytes().as_slice(), hmac_secret_output.as_slice()],
-                    hkdf_info::KEK_FIDO2_PASSPHRASE,
-                ))
-            }
-            Self::Tpm { unsealed } => Ok(hkdf_kek(
-                per_vault_salt,
-                unsealed.as_slice(),
-                hkdf_info::KEK_TPM,
-            )),
-            Self::TpmPassphrase {
-                passphrase,
-                argon2,
-                unsealed,
-            } => {
-                let pp = derive_kek(passphrase, per_vault_salt, *argon2)?;
-                Ok(hkdf_combine(
-                    per_vault_salt,
-                    &[pp.as_bytes().as_slice(), unsealed.as_slice()],
-                    hkdf_info::KEK_TPM_PASSPHRASE,
-                ))
-            }
-            Self::TpmFido2 {
-                unsealed,
-                hmac_secret_output,
-            } => Ok(hkdf_combine(
-                per_vault_salt,
-                &[unsealed.as_slice(), hmac_secret_output.as_slice()],
-                hkdf_info::KEK_TPM_FIDO2,
-            )),
-            Self::HybridPqPassphrase {
-                passphrase,
-                argon2,
-                mlkem_shared,
-            } => {
-                let pp = derive_kek(passphrase, per_vault_salt, *argon2)?;
-                Ok(hkdf_combine(
-                    per_vault_salt,
-                    &[pp.as_bytes().as_slice(), mlkem_shared.as_slice()],
-                    hkdf_info::KEK_PQ_PASSPHRASE,
-                ))
-            }
-            Self::HybridPqFido2 {
-                mlkem_shared,
-                hmac_secret_output,
-            } => Ok(hkdf_combine(
-                per_vault_salt,
-                &[mlkem_shared.as_slice(), hmac_secret_output.as_slice()],
-                hkdf_info::KEK_PQ_FIDO2,
-            )),
-            Self::HybridPqTpm {
-                mlkem_shared,
-                unsealed,
-            } => Ok(hkdf_combine(
-                per_vault_salt,
-                &[mlkem_shared.as_slice(), unsealed.as_slice()],
-                hkdf_info::KEK_PQ_TPM,
-            )),
-            Self::HybridPqTpmFido2 {
-                mlkem_shared,
-                unsealed,
-                hmac_secret_output,
-            } => Ok(hkdf_combine(
+                hmac_secret_output, ..
+            } => hkdf_combine(
                 per_vault_salt,
                 &[
+                    envelope_kek.as_bytes().as_slice(),
+                    hmac_secret_output.as_slice(),
+                ],
+                hkdf_info::KEK_FIDO2_PASSPHRASE,
+            ),
+            Self::TpmPassphrase { unsealed, .. } => hkdf_combine(
+                per_vault_salt,
+                &[envelope_kek.as_bytes().as_slice(), unsealed.as_slice()],
+                hkdf_info::KEK_TPM_PASSPHRASE,
+            ),
+            Self::TpmFido2Passphrase {
+                unsealed,
+                hmac_secret_output,
+                ..
+            } => hkdf_combine(
+                per_vault_salt,
+                &[
+                    envelope_kek.as_bytes().as_slice(),
+                    unsealed.as_slice(),
+                    hmac_secret_output.as_slice(),
+                ],
+                hkdf_info::KEK_TPM_FIDO2_PASSPHRASE,
+            ),
+            Self::HybridPqPassphrase { mlkem_shared, .. } => hkdf_combine(
+                per_vault_salt,
+                &[envelope_kek.as_bytes().as_slice(), mlkem_shared.as_slice()],
+                hkdf_info::KEK_PQ_PASSPHRASE,
+            ),
+            Self::HybridPqFido2Passphrase {
+                mlkem_shared,
+                hmac_secret_output,
+                ..
+            } => hkdf_combine(
+                per_vault_salt,
+                &[
+                    envelope_kek.as_bytes().as_slice(),
+                    mlkem_shared.as_slice(),
+                    hmac_secret_output.as_slice(),
+                ],
+                hkdf_info::KEK_PQ_FIDO2_PASSPHRASE,
+            ),
+            Self::HybridPqTpmPassphrase {
+                mlkem_shared,
+                unsealed,
+                ..
+            } => hkdf_combine(
+                per_vault_salt,
+                &[
+                    envelope_kek.as_bytes().as_slice(),
+                    mlkem_shared.as_slice(),
+                    unsealed.as_slice(),
+                ],
+                hkdf_info::KEK_PQ_TPM_PASSPHRASE,
+            ),
+            Self::HybridPqTpmFido2Passphrase {
+                mlkem_shared,
+                unsealed,
+                hmac_secret_output,
+                ..
+            } => hkdf_combine(
+                per_vault_salt,
+                &[
+                    envelope_kek.as_bytes().as_slice(),
                     mlkem_shared.as_slice(),
                     unsealed.as_slice(),
                     hmac_secret_output.as_slice(),
                 ],
-                hkdf_info::KEK_PQ_TPM_FIDO2,
-            )),
+                hkdf_info::KEK_PQ_TPM_FIDO2_PASSPHRASE,
+            ),
         }
     }
 
@@ -549,15 +621,13 @@ impl DeniableCredential<'_> {
     pub fn label(&self) -> &'static str {
         match self {
             Self::Passphrase { .. } => "passphrase",
-            Self::Fido2 { .. } => "fido2",
             Self::Fido2Passphrase { .. } => "fido2+passphrase",
-            Self::Tpm { .. } => "tpm",
             Self::TpmPassphrase { .. } => "tpm+passphrase",
-            Self::TpmFido2 { .. } => "tpm+fido2",
+            Self::TpmFido2Passphrase { .. } => "tpm+fido2+passphrase",
             Self::HybridPqPassphrase { .. } => "pq+passphrase",
-            Self::HybridPqFido2 { .. } => "pq+fido2",
-            Self::HybridPqTpm { .. } => "pq+tpm",
-            Self::HybridPqTpmFido2 { .. } => "pq+tpm+fido2",
+            Self::HybridPqFido2Passphrase { .. } => "pq+fido2+passphrase",
+            Self::HybridPqTpmPassphrase { .. } => "pq+tpm+passphrase",
+            Self::HybridPqTpmFido2Passphrase { .. } => "pq+tpm+fido2+passphrase",
         }
     }
 }
@@ -605,6 +675,433 @@ pub fn inner_header_key(
     hk.expand(hkdf_info::INNER_HEADER, out.as_mut_slice())
         .expect("32 <= 255*HashLen");
     KeyEncryptionKey::from_bytes(*out)
+}
+
+// ============================================================
+// v2 slot payload: in-envelope material + wrapped MVK
+// ============================================================
+
+/// v2 slot payload structures + encode / decode. The payload is the
+/// plaintext that lives inside the AEAD outer envelope of a v2
+/// deniable slot. It carries the credential material (`cred_id`,
+/// `hmac_salt`, `tpm_blob`) that previously required a sidecar or
+/// external storage, plus the inner `wrapped_mvk` ciphertext.
+///
+/// See `docs/DENIABLE_HEADER.md` "Per-slot structure (v2)" for the
+/// byte layout. This module is the canonical encoder/decoder for it.
+pub mod slot_payload {
+    use super::{
+        DENIABLE_SLOT_SIZE, DeniableKindTag, Error, KEY_LEN, SLOT_NONCE_LEN, SLOT_TAG_LEN,
+    };
+    use zeroize::Zeroize;
+
+    /// Fixed header inside the payload: kind tag + 3 lengths +
+    /// reserved bytes. Always exactly 8 bytes.
+    pub const PAYLOAD_HEADER_LEN: usize = 8;
+
+    /// Inner wrapped-MVK envelope: 12-byte nonce + 32-byte MVK + 16-byte
+    /// AEAD tag. Always exactly 60 bytes.
+    pub const WRAPPED_MVK_LEN: usize = SLOT_NONCE_LEN + KEY_LEN + SLOT_TAG_LEN;
+
+    /// Maximum FIDO2 credential id length permitted in a slot. The
+    /// CTAP2 spec allows up to 1023 bytes; we cap at 1024 for a clean
+    /// power-of-two budget. Realistic devices stay well under 256 B.
+    pub const CRED_ID_MAX_LEN: usize = 1024;
+
+    /// Exact FIDO2 `hmac_salt` length (when present).
+    pub const HMAC_SALT_LEN: usize = 32;
+
+    /// Maximum TPM2 sealed blob length permitted in a slot. Most real
+    /// TPM2_PolicyAuthorize-bound sealed objects come out at
+    /// 1.5-3 KiB; the cap leaves ~400 B of safety margin.
+    pub const TPM_BLOB_MAX_LEN: usize = 3500;
+
+    /// Total plaintext length of the payload that lives inside the
+    /// AEAD outer envelope. `DENIABLE_SLOT_SIZE - nonce - tag`. The
+    /// remaining budget for material is
+    /// `PAYLOAD_PLAINTEXT_LEN - PAYLOAD_HEADER_LEN - WRAPPED_MVK_LEN`.
+    pub const PAYLOAD_PLAINTEXT_LEN: usize = DENIABLE_SLOT_SIZE - SLOT_NONCE_LEN - SLOT_TAG_LEN;
+
+    /// Combined budget for cred_id + hmac_salt + tpm_blob in a single
+    /// slot. Validated at encode time; over-budget material returns
+    /// `Error::InvalidField`.
+    pub const MATERIAL_BUDGET: usize = PAYLOAD_PLAINTEXT_LEN - PAYLOAD_HEADER_LEN - WRAPPED_MVK_LEN;
+
+    // Compile-time sanity checks for the layout constants.
+    const _: () = assert!(PAYLOAD_PLAINTEXT_LEN == 4068);
+    const _: () = assert!(WRAPPED_MVK_LEN == 60);
+    const _: () = assert!(MATERIAL_BUDGET == 4000);
+    const _: () = assert!(CRED_ID_MAX_LEN + HMAC_SALT_LEN + TPM_BLOB_MAX_LEN >= MATERIAL_BUDGET);
+
+    /// Owned slot payload: all the bytes that go inside the outer
+    /// envelope, parsed into named fields. Construct via
+    /// `SlotPayload::new` (validates lengths against the budget),
+    /// emit on-the-wire bytes via `encode`, parse incoming bytes via
+    /// `decode`. The wrapped-MVK fields are opaque to this module -
+    /// callers seal them with `KEK_factors` before constructing the
+    /// payload and open them with `KEK_factors` after decoding.
+    #[derive(Debug)]
+    pub struct SlotPayload {
+        pub kind: DeniableKindTag,
+        pub cred_id: Vec<u8>,
+        /// `Some([..; 32])` only for variants whose `kind` has a
+        /// FIDO2 factor. `None` otherwise (and the on-disk
+        /// `hmac_salt_len` is 0).
+        pub hmac_salt: Option<[u8; HMAC_SALT_LEN]>,
+        pub tpm_blob: Vec<u8>,
+        pub wrapped_mvk_nonce: [u8; SLOT_NONCE_LEN],
+        /// `KEK_factors`-sealed MVK + tag: exactly
+        /// `KEY_LEN + SLOT_TAG_LEN = 48 bytes`.
+        pub wrapped_mvk_ct_and_tag: [u8; KEY_LEN + SLOT_TAG_LEN],
+    }
+
+    impl Drop for SlotPayload {
+        fn drop(&mut self) {
+            // Best-effort cleanup. cred_id and tpm_blob may contain
+            // device-bound material that doesn't break confidentiality
+            // if leaked, but zeroizing is a defensive default.
+            self.cred_id.zeroize();
+            self.tpm_blob.zeroize();
+            self.wrapped_mvk_nonce.zeroize();
+            self.wrapped_mvk_ct_and_tag.zeroize();
+            if let Some(salt) = self.hmac_salt.as_mut() {
+                salt.zeroize();
+            }
+        }
+    }
+
+    impl SlotPayload {
+        /// Construct a new payload, validating each field against its
+        /// per-variant cap and the joint material budget. Returns
+        /// `Error::InvalidField` on over-budget or
+        /// `Error::InvalidField` on length-cap violations (cred_id >
+        /// `CRED_ID_MAX_LEN`, tpm_blob > `TPM_BLOB_MAX_LEN`).
+        pub fn new(
+            kind: DeniableKindTag,
+            cred_id: Vec<u8>,
+            hmac_salt: Option<[u8; HMAC_SALT_LEN]>,
+            tpm_blob: Vec<u8>,
+            wrapped_mvk_nonce: [u8; SLOT_NONCE_LEN],
+            wrapped_mvk_ct_and_tag: [u8; KEY_LEN + SLOT_TAG_LEN],
+        ) -> Result<Self, Error> {
+            if cred_id.len() > CRED_ID_MAX_LEN {
+                return Err(Error::InvalidField);
+            }
+            if tpm_blob.len() > TPM_BLOB_MAX_LEN {
+                return Err(Error::InvalidField);
+            }
+            let salt_len = if hmac_salt.is_some() {
+                HMAC_SALT_LEN
+            } else {
+                0
+            };
+            let material = cred_id.len() + salt_len + tpm_blob.len();
+            if material > MATERIAL_BUDGET {
+                return Err(Error::InvalidField);
+            }
+            Ok(Self {
+                kind,
+                cred_id,
+                hmac_salt,
+                tpm_blob,
+                wrapped_mvk_nonce,
+                wrapped_mvk_ct_and_tag,
+            })
+        }
+
+        /// Serialise the payload + random padding into a
+        /// `PAYLOAD_PLAINTEXT_LEN`-byte buffer ready for AEAD-sealing
+        /// with `KEK_envelope`. The trailing padding is filled with
+        /// OS-RNG bytes so the envelope ciphertext is the same length
+        /// regardless of variant - otherwise the envelope's length
+        /// would leak the slot kind.
+        pub fn encode(&self) -> Result<[u8; PAYLOAD_PLAINTEXT_LEN], Error> {
+            let salt_len = if self.hmac_salt.is_some() {
+                HMAC_SALT_LEN
+            } else {
+                0
+            };
+            let mut buf = [0u8; PAYLOAD_PLAINTEXT_LEN];
+            // Fixed header.
+            buf[0] = self.kind as u8;
+            buf[1..3].copy_from_slice(&(self.cred_id.len() as u16).to_le_bytes());
+            buf[3] = salt_len as u8;
+            buf[4..6].copy_from_slice(&(self.tpm_blob.len() as u16).to_le_bytes());
+            // bytes 6..8 reserved, already 0.
+
+            // Variable material.
+            let mut off = PAYLOAD_HEADER_LEN;
+            buf[off..off + self.cred_id.len()].copy_from_slice(&self.cred_id);
+            off += self.cred_id.len();
+            if let Some(salt) = self.hmac_salt.as_ref() {
+                buf[off..off + HMAC_SALT_LEN].copy_from_slice(salt);
+                off += HMAC_SALT_LEN;
+            }
+            buf[off..off + self.tpm_blob.len()].copy_from_slice(&self.tpm_blob);
+            off += self.tpm_blob.len();
+
+            // Inner wrapped_mvk (nonce + ct + tag).
+            buf[off..off + SLOT_NONCE_LEN].copy_from_slice(&self.wrapped_mvk_nonce);
+            off += SLOT_NONCE_LEN;
+            buf[off..off + KEY_LEN + SLOT_TAG_LEN].copy_from_slice(&self.wrapped_mvk_ct_and_tag);
+            off += KEY_LEN + SLOT_TAG_LEN;
+
+            // Trailing padding from OsRng so envelope length doesn't
+            // leak variant identity via the visible ciphertext length.
+            super::fill_random(&mut buf[off..])?;
+
+            Ok(buf)
+        }
+
+        /// Parse the decrypted envelope plaintext back into a
+        /// `SlotPayload`. Returns `Error::InvalidField` on any
+        /// length-cap violation, unknown `kind`, or layout that runs
+        /// past the buffer (a malicious envelope could otherwise
+        /// claim absurd lengths).
+        pub fn decode(buf: &[u8; PAYLOAD_PLAINTEXT_LEN]) -> Result<Self, Error> {
+            let kind = DeniableKindTag::from_u8(buf[0]).ok_or(Error::InvalidField)?;
+            let cred_id_len = u16::from_le_bytes([buf[1], buf[2]]) as usize;
+            let hmac_salt_len = buf[3] as usize;
+            let tpm_blob_len = u16::from_le_bytes([buf[4], buf[5]]) as usize;
+            // bytes 6..8 reserved, must be 0 for forward-compat. A
+            // future v2.1 may use them; for now reject non-zero as
+            // a probable corruption.
+            if buf[6] != 0 || buf[7] != 0 {
+                return Err(Error::InvalidField);
+            }
+
+            // Length caps.
+            if cred_id_len > CRED_ID_MAX_LEN {
+                return Err(Error::InvalidField);
+            }
+            if !(hmac_salt_len == 0 || hmac_salt_len == HMAC_SALT_LEN) {
+                return Err(Error::InvalidField);
+            }
+            if tpm_blob_len > TPM_BLOB_MAX_LEN {
+                return Err(Error::InvalidField);
+            }
+            // Joint material budget.
+            let material = cred_id_len + hmac_salt_len + tpm_blob_len;
+            if material > MATERIAL_BUDGET {
+                return Err(Error::InvalidField);
+            }
+
+            // Per-kind well-formedness: the kind tag declares which
+            // material MUST be present. A tampered envelope that
+            // tag-forged could claim an inconsistent shape (e.g.
+            // `kind = Passphrase` but `cred_id_len = 64`), which
+            // would still parse cleanly here. The per-variant create
+            // / open flows enforce consistency at the call site; we
+            // only check structural bounds here.
+            let mut off = PAYLOAD_HEADER_LEN;
+            let cred_id = buf[off..off + cred_id_len].to_vec();
+            off += cred_id_len;
+
+            let hmac_salt = if hmac_salt_len == HMAC_SALT_LEN {
+                let mut s = [0u8; HMAC_SALT_LEN];
+                s.copy_from_slice(&buf[off..off + HMAC_SALT_LEN]);
+                off += HMAC_SALT_LEN;
+                Some(s)
+            } else {
+                None
+            };
+
+            let tpm_blob = buf[off..off + tpm_blob_len].to_vec();
+            off += tpm_blob_len;
+
+            let mut wrapped_mvk_nonce = [0u8; SLOT_NONCE_LEN];
+            wrapped_mvk_nonce.copy_from_slice(&buf[off..off + SLOT_NONCE_LEN]);
+            off += SLOT_NONCE_LEN;
+
+            let mut wrapped_mvk_ct_and_tag = [0u8; KEY_LEN + SLOT_TAG_LEN];
+            wrapped_mvk_ct_and_tag.copy_from_slice(&buf[off..off + KEY_LEN + SLOT_TAG_LEN]);
+
+            Ok(Self {
+                kind,
+                cred_id,
+                hmac_salt,
+                tpm_blob,
+                wrapped_mvk_nonce,
+                wrapped_mvk_ct_and_tag,
+            })
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn dummy_payload(kind: DeniableKindTag) -> SlotPayload {
+            let cred_id = match kind {
+                DeniableKindTag::Fido2Passphrase
+                | DeniableKindTag::TpmFido2Passphrase
+                | DeniableKindTag::HybridPqFido2Passphrase
+                | DeniableKindTag::HybridPqTpmFido2Passphrase => vec![0xaa; 64],
+                _ => Vec::new(),
+            };
+            let hmac_salt = match kind {
+                DeniableKindTag::Fido2Passphrase
+                | DeniableKindTag::TpmFido2Passphrase
+                | DeniableKindTag::HybridPqFido2Passphrase
+                | DeniableKindTag::HybridPqTpmFido2Passphrase => Some([0xbb; HMAC_SALT_LEN]),
+                _ => None,
+            };
+            let tpm_blob = match kind {
+                DeniableKindTag::TpmPassphrase
+                | DeniableKindTag::TpmFido2Passphrase
+                | DeniableKindTag::HybridPqTpmPassphrase
+                | DeniableKindTag::HybridPqTpmFido2Passphrase => vec![0xcc; 1800],
+                _ => Vec::new(),
+            };
+            SlotPayload::new(
+                kind,
+                cred_id,
+                hmac_salt,
+                tpm_blob,
+                [0xdd; SLOT_NONCE_LEN],
+                [0xee; KEY_LEN + SLOT_TAG_LEN],
+            )
+            .expect("dummy payload fits in budget")
+        }
+
+        #[test]
+        fn round_trip_every_kind() {
+            for kind in [
+                DeniableKindTag::Passphrase,
+                DeniableKindTag::Fido2Passphrase,
+                DeniableKindTag::TpmPassphrase,
+                DeniableKindTag::TpmFido2Passphrase,
+                DeniableKindTag::HybridPqPassphrase,
+                DeniableKindTag::HybridPqFido2Passphrase,
+                DeniableKindTag::HybridPqTpmPassphrase,
+                DeniableKindTag::HybridPqTpmFido2Passphrase,
+            ] {
+                let p = dummy_payload(kind);
+                let cred_id = p.cred_id.clone();
+                let salt = p.hmac_salt;
+                let blob = p.tpm_blob.clone();
+                let nonce = p.wrapped_mvk_nonce;
+                let ct = p.wrapped_mvk_ct_and_tag;
+                let buf = p.encode().expect("encode succeeds");
+                let dec = SlotPayload::decode(&buf).expect("decode succeeds");
+                assert_eq!(dec.kind, kind);
+                assert_eq!(dec.cred_id, cred_id);
+                assert_eq!(dec.hmac_salt, salt);
+                assert_eq!(dec.tpm_blob, blob);
+                assert_eq!(dec.wrapped_mvk_nonce, nonce);
+                assert_eq!(dec.wrapped_mvk_ct_and_tag, ct);
+            }
+        }
+
+        #[test]
+        fn encoded_length_is_constant_regardless_of_variant() {
+            // Every variant encodes to exactly PAYLOAD_PLAINTEXT_LEN
+            // bytes (random padding fills the rest). This is what
+            // prevents the envelope ciphertext length from leaking
+            // the slot kind.
+            for kind in [
+                DeniableKindTag::Passphrase,
+                DeniableKindTag::Fido2Passphrase,
+                DeniableKindTag::TpmPassphrase,
+                DeniableKindTag::TpmFido2Passphrase,
+                DeniableKindTag::HybridPqPassphrase,
+                DeniableKindTag::HybridPqFido2Passphrase,
+                DeniableKindTag::HybridPqTpmPassphrase,
+                DeniableKindTag::HybridPqTpmFido2Passphrase,
+            ] {
+                let buf = dummy_payload(kind).encode().unwrap();
+                assert_eq!(buf.len(), PAYLOAD_PLAINTEXT_LEN);
+            }
+        }
+
+        #[test]
+        fn over_budget_material_rejected_at_construct() {
+            // 1024 + 32 + 3500 = 4556 > MATERIAL_BUDGET (4000).
+            let err = SlotPayload::new(
+                DeniableKindTag::TpmFido2Passphrase,
+                vec![0; CRED_ID_MAX_LEN],
+                Some([0; HMAC_SALT_LEN]),
+                vec![0; TPM_BLOB_MAX_LEN],
+                [0; SLOT_NONCE_LEN],
+                [0; KEY_LEN + SLOT_TAG_LEN],
+            )
+            .err()
+            .unwrap();
+            assert!(matches!(err, Error::InvalidField));
+        }
+
+        #[test]
+        fn over_long_cred_id_rejected() {
+            let err = SlotPayload::new(
+                DeniableKindTag::Fido2Passphrase,
+                vec![0; CRED_ID_MAX_LEN + 1],
+                Some([0; HMAC_SALT_LEN]),
+                Vec::new(),
+                [0; SLOT_NONCE_LEN],
+                [0; KEY_LEN + SLOT_TAG_LEN],
+            )
+            .err()
+            .unwrap();
+            assert!(matches!(err, Error::InvalidField));
+        }
+
+        #[test]
+        fn over_long_tpm_blob_rejected() {
+            let err = SlotPayload::new(
+                DeniableKindTag::TpmPassphrase,
+                Vec::new(),
+                None,
+                vec![0; TPM_BLOB_MAX_LEN + 1],
+                [0; SLOT_NONCE_LEN],
+                [0; KEY_LEN + SLOT_TAG_LEN],
+            )
+            .err()
+            .unwrap();
+            assert!(matches!(err, Error::InvalidField));
+        }
+
+        #[test]
+        fn decode_rejects_unknown_kind() {
+            let mut buf = [0u8; PAYLOAD_PLAINTEXT_LEN];
+            buf[0] = 0xff; // not a valid DeniableKindTag
+            let err = SlotPayload::decode(&buf).err().unwrap();
+            assert!(matches!(err, Error::InvalidField));
+        }
+
+        #[test]
+        fn decode_rejects_nonzero_reserved_bytes() {
+            // Encode a minimal passphrase payload then flip a
+            // reserved byte; decode must reject.
+            let mut buf = dummy_payload(DeniableKindTag::Passphrase).encode().unwrap();
+            buf[6] = 1;
+            let err = SlotPayload::decode(&buf).err().unwrap();
+            assert!(matches!(err, Error::InvalidField));
+        }
+
+        #[test]
+        fn decode_rejects_bad_hmac_salt_len() {
+            let mut buf = dummy_payload(DeniableKindTag::Fido2Passphrase)
+                .encode()
+                .unwrap();
+            buf[3] = 16; // valid values are 0 or 32
+            let err = SlotPayload::decode(&buf).err().unwrap();
+            assert!(matches!(err, Error::InvalidField));
+        }
+
+        #[test]
+        fn decode_rejects_over_budget_lengths() {
+            let mut buf = [0u8; PAYLOAD_PLAINTEXT_LEN];
+            buf[0] = DeniableKindTag::TpmFido2Passphrase as u8;
+            // cred_id_len = 1024 (max ok)
+            buf[1..3].copy_from_slice(&(CRED_ID_MAX_LEN as u16).to_le_bytes());
+            // hmac_salt_len = 32
+            buf[3] = HMAC_SALT_LEN as u8;
+            // tpm_blob_len = 3500 (max ok) — but joint = 1024 + 32 + 3500 = 4556 > 4000
+            buf[4..6].copy_from_slice(&(TPM_BLOB_MAX_LEN as u16).to_le_bytes());
+            let err = SlotPayload::decode(&buf).err().unwrap();
+            assert!(matches!(err, Error::InvalidField));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -802,28 +1299,68 @@ mod tests {
     }
 
     #[test]
-    fn invariant_5_domain_separation_distinct_keks() {
-        // INVARIANT 5: feeding the same secret through different
-        // credential derivations yields cryptographically independent
-        // KEKs. Using a shared 32-byte secret as both the FIDO2
-        // hmac-output AND the TPM-unsealed input MUST produce
-        // unequal KEKs.
+    fn invariant_5_v2_domain_separation_distinct_factors_keks() {
+        // INVARIANT 5 (v2): feeding the same secondary secrets through
+        // different DeniableCredential variants yields cryptographically
+        // independent KEK_factors. Reusing the same 32-byte secret as
+        // both an hmac-secret output AND a TPM-unsealed input MUST
+        // produce unequal factor KEKs for the relevant variants.
         let salt = test_salt();
         let secret = [0x99u8; 32];
-        let secret2 = [0xaau8; 32];
+        let other = [0xaau8; 32];
+        let env_kek = KeyEncryptionKey::from_bytes([0x42u8; KEY_LEN]);
 
-        let kek_fido2 = fido2_kek(&secret, &salt);
-        let kek_tpm = tpm_fido2_kek(&secret, &secret2, &salt);
-        let kek_pq = pq_hybrid_kek(&secret, &secret, &secret2, &salt);
+        let kek_fido2pp = DeniableCredential::Fido2Passphrase {
+            passphrase: b"x",
+            argon2: Argon2idParams::TEST_ONLY,
+            hmac_secret_output: &secret,
+        }
+        .derive_factors_kek(&salt, &env_kek);
+
+        let kek_tpmpp = DeniableCredential::TpmPassphrase {
+            passphrase: b"x",
+            argon2: Argon2idParams::TEST_ONLY,
+            unsealed: &secret,
+        }
+        .derive_factors_kek(&salt, &env_kek);
+
+        let kek_tpm_fido2pp = DeniableCredential::TpmFido2Passphrase {
+            passphrase: b"x",
+            argon2: Argon2idParams::TEST_ONLY,
+            unsealed: &secret,
+            hmac_secret_output: &other,
+        }
+        .derive_factors_kek(&salt, &env_kek);
+
         let kek_inner = inner_header_key(&MasterVolumeKey::from_bytes(secret), &salt);
 
         let pairs = [
-            ("fido2 vs tpm", kek_fido2.as_bytes(), kek_tpm.as_bytes()),
-            ("fido2 vs pq", kek_fido2.as_bytes(), kek_pq.as_bytes()),
-            ("tpm vs pq", kek_tpm.as_bytes(), kek_pq.as_bytes()),
-            ("fido2 vs inner", kek_fido2.as_bytes(), kek_inner.as_bytes()),
-            ("tpm vs inner", kek_tpm.as_bytes(), kek_inner.as_bytes()),
-            ("pq vs inner", kek_pq.as_bytes(), kek_inner.as_bytes()),
+            (
+                "fido2pp vs tpmpp",
+                kek_fido2pp.as_bytes(),
+                kek_tpmpp.as_bytes(),
+            ),
+            (
+                "fido2pp vs tpm+fido2pp",
+                kek_fido2pp.as_bytes(),
+                kek_tpm_fido2pp.as_bytes(),
+            ),
+            (
+                "tpmpp vs tpm+fido2pp",
+                kek_tpmpp.as_bytes(),
+                kek_tpm_fido2pp.as_bytes(),
+            ),
+            (
+                "fido2pp vs inner",
+                kek_fido2pp.as_bytes(),
+                kek_inner.as_bytes(),
+            ),
+            ("tpmpp vs inner", kek_tpmpp.as_bytes(), kek_inner.as_bytes()),
+            (
+                "tpm+fido2pp vs inner",
+                kek_tpm_fido2pp.as_bytes(),
+                kek_inner.as_bytes(),
+            ),
         ];
         for (label, a, b) in pairs.iter() {
             assert_ne!(
@@ -832,33 +1369,6 @@ mod tests {
                 label,
             );
         }
-    }
-
-    #[test]
-    fn fido2_hmac_salt_changes_per_credential() {
-        let salt = test_salt();
-        let cred_a = b"cred-a";
-        let cred_b = b"cred-b";
-        let s_a = fido2_hmac_salt(&salt, cred_a);
-        let s_b = fido2_hmac_salt(&salt, cred_b);
-        assert_ne!(
-            s_a, s_b,
-            "different credential IDs must give different hmac salts"
-        );
-    }
-
-    #[test]
-    fn fido2_hmac_salt_changes_per_vault() {
-        let cred = b"cred";
-        let salt_a = test_salt();
-        let mut salt_b = test_salt();
-        salt_b[0] ^= 0xff;
-        let s_a = fido2_hmac_salt(&salt_a, cred);
-        let s_b = fido2_hmac_salt(&salt_b, cred);
-        assert_ne!(
-            s_a, s_b,
-            "different vault salts must give different hmac salts"
-        );
     }
 
     #[test]
@@ -876,28 +1386,29 @@ mod tests {
     }
 
     #[test]
-    fn credential_kek_passphrase_round_trips() {
+    fn credential_envelope_kek_passphrase_round_trips() {
         let salt = test_salt();
         let cred = DeniableCredential::Passphrase {
             passphrase: b"hunter2",
             argon2: Argon2idParams::TEST_ONLY,
         };
-        let kek_a = cred.derive_kek(&salt).unwrap();
-        let kek_b = cred.derive_kek(&salt).unwrap();
+        let kek_a = cred.derive_envelope_kek(&salt).unwrap();
+        let kek_b = cred.derive_envelope_kek(&salt).unwrap();
         assert_eq!(
             kek_a.as_bytes(),
             kek_b.as_bytes(),
-            "same credential + same salt must derive identical KEKs",
+            "same credential + same salt must derive identical envelope KEKs",
         );
     }
 
     #[test]
-    fn credential_kek_all_variants_distinct() {
+    fn credential_factors_kek_all_variants_distinct() {
         // Identical secret material into every variant; the resulting
-        // KEKs MUST all differ thanks to per-variant HKDF info
+        // factor KEKs MUST all differ thanks to per-variant HKDF info
         // labels (security invariant #5 extended to the full
         // credential menu).
         let salt = test_salt();
+        let env_kek = KeyEncryptionKey::from_bytes([0x42u8; KEY_LEN]);
         let secret = [0x77u8; 32];
         let other = [0x88u8; 32];
         let third = [0x99u8; 32];
@@ -909,17 +1420,7 @@ mod tests {
                     passphrase: b"x",
                     argon2: Argon2idParams::TEST_ONLY,
                 }
-                .derive_kek(&salt)
-                .unwrap()
-                .as_bytes(),
-            ),
-            (
-                "fido2",
-                *DeniableCredential::Fido2 {
-                    hmac_secret_output: &secret,
-                }
-                .derive_kek(&salt)
-                .unwrap()
+                .derive_factors_kek(&salt, &env_kek)
                 .as_bytes(),
             ),
             (
@@ -929,16 +1430,8 @@ mod tests {
                     argon2: Argon2idParams::TEST_ONLY,
                     hmac_secret_output: &secret,
                 }
-                .derive_kek(&salt)
-                .unwrap()
+                .derive_factors_kek(&salt, &env_kek)
                 .as_bytes(),
-            ),
-            (
-                "tpm",
-                *DeniableCredential::Tpm { unsealed: &secret }
-                    .derive_kek(&salt)
-                    .unwrap()
-                    .as_bytes(),
             ),
             (
                 "tpm+passphrase",
@@ -947,18 +1440,18 @@ mod tests {
                     argon2: Argon2idParams::TEST_ONLY,
                     unsealed: &secret,
                 }
-                .derive_kek(&salt)
-                .unwrap()
+                .derive_factors_kek(&salt, &env_kek)
                 .as_bytes(),
             ),
             (
-                "tpm+fido2",
-                *DeniableCredential::TpmFido2 {
+                "tpm+fido2+passphrase",
+                *DeniableCredential::TpmFido2Passphrase {
+                    passphrase: b"x",
+                    argon2: Argon2idParams::TEST_ONLY,
                     unsealed: &secret,
                     hmac_secret_output: &other,
                 }
-                .derive_kek(&salt)
-                .unwrap()
+                .derive_factors_kek(&salt, &env_kek)
                 .as_bytes(),
             ),
             (
@@ -968,39 +1461,41 @@ mod tests {
                     argon2: Argon2idParams::TEST_ONLY,
                     mlkem_shared: &secret,
                 }
-                .derive_kek(&salt)
-                .unwrap()
+                .derive_factors_kek(&salt, &env_kek)
                 .as_bytes(),
             ),
             (
-                "pq+fido2",
-                *DeniableCredential::HybridPqFido2 {
+                "pq+fido2+passphrase",
+                *DeniableCredential::HybridPqFido2Passphrase {
+                    passphrase: b"x",
+                    argon2: Argon2idParams::TEST_ONLY,
                     mlkem_shared: &secret,
                     hmac_secret_output: &other,
                 }
-                .derive_kek(&salt)
-                .unwrap()
+                .derive_factors_kek(&salt, &env_kek)
                 .as_bytes(),
             ),
             (
-                "pq+tpm",
-                *DeniableCredential::HybridPqTpm {
+                "pq+tpm+passphrase",
+                *DeniableCredential::HybridPqTpmPassphrase {
+                    passphrase: b"x",
+                    argon2: Argon2idParams::TEST_ONLY,
                     mlkem_shared: &secret,
                     unsealed: &other,
                 }
-                .derive_kek(&salt)
-                .unwrap()
+                .derive_factors_kek(&salt, &env_kek)
                 .as_bytes(),
             ),
             (
-                "pq+tpm+fido2",
-                *DeniableCredential::HybridPqTpmFido2 {
+                "pq+tpm+fido2+passphrase",
+                *DeniableCredential::HybridPqTpmFido2Passphrase {
+                    passphrase: b"x",
+                    argon2: Argon2idParams::TEST_ONLY,
                     mlkem_shared: &secret,
                     unsealed: &other,
                     hmac_secret_output: &third,
                 }
-                .derive_kek(&salt)
-                .unwrap()
+                .derive_factors_kek(&salt, &env_kek)
                 .as_bytes(),
             ),
         ];
@@ -1009,7 +1504,7 @@ mod tests {
             for (r_label, r_kek) in keks.iter().skip(i + 1) {
                 assert_ne!(
                     l_kek, r_kek,
-                    "variants {} and {} produced identical KEKs - domain separation broken",
+                    "variants {} and {} produced identical factor KEKs - domain separation broken",
                     l_label, r_label,
                 );
             }
@@ -1017,20 +1512,20 @@ mod tests {
     }
 
     #[test]
-    fn credential_kek_changes_per_salt() {
+    fn credential_envelope_kek_changes_per_salt() {
         let salt_a = test_salt();
         let mut salt_b = test_salt();
         salt_b[0] ^= 0xff;
-        let secret = [0x42u8; 32];
-        let cred = DeniableCredential::Fido2 {
-            hmac_secret_output: &secret,
+        let cred = DeniableCredential::Passphrase {
+            passphrase: b"hunter2",
+            argon2: Argon2idParams::TEST_ONLY,
         };
-        let kek_a = cred.derive_kek(&salt_a).unwrap();
-        let kek_b = cred.derive_kek(&salt_b).unwrap();
+        let kek_a = cred.derive_envelope_kek(&salt_a).unwrap();
+        let kek_b = cred.derive_envelope_kek(&salt_b).unwrap();
         assert_ne!(
             kek_a.as_bytes(),
             kek_b.as_bytes(),
-            "different vault salts must give different KEKs",
+            "different vault salts must give different envelope KEKs",
         );
     }
 
@@ -1048,20 +1543,24 @@ mod tests {
             "passphrase",
         );
         assert_eq!(
-            DeniableCredential::Fido2 {
-                hmac_secret_output: &secret
+            DeniableCredential::Fido2Passphrase {
+                passphrase: b"x",
+                argon2: Argon2idParams::TEST_ONLY,
+                hmac_secret_output: &secret,
             }
             .label(),
-            "fido2",
+            "fido2+passphrase",
         );
         assert_eq!(
-            DeniableCredential::HybridPqTpmFido2 {
+            DeniableCredential::HybridPqTpmFido2Passphrase {
+                passphrase: b"x",
+                argon2: Argon2idParams::TEST_ONLY,
                 mlkem_shared: &secret,
                 unsealed: &secret,
                 hmac_secret_output: &secret,
             }
             .label(),
-            "pq+tpm+fido2",
+            "pq+tpm+fido2+passphrase",
         );
     }
 

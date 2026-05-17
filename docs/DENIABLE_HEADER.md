@@ -1,6 +1,9 @@
-# Deniable header format ("LUKSbox v1-deniable")
+# Deniable header format ("LUKSbox v2-deniable")
 
-**Status**: design specification; under implementation.
+**Status**: v2 design; under implementation. v1 (8 KiB header, 512 B
+slots, external `cred_id` / `hmac_salt` / `.tpm-blob` sidecars) was
+paused mid-implementation and is superseded; no public release ever
+shipped v1.
 
 LUKSbox's standard header (`docs/CRYPTO_SPEC.md`) stores plaintext
 markers - magic bytes, cipher suite ID, KDF ID, slot table - that
@@ -12,6 +15,60 @@ credential.
 
 This is opt-in at vault-creation time (`luksbox init --deniable`).
 Existing standard vaults are unaffected.
+
+## v2 design rationale (why we replaced v1)
+
+v1 wrapped only the 32-byte MVK inside each 512 B slot and required
+the user to supply every other piece of credential material at unlock
+time: `cred_id` and `hmac_salt` for FIDO2, the TPM-sealed blob (via
+a `.lbx.tpm` sidecar) for TPM, and the ML-KEM ciphertext (via a
+`.lbx.mlkem` sidecar) for hybrid-PQ. Two operational problems made
+this untenable:
+
+1. **Sidecars are a tell.** A `.lbx.tpm` next to a `vault.lbx` told a
+   forensic examiner the vault uses TPM, breaking deniability of the
+   credential type even though the vault file itself looked random.
+2. **External cred material is a UX trap.** Carrying around hex
+   `cred_id` blobs that "look random but aren't" defeats the entire
+   point - users either write them down where they leak, or lose
+   them and brick the vault.
+
+v2 solves both by **bumping the slot to 4 KiB** so it can carry the
+authenticator-bound material itself (`cred_id`, `hmac_salt`, TPM
+sealed blob) **inside the slot envelope**, wrapped under a
+passphrase-derived `KEK_envelope` so the slot still looks like uniform
+random on disk.
+
+Consequences:
+
+- **Passphrase is mandatory for every v2 deniable credential.** A
+  passphrase is the only discovery factor that can decrypt the slot
+  envelope without itself being inside the slot (chicken-and-egg). v1
+  "pure FIDO2" and "pure TPM" deniable modes are removed - they were
+  the modes that required external material in the first place.
+- **TPM sidecar (`.lbx.tpm`) is eliminated.** The sealed blob now
+  lives inside the v2 slot, wrapped by the passphrase envelope.
+- **FIDO2 `cred_id` and `hmac_salt` are no longer printed on a
+  recovery card.** The user only needs to remember their passphrase
+  + Argon2id parameters.
+- **ML-KEM sidecar (`.lbx.kyber`) is retained.** ML-KEM ciphertexts
+  (1568 B for ML-KEM-1024) and seed files have their own management
+  story already (sidecars served by the standard flow); folding them
+  into the slot envelope would force the same `m_cost` Argon2id
+  derivation to run over 2-3 KiB of payload per trial-decrypt and
+  gain no deniability benefit (the sidecar shape is itself wrapped
+  by a separate passphrase). v2 keeps the sidecar; the slot embeds
+  the per-vault ML-KEM share rather than the public-key blob.
+
+**Important: v2 changes ONLY affect deniable mode.** Standard
+(non-deniable) LUKSbox vaults are completely untouched. Pure-FIDO2,
+pure-TPM, pure-Hybrid-PQ keyslots remain fully supported there - the
+standard slot table is plaintext-keyed, the per-slot metadata
+declares its kind and carries `cred_id` / `hmac_salt` / TPM blob /
+ML-KEM ciphertext directly, and the unlock code reads them and drives
+the relevant authenticator without needing a passphrase as a
+discovery factor. The mandatory-passphrase rule exists solely to
+solve the deniable-mode chicken-and-egg problem.
 
 ## Threat model
 
@@ -27,9 +84,9 @@ the credential.
 | File-type tools (file(1), libmagic, yara) cannot identify the vault | yes |
 | Forensic analyst with LUKSbox knowledge cannot prove the file is a vault | yes |
 | Adversary cannot enumerate users / count slots | yes |
-| Adversary cannot identify which credential types are in use | yes (passphrase, FIDO2); partial (TPM, PQ-hybrid via sidecar) |
+| Adversary cannot identify which credential types are in use | yes (passphrase, FIDO2, TPM all in-slot); partial (PQ-hybrid via sidecar) |
 | Adversary cannot distinguish wrong-passphrase from wrong-cipher from wrong-KDF-params | yes (single AEAD failure mode) |
-| File-size pattern (8 KiB + N x 4 KiB) does not reveal LUKSbox | mitigated by optional `--pad-to <N>` quantization |
+| File-size pattern (~36 KiB header + N x 4 KiB) does not reveal LUKSbox | mitigated by optional `--pad-to <N>` quantization |
 | Per-chunk 4 KiB stride does not reveal LUKSbox | not addressed (same as standard mode; out of scope) |
 | Steganographic carrier (vault hidden inside PNG/JPEG/PDF) | not addressed (separate feature) |
 | Two vaults with same passphrase yield same wrapped MVK in slots | mild leak: forensic analyst who guesses the passphrase sees 2 slots match, learns ">=2 users share that passphrase" |
@@ -37,55 +94,109 @@ the credential.
 ## On-disk layout
 
 ```
-Offset (bytes)   Size       Content                          Looks like
---------------   ----       -------                          ----------
-0                32         Per-vault salt                   uniform random
-32               8 x 512    8 slots (any may be occupied)    uniform random
-4128             4064       Encrypted inner header           uniform random
-8192             ...        Chunked data area                uniform random
+Offset (bytes)   Size         Content                          Looks like
+--------------   ----         -------                          ----------
+0                32           Per-vault salt                   uniform random
+32               8 x 4096     8 slots (any may be occupied)    uniform random
+32800            4064         Encrypted inner header           uniform random
+36864            ...          Chunked data area                uniform random
 ```
 
-**Total header size: 8192 bytes** - identical to the standard format,
-so the deniable format does not introduce a new size tell.
+**Total header size: 36864 bytes (~36 KiB)** - larger than v1's
+8 KiB and larger than the standard format's 8 KiB, but still
+trivial on absolute terms and well below filesystem block-aligned
+overhead for any non-trivial vault. The size difference from the
+standard format is deliberately not aligned to any well-known
+multiple, so size alone is not a reliable LUKSbox fingerprint.
+`init --pad-to <N>` quantization remains available for users who
+want the file size to match a target distribution.
 
 The per-vault salt is the only "fixed structure" anywhere in the
 file. Since 32 bytes of uniform random is the unavoidable minimum
 prefix of any AEAD scheme, this leaks nothing on its own.
 
-## Per-slot structure
+## Per-slot structure (v2)
 
-Each slot is 512 bytes of indistinguishable ciphertext:
+Each slot is 4096 bytes of indistinguishable ciphertext:
 
 ```
-Slot layout (512 bytes):
-  [12B nonce] [32B encrypted MVK] [16B AEAD tag] [452B random padding]
+Slot layout (4096 bytes, after AEAD-decrypt with KEK_envelope):
+  [u8  kind]             credential variant tag (1 of 8)
+  [u16 cred_id_len]      FIDO2 credential id length, 0..=1024
+  [u8  hmac_salt_len]    32 if FIDO2 enabled, else 0
+  [u16 tpm_blob_len]     TPM2 sealed-blob length, 0 or 128..=3500
+  [u32 reserved]         set to 0; future-extension byte
+  [u8  cred_id[cred_id_len]]
+  [u8  hmac_salt[hmac_salt_len]]
+  [u8  tpm_blob[tpm_blob_len]]
+  [u8  wrapped_mvk_nonce[12]]
+  [u8  wrapped_mvk_ct_and_tag[48]]       AEAD(KEK_factors, MVK)
+  [random padding to fill 4068 bytes]    OsRng-filled at enroll time
+
+Encrypted as:
+  [u8  envelope_nonce[12]]
+  [u8  envelope_ct[4036 + 16]]           AEAD(KEK_envelope, payload, AAD)
 ```
 
-A slot is "occupied" iff AEAD-decrypting it with the candidate KEK
-produces a valid tag. An "empty" slot is 512 fresh `OsRng` bytes -
-under any secure AEAD's properties, occupied-slot ciphertext and
-empty-slot random are computationally indistinguishable.
+Two-layer encryption:
 
-The 452 bytes of padding inside an occupied slot are random bytes
-written at enrollment time and not subsequently verified. They exist
-so that all slots have identical on-disk layout regardless of how
-much per-slot metadata a future format might want; for v1 nothing
-uses them.
+- **Outer envelope** is sealed by `KEK_envelope = Argon2id(passphrase,
+  per_vault_salt, params)`. Trial-decrypt across all 8 slots at unlock
+  time recovers (cred_id, hmac_salt, tpm_blob, wrapped_mvk) if and
+  only if the user supplies the right passphrase + params.
+- **Inner `wrapped_mvk`** is sealed by `KEK_factors`, which combines
+  every secondary factor the slot's `kind` declares:
+
+  | kind | KEK_factors derivation |
+  |---|---|
+  | `Passphrase` | `KEK_envelope` itself (no inner factors; `wrapped_mvk` collapses to `AEAD(KEK_envelope, MVK)`) |
+  | `Fido2Passphrase` | `HKDF(per_vault_salt, KEK_envelope \|\| hmac_secret_output, "kek/fido2+passphrase")` |
+  | `TpmPassphrase` | `HKDF(per_vault_salt, KEK_envelope \|\| tpm_unsealed, "kek/tpm+passphrase")` |
+  | `TpmFido2Passphrase` | `HKDF(per_vault_salt, KEK_envelope \|\| tpm_unsealed \|\| hmac_secret_output, "kek/tpm+fido2+passphrase")` |
+  | `HybridPqPassphrase` | `HKDF(per_vault_salt, KEK_envelope \|\| mlkem_shared, "kek/pq+passphrase")` |
+  | `HybridPqFido2Passphrase` | adds `hmac_secret_output` |
+  | `HybridPqTpmPassphrase` | adds `tpm_unsealed` |
+  | `HybridPqTpmFido2Passphrase` | adds both |
+
+A slot is "occupied" iff AEAD-decrypting the outer envelope with the
+candidate `KEK_envelope` produces a valid tag. An "empty" slot is
+4096 fresh `OsRng` bytes - under any secure AEAD's properties,
+occupied-slot ciphertext and empty-slot random are computationally
+indistinguishable.
+
+Padding inside an occupied slot is random bytes written at enrollment
+time and not subsequently verified. It exists so every slot is the
+same wire length regardless of which credential variant occupies it -
+otherwise the envelope length itself would leak the slot kind.
 
 ## AEAD inputs (the binding details)
 
-For slot index `i`:
+For slot index `i`, the **outer envelope**:
+
+```
+plaintext  = payload (4036 bytes: kind || lens || cred_id || hmac_salt
+                     || tpm_blob || wrapped_mvk || random padding)
+key        = KEK_envelope (32 bytes, Argon2id-derived from passphrase)
+nonce      = random 12 bytes (fresh per slot enrollment)
+AAD        = b"luksbox-deniable-v2" || per_vault_salt || (i as u8)
+```
+
+For the **inner wrapped_mvk** at offset `payload_offset_of_wrapped_mvk`
+inside the decrypted payload:
 
 ```
 plaintext  = MVK (exactly 32 bytes)
-key        = KEK_i (32 bytes, derived per-credential, see below)
+key        = KEK_factors (32 bytes, HKDF-derived per the table above)
 nonce      = random 12 bytes (fresh per slot enrollment)
-AAD        = b"luksbox-deniable-v1" || per_vault_salt || (i as u8)
+AAD        = b"luksbox-deniable-v2/inner" || per_vault_salt || (i as u8)
 ```
 
-The AAD binds the slot to both (a) the format version and (b) the
-specific vault, preventing slot-shuffling attacks where an adversary
-copies bytes from one vault into another.
+The AAD binds each AEAD computation to (a) the format version, (b)
+the specific vault, and (c) the slot position, preventing
+slot-shuffling attacks across vaults or across slots within a vault.
+Outer and inner AADs are distinct (different prefix suffix) so a
+forged outer envelope cannot reuse an inner ciphertext from another
+slot.
 
 ## Inner header (offset 4128, length 4064)
 
@@ -123,10 +234,12 @@ labels in HKDF `info` strings (security invariant #5). All take the
 per-vault salt as input so two different vaults with the same
 credential produce different KEKs.
 
-### Passphrase
+`KEK_envelope` is always derived first, identically across every
+credential variant. The slot envelope cannot be opened without it -
+that is what makes the passphrase mandatory.
 
 ```
-KEK = Argon2id(
+KEK_envelope = Argon2id(
     password    = user_passphrase,
     salt        = per_vault_salt,
     m_cost_kib  = user_supplied_or_default,
@@ -136,115 +249,200 @@ KEK = Argon2id(
 )
 ```
 
-No on-disk per-slot data. User supplies the Argon2 parameters at
-unlock time; wrong parameters fail identically to a wrong passphrase.
+Wrong parameters fail identically to a wrong passphrase.
 
-### FIDO2 (hmac-secret extension)
+### Passphrase (no secondary factors)
 
 ```
-fido2_salt = HKDF(
-    salt = per_vault_salt,
-    ikm  = credential_id,
-    info = b"luksbox-deniable-v1/fido2-salt",
-    output_len = 32,
+KEK_factors = KEK_envelope
+wrapped_mvk = AEAD(KEK_factors, MVK, AAD = inner_aad(slot_idx))
+```
+
+`cred_id`, `hmac_salt`, `tpm_blob` are all empty (lengths = 0).
+
+### Fido2Passphrase
+
+User supplies a passphrase (envelope) AND taps their FIDO2 device
+(inner). At enroll time the host generates a fresh 32-byte random
+`hmac_salt` and a `cred_id` from `MakeCredential`; both are embedded
+in the slot envelope. At open time the host trial-decrypts the
+envelope, reads `cred_id` + `hmac_salt` out, then drives the
+authenticator:
+
+```
+hmac_secret_output = device.get_assertion(
+    rp_id = "luksbox",
+    cred_id,
+    hmac_secret_salt = hmac_salt,
 )
-hmac_output = device.get_assertion(rp_id, credential_id, hmac_secret_salt = fido2_salt)
-KEK = HKDF(
+KEK_factors = HKDF(
     salt = per_vault_salt,
-    ikm  = hmac_output,
-    info = b"luksbox-deniable-v1/fido2",
-    output_len = 32,
+    ikm  = KEK_envelope || hmac_secret_output,
+    info = b"luksbox-deniable-v2/kek/fido2+passphrase",
 )
+MVK = AEAD_open(KEK_factors, wrapped_mvk, AAD = inner_aad(slot_idx))
 ```
 
-No on-disk per-slot data. User supplies `credential_id` and `rp_id`
-at unlock time (they are remembered or stored in a password manager).
-Wrong `rp_id` -> wrong device assertion -> wrong KEK -> failed AEAD,
-indistinguishable from wrong passphrase.
+No external credential material to remember.
 
-### TPM + FIDO2 (sidecar required)
+### TpmPassphrase
+
+User supplies a passphrase (envelope) AND has the TPM chip the vault
+was sealed against (inner). At enroll time the host seals a 32-byte
+random `tpm_secret` via TPM2_Create / TPM2_Load + TPM2_PolicyAuthorize
+and embeds the sealed blob (~1.5-3 KB) in the slot envelope. At open
+time the host trial-decrypts the envelope, reads `tpm_blob` out, and
+unseals:
 
 ```
-tpm_secret      = TPM2_Unseal(sealed_blob)         // sealed_blob from sidecar
-fido2_kek       = FIDO2 KEK derivation above
-KEK = HKDF(
+tpm_unsealed = TPM2_Unseal(tpm_blob)
+KEK_factors = HKDF(
     salt = per_vault_salt,
-    ikm  = tpm_secret || fido2_kek,
-    info = b"luksbox-deniable-v1/tpm-fido2",
-    output_len = 32,
-)
-```
-
-The TPM sealed blob is a TPM2_PolicyAuthorize structure with a
-distinctive on-wire shape, it cannot be made indistinguishable from
-random bytes. It lives in a `<vault>.lbx.tpm` **sidecar** file that
-the user is expected to store on a separate device (USB key, paper,
-password manager export). The vault file itself stays opaque.
-
-If the adversary finds both the vault AND the sidecar on the same
-disk, deniability for this credential type is reduced - they learn
-the vault probably uses TPM. The vault file alone reveals nothing.
-
-### PQ-hybrid + FIDO2 (sidecar required)
-
-```
-classical_secret = HKDF(per_vault_salt, info=b"luksbox-deniable-v1/pq-classical")
-pq_shared        = ML_KEM_decap(ciphertext_from_sidecar, mlkem_secret_key)
-fido2_kek        = FIDO2 KEK derivation above
-KEK = HKDF(
-    salt = per_vault_salt,
-    ikm  = classical_secret || pq_shared || fido2_kek,
-    info = b"luksbox-deniable-v1/pq-hybrid",
-    output_len = 32,
+    ikm  = KEK_envelope || tpm_unsealed,
+    info = b"luksbox-deniable-v2/kek/tpm+passphrase",
 )
 ```
 
-ML-KEM-768 ciphertexts are 1,568 bytes - too large to fit in the
-512-byte slot. The ciphertext lives in a `<vault>.lbx.mlkem` sidecar
-on the same terms as the TPM sidecar above.
+No external sidecar.
 
-## Open ceremony
+### TpmFido2Passphrase
+
+Union of `TpmPassphrase` and `Fido2Passphrase`. Slot embeds both
+`tpm_blob` and `(cred_id, hmac_salt)`. Inner KEK combines all three
+factors:
+
+```
+KEK_factors = HKDF(
+    salt = per_vault_salt,
+    ikm  = KEK_envelope || tpm_unsealed || hmac_secret_output,
+    info = b"luksbox-deniable-v2/kek/tpm+fido2+passphrase",
+)
+```
+
+### HybridPq* (ML-KEM sidecar retained)
+
+ML-KEM-768 ciphertexts (1088 B) and seed files have their own
+passphrase-protected sidecar format (`.lbx.kyber`). v2 keeps the
+sidecar for ML-KEM material - folding it into the slot envelope
+gains no deniability (the sidecar is shaped by its own passphrase
+wrapper already) and forces a 1-2 KiB Argon2id input per
+trial-decrypt across the 8 slots.
+
+The slot envelope still embeds anything else the variant requires
+(`cred_id` + `hmac_salt` for hybrid+FIDO2 variants, `tpm_blob` for
+hybrid+TPM variants). The ML-KEM shared secret is computed at open
+time via `decap(ML-KEM secret key from sidecar, ciphertext from
+sidecar)` and contributes to `KEK_factors`.
+
+#### Optional separate seed-file passphrase
+
+The `.lbx.kyber` sidecar is wrapped by its own passphrase (Argon2id
+over the seed-file passphrase). At create time the user can either:
+
+- **Reuse the envelope passphrase** for the seed file (default; one
+  passphrase opens both). The GUI and TUI present the seed-file
+  passphrase field as optional with the hint "leave blank to reuse
+  the envelope passphrase above for both roles".
+- **Set a distinct seed-file passphrase** for a defense-in-depth
+  split: the envelope passphrase opens the slot envelope but the
+  seed file refuses to decrypt without the second passphrase. Both
+  must then be supplied at every unlock.
+
+At open time the unlock form shows the envelope passphrase field
+(required) plus the seed-file passphrase field (blank means "reuse
+envelope"). The decap helper prefers the explicit seed-file
+passphrase when non-empty and falls back to the envelope passphrase
+otherwise.
+
+| Choice | Create-time fields | Open-time fields |
+|---|---|---|
+| One passphrase (default) | Envelope passphrase (filled), seed-file passphrase (blank) | Envelope passphrase (filled), seed-file passphrase (blank) |
+| Distinct passphrases | Envelope passphrase + seed-file passphrase, both filled | Envelope passphrase + seed-file passphrase, both filled |
+
+The same passphrase-strength meter, "Generate strong passphrase"
+button, and empty-passphrase-confirm modal that protect the
+envelope passphrase also apply to the optional seed-file passphrase
+in both UIs.
+
+## Open ceremony (v2)
 
 ```
 1. Read first 32 bytes of vault file -> per_vault_salt.
-2. Read next 4096 bytes (8 slots x 512 B) -> slot table.
-3. For the supplied credential, derive KEK (per the per-credential
-   recipe above) using per_vault_salt and the user-supplied params.
+2. Read next 32768 bytes (8 slots x 4096 B) -> slot table.
+3. Derive KEK_envelope = Argon2id(passphrase, per_vault_salt, params).
 4. For slot_idx in 0..8:
-     try AEAD-decrypt slot[slot_idx] with KEK, AAD =
-       b"luksbox-deniable-v1" || per_vault_salt || (slot_idx as u8)
-     record (success, candidate_mvk) constant-time (no early exit).
-5. If any slot succeeded, use that MVK; otherwise return
-   ERROR_OPAQUE_UNLOCK_FAILED (the same error returned for every
-   wrong-credential / wrong-params / wrong-cipher case).
-6. Read 4064-byte encrypted inner header.
-7. AEAD-decrypt with MVK and the inner-header HKDF / AAD above.
-8. Parse inner header -> cipher_suite, kdf_id, flags, offsets.
-9. Hand off to the existing VFS open path.
+     try AEAD-decrypt slot[slot_idx] with KEK_envelope, AAD =
+       b"luksbox-deniable-v2" || per_vault_salt || (slot_idx as u8)
+     record (success, candidate_payload) - constant-time (no early
+     exit). Step 4 MUST iterate all 8 slots even after a match is
+     found - security invariant #2.
+5. If no slot's envelope decrypted, return ERROR_OPAQUE_UNLOCK_FAILED.
+   If multiple slots decrypted (the user reused the same passphrase
+   across slots, e.g. a passphrase slot + an enrolled FIDO2-passphrase
+   slot), select the slot whose `kind` matches the credential
+   variant the caller is asking to unlock with. Otherwise pick the
+   first match. (This kind-matching is what lets the same envelope
+   passphrase coexist across multiple credential combos in the same
+   vault; the constant-time iteration in step 4 is preserved.)
+6. Parse payload: read kind, cred_id_len, hmac_salt_len, tpm_blob_len,
+   then cred_id, hmac_salt, tpm_blob, wrapped_mvk_nonce,
+   wrapped_mvk_ct_and_tag.
+7. Drive secondary factors based on kind:
+   - Fido2*: device.get_assertion(rp_id="luksbox", cred_id, hmac_salt)
+     -> hmac_secret_output (requires user touch + UV/PIN).
+   - Tpm*: TPM2_Unseal(tpm_blob) -> tpm_unsealed (requires the right
+     TPM chip; for Tpm2Pin variants the user also supplies the PIN).
+   - HybridPq*: ML-KEM decap(.lbx.kyber ciphertext, .lbx.kyber secret
+     key) -> mlkem_shared.
+8. KEK_factors = HKDF(per_vault_salt, KEK_envelope || <secondary
+   secrets in canonical order>, info per kind).
+9. MVK = AEAD_open(KEK_factors, wrapped_mvk, AAD =
+   b"luksbox-deniable-v2/inner" || per_vault_salt || (slot_idx as u8)).
+10. Read 4064-byte encrypted inner header from offset 32800.
+11. AEAD-decrypt with MVK and the inner-header HKDF / AAD.
+12. Parse inner header -> cipher_suite, kdf_id, flags, offsets.
+13. Hand off to the existing VFS open path.
 ```
 
-Step 4 MUST iterate all 8 slots even after a match is found. See
-security invariant #2.
+Steps 7-9 only run for the matching slot (no constant-time
+discipline across slots beyond step 4), because they may need user
+interaction (FIDO2 touch / TPM PIN entry / sidecar passphrase) and
+running them 8x for an attacker-controlled non-match would generate
+spurious prompts. The constant-time invariant only applies to step 4
+(envelope discovery); once an envelope matches, the variant identity
+is revealed to the user and further work proceeds normally.
 
-## Init ceremony
+## Init ceremony (v2)
 
 ```
 1. Generate per_vault_salt (32 fresh OsRng bytes).
 2. Generate MVK (32 fresh OsRng bytes).
-3. Generate inner_header_nonce (12 fresh OsRng bytes).
-4. Choose target slot (default: slot 0).
-5. Derive initial credential KEK per the recipe.
-6. AEAD-encrypt MVK into slot[0], AAD as above.
-7. Fill slots 1..8 with 512 fresh OsRng bytes each.
-8. Build inner_header_plaintext with user-chosen cipher_suite, kdf_id,
-   flags, metadata_offset = 8192, data_offset = 8192, etc.
-9. AEAD-encrypt inner_header_plaintext with MVK-derived key.
-10. Write 8192 bytes to disk.
+3. Choose target slot (default: slot 0).
+4. Derive KEK_envelope = Argon2id(passphrase, per_vault_salt, params).
+5. Per credential variant:
+   - Fido2*: enroll a fresh discoverable credential via
+     MakeCredential, capture cred_id. Generate 32-byte random
+     hmac_salt. Call GetAssertion(cred_id, hmac_salt) to get
+     hmac_secret_output (also confirms enrollment worked end-to-end).
+   - Tpm*: seal a 32-byte random tpm_secret via TPM2_Create / Load /
+     PolicyAuthorize, capture tpm_blob (the sealed blob).
+   - HybridPq*: generate ML-KEM keypair, write .lbx.kyber sidecar
+     (encrypted with sidecar passphrase), capture mlkem_shared from
+     a fresh encap.
+6. Derive KEK_factors per the per-kind formula above.
+7. wrapped_mvk = AEAD_seal(KEK_factors, MVK, AAD = inner_aad).
+8. Build payload: kind || lens || cred_id || hmac_salt || tpm_blob
+   || wrapped_mvk_nonce || wrapped_mvk_ct_and_tag || OsRng padding
+   to fill 4036 bytes.
+9. envelope_ct = AEAD_seal(KEK_envelope, payload, AAD = outer_aad).
+10. Slot[slot_idx] = envelope_nonce || envelope_ct.
+11. Fill all other slots with 4096 fresh OsRng bytes each (invariant
+    #3).
+12. Build inner_header_plaintext with user-chosen cipher_suite,
+    kdf_id, flags, metadata_offset = 36864, data_offset = 36864, etc.
+13. AEAD-encrypt inner_header_plaintext with MVK-derived key.
+14. Write 36864 bytes to disk.
 ```
-
-The wrap nonce + ciphertext + tag for the occupied slot are placed
-at slot bytes [0..60], then 452 bytes of OsRng padding fill the
-rest of the slot.
 
 ## Slot lifecycle
 
@@ -282,24 +480,44 @@ rotation" below.
 
 ### MVK rotation (recommended after removing any user)
 
+Shipped via `deniable_header::rotate_mvk_v2` and the
+container-level wrapper `Container::rotate_mvk_v2_deniable`. The
+caller hands in `keep_slots = [(slot_idx, credential, material)]`
+naming the slots to preserve. The function:
+
 ```
-1. Generate new MVK.
-2. For each slot 0..8:
-     if MVK-holder has a KEK that decrypted the old slot
-       AND wishes to keep that user:
-         AEAD-encrypt new_MVK with that KEK into the slot,
-         using a FRESH nonce (and freshly-randomized 452B padding).
-     else:
-         overwrite slot with 512 fresh OsRng bytes.
-3. Re-encrypt inner header with the new MVK (fresh inner-header nonce).
-4. Re-encrypt all chunked data with subkeys derived from the new MVK.
-5. Atomic commit (write to .lbx.new + rename).
+1. Validate slot_idx range + reject duplicate slot_idx entries.
+2. Generate new MVK + new per_vault_salt.
+3. For each slot 0..8 (in a temp buffer): fill with fresh OsRng.
+4. For each (slot_idx, credential, material) in keep_slots:
+     a. Derive KEK_envelope_new = Argon2id(credential.passphrase,
+                                            new_per_vault_salt, params).
+     b. Derive KEK_factors_new = HKDF(new_per_vault_salt,
+                                       envelope_kek_new || <secondaries>,
+                                       info-per-kind).
+     c. Seal new MVK with KEK_factors_new (fresh inner nonce + AAD).
+     d. Build SlotPayload(kind, cred_id, hmac_salt, tpm_blob,
+                           wrapped_mvk_new) and seal the envelope
+                           with KEK_envelope_new (fresh outer nonce + AAD).
+     e. Overwrite slot_idx in the temp buffer.
+5. Re-encrypt inner header with new MVK (fresh inner-header nonce).
+6. Assemble new 36864-byte header in a temp buffer.
+7. Atomic commit: memcpy temp -> caller's buffer ONLY on full success.
+   On any earlier error the original header bytes are untouched.
 ```
 
-Step 2's "else" branch is critical: empty slots MUST also be
-re-randomized so that an adversary with before/after snapshots
+Step 3's universal-OsRng pre-fill is critical: empty slots MUST also
+be re-randomized so that an adversary with before/after snapshots
 cannot see "these N slots changed; those M did not" and infer
-occupancy. See security invariant #4.
+occupancy. See security invariant #4. The atomic commit pattern in
+step 7 ensures partial failures (TPM unseal mid-rotation, OS RNG
+failure, etc.) cannot leave the vault unbootable.
+
+Caller is responsible for re-supplying each kept credential's
+secondary outputs (`hmac_secret_output`, `tpm_unsealed`,
+`mlkem_shared`) - rotation re-keys the envelope + factors KEKs
+against the new salt, but the underlying authenticator material
+(cred_id, hmac_salt, tpm_blob) carries over byte-for-byte.
 
 ## Security invariants (acceptance criteria)
 
@@ -396,7 +614,7 @@ and a FIDO2 hmac-output, derived KEKs MUST be unequal.
 | Same passphrase across users -> same KEK -> multiple slots decrypt | Minor: one bit (">=2 users use this passphrase") only if the passphrase is already broken. |
 | `luksbox` binary itself is identifiable on the host | Out of scope; the deniable mode protects the vault file, not the user's software inventory. |
 
-## What the user must supply at unlock time
+## What the user must supply at unlock time (v2)
 
 ```mermaid
 flowchart LR
@@ -409,58 +627,49 @@ flowchart LR
     nd_slot --> nd_unlock
     nd_unlock --> nd_mvk(["MVK"])
   end
-  subgraph d["Deniable mode"]
+  subgraph d["Deniable mode (v2)"]
     direction TB
-    d_user["User<br/>(PIN / passphrase +<br/>cred_id, hmac_salt,<br/>.tpm-blob path,<br/>.kyber path, Argon2 params)"]
-    d_slot["On-disk slot:<br/>512 uniformly-random bytes<br/>wrapping only the MVK"]
-    d_unlock["Unlock code<br/>has no metadata;<br/>derives KEK from<br/>user-supplied inputs"]
+    d_user["User<br/>(passphrase + Argon2 params<br/>+ FIDO2 tap / TPM presence<br/>+ .kyber path for hybrid-PQ)"]
+    d_slot["On-disk slot:<br/>4096 uniformly-random bytes<br/>wrapping kind + cred_id +<br/>hmac_salt + tpm_blob + MVK"]
+    d_unlock["Unlock code<br/>has no metadata;<br/>extracts material from slot<br/>after passphrase opens envelope"]
     d_user --> d_unlock
     d_slot --> d_unlock
     d_unlock --> d_mvk(["MVK"])
   end
 ```
 
-In **non-deniable** mode every slot record on disk carries plaintext
-metadata next to the wrapped MVK: slot kind tag, `cred_id` for FIDO2,
-`hmac_salt` for FIDO2, TPM sealed blob, ML-KEM ciphertext, etc. At
-unlock the code reads those fields, drives the authenticator / TPM /
-KEM, derives the KEK, unwraps. The user only types their passphrase
-or PIN.
-
-Deniable mode cannot store any of that. Every byte of the 8 KiB
-header must look uniformly random (invariants 3 + 5), so a typed /
-length-prefixed metadata block would be an immediate format-tell
-("slot 2 declares kind=FIDO2"). The design therefore moves all
-non-secret credential material **out of the file** and onto the user.
-The slot ciphertext wraps only the 32-byte MVK; everything needed to
-derive the KEK comes in via CLI flags / wizard prompts / GUI fields.
-
-This is why the create-time recovery card prints values that the
-non-deniable flow never had to show:
+v2 moved every authenticator-bound piece of material into the slot
+envelope. The user's mental burden collapses to: **the passphrase,
+the Argon2id parameters, plus presence of whichever device the
+credential variant requires.** No more hex `cred_id` blobs, no more
+`.tpm-blob` sidecar path.
 
 | Credential combo | Must be remembered/saved | Why |
 |---|---|---|
 | Passphrase | passphrase + cipher + Argon2 params | Argon2 inputs aren't on disk; wrong params -> wrong KEK. |
-| FIDO2 | `cred_id` (hex) + `hmac_salt` (32-byte hex) + PIN | `cred_id` tells the authenticator *which* credential to assert; `hmac_salt` is the `hmac-secret` input. Either wrong -> wrong output -> wrong KEK. The PIN stays in the user's head. |
-| TPM | `.tpm-blob` sidecar path (+ chip-side PIN if `Tpm2Pin`) | TPM2-sealed blob is ~1.5-3 KB, far over the 512-byte slot budget, so it lives in a sidecar. Anyone seeing the sidecar next to the vault learns "TPM-backed"; store on USB / paper for at-rest deniability. Single-factor: the TPM is the only unlock material, no passphrase combined into the KEK. |
-| TPM + FIDO2 | `.tpm-blob` + `cred_id` + `hmac_salt` + FIDO2 PIN | Union of TPM + FIDO2 above. Single deniable slot, both factors required at unlock. |
-| PQ-passphrase | `.kyber` seed-file path + seed-file passphrase + vault passphrase + Argon2 params | `.kyber` carries the ML-KEM private seed; the `.hybrid` sidecar carries the public key + ciphertext. Same sidecar-tell tradeoff. |
-| PQ-FIDO2 / PQ-TPM / PQ-TPM-FIDO2 | Union of the components above | One sidecar per non-passphrase factor. |
+| Fido2Passphrase | passphrase + Argon2 params + the same FIDO2 device + its PIN/UV | `cred_id` and `hmac_salt` are embedded in the slot envelope; user just plugs in the device that was enrolled at create time. |
+| TpmPassphrase | passphrase + Argon2 params + the same TPM chip (+ chip-side PIN for Tpm2Pin) | `tpm_blob` is embedded in the slot envelope; user just opens the vault on the same machine whose TPM was sealed against. |
+| TpmFido2Passphrase | passphrase + Argon2 params + TPM chip + FIDO2 device + FIDO2 PIN | Union of TpmPassphrase + Fido2Passphrase. Single deniable slot, all three factors required at unlock. |
+| HybridPqPassphrase | passphrase + Argon2 params + `.kyber` sidecar path + sidecar passphrase | `.kyber` carries the ML-KEM seed; the per-vault encap result is embedded in the slot. |
+| HybridPqFido2Passphrase / HybridPqTpmPassphrase / HybridPqTpmFido2Passphrase | Union of HybridPq* with the FIDO2 / TPM additions | One sidecar (`.kyber`) plus the relevant devices. |
 
-The recovery card / TUI / `deniable-init` stdout prints every value
-above as soon as a vault is created. Lose any of them and the vault
-is unrecoverable -- there is no fallback path, no metadata, no fail-
-fast magic. This is the price of looking like uniform noise.
+The recovery card / TUI / `deniable-init` stdout prints the passphrase
++ Argon2 params + `.kyber` path (when applicable). Lose any of them
+and the vault is unrecoverable -- there is no fallback path, no
+metadata, no fail-fast magic. This is the price of looking like
+uniform noise.
 
-**Operational guidance for sidecars**: `.tpm-blob`, `.kyber`, and
-`.hybrid` files do not contain secrets a passive attacker can use
-(the TPM blob is bound to the TPM chip; the `.kyber` is encrypted
-under its own passphrase; the `.hybrid` only contains a public key +
-KEM ciphertext). But their *presence* tells an examiner the vault
-uses the matching credential type. For maximum deniability, keep
-sidecars off the same disk as the vault (USB key, paper QR, password
-manager attachment). Mount-time `--tpm-blob-path` / `--kyber-path`
-accept arbitrary paths so the sidecar can live anywhere.
+**Operational guidance for the remaining sidecar (`.kyber`)**: the
+file does not contain secrets a passive attacker can use (it's
+encrypted under its own passphrase) but its *presence* tells an
+examiner the vault uses hybrid-PQ. For maximum deniability keep the
+sidecar off the same disk as the vault (USB key, paper QR, password
+manager attachment). Mount-time `--kyber-path` accepts arbitrary
+paths so the sidecar can live anywhere.
+
+**No more TPM sidecar**: v1's `.lbx.tpm` file is gone. The TPM
+sealed blob now lives inside the slot envelope, indistinguishable
+from random to anyone without the passphrase.
 
 ## Operational gotchas
 
@@ -473,12 +682,19 @@ accept arbitrary paths so the sidecar can live anywhere.
   on bad magic; deniable mode cannot. This is intentional (no oracle
   for "is this a vault") but means typos are expensive (~1 second
   with default Argon2 cost).
-- **8 slots is a hard cap** for v1. For teams >8 we would need to
-  bump the format (v2 with 16 slots; same layout, new outer
-  identifier baked into the binary).
+- **8 slots is a hard cap** for v2. For teams >8 we would need to
+  bump the format (more slots; same layout, new outer identifier
+  baked into the binary).
 - **Atomic write**: header writes go through the existing
   `supports_atomic_rotation` path (.lbx.new + rename) when the
   inline-header storage is in use.
+- **Loss of any factor is fatal**: lose the FIDO2 device or wipe the
+  TPM and the slot is permanently unrecoverable. The slot envelope
+  decrypts (you can read out `cred_id` / `tpm_blob`) but the inner
+  `wrapped_mvk` cannot be opened without the secondary factor. Enroll
+  a backup passphrase-only slot (`enroll Passphrase` after create) if
+  you want a recovery path - it costs deniability of co-existence,
+  not of the file's overall random-looking shape.
 
 ## Comparison with related systems
 
@@ -491,39 +707,91 @@ accept arbitrary paths so the sidecar can live anywhere.
 
 ## Where the code lives
 
-| Concern | File(s) | Status |
+| Concern | File(s) | Status (v2) |
 |---|---|---|
-| Format primitives (slot layout, AEAD calls, AAD encoding, constant-time trial decryption) | `crates/luksbox-core/src/deniable.rs` | shipped |
-| KEK derivation per credential with HKDF domain separation | `crates/luksbox-core/src/deniable.rs` | shipped |
-| High-level `create_with_passphrase` / `open_with_passphrase` API | `crates/luksbox-format/src/deniable_header.rs` | shipped |
-| Slot lifecycle (`install_slot`, `clear_slot`, `rotate_mvk`) | `crates/luksbox-format/src/deniable_header.rs` | shipped |
-| CLI subcommands (`deniable-init`, `deniable-info`) | `crates/luksbox-cli/src/main.rs` | shipped |
-| Invariant tests (#1, #2, #3, #4, #5) | unit tests inside the two modules above | shipped |
-| Fuzz target (open path) | `fuzz/fuzz_targets/deniable_header_parse.rs` | shipped |
-| Container integration (full mount / metadata region / data area for deniable-header files) | `crates/luksbox-format/src/container.rs` (`create_with_credential_deniable`, `open_with_credential_deniable`, `enroll_credential_deniable`, `DeniableState` field, branched `persist_header`) | shipped |
-| CLI `deniable-init` / `deniable-mount` / `deniable-info` with full credential parity (`--credential` + per-type material flags) | `crates/luksbox-cli/src/main.rs` | shipped |
-| TUI wizard parity (per-combo create + open dispatch, recovery card) | `crates/luksbox-cli/src/wizard.rs` | shipped |
-| GUI init wizard + unlock dialog + recovery-card modal | `crates/luksbox-gui/src/app.rs`, `crates/luksbox-gui/src/ops.rs` | shipped |
-| Deniable single-slot TPM (Tpm2, Tpm2Pin, Tpm2Fido2, HybridPqTpm2*, HybridPqTpm2Fido2*) | `DeniableCredential::Tpm` / `TpmFido2` / `HybridPqTpm` / `HybridPqTpmFido2`; create path bypasses the 2-slot bootstrap and writes the multi-factor credential at slot 0 directly | shipped |
-| Windows TPM (deniable + non-deniable) | needs `tss-esapi` stable on Windows or TBS direct calls | **deferred** |
+| Format primitives, AAD encoding, constant-time trial decryption | `crates/luksbox-core/src/deniable.rs` | shipped |
+| KEK derivation (`derive_envelope_kek` + `derive_factors_kek`, two-layer) | `crates/luksbox-core/src/deniable.rs` | shipped |
+| Slot payload encoder / decoder (in-envelope `cred_id` / `hmac_salt` / `tpm_blob`) | `crates/luksbox-core/src/deniable.rs::slot_payload` | shipped |
+| High-level create / open / enroll API (v2 two-layer envelope) | `crates/luksbox-format/src/deniable_header.rs` | shipped |
+| Slot lifecycle (`install_slot_v2`, `clear_slot`, `rotate_mvk_v2`) | `crates/luksbox-format/src/deniable_header.rs` | shipped |
+| Container integration (mount / metadata / data area, no `.tpm-blob` sidecar) | `crates/luksbox-format/src/container.rs` | shipped |
+| `Container::rotate_mvk_v2_deniable` wrapper (atomic re-keying, syncs in-memory MVK + salt + cached header, marks `header_dirty`) | `crates/luksbox-format/src/container.rs` | shipped |
+| Variant-aware kind-matching envelope discovery (multi-slot vaults with shared passphrase resolve to the slot whose `kind` matches the requested credential) | `crates/luksbox-format/src/deniable_header.rs::try_open_envelope_v2` | shipped |
+| Optional separate `.kyber` seed-file passphrase (blank = reuse envelope) for HybridPq variants | `CreateOpts.hybrid_seed_pw`, `UnlockOpts.hybrid_seed_pw`, `deniable_pq_decap` | shipped |
+| CLI subcommands (no `--fido2-cred-id` / `--fido2-hmac-salt` / `--tpm-blob-path` flags) | `crates/luksbox-cli/src/main.rs` | shipped |
+| TUI wizard (passphrase mandatory, no recovery-card hex blobs, no `.tpm-blob` sidecar, optional seed-file passphrase with generator + empty-passphrase warning) | `crates/luksbox-cli/src/wizard.rs` | shipped |
+| GUI create + open dialog (two-phase open, embedded material, envelope + optional seed-file passphrase fields with strength meter + Generate button) | `crates/luksbox-gui/src/app.rs`, `crates/luksbox-gui/src/ops.rs` | shipped |
+| GUI add-keyslot modals (FIDO2, TPM, TPM+PIN, TPM+FIDO2, hybrid TPM, 3-factor hybrid; all branch on `is_deniable` and surface envelope passphrase + slot index + Argon2id strength) | `crates/luksbox-gui/src/app.rs` | shipped |
+| GUI enroll-into-deniable (`enroll_fido2_deniable`, `enroll_tpm2_deniable`, `enroll_tpm2_fido2_deniable`, `enroll_hybrid_pq_tpm2*_deniable` all take `passphrase` + `argon2`) | `crates/luksbox-gui/src/ops.rs` | shipped |
+| Invariant tests (#1, #2, #3, #4, #5) + v2 round-trip tests + slot-payload encode/decode tests + v2 rotation tests (4 round-trip / drop-slot / duplicate-idx / atomic-failure tests at the format level + 2 container-level tests) | unit tests inside the modules above | shipped |
+| Fuzz target (open path) | `fuzz/fuzz_targets/deniable_header_parse.rs` | shipped (retargeted at v2 envelope discovery + complete-open) |
+| Windows TPM (deniable + non-deniable) | needs `tss-esapi` stable on Windows or TBS direct calls | **deferred** (orthogonal to v2) |
+
+### v1 surface: fully removed
+
+All v1 deniable-mode code has been removed. The cleanup is
+complete:
+
+- v1 `DeniableCredential` variants (`Fido2`, `Tpm`, `TpmFido2`,
+  `HybridPqFido2`, `HybridPqTpm`, `HybridPqTpmFido2`) are gone;
+  only `*Passphrase` variants remain.
+- v1 single-step `DeniableCredential::derive_kek` wrapper is gone;
+  callers use the two-step `derive_envelope_kek` +
+  `derive_factors_kek` API.
+- v1 deniable_header functions (`create_with_passphrase`,
+  `open_with_passphrase`, `create_with_credential`,
+  `open_with_credential`, `install_slot`,
+  `install_slot_with_credential`, `rotate_mvk`) are gone; v2
+  equivalents (`create_with_credential_v2`, `try_open_envelope_v2`
+  + `complete_open_v2`, `install_slot_v2`) cover create / open /
+  enroll.
+- v1 `Container::create_with_credential_deniable`,
+  `open_with_credential_deniable`, `enroll_credential_deniable`
+  are gone. `create_with_passphrase_deniable`,
+  `open_with_passphrase_deniable`, and `enroll_passphrase_deniable`
+  remain as thin convenience methods that delegate to the v2
+  two-layer API (same byte format on disk).
+- v1 standalone helpers (`fido2_hmac_salt`, `fido2_kek`,
+  `tpm_fido2_kek`, `pq_hybrid_kek`) and the v1-compat HKDF labels
+  (`FIDO2_SALT`, `KEK_FIDO2`, `KEK_TPM`, `KEK_TPM_FIDO2`,
+  `KEK_PQ_FIDO2`, `KEK_PQ_TPM`, `KEK_PQ_TPM_FIDO2`, `FIDO2_KEK`,
+  `TPM_FIDO2_KEK`, `PQ_CLASSICAL`, `PQ_HYBRID_KEK`) are gone.
+- v1 `tpm_seal_for_deniable` + `tpm_blob_sidecar_path` GUI
+  helpers (which wrote `.tpm-blob` sidecars) are gone.
+
+All previously-deferred items have shipped:
+- **v2 rotation API**: `deniable_header::rotate_mvk_v2` + the
+  container-level `Container::rotate_mvk_v2_deniable` wrapper.
+  Re-keys each kept slot under a fresh `per_vault_salt` + new MVK,
+  re-randomises non-kept slots, atomically commits. 4 format-level
+  tests + 2 container-level tests.
+- **Fuzz target retarget**: `fuzz/fuzz_targets/deniable_header_parse.rs`
+  now exercises the v2 envelope-discovery + complete-open flow.
 
 ## Future work
 
 - **Windows TPM**: tracked in `docs/TPM_FUTURE_IMPROVEMENTS.md`. Once
   shipped, the deniable TPM combos light up automatically via the
-  same `DeniableCredential::Tpm*` variants.
+  same `DeniableCredential::Tpm*Passphrase` variants.
 - **Deniable anchor sidecar**: anchor file currently writes a plain
   32-byte challenge in deniable mode (`anchor.rs::deniable_write`).
   Indistinguishability holds for the file content; the sidecar
-  *presence* is the same kind of tell as `.tpm-blob` / `.kyber`.
+  *presence* is the same kind of tell as `.kyber`.
+- **ML-KEM material in-slot**: long-term we may fold ML-KEM
+  ciphertexts into the slot envelope too, eliminating the last
+  sidecar. Blocker is the Argon2id cost per trial-decrypt over ~2 KiB
+  of payload and the migration story for users with existing
+  `.kyber` files.
 
-## Deniable + TPM combos: always single-factor
+## Deniable + TPM / FIDO2 combos: single slot, passphrase mandatory
 
-Every TPM-bearing deniable combo (`Tpm`, `Tpm + FIDO2`, `Hybrid-PQ + TPM`,
-`Hybrid-PQ + TPM + FIDO2`) is forced to a single deniable slot at index 0
-carrying the multi-factor credential directly. The legacy "passphrase
-slot + multi-factor slot" shape that non-deniable mode used by default
-is **never** produced in deniable mode, regardless of UI checkboxes.
+Every TPM- or FIDO2-bearing deniable combo (`Fido2Passphrase`,
+`TpmPassphrase`, `TpmFido2Passphrase`, `Hybrid-PQ + (FIDO2|TPM|both) +
+Passphrase`) is created as a single deniable slot at the user's chosen
+index, carrying every credential factor inside the slot envelope. The
+legacy "passphrase bootstrap slot + multi-factor slot" shape that
+non-deniable mode used by default is **never** produced in deniable
+mode, regardless of UI checkboxes.
 
 The reason is the slot-enumeration foot-gun: deniable vaults can't list
 their slots, so an invisible second slot is unrevokable. A user who
@@ -531,9 +799,11 @@ ticked "add backup passphrase" once couldn't tell later whether the slot
 exists, and couldn't selectively clear it. So the deniable path skips
 the question and creates exactly the multi-factor slot the user asked
 for. If the user wants a backup passphrase, they enroll one explicitly
-via "Add slot", where they consciously pick the slot index and the
-recovery card prints it for the record.
+via "Add slot" (a Passphrase-only variant), where they consciously
+pick the slot index and the recovery card prints it for the record.
 
-This means: lose any factor in a deniable TPM combo and the vault is
-permanently unrecoverable. That's the trade the user accepted by picking
-the combo + deniable mode together.
+This means: lose any factor in a deniable TPM / FIDO2 combo and the
+vault is permanently unrecoverable. That's the trade the user accepted
+by picking the combo + deniable mode together. The passphrase alone
+opens the slot envelope but **not** the inner `wrapped_mvk` -
+losing the device is the same fatality as losing the passphrase.
