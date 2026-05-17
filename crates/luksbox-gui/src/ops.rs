@@ -315,6 +315,13 @@ pub struct UnlockOpts {
     pub deniable_kdf: KdfStrength,
 }
 
+// `Tpm2*` and `HybridPqTpm2*` variants are constructed only from
+// Linux+hardware code paths (the corresponding ops functions are
+// gated the same way). The enum is unconditionally defined so that
+// non-Linux builds can still match on `UnlockMethod` without cfg
+// noise at every match arm; allow `dead_code` so the otherwise-
+// unused variants do not generate warnings on macOS/Windows.
+#[cfg_attr(not(all(feature = "hardware", target_os = "linux")), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnlockMethod {
     Passphrase,

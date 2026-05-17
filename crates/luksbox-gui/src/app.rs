@@ -558,6 +558,10 @@ struct AddHybridTpm2Form {
 }
 
 impl AddHybridTpm2Form {
+    // Only called from the Linux-only modal triggers in `update`.
+    // Allow dead_code on non-Linux so the constructor coexists with
+    // the unconditionally-compiled struct definition without warning.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn new(kem_size: u16) -> Self {
         Self {
             kyber_path: String::new(),
@@ -595,6 +599,8 @@ struct AddHybridTpm2Fido2Form {
 }
 
 impl AddHybridTpm2Fido2Form {
+    // Same Linux-only constraint as `AddHybridTpm2Form::new` above.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     fn new(kem_size: u16) -> Self {
         Self {
             kyber_path: String::new(),
@@ -7019,6 +7025,11 @@ impl LuksboxApp {
                 let extras = form.extras;
                 let (tx, rx) = std::sync::mpsc::channel::<VaultRet<usize>>();
                 std::thread::spawn(move || {
+                    // `mut` is required on Linux+hardware (`enroll_tpm2_deniable`
+                    // takes `&mut v.vfs`); on other platforms the call
+                    // is cfg'd out, so the mutability is intentionally
+                    // unused there.
+                    #[allow(unused_mut)]
                     let mut v = v;
                     #[cfg(all(feature = "hardware", target_os = "linux"))]
                     let r = ops::enroll_tpm2_deniable(

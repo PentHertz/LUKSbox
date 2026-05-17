@@ -349,12 +349,27 @@ Full implementation shipped this revision:
   independence, mixed-kind rotation with partial keep set, and
   add-slot-of-different-kind after init. Each pins a specific bug
   that surfaced during the v1 -> v2 migration.
-- **New fuzz targets** for the v2 slot-payload codec:
-  `slot_payload_decode` (direct decoder, no Argon2id) and
-  `slot_payload_roundtrip` (`new` -> `encode` -> `decode` field
-  equality with attacker-controlled length triples). These cover
-  the trust boundary the audit hardened that the existing
-  `deniable_header_parse` fuzzer only reaches probabilistically.
+- **New fuzz targets** for the v2 slot-payload codec, in both
+  fuzzing setups: `slot_payload_decode` (direct decoder, no
+  Argon2id) and `slot_payload_roundtrip` (`new` -> `encode` ->
+  `decode` field equality with attacker-controlled length triples).
+  These cover the trust boundary the audit hardened that the
+  existing `deniable_header_parse` fuzzer only reaches
+  probabilistically. Each target now has both a libfuzzer harness
+  (`fuzz/fuzz_targets/`) and an AFL++ harness
+  (`fuzz-afl/src/bin/`) — different engines, different mutator
+  personalities, different bugs found. The previously-missing
+  `deniable_header_parse` AFL++ harness was added at the same time,
+  closing a pre-existing gap on the deniable surface.
+- **Shared fuzz seed corpus**:
+  `crates/luksbox-format/examples/gen_fuzz_seeds.rs` now writes
+  one curated seed per new target into both `fuzz/corpus/<target>/`
+  and `fuzz-afl/seeds/<target>/` so the two engines bootstrap from
+  the same regression inputs. Re-run with
+  `cargo run --example gen_fuzz_seeds -p luksbox-format`.
+- **AFL orchestration**: the three new targets are registered in
+  `scripts/fuzz_server.sh`'s `TARGETS` array so the "run all" path
+  and the per-target launcher pick them up automatically.
 - **Cross-platform deniable enroll gating.** Five call sites in
   `crates/luksbox-gui/src/app.rs` that invoke the
   Linux-only-`#[cfg]`-gated deniable TPM enroll helpers now have

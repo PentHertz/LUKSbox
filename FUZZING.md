@@ -52,22 +52,40 @@ cargo +nightly fuzz run header_parse -- -max_total_time=60
 
 ## Available targets
 
-Each target appears in both setups under the same name:
+Targets in **bold** appear in both setups under the same name (the
+shared subset that the orchestration scripts and CI both know
+about). A target listed only in `fuzz/` is libfuzzer-only.
 
-| Target | Parser tested | Attack surface |
-|---|---|---|
-| `header_parse` | `Header::from_bytes` (8 KB header) | Magic / version / slot table / offsets |
-| `keyslot_parse` | `Keyslot::from_bytes` (512 B slot) | Kind, KDF params, V1/V2/V3 layout selector, cred_id length cap (128 B for V1/V2, 352 B for V3), aad_version-driven offset dispatch |
-| `metadata_parse` | `metadata::read_metadata` pre-AEAD | Nonce, ct_len framing |
-| `header_roundtrip` | `Header::from_bytes` -> `to_bytes` -> `from_bytes` | Serializer/parser asymmetry. Asserts `aad_version`, `fido2_cred_id`, and `fido2_hmac_salt` round-trip byte-identical (catches V1/V2 vs V3 layout drift between read and write paths). |
-| `hybrid_sidecar_parse` | `hybrid_sidecar::read` (v1/v2) | Per-entry level byte -> variable entry size dispatch |
-| `seed_file_parse` | `seed_file::read` (`.kyber` files) | Magic, version, on-disk Argon2id params |
-| `auth_then_process` | post-AEAD bincode-decode of `DirectoryTree` (with fixed MVK) | Decoder length-cap, BTreeMap construction, UTF-8 child names |
+| Target | Parser tested | Attack surface | libfuzzer | AFL++ |
+|---|---|---|---|---|
+| **`header_parse`** | `Header::from_bytes` (8 KB header) | Magic / version / slot table / offsets | ✅ | ✅ |
+| **`keyslot_parse`** | `Keyslot::from_bytes` (512 B slot) | Kind, KDF params, V1/V2/V3 layout selector, cred_id length cap (128 B for V1/V2, 352 B for V3), aad_version-driven offset dispatch | ✅ | ✅ |
+| **`metadata_parse`** | `metadata::read_metadata` pre-AEAD | Nonce, ct_len framing | ✅ | ✅ |
+| `header_roundtrip` | `Header::from_bytes` -> `to_bytes` -> `from_bytes` | Serializer/parser asymmetry. Asserts `aad_version`, `fido2_cred_id`, and `fido2_hmac_salt` round-trip byte-identical (catches V1/V2 vs V3 layout drift between read and write paths). | ✅ | — |
+| **`hybrid_sidecar_parse`** | `hybrid_sidecar::read` (v1/v2) | Per-entry level byte -> variable entry size dispatch | ✅ | ✅ |
+| `hybrid_sidecar_adversarial` | `hybrid_sidecar::read` driven against a real vault | Duplicate-slot-idx, overrun, level-byte-mutation rejection | ✅ | — |
+| **`seed_file_parse`** | `seed_file::read` (`.kyber` files) | Magic, version, on-disk Argon2id params | ✅ | ✅ |
+| **`auth_then_process`** | post-AEAD bincode-decode of `DirectoryTree` (with fixed MVK) | Decoder length-cap, BTreeMap construction, UTF-8 child names | ✅ | ✅ |
+| `vfs_ops` | `Vfs::{mkdir,create,rename,unlink,lookup,readdir,write,flush}` with attacker-controlled name strings | UTF-8 garbage, embedded NUL, slashes, oversized, control chars, `..`, reserved Windows names | ✅ | — |
+| `webauthn_device_path` | `luksbox_fido2::webauthn_paths` device-path classifier | Windows-style FIDO HID path strings | ✅ | — |
+| `winfsp_path_parse` | `luksbox_mount::winfsp_path` parsers | Cross-platform path normalization (no FFI) | ✅ | — |
+| **`deniable_header_parse`** | v2 deniable open path (`try_open_envelope_v2` + `complete_open_v2`) | No-oracle property: every failure collapses to `Error::OpaqueUnlockFailed` | ✅ | ✅ |
+| **`slot_payload_decode`** | `SlotPayload::decode` (bypasses Argon2id) | Per-field caps, reserved-bytes-zero check, joint material budget, in-buffer offset arithmetic | ✅ | ✅ |
+| **`slot_payload_roundtrip`** | `SlotPayload::new` -> `encode` -> `decode` with attacker-controlled length triples | Encoder/decoder symmetry; constructor rejections always justified | ✅ | ✅ |
 
 `auth_then_process` is special: it requires a known MVK to encrypt
 fuzz bytes into a "valid" metadata blob, then exercises the decoder
-that runs **after** AEAD verification. The other six exercise
-attacker-pre-auth surfaces.
+that runs **after** AEAD verification. The other parser targets
+exercise attacker-pre-auth surfaces.
+
+The three deniable-v2 targets bottom of the table are the most
+recent additions (post 2026-05 cryptographic audit). They cover the
+trust boundary the audit hardened — `slot_payload_decode` directly
+fuzzes the structural validator on AEAD-verified envelope plaintext,
+`slot_payload_roundtrip` catches encoder/decoder asymmetries that
+would corrupt legitimate vaults across save/load, and
+`deniable_header_parse` exercises the full envelope-open flow with
+attacker-controlled passphrase + header buffer + cipher choice.
 
 ---
 
