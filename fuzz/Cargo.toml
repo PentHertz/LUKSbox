@@ -130,6 +130,34 @@ test = false
 doc = false
 bench = false
 
+# Slot-payload decoder: bypasses Argon2id and feeds arbitrary
+# PAYLOAD_PLAINTEXT_LEN-byte buffers directly into
+# `SlotPayload::decode`. Reaches the length-cap, reserved-byte, and
+# joint-material-budget checks that `deniable_header_parse` can only
+# reach if the fuzzer guesses a valid envelope KEK (effectively
+# never). Verifies: never panic, every rejection is exactly
+# `Error::InvalidField`, and any successful decode round-trips
+# byte-for-byte through `encode` (excluding the random padding tail).
+[[bin]]
+name = "slot_payload_decode"
+path = "fuzz_targets/slot_payload_decode.rs"
+test = false
+doc = false
+bench = false
+
+# Slot-payload round-trip: construct `SlotPayload` via `new()` from
+# attacker-controlled length triples, encode, decode, and check
+# field-by-field equality. Catches encoder/decoder asymmetries that
+# would cause legitimate vaults to corrupt themselves across
+# save/load - a class of bug unit tests miss because they only
+# exercise the eight canonical layouts.
+[[bin]]
+name = "slot_payload_roundtrip"
+path = "fuzz_targets/slot_payload_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
 # Fuzz binaries should not be part of the workspace; cargo-fuzz expects to
 # build them with sanitizers and -C codegen-units=1. Excluding from the
 # workspace lets us keep workspace-wide `cargo build` fast and unsanitized.

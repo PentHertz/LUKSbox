@@ -313,22 +313,6 @@ pub struct UnlockOpts {
     /// Argon2id strength preset the deniable vault was created with.
     /// Same wrong-value behaviour as `deniable_cipher`.
     pub deniable_kdf: KdfStrength,
-    /// FIDO2 deniable unlock: cred_id (hex) the user recorded at
-    /// create time. The deniable header does NOT store cred_id so
-    /// the user must keep it externally (recovery card from the
-    /// create dialog). Empty string when method is not Fido2 or
-    /// vault is not deniable.
-    pub deniable_fido2_cred_id_hex: String,
-    /// FIDO2 deniable unlock: hmac_salt (hex, 64 chars = 32 bytes)
-    /// the user recorded at create time.
-    pub deniable_fido2_hmac_salt_hex: String,
-    /// TPM deniable unlock: filesystem path to the user-managed
-    /// `.tpm-blob` sidecar holding the TPM2 sealed blob. The
-    /// deniable header doesn't store the blob (would fingerprint
-    /// the vault as TPM-using); the user keeps the sidecar
-    /// wherever they want (next to the vault, on USB, anywhere).
-    /// Empty when method doesn't use TPM.
-    pub deniable_tpm_blob_path: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1279,7 +1263,12 @@ pub fn create_vault_with_tpm_bootstrap(
     // v2 deniable bootstrap enroll: reuse the create-time passphrase
     // (captured into bootstrap_pw_owned before opts was moved) as the
     // new TPM-bearing slot's envelope passphrase. Same Argon2id params.
+    // Annotated `#[allow]` because the consumers below are all
+    // Linux-only via cfg gates; on macOS/Windows the bindings are
+    // technically unused but kept for symmetry with the dispatch.
+    #[allow(unused_variables)]
     let bootstrap_pw = bootstrap_pw_owned.as_str();
+    #[allow(unused_variables)]
     let bootstrap_argon2 = bootstrap_argon2_owned;
     let enroll_result: Result<usize, String> = match (kind, is_deniable) {
         #[cfg(all(feature = "hardware", target_os = "linux"))]
@@ -2096,8 +2085,14 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
             Container::try_open_envelope_v2_deniable(&opts.path, None, &env_cred, cipher)
                 .map_err(estr)?;
 
-        // Variant cross-check.
+        // Variant cross-check. The catch-all below covers
+        // platform/feature combos where some `UnlockMethod` variants
+        // are unreachable (e.g., TPM on macOS without the Linux
+        // hardware build). On Linux+hardware every variant is
+        // listed explicitly and the catch-all is structurally
+        // unreachable - allow the lint so the match stays portable.
         use luksbox_core::deniable::DeniableKindTag;
+        #[allow(unreachable_patterns)]
         let expected = match opts.method {
             UnlockMethod::Passphrase => DeniableKindTag::Passphrase,
             UnlockMethod::Fido2 => DeniableKindTag::Fido2Passphrase,
@@ -2124,9 +2119,18 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
 
         let payload_cred_id = envelope.payload().cred_id.clone();
         let payload_hmac_salt = envelope.payload().hmac_salt;
+        // Consumers below are Linux+hardware-gated; on macOS/Windows
+        // builds none of the unseal arms exist so the binding is
+        // dead. Allow rather than cfg-gate to keep the extraction
+        // logic symmetric across platforms.
+        #[allow(unused_variables)]
         let payload_tpm_blob = envelope.payload().tpm_blob.clone();
 
-        // Phase 2: drive secondaries, build full credential, complete open.
+        // Phase 2: drive secondaries, build full credential, complete
+        // open. Same portability note as the variant cross-check
+        // above: catch-all is structurally unreachable on
+        // Linux+hardware, allow the lint to keep the match portable.
+        #[allow(unreachable_patterns)]
         let cont = match opts.method {
             UnlockMethod::Passphrase => {
                 let cred = luksbox_core::deniable::DeniableCredential::Passphrase {
@@ -2531,41 +2535,13 @@ fn create_hybrid_pq_fido2_deniable(
 // combo-specific dispatch arms in `unlock_vault` call zero or more
 // of these and assemble the resulting `DeniableCredential` variant.
 
-/// Decode + validate a hex-encoded 32-byte salt from a user-pasted
-/// string. Used by FIDO2 deniable unlock for the hmac_salt field.
-fn parse_hex_32(s: &str, label: &str) -> Result<[u8; 32], String> {
-    let bytes = hex::decode(s.trim()).map_err(|_| format!("{label} must be hex"))?;
-    if bytes.len() != 32 {
-        return Err(format!("{label} must be 32 bytes ({} given)", bytes.len()));
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes);
-    Ok(out)
-}
-
-#[cfg(feature = "hardware")]
-fn deniable_fido2_hmac(opts: &UnlockOpts) -> Result<luksbox_fido2::HmacSecret, String> {
-    use luksbox_fido2::{Fido2Authenticator, RP_ID};
-    let pin = opts.pin.as_ref().ok_or("FIDO2 PIN required")?;
-    let cred_id = hex::decode(opts.deniable_fido2_cred_id_hex.trim()).map_err(|_| {
-        "FIDO2 credential ID must be hex; copy from the recovery card shown at create".to_string()
-    })?;
-    if cred_id.is_empty() {
-        return Err("FIDO2 credential ID required for deniable FIDO2 unlock".into());
-    }
-    let hmac_salt = parse_hex_32(&opts.deniable_fido2_hmac_salt_hex, "FIDO2 hmac_salt")?;
-    let mut auth = make_fido2_authenticator();
-    auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin))
-        .map_err(estr)
-}
-
 /// Deniable PQ-decap: reads the user's `.kyber` seed file at
 /// `opts.hybrid_kyber_path` using `opts.passphrase` (the seed
 /// passphrase), then runs ML-KEM decapsulation against the
 /// ciphertext in the existing `.hybrid` sidecar next to the vault.
 /// Returns the 32-byte shared secret to feed into a
 /// `DeniableCredential::HybridPq*` variant.
-fn deniable_pq_decap(opts: &UnlockOpts) -> Result<[u8; 32], String> {
+fn deniable_pq_decap(opts: &UnlockOpts) -> Result<Zeroizing<[u8; 32]>, String> {
     use luksbox_format::hybrid_sidecar;
     use luksbox_pq::seed_file;
     let kyber_path = opts
@@ -2592,14 +2568,11 @@ fn deniable_pq_decap(opts: &UnlockOpts) -> Result<[u8; 32], String> {
     let entry = entries
         .first()
         .ok_or_else(|| "hybrid sidecar is empty".to_string())?;
-    let shared =
-        luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext).map_err(estr)?;
-    // decapsulate_with returns Zeroizing<[u8; 32]>; copy out into
-    // a plain array. The Zeroizing wrapper drops here, wiping its
-    // copy; the returned array is short-lived in the calling
-    // dispatch arm and goes out of scope after the slot KEK is
-    // derived.
-    Ok(*shared)
+    // decapsulate_with returns Zeroizing<[u8; 32]>; pass it
+    // through unchanged so the caller borrows from the wrapper and
+    // the shared secret is wiped when the caller drops the
+    // returned value (after the slot KEK has been derived).
+    luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext).map_err(estr)
 }
 
 /// v2 GUI helper: drive the FIDO2 authenticator using cred_id +
@@ -2638,33 +2611,6 @@ fn deniable_tpm_unseal_from_bytes(
         Some(p) => sealer.unseal_with_pin(&blob, Some(p)).map_err(estr)?,
         None => sealer.unseal(&blob).map_err(estr)?,
     };
-    Ok(*unsealed)
-}
-
-/// Deniable TPM unseal: reads the user-managed `.tpm-blob` sidecar
-/// at `opts.deniable_tpm_blob_path` (a raw TPM2 sealed blob the
-/// vault creator saved at create time), then asks the local TPM to
-/// unseal it. Returns the 32-byte unsealed secret.
-#[cfg(all(feature = "hardware", target_os = "linux"))]
-fn deniable_tpm_unseal(opts: &UnlockOpts, pin: Option<&[u8]>) -> Result<[u8; 32], String> {
-    use luksbox_tpm::{SealedBlob, Tpm2Sealer};
-    let path = opts.deniable_tpm_blob_path.trim();
-    if path.is_empty() {
-        return Err(
-            "TPM deniable unlock requires the `.tpm-blob` sidecar path the vault creator saved"
-                .into(),
-        );
-    }
-    let blob_bytes = std::fs::read(path)
-        .map_err(|e| format!("failed to read TPM sidecar at {}: {}", path, e))?;
-    let blob = SealedBlob::from_bytes(&blob_bytes).map_err(estr)?;
-    let mut sealer = Tpm2Sealer::new().map_err(estr)?;
-    let unsealed = match pin {
-        Some(p) => sealer.unseal_with_pin(&blob, Some(p)).map_err(estr)?,
-        None => sealer.unseal(&blob).map_err(estr)?,
-    };
-    // unseal returns Zeroizing<[u8; 32]>; same pattern as the PQ
-    // helper - copy out, the Zeroizing wrapper wipes on drop.
     Ok(*unsealed)
 }
 
@@ -3431,15 +3377,6 @@ pub fn enroll_passphrase_deniable(
         .map_err(estr)?;
     cont.persist_header().map_err(estr)?;
     Ok(idx)
-}
-
-/// Deniable-mode slot clear at a specific slot index. Refuses to
-/// clear the admin's own unlock slot (Container-side guard).
-pub fn clear_deniable_slot(vfs: &mut Vfs, slot_idx: usize) -> Result<(), String> {
-    let cont = vfs.container_mut();
-    cont.clear_deniable_slot(slot_idx).map_err(estr)?;
-    cont.persist_header().map_err(estr)?;
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

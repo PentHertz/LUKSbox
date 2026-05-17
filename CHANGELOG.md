@@ -331,6 +331,49 @@ Full implementation shipped this revision:
   single-slot constructor, covering Tpm2, Tpm2Pin, Tpm2Fido2, and
   HybridPqTpm2 paths. Use the mocked-TPM closure so CI runs on
   every commit without real TPM hardware.
+- **Cryptographic security audit (round 11)** swept the deniable
+  v2 code paths for null-secret / zero-KEK fallbacks, nonce reuse,
+  AAD coverage, and material-zeroization gaps. Three real findings
+  shipped fixes (per-vault salt mixed into the inner-header AAD,
+  envelope plaintext wrapped in `Zeroizing`, `Zeroizing<[u8; 32]>`
+  propagated through `deniable_pq_decap` so the ML-KEM shared
+  secret is wiped after the slot KEK derives). False-positive
+  findings (variant enumeration via timing) documented in
+  `docs/DENIABLE_HEADER.md` § "Findings that look like leaks but
+  are not".
+- **New workflow / regression test suite** at
+  `crates/luksbox-format/tests/deniable_workflows.rs` (5 tests):
+  multi-slot mixed-kind enrollment with shared envelope passphrase,
+  cross-vault slot splicing rejection (regresses the per-vault salt
+  AAD binding), HybridPq envelope-pass / ML-KEM-shared
+  independence, mixed-kind rotation with partial keep set, and
+  add-slot-of-different-kind after init. Each pins a specific bug
+  that surfaced during the v1 -> v2 migration.
+- **New fuzz targets** for the v2 slot-payload codec:
+  `slot_payload_decode` (direct decoder, no Argon2id) and
+  `slot_payload_roundtrip` (`new` -> `encode` -> `decode` field
+  equality with attacker-controlled length triples). These cover
+  the trust boundary the audit hardened that the existing
+  `deniable_header_parse` fuzzer only reaches probabilistically.
+- **Cross-platform deniable enroll gating.** Five call sites in
+  `crates/luksbox-gui/src/app.rs` that invoke the
+  Linux-only-`#[cfg]`-gated deniable TPM enroll helpers now have
+  matching cfg gates with clear "requires the Linux hardware
+  build" errors on macOS / Windows, fixing CI failures on those
+  platforms.
+
+### Cleanup
+
+- Removed v1 leftover GUI helpers (`parse_hex_32`,
+  `deniable_fido2_hmac`, `deniable_tpm_unseal`, `clear_deniable_slot`)
+  and their UnlockForm / UnlockOpts companion string fields
+  (`deniable_fido2_cred_id_hex`, `deniable_fido2_hmac_salt_hex`,
+  `deniable_tpm_blob_path`). v2 embeds all that material in the
+  slot envelope, making the hex-input / sidecar-path GUI surface
+  obsolete.
+- Updated deprecated egui APIs (`Frame::none` -> `Frame::NONE`,
+  `Frame::rounding` -> `Frame::corner_radius`) so the workspace
+  builds without deprecation warnings.
 
 ---
 

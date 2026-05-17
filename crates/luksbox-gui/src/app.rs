@@ -353,17 +353,6 @@ struct UnlockForm {
     use_deniable: bool,
     deniable_cipher: CipherChoice,
     deniable_kdf: KdfStrength,
-    /// For `method == Fido2 && use_deniable`: the FIDO2 cred_id
-    /// (hex) the user saved at create time from the recovery
-    /// card. Empty otherwise. Standard FIDO2 unlock doesn't use
-    /// this (cred_id is stored in the on-disk keyslot).
-    deniable_fido2_cred_id_hex: String,
-    /// For `method == Fido2 && use_deniable`: the hmac-secret salt
-    /// (hex, 64 chars = 32 bytes) the user saved at create time.
-    deniable_fido2_hmac_salt_hex: String,
-    /// For `method == Tpm2*` + `use_deniable`: path to the
-    /// `.tpm-blob` sidecar holding the TPM2 sealed blob.
-    deniable_tpm_blob_path: String,
 }
 
 impl Default for UnlockForm {
@@ -383,9 +372,6 @@ impl Default for UnlockForm {
             use_deniable: false,
             deniable_cipher: CipherChoice::AesSiv,
             deniable_kdf: KdfStrength::Interactive,
-            deniable_fido2_cred_id_hex: String::new(),
-            deniable_fido2_hmac_salt_hex: String::new(),
-            deniable_tpm_blob_path: String::new(),
         }
     }
 }
@@ -922,6 +908,12 @@ struct DeniableRecoveryDisplay {
 /// rest of the vault state - currently a header-only utility
 /// because the full Container integration for deniable mode is
 /// deferred (see `docs/DENIABLE_HEADER.md` 'Deferred work' section).
+// `Verify` is constructed by the live deniable-utility modal flow;
+// `Create` is a placeholder for the long-deferred header-only
+// "create empty deniable header" utility (see comment above
+// `DeniableMode`). Allow `dead_code` so the placeholder stays in
+// place until that utility ships.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DeniableMode {
     Create,
@@ -994,6 +986,7 @@ struct DeniableModal {
     result: Option<Result<String, String>>,
 }
 
+#[allow(dead_code)]
 impl DeniableModal {
     fn create() -> Self {
         Self {
@@ -2181,9 +2174,6 @@ impl LuksboxApp {
             use_deniable: false,
             deniable_cipher: CipherChoice::AesSiv,
             deniable_kdf: KdfStrength::Interactive,
-            deniable_fido2_cred_id_hex: String::new(),
-            deniable_fido2_hmac_salt_hex: String::new(),
-            deniable_tpm_blob_path: String::new(),
         };
         self.view = View::Unlock;
     }
@@ -2590,20 +2580,29 @@ impl LuksboxApp {
                         }
                 });
                 ui.add_space(8.0);
-                ui.checkbox(
-                    &mut self.create.use_detached,
-                    "Use a detached header sidecar (the .lbx alone becomes opaque random, strongest at-rest posture)",
-                );
-                if self.create.use_detached {
-                    ui.label(RichText::new("Header sidecar path").color(theme::DIM).size(12.0));
-                    ui.horizontal(|ui| {
-                        let (field_w, browse_w) = trailing_button_row_widths(ui, FORM_FIELD_MAX_W, 90.0);
-                        ui.add_sized([field_w, CONTROL_H], egui::TextEdit::singleline(&mut self.create.header_path).hint_text(path_hints::usb("secret.hdr")));
-                        if ui.add_sized([browse_w, CONTROL_H], ghost_button("Browse...")).clicked()
-                            && let Some(p) = rfd::FileDialog::new().set_title("Header sidecar").save_file() {
-                                self.create.header_path = p.display().to_string();
-                            }
-                    });
+                // Detached-header sidecar is incompatible with deniable
+                // mode at the format level (`ops::create_vault` rejects
+                // the combo with "detached headers are not yet
+                // supported in deniable mode"). Hide the checkbox
+                // entirely when deniable is on so the user is not
+                // tempted to set a value that submit-time validation
+                // will reject.
+                if !self.create.use_deniable {
+                    ui.checkbox(
+                        &mut self.create.use_detached,
+                        "Use a detached header sidecar (the .lbx alone becomes opaque random, strongest at-rest posture)",
+                    );
+                    if self.create.use_detached {
+                        ui.label(RichText::new("Header sidecar path").color(theme::DIM).size(12.0));
+                        ui.horizontal(|ui| {
+                            let (field_w, browse_w) = trailing_button_row_widths(ui, FORM_FIELD_MAX_W, 90.0);
+                            ui.add_sized([field_w, CONTROL_H], egui::TextEdit::singleline(&mut self.create.header_path).hint_text(path_hints::usb("secret.hdr")));
+                            if ui.add_sized([browse_w, CONTROL_H], ghost_button("Browse...")).clicked()
+                                && let Some(p) = rfd::FileDialog::new().set_title("Header sidecar").save_file() {
+                                    self.create.header_path = p.display().to_string();
+                                }
+                        });
+                    }
                 }
                 // Deniable-header toggle. When checked the create flow
                 // dispatches to Container::create_with_passphrase_deniable
@@ -2621,9 +2620,13 @@ impl LuksboxApp {
                 );
                 // Snap the slot kind to Passphrase the moment the
                 // user toggles deniable on, so the Keyslot factor
-                // radios below render in a coherent state.
+                // radios below render in a coherent state. Also
+                // clear any stale detached-header selection so the
+                // hidden field doesn't get smuggled into submit.
                 if !prev_deniable && self.create.use_deniable {
                     self.create.kind = CreateKind::Passphrase;
+                    self.create.use_detached = false;
+                    self.create.header_path.clear();
                 }
                 if self.create.use_deniable {
                     ui.label(
@@ -4027,31 +4030,37 @@ impl LuksboxApp {
     /// leave a wide right margin inside each section.
     fn draw_unlock_form(&mut self, ui: &mut egui::Ui) {
         section(ui, "Sidecars", |ui| {
-            ui.checkbox(
-                &mut self.unlock.use_detached,
-                "This vault uses a detached header sidecar",
-            );
-            if self.unlock.use_detached {
-                ui.horizontal(|ui| {
-                    let (field_w, browse_w) =
-                        trailing_button_row_widths(ui, FORM_FIELD_MAX_W, 90.0);
-                    ui.add_sized(
-                        [field_w, CONTROL_H],
-                        egui::TextEdit::singleline(&mut self.unlock.header_path)
-                            .hint_text("path to .hdr"),
-                    );
-                    if ui
-                        .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
-                        .clicked()
-                        && let Some(p) = rfd::FileDialog::new()
-                            .set_title("Header sidecar")
-                            .pick_file()
-                    {
-                        self.unlock.header_path = p.display().to_string();
-                    }
-                });
+            // Detached headers are not supported in deniable mode
+            // (ops::unlock_vault rejects the combo). Hide the
+            // checkbox + path field when deniable is on so the
+            // user does not configure an option that won't apply.
+            if !self.unlock.use_deniable {
+                ui.checkbox(
+                    &mut self.unlock.use_detached,
+                    "This vault uses a detached header sidecar",
+                );
+                if self.unlock.use_detached {
+                    ui.horizontal(|ui| {
+                        let (field_w, browse_w) =
+                            trailing_button_row_widths(ui, FORM_FIELD_MAX_W, 90.0);
+                        ui.add_sized(
+                            [field_w, CONTROL_H],
+                            egui::TextEdit::singleline(&mut self.unlock.header_path)
+                                .hint_text("path to .hdr"),
+                        );
+                        if ui
+                            .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
+                            .clicked()
+                            && let Some(p) = rfd::FileDialog::new()
+                                .set_title("Header sidecar")
+                                .pick_file()
+                        {
+                            self.unlock.header_path = p.display().to_string();
+                        }
+                    });
+                }
+                ui.add_space(6.0);
             }
-            ui.add_space(6.0);
             ui.checkbox(
                 &mut self.unlock.use_anchor,
                 "Verify against a rollback-detection anchor sidecar",
@@ -4080,11 +4089,20 @@ impl LuksboxApp {
             // KDF dropdowns below are required (the user must have
             // recorded them at create time). Mutually exclusive
             // with the detached and anchor sidecar options in v1.
+            // Snap-clear `use_detached` when toggling deniable on
+            // so a previously-set sidecar path is not silently
+            // smuggled into the unlock attempt (the field is
+            // hidden above when deniable is on).
             ui.add_space(6.0);
+            let prev_unlock_deniable = self.unlock.use_deniable;
             ui.checkbox(
                 &mut self.unlock.use_deniable,
                 "This vault uses a deniable header (advanced)",
             );
+            if !prev_unlock_deniable && self.unlock.use_deniable {
+                self.unlock.use_detached = false;
+                self.unlock.header_path.clear();
+            }
             if self.unlock.use_deniable {
                 ui.label(
                     RichText::new("Cipher suite (must match create time)")
@@ -4725,9 +4743,6 @@ impl LuksboxApp {
                 CipherChoice::Chacha => luksbox_core::CipherSuite::ChaCha20Poly1305,
             },
             deniable_kdf: self.unlock.deniable_kdf,
-            deniable_fido2_cred_id_hex: self.unlock.deniable_fido2_cred_id_hex.clone(),
-            deniable_fido2_hmac_salt_hex: self.unlock.deniable_fido2_hmac_salt_hex.clone(),
-            deniable_tpm_blob_path: self.unlock.deniable_tpm_blob_path.clone(),
         };
         let needs_touch = matches!(
             opts.method,
@@ -5220,10 +5235,10 @@ impl LuksboxApp {
         // hits the mount. macFUSE doesn't have this issue (kext gates
         // the channel by /dev/macfuse* device-node permissions).
         if luksbox_mount::FUSE_BACKEND == "fuse-t" {
-            egui::Frame::none()
+            egui::Frame::NONE
                 .fill(theme::WARN.linear_multiply(0.12))
                 .stroke(egui::Stroke::new(1.0, theme::WARN))
-                .rounding(6.0)
+                .corner_radius(6.0)
                 .inner_margin(egui::Margin::symmetric(12, 10))
                 .show(ui, |ui| {
                     ui.label(
@@ -6822,13 +6837,23 @@ impl LuksboxApp {
                 std::thread::spawn(move || {
                     let mut v = v;
                     let r = if is_den {
-                        ops::enroll_tpm2_fido2_deniable(
-                            &mut v.vfs,
-                            extras.slot_idx,
-                            &pin,
-                            &extras.passphrase,
-                            extras.kdf.params(),
-                        )
+                        #[cfg(all(feature = "hardware", target_os = "linux"))]
+                        {
+                            ops::enroll_tpm2_fido2_deniable(
+                                &mut v.vfs,
+                                extras.slot_idx,
+                                &pin,
+                                &extras.passphrase,
+                                extras.kdf.params(),
+                            )
+                        }
+                        #[cfg(not(all(feature = "hardware", target_os = "linux")))]
+                        {
+                            let _ = (&extras, &pin);
+                            Err::<usize, String>(
+                                "deniable TPM enrollment requires the Linux hardware build".into(),
+                            )
+                        }
                     } else {
                         ops::enroll_tpm2_fido2(&mut v.vfs, &pin)
                     };
@@ -6919,12 +6944,22 @@ impl LuksboxApp {
                         // routes here as TPM-only-with-envelope.
                         // The PIN typed by the user is ignored.
                         let _ = pin;
-                        ops::enroll_tpm2_deniable(
-                            &mut v.vfs,
-                            extras.slot_idx,
-                            &extras.passphrase,
-                            extras.kdf.params(),
-                        )
+                        #[cfg(all(feature = "hardware", target_os = "linux"))]
+                        {
+                            ops::enroll_tpm2_deniable(
+                                &mut v.vfs,
+                                extras.slot_idx,
+                                &extras.passphrase,
+                                extras.kdf.params(),
+                            )
+                        }
+                        #[cfg(not(all(feature = "hardware", target_os = "linux")))]
+                        {
+                            let _ = &extras;
+                            Err::<usize, String>(
+                                "deniable TPM enrollment requires the Linux hardware build".into(),
+                            )
+                        }
                     } else {
                         ops::enroll_tpm2_pin(&mut v.vfs, &pin)
                     };
@@ -6985,12 +7020,20 @@ impl LuksboxApp {
                 let (tx, rx) = std::sync::mpsc::channel::<VaultRet<usize>>();
                 std::thread::spawn(move || {
                     let mut v = v;
+                    #[cfg(all(feature = "hardware", target_os = "linux"))]
                     let r = ops::enroll_tpm2_deniable(
                         &mut v.vfs,
                         extras.slot_idx,
                         &extras.passphrase,
                         extras.kdf.params(),
                     );
+                    #[cfg(not(all(feature = "hardware", target_os = "linux")))]
+                    let r = {
+                        let _ = (&v.vfs, &extras);
+                        Err::<usize, String>(
+                            "deniable TPM enrollment requires the Linux hardware build".into(),
+                        )
+                    };
                     let _ = tx.send((v, r));
                 });
                 self.pending = Some(Pending::EnrollTpm2 { rx });
@@ -7114,21 +7157,39 @@ impl LuksboxApp {
                 std::thread::spawn(move || {
                     let mut v = v;
                     let r = if is_den {
-                        let params = if kem_size == 1024 {
-                            luksbox_pq::PqParams::Ml1024
-                        } else {
-                            luksbox_pq::PqParams::Ml768
-                        };
-                        ops::enroll_hybrid_pq_tpm2_deniable(
-                            &mut v.vfs,
-                            extras.slot_idx,
-                            &vault_path,
-                            &kyber_path,
-                            &seed_pw,
-                            &extras.passphrase,
-                            extras.kdf.params(),
-                            params,
-                        )
+                        #[cfg(all(feature = "hardware", target_os = "linux"))]
+                        {
+                            let params = if kem_size == 1024 {
+                                luksbox_pq::PqParams::Ml1024
+                            } else {
+                                luksbox_pq::PqParams::Ml768
+                            };
+                            ops::enroll_hybrid_pq_tpm2_deniable(
+                                &mut v.vfs,
+                                extras.slot_idx,
+                                &vault_path,
+                                &kyber_path,
+                                &seed_pw,
+                                &extras.passphrase,
+                                extras.kdf.params(),
+                                params,
+                            )
+                        }
+                        #[cfg(not(all(feature = "hardware", target_os = "linux")))]
+                        {
+                            let _ = (
+                                &v.vfs,
+                                &extras,
+                                &vault_path,
+                                &kyber_path,
+                                &seed_pw,
+                                kem_size,
+                            );
+                            Err::<usize, String>(
+                                "deniable hybrid-PQ + TPM enrollment requires the Linux hardware build"
+                                    .into(),
+                            )
+                        }
                     } else {
                         ops::enroll_hybrid_pq_tpm2(
                             &mut v.vfs,
@@ -7266,22 +7327,41 @@ impl LuksboxApp {
                 std::thread::spawn(move || {
                     let mut v = v;
                     let r = if is_den {
-                        let params = if kem_size == 1024 {
-                            luksbox_pq::PqParams::Ml1024
-                        } else {
-                            luksbox_pq::PqParams::Ml768
-                        };
-                        ops::enroll_hybrid_pq_tpm2_fido2_deniable(
-                            &mut v.vfs,
-                            extras.slot_idx,
-                            &vault_path,
-                            &kyber_path,
-                            &seed_pw,
-                            &fido2_pin,
-                            &extras.passphrase,
-                            extras.kdf.params(),
-                            params,
-                        )
+                        #[cfg(all(feature = "hardware", target_os = "linux"))]
+                        {
+                            let params = if kem_size == 1024 {
+                                luksbox_pq::PqParams::Ml1024
+                            } else {
+                                luksbox_pq::PqParams::Ml768
+                            };
+                            ops::enroll_hybrid_pq_tpm2_fido2_deniable(
+                                &mut v.vfs,
+                                extras.slot_idx,
+                                &vault_path,
+                                &kyber_path,
+                                &seed_pw,
+                                &fido2_pin,
+                                &extras.passphrase,
+                                extras.kdf.params(),
+                                params,
+                            )
+                        }
+                        #[cfg(not(all(feature = "hardware", target_os = "linux")))]
+                        {
+                            let _ = (
+                                &v.vfs,
+                                &extras,
+                                &vault_path,
+                                &kyber_path,
+                                &seed_pw,
+                                &fido2_pin,
+                                kem_size,
+                            );
+                            Err::<usize, String>(
+                                "deniable hybrid-PQ + TPM + FIDO2 enrollment requires the Linux hardware build"
+                                    .into(),
+                            )
+                        }
                     } else {
                         ops::enroll_hybrid_pq_tpm2_fido2(
                             &mut v.vfs,

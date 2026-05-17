@@ -57,11 +57,25 @@ pub struct DeniableInnerHeader {
     pub chunk_size: u32,
 }
 
-/// Magic-equivalent for the inner header. Not on-disk - bound into
-/// the AAD of the inner-header AEAD so an attacker who somehow
-/// recovers the MVK still cannot substitute an arbitrary "looks like
-/// random plaintext" blob without it tripping the AAD check.
-const INNER_AAD: &[u8] = b"luksbox-deniable-v1/inner-header-aad";
+/// Static prefix for the inner-header AEAD AAD. The full AAD is
+/// `INNER_AAD_PREFIX || per_vault_salt`, built per call via
+/// `inner_header_aad()`. The per-vault salt is already in the
+/// inner-header KEK derivation (HKDF salt input) so this is
+/// belt-and-suspenders: future MVK-reuse scenarios that would
+/// otherwise allow swapping inner headers between vaults are
+/// rejected by the AAD check too.
+const INNER_AAD_PREFIX: &[u8] = b"luksbox-deniable-v2/inner-header-aad";
+
+/// Build the inner-header AEAD AAD: `INNER_AAD_PREFIX || per_vault_salt`.
+/// Used by create / open / rotate so an inner-header ciphertext
+/// from one vault cannot decrypt against another vault's MVK even
+/// if the MVK is somehow shared.
+fn inner_header_aad(per_vault_salt: &[u8; DENIABLE_SALT_SIZE]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(INNER_AAD_PREFIX.len() + DENIABLE_SALT_SIZE);
+    aad.extend_from_slice(INNER_AAD_PREFIX);
+    aad.extend_from_slice(per_vault_salt);
+    aad
+}
 
 /// Plaintext size of the inner header (bytes). 28 bytes of AEAD
 /// overhead (12 nonce + 16 tag) inside a 4064-byte region leaves
@@ -329,11 +343,12 @@ pub fn create_with_credential_v2(
     let inner_key = deniable::inner_header_key(&mvk, &per_vault_salt);
     let mut inner_nonce = [0u8; SLOT_NONCE_LEN];
     deniable::fill_random(&mut inner_nonce).map_err(Error::Crypto)?;
+    let inner_aad_bytes = inner_header_aad(&per_vault_salt);
     let inner_ct = aead::seal(
         cipher_suite,
         inner_key.as_bytes(),
         &inner_nonce,
-        INNER_AAD,
+        &inner_aad_bytes,
         &inner_pt,
     )
     .map_err(Error::Crypto)?;
@@ -425,10 +440,17 @@ pub fn try_open_envelope_v2(
             env_ct,
         );
         if let Ok(pt) = pt_res {
+            // Wrap the AEAD plaintext (envelope payload, holds
+            // cred_id + hmac_salt + tpm_blob in the clear) so it is
+            // wiped on drop. `buf` is a stack-allocated copy used
+            // by the decoder; explicitly zeroize before scope exit.
+            let pt = Zeroizing::new(pt);
             if pt.len() == luksbox_core::deniable::slot_payload::PAYLOAD_PLAINTEXT_LEN {
-                let mut buf = [0u8; luksbox_core::deniable::slot_payload::PAYLOAD_PLAINTEXT_LEN];
-                buf.copy_from_slice(&pt);
-                if let Ok(payload) = SlotPayload::decode(&buf) {
+                let mut buf = Zeroizing::new(
+                    [0u8; luksbox_core::deniable::slot_payload::PAYLOAD_PLAINTEXT_LEN],
+                );
+                buf.copy_from_slice(&pt[..]);
+                if let Ok(payload) = SlotPayload::decode(&*buf) {
                     candidates.push((slot_idx, payload));
                 }
             }
@@ -509,11 +531,12 @@ pub fn complete_open_v2(
         .unwrap();
     let inner_ct = &opened.inner_header_region[SLOT_NONCE_LEN..DENIABLE_INNER_SIZE];
     let inner_key = deniable::inner_header_key(&mvk, &opened.per_vault_salt);
+    let inner_aad_bytes = inner_header_aad(&opened.per_vault_salt);
     let inner_pt = match aead::open(
         cipher_suite,
         inner_key.as_bytes(),
         &nonce,
-        INNER_AAD,
+        &inner_aad_bytes,
         inner_ct,
     ) {
         Ok(pt) => Zeroizing::new(pt),
@@ -773,11 +796,12 @@ pub fn rotate_mvk_v2(
     let inner_key = deniable::inner_header_key(&new_mvk, &new_per_vault_salt);
     let mut inner_nonce = [0u8; SLOT_NONCE_LEN];
     deniable::fill_random(&mut inner_nonce).map_err(Error::Crypto)?;
+    let inner_aad_bytes = inner_header_aad(&new_per_vault_salt);
     let inner_ct = aead::seal(
         cipher_suite,
         inner_key.as_bytes(),
         &inner_nonce,
-        INNER_AAD,
+        &inner_aad_bytes,
         &inner_pt,
     )
     .map_err(Error::Crypto)?;

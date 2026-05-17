@@ -614,6 +614,50 @@ and a FIDO2 hmac-output, derived KEKs MUST be unequal.
 | Same passphrase across users -> same KEK -> multiple slots decrypt | Minor: one bit (">=2 users use this passphrase") only if the passphrase is already broken. |
 | `luksbox` binary itself is identifiable on the host | Out of scope; the deniable mode protects the vault file, not the user's software inventory. |
 
+### Findings that look like leaks but are not (audit notes)
+
+The 2026-05 cryptographic audit surfaced three candidate side-channel
+findings that initially appeared to leak credential metadata. All
+three are gated by *first* knowing the envelope passphrase, after
+which the slot's `kind_tag` is in plaintext anyway. They are recorded
+here so future audits do not re-raise them.
+
+1. **Variant enumeration via "kind_tag mismatch" timing.** An
+   attacker who can submit unlock attempts and time them precisely
+   might hope to distinguish "AEAD verified but kind_tag did not
+   match the requested credential" from "AEAD failed". The
+   AEAD-verify step requires the envelope KEK, which requires the
+   passphrase. Once the AEAD has verified, the attacker has the
+   full SlotPayload plaintext (kind tag, cred_id, hmac_salt,
+   tpm_blob) -- learning *which* kind via timing is strictly less
+   information than what they already hold. No new leakage.
+
+2. **Phase-1 vs phase-2 timing in `try_open_envelope_v2` /
+   `complete_open_v2`.** Phase 1 trial-decrypts all 8 slots with
+   the envelope KEK; phase 2 derives the per-credential KEK and
+   unwraps the MVK. The two phases have different runtimes (phase 2
+   includes HKDF, possibly TPM unseal, possibly an FIDO2 round
+   trip). An attacker observing only "phase 1 finished, phase 2 did
+   not run" learns "no slot matched this envelope passphrase". This
+   is the standard wrong-passphrase signal that any KDF-gated
+   format exhibits and does not distinguish vault contents.
+
+3. **Kind-matching fallback when multiple slots share an envelope
+   passphrase.** When two slots are enrolled with the same
+   envelope passphrase but different credential kinds (e.g.,
+   passphrase-only + FIDO2+passphrase), phase 1 returns multiple
+   candidate payloads. The code prefers the candidate whose kind
+   matches the requested unlock variant. The kind tag is part of
+   the AEAD-verified plaintext, so by the time this preference
+   runs, the attacker who could observe it would already hold the
+   envelope passphrase -- and thus the plaintext kind tags
+   directly. Again no new leakage.
+
+The actionable hardening from the audit (per-vault salt mixed into
+the inner-header AAD, envelope plaintext wrapped in `Zeroizing`,
+`Zeroizing<[u8; 32]>` propagated through the hybrid-PQ decapsulation
+return type) has shipped.
+
 ## What the user must supply at unlock time (v2)
 
 ```mermaid
@@ -724,7 +768,9 @@ from random to anyone without the passphrase.
 | GUI add-keyslot modals (FIDO2, TPM, TPM+PIN, TPM+FIDO2, hybrid TPM, 3-factor hybrid; all branch on `is_deniable` and surface envelope passphrase + slot index + Argon2id strength) | `crates/luksbox-gui/src/app.rs` | shipped |
 | GUI enroll-into-deniable (`enroll_fido2_deniable`, `enroll_tpm2_deniable`, `enroll_tpm2_fido2_deniable`, `enroll_hybrid_pq_tpm2*_deniable` all take `passphrase` + `argon2`) | `crates/luksbox-gui/src/ops.rs` | shipped |
 | Invariant tests (#1, #2, #3, #4, #5) + v2 round-trip tests + slot-payload encode/decode tests + v2 rotation tests (4 round-trip / drop-slot / duplicate-idx / atomic-failure tests at the format level + 2 container-level tests) | unit tests inside the modules above | shipped |
-| Fuzz target (open path) | `fuzz/fuzz_targets/deniable_header_parse.rs` | shipped (retargeted at v2 envelope discovery + complete-open) |
+| Workflow / regression tests (multi-slot mixed kinds, cross-vault splice rejection, HybridPq pass/shared independence, mixed-kind rotation, add-slot-of-different-kind) | `crates/luksbox-format/tests/deniable_workflows.rs` | shipped |
+| Fuzz target (envelope open path) | `fuzz/fuzz_targets/deniable_header_parse.rs` | shipped (retargeted at v2 envelope discovery + complete-open) |
+| Fuzz targets (slot-payload decoder + round-trip) | `fuzz/fuzz_targets/slot_payload_decode.rs`, `fuzz/fuzz_targets/slot_payload_roundtrip.rs` | shipped (bypass Argon2id, hit `SlotPayload::decode`/`encode` directly) |
 | Windows TPM (deniable + non-deniable) | needs `tss-esapi` stable on Windows or TBS direct calls | **deferred** (orthogonal to v2) |
 
 ### v1 surface: fully removed
@@ -767,6 +813,72 @@ All previously-deferred items have shipped:
   tests + 2 container-level tests.
 - **Fuzz target retarget**: `fuzz/fuzz_targets/deniable_header_parse.rs`
   now exercises the v2 envelope-discovery + complete-open flow.
+
+## Test coverage matrix
+
+Each automated test pins a specific behavioural contract. A future
+change that breaks any of these should fail loudly. If you're adding
+a new credential combo or changing the open ceremony, scan this
+table for the regression you need to update.
+
+### Unit tests (inline in `crates/luksbox-format/src/deniable_header.rs`)
+
+| Test | Pins |
+|---|---|
+| `v2_create_then_open_round_trips_passphrase_only` | Single-slot Passphrase create + open + MVK match. |
+| `v2_round_trip_with_fido2_material_embedded` | Slot envelope correctly carries `cred_id` + `hmac_salt`; recovered on open. |
+| `v2_round_trip_with_tpm_blob_embedded` | Slot envelope carries the TPM2 sealed blob; recovered on open. |
+| `v2_wrong_passphrase_returns_opaque_error` | Wrong passphrase fails with `Error::OpaqueUnlockFailed` (no oracle). |
+| `v2_complete_open_rejects_variant_mismatch` | Slot with `kind=Passphrase` won't open against `Fido2Passphrase` credential. |
+| `v2_rotate_mvk_round_trips_with_kept_slots` | After rotation, the kept slot still opens and yields the new MVK. |
+| `v2_rotate_mvk_with_dropped_slot_loses_that_credential` | Dropped slot's credential opaquely fails post-rotation. |
+| `v2_rotate_mvk_rejects_duplicate_slot_indices` | `rotate_mvk_v2` refuses a `keep_slots` list with duplicate indices. |
+| `v2_rotate_mvk_leaves_header_intact_on_failure` | Mid-rotation error leaves the in-memory header bytes untouched. |
+| `inner_header_parser_rejects_*` (4 tests) | Tag-forged inner-header values (oversized metadata, bad chunk size, offset inversions) are rejected. |
+
+### Slot-payload unit tests (inline in `crates/luksbox-core/src/deniable.rs::slot_payload`)
+
+| Test | Pins |
+|---|---|
+| `round_trip_every_kind` | All 8 `DeniableKindTag` variants survive encode + decode. |
+| `encoded_length_is_constant_regardless_of_variant` | Envelope ciphertext length doesn't leak kind. |
+| `over_budget_material_rejected_at_construct` / `over_long_cred_id_rejected` / `over_long_tpm_blob_rejected` | Constructor enforces per-field and joint material caps. |
+| `decode_rejects_unknown_kind` / `decode_rejects_nonzero_reserved_bytes` / `decode_rejects_bad_hmac_salt_len` / `decode_rejects_over_budget_lengths` | Decoder enforces structural bounds on tag-forged input. |
+
+### Workflow / regression tests (`crates/luksbox-format/tests/deniable_workflows.rs`)
+
+These exercise multi-slot or multi-vault scenarios that broke during
+the v1 -> v2 migration and would otherwise have no coverage.
+
+| Test | Regression target |
+|---|---|
+| `multi_slot_mixed_kinds_each_credential_opens_its_own_slot` | Kind-matching candidate selection in `try_open_envelope_v2` for vaults where two slots share an envelope passphrase but differ in kind. |
+| `cross_vault_slot_splice_is_rejected` | Per-vault salt mixed into inner-header AAD: a slot lifted from vault A and pasted into vault B's slot table must fail to open with B's passphrase. |
+| `hybrid_envelope_pass_and_mlkem_shared_are_independent_inputs` | Envelope KEK depends only on passphrase (phase 1 succeeds with right pass + wrong shared), factors KEK binds the shared (phase 2 fails). |
+| `rotation_with_mixed_kept_set_preserves_kept_and_drops_others` | `rotate_mvk_v2` with a mixed-kind `keep_slots` keeps the right credentials and drops the rest. |
+| `add_slot_of_different_kind_after_init_round_trips_both_slots` | `install_slot_v2` can add a TPM (or FIDO2) slot to a vault that was init'd as Passphrase-only, without the dispatch error "credential kind mismatch". |
+
+### Fuzz targets (`fuzz/fuzz_targets/`)
+
+| Target | Surface | Invariants |
+|---|---|---|
+| `deniable_header_parse` | Full v2 open path (`try_open_envelope_v2` + `complete_open_v2`) with attacker-controlled bytes + passphrase + cipher | Never panics; every failure collapses to `Error::OpaqueUnlockFailed` (no oracle leakage). |
+| `slot_payload_decode` | `SlotPayload::decode` directly (bypasses Argon2id, no envelope KEK needed) | Never panics; every rejection is `Error::InvalidField`; successful decode round-trips via `encode` (excluding random padding tail). |
+| `slot_payload_roundtrip` | `SlotPayload::new` + `encode` + `decode` with attacker-controlled length triples | Constructor rejections are always justified by a documented cap; successful constructions round-trip field-for-field. |
+
+### Cross-platform deniable-enroll gating
+
+The deniable-mode TPM enroll helpers
+(`enroll_tpm2_deniable`, `enroll_tpm2_fido2_deniable`,
+`enroll_hybrid_pq_tpm2_deniable`,
+`enroll_hybrid_pq_tpm2_fido2_deniable`) in
+`crates/luksbox-gui/src/ops.rs` are gated behind
+`#[cfg(all(feature = "hardware", target_os = "linux"))]`. The
+matching `app.rs` call sites are now wrapped with the same cfg
+gate, returning a clear `"deniable TPM enrollment requires the
+Linux hardware build"` error on macOS / Windows instead of failing
+to compile. When TPM support lands on another platform, drop the
+`target_os = "linux"` clause everywhere those gates appear.
 
 ## Future work
 
