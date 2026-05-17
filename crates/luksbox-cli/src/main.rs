@@ -1948,47 +1948,79 @@ fn read_passphrase_from_stdin_pipe() -> io::Result<Zeroizing<String>> {
 /// reallocations made by `String::push`/`format!` aren't tracked, we rely
 /// on `rpassword`/`std::env::var` returning a single allocation here.
 ///
-/// Source priority (audit Round 9F):
-///   1. `LUKSBOX_PASSPHRASE` env var, if set. (Most-secure non-
-///      interactive option for shell scripts that already manage
-///      env vars; visible to same-UID processes via `/proc/<pid>/environ`.)
-///   2. Stdin, if stdin is NOT a terminal (i.e., piped from
+/// Source priority:
+///   1. Stdin, if stdin is NOT a terminal (i.e., piped from
 ///      another process or redirected from a file). The passphrase
 ///      bytes never appear in argv or env; the writing process
 ///      controls visibility. Use:
 ///        cat ~/.config/my-pp | luksbox open my.lbx
+///   2. `LUKSBOX_PASSPHRASE` env var, if set. (Convenient for shell
+///      scripts; visible to same-UID processes via
+///      `/proc/<pid>/environ` so prefer the pipe when both are
+///      available.)
 ///   3. Interactive prompt via `rpassword` (echo disabled, terminal
 ///      cleanup on signals).
+///
+/// When real bytes arrive on the pipe AND `LUKSBOX_PASSPHRASE` is
+/// also set, the function returns an error rather than silently
+/// picking one source over the other. Previously the env var won
+/// unconditionally, which let a stale or injected env var override
+/// the secret a script was piping in - a quiet, hard-to-spot
+/// precedence bug. An empty/closed stdin pipe (`Command::output()`
+/// auto-pipes but writes nothing, the common test pattern) falls
+/// through to the env var so existing harnesses keep working.
 fn read_passphrase(prompt: &str) -> io::Result<Zeroizing<String>> {
+    use std::io::IsTerminal;
+    let env_set = std::env::var_os("LUKSBOX_PASSPHRASE").is_some();
+    if !io::stdin().is_terminal() {
+        let piped = read_passphrase_from_stdin_pipe()?;
+        if !piped.is_empty() {
+            if env_set {
+                return Err(io::Error::other(
+                    "ambiguous passphrase source: both stdin pipe and \
+                     LUKSBOX_PASSPHRASE are providing input. Unset \
+                     one to disambiguate (the env var is visible via \
+                     /proc/<pid>/environ, the pipe is not).",
+                ));
+            }
+            return Ok(piped);
+        }
+        // Empty pipe (e.g. `Command::output()` with no write to
+        // child.stdin) - fall through to env var / prompt.
+    }
     if let Ok(p) = std::env::var("LUKSBOX_PASSPHRASE") {
         return Ok(Zeroizing::new(p));
-    }
-    use std::io::IsTerminal;
-    if !io::stdin().is_terminal() {
-        return read_passphrase_from_stdin_pipe();
     }
     Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
 }
 
 fn read_passphrase_confirmed(prompt: &str) -> io::Result<Zeroizing<String>> {
-    // Tests/scripts can pre-fill the new passphrase via `LUKSBOX_NEW_PASSPHRASE`,
-    // which is checked first so it can differ from the unlock passphrase
-    // (`LUKSBOX_PASSPHRASE`). For backward compat, and for cases where the
-    // new and existing passphrases happen to be the same, fall back to
-    // `LUKSBOX_PASSPHRASE`.
+    // Source priority mirrors `read_passphrase`. `LUKSBOX_NEW_PASSPHRASE`
+    // takes precedence over `LUKSBOX_PASSPHRASE` when both env vars
+    // are set; same ambiguity guard fires when real bytes arrive on
+    // the pipe AND any of the recognised env vars is set.
+    use std::io::IsTerminal;
+    let env_set = std::env::var_os("LUKSBOX_NEW_PASSPHRASE").is_some()
+        || std::env::var_os("LUKSBOX_PASSPHRASE").is_some();
+    if !io::stdin().is_terminal() {
+        let piped = read_passphrase_from_stdin_pipe()?;
+        if !piped.is_empty() {
+            if env_set {
+                return Err(io::Error::other(
+                    "ambiguous passphrase source: both stdin pipe and \
+                     LUKSBOX_NEW_PASSPHRASE or LUKSBOX_PASSPHRASE \
+                     are providing input. Unset the env var(s) or \
+                     close stdin to disambiguate.",
+                ));
+            }
+            return Ok(piped);
+        }
+    }
     if let Ok(p) = std::env::var("LUKSBOX_NEW_PASSPHRASE") {
         return Ok(Zeroizing::new(p));
     }
     if let Ok(p) = std::env::var("LUKSBOX_PASSPHRASE") {
         return Ok(Zeroizing::new(p));
-    }
-    // Stdin pipe path: same as `read_passphrase`. The reader can
-    // supply the passphrase ONCE; we don't re-prompt for confirmation
-    // since the writer of the pipe is presumed to be a script that
-    // knows what it's writing.
-    use std::io::IsTerminal;
-    if !io::stdin().is_terminal() {
-        return read_passphrase_from_stdin_pipe();
     }
     loop {
         let a = Zeroizing::new(rpassword::prompt_password(prompt)?);
@@ -2225,7 +2257,11 @@ fn open_container_hybrid_pq(
     let seed =
         seed_file::read(kyber_path, pw.as_bytes()).map_err(|e| format!("read kyber seed: {e}"))?;
     let sidecar_path = hybrid_sidecar::sidecar_path(path);
-    let entries = hybrid_sidecar::read(&sidecar_path)
+    // `read_for_vault` verifies the v3 vault-binding (if present)
+    // against the .lbx's `header_salt`, catching cross-vault sidecar
+    // swaps before decap. v1/v2 sidecars pass through; downstream
+    // AEAD still catches tampering there.
+    let entries = hybrid_sidecar::read_for_vault(&sidecar_path, path, header_path)
         .map_err(|e| format!("read hybrid sidecar at {}: {e}", sidecar_path.display()))?;
     if entries.is_empty() {
         return Err("hybrid sidecar exists but contains no entries".into());
@@ -2624,7 +2660,8 @@ fn open_container_hybrid_pq_tpm2(
     let seed = seed_file::read(kyber_path, seed_pw.as_bytes())
         .map_err(|e| format!("read kyber seed: {e}"))?;
     let sidecar_path = hybrid_sidecar::sidecar_path(path);
-    let entries = hybrid_sidecar::read(&sidecar_path)
+    // v3 vault-binding verification (see `read_for_vault` doc).
+    let entries = hybrid_sidecar::read_for_vault(&sidecar_path, path, header_path)
         .map_err(|e| format!("read hybrid sidecar at {}: {e}", sidecar_path.display()))?;
 
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
@@ -2713,7 +2750,8 @@ fn open_container_hybrid_pq_tpm2_fido2(
     let seed = seed_file::read(kyber_path, seed_pw.as_bytes())
         .map_err(|e| format!("read kyber seed: {e}"))?;
     let sidecar_path = hybrid_sidecar::sidecar_path(path);
-    let entries = hybrid_sidecar::read(&sidecar_path)
+    // v3 vault-binding verification (see `read_for_vault` doc).
+    let entries = hybrid_sidecar::read_for_vault(&sidecar_path, path, header_path)
         .map_err(|e| format!("read hybrid sidecar at {}: {e}", sidecar_path.display()))?;
 
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;

@@ -173,3 +173,45 @@ fn env_var_passphrase_visible_in_proc_environ_documented() {
          entry` section. environ contents: {environ_str:?}"
     );
 }
+
+#[test]
+fn stdin_pipe_with_env_var_set_is_rejected_as_ambiguous() {
+    // Regression test for the env-var-overrides-pipe bug. If a
+    // script pipes a passphrase AND LUKSBOX_PASSPHRASE is also set
+    // (e.g. stale from a parent shell), the previous behaviour
+    // silently used the env var, ignoring the piped bytes. The
+    // current behaviour rejects with a clear error so the user
+    // unsets one source explicitly.
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    let mut child = Command::new(bin())
+        .args(["create", "v.lbx"])
+        .current_dir(dir)
+        .env("LUKSBOX_TEST_FAST_KDF", "1")
+        .env("LUKSBOX_PASSPHRASE", "env-var-pp")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    // Actual bytes on the pipe (NOT empty) - this is what triggers
+    // the ambiguity check.
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(b"piped-pp\n")
+        .expect("write stdin");
+    let out = child.wait_with_output().expect("wait");
+
+    assert!(
+        !out.status.success(),
+        "expected create to fail with ambiguity error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ambiguous passphrase source"),
+        "expected ambiguity error, got stderr: {stderr}"
+    );
+}

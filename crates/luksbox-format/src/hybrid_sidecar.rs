@@ -215,6 +215,53 @@ pub fn parse_bundle(bytes: &[u8]) -> Result<SidecarBundle, Error> {
 /// Returns `Ok(())` if the sidecar is v3 and the binding matches, OR
 /// if the sidecar is v1/v2 (no binding to check, older format).
 /// Returns `Err` only on a v3 sidecar with a mismatching binding.
+/// Convenience wrapper for unlock-time call sites: peek at the vault
+/// header to recover `header_salt`, read the sidecar bundle, and
+/// verify the v3 binding matches. Returns just the entries on
+/// success (the bundle is consumed). v1/v2 sidecars (no binding to
+/// check) pass through unchanged.
+///
+/// Use this instead of `read()` at every site where a sidecar load
+/// immediately precedes a `Container::open` against the same vault.
+/// Catches cross-vault sidecar swaps at sidecar load time, before
+/// the wrong decap output flows into ML-KEM and the wrong combined
+/// KEK reaches AEAD verification (which would have caught it
+/// anyway, but later and with a worse error message).
+pub fn read_for_vault(
+    sidecar_path: &Path,
+    vault_path: &Path,
+    header_path: Option<&Path>,
+) -> Result<Vec<HybridEntry>, Error> {
+    let bundle = read_bundle(sidecar_path)?;
+    // v1/v2 sidecars: no binding to verify; trust falls back to the
+    // downstream AEAD tag the way it always has on older vaults.
+    if bundle.binding.is_none() {
+        return Ok(bundle.entries);
+    }
+    let salt = peek_vault_header_salt(vault_path, header_path)?;
+    verify_binding(&bundle, &salt)?;
+    Ok(bundle.entries)
+}
+
+/// Read just the 32-byte `header_salt` from a vault file (or its
+/// detached-header sidecar). Used by `read_for_vault` to load the
+/// vault binding without a full `Container::open` (which would
+/// need credentials we don't have yet at this point).
+fn peek_vault_header_salt(
+    vault_path: &Path,
+    header_path: Option<&Path>,
+) -> Result<[u8; BINDING_LEN], Error> {
+    use luksbox_core::HEADER_SIZE;
+    use std::io::Read;
+    let src = header_path.unwrap_or(vault_path);
+    let mut f = fs::File::open(src)?;
+    let mut buf = [0u8; HEADER_SIZE];
+    f.read_exact(&mut buf)?;
+    let header = luksbox_core::Header::from_bytes(&buf)
+        .map_err(|e| Error::Io(std::io::Error::other(format!("peek header: {e}"))))?;
+    Ok(header.header_salt)
+}
+
 pub fn verify_binding(
     bundle: &SidecarBundle,
     expected_salt: &[u8; BINDING_LEN],

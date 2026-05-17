@@ -43,6 +43,18 @@ winfsp_wrs = { version = "0.4", optional = true }
 # for a clean unmount; without it the mount holder is killed mid-IO and
 # the kernel driver can leave the drive letter half-attached.
 ctrlc.workspace = true
+# Used to look up the current process's user SID so the volume's
+# default security descriptor grants Full Access to the *user that
+# mounted the volume* + Administrators + SYSTEM, instead of the prior
+# Everyone (`WD`) which let any local logon read decrypted contents
+# while mounted. Already a transitive dep of `winfsp_wrs`, declared
+# explicitly here for the SID lookup in `winfsp.rs::current_user_sid`.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 luksbox-core = { path = "../luksbox-core" }

@@ -2571,6 +2571,11 @@ fn deniable_pq_decap(opts: &UnlockOpts) -> Result<Zeroizing<[u8; 32]>, String> {
         )?;
     let seed = seed_file::read(kyber_path, seed_pw.as_bytes()).map_err(estr)?;
     let sidecar = hybrid_sidecar::sidecar_path(&opts.path);
+    // Deniable mode does not have a standard `Header::header_salt`
+    // (the v3 sidecar binding format), so `read_for_vault` does not
+    // apply here. Cross-vault swap detection in deniable mode falls
+    // back to downstream AEAD failure (slot envelope tag verification)
+    // - same posture as v1/v2 sidecars in standard mode.
     let entries = hybrid_sidecar::read(&sidecar).map_err(estr)?;
     let entry = entries
         .first()
@@ -2862,8 +2867,10 @@ fn unlock_with_hybrid_pq_tpm2(
     }
     let seed = seed_file::read(kyber_path, seed_pw.as_bytes())
         .map_err(|e| format!("read kyber seed: {e}"))?;
-    let entries = hybrid_sidecar::read(&hybrid_sidecar::sidecar_path(path))
-        .map_err(|e| format!("read hybrid sidecar: {e}"))?;
+    // v3 vault-binding verification (see `read_for_vault` doc).
+    let entries =
+        hybrid_sidecar::read_for_vault(&hybrid_sidecar::sidecar_path(path), path, header_path)
+            .map_err(|e| format!("read hybrid sidecar: {e}"))?;
     let mut sealer =
         Tpm2Sealer::new().map_err(|e| format!("could not open local TPM 2.0 device: {e}"))?;
 
@@ -2959,8 +2966,10 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
     }
     let seed = seed_file::read(kyber_path, seed_pw.as_bytes())
         .map_err(|e| format!("read kyber seed: {e}"))?;
-    let entries = hybrid_sidecar::read(&hybrid_sidecar::sidecar_path(path))
-        .map_err(|e| format!("read hybrid sidecar: {e}"))?;
+    // v3 vault-binding verification (see `read_for_vault` doc).
+    let entries =
+        hybrid_sidecar::read_for_vault(&hybrid_sidecar::sidecar_path(path), path, header_path)
+            .map_err(|e| format!("read hybrid sidecar: {e}"))?;
     let mut sealer =
         Tpm2Sealer::new().map_err(|e| format!("could not open local TPM 2.0 device: {e}"))?;
     let mut auth = make_fido2_authenticator();

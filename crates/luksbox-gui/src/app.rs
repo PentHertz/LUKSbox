@@ -5633,7 +5633,10 @@ impl LuksboxApp {
                         "Adds a TPM 2.0-bound keyslot. The wrap key lives inside the local \
                  TPM chip; no passphrase needed. Linux only. The vault becomes uncrackable \
                  if its file is stolen separately from this machine, but only unlocks on \
-                 this machine.",
+                 this machine. Threat-model caveat: with no PIN and no PCR policy, anyone \
+                 who can boot this device and reach the TPM can unseal. For stronger \
+                 device-theft protection, use 'Add TPM 2.0 + PIN' instead - the chip's \
+                 dictionary-attack lockout gates an offline PIN attack.",
                     )
                     .clicked()
                 {

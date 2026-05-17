@@ -621,6 +621,20 @@ risk first.
       caller on this TPM can unseal). Tracked in
       `docs/TPM_FUTURE_IMPROVEMENTS.md`.
 
+      **Threat model reminder for the bare `Tpm2Sealed` kind**:
+      with no PIN (`userAuth`) and no PCR policy, the sealed blob
+      is unsealable by ANY caller on the same TPM device. This
+      protects the vault file in isolation (a stolen `.lbx` cannot
+      be opened without the TPM) but does NOT protect against an
+      attacker who has the WHOLE DEVICE booted and running. For
+      device-theft scenarios, prefer `Tpm2SealedPin`
+      (`--kind tpm2-pin` on enroll) so the chip's
+      dictionary-attack lockout gates an offline-style attack
+      against the PIN, and add PCR policy as an opt-in once it
+      ships (boot-chain tamper detection). The wizard surfaces a
+      one-line warning at the `tpm2` enroll prompt; the GUI shows
+      it under the "Add TPM 2.0 keyslot" modal.
+
     - **Windows**: not yet shipped, **but reachable today via the
       `TctiNameConf::Tbs` variant added in `tss-esapi 8.0.0-alpha.2`**.
       The Linux `Tpm2Sealer` implementation works against `Tcti::Tbs`

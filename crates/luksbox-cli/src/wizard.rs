@@ -3913,7 +3913,8 @@ fn unlock_via_hybrid_pq(
     let seed =
         seed_file::read(&kyber_path, pw.as_bytes()).map_err(|e| format!("read kyber seed: {e}"))?;
     let sidecar = hybrid_sidecar::sidecar_path(vault);
-    let entries = hybrid_sidecar::read(&sidecar)
+    // v3 vault-binding verification (see `read_for_vault` doc).
+    let entries = hybrid_sidecar::read_for_vault(&sidecar, vault, header_path)
         .map_err(|e| format!("read hybrid sidecar at {}: {e}", sidecar.display()))?;
     if entries.is_empty() {
         return Err("hybrid sidecar is empty".into());
@@ -3972,7 +3973,9 @@ fn unlock_via_hybrid_pq_fido2(
         .map_err(|e| format!("read kyber seed: {e}"))?;
 
     let sidecar = hybrid_sidecar::sidecar_path(vault);
-    let entries = hybrid_sidecar::read(&sidecar).map_err(|e| format!("read sidecar: {e}"))?;
+    // v3 vault-binding verification (see `read_for_vault` doc).
+    let entries = hybrid_sidecar::read_for_vault(&sidecar, vault, header_path)
+        .map_err(|e| format!("read sidecar: {e}"))?;
 
     let mut auth = crate::make_fido2_authenticator();
     let mut last_err: Option<String> = None;
@@ -4088,6 +4091,13 @@ fn enroll_tpm2_into(_theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     use rand_core::{OsRng, RngCore};
     use zeroize::Zeroizing;
 
+    eprintln!(
+        "note: bare TPM 2.0 (no PIN, no PCR policy) protects against \
+         a stolen vault file but NOT a stolen device booted and \
+         running. For device-theft scenarios, prefer the `tpm2-pin` \
+         kind so the chip's dictionary-attack lockout gates an \
+         offline PIN attack."
+    );
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
     let mut kek = Zeroizing::new([0u8; 32]);
     OsRng
