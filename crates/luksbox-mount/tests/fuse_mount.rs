@@ -54,6 +54,7 @@ use std::time::Duration;
 
 use luksbox_core::{Argon2idParams, CipherSuite};
 use luksbox_format::container::{Container, UnlockMaterial};
+use luksbox_format::error::Error as FormatError;
 use luksbox_vfs::Vfs;
 use tempfile::TempDir;
 
@@ -120,8 +121,34 @@ fn fresh_vault(dir: &Path, name: &str) -> PathBuf {
 }
 
 fn reopen_vfs(vault: &Path) -> Vfs {
-    let cont = Container::open(vault, None, UnlockMaterial::Passphrase(PASS)).expect("open vault");
-    Vfs::open(cont).expect("open vfs")
+    // Poll-and-retry on `VaultLocked`. Background: the previous
+    // mount cycle's `Container` was dropped (or its mount thread
+    // exited) microseconds ago; the kernel releases the per-inode
+    // `flock` asynchronously after `close(2)`. On a fast/contended
+    // CI runner the next `Container::open` can race the kernel and
+    // see the old lock still held. A fixed sleep was insufficient
+    // (the race is unbounded in principle); poll for up to ~2 s
+    // with 25 ms backoff so we wait only as long as needed and fail
+    // loudly if the lock genuinely never releases.
+    let start = std::time::Instant::now();
+    let mut last_err: Option<FormatError> = None;
+    while start.elapsed() < Duration::from_secs(2) {
+        match Container::open(vault, None, UnlockMaterial::Passphrase(PASS)) {
+            Ok(cont) => return Vfs::open(cont).expect("open vfs"),
+            Err(FormatError::VaultLocked { .. }) => {
+                last_err = Some(FormatError::VaultLocked {
+                    path: vault.display().to_string(),
+                });
+                std::thread::sleep(Duration::from_millis(25));
+                continue;
+            }
+            Err(e) => panic!("open vault: {e:?}"),
+        }
+    }
+    panic!(
+        "open vault: still locked after 2 s of polling ({:?})",
+        last_err.expect("loop only exits via Ok return or panic")
+    );
 }
 
 /// Skip the test if FUSE isn't available (instead of failing). Keeps
