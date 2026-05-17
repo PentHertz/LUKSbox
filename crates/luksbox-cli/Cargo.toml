@@ -36,6 +36,10 @@ zxcvbn = "3"
 # GUI crate; reused here.
 serde_json = "1"
 serde = { workspace = true }
+# Used by deniable-mode wizard + CLI subcommands to render the
+# FIDO2 cred_id + hmac_salt as hex (recovery card) and to parse
+# the same hex strings back at unlock time.
+hex = "0.4"
 
 # Used by the FUSE-T mount-helper subprocess to set SIGPIPE = SIG_IGN
 # at startup so libfuse-t's internal pipe writes during teardown don't

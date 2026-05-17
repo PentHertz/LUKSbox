@@ -54,6 +54,10 @@ zxcvbn = "3"
 # Hash-compare the clipboard contents at auto-clear time so we don't
 # wipe a user's subsequent unrelated copy (the KeePassXC pattern).
 sha2 = { workspace = true }
+# Used by the deniable-FIDO2 unlock path to decode user-pasted
+# cred_id + hmac_salt hex strings (and by the create-success
+# modal to render them as hex for the user to save).
+hex = "0.4"
 # Direct OS clipboard access - egui's `ctx.copy_text` is write-only,
 # we need a read path to compare hashes before clearing. arboard is
 # the standard cross-platform crate, ~2k LoC pure-Rust on each backend.

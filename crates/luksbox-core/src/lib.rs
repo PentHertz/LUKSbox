@@ -5,6 +5,7 @@
 //! format for the luksbox encrypted-container tool. Pure crypto, no I/O.
 
 pub mod aead;
+pub mod deniable;
 pub mod error;
 pub mod file_util;
 pub mod header;

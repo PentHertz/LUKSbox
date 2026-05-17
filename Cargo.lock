@@ -2489,6 +2489,7 @@ version = "0.1.1"
 dependencies = [
  "clap",
  "dialoguer",
+ "hex",
  "libc",
  "luksbox-core",
  "luksbox-fido2",
@@ -2591,6 +2592,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_extras",
+ "hex",
  "image",
  "libc",
  "luksbox-core",

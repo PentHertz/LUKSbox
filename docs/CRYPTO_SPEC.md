@@ -1736,7 +1736,17 @@ sequenceDiagram
 
 7. **Lost device with backup enrolled**. If the user enrolled either
    (a) a backup passphrase slot or (b) a second device's keyslot, the
-   vault is recoverable from the backup material alone.
+   vault is recoverable from the backup material alone. **Note**: as
+   of 2026-05, the create flow defaults to **no backup passphrase**
+   for `Fido2Direct` and for every 3-factor TPM combo (`Tpm2Fido2`,
+   `HybridPqTpm2*`, `HybridPqTpm2Fido2*`). The user must explicitly
+   tick "Enable recovery passphrase" at create time to get the
+   passphrase fallback; ticking it adds an OR-attack path that
+   defeats the "all factors required" guarantee. The trade-off is
+   intentional: users who pick these multi-factor combos are usually
+   asking for AND-semantics, not for any single-secret recovery
+   path. See the "Default slot policy for multi-factor combos"
+   subsection below.
 
 #### What we explicitly do NOT defend against
 
@@ -1876,6 +1886,73 @@ who want to defend against it.
 | Rogue-authenticator regression tests | `crates/luksbox-fido2/tests/rogue_authenticator.rs` |
 | Hardware probe (single device) | `crates/luksbox-fido2/examples/probe.rs` (run with `--features hardware --example probe`) |
 | Hardware probe (multi-device V3 roundtrip) | `crates/luksbox-fido2/examples/multidev_probe.rs` |
+
+### 19.10 Default slot policy for multi-factor combos
+
+Until 2026-05 every create flow went through `create_with_passphrase`
+first and then enrolled the requested keyslot (FIDO2, TPM, hybrid) as
+slot 1. Resulting vault: 2 slots, passphrase at slot 0 and the
+multi-factor slot at slot 1. Convenient (any forgotten factor still
+leaves the passphrase) but it leaks an OR-attack path: anyone with the
+passphrase opens the vault without any of the hardware factors. For
+`Fido2Direct` and the 3-factor TPM combos (`Tpm2Fido2`,
+`HybridPqTpm2`, `HybridPq1024Tpm2`, `HybridPqTpm2Fido2`,
+`HybridPq1024Tpm2Fido2`) this directly defeats the design intent of
+the combo: these users picked them precisely because they want
+AND-semantics.
+
+The 2026-05 change ships new single-slot create constructors that
+place the requested credential at slot 0 with no passphrase fallback:
+
+| Constructor | Slot kind | Use |
+|---|---|---|
+| `Container::create_with_tpm2` | `Tpm2Sealed` | Plain TPM, single slot |
+| `Container::create_with_tpm2_pin` | `Tpm2SealedPin` | TPM + chip-PIN, single slot |
+| `Container::create_with_tpm2_fido2` | `Tpm2Fido2` | Fused TPM + FIDO2, single slot |
+| `Container::create_with_hybrid_pq_tpm2` | `HybridPqKemTpm2` | TPM + ML-KEM-768 |
+| `Container::create_with_hybrid_pq_1024_tpm2` | `HybridPqKem1024Tpm2` | TPM + ML-KEM-1024 |
+| `Container::create_with_hybrid_pq_tpm2_fido2` | `HybridPqKemTpm2Fido2` | TPM + FIDO2 + ML-KEM-768 |
+| `Container::create_with_hybrid_pq_1024_tpm2_fido2` | `HybridPqKem1024Tpm2Fido2` | TPM + FIDO2 + ML-KEM-1024 |
+
+These produce a vault with exactly one keyslot at index 0. Opening
+with any passphrase fails cleanly with `UnlockFailed`. If any factor
+is lost the vault is permanently unrecoverable.
+
+#### Defaults by combo
+
+| Combo family | Default at create | Opt-in |
+|---|---|---|
+| Passphrase, FIDO2-wrapped, HybridPqPassphrase, HybridPqFido2 | 1 slot (unchanged) | n/a |
+| `Fido2Direct` | 1 slot (FIDO2-derived MVK only) | "Enable backup passphrase" adds a passphrase slot |
+| `Tpm2`, `Tpm2Pin` | 2 slots (passphrase + TPM) | "Skip bootstrap passphrase" gives a single TPM slot |
+| `Tpm2Fido2`, `HybridPqTpm2*`, `HybridPqTpm2Fido2*` | 1 slot (multi-factor only) | "Enable recovery passphrase" adds a passphrase slot |
+| Any of the above + deniable mode | 1 slot, no UI checkbox (forced single-slot in deniable to avoid the invisible-second-slot foot-gun) | n/a |
+
+Read: the single-factor TPM kinds default to the recovery-friendly
+2-slot shape because the recovery argument (chip dies, passphrase
+gets you back in) outweighs the OR-attack downside for the average
+user. The multi-factor combos default to single-slot because the
+combo's only reason to exist is the AND-semantics, and a default-on
+passphrase slot would silently undermine that.
+
+#### Threat model implications
+
+When the user picks a multi-factor combo and does not tick
+"Enable recovery passphrase":
+
+- The vault has exactly one keyslot.
+- An attacker with the `.lbx` file alone has no offline passphrase
+  brute-force target. The only attack surface is the multi-factor
+  unwrap path (TPM chip + FIDO2 device + ML-KEM seed, as applicable).
+- Loss of any factor is unrecoverable.
+- Adding factors later via "Add slot" creates new keyslots whose
+  threat model is each independently considered. Adding a passphrase
+  slot re-introduces the OR-attack path the default avoided.
+
+In deniable mode the multi-factor combos are always single-slot
+regardless of UI state. The deniable second-slot foot-gun (invisible
+and unrevokable) is worse than the lost-vault-if-factor-lost
+trade-off; see `docs/DENIABLE_HEADER.md`.
 
 ---
 

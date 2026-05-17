@@ -396,6 +396,72 @@ and a FIDO2 hmac-output, derived KEKs MUST be unequal.
 | Same passphrase across users -> same KEK -> multiple slots decrypt | Minor: one bit (">=2 users use this passphrase") only if the passphrase is already broken. |
 | `luksbox` binary itself is identifiable on the host | Out of scope; the deniable mode protects the vault file, not the user's software inventory. |
 
+## What the user must supply at unlock time
+
+```mermaid
+flowchart LR
+  subgraph nd["Non-deniable mode"]
+    direction TB
+    nd_user["User<br/>(PIN / passphrase)"]
+    nd_slot["On-disk slot:<br/>kind | cred_id | hmac_salt |<br/>tpm_blob | kem_ct | wrapped_MVK"]
+    nd_unlock["Unlock code<br/>reads metadata<br/>+ drives authenticator"]
+    nd_user --> nd_unlock
+    nd_slot --> nd_unlock
+    nd_unlock --> nd_mvk(["MVK"])
+  end
+  subgraph d["Deniable mode"]
+    direction TB
+    d_user["User<br/>(PIN / passphrase +<br/>cred_id, hmac_salt,<br/>.tpm-blob path,<br/>.kyber path, Argon2 params)"]
+    d_slot["On-disk slot:<br/>512 uniformly-random bytes<br/>wrapping only the MVK"]
+    d_unlock["Unlock code<br/>has no metadata;<br/>derives KEK from<br/>user-supplied inputs"]
+    d_user --> d_unlock
+    d_slot --> d_unlock
+    d_unlock --> d_mvk(["MVK"])
+  end
+```
+
+In **non-deniable** mode every slot record on disk carries plaintext
+metadata next to the wrapped MVK: slot kind tag, `cred_id` for FIDO2,
+`hmac_salt` for FIDO2, TPM sealed blob, ML-KEM ciphertext, etc. At
+unlock the code reads those fields, drives the authenticator / TPM /
+KEM, derives the KEK, unwraps. The user only types their passphrase
+or PIN.
+
+Deniable mode cannot store any of that. Every byte of the 8 KiB
+header must look uniformly random (invariants 3 + 5), so a typed /
+length-prefixed metadata block would be an immediate format-tell
+("slot 2 declares kind=FIDO2"). The design therefore moves all
+non-secret credential material **out of the file** and onto the user.
+The slot ciphertext wraps only the 32-byte MVK; everything needed to
+derive the KEK comes in via CLI flags / wizard prompts / GUI fields.
+
+This is why the create-time recovery card prints values that the
+non-deniable flow never had to show:
+
+| Credential combo | Must be remembered/saved | Why |
+|---|---|---|
+| Passphrase | passphrase + cipher + Argon2 params | Argon2 inputs aren't on disk; wrong params -> wrong KEK. |
+| FIDO2 | `cred_id` (hex) + `hmac_salt` (32-byte hex) + PIN | `cred_id` tells the authenticator *which* credential to assert; `hmac_salt` is the `hmac-secret` input. Either wrong -> wrong output -> wrong KEK. The PIN stays in the user's head. |
+| TPM | `.tpm-blob` sidecar path (+ chip-side PIN if `Tpm2Pin`) | TPM2-sealed blob is ~1.5-3 KB, far over the 512-byte slot budget, so it lives in a sidecar. Anyone seeing the sidecar next to the vault learns "TPM-backed"; store on USB / paper for at-rest deniability. Single-factor: the TPM is the only unlock material, no passphrase combined into the KEK. |
+| TPM + FIDO2 | `.tpm-blob` + `cred_id` + `hmac_salt` + FIDO2 PIN | Union of TPM + FIDO2 above. Single deniable slot, both factors required at unlock. |
+| PQ-passphrase | `.kyber` seed-file path + seed-file passphrase + vault passphrase + Argon2 params | `.kyber` carries the ML-KEM private seed; the `.hybrid` sidecar carries the public key + ciphertext. Same sidecar-tell tradeoff. |
+| PQ-FIDO2 / PQ-TPM / PQ-TPM-FIDO2 | Union of the components above | One sidecar per non-passphrase factor. |
+
+The recovery card / TUI / `deniable-init` stdout prints every value
+above as soon as a vault is created. Lose any of them and the vault
+is unrecoverable -- there is no fallback path, no metadata, no fail-
+fast magic. This is the price of looking like uniform noise.
+
+**Operational guidance for sidecars**: `.tpm-blob`, `.kyber`, and
+`.hybrid` files do not contain secrets a passive attacker can use
+(the TPM blob is bound to the TPM chip; the `.kyber` is encrypted
+under its own passphrase; the `.hybrid` only contains a public key +
+KEM ciphertext). But their *presence* tells an examiner the vault
+uses the matching credential type. For maximum deniability, keep
+sidecars off the same disk as the vault (USB key, paper QR, password
+manager attachment). Mount-time `--tpm-blob-path` / `--kyber-path`
+accept arbitrary paths so the sidecar can live anywhere.
+
 ## Operational gotchas
 
 - **Permanent lockout on forgotten params**: by design. The CLI / GUI
@@ -425,11 +491,49 @@ and a FIDO2 hmac-output, derived KEKs MUST be unequal.
 
 ## Where the code lives
 
-| Concern | File(s) |
-|---|---|
-| Format primitives (slot layout, AEAD calls, AAD encoding) | `crates/luksbox-core/src/deniable.rs` (new) |
-| KEK derivation per credential | `crates/luksbox-core/src/deniable.rs` |
-| Container init / open / slot management | `crates/luksbox-format/src/container.rs` (new methods alongside existing `open`/`init`) |
-| CLI flags (`--deniable`, `--cipher`, `--argon2-*`) | `crates/luksbox-cli/src/main.rs` |
-| GUI init wizard + unlock dialog | `crates/luksbox-gui/src/app.rs` |
-| Acceptance tests for the five invariants | `crates/luksbox-core/tests/deniable_invariants.rs` (new) |
+| Concern | File(s) | Status |
+|---|---|---|
+| Format primitives (slot layout, AEAD calls, AAD encoding, constant-time trial decryption) | `crates/luksbox-core/src/deniable.rs` | shipped |
+| KEK derivation per credential with HKDF domain separation | `crates/luksbox-core/src/deniable.rs` | shipped |
+| High-level `create_with_passphrase` / `open_with_passphrase` API | `crates/luksbox-format/src/deniable_header.rs` | shipped |
+| Slot lifecycle (`install_slot`, `clear_slot`, `rotate_mvk`) | `crates/luksbox-format/src/deniable_header.rs` | shipped |
+| CLI subcommands (`deniable-init`, `deniable-info`) | `crates/luksbox-cli/src/main.rs` | shipped |
+| Invariant tests (#1, #2, #3, #4, #5) | unit tests inside the two modules above | shipped |
+| Fuzz target (open path) | `fuzz/fuzz_targets/deniable_header_parse.rs` | shipped |
+| Container integration (full mount / metadata region / data area for deniable-header files) | `crates/luksbox-format/src/container.rs` (`create_with_credential_deniable`, `open_with_credential_deniable`, `enroll_credential_deniable`, `DeniableState` field, branched `persist_header`) | shipped |
+| CLI `deniable-init` / `deniable-mount` / `deniable-info` with full credential parity (`--credential` + per-type material flags) | `crates/luksbox-cli/src/main.rs` | shipped |
+| TUI wizard parity (per-combo create + open dispatch, recovery card) | `crates/luksbox-cli/src/wizard.rs` | shipped |
+| GUI init wizard + unlock dialog + recovery-card modal | `crates/luksbox-gui/src/app.rs`, `crates/luksbox-gui/src/ops.rs` | shipped |
+| Deniable single-slot TPM (Tpm2, Tpm2Pin, Tpm2Fido2, HybridPqTpm2*, HybridPqTpm2Fido2*) | `DeniableCredential::Tpm` / `TpmFido2` / `HybridPqTpm` / `HybridPqTpmFido2`; create path bypasses the 2-slot bootstrap and writes the multi-factor credential at slot 0 directly | shipped |
+| Windows TPM (deniable + non-deniable) | needs `tss-esapi` stable on Windows or TBS direct calls | **deferred** |
+
+## Future work
+
+- **Windows TPM**: tracked in `docs/TPM_FUTURE_IMPROVEMENTS.md`. Once
+  shipped, the deniable TPM combos light up automatically via the
+  same `DeniableCredential::Tpm*` variants.
+- **Deniable anchor sidecar**: anchor file currently writes a plain
+  32-byte challenge in deniable mode (`anchor.rs::deniable_write`).
+  Indistinguishability holds for the file content; the sidecar
+  *presence* is the same kind of tell as `.tpm-blob` / `.kyber`.
+
+## Deniable + TPM combos: always single-factor
+
+Every TPM-bearing deniable combo (`Tpm`, `Tpm + FIDO2`, `Hybrid-PQ + TPM`,
+`Hybrid-PQ + TPM + FIDO2`) is forced to a single deniable slot at index 0
+carrying the multi-factor credential directly. The legacy "passphrase
+slot + multi-factor slot" shape that non-deniable mode used by default
+is **never** produced in deniable mode, regardless of UI checkboxes.
+
+The reason is the slot-enumeration foot-gun: deniable vaults can't list
+their slots, so an invisible second slot is unrevokable. A user who
+ticked "add backup passphrase" once couldn't tell later whether the slot
+exists, and couldn't selectively clear it. So the deniable path skips
+the question and creates exactly the multi-factor slot the user asked
+for. If the user wants a backup passphrase, they enroll one explicitly
+via "Add slot", where they consciously pick the slot index and the
+recovery card prints it for the record.
+
+This means: lose any factor in a deniable TPM combo and the vault is
+permanently unrecoverable. That's the trade the user accepted by picking
+the combo + deniable mode together.

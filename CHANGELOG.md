@@ -14,6 +14,127 @@ canonical record.
 
 ---
 
+## [Unreleased]
+
+Slot-policy revisit for the multi-factor combos. Existing v0.1.1
+vaults open unchanged; the behavior change is entirely at create
+time.
+
+### Changed (defaults at vault creation)
+
+- **FIDO2-direct: backup passphrase is now opt-in.** The create
+  form no longer always shows a "backup passphrase" field. A new
+  checkbox "Enable backup passphrase" defaults OFF; ticking it
+  reveals the field. Empty field with the checkbox off means no
+  passphrase slot is enrolled, the vault is openable only with the
+  FIDO2 authenticator, and the create flow no longer asks "are you
+  sure" about an empty backup. Existing vaults are unaffected.
+
+- **Tpm2 and Tpm2Pin: opt-in single-slot path.** New checkbox
+  "Skip bootstrap passphrase (single TPM slot, no recovery if chip
+  dies)" defaults OFF, preserving the current 2-slot
+  passphrase + TPM behavior for users who want the recovery
+  fallback. Ticking it routes the create through new
+  `Container::create_with_tpm2` / `create_with_tpm2_pin`
+  constructors that produce a vault with a single TPM keyslot at
+  index 0 and no passphrase fallback. If the chip clears the vault
+  is permanently unrecoverable.
+
+- **3-factor TPM combos: single-slot by default.** `Tpm2Fido2`,
+  `HybridPqTpm2`, `HybridPq1024Tpm2`, `HybridPqTpm2Fido2`, and
+  `HybridPq1024Tpm2Fido2` no longer enrol a passphrase slot at
+  slot 0 by default. The new default is one keyslot at index 0
+  carrying the multi-factor credential, all factors required at
+  every unlock. A new checkbox "Enable recovery passphrase (adds
+  an OR-attack path; default OFF)" preserves the legacy 2-slot
+  behavior for users who want the recovery fallback. Five new
+  single-slot `Container::create_with_*` constructors back the new
+  defaults
+  ([crates/luksbox-format/src/container.rs](crates/luksbox-format/src/container.rs)).
+
+- **Deniable mode: TPM combos always single-slot.** Tpm2,
+  Tpm2Pin, Tpm2Fido2, HybridPqTpm2, HybridPq1024Tpm2,
+  HybridPqTpm2Fido2, and HybridPq1024Tpm2Fido2 in deniable mode
+  are forced to a single deniable slot regardless of UI checkboxes.
+  Rationale: the alternative shape (passphrase slot + multi-factor
+  slot) would create an invisible second slot the user could never
+  enumerate or selectively revoke, see
+  [docs/DENIABLE_HEADER.md](docs/DENIABLE_HEADER.md).
+
+### Added
+
+- **Slot-index warning in deniable Add-slot flows.** GUI and TUI
+  show "Remember slot N. Deniable vaults cannot enumerate slots,
+  so to revoke this credential later you must remember which index
+  you used." Appears below the slot picker in Add-FIDO2 /
+  Add-passphrase modals and after the TUI's slot-index prompt.
+
+- **CLI parity for deniable create / mount / info.** The
+  `deniable-init`, `deniable-mount`, and `deniable-info`
+  subcommands gain a `--credential <type>` flag plus per-type
+  material flags (`--kyber-path`, `--tpm-blob-path`,
+  `--fido2-cred-id`, `--fido2-hmac-salt`). Credential types match
+  the wizard's coverage: `passphrase`, `fido2`, `pq-passphrase`,
+  `pq-fido2`, `tpm`, `tpm-fido2`, `pq-tpm`, `pq-tpm-fido2`. PINs
+  and passphrases stay interactive via `rpassword` so secrets do
+  not appear in shell history or `ps argv`. The init flow prints
+  a recovery card listing the FIDO2 `cred_id` / `hmac_salt` (hex)
+  and the `.tpm-blob` sidecar path as applicable.
+
+- **GUI recovery-card modal for deniable create.** After a deniable
+  vault is created the GUI shows a modal listing the
+  non-secret-but-not-on-disk values the user must save externally
+  (FIDO2 cred_id, hmac_salt, TPM sidecar path, KDF params) with
+  Copy buttons for each field.
+
+- **TUI wizard parity for the deniable flow.** Per-combo create
+  helpers (`create_den_fido2`, `create_den_pq_passphrase`,
+  `create_den_pq_fido2`, `create_den_tpm`, `create_den_tpm_fido2`,
+  `create_den_pq_tpm`, `create_den_pq_tpm_fido2`), an
+  `open_deniable_by_kind` dispatcher, and a printed recovery card
+  at the end of the create flow.
+
+### Fixed
+
+- **FUSE-T: "not enough space" when copying files into a mounted
+  vault on macOS.** The FUSE-T `statfs` callback returned zeros,
+  which the macOS NFS client interpreted as a full filesystem and
+  refused every WRITE3 request. Fixed by querying the host
+  filesystem via `libc::statvfs` and surfacing the real values
+  ([crates/luksbox-mount/src/fuse_t.rs](crates/luksbox-mount/src/fuse_t.rs)).
+
+### Documentation
+
+- **CRYPTO\_SPEC §19.10 Default slot policy for multi-factor combos**
+  ([docs/CRYPTO\_SPEC.md](docs/CRYPTO_SPEC.md)). Documents the new
+  single-slot create constructors, the per-combo defaults, and the
+  threat-model implications of the AND-semantics-by-default
+  choice. Cross-references from §7 ("Lost device with backup
+  enrolled") clarifying that the backup-passphrase recovery
+  argument no longer applies by default for FIDO2-direct and
+  multi-factor combos.
+
+- **DENIABLE\_HEADER.md** rewritten in places to reflect the new
+  shape: the per-credential recovery table for the TPM row now
+  records that deniable TPM is single-factor (no backup
+  passphrase combined into the KEK); a new section "Deniable +
+  TPM combos: always single-factor" spells out the rationale.
+
+- **DISCLAIMER.md** notes that the create flow no longer enrols a
+  backup passphrase by default for FIDO2-direct and 3-factor TPM
+  combos. Users either tick "Enable backup / recovery
+  passphrase" at create time or add a passphrase slot afterwards
+  via "Add slot".
+
+### Test coverage
+
+- Round-trip + "passphrase does not work" tests for every new
+  single-slot constructor, covering Tpm2, Tpm2Pin, Tpm2Fido2, and
+  HybridPqTpm2 paths. Use the mocked-TPM closure so CI runs on
+  every commit without real TPM hardware.
+
+---
+
 ## [v0.1.1] — 2026-05-08
 
 First post-release iteration on top of v0.1.0. No breaking format

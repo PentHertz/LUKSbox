@@ -14,6 +14,15 @@ pub enum Error {
     #[error("no keyslot accepted the provided unlock material")]
     UnlockFailed,
 
+    /// Single failure mode for the deniable header open path. Wrong
+    /// passphrase, wrong cipher, wrong Argon2 params, wrong vault file,
+    /// truncated input, and AEAD tag failure all collapse into this
+    /// one variant so an attacker observing error output cannot tell
+    /// which dimension was wrong. See `docs/DENIABLE_HEADER.md` for
+    /// the threat model that motivates the no-oracle property.
+    #[error("unlock failed")]
+    OpaqueUnlockFailed,
+
     #[error("metadata blob is larger than the metadata region")]
     MetadataTooLarge,
 

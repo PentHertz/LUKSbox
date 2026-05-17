@@ -258,6 +258,38 @@ struct CreateForm {
     /// previous wizard / GUI used unconditionally).
     hybrid_seed_pw: Zeroizing<String>,
     kdf: KdfStrength,
+    /// "Header format" toggle - when set, the create flow uses
+    /// `Container::create_with_passphrase_deniable` instead of the
+    /// standard `create_with_passphrase_flags`. v1 limitations
+    /// enforced in `ops::create_vault`: requires `kind == Passphrase`,
+    /// no detached header, no anchor, no size-hiding flags.
+    use_deniable: bool,
+    /// Opt-in toggle for the FIDO2-direct "backup passphrase" slot.
+    /// Default OFF. When ON, the create flow enrolls an additional
+    /// passphrase slot after the FIDO2 slot so the vault is still
+    /// openable if the authenticator is lost. The field is hidden
+    /// when the toggle is off to keep the failure mode obvious
+    /// ("either I have my key, or the vault is gone"). For deniable
+    /// vaults this slot is invisible after create (no slot enumeration)
+    /// so the create form shows a warning explaining the tradeoff.
+    enable_backup_passphrase: bool,
+    /// Opt-in toggle for the TPM kinds (Tpm2 / Tpm2Pin) to skip the
+    /// passphrase bootstrap entirely. Default OFF (current behaviour,
+    /// vault has a passphrase slot + TPM slot). When ON, the create
+    /// flow goes through `Container::create_with_tpm2[_pin]` which
+    /// produces a SINGLE TPM slot; if the chip dies, the vault is
+    /// permanently unrecoverable.
+    skip_tpm_bootstrap_passphrase: bool,
+    /// Opt-in toggle for the 3-factor TPM combos (Tpm2Fido2,
+    /// HybridPqTpm2*, HybridPqTpm2Fido2*) to add a passphrase
+    /// recovery slot. Default OFF (single multi-factor slot, all
+    /// factors required at every unlock - matches the design intent
+    /// of these combos). When ON, the legacy 2-slot bootstrap path
+    /// runs and a passphrase recovery slot is enrolled alongside
+    /// the multi-factor slot. The passphrase becomes an OR-attack
+    /// path: anyone with it can open the vault without ANY of the
+    /// hardware factors.
+    enable_recovery_passphrase: bool,
 }
 
 impl Default for CreateForm {
@@ -278,6 +310,10 @@ impl Default for CreateForm {
             hybrid_kyber_path: String::new(),
             hybrid_seed_pw: Zeroizing::default(),
             kdf: KdfStrength::Interactive,
+            use_deniable: false,
+            enable_backup_passphrase: false,
+            skip_tpm_bootstrap_passphrase: false,
+            enable_recovery_passphrase: false,
         }
     }
 }
@@ -301,6 +337,24 @@ struct UnlockForm {
     /// = error message to surface, None = not loaded yet (e.g. the
     /// user typed a path manually instead of clicking a recent).
     slot_inspection: Option<Result<Vec<String>, String>>,
+    /// Deniable-mode unlock: when set, the open flow routes through
+    /// `Container::open_with_credential_deniable` with the
+    /// user-supplied `deniable_cipher` + `deniable_kdf` + the
+    /// type-specific material below.
+    use_deniable: bool,
+    deniable_cipher: CipherChoice,
+    deniable_kdf: KdfStrength,
+    /// For `method == Fido2 && use_deniable`: the FIDO2 cred_id
+    /// (hex) the user saved at create time from the recovery
+    /// card. Empty otherwise. Standard FIDO2 unlock doesn't use
+    /// this (cred_id is stored in the on-disk keyslot).
+    deniable_fido2_cred_id_hex: String,
+    /// For `method == Fido2 && use_deniable`: the hmac-secret salt
+    /// (hex, 64 chars = 32 bytes) the user saved at create time.
+    deniable_fido2_hmac_salt_hex: String,
+    /// For `method == Tpm2*` + `use_deniable`: path to the
+    /// `.tpm-blob` sidecar holding the TPM2 sealed blob.
+    deniable_tpm_blob_path: String,
 }
 
 impl Default for UnlockForm {
@@ -316,6 +370,12 @@ impl Default for UnlockForm {
             pin: Zeroizing::default(),
             hybrid_kyber_path: String::new(),
             slot_inspection: None,
+            use_deniable: false,
+            deniable_cipher: CipherChoice::AesSiv,
+            deniable_kdf: KdfStrength::Interactive,
+            deniable_fido2_cred_id_hex: String::new(),
+            deniable_fido2_hmac_salt_hex: String::new(),
+            deniable_tpm_blob_path: String::new(),
         }
     }
 }
@@ -334,9 +394,39 @@ struct RotateForm {
     kdf: KdfStrength,
 }
 
+/// Form state for the "+ Add FIDO2 keyslot" modal. Wraps the PIN
+/// (the device's user-verification PIN, also `Zeroizing` so it's
+/// wiped on drop) and a deniable_slot_idx for the case where the
+/// open vault is in deniable mode and the admin must explicitly
+/// choose a slot index (standard vaults auto-pick first-free
+/// from the visible slot table).
+struct AddFido2Form {
+    pin: Zeroizing<String>,
+    /// Target slot index for deniable vaults. Ignored on standard
+    /// vaults. Default = 1 (since freshly-created deniable vaults
+    /// put the admin credential in slot 0).
+    deniable_slot_idx: usize,
+}
+
+impl Default for AddFido2Form {
+    fn default() -> Self {
+        Self {
+            pin: Zeroizing::default(),
+            deniable_slot_idx: 1,
+        }
+    }
+}
+
 struct AddPassphraseForm {
     passphrase: Zeroizing<String>,
     kdf: KdfStrength,
+    /// Target slot index. Standard vaults auto-pick the first free
+    /// slot from the visible keyslot table; deniable vaults have
+    /// no visible occupancy, so the admin picks an explicit slot
+    /// index 0..7. Defaults to 1 (slot 0 is the admin's unlock
+    /// slot for a freshly-created deniable vault). Ignored on
+    /// standard vaults.
+    deniable_slot_idx: usize,
 }
 
 impl Default for AddPassphraseForm {
@@ -344,6 +434,7 @@ impl Default for AddPassphraseForm {
         Self {
             passphrase: Zeroizing::default(),
             kdf: KdfStrength::Interactive,
+            deniable_slot_idx: 1,
         }
     }
 }
@@ -398,10 +489,6 @@ enum EmptyPassphraseTarget {
     /// User clicked "Create vault" with an empty passphrase field
     /// for a kind that needs a passphrase. Empty = no protection.
     CreateVault,
-    /// User clicked "Create vault" for FIDO2-direct with the
-    /// backup-passphrase field empty. Empty backup = lose the FIDO2
-    /// authenticator and the vault is unrecoverable.
-    Fido2DirectBackup,
     /// User clicked "Enroll" inside the "Add passphrase keyslot"
     /// modal with the passphrase field empty.
     AddPassphraseKeyslot,
@@ -625,7 +712,7 @@ pub struct LuksboxApp {
     add_passphrase_modal: Option<AddPassphraseForm>,
     /// PIN typed into the "add FIDO2 keyslot" modal. Wrapped in
     /// `Zeroizing` so the buffer is wiped on cancel / submit / drop.
-    add_fido2_pin_modal: Option<Zeroizing<String>>,
+    add_fido2_pin_modal: Option<AddFido2Form>,
     /// PIN typed into the "add fused TPM+FIDO2 keyslot" modal. Same
     /// shape as `add_fido2_pin_modal`; separate field so the two
     /// flows can't collide if the user opens both in quick
@@ -688,6 +775,14 @@ pub struct LuksboxApp {
     /// the LAST active credential on the vault (revoking it would
     /// permanently lock the user out).
     revoke_confirm: Option<RevokeConfirm>,
+    /// Active deniable-mode utility modal (create or verify a
+    /// deniable header). `None` outside the flow.
+    deniable_modal: Option<DeniableModal>,
+    /// One-shot "save your recovery info" modal triggered after a
+    /// successful deniable create / TPM-bootstrap / FIDO2-enroll
+    /// that produced cred_id+hmac_salt or a .tpm-blob sidecar
+    /// path. The user must acknowledge before continuing.
+    recovery_display: Option<DeniableRecoveryDisplay>,
 }
 
 /// In-flight keyslot-revocation confirmation. Carries the slot index,
@@ -697,6 +792,124 @@ struct RevokeConfirm {
     slot_idx: usize,
     slot_kind: SlotKind,
     would_be_last_active_slot: bool,
+}
+
+/// One-shot modal shown after a successful deniable create / enroll
+/// to surface the per-credential material that the user MUST save
+/// externally (the deniable header doesn't store it on disk).
+/// Currently covers FIDO2 cred_id + hmac_salt and the TPM
+/// `.tpm-blob` sidecar path. The modal blocks the new vault from
+/// being usable until the user explicitly acknowledges they've
+/// saved the info, so a user who clicks past the modal can't
+/// silently lose access.
+struct DeniableRecoveryDisplay {
+    fido2: Option<ops::DeniableFido2RecoveryInfo>,
+    tpm_blob_path: Option<std::path::PathBuf>,
+}
+
+/// Modal state for the "advanced" deniable-header create/verify
+/// utility. Pops up over Welcome via the two buttons "Create
+/// deniable header" / "Verify deniable header". Independent of the
+/// rest of the vault state - currently a header-only utility
+/// because the full Container integration for deniable mode is
+/// deferred (see `docs/DENIABLE_HEADER.md` 'Deferred work' section).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeniableMode {
+    Create,
+    Verify,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeniableCipherChoice {
+    AesSiv,
+    AesGcm,
+    ChaCha,
+}
+
+impl DeniableCipherChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::AesSiv => "AES-256-GCM-SIV (recommended)",
+            Self::AesGcm => "AES-256-GCM",
+            Self::ChaCha => "ChaCha20-Poly1305",
+        }
+    }
+    fn to_suite(self) -> luksbox_core::CipherSuite {
+        match self {
+            Self::AesSiv => luksbox_core::CipherSuite::Aes256GcmSiv,
+            Self::AesGcm => luksbox_core::CipherSuite::Aes256Gcm,
+            Self::ChaCha => luksbox_core::CipherSuite::ChaCha20Poly1305,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DeniableKdfChoice {
+    Interactive,
+    Moderate,
+    Sensitive,
+}
+
+impl DeniableKdfChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Interactive => "Interactive (256 MiB, t=3) - ~500 ms",
+            Self::Moderate => "Moderate (512 MiB, t=4) - ~1.5 s",
+            Self::Sensitive => "Sensitive (1 GiB, t=5) - ~3-4 s",
+        }
+    }
+    fn to_params(self) -> luksbox_core::Argon2idParams {
+        match self {
+            Self::Interactive => luksbox_core::Argon2idParams::INTERACTIVE,
+            Self::Moderate => luksbox_core::Argon2idParams::MODERATE,
+            Self::Sensitive => luksbox_core::Argon2idParams::SENSITIVE,
+        }
+    }
+}
+
+struct DeniableModal {
+    mode: DeniableMode,
+    path: String,
+    cipher: DeniableCipherChoice,
+    kdf: DeniableKdfChoice,
+    passphrase: Zeroizing<String>,
+    confirm_passphrase: Zeroizing<String>,
+    /// Background-job handle. Argon2id at MODERATE or SENSITIVE
+    /// blocks for 1.5-4 s; running it on the egui thread freezes the
+    /// UI. Worker thread runs the deniable_header API and sends back
+    /// a Result. Polled each frame from `update`.
+    pending: Option<Receiver<Result<String, String>>>,
+    /// Last completed result. `Ok(message)` shows green; `Err(message)`
+    /// shows red. Cleared on form change so stale messages don't
+    /// confuse a follow-up attempt.
+    result: Option<Result<String, String>>,
+}
+
+impl DeniableModal {
+    fn create() -> Self {
+        Self {
+            mode: DeniableMode::Create,
+            path: String::new(),
+            cipher: DeniableCipherChoice::AesSiv,
+            kdf: DeniableKdfChoice::Moderate,
+            passphrase: Zeroizing::new(String::new()),
+            confirm_passphrase: Zeroizing::new(String::new()),
+            pending: None,
+            result: None,
+        }
+    }
+    fn verify() -> Self {
+        Self {
+            mode: DeniableMode::Verify,
+            path: String::new(),
+            cipher: DeniableCipherChoice::AesSiv,
+            kdf: DeniableKdfChoice::Moderate,
+            passphrase: Zeroizing::new(String::new()),
+            confirm_passphrase: Zeroizing::new(String::new()),
+            pending: None,
+            result: None,
+        }
+    }
 }
 
 struct PendingPicker {
@@ -811,6 +1024,8 @@ impl LuksboxApp {
             prefs: preferences::load(),
             pending_clipboard_warning: None,
             revoke_confirm: None,
+            deniable_modal: None,
+            recovery_display: None,
         };
         // Cheap initial probe so the welcome banner + sidebar reflect
         // which FIDO2 authenticators are available before the user
@@ -1094,6 +1309,18 @@ impl LuksboxApp {
                     let has_fido2 = opened.has_fido2;
                     let has_hybrid_pq = opened.has_hybrid_pq;
                     let has_tpm = opened.has_tpm;
+                    // Extract deniable recovery info BEFORE moving
+                    // opened into self.vault. If either is set, pop
+                    // the recovery-card modal so the user sees the
+                    // values before they start using the vault.
+                    let fido2_rec = opened.deniable_fido2_recovery.clone();
+                    let tpm_blob = opened.deniable_tpm_blob_path.clone();
+                    if fido2_rec.is_some() || tpm_blob.is_some() {
+                        self.recovery_display = Some(DeniableRecoveryDisplay {
+                            fido2: fido2_rec,
+                            tpm_blob_path: tpm_blob,
+                        });
+                    }
                     self.vault = Some(opened);
                     self.cwd = "/".into();
                     self.refresh_listing();
@@ -1130,6 +1357,14 @@ impl LuksboxApp {
                     let has_fido2 = opened.has_fido2;
                     let has_hybrid_pq = opened.has_hybrid_pq;
                     let has_tpm = opened.has_tpm;
+                    let fido2_rec = opened.deniable_fido2_recovery.clone();
+                    let tpm_blob = opened.deniable_tpm_blob_path.clone();
+                    if fido2_rec.is_some() || tpm_blob.is_some() {
+                        self.recovery_display = Some(DeniableRecoveryDisplay {
+                            fido2: fido2_rec,
+                            tpm_blob_path: tpm_blob,
+                        });
+                    }
                     self.vault = Some(opened);
                     self.cwd = "/".into();
                     self.refresh_listing();
@@ -1832,6 +2067,12 @@ impl LuksboxApp {
             pin: Zeroizing::default(),
             hybrid_kyber_path: String::new(),
             slot_inspection,
+            use_deniable: false,
+            deniable_cipher: CipherChoice::AesSiv,
+            deniable_kdf: KdfStrength::Interactive,
+            deniable_fido2_cred_id_hex: String::new(),
+            deniable_fido2_hmac_salt_hex: String::new(),
+            deniable_tpm_blob_path: String::new(),
         };
         self.view = View::Unlock;
     }
@@ -2253,6 +2494,37 @@ impl LuksboxApp {
                             }
                     });
                 }
+                // Deniable-header toggle. When checked the create flow
+                // dispatches to Container::create_with_passphrase_deniable
+                // and the vault's on-disk bytes become indistinguishable
+                // from uniform random output. v1 limitations: requires
+                // passphrase kind, no detached header, no anchor, no
+                // size-hiding flags. Selecting an incompatible
+                // combination is rejected at submit time with a clear
+                // toast (see ops::create_vault validation).
+                ui.add_space(4.0);
+                let prev_deniable = self.create.use_deniable;
+                ui.checkbox(
+                    &mut self.create.use_deniable,
+                    "Use a deniable header (every on-disk byte indistinguishable from random; passphrase-only in v1)",
+                );
+                // Snap the slot kind to Passphrase the moment the
+                // user toggles deniable on, so the Keyslot factor
+                // radios below render in a coherent state.
+                if !prev_deniable && self.create.use_deniable {
+                    self.create.kind = CreateKind::Passphrase;
+                }
+                if self.create.use_deniable {
+                    ui.label(
+                        RichText::new(
+                            "Advanced. You MUST remember the cipher + Argon2 strength to \
+                             reopen this vault. Forgetting any of them is permanent lockout \
+                             by design; there's no fail-fast magic check.",
+                        )
+                        .color(theme::WARN)
+                        .size(11.0),
+                    );
+                }
             });
 
             section(ui, "Cipher", |ui| {
@@ -2274,9 +2546,6 @@ impl LuksboxApp {
                 #[cfg(target_os = "linux")]
                 ui.radio_value(&mut factor, Factor::Tpm2, Factor::Tpm2.label());
                 if factor != prev {
-                    // Switching factors snaps the kind to the simplest
-                    // variant of that factor so the user always lands
-                    // on a coherent state.
                     self.create.kind = match factor {
                         Factor::Passphrase => CreateKind::Passphrase,
                         Factor::Fido2 => CreateKind::Fido2,
@@ -2309,17 +2578,17 @@ impl LuksboxApp {
                     }
                     Factor::Tpm2 => {
                         ui.radio_value(&mut self.create.kind, CreateKind::Tpm2,
-                            "Plain TPM 2.0, wrap key sealed under the local chip. Backup passphrase only.");
+                            "Plain TPM 2.0, wrap key sealed under the local chip. Bootstrap passphrase REQUIRED (also acts as recovery if chip dies).");
                         ui.radio_value(&mut self.create.kind, CreateKind::Tpm2Pin,
-                            "TPM 2.0 + PIN, sealed object bound to a memorised PIN via userAuth. Backup passphrase + TPM PIN.");
+                            "TPM 2.0 + PIN, sealed object bound to a memorised PIN via userAuth. Bootstrap passphrase + TPM PIN.");
                         ui.radio_value(&mut self.create.kind, CreateKind::Tpm2Fido2,
-                            "Fused TPM 2.0 + FIDO2, both factors required at every unlock. Backup passphrase + FIDO2 PIN.");
+                            "Fused TPM 2.0 + FIDO2, both factors required at every unlock. Bootstrap passphrase + FIDO2 PIN.");
                         ui.radio_value(&mut self.create.kind, CreateKind::HybridPqTpm2,
                             "Hybrid TPM 2.0 + ML-KEM-768. PQ + machine-bound. .kyber seed file required.");
                         ui.radio_value(&mut self.create.kind, CreateKind::HybridPq1024Tpm2,
                             "Hybrid TPM 2.0 + ML-KEM-1024. Strongest 2-factor PQ + TPM.");
                         ui.radio_value(&mut self.create.kind, CreateKind::HybridPqTpm2Fido2,
-                            "3-factor: TPM 2.0 + FIDO2 + ML-KEM-768. Backup passphrase + FIDO2 PIN + .kyber seed.");
+                            "3-factor: TPM 2.0 + FIDO2 + ML-KEM-768. Bootstrap passphrase + FIDO2 PIN + .kyber seed.");
                         ui.radio_value(&mut self.create.kind, CreateKind::HybridPq1024Tpm2Fido2,
                             "3-factor: TPM 2.0 + FIDO2 + ML-KEM-1024. Strongest configuration.");
                     }
@@ -2384,26 +2653,62 @@ impl LuksboxApp {
                     });
                 }
                 CreateKind::Fido2Direct => {
-                    section(ui, "FIDO2-direct (optional backup passphrase)", |ui| {
+                    section(ui, "FIDO2-direct", |ui| {
                         ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
                         ui.add_sized([form_width(ui), CONTROL_H], egui::TextEdit::singleline(&mut *self.create.pin).password(true));
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new("Backup passphrase (optional). Filling it adds a passphrase keyslot wrapping the same MVK after create. \
-                                           Trade-off: losing the device no longer loses the vault, but the wrapped MVK now exists on disk under the passphrase KEK \
-                                           and can be brute-forced offline if the passphrase is weak. Leave empty for the no-wrapped-MVK property of FIDO2-direct.")
-                                .color(theme::WARN).size(12.0),
+                        ui.add_space(10.0);
+                        let cb_resp = ui.checkbox(
+                            &mut self.create.enable_backup_passphrase,
+                            "Enable backup passphrase",
                         );
-                        let te = egui::TextEdit::singleline(&mut *self.create.backup_passphrase)
-                            .password(true);
-                        ui.add_sized([form_width(ui), CONTROL_H], te);
-                        strength_meter(ui, &self.create.backup_passphrase);
-                        ui.add_space(6.0);
-                        if ui
-                            .add_sized([form_width(ui), CONTROL_H], ghost_button("Generate strong passphrase..."))
-                            .clicked()
-                        {
-                            self.open_passgen(PassgenTarget::CreateBackup);
+                        if cb_resp.changed() && !self.create.enable_backup_passphrase {
+                            self.create.backup_passphrase.clear();
+                        }
+                        ui.label(
+                            RichText::new(
+                                "Off (default): the vault is openable only with the FIDO2 \
+                                 authenticator. Losing the device = losing the vault. The \
+                                 MVK never exists on disk under a passphrase KEK.",
+                            )
+                            .color(theme::FAINT)
+                            .size(12.0),
+                        );
+                        if self.create.enable_backup_passphrase {
+                            ui.add_space(8.0);
+                            ui.label(
+                                RichText::new(
+                                    "On: a second passphrase keyslot is enrolled after the \
+                                     FIDO2 slot, wrapping the same MVK. Tradeoff: losing the \
+                                     device no longer kills the vault, but a weak passphrase \
+                                     becomes an offline brute-force target.",
+                                )
+                                .color(theme::WARN)
+                                .size(12.0),
+                            );
+                            if self.create.use_deniable {
+                                ui.label(
+                                    RichText::new(
+                                        "Note (deniable mode): this slot is invisible after create \
+                                         (no slot enumeration). You cannot selectively revoke \
+                                         it later. Pick a strong passphrase or leave the \
+                                         checkbox off.",
+                                    )
+                                    .color(theme::WARN)
+                                    .size(12.0),
+                                );
+                            }
+                            ui.add_space(4.0);
+                            let te = egui::TextEdit::singleline(&mut *self.create.backup_passphrase)
+                                .password(true);
+                            ui.add_sized([form_width(ui), CONTROL_H], te);
+                            strength_meter(ui, &self.create.backup_passphrase);
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized([form_width(ui), CONTROL_H], ghost_button("Generate strong passphrase..."))
+                                .clicked()
+                            {
+                                self.open_passgen(PassgenTarget::CreateBackup);
+                            }
                         }
                     });
                 }
@@ -2519,21 +2824,50 @@ impl LuksboxApp {
                     });
                 }
                 CreateKind::Tpm2 => {
-                    section(ui, "TPM 2.0 + backup passphrase", |ui| {
-                        ui.label(
-                            RichText::new("Backup passphrase (slot 0; recovery path if the TPM dies)")
+                    section(ui, "TPM 2.0", |ui| {
+                        if self.create.use_deniable {
+                            ui.label(
+                                RichText::new(
+                                    "Deniable mode: single TPM slot (forced). Adding a backup \
+                                     passphrase here would create an invisible second slot you \
+                                     can never list or revoke.",
+                                )
+                                .color(theme::FAINT).size(11.0),
+                            );
+                        } else {
+                            ui.checkbox(
+                                &mut self.create.skip_tpm_bootstrap_passphrase,
+                                "Skip bootstrap passphrase (single TPM slot, no recovery if chip dies)",
+                            );
+                        }
+                        if self.create.skip_tpm_bootstrap_passphrase || self.create.use_deniable {
+                            ui.label(
+                                RichText::new(
+                                    "TPM-only mode: the vault has ONE keyslot. If the TPM \
+                                     chip clears (BIOS reset, motherboard replacement, OS \
+                                     reinstall on platforms without TPM key persistence) the \
+                                     vault is permanently unrecoverable. No passphrase fallback.",
+                                )
                                 .color(theme::WARN).size(12.0),
-                        );
-                        let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
-                            .password(true);
-                        ui.add_sized([form_width(ui), CONTROL_H], te);
-                        strength_meter(ui, &self.create.passphrase);
-                        ui.add_space(6.0);
-                        if ui
-                            .add_sized([form_width(ui), CONTROL_H], ghost_button("Generate strong passphrase..."))
-                            .clicked()
-                        {
-                            self.open_passgen(PassgenTarget::CreatePrimary);
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(
+                                    "Bootstrap passphrase (REQUIRED, also acts as recovery path if the TPM dies)",
+                                )
+                                .color(theme::WARN).size(12.0),
+                            );
+                            let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
+                                .password(true);
+                            ui.add_sized([form_width(ui), CONTROL_H], te);
+                            strength_meter(ui, &self.create.passphrase);
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized([form_width(ui), CONTROL_H], ghost_button("Generate strong passphrase..."))
+                                .clicked()
+                            {
+                                self.open_passgen(PassgenTarget::CreatePrimary);
+                            }
                         }
                         ui.label(
                             RichText::new(
@@ -2545,16 +2879,44 @@ impl LuksboxApp {
                     });
                 }
                 CreateKind::Tpm2Pin => {
-                    section(ui, "TPM 2.0 + PIN + backup passphrase", |ui| {
-                        ui.label(
-                            RichText::new("Backup passphrase (slot 0; recovery path)")
+                    section(ui, "TPM 2.0 + PIN", |ui| {
+                        if self.create.use_deniable {
+                            ui.label(
+                                RichText::new(
+                                    "Deniable mode: single TPM+PIN slot (forced). Adding a backup \
+                                     passphrase here would create an invisible second slot you \
+                                     can never list or revoke.",
+                                )
+                                .color(theme::FAINT).size(11.0),
+                            );
+                        } else {
+                            ui.checkbox(
+                                &mut self.create.skip_tpm_bootstrap_passphrase,
+                                "Skip bootstrap passphrase (single TPM+PIN slot, no recovery if chip dies)",
+                            );
+                        }
+                        if self.create.skip_tpm_bootstrap_passphrase || self.create.use_deniable {
+                            ui.label(
+                                RichText::new(
+                                    "TPM-only mode: the vault has ONE keyslot bound to the chip + PIN. \
+                                     If the TPM clears the vault is permanently unrecoverable. No \
+                                     passphrase fallback.",
+                                )
                                 .color(theme::WARN).size(12.0),
-                        );
-                        let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
-                            .password(true);
-                        ui.add_sized([form_width(ui), CONTROL_H], te);
-                        strength_meter(ui, &self.create.passphrase);
-                        ui.add_space(8.0);
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(
+                                    "Bootstrap passphrase (REQUIRED, also acts as recovery path if the TPM dies)",
+                                )
+                                .color(theme::WARN).size(12.0),
+                            );
+                            let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
+                                .password(true);
+                            ui.add_sized([form_width(ui), CONTROL_H], te);
+                            strength_meter(ui, &self.create.passphrase);
+                            ui.add_space(8.0);
+                        }
                         ui.label(RichText::new("TPM PIN").color(theme::DIM).size(12.0));
                         let te = egui::TextEdit::singleline(&mut *self.create.pin).password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
@@ -2569,56 +2931,108 @@ impl LuksboxApp {
                     });
                 }
                 CreateKind::Tpm2Fido2 => {
-                    section(ui, "Fused TPM 2.0 + FIDO2 + backup passphrase", |ui| {
-                        ui.label(
-                            RichText::new("Backup passphrase (slot 0; recovery path)")
-                                .color(theme::WARN).size(12.0),
-                        );
-                        let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
-                            .password(true);
-                        ui.add_sized([form_width(ui), CONTROL_H], te);
-                        strength_meter(ui, &self.create.passphrase);
+                    section(ui, "Fused TPM 2.0 + FIDO2", |ui| {
+                        if self.create.use_deniable {
+                            ui.label(
+                                RichText::new(
+                                    "Deniable mode: single multi-factor slot (forced). The \
+                                     'recovery passphrase' option would create an invisible \
+                                     second slot you can never list or revoke.",
+                                )
+                                .color(theme::FAINT).size(11.0),
+                            );
+                        } else {
+                            ui.checkbox(
+                                &mut self.create.enable_recovery_passphrase,
+                                "Enable recovery passphrase (adds an OR-attack path; default OFF)",
+                            );
+                            if self.create.enable_recovery_passphrase {
+                                ui.label(
+                                    RichText::new(
+                                        "With recovery passphrase: anyone with the passphrase \
+                                         can open the vault WITHOUT the TPM or FIDO2. This \
+                                         defeats the 'both factors required' guarantee. Pick a \
+                                         strong passphrase.",
+                                    )
+                                    .color(theme::WARN).size(12.0),
+                                );
+                                ui.label(
+                                    RichText::new("Recovery passphrase").color(theme::DIM).size(12.0),
+                                );
+                                let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
+                                    .password(true);
+                                ui.add_sized([form_width(ui), CONTROL_H], te);
+                                strength_meter(ui, &self.create.passphrase);
+                                ui.add_space(6.0);
+                            } else {
+                                ui.label(
+                                    RichText::new(
+                                        "Default: TPM AND FIDO2 required at every unlock. Loss \
+                                         of either factor permanently destroys the vault.",
+                                    )
+                                    .color(theme::FAINT).size(11.0),
+                                );
+                            }
+                        }
                         ui.add_space(8.0);
                         ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
                         let te = egui::TextEdit::singleline(&mut *self.create.pin).password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
-                        ui.label(
-                            RichText::new(
-                                "Both factors required at every unlock: local TPM AND the \
-                                 FIDO2 authenticator. Loss of either kills the slot, keep \
-                                 the backup passphrase.",
-                            )
-                            .color(theme::FAINT).size(11.0),
-                        );
                     });
                 }
                 CreateKind::HybridPqTpm2 | CreateKind::HybridPq1024Tpm2 => {
                     let title = if self.create.kind == CreateKind::HybridPq1024Tpm2 {
-                        "Hybrid TPM 2.0 + ML-KEM-1024 + backup passphrase"
+                        "Hybrid TPM 2.0 + ML-KEM-1024"
                     } else {
-                        "Hybrid TPM 2.0 + ML-KEM-768 + backup passphrase"
+                        "Hybrid TPM 2.0 + ML-KEM-768"
                     };
                     section(ui, title, |ui| {
-                        ui.label(
-                            RichText::new("Backup passphrase (slot 0; recovery path if the TPM dies)")
-                                .color(theme::WARN).size(12.0),
-                        );
-                        let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
-                            .password(true);
-                        ui.add_sized([form_width(ui), CONTROL_H], te);
-                        strength_meter(ui, &self.create.passphrase);
-                        ui.add_space(6.0);
-                        if ui
-                            .add_sized([form_width(ui), CONTROL_H], ghost_button("Generate strong passphrase..."))
-                            .clicked()
-                        {
-                            self.open_passgen(PassgenTarget::CreatePrimary);
+                        if self.create.use_deniable {
+                            ui.label(
+                                RichText::new(
+                                    "Deniable mode: single multi-factor slot (forced).",
+                                )
+                                .color(theme::FAINT).size(11.0),
+                            );
+                        } else {
+                            ui.checkbox(
+                                &mut self.create.enable_recovery_passphrase,
+                                "Enable recovery passphrase (adds an OR-attack path; default OFF)",
+                            );
+                            if self.create.enable_recovery_passphrase {
+                                ui.label(
+                                    RichText::new(
+                                        "With recovery passphrase: anyone with the passphrase \
+                                         can open the vault WITHOUT the TPM or ML-KEM seed.",
+                                    )
+                                    .color(theme::WARN).size(12.0),
+                                );
+                                let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
+                                    .password(true);
+                                ui.add_sized([form_width(ui), CONTROL_H], te);
+                                strength_meter(ui, &self.create.passphrase);
+                                ui.add_space(6.0);
+                                if ui
+                                    .add_sized([form_width(ui), CONTROL_H], ghost_button("Generate strong passphrase..."))
+                                    .clicked()
+                                {
+                                    self.open_passgen(PassgenTarget::CreatePrimary);
+                                }
+                            } else {
+                                ui.label(
+                                    RichText::new(
+                                        "Default: TPM AND .kyber seed required at every unlock. \
+                                         Loss of either permanently destroys the vault.",
+                                    )
+                                    .color(theme::FAINT).size(11.0),
+                                );
+                            }
                         }
                         ui.add_space(10.0);
                         ui.label(
                             RichText::new(
                                 "Seed-file passphrase (encrypts the .kyber seed file at rest. \
-                                 Leave empty to reuse the backup passphrase above.)",
+                                 Required - the .kyber must be passphrase-protected.)",
                             )
                             .color(theme::DIM).size(12.0),
                         );
@@ -2628,7 +3042,7 @@ impl LuksboxApp {
                         ui.add_space(10.0);
                         ui.label(
                             RichText::new(
-                                "Path to write the secret .kyber seed file (KEEP ON SEPARATE STORAGE. Lose seed OR chip = lose slot; backup passphrase still recovers.)",
+                                "Path to write the secret .kyber seed file (KEEP ON SEPARATE STORAGE. Lose seed OR chip = lose slot; bootstrap passphrase still recovers.)",
                             )
                             .color(theme::WARN).size(12.0),
                         );
@@ -2655,20 +3069,44 @@ impl LuksboxApp {
                 }
                 CreateKind::HybridPqTpm2Fido2 | CreateKind::HybridPq1024Tpm2Fido2 => {
                     let title = if self.create.kind == CreateKind::HybridPq1024Tpm2Fido2 {
-                        "3-factor: TPM 2.0 + FIDO2 + ML-KEM-1024 + backup passphrase"
+                        "3-factor: TPM 2.0 + FIDO2 + ML-KEM-1024"
                     } else {
-                        "3-factor: TPM 2.0 + FIDO2 + ML-KEM-768 + backup passphrase"
+                        "3-factor: TPM 2.0 + FIDO2 + ML-KEM-768"
                     };
                     section(ui, title, |ui| {
-                        ui.label(
-                            RichText::new("Backup passphrase (slot 0; recovery path)")
-                                .color(theme::WARN).size(12.0),
-                        );
-                        let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
-                            .password(true);
-                        ui.add_sized([form_width(ui), CONTROL_H], te);
-                        strength_meter(ui, &self.create.passphrase);
-                        ui.add_space(8.0);
+                        if self.create.use_deniable {
+                            ui.label(
+                                RichText::new(
+                                    "Deniable mode: single 3-factor slot (forced).",
+                                )
+                                .color(theme::FAINT).size(11.0),
+                            );
+                        } else {
+                            ui.checkbox(
+                                &mut self.create.enable_recovery_passphrase,
+                                "Enable recovery passphrase (adds an OR-attack path; default OFF)",
+                            );
+                        }
+                        if !self.create.use_deniable && !self.create.enable_recovery_passphrase {
+                            ui.label(
+                                RichText::new(
+                                    "Default: TPM + FIDO2 + .kyber seed all required at every unlock. \
+                                     Loss of any factor permanently destroys the vault.",
+                                )
+                                .color(theme::FAINT).size(11.0),
+                            );
+                        }
+                        if !self.create.use_deniable && self.create.enable_recovery_passphrase {
+                            ui.label(
+                                RichText::new("Recovery passphrase (defeats the 3-factor guarantee if used)")
+                                    .color(theme::WARN).size(12.0),
+                            );
+                            let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
+                                .password(true);
+                            ui.add_sized([form_width(ui), CONTROL_H], te);
+                            strength_meter(ui, &self.create.passphrase);
+                            ui.add_space(8.0);
+                        }
                         ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
                         let te = egui::TextEdit::singleline(&mut *self.create.pin).password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
@@ -2676,7 +3114,7 @@ impl LuksboxApp {
                         ui.label(
                             RichText::new(
                                 "Seed-file passphrase (encrypts the .kyber seed file at rest. \
-                                 Leave empty to reuse the backup passphrase above.)",
+                                 Required - the .kyber must be passphrase-protected.)",
                             )
                             .color(theme::DIM).size(12.0),
                         );
@@ -2810,10 +3248,33 @@ impl LuksboxApp {
         // to None and bypasses this check.
         // Every kind except FIDO2 / FIDO2-direct needs a passphrase
         // (either as the primary slot or as the TPM-bootstrap backup).
+        // Tpm2 / Tpm2Pin can opt out via skip_tpm_bootstrap_passphrase:
+        // when ticked, the create flow goes through the new single-slot
+        // TPM constructors and no passphrase is collected. Deniable mode
+        // FORCES single-slot for these kinds (the 2-slot pattern would
+        // create an invisible-second-slot foot-gun, see DENIABLE_HEADER.md).
+        let tpm_only = (self.create.skip_tpm_bootstrap_passphrase || self.create.use_deniable)
+            && matches!(self.create.kind, CreateKind::Tpm2 | CreateKind::Tpm2Pin);
+        // The 3-factor combos default to single-slot (no passphrase
+        // needed). The user opts INTO a recovery passphrase via the
+        // `enable_recovery_passphrase` checkbox; when ON the legacy
+        // 2-slot bootstrap path runs and a passphrase IS needed.
+        // Deniable mode forces single-slot for 3-factor (no checkbox).
+        let three_factor_kind = matches!(
+            self.create.kind,
+            CreateKind::Tpm2Fido2
+                | CreateKind::HybridPqTpm2
+                | CreateKind::HybridPq1024Tpm2
+                | CreateKind::HybridPqTpm2Fido2
+                | CreateKind::HybridPq1024Tpm2Fido2
+        );
+        let three_factor_no_passphrase = three_factor_kind
+            && (self.create.use_deniable || !self.create.enable_recovery_passphrase);
         let needs_passphrase = !matches!(
             self.create.kind,
             CreateKind::Fido2 | CreateKind::Fido2Direct
-        );
+        ) && !tpm_only
+            && !three_factor_no_passphrase;
         if needs_passphrase
             && self.create.passphrase.is_empty()
             && self.empty_passphrase_confirm.is_none()
@@ -2821,18 +3282,10 @@ impl LuksboxApp {
             self.empty_passphrase_confirm = Some(EmptyPassphraseTarget::CreateVault);
             return;
         }
-        // FIDO2-direct backup-passphrase guard: the FIDO2-direct kind
-        // derives the MVK from the authenticator output (no wrapped
-        // MVK on disk). Without a backup passphrase, losing the
-        // authenticator = losing the vault, no recovery. Confirm
-        // before allowing an empty backup.
-        if self.create.kind == CreateKind::Fido2Direct
-            && self.create.backup_passphrase.is_empty()
-            && self.empty_passphrase_confirm.is_none()
-        {
-            self.empty_passphrase_confirm = Some(EmptyPassphraseTarget::Fido2DirectBackup);
-            return;
-        }
+        // No FIDO2-direct backup-passphrase guard needed anymore: the
+        // backup is now an explicit opt-in checkbox
+        // (`enable_backup_passphrase`). Empty = user didn't opt in,
+        // not user-forgot-to-fill.
         self.empty_passphrase_confirm = None;
         let opts = ops::CreateOpts {
             path: PathBuf::from(self.create.path.trim()),
@@ -2867,7 +3320,13 @@ impl LuksboxApp {
             } else {
                 None
             },
+            // Only attach the backup-passphrase slot when the user
+            // explicitly opted in via the checkbox AND filled the
+            // field. Empty-with-checkbox-on is treated as "user
+            // started but didn't finish": skip rather than enrol an
+            // empty-string slot.
             backup_passphrase: if self.create.kind == CreateKind::Fido2Direct
+                && self.create.enable_backup_passphrase
                 && !self.create.backup_passphrase.is_empty()
             {
                 Some(std::mem::take(&mut self.create.backup_passphrase))
@@ -2922,6 +3381,8 @@ impl LuksboxApp {
                 None
             },
             kdf: self.create.kdf,
+            use_deniable: self.create.use_deniable,
+            enable_recovery_passphrase: self.create.enable_recovery_passphrase,
         };
         let needs_touch = self.create.kind.needs_fido2();
 
@@ -2948,6 +3409,29 @@ impl LuksboxApp {
         // passphrase field (it has already been moved into `opts.passphrase`
         // above; clone before the move to keep a copy here). Simpler:
         // re-borrow from opts.passphrase for the bootstrap struct.
+        // TPM-only path: when the user ticks "Skip bootstrap passphrase"
+        // on Tpm2 / Tpm2Pin, we go through `create_vault_tpm2_only`
+        // which builds a single-slot vault directly (no passphrase
+        // slot, no enroll-then-swap dance).
+        if tpm_only {
+            if let Err(e) = ops::pre_check_tpm() {
+                self.toast_err(e);
+                return;
+            }
+            let pin_opt = if self.create.kind == CreateKind::Tpm2Pin {
+                let pin = std::mem::take(&mut self.create.pin);
+                if pin.is_empty() {
+                    self.toast_err("TPM PIN required");
+                    return;
+                }
+                Some(pin)
+            } else {
+                None
+            };
+            let rx = ops::spawn(move || ops::create_vault_tpm2_only(opts, pin_opt));
+            self.pending = Some(Pending::CreateWithTpmBootstrap { rx, needs_touch });
+            return;
+        }
         let tpm_bootstrap_kind: Option<ops::TpmBootstrapKind> = match self.create.kind {
             CreateKind::Tpm2 => Some(ops::TpmBootstrapKind::Tpm2),
             CreateKind::Tpm2Pin => {
@@ -3256,6 +3740,124 @@ impl LuksboxApp {
                     }
                 });
             }
+            // Deniable-mode unlock toggle. When set, the cipher +
+            // KDF dropdowns below are required (the user must have
+            // recorded them at create time). Mutually exclusive
+            // with the detached and anchor sidecar options in v1.
+            ui.add_space(6.0);
+            ui.checkbox(
+                &mut self.unlock.use_deniable,
+                "This vault uses a deniable header (advanced)",
+            );
+            if self.unlock.use_deniable {
+                ui.label(
+                    RichText::new("Cipher suite (must match create time)")
+                        .color(theme::DIM)
+                        .size(12.0),
+                );
+                ui.radio_value(
+                    &mut self.unlock.deniable_cipher,
+                    CipherChoice::AesSiv,
+                    "AES-256-GCM-SIV",
+                );
+                ui.radio_value(
+                    &mut self.unlock.deniable_cipher,
+                    CipherChoice::Aes,
+                    "AES-256-GCM",
+                );
+                ui.radio_value(
+                    &mut self.unlock.deniable_cipher,
+                    CipherChoice::Chacha,
+                    "ChaCha20-Poly1305",
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new("Argon2id strength (must match create time)")
+                        .color(theme::DIM)
+                        .size(12.0),
+                );
+                egui::ComboBox::from_id_salt("unlock-deniable-kdf")
+                    .selected_text(self.unlock.deniable_kdf.label())
+                    .show_ui(ui, |ui| {
+                        for k in [
+                            KdfStrength::Interactive,
+                            KdfStrength::Moderate,
+                            KdfStrength::Sensitive,
+                        ] {
+                            ui.selectable_value(&mut self.unlock.deniable_kdf, k, k.label());
+                        }
+                    });
+                // Per-method extra fields for deniable unlock.
+                // Each credential type needs different material
+                // surfaced from outside the vault file (cred_id
+                // for FIDO2, .tpm-blob for TPM, .kyber for PQ).
+                let needs_fido2_recovery = matches!(
+                    self.unlock.method,
+                    UnlockMethod::Fido2
+                        | UnlockMethod::HybridPqFido2
+                        | UnlockMethod::Tpm2Fido2
+                        | UnlockMethod::HybridPqTpm2Fido2,
+                );
+                let needs_tpm_blob = matches!(
+                    self.unlock.method,
+                    UnlockMethod::Tpm2
+                        | UnlockMethod::Tpm2Pin
+                        | UnlockMethod::Tpm2Fido2
+                        | UnlockMethod::HybridPqTpm2
+                        | UnlockMethod::HybridPqTpm2Fido2,
+                );
+                if needs_fido2_recovery {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("FIDO2 credential ID (hex, from your recovery card)")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    ui.add_sized(
+                        [capped_width(ui, FORM_FIELD_MAX_W), CONTROL_H],
+                        egui::TextEdit::singleline(&mut self.unlock.deniable_fido2_cred_id_hex)
+                            .hint_text("paste cred_id hex here"),
+                    );
+                    ui.label(
+                        RichText::new("FIDO2 hmac salt (hex, 64 chars / 32 bytes)")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    ui.add_sized(
+                        [capped_width(ui, FORM_FIELD_MAX_W), CONTROL_H],
+                        egui::TextEdit::singleline(&mut self.unlock.deniable_fido2_hmac_salt_hex)
+                            .hint_text("paste hmac_salt hex here"),
+                    );
+                }
+                if needs_tpm_blob {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "TPM sealed-blob path (the .tpm-blob sidecar saved at create time)",
+                        )
+                        .color(theme::DIM)
+                        .size(12.0),
+                    );
+                    ui.horizontal(|ui| {
+                        let (field_w, browse_w) =
+                            trailing_button_row_widths(ui, FORM_FIELD_MAX_W, 90.0);
+                        ui.add_sized(
+                            [field_w, CONTROL_H],
+                            egui::TextEdit::singleline(&mut self.unlock.deniable_tpm_blob_path)
+                                .hint_text("path to .tpm-blob"),
+                        );
+                        if ui
+                            .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
+                            .clicked()
+                            && let Some(p) = rfd::FileDialog::new()
+                                .set_title("TPM sealed-blob")
+                                .pick_file()
+                        {
+                            self.unlock.deniable_tpm_blob_path = p.display().to_string();
+                        }
+                    });
+                }
+            }
         });
 
         section(ui, "Method", |ui| {
@@ -3279,11 +3881,6 @@ impl LuksboxApp {
                 UnlockMethod::HybridPqFido2,
                 "Hybrid FIDO2 + ML-KEM (post-quantum, authenticator + .kyber)",
             );
-            // TPM unlock methods only on Linux. Windows TPM
-            // is on the roadmap (see docs/SECURITY.md Tier 3
-            // item 10); macOS uses Secure Enclave instead. On
-            // those platforms hide the radios so users don't
-            // see options that would just error.
             #[cfg(target_os = "linux")]
             {
                 ui.radio_value(
@@ -3651,6 +4248,16 @@ impl LuksboxApp {
             } else {
                 None
             },
+            use_deniable: self.unlock.use_deniable,
+            deniable_cipher: match self.unlock.deniable_cipher {
+                CipherChoice::AesSiv => luksbox_core::CipherSuite::Aes256GcmSiv,
+                CipherChoice::Aes => luksbox_core::CipherSuite::Aes256Gcm,
+                CipherChoice::Chacha => luksbox_core::CipherSuite::ChaCha20Poly1305,
+            },
+            deniable_kdf: self.unlock.deniable_kdf,
+            deniable_fido2_cred_id_hex: self.unlock.deniable_fido2_cred_id_hex.clone(),
+            deniable_fido2_hmac_salt_hex: self.unlock.deniable_fido2_hmac_salt_hex.clone(),
+            deniable_tpm_blob_path: self.unlock.deniable_tpm_blob_path.clone(),
         };
         let needs_touch = matches!(
             opts.method,
@@ -4518,7 +5125,7 @@ impl LuksboxApp {
                     if let Err(e) = ops::pre_check_fido2() {
                         self.toast_err(e);
                     } else {
-                        self.add_fido2_pin_modal = Some(Zeroizing::default());
+                        self.add_fido2_pin_modal = Some(AddFido2Form::default());
                     }
                 }
                 // TPM-bound "Add keyslot" buttons only on Linux. Each
@@ -4975,14 +5582,6 @@ impl LuksboxApp {
                  to continue?",
                 "Yes, use empty passphrase",
             ),
-            EmptyPassphraseTarget::Fido2DirectBackup => (
-                "No backup passphrase, are you sure?",
-                "FIDO2-direct vaults derive the master key from the authenticator's \
-                 output; there's no wrapped MVK on disk to brute-force. Without a backup \
-                 passphrase, LOSING THE AUTHENTICATOR loses the vault permanently with \
-                 no recovery. Are you sure you want to skip the backup?",
-                "Yes, skip backup passphrase",
-            ),
         };
         let mut proceed = false;
         let mut cancel = false;
@@ -5009,9 +5608,7 @@ impl LuksboxApp {
             // sees `empty_passphrase_confirm.is_some()`, skips the
             // guard, then clears the flag.
             match target {
-                EmptyPassphraseTarget::CreateVault | EmptyPassphraseTarget::Fido2DirectBackup => {
-                    self.submit_create()
-                }
+                EmptyPassphraseTarget::CreateVault => self.submit_create(),
                 EmptyPassphraseTarget::AddPassphraseKeyslot => {
                     // Bypass the modal-poll path: we already know the
                     // user hit Yes, so dispatch the enroll directly.
@@ -5020,9 +5617,19 @@ impl LuksboxApp {
                         && let Some(v) = self.vault.take()
                     {
                         let (tx, rx) = std::sync::mpsc::channel::<VaultRet<usize>>();
+                        let is_deniable = v.vfs.container().is_deniable();
                         std::thread::spawn(move || {
                             let mut v = v;
-                            let r = ops::enroll_passphrase(&mut v.vfs, &form.passphrase, form.kdf);
+                            let r = if is_deniable {
+                                ops::enroll_passphrase_deniable(
+                                    &mut v.vfs,
+                                    form.deniable_slot_idx,
+                                    &form.passphrase,
+                                    form.kdf,
+                                )
+                            } else {
+                                ops::enroll_passphrase(&mut v.vfs, &form.passphrase, form.kdf)
+                            };
                             let _ = tx.send((v, r));
                         });
                         self.pending = Some(Pending::EnrollPassphrase { rx });
@@ -5339,17 +5946,80 @@ impl LuksboxApp {
         self.draw_rotate_modal(ctx);
         self.draw_confirm_lock_modal(ctx);
         self.draw_empty_passphrase_confirm_modal(ctx);
+        self.draw_deniable_modal(ctx);
+        self.draw_deniable_recovery_modal(ctx);
 
         // Add-passphrase modal
         let mut close_pp = false;
         let mut submit_pp = false;
         let mut open_passgen_for_keyslot = false;
+        // Compute deniable-mode info BEFORE borrowing the modal mut.
+        // The modal closure holds &mut self.add_passphrase_modal; we
+        // can't also reach into self.vault from inside it.
+        let deniable_info: Option<(bool, Option<usize>)> = self.vault.as_ref().map(|v| {
+            let c = v.vfs.container();
+            (c.is_deniable(), c.deniable_unlocked_slot())
+        });
         if let Some(form) = self.add_passphrase_modal.as_mut() {
             egui::Window::new("Add passphrase keyslot")
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
+                    // Deniable-mode picker. Standard vaults expose the
+                    // slot table directly so the GUI can pick the
+                    // first-free index automatically; deniable vaults
+                    // don't, so the admin must choose a target slot
+                    // (0..7) explicitly. The unlock-slot index is
+                    // shown so the admin doesn't overwrite themselves
+                    // (Container also guards this).
+                    if let Some((true, unlocked)) = deniable_info {
+                        ui.label(
+                            RichText::new(
+                                "Deniable vault: pick a slot index for the new credential. \
+                                 Other slots may belong to other users (you cannot tell \
+                                 without their credential). The slot below marked '(you)' \
+                                 is your current unlock slot and cannot be overwritten here.",
+                            )
+                            .color(theme::WARN)
+                            .size(11.0),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Target slot").color(theme::DIM).size(12.0));
+                        egui::ComboBox::from_id_salt("add-pp-deniable-slot")
+                            .selected_text(format!(
+                                "Slot {}{}",
+                                form.deniable_slot_idx,
+                                if Some(form.deniable_slot_idx) == unlocked {
+                                    " (you - cannot overwrite)"
+                                } else {
+                                    ""
+                                },
+                            ))
+                            .show_ui(ui, |ui| {
+                                for i in 0..luksbox_core::deniable::DENIABLE_SLOT_COUNT {
+                                    let label = if Some(i) == unlocked {
+                                        format!("Slot {} (you - cannot overwrite)", i)
+                                    } else {
+                                        format!("Slot {}", i)
+                                    };
+                                    ui.selectable_value(&mut form.deniable_slot_idx, i, label);
+                                }
+                            });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Remember slot {}. Deniable vaults cannot enumerate slots, \
+                                 so to revoke this passphrase later you must remember which \
+                                 index you used.",
+                                form.deniable_slot_idx,
+                            ))
+                            .color(theme::WARN)
+                            .size(11.0),
+                        );
+                        ui.add_space(10.0);
+                    }
+
                     ui.label(RichText::new("New passphrase").color(theme::DIM).size(12.0));
                     ui.horizontal(|ui| {
                         let (field_w, button_w) = trailing_button_row_widths(ui, 320.0, 110.0);
@@ -5425,9 +6095,19 @@ impl LuksboxApp {
                     && let Some(v) = self.vault.take()
                 {
                     let (tx, rx) = std::sync::mpsc::channel::<VaultRet<usize>>();
+                    let is_deniable = v.vfs.container().is_deniable();
                     std::thread::spawn(move || {
                         let mut v = v;
-                        let r = ops::enroll_passphrase(&mut v.vfs, &form.passphrase, form.kdf);
+                        let r = if is_deniable {
+                            ops::enroll_passphrase_deniable(
+                                &mut v.vfs,
+                                form.deniable_slot_idx,
+                                &form.passphrase,
+                                form.kdf,
+                            )
+                        } else {
+                            ops::enroll_passphrase(&mut v.vfs, &form.passphrase, form.kdf)
+                        };
                         let _ = tx.send((v, r));
                     });
                     self.pending = Some(Pending::EnrollPassphrase { rx });
@@ -5440,14 +6120,71 @@ impl LuksboxApp {
         // Add-fido2 modal
         let mut close_fido = false;
         let mut submit_fido = false;
-        if let Some(buf) = self.add_fido2_pin_modal.as_mut() {
+        // Probe deniable status before borrowing the modal mut (same
+        // pattern as draw_deniable_modal earlier).
+        let fido_deniable_info: Option<(bool, Option<usize>)> = self.vault.as_ref().map(|v| {
+            let c = v.vfs.container();
+            (c.is_deniable(), c.deniable_unlocked_slot())
+        });
+        if let Some(form) = self.add_fido2_pin_modal.as_mut() {
             egui::Window::new("Add FIDO2 authenticator keyslot")
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .collapsible(false)
                 .resizable(false)
                 .show(ctx, |ui| {
+                    // Slot-index picker for deniable vaults (same UX
+                    // as draw_add_passphrase_modal). Standard vaults
+                    // auto-pick first-free from the visible keyslot
+                    // table and don't need a picker.
+                    if let Some((true, unlocked)) = fido_deniable_info {
+                        ui.label(
+                            RichText::new(
+                                "Deniable vault: pick a slot index for the new FIDO2 \
+                                 credential. The slot marked '(you)' is your current \
+                                 unlock slot and cannot be overwritten.",
+                            )
+                            .color(theme::WARN)
+                            .size(11.0),
+                        );
+                        ui.add_space(4.0);
+                        ui.label(RichText::new("Target slot").color(theme::DIM).size(12.0));
+                        egui::ComboBox::from_id_salt("add-fido2-deniable-slot")
+                            .selected_text(format!(
+                                "Slot {}{}",
+                                form.deniable_slot_idx,
+                                if Some(form.deniable_slot_idx) == unlocked {
+                                    " (you - cannot overwrite)"
+                                } else {
+                                    ""
+                                },
+                            ))
+                            .show_ui(ui, |ui| {
+                                for i in 0..luksbox_core::deniable::DENIABLE_SLOT_COUNT {
+                                    let label = if Some(i) == unlocked {
+                                        format!("Slot {} (you - cannot overwrite)", i)
+                                    } else {
+                                        format!("Slot {}", i)
+                                    };
+                                    ui.selectable_value(&mut form.deniable_slot_idx, i, label);
+                                }
+                            });
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "Remember slot {}. Deniable vaults cannot enumerate slots, \
+                                 so to revoke this FIDO2 credential later you must remember \
+                                 which index you used (in addition to the cred_id + hmac_salt \
+                                 on the recovery card).",
+                                form.deniable_slot_idx,
+                            ))
+                            .color(theme::WARN)
+                            .size(11.0),
+                        );
+                        ui.add_space(10.0);
+                    }
+
                     ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                    let te = egui::TextEdit::singleline(&mut **buf).password(true);
+                    let te = egui::TextEdit::singleline(&mut *form.pin).password(true);
                     ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
                     ui.label(
                         RichText::new("You'll be asked to touch the FIDO2 authenticator twice.")
@@ -5466,13 +6203,18 @@ impl LuksboxApp {
                 });
         }
         if submit_fido {
-            if let Some(pin) = self.add_fido2_pin_modal.take()
+            if let Some(form) = self.add_fido2_pin_modal.take()
                 && let Some(v) = self.vault.take()
             {
                 let (tx, rx) = std::sync::mpsc::channel::<VaultRet<usize>>();
+                let is_deniable = v.vfs.container().is_deniable();
                 std::thread::spawn(move || {
                     let mut v = v;
-                    let r = ops::enroll_fido2(&mut v.vfs, &pin);
+                    let r = if is_deniable {
+                        ops::enroll_fido2_deniable(&mut v.vfs, form.deniable_slot_idx, &form.pin)
+                    } else {
+                        ops::enroll_fido2(&mut v.vfs, &form.pin)
+                    };
                     let _ = tx.send((v, r));
                 });
                 self.pending = Some(Pending::EnrollFido2 { rx });
@@ -7146,4 +7888,471 @@ fn find_free_windows_drive_letter() -> Option<std::path::PathBuf> {
         }
     }
     None
+}
+
+// ============================================================
+// Deniable-header utility modal
+// ============================================================
+
+impl LuksboxApp {
+    /// Draw the deniable-header create/verify modal. No-op when
+    /// `self.deniable_modal` is None. Also drains any completed
+    /// background job's Receiver and lifts the result into
+    /// `form.result` for display.
+    /// Draw the "save your deniable-mode recovery info" modal that
+    /// appears once after every successful deniable create / TPM
+    /// bootstrap / FIDO2 enroll that produced material the user
+    /// must remember (FIDO2 cred_id + hmac_salt, TPM `.tpm-blob`
+    /// path). Modal blocks - user must click "I've saved this" to
+    /// dismiss; closing without saving means the vault becomes
+    /// unopenable.
+    fn draw_deniable_recovery_modal(&mut self, ctx: &egui::Context) {
+        let Some(rec) = self.recovery_display.as_ref() else {
+            return;
+        };
+        let fido2 = rec.fido2.clone();
+        let tpm_blob = rec.tpm_blob_path.clone();
+        let mut close = false;
+
+        egui::Window::new("Deniable vault - save this recovery info")
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    RichText::new(
+                        "Without these values your vault is UNRECOVERABLE. Save them \
+                         in a password manager / on paper before continuing. The \
+                         deniable header does not store this on disk by design.",
+                    )
+                    .color(theme::DANGER)
+                    .size(13.0)
+                    .strong(),
+                );
+                ui.add_space(12.0);
+
+                if let Some(fido2) = fido2.as_ref() {
+                    ui.label(
+                        RichText::new("FIDO2 credential ID (hex)")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    let cred_id_hex = hex::encode(&fido2.cred_id);
+                    let mut cred_id_buf = cred_id_hex.clone();
+                    ui.horizontal(|ui| {
+                        let (field_w, button_w) = trailing_button_row_widths(ui, 460.0, 80.0);
+                        ui.add_sized(
+                            [field_w, CONTROL_H],
+                            egui::TextEdit::singleline(&mut cred_id_buf)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if ui
+                            .add_sized([button_w, CONTROL_H], ghost_button("Copy"))
+                            .clicked()
+                        {
+                            ctx.copy_text(cred_id_hex.clone());
+                        }
+                    });
+                    ui.add_space(6.0);
+
+                    ui.label(
+                        RichText::new("FIDO2 hmac salt (hex, 32 bytes)")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    let hmac_salt_hex = hex::encode(fido2.hmac_salt);
+                    let mut hmac_salt_buf = hmac_salt_hex.clone();
+                    ui.horizontal(|ui| {
+                        let (field_w, button_w) = trailing_button_row_widths(ui, 460.0, 80.0);
+                        ui.add_sized(
+                            [field_w, CONTROL_H],
+                            egui::TextEdit::singleline(&mut hmac_salt_buf)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if ui
+                            .add_sized([button_w, CONTROL_H], ghost_button("Copy"))
+                            .clicked()
+                        {
+                            ctx.copy_text(hmac_salt_hex.clone());
+                        }
+                    });
+                    ui.add_space(10.0);
+                }
+
+                if let Some(tpm_path) = tpm_blob.as_ref() {
+                    ui.label(
+                        RichText::new("TPM sealed-blob sidecar (file path)")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    let path_str = tpm_path.display().to_string();
+                    let mut path_buf = path_str.clone();
+                    ui.horizontal(|ui| {
+                        let (field_w, button_w) = trailing_button_row_widths(ui, 460.0, 80.0);
+                        ui.add_sized(
+                            [field_w, CONTROL_H],
+                            egui::TextEdit::singleline(&mut path_buf)
+                                .font(egui::TextStyle::Monospace),
+                        );
+                        if ui
+                            .add_sized([button_w, CONTROL_H], ghost_button("Copy"))
+                            .clicked()
+                        {
+                            ctx.copy_text(path_str.clone());
+                        }
+                    });
+                    ui.label(
+                        RichText::new(
+                            "The .tpm-blob file IS already written to the path \
+                             above. You can move it to USB / paper-printed-base64 / \
+                             separate disk - just remember where you put it. Anyone \
+                             who finds the file alongside the vault learns 'this \
+                             vault uses TPM' (sidecar fingerprint; vault file itself \
+                             stays opaque).",
+                        )
+                        .color(theme::FAINT)
+                        .size(11.0),
+                    );
+                    ui.add_space(10.0);
+                }
+
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.add(primary_button("I've saved this - close")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if close {
+            self.recovery_display = None;
+        }
+    }
+
+    fn draw_deniable_modal(&mut self, ctx: &egui::Context) {
+        // Step 1: poll the worker thread (if any) BEFORE the borrow
+        // that the egui::Window closure takes. If the job completed
+        // since the last frame, lift the result into the form's
+        // `result` field and clear `pending`.
+        if let Some(form) = self.deniable_modal.as_mut() {
+            if let Some(rx) = form.pending.as_ref() {
+                if let Ok(res) = rx.try_recv() {
+                    form.result = Some(res);
+                    form.pending = None;
+                }
+            }
+        }
+
+        let Some(form) = self.deniable_modal.as_mut() else {
+            return;
+        };
+
+        let mut close = false;
+        let mut submit = false;
+        let title = match form.mode {
+            DeniableMode::Create => "Create deniable header",
+            DeniableMode::Verify => "Verify deniable header",
+        };
+
+        egui::Window::new(title)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .show(ctx, |ui| {
+                // ---- Top warning -------------------------------------
+                ui.label(
+                    RichText::new(
+                        "ADVANCED. Forgetting any of (cipher, Argon2 \
+                         params, passphrase) means PERMANENT lockout. \
+                         There is no fail-fast magic check.",
+                    )
+                    .color(theme::WARN)
+                    .size(12.0),
+                );
+                ui.add_space(10.0);
+
+                // ---- Path --------------------------------------------
+                ui.label(RichText::new("File path").color(theme::DIM).size(12.0));
+                ui.horizontal(|ui| {
+                    let (field_w, button_w) = trailing_button_row_widths(ui, 320.0, 90.0);
+                    ui.add_sized(
+                        [field_w, CONTROL_H],
+                        egui::TextEdit::singleline(&mut form.path),
+                    );
+                    let btn_label = if matches!(form.mode, DeniableMode::Create) {
+                        "Save as..."
+                    } else {
+                        "Open..."
+                    };
+                    if ui
+                        .add_sized([button_w, CONTROL_H], ghost_button(btn_label))
+                        .clicked()
+                    {
+                        let picked = match form.mode {
+                            DeniableMode::Create => rfd::FileDialog::new()
+                                .set_title("Save deniable-header file")
+                                .save_file(),
+                            DeniableMode::Verify => rfd::FileDialog::new()
+                                .set_title("Open deniable-header file")
+                                .pick_file(),
+                        };
+                        if let Some(p) = picked {
+                            form.path = p.to_string_lossy().into_owned();
+                        }
+                    }
+                });
+                ui.add_space(8.0);
+
+                // ---- Cipher dropdown --------------------------------
+                ui.label(
+                    RichText::new("Cipher suite (you must remember this)")
+                        .color(theme::DIM)
+                        .size(12.0),
+                );
+                egui::ComboBox::from_id_salt("deniable-cipher")
+                    .width(capped_width(ui, 420.0))
+                    .selected_text(form.cipher.label())
+                    .show_ui(ui, |ui| {
+                        for c in [
+                            DeniableCipherChoice::AesSiv,
+                            DeniableCipherChoice::AesGcm,
+                            DeniableCipherChoice::ChaCha,
+                        ] {
+                            ui.selectable_value(&mut form.cipher, c, c.label());
+                        }
+                    });
+                ui.add_space(8.0);
+
+                // ---- KDF preset -------------------------------------
+                ui.label(
+                    RichText::new("Argon2id strength (you must remember this)")
+                        .color(theme::DIM)
+                        .size(12.0),
+                );
+                egui::ComboBox::from_id_salt("deniable-kdf")
+                    .width(capped_width(ui, 420.0))
+                    .selected_text(form.kdf.label())
+                    .show_ui(ui, |ui| {
+                        for k in [
+                            DeniableKdfChoice::Interactive,
+                            DeniableKdfChoice::Moderate,
+                            DeniableKdfChoice::Sensitive,
+                        ] {
+                            ui.selectable_value(&mut form.kdf, k, k.label());
+                        }
+                    });
+                ui.add_space(8.0);
+
+                // ---- Passphrase fields ------------------------------
+                ui.label(RichText::new("Passphrase").color(theme::DIM).size(12.0));
+                ui.add_sized(
+                    [capped_width(ui, 420.0), CONTROL_H],
+                    egui::TextEdit::singleline(&mut *form.passphrase).password(true),
+                );
+                if matches!(form.mode, DeniableMode::Create) {
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("Confirm passphrase")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    ui.add_sized(
+                        [capped_width(ui, 420.0), CONTROL_H],
+                        egui::TextEdit::singleline(&mut *form.confirm_passphrase).password(true),
+                    );
+                }
+                ui.add_space(12.0);
+
+                // ---- Result / pending banner ------------------------
+                if form.pending.is_some() {
+                    ui.horizontal(|ui| {
+                        ui.add(egui::Spinner::new().color(theme::ACCENT).size(18.0));
+                        ui.label(
+                            RichText::new("Running Argon2id...")
+                                .color(theme::DIM)
+                                .size(12.0),
+                        );
+                    });
+                    ui.add_space(8.0);
+                } else if let Some(res) = &form.result {
+                    let (color, prefix) = match res {
+                        Ok(_) => (theme::OK, "✓ "),
+                        Err(_) => (theme::DANGER, "✗ "),
+                    };
+                    let text = match res {
+                        Ok(s) | Err(s) => s.clone(),
+                    };
+                    ui.label(
+                        RichText::new(format!("{}{}", prefix, text))
+                            .color(color)
+                            .size(12.0),
+                    );
+                    ui.add_space(8.0);
+                }
+
+                // ---- Submit + Close ---------------------------------
+                ui.horizontal(|ui| {
+                    let label = match form.mode {
+                        DeniableMode::Create => "Create",
+                        DeniableMode::Verify => "Verify",
+                    };
+                    let btn_enabled = form.pending.is_none()
+                        && !form.path.is_empty()
+                        && !form.passphrase.is_empty()
+                        && (form.mode == DeniableMode::Verify
+                            || !form.confirm_passphrase.is_empty());
+                    ui.add_enabled_ui(btn_enabled, |ui| {
+                        if ui.add(primary_button(label)).clicked() {
+                            submit = true;
+                        }
+                    });
+                    if ui.add(ghost_button("Close")).clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        // Handle submit OUTSIDE the egui::Window closure so we can
+        // mutate `self.deniable_modal` (the closure borrowed it
+        // mutably already via `form`).
+        if submit {
+            self.spawn_deniable_job(ctx);
+        }
+        if close {
+            self.deniable_modal = None;
+        }
+    }
+
+    /// Spawn the background Argon2id+AEAD worker for the active
+    /// deniable-modal form. Validates fields synchronously; on a
+    /// validation failure the result is set directly without
+    /// spawning. On success a worker thread runs the deniable_header
+    /// API and sends the result back via a Receiver that
+    /// `draw_deniable_modal` polls on the next frame.
+    fn spawn_deniable_job(&mut self, ctx: &egui::Context) {
+        let Some(form) = self.deniable_modal.as_mut() else {
+            return;
+        };
+        // Synchronous validation. These error paths never spawn the
+        // worker, so the result is visible instantly.
+        if matches!(form.mode, DeniableMode::Create) && *form.passphrase != *form.confirm_passphrase
+        {
+            form.result = Some(Err("passphrases do not match".into()));
+            return;
+        }
+        if form.path.trim().is_empty() {
+            form.result = Some(Err("path is required".into()));
+            return;
+        }
+
+        let mode = form.mode;
+        let path = std::path::PathBuf::from(form.path.trim());
+        let cipher_suite = form.cipher.to_suite();
+        let params = form.kdf.to_params();
+        let passphrase = form.passphrase.clone();
+        let ctx_clone = ctx.clone();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        form.pending = Some(rx);
+        form.result = None;
+
+        std::thread::spawn(move || {
+            let result = match mode {
+                DeniableMode::Create => {
+                    deniable_create_worker(&path, passphrase.as_bytes(), params, cipher_suite)
+                }
+                DeniableMode::Verify => {
+                    deniable_verify_worker(&path, passphrase.as_bytes(), params, cipher_suite)
+                }
+            };
+            let _ = tx.send(result);
+            // Wake the UI thread so it polls the Receiver immediately
+            // instead of waiting for the next animation frame (which
+            // could be many seconds away if egui is idle).
+            ctx_clone.request_repaint();
+        });
+    }
+}
+
+/// Background worker: build a fresh deniable header and write it to
+/// `path`. Returns a friendly success message or an error string
+/// (sanitised - never echoes the passphrase or any secret material).
+fn deniable_create_worker(
+    path: &std::path::Path,
+    passphrase: &[u8],
+    params: luksbox_core::Argon2idParams,
+    cipher_suite: luksbox_core::CipherSuite,
+) -> Result<String, String> {
+    use luksbox_core::{KdfId, deniable::DENIABLE_HEADER_SIZE};
+    use luksbox_format::deniable_header::{DeniableInnerHeader, create_with_passphrase};
+    use std::io::Write;
+
+    if path.exists() {
+        return Err(format!(
+            "refusing to overwrite existing file: {}",
+            path.display()
+        ));
+    }
+    let metadata_size: u64 = luksbox_format::DEFAULT_METADATA_REGION_SIZE;
+    let inner = DeniableInnerHeader {
+        format_version_minor: 0,
+        cipher_suite,
+        kdf_id: KdfId::Argon2id,
+        flags: 0,
+        metadata_offset: DENIABLE_HEADER_SIZE as u64,
+        metadata_size,
+        data_offset: DENIABLE_HEADER_SIZE as u64 + metadata_size,
+        chunk_size: 4096,
+    };
+    let (header_bytes, _mvk) = create_with_passphrase(passphrase, params, cipher_suite, inner)
+        .map_err(|e| format!("create failed: {e}"))?;
+
+    let mut file = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(path)
+        .map_err(|e| format!("open for write failed: {e}"))?;
+    file.write_all(&header_bytes)
+        .map_err(|e| format!("write failed: {e}"))?;
+    file.flush().map_err(|e| format!("flush failed: {e}"))?;
+
+    Ok(format!(
+        "wrote {} bytes to {}. SAVE the cipher + Argon2 params now.",
+        header_bytes.len(),
+        path.display()
+    ))
+}
+
+/// Background worker: read the header from `path`, run the open path
+/// with the supplied credential + params + cipher, and return a
+/// success message with the parsed inner fields OR the same
+/// `OpaqueUnlockFailed` message any failure produces (no oracle
+/// leakage about which step rejected).
+fn deniable_verify_worker(
+    path: &std::path::Path,
+    passphrase: &[u8],
+    params: luksbox_core::Argon2idParams,
+    cipher_suite: luksbox_core::CipherSuite,
+) -> Result<String, String> {
+    use luksbox_core::deniable::DENIABLE_HEADER_SIZE;
+    use luksbox_format::deniable_header::open_with_passphrase;
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path).map_err(|e| format!("open for read failed: {e}"))?;
+    let mut header = vec![0u8; DENIABLE_HEADER_SIZE];
+    file.read_exact(&mut header)
+        .map_err(|_| "unlock failed".to_string())?;
+    let opened = open_with_passphrase(&header, passphrase, params, cipher_suite)
+        .map_err(|_| "unlock failed".to_string())?;
+    Ok(format!(
+        "header opened. cipher={:?} flags=0x{:08x} chunk_size={} metadata_off={} data_off={}",
+        opened.inner.cipher_suite,
+        opened.inner.flags,
+        opened.inner.chunk_size,
+        opened.inner.metadata_offset,
+        opened.inner.data_offset,
+    ))
 }

@@ -116,6 +116,20 @@ test = false
 doc = false
 bench = false
 
+# Deniable header parse: feed arbitrary 8 KiB+ bytes through the
+# deniable open path with attacker-controlled passphrase + cipher
+# choice. Verifies (a) never panic, (b) never leaks failure mode
+# via a non-`OpaqueUnlockFailed` error variant. Critical because
+# the deniable format's no-oracle property is a load-bearing
+# security property; a panic or distinguishable error would
+# fingerprint the vault to a remote attacker.
+[[bin]]
+name = "deniable_header_parse"
+path = "fuzz_targets/deniable_header_parse.rs"
+test = false
+doc = false
+bench = false
+
 # Fuzz binaries should not be part of the workspace; cargo-fuzz expects to
 # build them with sanitizers and -C codegen-units=1. Excluding from the
 # workspace lets us keep workspace-wide `cargo build` fast and unsanitized.
