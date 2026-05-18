@@ -1125,6 +1125,7 @@ dependencies = [
  "pkg-config",
  "rand_core 0.6.4",
  "sha2",
+ "subtle",
  "thiserror 2.0.18",
  "vcpkg",
  "windows",

@@ -336,6 +336,12 @@ jobs:
       - name: Fuzz ${{ matrix.target }} for 5 minutes
         run: |
           cd "$GITHUB_WORKSPACE"
+          # Defensively create the corpus dir if the repo doesn't ship
+          # one yet (cargo-fuzz refuses with "required directory does
+          # not exist" otherwise). Empty dirs aren't tracked by git so
+          # a freshly-added target without seeds would otherwise fail
+          # CI on its first run.
+          mkdir -p fuzz/corpus/${{ matrix.target }}
           cargo +nightly fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} \
             -- -max_total_time=300

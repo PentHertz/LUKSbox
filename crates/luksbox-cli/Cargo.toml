@@ -234,7 +234,7 @@ vendor = "Penthertz"
 # Post-install the user MUST `sudo usermod -aG tss $USER` and log
 # back in - Fedora/RHEL convention is the same as Debian's, no
 # silent privileged-group additions from a scriptlet.
-recommends = ["tpm2-tss", "tpm2-tools"]
+recommends = "tpm2-tss, tpm2-tools"
 assets = [
     # Same sentinel convention as cargo-deb above: cargo-generate-rpm
     # rewrites `target/release/<bin>` to the real `target/<triple>/<profile>/<bin>`
