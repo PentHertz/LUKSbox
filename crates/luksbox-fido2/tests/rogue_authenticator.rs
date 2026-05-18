@@ -142,10 +142,10 @@ fn rogue_device_with_chosen_hmac_secret_cannot_unlock_legit_wrap_slot() {
         .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
         .unwrap();
     assert_eq!(
-        rogue_secret, [0xDE; 32],
+        *rogue_secret, [0xDE; 32],
         "rogue device returns chosen value"
     );
-    assert_ne!(rogue_secret, real_secret, "rogue ≠ legit");
+    assert_ne!(*rogue_secret, *real_secret, "rogue != legit");
 
     let result = slot.unlock_fido2(SUITE, None, &rogue_secret, &HEADER_SALT);
     assert!(

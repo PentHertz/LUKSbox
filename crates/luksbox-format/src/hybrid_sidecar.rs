@@ -55,12 +55,39 @@
 //! accidentally cross-pollinated sidecars between vaults.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use luksbox_core::file_util::atomic_secure_write;
 use luksbox_pq::PqParams;
 
 use crate::Error;
+
+/// Round 12 fix R12-06: read the hybrid sidecar with `O_NOFOLLOW`
+/// so an attacker who swapped the `.hybrid` file for a symlink (e.g.
+/// to `/etc/passwd` or to a FIFO that stalls forever) is refused at
+/// the format layer. Mirrors `anchor::open_anchor_for_read`.
+///
+/// Windows: plain read. The reparse-point equivalent is invasive and
+/// the threat model differs (hybrid sidecars under `%LOCALAPPDATA%`
+/// rely on ACL inheritance); tracked under R12-15 as a follow-up.
+fn read_sidecar_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf)?;
+        Ok(buf)
+    }
+    #[cfg(not(unix))]
+    {
+        fs::read(path)
+    }
+}
 
 const MAGIC: [u8; 8] = *b"lbxhybr1";
 const VERSION_V1: u8 = 0x01;
@@ -162,7 +189,7 @@ pub fn write_with_binding(
 /// Existing call sites that don't yet plumb the vault salt should use
 /// `read` instead; both functions share the same parser.
 pub fn read_bundle(path: &Path) -> Result<SidecarBundle, Error> {
-    let bytes = fs::read(path)?;
+    let bytes = read_sidecar_bytes(path)?;
     parse_bundle(&bytes)
 }
 
@@ -252,8 +279,20 @@ fn peek_vault_header_salt(
     header_path: Option<&Path>,
 ) -> Result<[u8; BINDING_LEN], Error> {
     use luksbox_core::HEADER_SIZE;
-    use std::io::Read;
     let src = header_path.unwrap_or(vault_path);
+    // Round 12 fix R12-06 (continued): pre-binding header peek also
+    // refuses symlinks via `O_NOFOLLOW`. Without this an attacker
+    // who controls the path between the GUI's preflight and
+    // `read_for_vault`'s arrival could divert the salt read.
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(src)?
+    };
+    #[cfg(not(unix))]
     let mut f = fs::File::open(src)?;
     let mut buf = [0u8; HEADER_SIZE];
     f.read_exact(&mut buf)?;

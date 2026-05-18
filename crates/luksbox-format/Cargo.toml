@@ -30,3 +30,12 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 libc = "0.2"
+# In-repo DudeCT statistical timing tester. Used by
+# `benches/dudect_deniable_envelope.rs` to regress R12-01 (deniable
+# envelope-discovery loop timing leak). Same crate already pulled in
+# by luksbox-core for its existing dudect benches.
+luksbox-ct-bench = { path = "../luksbox-ct-bench" }
+
+[[bench]]
+name = "dudect_deniable_envelope"
+harness = false

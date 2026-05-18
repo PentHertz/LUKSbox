@@ -529,11 +529,11 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
             // or length. webauthn.dll's documented behaviour is that
             // `pbFirst` is a non-null pointer to `cbFirst` bytes for
             // the duration of the assertion. We additionally enforce
-            // `cbFirst == 32` since hmac-secret per CTAP2 §6.5 is a
+            // `cbFirst == 32` since hmac-secret per CTAP2 sec.6.5 is a
             // fixed 32-byte HMAC-SHA256 output.
             //
             // FFI trust note: we do not range-check `pbFirst` further
-            // because webauthn.dll is part of Windows itself — same
+            // because webauthn.dll is part of Windows itself - same
             // trust boundary as `kernel32.dll` or `bcrypt.dll`. If
             // webauthn.dll is compromised the entire process is
             // already owned. By contrast, the libfido2-on-Linux/macOS
@@ -554,8 +554,10 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
             out
         };
 
-        // HmacSecret is a `[u8; 32]` type alias, not a newtype.
-        Ok(secret)
+        // Round 12 fix R12-19: HmacSecret is now a newtype with
+        // Zeroize+ZeroizeOnDrop; wrap the raw bytes once on the way
+        // out so the consumer's stack copy is wiped on Drop.
+        Ok(HmacSecret(secret))
     }
 }
 

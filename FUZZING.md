@@ -74,6 +74,7 @@ about). A target listed only in `fuzz/` is libfuzzer-only.
 | **`slot_payload_roundtrip`** | `SlotPayload::new` -> `encode` -> `decode` with attacker-controlled length triples | Encoder/decoder symmetry; constructor rejections always justified | OK | OK |
 | **`chunk_aead_decrypt`** | `aead::open` at the production chunk callsite with constructed AAD (`file_id || chunk_idx || generation`) | Per-chunk decrypt with attacker-controlled nonce + ct + tag (raw block device / NFS middlebox / ZFS snapshot rollback threat). Every read from a mounted vault flows through this AEAD call; previously only fuzzed transitively via `vfs_ops` with locally-produced ct. Added 2026-05. | OK | OK |
 | **`anchor_parse`** | `anchor::read_and_verify` (48 B standard) + `anchor::deniable_read_and_verify` (256 B deniable) | Random bytes through both readers; truncation, magic-match-but-garbage, AEAD-fail. Added after the O_NOFOLLOW hardening in 2026-05 - defenses are most useful when fuzzed. | OK | OK |
+| **`deniable_envelope_multi_slot`** | `try_open_envelope_v2` on real headers with fuzzer-selected slot occupancy | Multi-slot deniable open: builds a valid deniable header with a fuzzer-chosen subset of the 8 slots enrolled under a shared envelope passphrase, then drives the envelope-discovery loop with an attacker-supplied passphrase / cipher. Catches regressions to a NON-OPAQUE error variant or a panic on the multi-slot path. Added Round 12 (R12-01). | OK | OK |
 
 `auth_then_process` is special: it requires a known MVK to encrypt
 fuzz bytes into a "valid" metadata blob, then exercises the decoder
@@ -90,12 +91,40 @@ vaults across save/load, and `deniable_header_parse` exercises the
 full envelope-open flow with attacker-controlled passphrase + header
 buffer + cipher choice.
 
-The two newest targets (`chunk_aead_decrypt` and `anchor_parse`,
-added 2026-05 after the post-audit hardening pass) cover surfaces
-that previously had no direct fuzz coverage - every read from a
-mounted vault flows through `chunk_aead_decrypt`'s callsite, and the
-anchor readers gained `O_NOFOLLOW` + a GUI preflight that benefit
-from adversarial coverage.
+The two 2026-05 additions (`chunk_aead_decrypt` and `anchor_parse`,
+added after the post-audit hardening pass) cover surfaces that
+previously had no direct fuzz coverage - every read from a mounted
+vault flows through `chunk_aead_decrypt`'s callsite, and the anchor
+readers gained `O_NOFOLLOW` + a GUI preflight that benefit from
+adversarial coverage.
+
+The Round 12 addition (`deniable_envelope_multi_slot`) is structurally
+different from the existing `deniable_header_parse` target: instead
+of feeding 36 KiB of fuzzer-controlled bytes, it builds a real, valid
+deniable header at the start of each iteration with a fuzzer-chosen
+slot occupancy bitmap, then drives the envelope-discovery loop with
+an attacker passphrase / cipher. This covers the kind-disambiguation
+path through `try_open_envelope_v2` that the (currently leaky, see
+R12-01) constant-time invariant must protect. The timing-leak proper
+is measured separately by the dudect bench
+`crates/luksbox-format/benches/dudect_deniable_envelope.rs` - run
+`cargo bench --bench dudect_deniable_envelope -p luksbox-format` to
+reproduce.
+
+### Constant-time verification (dudect benches)
+
+| Bench | What it pins | How to run |
+|---|---|---|
+| `dudect_hmac_verify` | `Header::verify_hmac`, `subtle::ConstantTimeEq` | `cargo bench --bench dudect_hmac_verify -p luksbox-core` |
+| `dudect_aead_open` | AEAD-open rejection path, no MAC-comparison oracle | `cargo bench --bench dudect_aead_open -p luksbox-core` |
+| `dudect_slot_unlock` | Keyslot post-Argon2id unwrap | `cargo bench --bench dudect_slot_unlock -p luksbox-core` |
+| `dudect_deniable_envelope` | Deniable envelope discovery loop (Round 12 R12-01) | `cargo bench --bench dudect_deniable_envelope -p luksbox-format` |
+| `dudect_reference_leaky` | Known-leaky control for t-stat calibration | `cargo bench --bench dudect_reference_leaky -p luksbox-core` |
+
+The acceptance bar is |t| < 3.0 sustained across 5 K - 50 K samples
+per class. `dudect_deniable_envelope` is expected to FAIL on the
+current branch (large |t|) until the R12-01 fix lands; the bench is
+the regression gate the fix needs to satisfy.
 
 ### Dual-engine policy + shared corpus
 

@@ -32,6 +32,7 @@ use luksbox_core::deniable::{
     SLOT_NONCE_LEN, SLOT_TAG_LEN,
 };
 use luksbox_core::{CipherSuite, KdfId, MasterVolumeKey, aead};
+use subtle::{Choice, ConditionallySelectable, ConstantTimeEq};
 use zeroize::Zeroizing;
 
 use crate::error::Error;
@@ -415,62 +416,129 @@ pub fn try_open_envelope_v2(
         Err(_) => return Err(Error::OpaqueUnlockFailed),
     };
 
-    // Constant-time trial decrypt across all 8 slots. We always
-    // perform 8 AEAD opens regardless of where (or whether) a match
-    // lies, preserving the v1 invariant #2 about envelope-discovery
-    // timing. Each successful decode is appended to `candidates`;
-    // the caller-supplied credential's `kind_tag()` selects among
-    // them so a user who reused the same envelope passphrase across
-    // slots can still open the variant they asked for. If no
-    // kind-matching candidate exists we fall back to the first
-    // decoded slot so the kind-mismatch surface in `complete_open_v2`
-    // still fires cleanly.
-    let mut candidates: Vec<(usize, SlotPayload)> = Vec::new();
+    // Round 12 fix R12-01: constant-time envelope discovery.
+    //
+    // Earlier implementations branched on AEAD-open success, pushed
+    // matches into a heap Vec, and ran `SlotPayload::decode` only on
+    // successful slots. Heap-allocator activity and per-iteration
+    // wall-clock then depended on (a) whether any slot matched and
+    // (b) WHICH slot matched, leaking the slot index via dudect.
+    //
+    // The pattern below performs IDENTICAL work for every slot
+    // inside the loop:
+    //  - Always run `aead::open` (RustCrypto AEAD primitives are
+    //    constant-time on tag verification; the only success/failure
+    //    asymmetry is the success path's Vec allocation, which
+    //    happens BEFORE the tag check inside the upstream impl).
+    //  - Always allocate a fixed-size plaintext scratch buffer.
+    //  - Always memcpy `PAYLOAD_PLAINTEXT_LEN` bytes into it (real
+    //    plaintext on AEAD success, zero pad on failure) using
+    //    `subtle::Choice` driven byte selection so the write itself
+    //    is unconditional.
+    //  - Track AEAD-OK and kind-match as `subtle::Choice` (0/1).
+    //
+    // Decoding into the variable-length `SlotPayload` (which owns
+    // heap-allocated `Vec<u8>` for cred_id / tpm_blob) is deferred
+    // to AFTER the loop, run exactly ONCE on the constant-time-chosen
+    // slot's plaintext. That way the heap-allocator activity is the
+    // same regardless of which slot index matched.
+    const PT_LEN: usize = luksbox_core::deniable::slot_payload::PAYLOAD_PLAINTEXT_LEN;
+    let want_kind_u8: u8 = credential.kind_tag().into();
+
+    let mut all_pt: [Zeroizing<[u8; PT_LEN]>; DENIABLE_SLOT_COUNT] =
+        std::array::from_fn(|_| Zeroizing::new([0u8; PT_LEN]));
+    let mut ok_any: [Choice; DENIABLE_SLOT_COUNT] = [Choice::from(0u8); DENIABLE_SLOT_COUNT];
+    let mut ok_kind: [Choice; DENIABLE_SLOT_COUNT] = [Choice::from(0u8); DENIABLE_SLOT_COUNT];
+
     for slot_idx in 0..DENIABLE_SLOT_COUNT {
         let off = DENIABLE_SLOT_TABLE_OFFSET + slot_idx * DENIABLE_SLOT_SIZE;
         let slot = &header[off..off + DENIABLE_SLOT_SIZE];
         let env_nonce: [u8; SLOT_NONCE_LEN] = slot[..SLOT_NONCE_LEN].try_into().unwrap();
         let env_ct = &slot[SLOT_NONCE_LEN..];
         let outer_aad = deniable::slot_aad(&per_vault_salt, slot_idx);
-        let pt_res = luksbox_core::aead::open(
+
+        // Always allocate scratch for the AEAD result so the success
+        // path doesn't burn an extra Vec allocation visible to the
+        // allocator. RustCrypto's AEAD impls don't expose an in-place
+        // open API for our wrapper, so we accept the upstream Vec
+        // alloc and memcpy out in fixed-size form below.
+        let pt_res = aead::open(
             cipher_suite,
             env_kek.as_bytes(),
             &env_nonce,
             &outer_aad,
             env_ct,
         );
-        if let Ok(pt) = pt_res {
-            // Wrap the AEAD plaintext (envelope payload, holds
-            // cred_id + hmac_salt + tpm_blob in the clear) so it is
-            // wiped on drop. `buf` is a stack-allocated copy used
-            // by the decoder; explicitly zeroize before scope exit.
-            let pt = Zeroizing::new(pt);
-            if pt.len() == luksbox_core::deniable::slot_payload::PAYLOAD_PLAINTEXT_LEN {
-                let mut buf = Zeroizing::new(
-                    [0u8; luksbox_core::deniable::slot_payload::PAYLOAD_PLAINTEXT_LEN],
-                );
-                buf.copy_from_slice(&pt[..]);
-                if let Ok(payload) = SlotPayload::decode(&*buf) {
-                    candidates.push((slot_idx, payload));
-                }
+
+        // Unconditional fixed-size copy. On AEAD success, source is
+        // the returned plaintext; on failure, source is a stack
+        // zero buffer. Either way we write PT_LEN bytes into all_pt.
+        let zero_src = [0u8; PT_LEN];
+        let mut src_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; PT_LEN]);
+        let aead_ok = match pt_res {
+            Ok(v) if v.len() == PT_LEN => {
+                src_bytes.copy_from_slice(&v[..]);
+                Choice::from(1u8)
             }
-        }
+            _ => {
+                src_bytes.copy_from_slice(&zero_src[..]);
+                Choice::from(0u8)
+            }
+        };
+        all_pt[slot_idx].copy_from_slice(&src_bytes[..]);
+
+        // Kind-byte match. SlotPayload's wire layout puts the kind
+        // byte at offset 0; if AEAD failed, all_pt[slot_idx][0] == 0
+        // which doesn't match any valid DeniableKindTag (range 1..=8)
+        // so kind_match collapses to 0.
+        let kind_byte = all_pt[slot_idx][0];
+        let kind_match = kind_byte.ct_eq(&want_kind_u8);
+
+        ok_any[slot_idx] = aead_ok;
+        ok_kind[slot_idx] = aead_ok & kind_match;
     }
 
-    if candidates.is_empty() {
+    // Constant-time pick:
+    //  - matched_slot_idx defaults to 0.
+    //  - Reverse-sweep so the FIRST matching slot wins (reverse so
+    //    earlier indices overwrite later picks, matching the legacy
+    //    behaviour).
+    //  - Prefer ok_kind hits; fall back to ok_any so
+    //    `complete_open_v2`'s kind-mismatch error path fires
+    //    deterministically (preserves the legacy fallback semantic).
+    let mut matched_slot_idx_u8: u8 = 0;
+    let mut found_kind = Choice::from(0u8);
+    for i in (0..DENIABLE_SLOT_COUNT).rev() {
+        let i_u8 = i as u8;
+        let pick = ok_kind[i];
+        matched_slot_idx_u8 = u8::conditional_select(&matched_slot_idx_u8, &i_u8, pick);
+        found_kind |= pick;
+    }
+    let mut matched_slot_idx_any_u8: u8 = 0;
+    let mut found_any = Choice::from(0u8);
+    for i in (0..DENIABLE_SLOT_COUNT).rev() {
+        let i_u8 = i as u8;
+        let pick = ok_any[i];
+        matched_slot_idx_any_u8 = u8::conditional_select(&matched_slot_idx_any_u8, &i_u8, pick);
+        found_any |= pick;
+    }
+    matched_slot_idx_u8 =
+        u8::conditional_select(&matched_slot_idx_any_u8, &matched_slot_idx_u8, found_kind);
+
+    // No slot matched at all -> opaque failure.
+    if bool::from(!found_any) {
         return Err(Error::OpaqueUnlockFailed);
     }
 
-    // Prefer the slot whose kind matches the credential variant
-    // the caller is asking for; otherwise fall back to the first
-    // successful slot so the variant-mismatch error path in
-    // `complete_open_v2` runs.
-    let want_kind = credential.kind_tag();
-    let matched_idx = candidates
-        .iter()
-        .position(|(_, p)| p.kind == want_kind)
-        .unwrap_or(0);
-    let (matched_slot_idx, payload) = candidates.swap_remove(matched_idx);
+    let matched_slot_idx = matched_slot_idx_u8 as usize;
+
+    // Decode the chosen slot's plaintext once. Variable-length heap
+    // allocations (cred_id / tpm_blob Vecs) happen here, exactly
+    // once, on a single fixed-position buffer. The allocator pattern
+    // is the same regardless of which slot index won the constant-
+    // time pick.
+    let payload =
+        SlotPayload::decode(&*all_pt[matched_slot_idx]).map_err(|_| Error::OpaqueUnlockFailed)?;
 
     // Carve inner header region for phase 2.
     let inner_region = header[DENIABLE_INNER_OFFSET..].to_vec();

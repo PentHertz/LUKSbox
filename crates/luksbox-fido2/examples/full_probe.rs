@@ -38,8 +38,10 @@ fn assert_for(
     pin: Option<&str>,
 ) -> [u8; 32] {
     let mut a = auth_for(path);
-    a.hmac_secret(RP, cred, salt, pin)
-        .unwrap_or_else(|e| panic!("{label} assert failed: {e:?}"))
+    let h = a
+        .hmac_secret(RP, cred, salt, pin)
+        .unwrap_or_else(|e| panic!("{label} assert failed: {e:?}"));
+    *h
 }
 
 fn pass_or_fail(passed: bool) -> &'static str {

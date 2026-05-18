@@ -86,7 +86,7 @@ pub fn secure_create_new(path: &Path) -> io::Result<File> {
 /// already exists as a symlink, `open` fails with `ELOOP` instead of
 /// following the link and writing the vault contents into the link
 /// target. Without this guard, an attacker who can pre-create a
-/// symlink at the destination (e.g. `/tmp/output.txt` → `/etc/passwd`)
+/// symlink at the destination (e.g. `/tmp/output.txt` -> `/etc/passwd`)
 /// would have arbitrary file overwrite if `luksbox get` runs as a user
 /// with write permission to the target, a privilege-escalation
 /// primitive when invoked as root, an integrity-tampering primitive
@@ -95,7 +95,67 @@ pub fn secure_create_new(path: &Path) -> io::Result<File> {
 /// `O_NOFOLLOW` only refuses the FINAL path component; intermediate
 /// directory symlinks are still followed (refusing those would break
 /// legitimate setups like `~/extracted -> /mnt/usb/extracted`).
+/// Deny-list helper for `secure_create_or_truncate` (Round 12
+/// R12-09). Returns true if the canonical path is, or sits under, a
+/// system directory we never want plaintext written into via a
+/// root-privileged extract. Mirrors the spirit of
+/// `cmd_mount`'s `validate_mountpoint_safety` in the CLI.
+#[cfg(unix)]
+fn is_denied_extract_root(canonical_parent: &Path) -> bool {
+    const DENIED_PREFIXES: &[&str] = &[
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/boot",
+        "/sys",
+        "/proc",
+        "/dev",
+        "/System",                                  // macOS
+        "/Library/System",                          // macOS
+        "/Library/Preferences/SystemConfiguration", // macOS
+    ];
+    let s = canonical_parent.to_string_lossy();
+    DENIED_PREFIXES
+        .iter()
+        .any(|p| s == *p || s.starts_with(&format!("{p}/")))
+}
+
 pub fn secure_create_or_truncate(path: &Path) -> io::Result<File> {
+    // Round 12 fix R12-09 (partial): canonicalize the parent directory
+    // first and reject extraction paths whose CANONICAL parent lands
+    // inside a deny-listed system root. `O_NOFOLLOW` on the final
+    // component does not protect against an attacker who symlinks an
+    // intermediate component (e.g. `/tmp/extract` -> `/etc`). Full
+    // `openat()`-based directory-fd traversal is the long-term answer
+    // and is tracked for Round 13; the deny-list below is the minimum
+    // bar against shipping plaintext into `/etc`, `/usr`, `/System`,
+    // or `/bin` from a root-privileged extract.
+    //
+    // Skip the check if the parent does not yet exist (the caller is
+    // expected to have created it via `secure_create_dir_all` already,
+    // but tolerate the order). Skip on Windows where the equivalent
+    // ACL story differs (tracked under R12-15).
+    #[cfg(unix)]
+    {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                if let Ok(canon) = parent.canonicalize() {
+                    if is_denied_extract_root(&canon) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "refusing to write under a system directory: {} \
+                                 (parent symlink may have redirected the extraction; \
+                                 resolve the path manually with readlink -f)",
+                                canon.display()
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
     let mut o = OpenOptions::new();
     o.read(true).write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -104,7 +164,28 @@ pub fn secure_create_or_truncate(path: &Path) -> io::Result<File> {
         o.mode(SECURE_FILE_MODE);
         o.custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        // Round 12 fix R12-15: open reparse points directly rather
+        // than dereferencing them, then refuse the file if the
+        // resulting attribute set says it is one (symlink / junction).
+        // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000.
+        use std::os::windows::fs::OpenOptionsExt;
+        o.custom_flags(0x0020_0000);
+    }
     let f = o.open(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+        let attrs = f.metadata()?.file_attributes();
+        if attrs & 0x0000_0400 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "extraction destination is a reparse point (symlink / junction); refused",
+            ));
+        }
+    }
 
     // If the file pre-existed with a wider mode, the .mode() above
     // is a no-op (umask only applies on creation, not on truncate).

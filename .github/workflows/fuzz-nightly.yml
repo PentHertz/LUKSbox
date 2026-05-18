@@ -53,6 +53,10 @@ jobs:
           # deniable anchor readers. See FUZZING.md table.
           - chunk_aead_decrypt
           - anchor_parse
+          # Round 12 addition: multi-slot envelope opacity. Catches
+          # any regression to a non-opaque error variant on the
+          # multi-slot deniable open path. See R12-01.
+          - deniable_envelope_multi_slot
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

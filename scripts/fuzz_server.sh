@@ -53,7 +53,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 AFL_DIR="$REPO_ROOT/fuzz-afl"
-TARGETS=(header_parse keyslot_parse metadata_parse hybrid_sidecar_parse seed_file_parse auth_then_process deniable_header_parse slot_payload_decode slot_payload_roundtrip)
+TARGETS=(header_parse keyslot_parse metadata_parse hybrid_sidecar_parse seed_file_parse auth_then_process deniable_header_parse slot_payload_decode slot_payload_roundtrip chunk_aead_decrypt anchor_parse deniable_envelope_multi_slot)
 
 # ---- arg parse ------------------------------------------------------------
 

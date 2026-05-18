@@ -74,10 +74,11 @@ use crate::error::Error;
 /// at open time, the kernel returns `ELOOP` and we error out instead
 /// of silently dereferencing into whatever the symlink targets.
 ///
-/// Windows: plain open. The equivalent dance (FILE_FLAG_OPEN_REPARSE_POINT
-/// + manual ReparseData inspection) is invasive and the threat model
-/// on Windows is different (anchor files typically live under the
-/// user's profile with ACL inheritance). Left as a follow-up.
+/// Windows: Round 12 fix R12-15 - pass `FILE_FLAG_OPEN_REPARSE_POINT`
+/// via `custom_flags` so the kernel opens the reparse-point file
+/// directly instead of dereferencing the link to its target, then
+/// inspect the attribute set and refuse if `FILE_ATTRIBUTE_REPARSE_POINT`
+/// is present. Mirrors the Unix `O_NOFOLLOW` semantic.
 fn open_anchor_for_read(path: &Path) -> std::io::Result<File> {
     let mut opts = OpenOptions::new();
     opts.read(true);
@@ -86,7 +87,28 @@ fn open_anchor_for_read(path: &Path) -> std::io::Result<File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         opts.custom_flags(libc::O_NOFOLLOW);
     }
-    opts.open(path)
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+        // FILE_FLAG_BACKUP_SEMANTICS  = 0x02000000  (needed to open
+        //   reparse points reliably on directories; harmless on files)
+        opts.custom_flags(0x0020_0000);
+    }
+    let f = opts.open(path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+        let attrs = f.metadata()?.file_attributes();
+        if attrs & 0x0000_0400 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "anchor file is a reparse point (symlink / junction); refused",
+            ));
+        }
+    }
+    Ok(f)
 }
 
 const MAGIC: [u8; 8] = *b"LBXANCH1";

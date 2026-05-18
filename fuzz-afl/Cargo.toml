@@ -86,6 +86,10 @@ path = "src/bin/slot_payload_decode.rs"
 name = "slot_payload_roundtrip"
 path = "src/bin/slot_payload_roundtrip.rs"
 
+[[bin]]
+name = "deniable_envelope_multi_slot"
+path = "src/bin/deniable_envelope_multi_slot.rs"
+
 [profile.release]
 # AFL needs branch coverage instrumentation; opt-level 3 is fine but
 # debug-assertions catch overflow bugs the optimizer otherwise hides.

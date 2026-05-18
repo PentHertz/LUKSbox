@@ -157,12 +157,29 @@ pub fn private_mountpoint_for(vault_name: &str) -> std::io::Result<std::path::Pa
 /// macOS HFS+/APFS handles UTF-8 paths natively).
 #[cfg(target_os = "macos")]
 fn sanitize_vault_name_for_mount(s: &str) -> String {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | '\0'))
-        .take(128)
-        .collect();
-    let trimmed = cleaned.trim();
+    // Round 12 fix R12-16:
+    //  - Reject ':' as well as '/' '\\' '\0'. ':' was the path separator
+    //    on classic Mac (Carbon HFS+ APIs) and a few macOS framework
+    //    callsites still treat it as a delimiter. Refusing it here
+    //    avoids ambiguity at no real-world UX cost (no Mac user names
+    //    vaults with ':').
+    //  - Cap by BYTE length (255 = APFS/HFS+ filename limit), not by
+    //    char count. A 128-grapheme name in a complex script can
+    //    serialise to ~500 bytes and would otherwise produce
+    //    `ENAMETOOLONG` when the mountpoint is created.
+    const MAX_BYTES: usize = 200; // leave headroom for parent path
+    let mut out = String::with_capacity(MAX_BYTES);
+    for c in s.chars() {
+        if c.is_control() || matches!(c, '/' | '\\' | '\0' | ':') {
+            continue;
+        }
+        let needed = c.len_utf8();
+        if out.len() + needed > MAX_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    let trimmed = out.trim();
     // Reject exact "." and ".." (the only character sequences that
     // would cause path-traversal when appended to the base dir).
     // Embedded ".." inside a longer name is harmless: "foo..bar" is

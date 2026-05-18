@@ -100,7 +100,7 @@ fn is_symlink(path: &Path) -> bool {
 fn open_rw_checked(
     path: &Path,
     expected_inode: Option<(u64, u64)>,
-) -> Result<(File, (u64, u64)), Error> {
+) -> Result<(File, (u64, u64), PathBuf), Error> {
     if std::env::var_os("LUKSBOX_NO_FOLLOW_SYMLINKS").is_some() && is_symlink(path) {
         return Err(Error::SymlinkRefused {
             path: path.display().to_string(),
@@ -119,7 +119,16 @@ fn open_rw_checked(
             });
         }
     }
-    Ok((f, actual))
+    // Round 12 fix R12-11: capture the canonical (symlink-resolved)
+    // path right after the successful open so the later
+    // `verify_path_inode` can re-open with `O_NOFOLLOW` and still
+    // resolve to the same backing inode. Falls back to the caller's
+    // original path if canonicalize fails (e.g. permission denied on
+    // an intermediate dir for the canonicalize syscall; the caller's
+    // open already succeeded so the regression is just R12-pre-fix
+    // behaviour, not worse).
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    Ok((f, actual, canonical))
 }
 
 /// After we have opened a file and taken its lock, confirm that the path the
@@ -129,15 +138,30 @@ fn open_rw_checked(
 /// open + `inode_of` because stable `std::fs::metadata` does not expose
 /// volume serial / file index on Windows; this matches the FFI path
 /// `inode_of` already uses on a handle.
-fn verify_path_inode(path: &Path, expected: (u64, u64)) -> Result<(), Error> {
-    let probe = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|e| map_io_err_to_vault_locked(e, path))?;
-    let actual = inode_of(&probe).map_err(|e| map_io_err_to_vault_locked(e, path))?;
+///
+/// Round 12 fix R12-11: opens the CANONICAL path captured at the
+/// original open with `O_NOFOLLOW`. Canonical paths have no symlink
+/// components by construction so the open never legitimately needs to
+/// follow a link; an attacker-staged symlink over the canonical path
+/// is refused with `ELOOP` AND surfaces as `PathSubstituted` here.
+/// Legitimate `~/vault.lbx -> /mnt/usb/vault.lbx` users still work
+/// because the initial `open_rw_checked` follows the symlink ONCE
+/// and the canonical `/mnt/usb/vault.lbx` is then re-opened directly.
+fn verify_path_inode(canonical_path: &Path, expected: (u64, u64)) -> Result<(), Error> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let probe = opts
+        .open(canonical_path)
+        .map_err(|e| map_io_err_to_vault_locked(e, canonical_path))?;
+    let actual = inode_of(&probe).map_err(|e| map_io_err_to_vault_locked(e, canonical_path))?;
     if actual != expected {
         return Err(Error::PathSubstituted {
-            path: path.display().to_string(),
+            path: canonical_path.display().to_string(),
         });
     }
     Ok(())
@@ -1505,14 +1529,15 @@ impl Container {
         // header read/modify/write sequences so a second opener cannot keep
         // a stale pre-lock header in memory and later overwrite keyslot
         // changes made by the first opener.
-        let (mut file, file_inode) = open_rw_checked(path, None)?;
-        let (mut header_storage, header_inode) = match header_path {
-            None => (HeaderStorage::Inline, None),
+        let (mut file, file_inode, canonical_path) = open_rw_checked(path, None)?;
+        let (mut header_storage, header_inode, canonical_header) = match header_path {
+            None => (HeaderStorage::Inline, None, None),
             Some(hp) => {
-                let (hf, hf_inode) = open_rw_checked(hp, None)?;
+                let (hf, hf_inode, canon_hp) = open_rw_checked(hp, None)?;
                 (
                     HeaderStorage::Detached(hf, hp.to_path_buf()),
                     Some(hf_inode),
+                    Some(canon_hp),
                 )
             }
         };
@@ -1540,9 +1565,13 @@ impl Container {
         // with `PathSubstituted` so the user can investigate. Once verified,
         // the lock guarantees inode A stays our backing store regardless of
         // any further rename of the path.
-        verify_path_inode(path, file_inode)?;
-        if let (Some(hp), Some(expected)) = (header_path, header_inode) {
-            verify_path_inode(hp, expected)?;
+        // Round 12 fix R12-11: re-verify using the CANONICAL path
+        // captured at open time (symlinks resolved once), and the
+        // updated `verify_path_inode` opens with `O_NOFOLLOW` so an
+        // attacker-staged symlink swap is refused.
+        verify_path_inode(&canonical_path, file_inode)?;
+        if let (Some(canon_hp), Some(expected)) = (canonical_header.as_ref(), header_inode) {
+            verify_path_inode(canon_hp, expected)?;
         }
 
         let mut header_bytes = [0u8; HEADER_SIZE];
@@ -2338,22 +2367,54 @@ impl Container {
         // Flush any pending writes on the original before we copy.
         self.file.flush()?;
 
-        // Full byte-for-byte copy. std::fs::copy uses platform fast paths
-        // (copy_file_range on Linux, clonefile on APFS where supported).
-        // std::fs::copy preserves the source's permissions, so on a vault
-        // created post-Round-9E (mode 0600) the tmp inherits 0600 too.
-        // For LEGACY pre-9E vaults that may exist on disk with mode
-        // 0644, force-narrow the tmp to 0600 anyway so the rotation
-        // doesn't carry the legacy looseness forward.
-        std::fs::copy(&original, &tmp)?;
+        // Round 12 fix R12-10: create the rotation tmp atomically with
+        // `O_CREAT|O_EXCL|O_NOFOLLOW` at mode 0600 BEFORE copying
+        // content into it. The previous flow did `std::fs::copy` (which
+        // preserves source mode, briefly exposing legacy 0644 to other
+        // users) and then `set_permissions(0600)` non-atomically, and
+        // would happily follow a pre-existing `<vault>.rotating`
+        // symlink. The new sequence is:
+        //   1. open(tmp, O_CREAT|O_EXCL|O_NOFOLLOW, 0600)  -> tmp_file
+        //   2. read source -> write into tmp_file
+        //   3. (existing) fsync + rename on commit
+        //
+        // Windows: there is no portable `O_NOFOLLOW`/`O_EXCL` combo for
+        // refusing reparse points. Keep the previous `std::fs::copy`
+        // path (tracked under R12-15) and rely on the parent directory
+        // ACL for protection.
+        #[cfg(unix)]
+        let mut tmp_file: File = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&tmp)?
+        };
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+            use std::io::{Read, Seek, SeekFrom, Write};
+            // Reset the source's read position before slurping.
+            self.file.seek(SeekFrom::Start(0))?;
+            // 1 MiB chunks: low memory pressure, fits typical L2 cache.
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                let n = self.file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                tmp_file.write_all(&buf[..n])?;
+            }
+            tmp_file.flush()?;
         }
-
-        // Open the tmp for read+write and swap the file handle. The old
-        // handle drops here (closing the original file).
+        // Windows fallback: legacy copy + chmod-equivalent.
+        #[cfg(not(unix))]
+        {
+            std::fs::copy(&original, &tmp)?;
+        }
+        #[cfg(not(unix))]
         let tmp_file = OpenOptions::new().read(true).write(true).open(&tmp)?;
         self.file = tmp_file;
         self.path = tmp.clone();
@@ -3421,11 +3482,12 @@ mod tests {
         Container::create_with_passphrase(&b, None, CipherSuite::Aes256Gcm, test_params(), b"pwB")
             .unwrap();
 
-        let (a_handle, a_inode) = open_rw_checked(&a, None).unwrap();
+        let (a_handle, a_inode, a_canonical) = open_rw_checked(&a, None).unwrap();
         // Path `a` matches the handle's inode, must succeed.
-        verify_path_inode(&a, a_inode).expect("identical path resolves to same inode");
+        verify_path_inode(&a_canonical, a_inode).expect("identical path resolves to same inode");
         // Path `b` is a different file, must reject as substituted.
-        let err = verify_path_inode(&b, a_inode).unwrap_err();
+        let b_canonical = b.canonicalize().unwrap();
+        let err = verify_path_inode(&b_canonical, a_inode).unwrap_err();
         assert!(
             matches!(err, Error::PathSubstituted { .. }),
             "expected PathSubstituted, got {err:?}"
@@ -4068,7 +4130,7 @@ mod tests {
         )
         .unwrap();
 
-        // Try to open with the wrong variant — envelope opens (same
+        // Try to open with the wrong variant - envelope opens (same
         // passphrase) but the kind-tag check in complete_open_v2
         // rejects the mismatch.
         let wrong_cred = DeniableCredential::TpmPassphrase {
@@ -4155,7 +4217,7 @@ mod tests {
 
     #[test]
     fn deniable_container_rotate_mvk_v2_drops_credential() {
-        // Rotate keeping only one of two slots — the dropped one
+        // Rotate keeping only one of two slots - the dropped one
         // must no longer open the vault.
         use crate::deniable_header::DeniableMaterial;
         use luksbox_core::deniable::DeniableCredential;

@@ -181,6 +181,20 @@ test = false
 doc = false
 bench = false
 
+# Round 12: builds a real deniable header with a fuzzer-selected
+# subset of slots occupied, drives `try_open_envelope_v2` with an
+# attacker passphrase. Pins the multi-slot opacity invariant (see
+# docs/SECURITY_AUDIT_ROUND_12.md, finding R12-01). The timing-leak
+# proper is benched separately via dudect; this target catches
+# regressions that re-introduce a NON-OPAQUE error or a panic on the
+# multi-slot path.
+[[bin]]
+name = "deniable_envelope_multi_slot"
+path = "fuzz_targets/deniable_envelope_multi_slot.rs"
+test = false
+doc = false
+bench = false
+
 # Fuzz binaries should not be part of the workspace; cargo-fuzz expects to
 # build them with sanitizers and -C codegen-units=1. Excluding from the
 # workspace lets us keep workspace-wide `cargo build` fast and unsanitized.

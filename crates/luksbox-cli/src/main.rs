@@ -2034,6 +2034,11 @@ fn read_passphrase(prompt: &str) -> io::Result<Zeroizing<String>> {
     Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
 }
 
+/// Round 12 follow-up: explicit empty-passphrase confirmation in
+/// the confirmed-prompt path, matching the wizard's
+/// `ask_new_passphrase` warning. Without this an interactive user
+/// who Enter-mashes through both passphrase fields silently creates
+/// a passphrase-less vault.
 fn read_passphrase_confirmed(prompt: &str) -> io::Result<Zeroizing<String>> {
     // Source priority mirrors `read_passphrase`. `LUKSBOX_NEW_PASSPHRASE`
     // takes precedence over `LUKSBOX_PASSPHRASE` when both env vars
@@ -2069,11 +2074,33 @@ fn read_passphrase_confirmed(prompt: &str) -> io::Result<Zeroizing<String>> {
             eprintln!("passphrases do not match, try again");
             continue;
         }
+        // Empty-passphrase confirm: explicit, defaults to "no" so an
+        // accidental double-Enter does not produce a credential-less
+        // vault. Skipped in test/script mode (LUKSBOX_TEST_FAST_KDF
+        // or LUKSBOX_ACCEPT_EMPTY) since automation may set it on
+        // purpose.
+        if !test_fast_kdf_enabled()
+            && a.is_empty()
+            && std::env::var_os("LUKSBOX_ACCEPT_EMPTY").is_none()
+        {
+            eprintln!(
+                "warning: the passphrase is EMPTY. ANYONE with this vault file \
+                 will be able to open it."
+            );
+            let proceed = dialoguer::Confirm::new()
+                .with_prompt("Use the empty passphrase anyway?")
+                .default(false)
+                .interact()
+                .unwrap_or(false);
+            if !proceed {
+                continue;
+            }
+        }
         // Strength check. Skip in test mode (`LUKSBOX_TEST_FAST_KDF` is set
         // for tests with weak Argon2 params; same env signal stands for
         // "I'm in tests, skip nag prompts"). Release builds always run
         // the strength check - see `test_fast_kdf_enabled`.
-        if !test_fast_kdf_enabled() {
+        if !test_fast_kdf_enabled() && !a.is_empty() {
             let strength = passphrase::estimate(&a);
             if strength.score < passphrase::MIN_ACCEPTABLE_SCORE {
                 eprintln!(
@@ -4477,7 +4504,7 @@ fn cmd_mount(
     // would fail. Pass the user-supplied path through unchanged on
     // Windows.
     #[cfg(not(target_os = "windows"))]
-    let mp_abs: std::path::PathBuf = {
+    let mp_abs: (std::path::PathBuf, Option<(u64, u64)>) = {
         // FD-based check: open with O_DIRECTORY | O_NOFOLLOW so the
         // kernel atomically rejects both "not a directory" and "this
         // is a symlink" in one syscall. Replaces the previous
@@ -4508,6 +4535,14 @@ fn cmd_mount(
                 };
                 format!("mountpoint {} {kind}: {e}", mountpoint.display())
             })?;
+        // Capture the inode of the probed fd so we can detect any
+        // post-probe path-swap immediately before the mount syscall
+        // (Round 12 fix R12-08; see "tighten residual race" below).
+        use std::os::unix::fs::MetadataExt as _;
+        let probe_meta = probe
+            .metadata()
+            .map_err(|e| format!("cannot stat mountpoint {}: {e}", mountpoint.display()))?;
+        let probe_inode_pair = (probe_meta.dev(), probe_meta.ino());
         // The fd has served its check purpose; canonicalize via the
         // path now that we've confirmed at least the user-supplied
         // entry was a non-symlink directory.
@@ -4516,15 +4551,56 @@ fn cmd_mount(
             .canonicalize()
             .map_err(|e| format!("cannot resolve {}: {e}", mountpoint.display()))?;
         validate_mountpoint_safety(mountpoint, &canonical)?;
-        canonical
+        (canonical, Some(probe_inode_pair))
     };
     #[cfg(target_os = "windows")]
-    let mp_abs: std::path::PathBuf = mountpoint.to_path_buf();
+    let (mp_abs, _probe_inode): (std::path::PathBuf, Option<(u64, u64)>) =
+        (mountpoint.to_path_buf(), None);
+    #[cfg(not(target_os = "windows"))]
+    let (mp_abs, probe_inode) = mp_abs;
 
     let path_abs = path
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
     let vfs = open_vfs(&path_abs, unlock)?;
+
+    // Round 12 fix R12-08: re-probe the canonical mountpoint inode
+    // IMMEDIATELY before the mount syscall and refuse if it changed.
+    // The deny-list bounds the blast radius to user-writable paths,
+    // but this catches the narrow window where an attacker on the
+    // mountpoint's parent dir renames a symlink over the canonical
+    // entry between our initial probe and the kernel's mount-path
+    // lookup. On Linux this is a single openat+stat; on macOS the
+    // semantics match.
+    #[cfg(unix)]
+    if let Some(expected) = probe_inode {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let final_probe = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&mp_abs)
+            .map_err(|e| {
+                format!(
+                    "mountpoint {} could not be re-verified before mount: {e}",
+                    mp_abs.display()
+                )
+            })?;
+        let m = final_probe.metadata().map_err(|e| {
+            format!(
+                "cannot stat mountpoint {} for re-verify: {e}",
+                mp_abs.display()
+            )
+        })?;
+        if (m.dev(), m.ino()) != expected {
+            return Err(format!(
+                "mountpoint {} was swapped between probe and mount; refusing",
+                mp_abs.display()
+            )
+            .into());
+        }
+        drop(final_probe);
+    }
+
     if foreground {
         eprintln!(
             "mounted {} at {} (foreground)\n  unmount: luksbox umount {}  (or Ctrl-C, clean either way)",
@@ -4558,7 +4634,6 @@ fn cmd_mount(
 /// is the security trade-off documented in `docs/MACOS_FUSE_T.md`.
 fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Path) -> Result<()> {
     use std::io::Read;
-    use zeroize::Zeroize;
 
     // Stage trace - the parent captures our stderr and surfaces the
     // last lines in its error toast when we exit non-zero. Emitting a
@@ -4606,40 +4681,85 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
 
-    // Mountpoint validation matches `cmd_mount`'s POSIX branch
-    // (this subcommand is macOS-only at the runtime level, but we
-    // gate identically for safety).
-    if !mountpoint.is_dir() {
-        return Err(format!("mountpoint {} is not a directory", mountpoint.display()).into());
-    }
-    let mp_abs = mountpoint
-        .canonicalize()
-        .map_err(|e| format!("cannot resolve {}: {e}", mountpoint.display()))?;
+    // Round 12 fix R12-05: mountpoint validation now uses the same
+    // O_DIRECTORY|O_NOFOLLOW probe + validate_mountpoint_safety
+    // deny-list as the parent `cmd_mount`. The previous version
+    // (`is_dir()` -> later `canonicalize()`) re-opened the TOCTOU
+    // window the parent path was hardened to close.
+    #[cfg(unix)]
+    let mp_abs: std::path::PathBuf = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(mountpoint)
+            .map_err(|e| {
+                let kind = if e.raw_os_error() == Some(libc::ELOOP) {
+                    "is a symbolic link (refused: open the underlying directory directly)"
+                } else if e.raw_os_error() == Some(libc::ENOTDIR) {
+                    "is not a directory"
+                } else {
+                    "could not be opened"
+                };
+                format!("mountpoint {} {kind}: {e}", mountpoint.display())
+            })?;
+        drop(probe);
+        let canonical = mountpoint
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve {}: {e}", mountpoint.display()))?;
+        validate_mountpoint_safety(mountpoint, &canonical)?;
+        canonical
+    };
+    #[cfg(not(unix))]
+    let mp_abs: std::path::PathBuf = mountpoint.to_path_buf();
+
     let vault_abs = vault
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", vault.display()))?;
+
+    // Round 12 fix R12-03: canonicalize the `--header` path so the
+    // helper never opens an attacker-supplied symlink. The sandbox
+    // profile's `${HEADER_DIR}` subpath rule (also added in Round 12)
+    // only matches when the header is inside an explicitly allow-listed
+    // directory; canonicalize here ensures the path we hand to
+    // `open_with_mvk` is one the sandbox would also accept.
+    let header_abs: Option<std::path::PathBuf> = match header {
+        Some(p) => Some(
+            p.canonicalize()
+                .map_err(|e| format!("cannot resolve --header {}: {e}", p.display()))?,
+        ),
+        None => None,
+    };
     eprintln!(
-        "luksbox-mount-helper: canonicalized vault={} mountpoint={}",
+        "luksbox-mount-helper: canonicalized vault={} mountpoint={} header={:?}",
         vault_abs.display(),
-        mp_abs.display()
+        mp_abs.display(),
+        header_abs.as_ref().map(|p| p.display().to_string())
     );
 
     // Read MVK from stdin. Block until exactly 32 bytes arrive or
     // the parent closes the pipe early (which would be a parent
     // bug; surface as an io::Error from read_exact).
-    let mut mvk_bytes = [0u8; 32];
+    //
+    // Round 12 fix R12-12: wrap in `Zeroizing<[u8;32]>` so a partial
+    // read (`?` returns early) does not leak up to 31 MVK bytes on
+    // the stack. The previous version called `.zeroize()` manually
+    // AFTER the `?` so the error path skipped the wipe.
+    let mut mvk_bytes: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
     std::io::stdin()
-        .read_exact(&mut mvk_bytes)
+        .read_exact(&mut mvk_bytes[..])
         .map_err(|e| format!("could not read MVK from stdin: {e}"))?;
-    let mvk = MasterVolumeKey::from_bytes(mvk_bytes);
-    mvk_bytes.zeroize();
+    // Round 12 fix R12-17: use `from_zeroizing` so the caller's
+    // bytes are passed by reference, avoiding the by-value Copy
+    // pattern that left a stack residue on `from_bytes(*mvk_bytes)`.
+    let mvk = MasterVolumeKey::from_zeroizing(&mvk_bytes);
     eprintln!("luksbox-mount-helper: MVK received, opening container");
 
     // Open with the supplied MVK (no passphrase / FIDO2 derivation).
     // A wrong MVK fails fast with HeaderAuthFailed via the HMAC
     // check inside open_with_mvk - never silently produces a Vfs
     // backed by garbled metadata.
-    let container = Container::open_with_mvk(&vault_abs, header, mvk)
+    let container = Container::open_with_mvk(&vault_abs, header_abs.as_deref(), mvk)
         .map_err(|e| format!("open container ({}): {e}", vault_abs.display()))?;
     let vfs = Vfs::open(container).map_err(|e| format!("open Vfs: {e}"))?;
     eprintln!("luksbox-mount-helper: Vfs ready, calling mount");
@@ -5045,7 +5165,7 @@ fn cli_open_deniable_v2(
         }
         CliDenCred::PqPassphrase => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
-            let shared = cli_pq_decap(kp, path)?;
+            let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
             let cred = DeniableCredential::HybridPqPassphrase {
                 passphrase: pass_zeroizing.as_bytes(),
                 argon2,
@@ -5059,7 +5179,7 @@ fn cli_open_deniable_v2(
             #[cfg(feature = "hardware")]
             {
                 let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
-                let shared = cli_pq_decap(kp, path)?;
+                let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
                 let salt = payload_hmac_salt
                     .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
                 let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt)?;
@@ -5107,7 +5227,7 @@ fn cli_open_deniable_v2(
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         CliDenCred::PqTpm => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
-            let shared = cli_pq_decap(kp, path)?;
+            let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
             let unsealed = cli_tpm_unseal_from_bytes(&payload_tpm_blob, None)?;
             let cred = DeniableCredential::HybridPqTpmPassphrase {
                 passphrase: pass_zeroizing.as_bytes(),
@@ -5122,7 +5242,7 @@ fn cli_open_deniable_v2(
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         CliDenCred::PqTpmFido2 => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
-            let shared = cli_pq_decap(kp, path)?;
+            let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
             let unsealed = cli_tpm_unseal_from_bytes(&payload_tpm_blob, None)?;
             let salt = payload_hmac_salt
                 .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
@@ -5179,11 +5299,57 @@ fn cli_tpm_unseal_from_bytes(blob_bytes: &[u8], pin: Option<&[u8]>) -> Result<[u
     Ok(*unsealed)
 }
 
+#[allow(dead_code)]
 fn cli_pq_decap(kyber_path: &Path, vault: &Path) -> Result<[u8; 32]> {
+    // Legacy entry; kept for callers that don't yet know the envelope
+    // passphrase (e.g. non-deniable flows). Round 12 fix R12-02
+    // re-routed every deniable PQ caller to
+    // `cli_pq_decap_with_fallback(.., Some(envelope_pw))` so blank
+    // reuses the envelope passphrase.
+    cli_pq_decap_with_fallback(kyber_path, vault, None)
+}
+
+/// Round 12 fix R12-02: CLI seed-pw fallback. When the deniable
+/// vault was created via `deniable-init --credential pq-passphrase`
+/// the matching create helper writes the .kyber seed file using the
+/// ENVELOPE passphrase. The open path must accept the same default.
+/// The GUI (`luksbox-gui/src/ops.rs:deniable_pq_decap`) and the
+/// wizard (`ask_pq_decap_for_deniable`) both implement this fallback;
+/// the CLI previously did not.
+///
+/// `envelope_pw` is the envelope passphrase already collected by the
+/// caller. If the user leaves the seed-file passphrase prompt blank,
+/// the envelope passphrase is used instead. If `envelope_pw` is None
+/// (legacy callers / non-deniable callers), only the explicit prompt
+/// is honoured.
+fn cli_pq_decap_with_fallback(
+    kyber_path: &Path,
+    vault: &Path,
+    envelope_pw: Option<&[u8]>,
+) -> Result<[u8; 32]> {
     use luksbox_format::hybrid_sidecar;
     use luksbox_pq::seed_file;
-    let seed_pw = rpassword::prompt_password("Seed-file passphrase: ")?;
-    let seed = seed_file::read(kyber_path, seed_pw.as_bytes())?;
+
+    let prompt_text = if envelope_pw.is_some() {
+        "Seed-file passphrase (leave blank to reuse the envelope passphrase): "
+    } else {
+        "Seed-file passphrase: "
+    };
+    let typed_seed_pw = rpassword::prompt_password(prompt_text)?;
+    let seed_pw_bytes: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
+        match envelope_pw {
+            Some(env) => zeroize::Zeroizing::new(env.to_vec()),
+            None => {
+                return Err(cli_err!(
+                    "seed-file passphrase is required for this open path"
+                ));
+            }
+        }
+    } else {
+        zeroize::Zeroizing::new(typed_seed_pw.into_bytes())
+    };
+
+    let seed = seed_file::read(kyber_path, &seed_pw_bytes[..])?;
     let sidecar = hybrid_sidecar::sidecar_path(vault);
     let entries = hybrid_sidecar::read(&sidecar)?;
     let entry = entries
@@ -5330,7 +5496,15 @@ fn cli_create_pq_fido2_deniable_v2(
     };
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
     let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
-    let seed_pw = prompt_pass_twice("Seed-file passphrase: ", "Confirm:               ")?;
+    // Round 12 fix R12-02: align with GUI/wizard. Blank = reuse envelope.
+    let typed_seed_pw = rpassword::prompt_password(
+        "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
+    )?;
+    let seed_pw: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
+        zeroize::Zeroizing::new(pass.as_bytes().to_vec())
+    } else {
+        zeroize::Zeroizing::new(typed_seed_pw.into_bytes())
+    };
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
     let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
@@ -5368,7 +5542,7 @@ fn cli_create_pq_fido2_deniable_v2(
     seed_file::write(
         kyber_path,
         &seed,
-        seed_pw.as_bytes(),
+        &seed_pw[..],
         seed_file::KdfParams::default(),
     )?;
     Ok(cont)
@@ -5471,7 +5645,15 @@ fn cli_create_pq_tpm_deniable_v2(
     };
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
     let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
-    let seed_pw = prompt_pass_twice("Seed-file passphrase: ", "Confirm:               ")?;
+    // Round 12 fix R12-02: align with GUI/wizard. Blank = reuse envelope.
+    let typed_seed_pw = rpassword::prompt_password(
+        "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
+    )?;
+    let seed_pw: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
+        zeroize::Zeroizing::new(pass.as_bytes().to_vec())
+    } else {
+        zeroize::Zeroizing::new(typed_seed_pw.into_bytes())
+    };
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
     let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpmPassphrase {
@@ -5500,7 +5682,7 @@ fn cli_create_pq_tpm_deniable_v2(
     seed_file::write(
         kyber_path,
         &seed,
-        seed_pw.as_bytes(),
+        &seed_pw[..],
         seed_file::KdfParams::default(),
     )?;
     Ok(cont)
@@ -5526,7 +5708,15 @@ fn cli_create_pq_tpm_fido2_deniable_v2(
     };
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
     let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
-    let seed_pw = prompt_pass_twice("Seed-file passphrase: ", "Confirm:               ")?;
+    // Round 12 fix R12-02: align with GUI/wizard. Blank = reuse envelope.
+    let typed_seed_pw = rpassword::prompt_password(
+        "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
+    )?;
+    let seed_pw: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
+        zeroize::Zeroizing::new(pass.as_bytes().to_vec())
+    } else {
+        zeroize::Zeroizing::new(typed_seed_pw.into_bytes())
+    };
     let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
@@ -5566,7 +5756,7 @@ fn cli_create_pq_tpm_fido2_deniable_v2(
     seed_file::write(
         kyber_path,
         &seed,
-        seed_pw.as_bytes(),
+        &seed_pw[..],
         seed_file::KdfParams::default(),
     )?;
     Ok(cont)

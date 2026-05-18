@@ -312,14 +312,18 @@ vaults default to SIV (cipher_suite=0x0003).
 |---|---|---|
 | Unit tests | every commit | per-module crypto round-trips, parser correctness, `[u8]` round-trips |
 | Functional tests | every commit | end-to-end CLI workflows via subprocess |
-| Security-regression tests | every commit | 65+ tests pinning each known-fix invariant, Argon2 DoS guard, rogue authenticator, slot AAD coverage, generation rollback, lock contention, symlink swap, AES-NI warning, bincode OOM, and more |
-| Fuzz smoke (libFuzzer) | every PR | 5 min per target x 9 targets, cheap parser bugs |
+| Security-regression tests | every commit | 65+ tests pinning each known-fix invariant, Argon2 DoS guard, rogue authenticator, slot AAD coverage, generation rollback, lock contention, symlink swap, AES-NI warning, bincode OOM, and more. Round 12 added `crates/luksbox-format/tests/round12_findings.rs` with 2 always-run smoke tests plus 5 `#[ignore]`-gated regression placeholders (one per open HIGH finding) |
+| Fuzz smoke (libFuzzer) | every PR | 5 min per target x 17 targets including the Round 12 `deniable_envelope_multi_slot` target (multi-slot deniable envelope opacity) |
 | FIPS-203 conformance | every commit | 17 tests against published test vectors |
 | Hardware FIDO2 smoke | manual, before each release | wrap, direct, hybrid-pq-fido2, 4 flows x 6 touches against real authenticator |
-| Long-running fuzz | not yet automated | recommended pre-release: 24h x 9 targets |
+| Long-running fuzz | nightly via `.github/workflows/fuzz-nightly.yml` | 30 min per target x 17 targets including the Round 12 addition |
+| Constant-time bench (dudect) | on demand via `cargo bench` | 4 production benches (`dudect_hmac_verify`, `dudect_aead_open`, `dudect_slot_unlock`, Round 12's `dudect_deniable_envelope`) + 1 known-leaky control |
 
 Total automated test count at last run: **183 passing, 0 failing, 0 ignored**.
-30M+ fuzz iterations across all targets to date.
+30M+ fuzz iterations across all targets to date. The Round 12
+`dudect_deniable_envelope` bench is documented in
+`docs/SECURITY_AUDIT_ROUND_12.md` and expected to FAIL on the
+current branch (large |t|) until R12-01 fix lands.
 
 ### What we do NOT test
 
@@ -862,6 +866,8 @@ for the full per-round log.
 | 4 | Live YubiKey detection layer | no findings; thread-safety verified |
 | 5 | End-to-end hardware + rogue edge cases | round-2 fix verified on real hardware; 6 additional rogue tests |
 | 6 | Invariant lockdown across the stack | no new vulns; HKDF info-string uniqueness, header-tamper coverage, slot AEAD AAD field-by-field, cross-file substitution, generation rollback, concurrent-open enforcement (flock), symlink TOCTOU defense, AES-NI startup warning |
+| 11 | Deniable v2 cryptographic sweep | 3 fixes (per-vault salt in inner-header AAD, `Zeroizing` for envelope plaintext, propagated `Zeroizing<[u8;32]>` through `deniable_pq_decap`); 5 new workflow tests + 3 new fuzz targets |
+| 12 | FUSE-T subprocess + deniable v2 timing + filesystem TOCTOU + memory safety | 1 CRITICAL + 5 HIGH + 7 MEDIUM + 6 LOW; **all 19 findings shipped fixes in the same revision** (R12-14 formally superseded by R12-11). Full report + Fix-status table at [docs/SECURITY_AUDIT_ROUND_12.md](docs/SECURITY_AUDIT_ROUND_12.md). Headline fix: R12-01's deniable envelope discovery loop is now constant-time via `subtle::Choice`-driven byte selection + single-shot `SlotPayload::decode` on the chosen slot. New regression coverage: `dudect_deniable_envelope` bench + `deniable_envelope_multi_slot` libFuzzer + AFL++ target + `round12_findings.rs` deterministic regression suite (7 tests, 0 `#[ignore]`d). |
 
 **Ad-hoc improvements** since the audit log was last updated:
 

@@ -42,7 +42,7 @@ use hkdf::Hkdf;
 use rand_core::{OsRng, RngCore};
 use sha2::Sha256;
 use subtle::{Choice, ConditionallySelectable};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::aead::{self, CipherSuite};
 use crate::error::Error;
@@ -296,10 +296,19 @@ pub fn trial_decrypt_with_idx(
         let attempt = try_unwrap_slot(&slots[slot_idx], kek, suite, per_vault_salt, slot_idx);
         let valid = Choice::from(attempt.is_some() as u8);
 
-        let cand_bytes: [u8; KEY_LEN] = attempt
-            .as_ref()
-            .map(|m| *m.as_bytes())
-            .unwrap_or([0u8; KEY_LEN]);
+        // Round 12 fix R12-13: wrap the candidate bytes in
+        // `Zeroizing` so the Drop-on-scope-exit path zeroes the
+        // STORAGE rather than a separately-named Copy. The previous
+        // `let mut cand_scrub = cand_bytes; cand_scrub.zeroize()`
+        // wiped a copy and left the original `[u8;32]` (which is
+        // Copy) sitting on the stack until the frame reused the
+        // slot.
+        let cand_bytes: Zeroizing<[u8; KEY_LEN]> = Zeroizing::new(
+            attempt
+                .as_ref()
+                .map(|m| *m.as_bytes())
+                .unwrap_or([0u8; KEY_LEN]),
+        );
 
         for i in 0..KEY_LEN {
             mvk_bytes[i] = u8::conditional_select(&mvk_bytes[i], &cand_bytes[i], valid);
@@ -310,9 +319,7 @@ pub fn trial_decrypt_with_idx(
         // that invariant.
         found_idx_u8 = u8::conditional_select(&found_idx_u8, &(slot_idx as u8), valid);
         found |= valid;
-
-        let mut cand_scrub = cand_bytes;
-        cand_scrub.zeroize();
+        // `cand_bytes` drops here and wipes its storage.
     }
 
     if bool::from(found) {
@@ -463,6 +470,12 @@ impl DeniableKindTag {
             8 => Some(Self::HybridPqTpmFido2Passphrase),
             _ => None,
         }
+    }
+}
+
+impl From<DeniableKindTag> for u8 {
+    fn from(t: DeniableKindTag) -> u8 {
+        t as u8
     }
 }
 
@@ -1096,7 +1109,7 @@ pub mod slot_payload {
             buf[1..3].copy_from_slice(&(CRED_ID_MAX_LEN as u16).to_le_bytes());
             // hmac_salt_len = 32
             buf[3] = HMAC_SALT_LEN as u8;
-            // tpm_blob_len = 3500 (max ok) — but joint = 1024 + 32 + 3500 = 4556 > 4000
+            // tpm_blob_len = 3500 (max ok) - but joint = 1024 + 32 + 3500 = 4556 > 4000
             buf[4..6].copy_from_slice(&(TPM_BLOB_MAX_LEN as u16).to_le_bytes());
             let err = SlotPayload::decode(&buf).err().unwrap();
             assert!(matches!(err, Error::InvalidField));

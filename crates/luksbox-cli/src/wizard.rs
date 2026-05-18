@@ -3541,8 +3541,8 @@ fn collect_fido2_credential_for_rotate(
     Ok(SlotCredential::Fido2Wrap {
         slot_idx,
         passphrase: None,
-        hmac_secret_for_verify: zeroize::Zeroizing::new(old),
-        hmac_secret_for_new_wrap: zeroize::Zeroizing::new(new),
+        hmac_secret_for_verify: zeroize::Zeroizing::new(*old),
+        hmac_secret_for_new_wrap: zeroize::Zeroizing::new(*new),
         cred_id,
         new_hmac_salt,
     })

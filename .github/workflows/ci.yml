@@ -307,6 +307,11 @@ jobs:
           # smoke budget. See FUZZING.md for the threat model.
           - chunk_aead_decrypt
           - anchor_parse
+          # Round 12 addition: multi-slot envelope opacity. Builds a
+          # real deniable header with a fuzzer-selected subset of slots
+          # enrolled, then drives the envelope-discovery loop with
+          # attacker input. Pins R12-01's opacity invariant.
+          - deniable_envelope_multi_slot
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

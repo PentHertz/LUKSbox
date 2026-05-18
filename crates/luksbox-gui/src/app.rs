@@ -1088,6 +1088,30 @@ enum MountBackend {
     },
 }
 
+impl Drop for MountBackend {
+    fn drop(&mut self) {
+        // Round 12 fix R12-04: when the GUI panics, force-quits, or
+        // the user closes the window before clicking "Unmount", the
+        // Subprocess arm previously orphaned the helper child + left
+        // the live MVK resident in its address space + left the NFS
+        // mount up unsupervised. Kill + reap on drop to bound the
+        // damage. Best-effort: if we cannot reach the child (already
+        // gone) the errors are swallowed - the worst case is the
+        // pre-existing orphan.
+        if let MountBackend::Subprocess { child, .. } = self {
+            // Already exited? try_wait Ok(Some(_)) means reaped, we
+            // are done. Ok(None) means still running -> kill + wait.
+            match child.try_wait() {
+                Ok(Some(_)) => {}
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 struct DirEntry {
     name: String,
@@ -8808,8 +8832,42 @@ fn build_helper_command(
             let mut cmd = Command::new("/usr/bin/sandbox-exec");
             // -D <KEY=VAL> injects parameters into the profile,
             // available via (param "KEY") in Scheme.
-            let vault_dir = vault.parent().unwrap_or_else(|| Path::new("/"));
-            let mp_dir = mountpoint.parent().unwrap_or_else(|| Path::new("/"));
+            //
+            // Round 12 fix R12-07: canonicalize vault + mountpoint
+            // (and header, if provided) BEFORE deriving the parent
+            // directory for the sandbox `subpath` rule. If the
+            // user-supplied path contains a symlinked component
+            // (e.g. `~/Documents` is itself a symlink), the
+            // child's later `canonicalize()` resolves to a different
+            // string than the parent passed in, the sandbox rule
+            // doesn't match, and the mount fails closed for confusing
+            // reasons. Resolving upfront keeps the failure modes the
+            // user sees consistent.
+            let vault_canon = vault.canonicalize().unwrap_or_else(|_| vault.to_path_buf());
+            let mp_canon = mountpoint
+                .canonicalize()
+                .unwrap_or_else(|_| mountpoint.to_path_buf());
+            let header_canon: Option<PathBuf> =
+                header.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+            let vault_dir = vault_canon
+                .parent()
+                .unwrap_or_else(|| Path::new("/"))
+                .to_path_buf();
+            let mp_dir = mp_canon
+                .parent()
+                .unwrap_or_else(|| Path::new("/"))
+                .to_path_buf();
+            // Round 12 fix R12-03 (sandbox profile side): if a
+            // detached header is in use, allow the helper to open
+            // its parent directory. Without this the sandbox would
+            // deny the open even though the helper canonicalized
+            // the path correctly. Falls back to VAULT_DIR (which the
+            // sandbox already allow-lists) when no header is supplied
+            // so the param expansion is always defined.
+            let header_dir = header_canon
+                .as_ref()
+                .and_then(|p| p.parent().map(|q| q.to_path_buf()))
+                .unwrap_or_else(|| vault_dir.clone());
             let bundle_dir = std::env::current_exe()
                 .ok()
                 .and_then(|p| p.canonicalize().ok())
@@ -8819,6 +8877,8 @@ fn build_helper_command(
                 .arg(format!("VAULT_DIR={}", vault_dir.display()));
             cmd.arg("-D")
                 .arg(format!("MOUNTPOINT_DIR={}", mp_dir.display()));
+            cmd.arg("-D")
+                .arg(format!("HEADER_DIR={}", header_dir.display()));
             cmd.arg("-D").arg(format!(
                 "HOME={}",
                 std::env::var("HOME").unwrap_or_else(|_| "/".to_string())

@@ -314,7 +314,17 @@ impl Tpm2Sealer {
             .build()
             .map_err(|e| Error::TpmError(format!("PublicBuilder (sealed): {e}")))?;
 
-        let sensitive_data = SensitiveData::try_from(plaintext.to_vec())
+        // Round 12 fix R12-18: wrap the intermediate Vec in a
+        // Zeroizing wrapper so the heap copy of the 32-byte plaintext
+        // is wiped at end-of-scope rather than left dangling for
+        // allocator reuse to reveal. `SensitiveData::try_from`
+        // internally clones the bytes into a TSS-owned buffer; the
+        // upstream impl does NOT zeroize on drop (see audit note in
+        // unseal_with_pin), so this wrapper is the last line of
+        // defense before the bytes leave Rust's allocator.
+        let plaintext_vec: zeroize::Zeroizing<Vec<u8>> =
+            zeroize::Zeroizing::new(plaintext.to_vec());
+        let sensitive_data = SensitiveData::try_from((*plaintext_vec).clone())
             .map_err(|e| Error::TpmError(format!("SensitiveData: {e}")))?;
 
         // tss-esapi 7.x's Context::create takes (auth_value,

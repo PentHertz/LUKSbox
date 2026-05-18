@@ -11,6 +11,7 @@ luksbox-core = { path = "../luksbox-core" }
 sha2.workspace = true
 hmac.workspace = true
 zeroize.workspace = true
+subtle.workspace = true
 rand_core.workspace = true
 thiserror.workspace = true
 aes.workspace = true
