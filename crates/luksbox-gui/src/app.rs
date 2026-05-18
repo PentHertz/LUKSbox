@@ -3442,16 +3442,41 @@ impl LuksboxApp {
                         let te = egui::TextEdit::singleline(&mut *self.create.pin).password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         ui.add_space(8.0);
-                        ui.label(
-                            RichText::new(
-                                "Seed-file passphrase (encrypts the .kyber seed file at rest. \
-                                 Required - the .kyber must be passphrase-protected.)",
-                            )
-                            .color(theme::DIM).size(12.0),
-                        );
+                        if self.create.use_deniable {
+                            ui.label(
+                                RichText::new(
+                                    "Optional separate .kyber seed-file passphrase. \
+                                     Leave BLANK to use the envelope passphrase above for \
+                                     both roles (one passphrase opens the vault AND \
+                                     decrypts the .kyber). Fill it to set a DISTINCT \
+                                     seed-file passphrase. You'll then need to type \
+                                     both at every unlock.",
+                                )
+                                .color(theme::DIM).size(12.0),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(
+                                    "Seed-file passphrase (encrypts the .kyber seed file at rest. \
+                                     Required - the .kyber must be passphrase-protected.)",
+                                )
+                                .color(theme::DIM).size(12.0),
+                            );
+                        }
                         let te = egui::TextEdit::singleline(&mut *self.create.hybrid_seed_pw)
                             .password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
+                        strength_meter(ui, &self.create.hybrid_seed_pw);
+                        ui.add_space(4.0);
+                        if ui
+                            .add_sized(
+                                [form_width(ui), CONTROL_H],
+                                ghost_button("Generate strong .kyber seed passphrase..."),
+                            )
+                            .clicked()
+                        {
+                            self.open_passgen(PassgenTarget::CreateSeedPw);
+                        }
                         ui.add_space(10.0);
                         ui.label(
                             RichText::new(
