@@ -930,10 +930,7 @@ fn mount_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
     use luksbox_vfs::Vfs;
 
     let path = ask_path(theme, "Path to the deniable vault")?;
-    let mountpoint = ask_path(
-        theme,
-        "Mountpoint (must exist + be a directory on Linux/macOS)",
-    )?;
+    let mountpoint = ask_mountpoint(theme, &path)?;
 
     #[cfg(not(target_os = "windows"))]
     let mp_abs = {
@@ -1414,6 +1411,46 @@ fn ask_path_with_default(theme: &ColorfulTheme, prompt: &str, default: &str) -> 
         .with_initial_text(default)
         .interact_text()?;
     Ok(PathBuf::from(s))
+}
+
+/// Prompt the user for a mount target. On macOS+FUSE-T this offers a
+/// "private mount" shortcut up front: a `Confirm` (default no) that,
+/// if accepted, derives `~/Library/LUKSbox/Mounts/<vault-name>` via
+/// [`luksbox_mount::private_mountpoint_for`] so the mountpoint name
+/// is invisible to other local users (see the helper's doc comment
+/// for the rationale). On every other backend the Confirm is skipped
+/// and the user goes straight to the regular path prompt with
+/// platform-appropriate phrasing.
+///
+/// Shared by the standard `mount_action` and the deniable-mode
+/// `mount_deniable_wizard` so the prompt copy + private-mount logic
+/// stay in lockstep.
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+fn ask_mountpoint(theme: &ColorfulTheme, vault: &Path) -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    if luksbox_mount::FUSE_BACKEND == "fuse-t"
+        && Confirm::with_theme(theme)
+            .with_prompt(
+                "Use a private mountpoint under ~/Library/LUKSbox/Mounts/<vault-name>? \
+                 (other local users won't see the mount name, but it won't appear in \
+                 Finder's Locations sidebar)",
+            )
+            .default(false)
+            .interact()?
+    {
+        let vault_name = vault
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "vault".to_string());
+        return luksbox_mount::private_mountpoint_for(&vault_name)
+            .map_err(|e| format!("private mount setup failed: {e}").into());
+    }
+    let prompt = if cfg!(target_os = "windows") {
+        "Mount point (a drive letter like Z: or a non-existent path WinFsp will create)"
+    } else {
+        "Mount point (must be an existing empty directory)"
+    };
+    ask_path(theme, prompt)
 }
 
 /// Prompt the admin to pick a target slot index for a new deniable
@@ -3323,18 +3360,7 @@ fn mv_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
 }
 
 fn mount_action(theme: &ColorfulTheme, vfs: Vfs, vault: &Path) -> Result<()> {
-    // Per-OS mountpoint convention: existing empty dir on
-    // Linux/macOS (FUSE), drive letter / non-existent path on
-    // Windows (WinFsp). See cmd_mount in main.rs for the full
-    // explanation. The wizard prompt phrasing is platform-conditional
-    // so users aren't told to "pick an existing directory" on
-    // Windows where that would yield STATUS_OBJECT_NAME_COLLISION.
-    let prompt = if cfg!(target_os = "windows") {
-        "Mount point (a drive letter like Z: or a non-existent path WinFsp will create)"
-    } else {
-        "Mount point (must be an existing empty directory)"
-    };
-    let mp = ask_path(theme, prompt)?;
+    let mp = ask_mountpoint(theme, vault)?;
     #[cfg(not(target_os = "windows"))]
     {
         if !mp.is_dir() {

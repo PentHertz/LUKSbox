@@ -4841,7 +4841,29 @@ impl LuksboxApp {
                     .on_hover_text(mount_tooltip)
                     .clicked()
                 {
-                    self.start_mount_picker();
+                    self.start_mount_picker(false);
+                }
+                // Private mount button: macOS-only because that's the
+                // platform where the FUSE-T NFS-loopback model exposes
+                // the mountpoint name (under /Volumes) to every local
+                // user. Mounting under ~/Library/LUKSbox/Mounts/<name>
+                // hides the path itself (~/Library is mode 0700).
+                // Linux libfuse3 / Windows WinFsp don't have this
+                // exposure so no equivalent button is shown there.
+                #[cfg(target_os = "macos")]
+                if luksbox_mount::FUSE_BACKEND == "fuse-t"
+                    && ui
+                        .add(ghost_button("Mount privately"))
+                        .on_hover_text(
+                            "Mount inside your home Library folder so other users on this \
+                             Mac cannot see the mountpoint name in /Volumes. Path is \
+                             ~/Library/LUKSbox/Mounts/<vault-name>. The mount will NOT \
+                             appear in Finder's Locations sidebar; open it via the \
+                             \"Open mountpoint\" button below, or Finder > Go > Go to Folder.",
+                        )
+                        .clicked()
+                {
+                    self.start_mount_picker(true);
                 }
                 if ui.add(ghost_button("Keyslots")).clicked() {
                     self.view = View::Keyslots;
@@ -5147,7 +5169,7 @@ impl LuksboxApp {
     /// Open a folder picker, then spawn the mount on a worker thread.
     /// The Vfs is moved into the thread; the GUI no longer owns it
     /// while mounted, hence the dedicated "mounted" UI in `draw_mounted`.
-    fn start_mount_picker(&mut self) {
+    fn start_mount_picker(&mut self, private: bool) {
         // Mountpoint semantics differ by OS:
         //
         // - Linux / macOS: FUSE mounts onto an existing directory.
@@ -5161,6 +5183,14 @@ impl LuksboxApp {
         //   has to know this rule. Power users who want a specific
         //   letter can use the CLI, which forwards whatever path
         //   they supplied.
+        //
+        // `private` is only honored on macOS+FUSE-T. On every other
+        // backend the parameter is ignored: Linux libfuse3 already
+        // hides the mount contents from other users via mode 0700 on
+        // the mount root (no NFS-loopback exposure), and Windows uses
+        // a drive letter so there is no shared parent directory.
+        // The caller still passes the flag uniformly so the call
+        // sites stay symmetric.
         let mountpoint: PathBuf = if cfg!(target_os = "windows") {
             match find_free_windows_drive_letter() {
                 Some(p) => p,
@@ -5171,6 +5201,34 @@ impl LuksboxApp {
                     );
                     return;
                 }
+            }
+        } else if private {
+            #[cfg(target_os = "macos")]
+            {
+                let vault_name = self
+                    .vault
+                    .as_ref()
+                    .and_then(|v| v.vault_path.file_stem())
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "vault".to_string());
+                match luksbox_mount::private_mountpoint_for(&vault_name) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        self.toast_err(format!(
+                            "Private mount setup failed: {e}. Use \"Mount as volume...\" to \
+                             pick a folder manually."
+                        ));
+                        return;
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                // Unreachable in practice: the private-mount button is
+                // only rendered on macOS+FUSE-T. Belt-and-suspenders so
+                // a future caller can't silently fall through.
+                self.toast_err("private mount is only supported on macOS+FUSE-T");
+                return;
             }
         } else {
             let Some(mp) = rfd::FileDialog::new()

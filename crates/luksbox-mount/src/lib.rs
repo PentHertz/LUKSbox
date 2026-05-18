@@ -85,6 +85,133 @@ pub const FUSE_BACKEND: &str = {
     }
 };
 
+/// macOS-only: derive a per-user mountpoint under
+/// `~/Library/LUKSbox/Mounts/<sanitized-vault-name>`, creating the
+/// directory tree (with mode 0700 on every component owned by us) if
+/// missing. Returns an absolute path the caller can pass straight to
+/// `mount()`.
+///
+/// Why this exists: on macOS the default mountpoint is `/Volumes/<name>`,
+/// which sits inside a world-readable directory. With FUSE-T the
+/// on-disk mode bits (0700 root, 0600 files) keep data confidential -
+/// other users get EACCES on every op - but the mount's NAME is still
+/// visible to anyone running `ls /Volumes`. Some users running a
+/// shared Mac want the name hidden too. Mounting under `~/Library`
+/// (mode 0700 by default) makes the mountpoint path itself
+/// unreachable from another account.
+///
+/// Errors:
+/// - `$HOME` is unset (rare on macOS, but inherits from the OS).
+/// - The target dir exists and is not empty (a previous mount may
+///   not have been cleaned up). We refuse to overlay user data; the
+///   caller should display the error and let the user unmount /
+///   delete the stale dir manually.
+///
+/// Note: the helper does NOT lock the dir against concurrent mounts.
+/// The flock on the .lbx vault file (acquired by `Container::open`)
+/// already prevents two concurrent mounts of the same vault, so a
+/// non-empty mountpoint here means a previous session left state
+/// behind, not a live conflict.
+#[cfg(target_os = "macos")]
+pub fn private_mountpoint_for(vault_name: &str) -> std::io::Result<std::path::PathBuf> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt as _;
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "HOME environment variable is not set",
+        )
+    })?;
+    let safe = sanitize_vault_name_for_mount(vault_name);
+    let base = std::path::PathBuf::from(home).join("Library/LUKSbox/Mounts");
+    fs::create_dir_all(&base)?;
+    // create_dir_all honors umask (typically 022 -> 0755). Tighten to
+    // 0700 explicitly so the parent doesn't leak the names of other
+    // mountpoints to anyone with shell access on a multi-user Mac.
+    fs::set_permissions(&base, fs::Permissions::from_mode(0o700))?;
+    let dir = base.join(&safe);
+    if dir.exists() {
+        let mut it = fs::read_dir(&dir)?;
+        if it.next().is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "private mountpoint {} exists and is not empty - a previous \
+                     mount may not have been torn down. Unmount it or delete the \
+                     directory manually before retrying.",
+                    dir.display()
+                ),
+            ));
+        }
+    } else {
+        fs::create_dir(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(dir)
+}
+
+/// Filter a vault name into a path component that's safe to append
+/// to the private-mount base directory. Strips control chars and
+/// path separators; collapses to "vault" if the result is empty.
+/// Unicode letters/digits pass through (egui shows them fine, and
+/// macOS HFS+/APFS handles UTF-8 paths natively).
+#[cfg(target_os = "macos")]
+fn sanitize_vault_name_for_mount(s: &str) -> String {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | '\0'))
+        .take(128)
+        .collect();
+    let trimmed = cleaned.trim();
+    // Reject exact "." and ".." (the only character sequences that
+    // would cause path-traversal when appended to the base dir).
+    // Embedded ".." inside a longer name is harmless: "foo..bar" is
+    // just a regular directory name to the filesystem.
+    if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
+        "vault".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod private_mount_tests {
+    use super::sanitize_vault_name_for_mount as sanitize;
+
+    #[test]
+    fn rejects_path_separators() {
+        assert_eq!(sanitize("../etc/passwd"), "..etcpasswd");
+        assert_eq!(sanitize("a/b\\c"), "abc");
+    }
+    #[test]
+    fn strips_control_chars_and_nul() {
+        assert_eq!(sanitize("hi\0there\n"), "hithere");
+    }
+    #[test]
+    fn collapses_traversal_components_to_vault() {
+        assert_eq!(sanitize(""), "vault");
+        assert_eq!(sanitize("   "), "vault");
+        assert_eq!(sanitize("."), "vault");
+        assert_eq!(sanitize(".."), "vault");
+        assert_eq!(sanitize("  ..  "), "vault");
+    }
+    #[test]
+    fn preserves_leading_dot_names() {
+        // Legit "hidden" naming convention - do NOT silently rewrite.
+        assert_eq!(sanitize(".hidden_vault"), ".hidden_vault");
+        assert_eq!(sanitize("...overkill..."), "...overkill...");
+    }
+    #[test]
+    fn preserves_unicode() {
+        assert_eq!(sanitize("café-2026"), "café-2026");
+    }
+    #[test]
+    fn caps_length() {
+        let s = "a".repeat(300);
+        assert_eq!(sanitize(&s).len(), 128);
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum MountError {
     #[error("io: {0}")]

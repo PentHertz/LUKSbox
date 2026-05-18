@@ -460,7 +460,17 @@ enum Command {
         /// Run in the foreground instead of daemonizing.
         #[arg(short = 'f', long)]
         foreground: bool,
-        mountpoint: PathBuf,
+        /// Mountpoint. Required unless `--private-mount` is given.
+        mountpoint: Option<PathBuf>,
+        /// macOS-only: derive a per-user mountpoint under
+        /// `~/Library/LUKSbox/Mounts/<vault-name>` instead of using
+        /// the explicit `<mountpoint>` argument. `~/Library` is mode
+        /// 0700 on macOS, so the mountpoint name itself is invisible
+        /// to other users on the system (whereas `/Volumes/<name>`
+        /// reveals the mount's existence). No effect on Linux/Windows;
+        /// rejected if combined with an explicit mountpoint.
+        #[arg(long)]
+        private_mount: bool,
     },
     /// Subprocess-isolated FUSE-T mount helper. Reads a 32-byte
     /// MasterVolumeKey from stdin and uses it to open the vault
@@ -1055,7 +1065,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             unlock,
             foreground,
             mountpoint,
-        } => cmd_mount(&path, &unlock, foreground, &mountpoint),
+            private_mount,
+        } => cmd_mount(
+            &path,
+            &unlock,
+            foreground,
+            mountpoint.as_deref(),
+            private_mount,
+        ),
         Command::MountFuseTHelper {
             vault,
             header,
@@ -4393,7 +4410,53 @@ fn validate_mountpoint_safety(user_supplied: &Path, canonical: &Path) -> Result<
     Ok(())
 }
 
-fn cmd_mount(path: &Path, unlock: &UnlockArgs, foreground: bool, mountpoint: &Path) -> Result<()> {
+fn cmd_mount(
+    path: &Path,
+    unlock: &UnlockArgs,
+    foreground: bool,
+    mountpoint: Option<&Path>,
+    private_mount: bool,
+) -> Result<()> {
+    // Resolve mountpoint:
+    //   --private-mount + no explicit path -> derive ~/Library/LUKSbox/Mounts/<vault-name>
+    //   explicit path  + no --private-mount -> use as-is
+    //   neither / both -> reject (ambiguous or empty input)
+    // The helper is macOS-only; on other targets `--private-mount` is
+    // rejected so the user sees a clear error instead of a silent
+    // behavioural difference.
+    let mountpoint_owned: std::path::PathBuf = match (mountpoint, private_mount) {
+        (Some(_), true) => {
+            return Err(
+                "`--private-mount` cannot be combined with an explicit <mountpoint>; \
+                 pass exactly one"
+                    .into(),
+            );
+        }
+        (None, false) => {
+            return Err("missing <mountpoint>. Either give one explicitly or pass \
+                 `--private-mount` (macOS+FUSE-T only) to derive \
+                 ~/Library/LUKSbox/Mounts/<vault-name>."
+                .into());
+        }
+        (Some(p), false) => p.to_path_buf(),
+        (None, true) => {
+            #[cfg(target_os = "macos")]
+            {
+                let vault_name = path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "vault".to_string());
+                luksbox_mount::private_mountpoint_for(&vault_name)
+                    .map_err(|e| format!("private mount setup failed: {e}"))?
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err("`--private-mount` is only supported on macOS".into());
+            }
+        }
+    };
+    let mountpoint: &Path = mountpoint_owned.as_path();
+
     // Mountpoint validation is per-OS:
     //
     // - Linux / macOS (FUSE): the mountpoint MUST exist, be a
