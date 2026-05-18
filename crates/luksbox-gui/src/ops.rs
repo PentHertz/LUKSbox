@@ -2138,7 +2138,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
         // above: catch-all is structurally unreachable on
         // Linux+hardware, allow the lint to keep the match portable.
         #[allow(unreachable_patterns)]
-        let cont = match opts.method {
+        let mut cont = match opts.method {
             UnlockMethod::Passphrase => {
                 let cred = luksbox_core::deniable::DeniableCredential::Passphrase {
                     passphrase: pw.as_bytes(),
@@ -2253,12 +2253,42 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
             }
         };
         let cipher_label = format!("{:?} (deniable)", cipher);
+
+        // Anchor verification - mirrors the non-deniable path below.
+        // Without this block the user-supplied `opts.anchor_path` was
+        // silently ignored in deniable mode: any file (or a missing
+        // file) was accepted. `Container::set_anchor` branches on
+        // is_deniable() internally and uses the AEAD-encrypted
+        // deniable anchor format (see anchor.rs::deniable_read_and_verify),
+        // so a non-anchor file or an anchor from a different vault
+        // fails the AEAD and returns `Error::OpaqueUnlockFailed`.
+        let trusted_gen = if let Some(ap) = opts.anchor_path.as_ref() {
+            cont.set_anchor(Some(ap.clone())).map_err(estr)?
+        } else {
+            None
+        };
         let vfs = luksbox_vfs::Vfs::open(cont).map_err(estr)?;
+        if let Some(anchor_gen) = trusted_gen {
+            match anchor::compare(anchor_gen, vfs.vault_generation()) {
+                anchor::VerificationOutcome::Ok
+                | anchor::VerificationOutcome::AnchorStale { .. } => {}
+                anchor::VerificationOutcome::RollbackDetected {
+                    anchor_gen,
+                    metadata_gen,
+                } => {
+                    return Err(format!(
+                        "Rollback detected: anchor at gen {anchor_gen} > vault at \
+                         gen {metadata_gen}. Open refused (someone may have \
+                         substituted an old copy of the vault)."
+                    ));
+                }
+            }
+        }
         return Ok(OpenedVault {
             vfs,
             vault_path: opts.path.clone(),
             header_path: None,
-            anchor_path: None,
+            anchor_path: opts.anchor_path.clone(),
             cipher_label,
             has_fido2: false,
             has_hybrid_pq: false,
