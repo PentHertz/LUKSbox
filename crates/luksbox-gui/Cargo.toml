@@ -74,6 +74,14 @@ luksbox-vfs = { path = "../luksbox-vfs" }
 # `winfsp = ["luksbox-mount/winfsp"]` feature above.
 luksbox-mount = { path = "../luksbox-mount", default-features = false }
 
+# Used by the pre-flight check in `start_mount_subprocess` to detect
+# when another process (e.g. a stale helper from a previous mount or
+# a CLI `luksbox mount`) already holds an exclusive lock on the vault
+# file. Catches the conflict in the parent with a friendly toast
+# instead of letting the helper subprocess fail with VaultLocked +
+# exit code 1.
+fs2 = "0.4"
+
 # SIGPIPE constant for exit_status_is_clean_unmount on macOS
 # (FUSE-T helper subprocess sometimes exits with signal 13 during
 # unmount; we classify that as a clean unmount). Cheap to compile

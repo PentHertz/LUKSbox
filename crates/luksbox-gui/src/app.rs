@@ -8442,6 +8442,22 @@ fn start_mount_subprocess(
     // acquire it.
     drop(opened);
 
+    // 2b. Pre-flight: confirm no OTHER process (e.g. a stale
+    // mount-fuse-t-helper from a previous failed unmount, or a CLI
+    // `luksbox mount` running in a Terminal) is currently holding
+    // an exclusive lock on the vault file. Without this check the
+    // helper would race for `flock(LOCK_EX)` inside
+    // `Container::open_with_mvk`, fail, and exit 1 - leaving the
+    // user with a generic "mount helper exited abnormally" toast
+    // that gives no hint that a duplicate-mount conflict is the
+    // root cause. The pre-flight maps the same condition to a
+    // dedicated error message so the user immediately knows to
+    // hunt for the other process. Detached header (if any) is
+    // probed too; child's `lock_handles` locks both.
+    if let Err(e) = preflight_vault_unlocked(&vault_path, header_path.as_deref()) {
+        return Err(e);
+    }
+
     // 3. Spawn the child. Optionally wrap with macOS sandbox-exec
     // for defense-in-depth (opt-in via LUKSBOX_SANDBOX_HELPER=1
     // until validated end-to-end on macOS hosts).
@@ -8516,6 +8532,66 @@ fn start_mount_subprocess(
     // copy, will reconstruct a MasterVolumeKey from it, and zeroize
     // its stdin buffer.
     Ok((child, stderr_buf))
+}
+
+/// Pre-flight probe to verify that no other process is currently
+/// holding an exclusive lock on the vault (and detached header, if
+/// any) before we spawn the FUSE-T helper.
+///
+/// The probe opens the file read-only, calls non-blocking
+/// `try_lock_exclusive`, then immediately unlocks. A failure means
+/// another process owns the lock - typically:
+///
+/// - A stale `mount-fuse-t-helper` from a previous mount where
+///   libfuse-t didn't tear down cleanly (the helper is still
+///   running, holding the flock, but the mountpoint is detached).
+/// - A `luksbox mount` invocation running in another Terminal
+///   against the same vault.
+/// - A second LUKSbox GUI process the user double-launched.
+///
+/// On success we drop the lock immediately. There IS a TOCTOU window
+/// between our probe and the child's lock acquisition, but it only
+/// matters if some other process opens the vault in those few
+/// milliseconds - in which case we fall back to the helper's own
+/// VaultLocked error (now surfaced via the stderr-capture toast).
+/// This is a UX-quality check, not a security guarantee.
+///
+/// Only meaningful for the FUSE-T (Subprocess) backend. The
+/// `InProcess` backends (Linux libfuse3, macFUSE, Windows WinFsp)
+/// keep the GUI's Vfs - and thus the file lock - inside the worker
+/// thread without ever dropping it, so they have no equivalent race
+/// window. See the comment in `start_mount_picker` for the backend
+/// dispatch rationale.
+fn preflight_vault_unlocked(vault: &Path, header: Option<&Path>) -> Result<(), String> {
+    use fs2::FileExt as _;
+    use std::fs::OpenOptions;
+
+    let probe = |path: &Path, label: &str| -> Result<(), String> {
+        let f = OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(|e| format!("pre-flight: cannot open {label} {}: {e}", path.display()))?;
+        match f.try_lock_exclusive() {
+            Ok(()) => {
+                let _ = f.unlock();
+                Ok(())
+            }
+            Err(_) => Err(format!(
+                "{label} {} is already locked by another process - is a previous \
+                 mount-fuse-t-helper still running, or a `luksbox mount` command \
+                 active in a Terminal? Run `pgrep -fl mount-fuse-t-helper` (or \
+                 check Activity Monitor for `luksbox`) and stop the existing \
+                 holder before trying to mount again.",
+                path.display()
+            )),
+        }
+    };
+
+    probe(vault, "vault")?;
+    if let Some(hp) = header {
+        probe(hp, "detached header")?;
+    }
+    Ok(())
 }
 
 /// Trim accumulated child stderr down to its last `n` chars, on a

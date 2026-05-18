@@ -2592,6 +2592,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_extras",
+ "fs2",
  "hex",
  "image",
  "libc",
