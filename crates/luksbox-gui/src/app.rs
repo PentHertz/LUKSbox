@@ -1077,6 +1077,14 @@ enum MountBackend {
     },
     Subprocess {
         child: std::process::Child,
+        /// Accumulated stderr from the child, captured by a background
+        /// thread so the parent can surface a real error message when
+        /// the helper exits non-zero. Without this the GUI only sees
+        /// `exit status: 1`, which gives the user no way to debug what
+        /// failed inside the helper (could be a wrong MVK, a stale
+        /// flock, a missing libfuse-t.dylib, a mountpoint that's
+        /// suddenly unwritable, etc.).
+        stderr: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
     },
 }
 
@@ -5180,7 +5188,7 @@ impl LuksboxApp {
         //     have the close-on-unmount bug FUSE-T has.
         let backend = if luksbox_mount::FUSE_BACKEND == "fuse-t" {
             match start_mount_subprocess(opened, &mountpoint) {
-                Ok(child) => MountBackend::Subprocess { child },
+                Ok((child, stderr)) => MountBackend::Subprocess { child, stderr },
                 Err(e) => {
                     self.toast_err(format!("could not start mount helper: {e}"));
                     // OpenedVault was consumed; user must reopen the
@@ -5373,11 +5381,19 @@ impl LuksboxApp {
                     self.toast_err("mount thread terminated unexpectedly");
                 }
             },
-            MountBackend::Subprocess { child } => match child.try_wait() {
+            MountBackend::Subprocess { child, stderr } => match child.try_wait() {
                 Ok(None) => {
                     // Child still running, nothing to do.
                 }
                 Ok(Some(status)) => {
+                    // Snapshot the captured stderr now (the background
+                    // drain thread will have finished or be on its
+                    // last cycle once the child has exited).
+                    let stderr_snapshot = stderr
+                        .lock()
+                        .ok()
+                        .map(|g| String::from_utf8_lossy(&g).into_owned())
+                        .unwrap_or_default();
                     self.mount_status = None;
                     self.view = View::Welcome;
                     self.cwd = "/".into();
@@ -5388,13 +5404,19 @@ impl LuksboxApp {
                         // Non-zero exit can mean libfuse-t aborted
                         // itself during teardown (the original FUSE-T
                         // bug we're isolating), the kernel killed the
-                        // child, or a real error. We can't always
-                        // tell which from just the exit code, so the
-                        // message is deliberately neutral.
-                        self.toast_err(format!(
-                            "mount helper exited abnormally ({status}); \
-                             the mount has been torn down."
-                        ));
+                        // child, or a real error. We surface the last
+                        // ~400 chars of the child's stderr so the user
+                        // (and us) can see WHICH of those it was.
+                        let tail = stderr_tail(&stderr_snapshot, 400);
+                        let msg = if tail.is_empty() {
+                            format!(
+                                "mount helper exited abnormally ({status}); \
+                                 the mount has been torn down."
+                            )
+                        } else {
+                            format!("mount helper exited abnormally ({status}): {tail}")
+                        };
+                        self.toast_err(msg);
                     }
                 }
                 Err(e) => {
@@ -8392,8 +8414,14 @@ fn resolved_default_app_opener() -> Option<std::path::PathBuf> {
 fn start_mount_subprocess(
     opened: OpenedVault,
     mountpoint: &Path,
-) -> Result<std::process::Child, String> {
-    use std::io::Write as _;
+) -> Result<
+    (
+        std::process::Child,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    ),
+    String,
+> {
+    use std::io::{Read as _, Write as _};
     use std::process::Stdio;
     use zeroize::Zeroize as _;
 
@@ -8419,12 +8447,15 @@ fn start_mount_subprocess(
     // until validated end-to-end on macOS hosts).
     let mut cmd = build_helper_command(&helper, &vault_path, header_path.as_deref(), mountpoint);
     cmd.stdin(Stdio::piped());
-    // Inherit stdout/stderr so the child's diagnostic eprintlns
-    // (and any panic output) end up in the parent's terminal when
-    // the GUI was launched from Terminal, or in the system log
-    // otherwise.
+    // stdout is irrelevant - the helper doesn't print anything on
+    // the happy path. Inherit so user-launched-from-Terminal devs
+    // see anything unexpected. stderr is PIPED so we can surface
+    // the helper's `error: <...>` line in the GUI toast when the
+    // child exits non-zero (otherwise the user sees `exit status:
+    // 1` with no clue what failed - especially bad in packaged
+    // .app launches where stderr would otherwise go to /dev/null).
     cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::inherit());
+    cmd.stderr(Stdio::piped());
 
     let mut child = cmd
         .spawn()
@@ -8446,11 +8477,70 @@ fn start_mount_subprocess(
     drop(stdin);
     write_res.map_err(|e| format!("could not write MVK to child stdin: {e}"))?;
 
+    // 5. Drain stderr in a background thread so the OS pipe buffer
+    // can't deadlock the child if libfuse-t (or our own diagnostic
+    // path) chatters more than ~64 KiB. Cap accumulated output at
+    // 64 KiB - past that we tail-truncate, which is what the GUI
+    // displays anyway. Without this drain, a chatty child stuck on
+    // a blocked write to stderr would never reach exit(1) and the
+    // GUI would think the mount is still healthy.
+    let stderr_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    if let Some(mut cstderr) = child.stderr.take() {
+        let buf = std::sync::Arc::clone(&stderr_buf);
+        std::thread::spawn(move || {
+            const CAP: usize = 64 * 1024;
+            let mut chunk = [0u8; 4096];
+            loop {
+                match cstderr.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if let Ok(mut g) = buf.lock() {
+                            // Tail-truncate to stay under CAP.
+                            if g.len() + n > CAP {
+                                let drop_front = (g.len() + n) - CAP;
+                                if drop_front <= g.len() {
+                                    g.drain(..drop_front);
+                                }
+                            }
+                            g.extend_from_slice(&chunk[..n]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+    }
+
     // The MVK drops here at end-of-function; SecretBox's Drop runs
     // and zeroizes its inner storage. The child now has its own
     // copy, will reconstruct a MasterVolumeKey from it, and zeroize
     // its stdin buffer.
-    Ok(child)
+    Ok((child, stderr_buf))
+}
+
+/// Trim accumulated child stderr down to its last `n` chars, on a
+/// line boundary if possible. Whitespace-only output collapses to "".
+fn stderr_tail(s: &str, n: usize) -> String {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.len() <= n {
+        return trimmed.to_string();
+    }
+    // Slice from the end, then nudge forward to the first newline
+    // so we don't cut in the middle of a UTF-8 grapheme or word.
+    let start = trimmed.len().saturating_sub(n);
+    let mut start = start;
+    while !trimmed.is_char_boundary(start) && start < trimmed.len() {
+        start += 1;
+    }
+    let tail = &trimmed[start..];
+    if let Some(nl) = tail.find('\n') {
+        tail[nl + 1..].trim().to_string()
+    } else {
+        tail.trim().to_string()
+    }
 }
 
 /// True if the helper subprocess's exit status represents a clean

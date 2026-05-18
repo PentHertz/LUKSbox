@@ -4443,6 +4443,19 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
     use std::io::Read;
     use zeroize::Zeroize;
 
+    // Stage trace - the parent captures our stderr and surfaces the
+    // last lines in its error toast when we exit non-zero. Emitting a
+    // line at each stage lets us pinpoint which step failed from the
+    // GUI alone, without asking the user to dig out a logfile. The
+    // happy path produces a small constant amount of output (~5
+    // lines), all well below the parent's 64 KiB drain cap.
+    eprintln!(
+        "luksbox-mount-helper: start vault={} mountpoint={} header={:?}",
+        vault.display(),
+        mountpoint.display(),
+        header
+    );
+
     // Ignore SIGPIPE for the entire helper process lifetime.
     //
     // libfuse-t.dylib (and its closed-source `go-nfsv4` companion)
@@ -4488,6 +4501,11 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
     let vault_abs = vault
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", vault.display()))?;
+    eprintln!(
+        "luksbox-mount-helper: canonicalized vault={} mountpoint={}",
+        vault_abs.display(),
+        mp_abs.display()
+    );
 
     // Read MVK from stdin. Block until exactly 32 bytes arrive or
     // the parent closes the pipe early (which would be a parent
@@ -4498,18 +4516,23 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
         .map_err(|e| format!("could not read MVK from stdin: {e}"))?;
     let mvk = MasterVolumeKey::from_bytes(mvk_bytes);
     mvk_bytes.zeroize();
+    eprintln!("luksbox-mount-helper: MVK received, opening container");
 
     // Open with the supplied MVK (no passphrase / FIDO2 derivation).
     // A wrong MVK fails fast with HeaderAuthFailed via the HMAC
     // check inside open_with_mvk - never silently produces a Vfs
     // backed by garbled metadata.
-    let container = Container::open_with_mvk(&vault_abs, header, mvk)?;
-    let vfs = Vfs::open(container)?;
+    let container = Container::open_with_mvk(&vault_abs, header, mvk)
+        .map_err(|e| format!("open container ({}): {e}", vault_abs.display()))?;
+    let vfs = Vfs::open(container).map_err(|e| format!("open Vfs: {e}"))?;
+    eprintln!("luksbox-mount-helper: Vfs ready, calling mount");
 
     // Run the FUSE event loop in foreground (no daemonize). The
     // parent process polls our exit status; daemonizing here would
     // leave the parent unable to detect mount-end.
-    luksbox_mount::mount(vfs, &mp_abs, false)?;
+    luksbox_mount::mount(vfs, &mp_abs, false)
+        .map_err(|e| format!("mount {}: {e}", mp_abs.display()))?;
+    eprintln!("luksbox-mount-helper: mount returned cleanly, exiting");
     Ok(())
 }
 
