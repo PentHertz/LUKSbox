@@ -1702,7 +1702,7 @@ impl LuksboxApp {
                     // updated VFS; re-install it so the Keyslots
                     // view reflects the new wraps.
                     self.vault = Some(reopened);
-                    self.toast_ok("✓ master key rotated");
+                    self.toast_ok("OK master key rotated");
                 }
                 Ok(Err(e)) => {
                     // Rotation failed (or was aborted). The worker
@@ -1941,7 +1941,7 @@ impl LuksboxApp {
 
         ui.add_space(4.0);
         if ui
-            .add_sized([width, 22.0], ghost_button("↻ Re-detect"))
+            .add_sized([width, 22.0], ghost_button("(refresh) Re-detect"))
             .on_hover_text(
                 "Re-enumerate plugged-in FIDO2 authenticators. Useful after \
                  plugging or unplugging a device.",
@@ -1974,7 +1974,7 @@ impl LuksboxApp {
                 ui.horizontal(|ui| {
                     let title_color = if missing { theme::DIM } else { theme::TEXT };
                     // Truncate long vault names with ellipsis so they
-                    // can't push the × button off-screen on narrow
+                    // can't push the x button off-screen on narrow
                     // sidebars; full name still available on hover.
                     ui.add(
                         egui::Label::new(
@@ -1984,7 +1984,7 @@ impl LuksboxApp {
                         .selectable(false),
                     )
                     .on_hover_text(&name);
-                    // Push the × button to the right edge with explicit
+                    // Push the x button to the right edge with explicit
                     // spacing rather than a nested right_to_left layout,
                     // which was clipping the button's hit-rect on narrow
                     // sidebars and silently swallowing clicks.
@@ -1994,7 +1994,7 @@ impl LuksboxApp {
                     }
                     let btn = ui.add_sized(
                         [22.0, 22.0],
-                        egui::Button::new(RichText::new("×").color(theme::FAINT).size(14.0))
+                        egui::Button::new(RichText::new("x").color(theme::FAINT).size(14.0))
                             .frame(false),
                     );
                     if btn
@@ -2051,7 +2051,7 @@ impl LuksboxApp {
                     ui.label(
                         RichText::new(
                             "file not found at this path, moved or deleted? \
-                             click × to forget it from this list, or move \
+                             click x to forget it from this list, or move \
                              the .lbx back to this path.",
                         )
                         .small()
@@ -2096,7 +2096,7 @@ impl LuksboxApp {
         if resp.clicked() && !want_forget {
             if missing {
                 self.toast_warn(format!(
-                    "{} no longer exists, click × to forget it.",
+                    "{} no longer exists, click x to forget it.",
                     r.path.display()
                 ));
             } else {
@@ -3551,7 +3551,7 @@ impl LuksboxApp {
                     ui.collapsing(
                         RichText::new("Advanced size-hiding (paranoid)").color(theme::DIM).size(12.0),
                         |ui| {
-                            ui.checkbox(&mut self.create.pad_files, "Pad files to power-of-2 chunks (hides per-file size in a 2× bucket; up to 2× storage cost)");
+                            ui.checkbox(&mut self.create.pad_files, "Pad files to power-of-2 chunks (hides per-file size in a 2x bucket; up to 2x storage cost)");
                             ui.checkbox(&mut self.create.hide_sizes, "Hide exact sizes (encrypts size in chunk-0 plaintext; implies padding)");
                         },
                     );
@@ -3585,7 +3585,7 @@ impl LuksboxApp {
         // FORCES single-slot for these kinds (the 2-slot pattern would
         // create an invisible-second-slot foot-gun, see DENIABLE_HEADER.md).
         // `tpm_only` routes to `create_vault_tpm2_only` (single-slot
-        // TPM vault — no separate passphrase slot). Triggered by
+        // TPM vault - no separate passphrase slot). Triggered by
         // either the explicit "skip bootstrap" checkbox OR
         // deniable mode (which always wants single-slot to avoid
         // the invisible-second-slot foot-gun).
@@ -3724,7 +3724,7 @@ impl LuksboxApp {
             // v2 deniable: optional separate seed-file passphrase
             // for the .kyber. When None / empty, ops dispatch
             // falls back to opts.passphrase (envelope passphrase
-            // doubles as the seed-file passphrase — the common
+            // doubles as the seed-file passphrase - the common
             // default UX). Set only when the user explicitly typed
             // a different seed_pw.
             hybrid_seed_pw: if self.create.use_deniable
@@ -4812,7 +4812,7 @@ impl LuksboxApp {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&self.cwd).monospace().color(theme::DIM));
                     ui.label(
-                        RichText::new(format!("· {}", cipher))
+                        RichText::new(format!("* {}", cipher))
                             .small()
                             .color(theme::FAINT),
                     );
@@ -5418,9 +5418,9 @@ impl LuksboxApp {
     /// has been consumed/released and there's nothing to browse.
     ///
     /// The two backends report completion differently:
-    ///   - InProcess: receiver fires with the worker thread's
+    ///  - InProcess: receiver fires with the worker thread's
     ///     `Result<(), String>`.
-    ///   - Subprocess: child.try_wait() returns Some(ExitStatus).
+    ///  - Subprocess: child.try_wait() returns Some(ExitStatus).
     /// Both translate into the same view transition.
     fn poll_mount(&mut self) {
         let Some(ms) = self.mount_status.as_mut() else {
@@ -5737,7 +5737,7 @@ impl LuksboxApp {
                             .is_some_and(|v| v.vfs.container().is_deniable());
                         if is_deniable {
                             // v2 deniable enroll needs envelope
-                            // passphrase + slot index — open the
+                            // passphrase + slot index - open the
                             // modal to collect them.
                             self.add_tpm2_deniable_modal =
                                 Some(AddTpm2DeniableForm::default());
@@ -8312,7 +8312,7 @@ fn strength_meter(ui: &mut egui::Ui, passphrase: &str) {
     ui.add_space(2.0);
     let suffix = if chars == 1 { "char" } else { "chars" };
     ui.label(
-        RichText::new(format!("{label}  ·  {chars} {suffix}"))
+        RichText::new(format!("{label}  *  {chars} {suffix}"))
             .color(color)
             .size(11.0),
     );
@@ -8336,7 +8336,7 @@ fn ghost_button(text: impl Into<egui::WidgetText>) -> egui::Button<'static> {
 /// frames on `draw_welcome`.
 fn bullet(ui: &mut egui::Ui, title: &str, body: &str) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new("•").color(theme::ACCENT).size(13.0));
+        ui.label(RichText::new("*").color(theme::ACCENT).size(13.0));
         ui.vertical(|ui| {
             ui.label(RichText::new(title).strong().color(theme::TEXT).size(13.0));
             ui.label(RichText::new(body).color(theme::DIM).size(12.0));
@@ -8527,7 +8527,7 @@ fn start_mount_subprocess(
     // 3. Spawn the child. Optionally wrap with macOS sandbox-exec
     // for defense-in-depth (opt-in via LUKSBOX_SANDBOX_HELPER=1
     // until validated end-to-end on macOS hosts).
-    let mut cmd = build_helper_command(&helper, &vault_path, header_path.as_deref(), mountpoint);
+    let mut cmd = build_helper_command(&helper, &vault_path, header_path.as_deref(), mountpoint)?;
     cmd.stdin(Stdio::piped());
     // stdout is irrelevant - the helper doesn't print anything on
     // the happy path. Inherit so user-launched-from-Terminal devs
@@ -8768,7 +8768,7 @@ fn build_helper_command(
     vault: &Path,
     header: Option<&Path>,
     mountpoint: &Path,
-) -> std::process::Command {
+) -> Result<std::process::Command, String> {
     use std::process::Command;
 
     // Sandbox opt-in. Re-read on every spawn so a user can flip the
@@ -8807,17 +8807,24 @@ fn build_helper_command(
                 cmd.arg("--header").arg(hp);
             }
             cmd.arg(vault).arg(mountpoint);
-            return cmd;
+            return Ok(cmd);
         }
-        // Fall through to unsandboxed invocation if the profile is
-        // missing - log a warning to stderr but don't refuse to
-        // mount. The user opted in for hardening; if the profile
-        // is gone, they at least get the mount working.
-        eprintln!(
-            "luksbox: LUKSBOX_SANDBOX_HELPER=1 set but sandbox profile not found \
-             at <bundle>/Contents/Resources/fuse-t-helper.sb; spawning helper \
-             unsandboxed."
-        );
+        // Hard-fail when sandboxing was explicitly requested but the
+        // profile is missing. Previously the code logged a warning to
+        // stderr and fell through to an unsandboxed spawn, which on a
+        // packaged .app sends the warning to /dev/null and silently
+        // downgrades a security-conscious user back to no isolation.
+        // The whole point of the opt-in is that the user told us they
+        // want sandboxing; honor that or refuse, never silently
+        // weaken. The error surfaces in the GUI toast.
+        return Err(format!(
+            "LUKSBOX_SANDBOX_HELPER=1 is set but the sandbox profile was \
+             not found in the .app bundle's Resources directory \
+             (expected: <bundle>/Contents/Resources/fuse-t-helper.sb). \
+             Refusing to spawn the helper unsandboxed. Either unset \
+             LUKSBOX_SANDBOX_HELPER (and accept no sandboxing), or \
+             reinstall LUKSbox so the bundle ships the profile."
+        ));
     }
 
     // Default path: direct invocation of the helper, no sandbox wrap.
@@ -8827,7 +8834,7 @@ fn build_helper_command(
         cmd.arg("--header").arg(hp);
     }
     cmd.arg(vault).arg(mountpoint);
-    cmd
+    Ok(cmd)
 }
 
 /// Find the sandbox profile file that ships in the .app bundle's
@@ -9223,8 +9230,8 @@ impl LuksboxApp {
                     ui.add_space(8.0);
                 } else if let Some(res) = &form.result {
                     let (color, prefix) = match res {
-                        Ok(_) => (theme::OK, "✓ "),
-                        Err(_) => (theme::DANGER, "✗ "),
+                        Ok(_) => (theme::OK, "OK "),
+                        Err(_) => (theme::DANGER, "FAIL "),
                     };
                     let text = match res {
                         Ok(s) | Err(s) => s.clone(),

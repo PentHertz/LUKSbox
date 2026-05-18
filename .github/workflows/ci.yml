@@ -299,6 +299,14 @@ jobs:
           - header_roundtrip
           - winfsp_path_parse
           - webauthn_device_path
+          - deniable_header_parse
+          - slot_payload_decode
+          - slot_payload_roundtrip
+          # 2026-05 additions: chunk AEAD callsite + anchor parsers.
+          # Both are cheap per iteration, fit comfortably in the 5-min
+          # smoke budget. See FUZZING.md for the threat model.
+          - chunk_aead_decrypt
+          - anchor_parse
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

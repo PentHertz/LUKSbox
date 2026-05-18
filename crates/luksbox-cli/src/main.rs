@@ -220,7 +220,7 @@ enum SlotKindArg {
     /// permanent, pair with a Passphrase or FIDO2 recovery slot
     /// unless you accept the unrecoverable trade-off. Constraint:
     /// FIDO2 cred_id + TPM SealedBlob must fit in 352 B (typical
-    /// YubiKey ≤ 80 B + about 280 B blob is fine; Google Titan about 288 B
+    /// YubiKey <= 80 B + about 280 B blob is fine; Google Titan about 288 B
     /// cred_id overflows, use independent Tpm2 + Fido2 slots).
     Tpm2Fido2,
     /// TPM 2.0 keyslot gated by a user PIN. Same as `Tpm2`
@@ -440,10 +440,10 @@ enum Command {
     /// Mount the container as a userspace filesystem.
     ///
     /// Mountpoint conventions:
-    ///   - Linux / macOS (FUSE3 / FUSE-T / macFUSE): mountpoint is an
+    ///  - Linux / macOS (FUSE3 / FUSE-T / macFUSE): mountpoint is an
     ///     EXISTING empty directory. `mkdir -p ~/vault && luksbox mount
     ///     v.lbx ~/vault` is the typical pattern.
-    ///   - Windows (WinFsp): mountpoint is either a drive letter
+    ///  - Windows (WinFsp): mountpoint is either a drive letter
     ///     (e.g. `Z:`) OR a non-existent path the driver materializes
     ///     as a reparse point. Passing an existing directory yields
     ///     STATUS_OBJECT_NAME_COLLISION (0xC0000035) at mount start.
@@ -1418,7 +1418,7 @@ fn cmd_header_restore(
     // 3. Write to disk. Inline mode rewrites bytes 0..8192 of the
     //    vault file in place; detached mode atomic-replaces the
     //    sidecar (temp+fsync+rename+sync_parent_dir). Inline path is
-    //    intentionally NOT atomic across crashes — if the user wants
+    //    intentionally NOT atomic across crashes - if the user wants
     //    crash safety they can keep the existing on-disk header as a
     //    rollback before running this; the inline restore is a
     //    targeted byte-region rewrite.
@@ -1465,7 +1465,7 @@ fn cmd_header_dump(vault: &Path, unlock: &UnlockArgs, pretty: bool) -> Result<()
 
     // Recursively walk the directory tree from root, building a
     // serializable inode list. Uses `readdir` (returns name + child
-    // id), `inode_kind`, `inode_size_raw`, and `file_chunks` — none
+    // id), `inode_kind`, `inode_size_raw`, and `file_chunks` - none
     // require a chunk decrypt, so a vault with corrupted chunks still
     // produces a complete dump (each chunk's status is reported by
     // `check`, not here).
@@ -1727,7 +1727,7 @@ fn cmd_extract(
     let stored_size = vfs.inode_size_raw(id)?;
     // Hide-size mode stores the real size inside chunk 0; if chunk 0 is
     // unreadable we can't know the real size, so we fall back to the
-    // padded length (which over-reads zeros at EOF — acceptable in the
+    // padded length (which over-reads zeros at EOF - acceptable in the
     // forensic recovery path).
     let hide_size = vfs.container().header.hide_size_header();
     let data_offset = vfs.container().data_offset();
@@ -1778,7 +1778,7 @@ fn cmd_extract(
         };
         // Skip the 8-byte size header on chunk 0 in hide-size mode.
         // (If chunk 0 failed and we're emitting zeros, those 8 zero
-        // bytes still get skipped — same shape, no off-by-one.)
+        // bytes still get skipped - same shape, no off-by-one.)
         let chunk_data_start = if hide_size && idx == 0 { 8 } else { 0 };
         dst.write_all(&pt[chunk_data_start..])
             .map_err(|e| format!("writing to {}: {e}", local.display()))?;
@@ -4478,9 +4478,40 @@ fn cmd_mount(
     // Windows.
     #[cfg(not(target_os = "windows"))]
     let mp_abs: std::path::PathBuf = {
-        if !mountpoint.is_dir() {
-            return Err(format!("mountpoint {} is not a directory", mountpoint.display()).into());
-        }
+        // FD-based check: open with O_DIRECTORY | O_NOFOLLOW so the
+        // kernel atomically rejects both "not a directory" and "this
+        // is a symlink" in one syscall. Replaces the previous
+        // `is_dir()` + later `canonicalize()` pattern which had a
+        // TOCTOU window where an attacker (on a writable shared dir)
+        // could swap a real directory for a symlink to a sensitive
+        // path between the check and the canonicalize/mount.
+        //
+        // The deny-list check (validate_mountpoint_safety) still runs
+        // on the canonical path because FUSE's mount(2) accepts a
+        // PATH not an fd: between our drop(fd) below and the kernel's
+        // own path lookup at mount time the attacker could still swap
+        // the entry. We document this residual race here. Bounding
+        // the blast radius is the role of validate_mountpoint_safety
+        // (no /etc, /usr, /Library, etc.).
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(mountpoint)
+            .map_err(|e| {
+                let kind = if e.raw_os_error() == Some(libc::ELOOP) {
+                    "is a symbolic link (refused: open the underlying directory directly)"
+                } else if e.raw_os_error() == Some(libc::ENOTDIR) {
+                    "is not a directory"
+                } else {
+                    "could not be opened"
+                };
+                format!("mountpoint {} {kind}: {e}", mountpoint.display())
+            })?;
+        // The fd has served its check purpose; canonicalize via the
+        // path now that we've confirmed at least the user-supplied
+        // entry was a non-symlink directory.
+        drop(probe);
         let canonical = mountpoint
             .canonicalize()
             .map_err(|e| format!("cannot resolve {}: {e}", mountpoint.display()))?;
@@ -4624,7 +4655,7 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
 
 fn cmd_umount(mountpoint: &Path) -> Result<()> {
     luksbox_mount::unmount(mountpoint)?;
-    println!("✓ unmounted {}", mountpoint.display());
+    println!("OK unmounted {}", mountpoint.display());
     Ok(())
 }
 
@@ -4798,7 +4829,7 @@ fn cmd_deniable_init(
     }
     drop(cont);
 
-    println!("✓ deniable vault created at {}", path.display());
+    println!("OK deniable vault created at {}", path.display());
     println!("  cipher:     {:?}", cipher_suite);
     println!("  argon2:     m={m}KiB t={t} p={p}");
     println!("  credential: {credential}");
@@ -4831,7 +4862,7 @@ fn cmd_deniable_info(
     let cred = parse_cli_den_cred(credential)?;
 
     let container = cli_open_deniable_v2(path, cipher_suite, argon2_params, cred, kyber_path)?;
-    println!("✓ deniable vault opened");
+    println!("OK deniable vault opened");
     println!("  cipher suite:   {:?}", container.header.cipher_suite);
     println!("  kdf id:         {:?}", container.header.kdf);
     println!("  flags:          0x{:08x}", container.header.flags);
@@ -5802,10 +5833,10 @@ fn cmd_kdf_bench(samples: u32) -> Result<()> {
     println!("  bounded by RAM (each attempt needs `memory MiB` MiB resident).");
     println!();
     println!("Recommendations:");
-    println!("  - interactive: fine for daily-use vaults that you unlock often.");
-    println!("  - moderate:    annual-archive vaults or anything you'd grumble");
+    println!(" - interactive: fine for daily-use vaults that you unlock often.");
+    println!(" - moderate:    annual-archive vaults or anything you'd grumble");
     println!("                 about losing for 1-2 sec of unlock latency.");
-    println!("  - sensitive:   long-term cold storage. Multiplies attacker cost");
+    println!(" - sensitive:   long-term cold storage. Multiplies attacker cost");
     println!("                 6x vs interactive at 6x your unlock wait.");
     println!();
     println!("For full math, contact security@penthertz.com (internal cracking-cost analysis).");

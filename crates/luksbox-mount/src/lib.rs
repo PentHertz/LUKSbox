@@ -227,12 +227,12 @@ pub enum MountError {
         "mount support was not compiled into this binary. \
          To enable: install a FUSE provider for your platform and \
          rebuild luksbox-mount with the matching feature flag.\n\
-         - Linux: `apt install libfuse3-dev` and the `fuse` feature.\n\
-         - macOS (kext-free): `brew tap macos-fuse-t/homebrew-cask && \
+        - Linux: `apt install libfuse3-dev` and the `fuse` feature.\n\
+        - macOS (kext-free): `brew tap macos-fuse-t/homebrew-cask && \
            brew install --cask fuse-t` and the `fuse-t` feature.\n\
-         - macOS (legacy): `brew install --cask macfuse` and the \
+        - macOS (legacy): `brew install --cask macfuse` and the \
            `fuse` feature.\n\
-         - Windows: WinFsp from https://winfsp.dev/ and the `winfsp` \
+        - Windows: WinFsp from https://winfsp.dev/ and the `winfsp` \
            feature.\n\
          Then: `cargo clean -p luksbox-mount && cargo build --release \
          -p luksbox-cli`. The default workspace features include `fuse` \

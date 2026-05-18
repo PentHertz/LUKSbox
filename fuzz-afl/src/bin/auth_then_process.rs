@@ -1,9 +1,11 @@
-//! AFL++ harness: post-AEAD bincode decode of `DirectoryTree` with
-//! a fixed MVK. Same logic as `fuzz/fuzz_targets/auth_then_process.rs`
-//! (libfuzzer variant). This is the harness that found the bincode-
-//! OOM bug, running it on a server with `cargo afl fuzz -t 5000ms`
-//! plus AFL++'s timeout-detection catches a wider class of slow-path
-//! DoS than libFuzzer's default behaviour.
+//! AFL++ harness: post-AEAD decode of the magic-prefixed
+//! `DirectoryTree` blob with a fixed MVK. Same logic as
+//! `fuzz/fuzz_targets/auth_then_process.rs` (libfuzzer variant).
+//! Updated 2026-05 to mirror the libfuzzer migration off bincode to
+//! postcard + the `LBM\x02` magic-prefix dispatch added to
+//! `Vfs::open`. Originally this harness found a bincode-OOM bug,
+//! kept as the AFL++ counterpart so timeout-detection (which AFL++
+//! does at -t Nms granularity) catches the slow-path DoS class.
 
 use std::collections::BTreeMap;
 
@@ -16,15 +18,13 @@ const SUITE: CipherSuite = CipherSuite::Aes256Gcm;
 const MAX_PLAINTEXT: usize = (DEFAULT_METADATA_REGION_SIZE as usize) - 36;
 
 fn main() {
-    let mvk = MasterVolumeKey::from_bytes(MVK_BYTES);
-    let mut region = vec![0u8; DEFAULT_METADATA_REGION_SIZE as usize];
-    // 64 MiB cap mirrors the production decoder in luksbox-vfs::vfs.
-    const LIMIT: usize = 64 * 1024 * 1024;
-
     afl::fuzz!(|data: &[u8]| {
         if data.len() > MAX_PLAINTEXT {
             return;
         }
+        let mvk = MasterVolumeKey::from_bytes(MVK_BYTES);
+        let mut region = vec![0u8; DEFAULT_METADATA_REGION_SIZE as usize];
+
         if write_metadata(SUITE, &mvk, &HEADER_SALT, data, &mut region).is_err() {
             return;
         }
@@ -32,10 +32,17 @@ fn main() {
             Ok(pt) => pt,
             Err(_) => return,
         };
-        let cfg = bincode::config::standard().with_limit::<LIMIT>();
-        let decoded: Result<(DirectoryTreeShape, usize), _> =
-            bincode::serde::decode_from_slice(&plaintext, cfg);
-        let Ok((tree, _consumed)) = decoded else {
+
+        const MAGIC: &[u8; 4] = b"LBM\x02";
+        const LIMIT: usize = 64 * 1024 * 1024;
+        if plaintext.len() < MAGIC.len() || &plaintext[..MAGIC.len()] != MAGIC {
+            return;
+        }
+        let payload = &plaintext[MAGIC.len()..];
+        if payload.len() > LIMIT {
+            return;
+        }
+        let Ok(tree) = postcard::from_bytes::<DirectoryTreeShape>(payload) else {
             return;
         };
         walk_tree(&tree);

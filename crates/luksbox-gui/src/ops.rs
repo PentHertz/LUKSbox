@@ -1532,13 +1532,13 @@ pub fn create_vault(opts: CreateOpts) -> Result<OpenedVault, String> {
         // All non-passphrase credential combos in deniable mode
         // require the user to save type-specific material at
         // create time (and supply it at unlock):
-        //   - FIDO2: cred_id + hmac_salt (surfaced via
+        //  - FIDO2: cred_id + hmac_salt (surfaced via
         //     OpenedVault.deniable_fido2_recovery; user pastes at
         //     unlock).
-        //   - Hybrid-PQ: .kyber seed file (path supplied at unlock
+        //  - Hybrid-PQ: .kyber seed file (path supplied at unlock
         //     via UnlockOpts.hybrid_kyber_path; the .hybrid
         //     sidecar holds the ciphertext, same as standard PQ).
-        //   - TPM: `.tpm-blob` sidecar holding the sealed blob
+        //  - TPM: `.tpm-blob` sidecar holding the sealed blob
         //     (path supplied at unlock via
         //     UnlockOpts.deniable_tpm_blob_path).
         // Every combo lives in the dispatch table below.
@@ -1650,7 +1650,7 @@ pub fn create_vault(opts: CreateOpts) -> Result<OpenedVault, String> {
             };
             let envelope_pw = opts.passphrase.as_ref().ok_or("passphrase required")?;
             // v2 deniable: optional separate seed-file passphrase.
-            // Empty / unset → falls back to the envelope passphrase
+            // Empty / unset -> falls back to the envelope passphrase
             // so the common "one passphrase for both" UX still
             // works.
             let seed_pw = opts
@@ -4368,11 +4368,11 @@ pub fn revoke_keyslot(vfs: &mut Vfs, slot: usize) -> Result<(), String> {
 ///
 /// Limitations enforced here (mirroring the wizard, which exposes
 /// the full multi-credential-kind interactive flow):
-///   - FIDO2-direct slots can't be rotated (the MVK *is* the
+///  - FIDO2-direct slots can't be rotated (the MVK *is* the
 ///     authenticator output).
-///   - Hybrid-PQ slots are not yet supported (would need to
+///  - Hybrid-PQ slots are not yet supported (would need to
 ///     re-encapsulate against the existing Kyber keypair).
-///   - FIDO2-wrap slots aren't covered by this entry point, they
+///  - FIDO2-wrap slots aren't covered by this entry point, they
 ///     need two authenticator touches per slot, and the GUI doesn't yet
 ///     offer a multi-touch credential modal. Use the CLI's
 ///     `luksbox rotate-mvk` (which delegates to the interactive

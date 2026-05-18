@@ -40,10 +40,19 @@ jobs:
           - metadata_parse
           - header_roundtrip
           - hybrid_sidecar_parse
+          - hybrid_sidecar_adversarial
           - seed_file_parse
           - auth_then_process
           - winfsp_path_parse
           - webauthn_device_path
+          - vfs_ops
+          - deniable_header_parse
+          - slot_payload_decode
+          - slot_payload_roundtrip
+          # 2026-05 additions: per-chunk AEAD callsite + standard +
+          # deniable anchor readers. See FUZZING.md table.
+          - chunk_aead_decrypt
+          - anchor_parse
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly

@@ -20,6 +20,13 @@ subtle.workspace = true
 # write corruption, see SECURITY.md §3.3 and round-6 audit notes.
 fs2 = "0.4"
 
+# O_NOFOLLOW for the anchor reader so the format layer refuses to
+# dereference symlinks even if a caller skipped the GUI-level
+# preflight. Unix-only because the equivalent Windows dance is more
+# invasive and the threat model differs there.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 libc = "0.2"

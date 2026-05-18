@@ -158,6 +158,29 @@ test = false
 doc = false
 bench = false
 
+# Chunk AEAD decrypt: fuzz the per-chunk `aead::open` call with
+# attacker-controlled bytes at the production callsite. Replicates
+# the AAD construction (file_id || chunk_idx || generation) and the
+# file_key derivation, then feeds arbitrary nonce+ct+tag from the
+# fuzzer. Catches: panic on weird ct lengths, OOB on truncated
+# inputs, any subtle distinguishability between rejection paths.
+[[bin]]
+name = "chunk_aead_decrypt"
+path = "fuzz_targets/chunk_aead_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+# Anchor parse: covers both standard (48 B) and deniable (256 B)
+# anchor formats. Random bytes -> assert clean error path; no panic,
+# no infinite loop, no distinguishable failure mode in deniable.
+[[bin]]
+name = "anchor_parse"
+path = "fuzz_targets/anchor_parse.rs"
+test = false
+doc = false
+bench = false
+
 # Fuzz binaries should not be part of the workspace; cargo-fuzz expects to
 # build them with sanitizers and -C codegen-units=1. Excluding from the
 # workspace lets us keep workspace-wide `cargo build` fast and unsanitized.

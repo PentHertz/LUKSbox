@@ -6,12 +6,12 @@
 //! so anything done here is byte-equivalent to running the matching CLI flag.
 //!
 //! The wizard supports every feature the subcommands do:
-//!   - inline and detached-header vaults (`--header` equivalent);
-//!   - all three keyslot kinds at create time (passphrase, fido2 wrap, fido2-direct);
-//!   - unlocking via passphrase or FIDO2 against either keyslot kind;
-//!   - put / get / cat / mkdir / rm / rmdir;
-//!   - keyslot enroll / revoke;
-//!   - background or foreground mount.
+//!  - inline and detached-header vaults (`--header` equivalent);
+//!  - all three keyslot kinds at create time (passphrase, fido2 wrap, fido2-direct);
+//!  - unlocking via passphrase or FIDO2 against either keyslot kind;
+//!  - put / get / cat / mkdir / rm / rmdir;
+//!  - keyslot enroll / revoke;
+//!  - background or foreground mount.
 
 use std::fs::File;
 use std::io::Read;
@@ -144,7 +144,7 @@ pub(crate) fn run() -> Result<()> {
             _ => unreachable!(),
         };
         if let Err(e) = r {
-            eprintln!("✗ {e}");
+            eprintln!("FAIL {e}");
         }
         println!();
     }
@@ -433,7 +433,7 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
     drop(cont);
 
     println!();
-    println!("✓ deniable vault written to {}", path.display());
+    println!("OK deniable vault written to {}", path.display());
     println!();
     println!("SAVE THESE PARAMETERS NOW. Without them the vault cannot be reopened:");
     println!();
@@ -907,7 +907,7 @@ fn info_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
 
     let container = open_deniable_by_kind(theme, &path, cipher, argon2, kind)?;
     println!();
-    println!("✓ deniable vault opened");
+    println!("OK deniable vault opened");
     println!("  cipher suite:   {:?}", container.header.cipher_suite);
     println!("  kdf id:         {:?}", container.header.kdf);
     println!("  flags:          0x{:08x}", container.header.flags);
@@ -991,7 +991,7 @@ fn mount_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
             }
         }
     }
-    println!("✓ mounting at {}", mp_abs.display());
+    println!("OK mounting at {}", mp_abs.display());
     luksbox_mount::mount(vfs, &mp_abs, false)?;
     Ok(())
 }
@@ -1250,7 +1250,7 @@ fn ask_pq_decap_for_deniable(
 }
 
 /// Prompt for an optional .kyber seed-file passphrase at CREATE
-/// time. Blank ⇒ reuse the envelope passphrase (one passphrase
+/// time. Blank => reuse the envelope passphrase (one passphrase
 /// opens both roles). Mirrors the GUI's seed-file passphrase
 /// field. Offers the strong-passphrase generator if the user wants
 /// a distinct one.
@@ -1260,9 +1260,9 @@ fn ask_optional_seed_pw(
 ) -> Result<zeroize::Zeroizing<String>> {
     println!();
     println!("  Optional separate .kyber seed-file passphrase.");
-    println!("  - Leave BLANK to use the envelope passphrase for both roles");
+    println!(" - Leave BLANK to use the envelope passphrase for both roles");
     println!("    (one passphrase opens the vault AND decrypts the .kyber).");
-    println!("  - Fill it to set a DISTINCT seed-file passphrase. You'll then need");
+    println!(" - Fill it to set a DISTINCT seed-file passphrase. You'll then need");
     println!("    to type both at every unlock.");
     if Confirm::with_theme(theme)
         .with_prompt("Use a separate seed-file passphrase?")
@@ -1359,7 +1359,7 @@ fn panic_by_path(theme: &ColorfulTheme) -> Result<()> {
     hf.seek(SeekFrom::Start(0))?;
     hf.write_all(&buf)?;
     hf.flush()?;
-    eprintln!("✓ header at {} overwritten", header_target.display());
+    eprintln!("OK header at {} overwritten", header_target.display());
 
     if wipe_data {
         let mut vf = OpenOptions::new().write(true).open(&vault)?;
@@ -1375,7 +1375,7 @@ fn panic_by_path(theme: &ColorfulTheme) -> Result<()> {
         }
         vf.flush()?;
         let _ = vf.sync_all();
-        eprintln!("✓ vault {} ({} bytes) wiped", vault.display(), len);
+        eprintln!("OK vault {} ({} bytes) wiped", vault.display(), len);
     }
     println!("done.");
     Ok(())
@@ -1545,7 +1545,7 @@ fn ask_create_options(theme: &ColorfulTheme, fido2_direct: bool) -> Result<Creat
         let pad = Confirm::with_theme(theme)
             .with_prompt(
                 "Pad each file's chunk count to the next power of 2? (hides per-file \
-                 size from disk-level forensics within a 2× bucket; up to 2× storage cost)",
+                 size from disk-level forensics within a 2x bucket; up to 2x storage cost)",
             )
             .default(false)
             .interact()?;
@@ -2032,9 +2032,9 @@ fn create_with_tpm_bootstrap(
     }
 
     // Per-kind opt-in question. Defaults match the GUI:
-    //   - Plain / Pin: default 2-slot (passphrase + TPM) for recovery.
+    //  - Plain / Pin: default 2-slot (passphrase + TPM) for recovery.
     //     Skip checkbox = single TPM slot, no recovery if chip dies.
-    //   - 3-factor combos: default single-slot (AND-semantics).
+    //  - 3-factor combos: default single-slot (AND-semantics).
     //     Opt-in adds a recovery passphrase that becomes an OR-attack
     //     path against the combo.
     let single_slot = match kind {
@@ -2074,7 +2074,7 @@ fn create_with_tpm_bootstrap(
         eprintln!("  anchor file initialized at {}", ap.display());
     }
     println!(
-        "✓ created {} (bootstrapping with backup passphrase; TPM keyslot will move to slot 0)",
+        "OK created {} (bootstrapping with backup passphrase; TPM keyslot will move to slot 0)",
         vault.display()
     );
 
@@ -2093,7 +2093,7 @@ fn create_with_tpm_bootstrap(
         // bootstrap-passphrase create, we DO NOT leave a passphrase-
         // only vault on disk. The user asked for a TPM-bound vault;
         // not getting that is a failure, not a soft fallback.
-        eprintln!("✗ TPM enroll failed: {e}");
+        eprintln!("FAIL TPM enroll failed: {e}");
         eprintln!("  rolling back the bootstrap vault to leave no orphan files...");
         // Drop the Container first to release the file lock + flush
         // any pending writes, THEN delete the file.
@@ -2144,7 +2144,7 @@ fn create_with_tpm_bootstrap(
         }
     }
     cont.persist_header()?;
-    println!("✓ moved TPM keyslot to slot 0 (backup passphrase now in slot 1)");
+    println!("OK moved TPM keyslot to slot 0 (backup passphrase now in slot 1)");
 
     if Confirm::with_theme(theme)
         .with_prompt("Revoke the backup passphrase now? (NOT recommended; loses the recovery path)")
@@ -2153,9 +2153,9 @@ fn create_with_tpm_bootstrap(
     {
         cont.revoke_slot(1)?;
         cont.persist_header()?;
-        println!("✓ backup passphrase revoked. Vault is now TPM-only.");
+        println!("OK backup passphrase revoked. Vault is now TPM-only.");
     } else {
-        println!("✓ backup passphrase retained in slot 1 (recovery path preserved)");
+        println!("OK backup passphrase retained in slot 1 (recovery path preserved)");
     }
 
     maybe_mount_now(theme, cont, vault)
@@ -2454,7 +2454,7 @@ fn create_single_slot_tpm_vault(
         eprintln!("  anchor file initialized at {}", ap.display());
     }
     println!(
-        "✓ created {} (single-slot TPM vault; no recovery if any factor is lost)",
+        "OK created {} (single-slot TPM vault; no recovery if any factor is lost)",
         vault.display()
     );
     maybe_mount_now(theme, cont, vault)
@@ -2493,7 +2493,7 @@ fn create_passphrase(
         cont.init_anchor(ap.clone(), 1)?;
         eprintln!("  anchor file initialized at {}", ap.display());
     }
-    println!("✓ created {}", vault.display());
+    println!("OK created {}", vault.display());
 
     if Confirm::with_theme(theme)
         .with_prompt("Enroll a FIDO2 keyslot now? (recommended)")
@@ -2501,7 +2501,7 @@ fn create_passphrase(
         .interact()?
     {
         if let Err(e) = enroll_fido2_into(theme, &mut cont) {
-            eprintln!("✗ FIDO2 enroll failed: {e}");
+            eprintln!("FAIL FIDO2 enroll failed: {e}");
             eprintln!("  (vault still usable via passphrase; you can try again later)");
         }
     }
@@ -2563,7 +2563,7 @@ fn create_fido2_wrap(
             eprintln!("  anchor file initialized at {}", ap.display());
         }
         println!(
-            "✓ created {} with FIDO2 wrap-style keyslot",
+            "OK created {} with FIDO2 wrap-style keyslot",
             vault.display()
         );
         maybe_mount_now(theme, cont, vault)
@@ -2630,7 +2630,7 @@ fn create_fido2_direct(
             cont.init_anchor(ap.clone(), 1)?;
             eprintln!("  anchor file initialized at {}", ap.display());
         }
-        println!("✓ created {} (FIDO2-direct, MVK derived)", vault.display());
+        println!("OK created {} (FIDO2-direct, MVK derived)", vault.display());
 
         if Confirm::with_theme(theme)
             .with_prompt(
@@ -2643,7 +2643,7 @@ fn create_fido2_direct(
             eprintln!("Stretching with Argon2id (about 500 ms)...");
             let idx = cont.enroll_passphrase(pw.as_bytes(), kdf_params())?;
             cont.persist_header()?;
-            println!("✓ passphrase backup enrolled in slot {idx}");
+            println!("OK passphrase backup enrolled in slot {idx}");
         }
 
         maybe_mount_now(theme, cont, vault)
@@ -2738,7 +2738,7 @@ fn create_hybrid_pq(
         cont.init_anchor(ap.clone(), 1)?;
         eprintln!("  anchor file initialized at {}", ap.display());
     }
-    println!("✓ created {} (hybrid-pq, {level_label})", vault.display());
+    println!("OK created {} (hybrid-pq, {level_label})", vault.display());
     eprintln!(
         "  hybrid sidecar (public Kyber blobs): {}",
         sidecar.display()
@@ -2867,7 +2867,7 @@ fn create_hybrid_pq_fido2(
         eprintln!("  anchor file initialized at {}", ap.display());
     }
     println!(
-        "✓ created {} (hybrid-pq-fido2, FIDO2 + {level_label})",
+        "OK created {} (hybrid-pq-fido2, FIDO2 + {level_label})",
         vault.display()
     );
     eprintln!("  hybrid sidecar: {}", sidecar.display());
@@ -3098,7 +3098,7 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
     if let Some(anchor_gen) = trusted_anchor_gen {
         match anchor::compare(anchor_gen, vfs.vault_generation()) {
             anchor::VerificationOutcome::Ok => {
-                eprintln!("  ✓ anchor matches vault (generation {anchor_gen})");
+                eprintln!("  OK anchor matches vault (generation {anchor_gen})");
             }
             anchor::VerificationOutcome::RollbackDetected {
                 anchor_gen,
@@ -3124,7 +3124,7 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
             }
         }
     }
-    println!("✓ opened {}", vault.display());
+    println!("OK opened {}", vault.display());
     open_loop(theme, vfs, &vault)
 }
 
@@ -3217,7 +3217,7 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
             _ => unreachable!(),
         };
         if let Err(e) = r {
-            eprintln!("✗ {e}");
+            eprintln!("FAIL {e}");
         }
     }
 }
@@ -3281,7 +3281,7 @@ fn put_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
     let mut src = File::open(&local)?;
     let n = copy_into(vfs, f, &mut src)?;
     vfs.flush()?;
-    println!("✓ wrote {n} bytes to {inner}");
+    println!("OK wrote {n} bytes to {inner}");
     Ok(())
 }
 
@@ -3297,7 +3297,7 @@ fn get_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
     // Mode 0600 - see cmd_get in main.rs for rationale.
     let mut dst = luksbox_core::file_util::secure_create_or_truncate(&local)?;
     let n = copy_out(vfs, id, &mut dst)?;
-    println!("✓ wrote {n} bytes to {}", local.display());
+    println!("OK wrote {n} bytes to {}", local.display());
     Ok(())
 }
 
@@ -3308,7 +3308,7 @@ fn mkdir_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
     let (parent, name) = split_parent_name(vfs, &inner)?;
     vfs.mkdir(parent, &name)?;
     vfs.flush()?;
-    println!("✓ created {inner}");
+    println!("OK created {inner}");
     Ok(())
 }
 
@@ -3326,7 +3326,7 @@ fn rm_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
     let (parent, name) = split_parent_name(vfs, &inner)?;
     vfs.unlink(parent, &name)?;
     vfs.flush()?;
-    println!("✓ removed {inner}");
+    println!("OK removed {inner}");
     Ok(())
 }
 
@@ -3337,7 +3337,7 @@ fn rmdir_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
     let (parent, name) = split_parent_name(vfs, &inner)?;
     vfs.rmdir(parent, &name)?;
     vfs.flush()?;
-    println!("✓ removed {inner}");
+    println!("OK removed {inner}");
     Ok(())
 }
 
@@ -3355,7 +3355,7 @@ fn mv_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
     }
     vfs.rename(old_parent, &old_name, &new_name)?;
     vfs.flush()?;
-    println!("✓ renamed {old} -> {new}");
+    println!("OK renamed {old} -> {new}");
     Ok(())
 }
 
@@ -3504,7 +3504,7 @@ fn rotate_mvk_action(theme: &ColorfulTheme, cont: Container) -> Result<Container
     vfs.rotate_mvk(credentials, kdf_params())?;
     vfs.flush()?;
     println!(
-        "✓ MVK rotated. {} keyslot(s) rebuilt with fresh salts.",
+        "OK MVK rotated. {} keyslot(s) rebuilt with fresh salts.",
         populated.len()
     );
     let cont = vfs.close()?;
@@ -3599,7 +3599,7 @@ fn panic_action(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Result<
     hf.write_all(&buf)?;
     hf.flush()?;
     eprintln!(
-        "✓ header at {} overwritten with random",
+        "OK header at {} overwritten with random",
         header_target.display()
     );
 
@@ -3618,7 +3618,7 @@ fn panic_action(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Result<
         vf.flush()?;
         let _ = vf.sync_all();
         eprintln!(
-            "✓ vault file at {} ({} bytes) wiped\n  \
+            "OK vault file at {} ({} bytes) wiped\n  \
              Note: on SSDs and copy-on-write filesystems, logical overwrite does \
              not guarantee physical destruction.",
             vault.display(),
@@ -3698,14 +3698,14 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     let idx =
                         cont.enroll_passphrase_deniable(slot_idx, pw.as_bytes(), kdf_params())?;
                     cont.persist_header()?;
-                    println!("✓ enrolled passphrase in slot {idx}");
+                    println!("OK enrolled passphrase in slot {idx}");
                     Ok(())
                 } else {
                     let pw = ask_new_passphrase(theme, "New passphrase")?;
                     eprintln!("Stretching with Argon2id (around 500 ms)...");
                     let idx = cont.enroll_passphrase(pw.as_bytes(), kdf_params())?;
                     cont.persist_header()?;
-                    println!("✓ enrolled passphrase in slot {idx}");
+                    println!("OK enrolled passphrase in slot {idx}");
                     Ok(())
                 }
             }
@@ -3835,7 +3835,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     {
                         cont.clear_deniable_slot(slot_idx)?;
                         cont.persist_header()?;
-                        println!("✓ deniable slot {slot_idx} cleared");
+                        println!("OK deniable slot {slot_idx} cleared");
                     }
                     Ok(())
                 } else {
@@ -3855,7 +3855,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     {
                         cont.revoke_slot(pick)?;
                         cont.persist_header()?;
-                        println!("✓ slot {pick} revoked");
+                        println!("OK slot {pick} revoked");
                     }
                     Ok(())
                 }
@@ -3864,7 +3864,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             _ => unreachable!(),
         };
         if let Err(e) = r {
-            eprintln!("✗ {e}");
+            eprintln!("FAIL {e}");
         }
     }
 }
@@ -3925,7 +3925,7 @@ fn update_keyslot_action(theme: &ColorfulTheme, cont: &mut Container) -> Result<
         update_fido2_in(theme, cont, slot_idx)?;
     }
     cont.persist_header()?;
-    println!("✓ slot {slot_idx} updated");
+    println!("OK slot {slot_idx} updated");
     Ok(())
 }
 
@@ -3998,7 +3998,7 @@ fn enroll_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
 
     let idx = c.enroll_fido2(None, &hmac_secret, &cred_id, hmac_salt, kdf_params())?;
     c.persist_header()?;
-    println!("✓ enrolled FIDO2 credential in slot {idx}");
+    println!("OK enrolled FIDO2 credential in slot {idx}");
     Ok(())
 }
 
@@ -4066,7 +4066,7 @@ fn enroll_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Resul
     };
     let idx = c.enroll_credential_v2_deniable(slot_idx, &cred, &material)?;
     c.persist_header()?;
-    println!("✓ deniable FIDO2 slot enrolled at index {idx}");
+    println!("OK deniable FIDO2 slot enrolled at index {idx}");
     Ok(())
 }
 
@@ -4095,7 +4095,7 @@ fn enroll_tpm2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Result
     };
     let idx = c.enroll_credential_v2_deniable(slot_idx, &cred, &material)?;
     c.persist_header()?;
-    println!("✓ deniable TPM slot enrolled at index {idx}");
+    println!("OK deniable TPM slot enrolled at index {idx}");
     Ok(())
 }
 
@@ -4140,7 +4140,7 @@ fn enroll_tpm2_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> 
     };
     let idx = c.enroll_credential_v2_deniable(slot_idx, &cred, &material)?;
     c.persist_header()?;
-    println!("✓ deniable TPM+FIDO2 slot enrolled at index {idx}");
+    println!("OK deniable TPM+FIDO2 slot enrolled at index {idx}");
     Ok(())
 }
 
@@ -4204,7 +4204,7 @@ fn enroll_hybrid_pq_tpm2_deniable_into(
         seed_file::KdfParams::default(),
     )?;
 
-    println!("✓ deniable hybrid-PQ+TPM slot enrolled at index {idx}");
+    println!("OK deniable hybrid-PQ+TPM slot enrolled at index {idx}");
     println!("  .kyber seed:    {}", kyber_path.display());
     println!(
         "  hybrid sidecar: {}",
@@ -4293,7 +4293,7 @@ fn enroll_hybrid_pq_tpm2_fido2_deniable_into(
         seed_file::KdfParams::default(),
     )?;
 
-    println!("✓ deniable 4-factor slot enrolled at index {idx}");
+    println!("OK deniable 4-factor slot enrolled at index {idx}");
     println!("  .kyber seed:    {}", kyber_path.display());
     println!(
         "  hybrid sidecar: {}",
@@ -4603,7 +4603,7 @@ fn enroll_tpm2_into(_theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     let idx = c.enroll_tpm2(&kek, &blob_bytes)?;
     c.persist_header()?;
     println!(
-        "✓ enrolled TPM 2.0 keyslot in slot {idx} (sealed {} B)",
+        "OK enrolled TPM 2.0 keyslot in slot {idx} (sealed {} B)",
         blob_bytes.len()
     );
     Ok(())
@@ -4639,7 +4639,7 @@ fn enroll_tpm2_pin_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> 
 
     let idx = c.enroll_tpm2_pin(&kek, &blob_bytes)?;
     c.persist_header()?;
-    println!("✓ enrolled PIN-protected TPM 2.0 keyslot in slot {idx}");
+    println!("OK enrolled PIN-protected TPM 2.0 keyslot in slot {idx}");
     Ok(())
 }
 
@@ -4694,7 +4694,7 @@ fn enroll_tpm2_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()
     )?;
     c.persist_header()?;
     println!(
-        "✓ enrolled fused TPM+FIDO2 keyslot in slot {idx} (cred_id {} B, sealed {} B)",
+        "OK enrolled fused TPM+FIDO2 keyslot in slot {idx} (cred_id {} B, sealed {} B)",
         cred_id.len(),
         blob_bytes.len()
     );
@@ -4785,7 +4785,7 @@ fn enroll_hybrid_pq_tpm2_into(
     .map_err(|e| format!("write kyber seed: {e}"))?;
 
     println!(
-        "✓ enrolled hybrid TPM 2.0 + {level_label} keyslot in slot {idx}\n  \
+        "OK enrolled hybrid TPM 2.0 + {level_label} keyslot in slot {idx}\n  \
          Kyber seed: {} (MOVE TO SEPARATE STORAGE - lose it = lose this slot)",
         kyber_path.display()
     );
@@ -4911,7 +4911,7 @@ fn enroll_hybrid_pq_tpm2_fido2_into(
     .map_err(|e| format!("write kyber seed: {e}"))?;
 
     println!(
-        "✓ enrolled three-factor TPM + FIDO2 + {level_label} keyslot in slot {idx}\n  \
+        "OK enrolled three-factor TPM + FIDO2 + {level_label} keyslot in slot {idx}\n  \
          Kyber seed: {}",
         kyber_path.display()
     );

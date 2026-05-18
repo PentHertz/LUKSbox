@@ -22,10 +22,10 @@
 </p>
 
 <p align="center">
-  <a href="https://luksbox.penthertz.com/"><strong>Website</strong></a> ·
-  <a href="https://luksbox.penthertz.com/docs/"><strong>Docs</strong></a> ·
-  <a href="https://luksbox.penthertz.com/docs/security/architecture/"><strong>Security</strong></a> ·
-  <a href="https://luksbox.penthertz.com/docs/security/tests/"><strong>Fuzzing</strong></a> ·
+  <a href="https://luksbox.penthertz.com/"><strong>Website</strong></a> |
+  <a href="https://luksbox.penthertz.com/docs/"><strong>Docs</strong></a> |
+  <a href="https://luksbox.penthertz.com/docs/security/architecture/"><strong>Security</strong></a> |
+  <a href="https://luksbox.penthertz.com/docs/security/tests/"><strong>Fuzzing</strong></a> |
   <a href="https://luksbox.penthertz.com/compare/"><strong>Compare</strong></a>
 </p>
 
@@ -145,10 +145,10 @@ concurrency / crash-safety pipeline, on-disk footprint), see
 | HMAC-SHA256 over the entire 8 KiB header | Detects header tampering once a keyslot unwraps the MVK | `crates/luksbox-core/src/header.rs` |
 | HKDF-SHA256 with per-purpose `info` strings | Derives every subkey from the MVK; uniqueness verified by regression test | `crates/luksbox-core/src/key.rs` |
 | Argon2id (default 256 MiB / 3 / 4) | Stretches passphrases; cost params bounded by parser to reject DoS attempts | `crates/luksbox-core/src/kdf.rs` |
-| FIDO2 hmac-secret (CTAP2 §6.5) | Hardware-backed unlock, wrap mode or direct mode | `crates/luksbox-fido2/` |
+| FIDO2 hmac-secret (CTAP2 sec.6.5) | Hardware-backed unlock, wrap mode or direct mode | `crates/luksbox-fido2/` |
 | TPM 2.0 sealed KEK (Linux) | Bind a vault to the local chip; optional PIN; fused TPM+FIDO2 mode | `crates/luksbox-tpm/` |
 | ML-KEM-768 / ML-KEM-1024 (FIPS 203) | Post-quantum half of every hybrid keyslot; classical+PQ mixed via HKDF | `crates/luksbox-pq/` |
-| Per-chunk AAD (`file_id ‖ chunk_index ‖ generation`) | Detects chunk substitution, position swap, and replay of older chunks at the same position | `crates/luksbox-vfs/src/chunk.rs` |
+| Per-chunk AAD (`file_id || chunk_index || generation`) | Detects chunk substitution, position swap, and replay of older chunks at the same position | `crates/luksbox-vfs/src/chunk.rs` |
 | Detached header sidecar (`.hdr`) | Vault file alone is opaque random, no magic, no version, no keyslots | `crates/luksbox-format/src/container.rs` |
 | Anchor sidecar (`.anchor`) | External rollback detection via MVK-keyed HMAC over a generation counter | `crates/luksbox-format/src/anchor.rs` |
 | Lock-before-read open | Concurrent enrolls / revokes can't race on the keyslot table | `crates/luksbox-format/src/container.rs::open` |
@@ -204,9 +204,23 @@ walkthroughs.
 | Windows | `LUKSboxSetup.exe` from Releases (bundles WinFsp); IT admins can use the bare `.msi` and install WinFsp separately |
 | From source | `cargo build --release -p luksbox-cli -p luksbox-gui` after the deps in [`BUILDING.md`](BUILDING.md) |
 
-The Linux release tarball's `dist/install.sh` optionally configures
-TPM permissions (creates the `tss` group, drops a udev rule) so you
-can use the TPM keyslot without root.
+The `.deb` and `.rpm` packages now Recommend `tpm-udev` + `tpm2-tools`
+(Debian / Ubuntu) and `tpm2-tss` + `tpm2-tools` (Fedora / RHEL /
+openSUSE), so installing them via `apt` / `dnf` brings the
+`/dev/tpm*` udev rules and the `tss` system group along for the ride.
+After install you still need to add yourself to the group once and
+log back in, that is the Debian / Fedora convention for any package
+that grants new device access:
+
+```bash
+sudo usermod -aG tss "$USER"
+# log out + log back in, then verify:
+id | tr , '\n' | grep tss
+```
+
+The Linux release tarball's `dist/install.sh --tpm-setup` does the
+same thing for users who installed via tarball instead of `apt` /
+`dnf` and don't have `tpm-udev` / `tpm2-tss` already.
 
 ---
 
@@ -291,33 +305,35 @@ respond within 72 hours and credit reporters in the public changelog
 
 ## Repository layout
 
-```text
-luksbox/
-├── crates/                   # Rust workspace: core crypto, format, VFS,
-│   │                         # FIDO2/TPM/PQ, mount, CLI, GUI
-│   ├── luksbox-core/         # Crypto primitives + on-disk header
-│   ├── luksbox-format/       # Container I/O, anchor, hybrid sidecar
-│   ├── luksbox-vfs/          # In-memory directory tree atop a Container
-│   ├── luksbox-fido2/        # FIDO2 hmac-secret + libfido2 / webauthn FFI
-│   ├── luksbox-tpm/          # Linux TPM 2.0 wrap/unwrap (gated)
-│   ├── luksbox-pq/           # ML-KEM-768 / 1024 + .kyber seed file
-│   ├── luksbox-mount/        # FUSE3 (Linux/macOS) + WinFsp (Windows)
-│   ├── luksbox-cli/          # `luksbox` binary + `luksbox wizard` TUI
-│   └── luksbox-gui/          # `luksbox-gui` egui desktop app
-├── fuzz/                     # cargo-fuzz harnesses (libFuzzer)
-├── fuzz-afl/                 # cargo-afl harnesses (AFL++)
-├── assets/                   # Repo-level branding (LUKSbox + Penthertz logos used by the README)
-├── dist/                     # Packaging metadata + install.sh
-├── scripts/                  # Operational scripts (release, fuzz, audit)
-├── docs/                     # Public docs: spec, architecture, side-channel notes, roadmaps
-├── BUILDING.md               # Per-platform build instructions
-├── DEVELOPMENT.md            # Maintainer dev workflow + release process
-├── FUZZING.md                # Fuzz harness setup + target list
-├── TESTING.md                # Test taxonomy + how to run each tier
-├── SECURITY.md               # Threat model, disclosure policy, known limitations
-├── TRADEMARK.md              # LUKSbox / Penthertz trademark policy
-├── LICENSE                   # Apache License 2.0
-└── NOTICE                    # Attribution notice (per Apache 2.0 §4)
+```mermaid
+flowchart LR
+    Root["luksbox/"]
+    Root --> Crates["crates/<br/>(Rust workspace)"]
+    Root --> Fuzz["fuzz/<br/>cargo-fuzz (libFuzzer)"]
+    Root --> FuzzAfl["fuzz-afl/<br/>cargo-afl (AFL++)"]
+    Root --> Assets["assets/<br/>repo branding"]
+    Root --> Dist["dist/<br/>packaging + install.sh"]
+    Root --> Scripts["scripts/<br/>release, fuzz, audit"]
+    Root --> Docs["docs/<br/>spec, architecture, side-channels"]
+    Root --> Top["top-level .md files"]
+
+    Crates --> Core["luksbox-core<br/>crypto primitives + on-disk header"]
+    Crates --> Format["luksbox-format<br/>container I/O, anchor, hybrid sidecar"]
+    Crates --> Vfs["luksbox-vfs<br/>directory tree atop a Container"]
+    Crates --> Fido2["luksbox-fido2<br/>libfido2 + webauthn FFI"]
+    Crates --> Tpm["luksbox-tpm<br/>Linux TPM 2.0 wrap/unwrap"]
+    Crates --> Pq["luksbox-pq<br/>ML-KEM-768/1024 + .kyber"]
+    Crates --> Mount["luksbox-mount<br/>FUSE3, FUSE-T, WinFsp"]
+    Crates --> Cli["luksbox-cli<br/>luksbox binary + wizard TUI"]
+    Crates --> Gui["luksbox-gui<br/>luksbox-gui egui desktop app"]
+
+    Top --> Building["BUILDING.md"]
+    Top --> Devel["DEVELOPMENT.md"]
+    Top --> Fuzzing["FUZZING.md"]
+    Top --> Testing["TESTING.md"]
+    Top --> Security["SECURITY.md"]
+    Top --> Trademark["TRADEMARK.md"]
+    Top --> License["LICENSE / NOTICE"]
 ```
 
 ---
@@ -382,4 +398,4 @@ Maintained by **Sébastien Dudek**, Penthertz
 ([penthertz.com](https://penthertz.com),
 [@PentHertz](https://x.com/PentHertz),
 `security@penthertz.com` / `sebastien.dudek@penthertz.com`).
-See [`SECURITY.md`](SECURITY.md) §1 for the responsible-disclosure flow.
+See [`SECURITY.md`](SECURITY.md) sec.1 for the responsible-disclosure flow.

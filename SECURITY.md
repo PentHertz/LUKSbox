@@ -225,6 +225,53 @@ how strong the cryptography is.
       an untrusted source silently installs the attacker's keyslot
       table.
 
+- **Filesystem snapshots taken while the vault is unlocked.** APFS
+  local snapshots, Time Machine, btrfs / ZFS snapshots, LVM snapshots,
+  and equivalent backup mechanisms capture the disk as it is at the
+  moment they run. If a snapshot is taken *while a vault is mounted*,
+  the underlying `.lbx` blocks captured are still encrypted (FUSE does
+  not materialize plaintext on disk), but a snapshot of the process's
+  RAM / swap (e.g. `vmss` images, hibernate files, full-VM snapshots)
+  captures the MVK in cleartext. Mitigations: disable hibernation on
+  hosts holding live vaults; verify swap is encrypted (default on
+  macOS 10.7+, manual on Linux); on macOS prefer FileVault so swap
+  files inherit volume encryption.
+
+- **Kernel-resident attacker.** A privileged module / rootkit / kernel
+  exploit can read userspace process memory, intercept FUSE traffic
+  before decryption, and substitute on-disk bytes between read and
+  AEAD-verify. LUKSbox is userspace; the kernel is in its trusted
+  computing base. Same statement applies to hypervisors on virtualized
+  hosts.
+
+- **Hardware tampering beyond the FIDO2 device.** Cold-boot RAM
+  attacks (extracting an unlocked MVK from de-energizing DRAM within
+  seconds of power-off), JTAG / debug-port access, DMA over
+  Thunderbolt with IOMMU disabled, supply-chain-implanted SPI flash.
+  None of these are mitigated by software. Mitigations are physical:
+  lock screens with zeroize-on-lock (not currently implemented; see
+  6.x Tier 1), full-memory encryption (Intel TME / AMD SME, where
+  available), IOMMU enforcement.
+
+- **Evil-maid attack on the LUKSbox binary itself.** An attacker with
+  brief physical access to an unattended unlocked machine can replace
+  `luksbox` / `luksbox-gui` with a trojan that exfiltrates the next
+  passphrase typed into it. The defense is full-disk encryption with
+  pre-boot authentication (FileVault on macOS, BitLocker on Windows,
+  LUKS on Linux) so the binary cannot be modified while the machine
+  is off. LUKSbox does not (and cannot) verify its own binary at
+  runtime against a tamper-resistant root of trust.
+
+- **Supply-chain attack on the LUKSbox build pipeline or dependencies.**
+  A malicious Cargo dep (RustSec-disclosed or zero-day), a compromised
+  crates.io account, or a tampered release artifact would compromise
+  the resulting binary. We pin via `Cargo.lock`, run `cargo audit` in
+  CI, and have begun a SLSA-track release pipeline (signed `.dmg`,
+  WiX-signed `.msi`, GitHub-attested artifacts), but a determined
+  supply-chain attacker is out of scope for source-level review. Users
+  at high risk should build from source against a verified Cargo.lock,
+  on a system they fully control.
+
 ---
 
 ## 4. Cryptographic primitives
@@ -430,7 +477,7 @@ get in touch.
     with `HeaderAuthFailed` instead of producing garbled
     metadata reads.
   - Full architectural detail in
-    [`docs/MACOS_FUSE_T.md` § Subprocess isolation](docs/MACOS_FUSE_T.md#subprocess-isolation-gui-mount-on-macosfuse-t).
+    [`docs/MACOS_FUSE_T.md` sec. Subprocess isolation](docs/MACOS_FUSE_T.md#subprocess-isolation-gui-mount-on-macosfuse-t).
   This pathway exists ONLY for GUI mounts on macOS+FUSE-T
   builds. CLI mounts (`luksbox mount ...`) and all other
   backends keep the legacy in-process flow with no MVK
@@ -621,20 +668,6 @@ risk first.
       caller on this TPM can unseal). Tracked in
       `docs/TPM_FUTURE_IMPROVEMENTS.md`.
 
-      **Threat model reminder for the bare `Tpm2Sealed` kind**:
-      with no PIN (`userAuth`) and no PCR policy, the sealed blob
-      is unsealable by ANY caller on the same TPM device. This
-      protects the vault file in isolation (a stolen `.lbx` cannot
-      be opened without the TPM) but does NOT protect against an
-      attacker who has the WHOLE DEVICE booted and running. For
-      device-theft scenarios, prefer `Tpm2SealedPin`
-      (`--kind tpm2-pin` on enroll) so the chip's
-      dictionary-attack lockout gates an offline-style attack
-      against the PIN, and add PCR policy as an opt-in once it
-      ships (boot-chain tamper detection). The wizard surfaces a
-      one-line warning at the `tpm2` enroll prompt; the GUI shows
-      it under the "Add TPM 2.0 keyslot" modal.
-
     - **Windows**: not yet shipped, **but reachable today via the
       `TctiNameConf::Tbs` variant added in `tss-esapi 8.0.0-alpha.2`**.
       The Linux `Tpm2Sealer` implementation works against `Tcti::Tbs`
@@ -674,7 +707,7 @@ risk first.
       `tss-esapi 8.0.0-alpha.2`'s `TctiNameConf::Tbs` variant. The
       NCrypt + Platform Crypto KSP API (which BitLocker / Windows
       Hello use) was considered as an alternative but rejected: it
-      uses a different on-disk wire format (NCrypt PCP key blobs ≠
+      uses a different on-disk wire format (NCrypt PCP key blobs !=
       TPM2B blobs), so a vault sealed on Windows would not unseal on
       Linux even with the same chip - that breaks the cross-platform
       vault-portability principle. See

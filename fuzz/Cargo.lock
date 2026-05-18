@@ -1138,6 +1138,7 @@ version = "0.1.1"
 dependencies = [
  "fs2",
  "hmac",
+ "libc",
  "luksbox-core",
  "luksbox-pq",
  "rand_core 0.6.4",
@@ -1172,6 +1173,7 @@ dependencies = [
  "libc",
  "luksbox-vfs",
  "thiserror 2.0.18",
+ "windows-sys 0.61.2",
  "winfsp_wrs",
  "zbus",
 ]

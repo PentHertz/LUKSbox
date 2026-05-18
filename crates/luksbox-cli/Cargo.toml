@@ -142,7 +142,26 @@ priority = "optional"
 # transitively by libfido2 but listed explicitly so apt can satisfy
 # it before libfido2's postinst.
 depends = "$auto, libfido2-1, libfuse3-3"
-recommends = "fuse3"
+# `tpm-udev` is the package that ships `/etc/udev/rules.d/60-tpm.rules`
+# and creates the `tss` system group on Debian / Ubuntu. Without it,
+# /dev/tpm0 and /dev/tpmrm0 are root-only and `luksbox enroll --tpm2`
+# fails with EACCES. We pull it in via Recommends (not Depends) so
+# users without a TPM aren't forced to install it and so users on
+# distros that don't ship the package (e.g. some derivatives) can
+# still install luksbox.
+#
+# `tpm2-tools` provides the `tpm2_*` CLI binaries (tpm2_getcap,
+# tpm2_pcrread, etc.) which are useful for debugging TPM availability
+# and for one-off operations outside luksbox. Not load-bearing for
+# luksbox itself (we link against libtss2-* directly via luksbox-tpm),
+# but a strict superset of what a TPM-using luksbox user typically
+# wants on the host.
+#
+# After install, the user MUST `sudo usermod -aG tss $USER` and log
+# back in for the new group to take effect. We do NOT do this
+# automatically (Debian convention: no silent privileged-group
+# membership changes in a postinst).
+recommends = "fuse3, tpm-udev, tpm2-tools"
 assets = [
     # Binaries. The literal `target/release/` prefix is a cargo-deb
     # sentinel: it auto-rewrites to `target/<triple>/<profile>/<bin>`
@@ -199,6 +218,23 @@ vendor = "Penthertz"
 # distro-correct shared-library dependencies (libfido2.so.1,
 # libfuse3.so.3, etc.) automatically. Listing them by package name
 # here trips rpmlint's `explicit-lib-dependency` rule.
+#
+# `recommends` mirrors the .deb's Recommends: tpm2-tss is the package
+# that ships /usr/lib/udev/rules.d/60-tpm-udev.rules and creates the
+# `tss` system group on Fedora / RHEL / openSUSE; without it the
+# /dev/tpm* devices stay root-only and `luksbox enroll --tpm2` fails
+# with EACCES. The auto-req above only pulls in tpm2-tss-libs (just
+# the .so), not the higher-level tpm2-tss that owns the udev rules.
+# `tpm2-tools` provides the tpm2_* CLI binaries for debugging
+# (tpm2_getcap, tpm2_pcrread, etc.) - same rationale as the .deb.
+# Both are Recommends (not Requires) so users without a TPM aren't
+# forced to install them, and so the RPM still installs on stripped-
+# down systems where these packages aren't available.
+#
+# Post-install the user MUST `sudo usermod -aG tss $USER` and log
+# back in - Fedora/RHEL convention is the same as Debian's, no
+# silent privileged-group additions from a scriptlet.
+recommends = ["tpm2-tss", "tpm2-tools"]
 assets = [
     # Same sentinel convention as cargo-deb above: cargo-generate-rpm
     # rewrites `target/release/<bin>` to the real `target/<triple>/<profile>/<bin>`

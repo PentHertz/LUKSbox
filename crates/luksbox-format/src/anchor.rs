@@ -51,7 +51,7 @@
 //! generation. But they CAN copy any past anchor that was created with
 //! the same MVK, which is exactly why we compare counter values.
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::Path;
 
@@ -62,6 +62,32 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use crate::error::Error;
+
+/// Open an anchor file for reading without following symlinks.
+///
+/// The anchor reader sits at a TOCTOU boundary: GUI / CLI surfaces
+/// pre-check that the path is a regular file (see e.g.
+/// `preflight_deniable_anchor` in the GUI), but the format layer is
+/// the second line of defense in case a caller skips the pre-check
+/// or an attacker swaps the path between the check and this open.
+/// On Unix we pass `O_NOFOLLOW`; if the path resolves to a symlink
+/// at open time, the kernel returns `ELOOP` and we error out instead
+/// of silently dereferencing into whatever the symlink targets.
+///
+/// Windows: plain open. The equivalent dance (FILE_FLAG_OPEN_REPARSE_POINT
+/// + manual ReparseData inspection) is invasive and the threat model
+/// on Windows is different (anchor files typically live under the
+/// user's profile with ACL inheritance). Left as a follow-up.
+fn open_anchor_for_read(path: &Path) -> std::io::Result<File> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts.open(path)
+}
 
 const MAGIC: [u8; 8] = *b"LBXANCH1";
 const ANCHOR_INFO: &[u8] = b"lbx:anchor-mac/v1";
@@ -94,7 +120,7 @@ pub fn read_and_verify(
     mvk: &MasterVolumeKey,
     header_salt: &[u8; 32],
 ) -> Result<AnchorContents, Error> {
-    let mut f = OpenOptions::new().read(true).open(path)?;
+    let mut f = open_anchor_for_read(path)?;
     let mut buf = [0u8; ANCHOR_SIZE];
     f.read_exact(&mut buf)?;
     if buf[..8] != MAGIC {
@@ -296,10 +322,12 @@ pub fn deniable_read_and_verify(
     // contexts fails AEAD.
     let _ = DENIABLE_AAD_PREFIX_BYTES;
 
-    let mut f = OpenOptions::new()
-        .read(true)
-        .open(path)
-        .map_err(|_| Error::OpaqueUnlockFailed)?;
+    // O_NOFOLLOW: refuse to dereference symlinks at the format layer
+    // even if a caller skipped the pre-check. ELOOP collapses to
+    // OpaqueUnlockFailed like every other file-level failure so the
+    // deniability story (no distinguishable error per failure mode)
+    // stays intact.
+    let mut f = open_anchor_for_read(path).map_err(|_| Error::OpaqueUnlockFailed)?;
     let mut buf = [0u8; DENIABLE_ANCHOR_SIZE];
     f.read_exact(&mut buf)
         .map_err(|_| Error::OpaqueUnlockFailed)?;
