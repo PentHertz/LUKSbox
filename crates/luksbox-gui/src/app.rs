@@ -2695,10 +2695,18 @@ impl LuksboxApp {
                     Factor::Fido2 => {
                         ui.radio_value(&mut self.create.kind, CreateKind::Fido2,
                             "FIDO2 (wrap). Random MVK wrapped under the authenticator's hmac-secret. Single-slot at create time; add a passphrase or second FIDO2 backup AFTER creation via the keyslot manager if you want recovery.");
-                        ui.radio_value(&mut self.create.kind, CreateKind::Fido2Direct,
-                            "FIDO2-direct. MVK = HKDF(hmac-secret); no FIDO2-side wrapped MVK on disk. \
-                             WITHOUT a backup passphrase below: nothing to brute-force, but losing the device = losing the vault. \
-                             WITH a backup passphrase below: a passphrase keyslot is auto-enrolled wrapping the same MVK, equivalent to wrap mode + backup.");
+                        // FIDO2-direct has no passphrase envelope, so it
+                        // cannot back a deniable vault (v2 deniable
+                        // requires a passphrase for every variant - see
+                        // luksbox-core/src/deniable.rs::DeniableCredential).
+                        // Hide the radio entirely in deniable mode rather
+                        // than rejecting it at submit time.
+                        if !self.create.use_deniable {
+                            ui.radio_value(&mut self.create.kind, CreateKind::Fido2Direct,
+                                "FIDO2-direct. MVK = HKDF(hmac-secret); no FIDO2-side wrapped MVK on disk. \
+                                 WITHOUT a backup passphrase below: nothing to brute-force, but losing the device = losing the vault. \
+                                 WITH a backup passphrase below: a passphrase keyslot is auto-enrolled wrapping the same MVK, equivalent to wrap mode + backup.");
+                        }
                         ui.radio_value(&mut self.create.kind, CreateKind::HybridPqFido2,
                             "Hybrid FIDO2 + ML-KEM-768. FIDO2 authenticator + .kyber seed file. Closes the actual PQ gap.");
                         ui.radio_value(&mut self.create.kind, CreateKind::HybridPq1024Fido2,

@@ -2064,6 +2064,64 @@ fn create_hybrid_pq_fido2(
 
 // ---- unlock ---------------------------------------------------------------
 
+/// Pre-flight checks for a deniable anchor file. Returns specific
+/// error messages for the file-level failure modes (missing, can't
+/// open, wrong size) that the format layer otherwise collapses into
+/// `Error::OpaqueUnlockFailed`. Safe to call only on the GUI side
+/// where the user has just chosen the anchor path themselves - this
+/// is not a deniability concession because the user already knows
+/// they supplied an anchor.
+fn preflight_deniable_anchor(path: &Path) -> Result<(), String> {
+    use luksbox_format::anchor::DENIABLE_ANCHOR_SIZE;
+    // symlink_metadata does NOT follow symlinks - we want to reject
+    // them explicitly rather than silently dereferencing into whatever
+    // target the symlink points at. A symlink at the anchor path is
+    // suspicious: a real anchor is a 256-byte regular file emitted by
+    // luksbox itself, never a link. Refusing here also rules out the
+    // small TOCTOU race where the path could be swapped between
+    // pre-flight and the format-layer open (which itself does follow
+    // symlinks). If the user has a legitimate reason to use a link,
+    // canonicalize it themselves before picking it.
+    let md = std::fs::symlink_metadata(path).map_err(|e| {
+        format!(
+            "Anchor file not readable at {}: {e}. Pick the .anchor file you \
+             exported when you created the vault, or open without an anchor \
+             to skip rollback detection.",
+            path.display()
+        )
+    })?;
+    let ft = md.file_type();
+    if ft.is_symlink() {
+        return Err(format!(
+            "Anchor path at {} is a symbolic link. LUKSbox refuses to follow \
+             symlinks for anchor files (a real anchor is a 256-byte regular \
+             file). Pick the underlying file directly.",
+            path.display()
+        ));
+    }
+    if !ft.is_file() {
+        return Err(format!(
+            "Anchor path at {} is not a regular file. A deniable anchor is a \
+             256-byte file produced by luksbox; directories, devices, and \
+             sockets are rejected.",
+            path.display()
+        ));
+    }
+    let len = md.len();
+    if len != DENIABLE_ANCHOR_SIZE as u64 {
+        return Err(format!(
+            "Anchor file at {} is {} bytes; a deniable anchor is exactly {} \
+             bytes. The file is either not a LUKSbox deniable anchor, was \
+             truncated/padded by transfer, or belongs to a standard \
+             (non-deniable) vault. Re-export the anchor from this vault.",
+            path.display(),
+            len,
+            DENIABLE_ANCHOR_SIZE,
+        ));
+    }
+    Ok(())
+}
+
 pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
     // Deniable mode short-circuit: detection-by-magic is impossible
     // (no magic exists by design), so the user MUST declare the
@@ -2262,8 +2320,32 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
         // deniable anchor format (see anchor.rs::deniable_read_and_verify),
         // so a non-anchor file or an anchor from a different vault
         // fails the AEAD and returns `Error::OpaqueUnlockFailed`.
+        //
+        // Error-message policy: the format crate deliberately collapses
+        // every anchor failure (missing file, wrong size, AEAD fail)
+        // into one opaque `OpaqueUnlockFailed` to keep deniability
+        // against an adversary running the reader on random files.
+        // Here we are past the credential unlock, on the user's own
+        // machine, and the user explicitly chose the anchor path - so
+        // surfacing what went wrong leaks nothing they don't already
+        // know. Pre-check file presence + size for sharper messages;
+        // translate any residual error from `set_anchor` (which can
+        // only be the AEAD step at that point) into an anchor-specific
+        // message instead of the generic "unlock failed".
         let trusted_gen = if let Some(ap) = opts.anchor_path.as_ref() {
-            cont.set_anchor(Some(ap.clone())).map_err(estr)?
+            preflight_deniable_anchor(ap)?;
+            cont.set_anchor(Some(ap.clone())).map_err(|e| {
+                format!(
+                    "Anchor verification failed for {}: the file is the right \
+                     size but does not decrypt under this vault's master key. \
+                     Likely causes: anchor belongs to a different vault, was \
+                     exported with different cipher/KDF parameters, or has been \
+                     tampered with. Re-export the anchor from this vault, or \
+                     open without an anchor (skips rollback detection). \
+                     (underlying error: {e})",
+                    ap.display()
+                )
+            })?
         } else {
             None
         };
