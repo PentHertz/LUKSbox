@@ -1513,6 +1513,133 @@ impl Container {
         })
     }
 
+    /// Open a **deniable-format** vault using a pre-supplied MVK and
+    /// the already-decrypted deniable state.
+    ///
+    /// Companion to `open_with_mvk` for the deniable container format,
+    /// used by the macOS FUSE-T mount helper subprocess. Standard
+    /// `open_with_mvk` cannot work on deniable vaults because:
+    ///   - there is no plaintext magic at offset 0 (the whole file
+    ///     looks uniformly random by design),
+    ///   - there is no plain HMAC header to verify the MVK against
+    ///     (each slot is independently AEAD-wrapped),
+    ///   - the inner header (cipher_suite, offsets, chunk_size) is
+    ///     AEAD-encrypted with a key derived from the user's
+    ///     **credential**, not from the MVK, so a holder of just the
+    ///     MVK cannot recover the layout fields needed to read chunks.
+    ///
+    /// The parent process that already unlocked the vault must
+    /// therefore hand the helper:
+    ///   - `mvk` — the recovered MVK,
+    ///   - `per_vault_salt` — first 32 B of the on-disk file (public,
+    ///     but needed to derive any secondary keys),
+    ///   - `inner` — the already-decrypted public layout fields,
+    ///   - `unlocked_slot_idx` — which slot's envelope the parent
+    ///     opened (used for downstream enroll/rotate refusals).
+    ///
+    /// On disk: re-opens `path` with `O_RDWR`, takes the exclusive
+    /// flock, and reads the 36864-byte deniable header into the
+    /// returned Container's `DeniableState.bytes` so that rotation /
+    /// enroll operations have the same authoritative byte image the
+    /// parent had.
+    ///
+    /// `header_path` is rejected with `InvalidField`: deniable vaults
+    /// store the header inline by definition (every byte must look
+    /// uniformly random — a detached header file would be a
+    /// distinguishability beacon).
+    pub fn open_with_mvk_deniable(
+        path: &Path,
+        header_path: Option<&Path>,
+        mvk: MasterVolumeKey,
+        per_vault_salt: [u8; luksbox_core::deniable::DENIABLE_SALT_SIZE],
+        inner: crate::deniable_header::DeniableInnerHeader,
+        unlocked_slot_idx: usize,
+    ) -> Result<Self, Error> {
+        use luksbox_core::deniable::{DENIABLE_HEADER_SIZE, DENIABLE_SLOT_COUNT};
+
+        if header_path.is_some() {
+            return Err(Error::Crypto(luksbox_core::Error::InvalidField));
+        }
+        if unlocked_slot_idx >= DENIABLE_SLOT_COUNT {
+            return Err(Error::Crypto(luksbox_core::Error::InvalidField));
+        }
+
+        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        lock_handles(&[(&file, path)])?;
+
+        let mut header_buf = Box::new([0u8; DENIABLE_HEADER_SIZE]);
+        file.read_exact(header_buf.as_mut_slice())
+            .map_err(|_| Error::OpaqueUnlockFailed)?;
+
+        // Belt-and-suspenders: the first 32 bytes of the on-disk file
+        // ARE the per_vault_salt. If the parent passed a salt that
+        // doesn't match what we read from disk, the parent's
+        // deniable-state cache has drifted from what's on disk and the
+        // helper would proceed to mount with a stale layout. Refuse
+        // rather than silently mount the wrong vault image. Constant-
+        // time compare so an attacker cannot side-channel the
+        // mismatch position (defense-in-depth; we're inside the trust
+        // boundary, but cheap).
+        use subtle::ConstantTimeEq;
+        if header_buf[..per_vault_salt.len()]
+            .ct_eq(&per_vault_salt)
+            .unwrap_u8()
+            == 0
+        {
+            return Err(Error::OpaqueUnlockFailed);
+        }
+
+        // Synthesize the standard Header struct the same way
+        // `complete_open_v2_deniable` does, so downstream code that
+        // reads `self.header.*` sees consistent values for the
+        // cipher_suite / metadata offsets / chunk size.
+        let mut synth_header = Header::try_new(
+            inner.cipher_suite,
+            inner.kdf_id,
+            inner.chunk_size,
+            inner.data_offset,
+        )?;
+        synth_header.flags = inner.flags;
+        synth_header.metadata_offset = inner.metadata_offset;
+        synth_header.metadata_size = inner.metadata_size;
+        synth_header.header_salt = per_vault_salt;
+
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            header_storage: HeaderStorage::Inline,
+            header: synth_header,
+            mvk,
+            header_dirty: false,
+            anchor_path: None,
+            rotation: None,
+            deniable: Some(DeniableState {
+                bytes: header_buf,
+                salt: per_vault_salt,
+                inner,
+                unlocked_slot_idx,
+            }),
+        })
+    }
+
+    /// Snapshot of the open-deniable state needed to hand off to a
+    /// mount-helper subprocess. Returns `None` for standard (non-
+    /// deniable) containers. The MVK is NOT included — the caller
+    /// already has it via `mvk_clone()`. The salt, inner header, and
+    /// slot index together are the minimum a helper needs to re-open
+    /// the same vault image without re-running envelope discovery.
+    pub fn deniable_handoff_state(
+        &self,
+    ) -> Option<(
+        [u8; luksbox_core::deniable::DENIABLE_SALT_SIZE],
+        crate::deniable_header::DeniableInnerHeader,
+        usize,
+    )> {
+        self.deniable
+            .as_ref()
+            .map(|d| (d.salt, d.inner, d.unlocked_slot_idx))
+    }
+
     /// Shared file-open + lock + TOCTOU re-verification + header read +
     /// header parse path used by both `open` and `open_with_mvk`. Stops
     /// just before the MVK source is needed (HMAC verification).
@@ -3619,6 +3746,159 @@ mod tests {
         .unwrap();
         assert_eq!(c.mvk_clone().as_bytes(), mvk_before.as_bytes());
         assert!(c.is_deniable());
+    }
+
+    #[test]
+    fn deniable_container_open_with_mvk_handoff_round_trip() {
+        // Models the macOS GUI -> mount-helper handoff for deniable
+        // vaults. The parent opens the vault via the credential, then
+        // hands (MVK, salt, inner header, slot_idx) over a pipe; the
+        // helper re-opens via open_with_mvk_deniable WITHOUT the
+        // credential and must produce a Container with the same MVK
+        // and the same observable deniable state. Anything less and
+        // the FUSE event loop in the helper would mount a vault that
+        // disagrees with the parent on layout / cipher.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let c_parent = Container::create_with_passphrase_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            cheap_argon2(),
+            0,
+            b"hunter2",
+        )
+        .unwrap();
+        let mvk_before = c_parent.mvk_clone();
+        let (salt, inner, slot_idx) = c_parent
+            .deniable_handoff_state()
+            .expect("deniable container must expose handoff state");
+        // Drop the parent's Container so its flock is released; the
+        // helper-side open will acquire its own.
+        drop(c_parent);
+
+        // Simulate the wire transit: serialize + parse inner header.
+        let inner_wire = inner.serialise_for_handoff();
+        let inner_parsed =
+            crate::deniable_header::DeniableInnerHeader::parse_from_handoff(&inner_wire).unwrap();
+        assert_eq!(inner, inner_parsed);
+
+        let c_helper = Container::open_with_mvk_deniable(
+            &path,
+            None,
+            mvk_before.clone(),
+            salt,
+            inner_parsed,
+            slot_idx,
+        )
+        .unwrap();
+        assert_eq!(c_helper.mvk_clone().as_bytes(), mvk_before.as_bytes());
+        assert!(c_helper.is_deniable());
+        assert_eq!(c_helper.deniable_unlocked_slot(), Some(slot_idx));
+        // And the helper-side handoff state must match what the parent
+        // exported, so a future re-handoff (e.g. unmount-then-remount)
+        // sees the same image.
+        assert_eq!(
+            c_helper.deniable_handoff_state(),
+            Some((salt, inner, slot_idx))
+        );
+    }
+
+    #[test]
+    fn deniable_open_with_mvk_refuses_salt_mismatch() {
+        // Defense-in-depth: if the parent's cached salt has drifted
+        // from what's on disk (e.g. a rotation happened in between),
+        // mounting with the stale salt would silently bind to the
+        // wrong vault image. The helper-side check refuses rather
+        // than mount inconsistently.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let c = Container::create_with_passphrase_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            cheap_argon2(),
+            0,
+            b"hunter2",
+        )
+        .unwrap();
+        let mvk = c.mvk_clone();
+        let (_real_salt, inner, slot_idx) = c.deniable_handoff_state().unwrap();
+        drop(c);
+
+        let wrong_salt = [0xABu8; luksbox_core::deniable::DENIABLE_SALT_SIZE];
+        let err = Container::open_with_mvk_deniable(&path, None, mvk, wrong_salt, inner, slot_idx)
+            .err()
+            .expect("must refuse wrong salt");
+        assert!(matches!(err, Error::OpaqueUnlockFailed), "got {err:?}");
+    }
+
+    #[test]
+    fn deniable_open_with_mvk_refuses_out_of_range_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let c = Container::create_with_passphrase_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            cheap_argon2(),
+            0,
+            b"hunter2",
+        )
+        .unwrap();
+        let mvk = c.mvk_clone();
+        let (salt, inner, _slot_idx) = c.deniable_handoff_state().unwrap();
+        drop(c);
+
+        let err = Container::open_with_mvk_deniable(
+            &path, None, mvk, salt, inner, 999, // > DENIABLE_SLOT_COUNT
+        )
+        .err()
+        .expect("must refuse out-of-range slot");
+        assert!(matches!(err, Error::Crypto(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn deniable_open_with_mvk_refuses_detached_header() {
+        // Deniable vaults are always inline-header (a detached header
+        // would be a structural fingerprint defeating the indistin-
+        // guishability goal). The handoff path enforces this.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let header_p = tmp.path().join("vault.hdr"); // not actually used
+        let c = Container::create_with_passphrase_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            cheap_argon2(),
+            0,
+            b"hunter2",
+        )
+        .unwrap();
+        let mvk = c.mvk_clone();
+        let (salt, inner, slot_idx) = c.deniable_handoff_state().unwrap();
+        drop(c);
+
+        let err =
+            Container::open_with_mvk_deniable(&path, Some(&header_p), mvk, salt, inner, slot_idx)
+                .err()
+                .expect("must refuse detached header path for deniable");
+        assert!(matches!(err, Error::Crypto(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn deniable_handoff_state_returns_none_for_standard_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let c = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            cheap_argon2(),
+            b"hunter2",
+        )
+        .unwrap();
+        assert_eq!(c.deniable_handoff_state(), None);
     }
 
     #[test]

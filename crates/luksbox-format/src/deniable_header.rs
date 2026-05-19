@@ -102,7 +102,34 @@ pub struct OpenedDeniableHeader {
 const _: () = assert!(DENIABLE_HEADER_SIZE == 36864);
 const _: () = assert!(INNER_PLAINTEXT_LEN == 4036);
 
+/// Serialised size of the inner header's public fields. Stable
+/// on-disk shape — also stable on the wire when the GUI hands off
+/// deniable state to the FUSE-T mount helper subprocess.
+pub const DENIABLE_INNER_HEADER_SERIALIZED_LEN: usize = 38;
+
 impl DeniableInnerHeader {
+    /// Public serialiser: writes the 38-byte stable wire form of
+    /// the inner header. Used by the mount-helper handoff protocol
+    /// to pass the already-decrypted inner header from the
+    /// unlocked-in-parent Container to the helper subprocess (the
+    /// helper can't re-decrypt it without the credential).
+    pub fn serialise_for_handoff(&self) -> [u8; DENIABLE_INNER_HEADER_SERIALIZED_LEN] {
+        let z = self.serialise();
+        let mut out = [0u8; DENIABLE_INNER_HEADER_SERIALIZED_LEN];
+        out.copy_from_slice(&z[..DENIABLE_INNER_HEADER_SERIALIZED_LEN]);
+        out
+    }
+
+    /// Public parser: same shape as `serialise_for_handoff`. Mirror
+    /// of the disk-form parse (`parse`) with the same field-by-field
+    /// sanity checks so a malformed handoff buffer can never produce
+    /// an out-of-range inner header that downstream code trusts.
+    pub fn parse_from_handoff(
+        buf: &[u8; DENIABLE_INNER_HEADER_SERIALIZED_LEN],
+    ) -> Result<Self, Error> {
+        Self::parse(buf)
+    }
+
     fn serialise(&self) -> Zeroizing<Vec<u8>> {
         let mut out = Zeroizing::new(vec![0u8; INNER_PLAINTEXT_LEN]);
         out[0..2].copy_from_slice(&self.format_version_minor.to_le_bytes());

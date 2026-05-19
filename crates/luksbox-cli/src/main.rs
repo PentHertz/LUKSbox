@@ -4788,14 +4788,33 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
         header_abs.as_ref().map(|p| p.display().to_string())
     );
 
-    // Read MVK from stdin. Block until exactly 32 bytes arrive or
-    // the parent closes the pipe early (which would be a parent
-    // bug; surface as an io::Error from read_exact).
+    // Stdin handoff protocol from the parent (GUI):
+    //
+    //   byte 0:        protocol version
+    //                    0x01 = standard format, MVK-only payload
+    //                    0x02 = deniable format, MVK + state payload
+    //   bytes 1..33:   MVK (32 bytes)
+    //
+    //   v2 deniable additionally appends:
+    //     bytes 33..65:   per_vault_salt (32 bytes)
+    //     bytes 65..66:   unlocked_slot_idx (u8)
+    //     bytes 66..104:  serialised DeniableInnerHeader (38 bytes)
+    //
+    // Why v2 exists: deniable vaults have no plaintext magic and no
+    // standard HMAC header — `Container::open_with_mvk` always fails
+    // with "invalid magic bytes". The parent already decrypted the
+    // inner header with the user's credential; the helper can't
+    // re-derive it from just the MVK, so the parent hands the
+    // recovered state over the pipe.
     //
     // Round 12 fix R12-12: wrap in `Zeroizing<[u8;32]>` so a partial
     // read (`?` returns early) does not leak up to 31 MVK bytes on
-    // the stack. The previous version called `.zeroize()` manually
-    // AFTER the `?` so the error path skipped the wipe.
+    // the stack.
+    let mut version_byte = [0u8; 1];
+    std::io::stdin()
+        .read_exact(&mut version_byte)
+        .map_err(|e| format!("could not read protocol version from stdin: {e}"))?;
+
     let mut mvk_bytes: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
     std::io::stdin()
         .read_exact(&mut mvk_bytes[..])
@@ -4804,14 +4823,58 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
     // bytes are passed by reference, avoiding the by-value Copy
     // pattern that left a stack residue on `from_bytes(*mvk_bytes)`.
     let mvk = MasterVolumeKey::from_zeroizing(&mvk_bytes);
-    eprintln!("luksbox-mount-helper: MVK received, opening container");
+    eprintln!(
+        "luksbox-mount-helper: MVK received (protocol v{}), opening container",
+        version_byte[0]
+    );
 
-    // Open with the supplied MVK (no passphrase / FIDO2 derivation).
-    // A wrong MVK fails fast with HeaderAuthFailed via the HMAC
-    // check inside open_with_mvk - never silently produces a Vfs
-    // backed by garbled metadata.
-    let container = Container::open_with_mvk(&vault_abs, header_abs.as_deref(), mvk)
-        .map_err(|e| format!("open container ({}): {e}", vault_abs.display()))?;
+    let container = match version_byte[0] {
+        0x01 => {
+            // Standard format: HMAC verification inside open_with_mvk
+            // catches a wrong MVK with HeaderAuthFailed before any
+            // garbled metadata is read.
+            Container::open_with_mvk(&vault_abs, header_abs.as_deref(), mvk)
+                .map_err(|e| format!("open container ({}): {e}", vault_abs.display()))?
+        }
+        0x02 => {
+            // Deniable format: read salt + slot_idx + 38-byte inner
+            // header from stdin, hand them to the deniable opener.
+            // Any partial read collapses to the same error wording the
+            // parent will surface in its toast.
+            let mut salt = [0u8; luksbox_core::deniable::DENIABLE_SALT_SIZE];
+            std::io::stdin()
+                .read_exact(&mut salt)
+                .map_err(|e| format!("could not read per-vault salt from stdin: {e}"))?;
+            let mut slot_byte = [0u8; 1];
+            std::io::stdin()
+                .read_exact(&mut slot_byte)
+                .map_err(|e| format!("could not read slot index from stdin: {e}"))?;
+            let mut inner_buf =
+                [0u8; luksbox_format::deniable_header::DENIABLE_INNER_HEADER_SERIALIZED_LEN];
+            std::io::stdin()
+                .read_exact(&mut inner_buf)
+                .map_err(|e| format!("could not read inner header from stdin: {e}"))?;
+            let inner = luksbox_format::deniable_header::DeniableInnerHeader::parse_from_handoff(
+                &inner_buf,
+            )
+            .map_err(|e| format!("inner header from parent is malformed: {e}"))?;
+            Container::open_with_mvk_deniable(
+                &vault_abs,
+                header_abs.as_deref(),
+                mvk,
+                salt,
+                inner,
+                slot_byte[0] as usize,
+            )
+            .map_err(|e| format!("open deniable container ({}): {e}", vault_abs.display()))?
+        }
+        other => {
+            return Err(format!(
+                "unknown helper protocol version 0x{other:02x} from parent (expected 0x01 or 0x02)"
+            )
+            .into());
+        }
+    };
     let vfs = Vfs::open(container).map_err(|e| format!("open Vfs: {e}"))?;
     eprintln!("luksbox-mount-helper: Vfs ready, calling mount");
 

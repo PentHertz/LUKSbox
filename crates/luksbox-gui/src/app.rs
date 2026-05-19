@@ -762,6 +762,24 @@ impl Pending {
                 | Pending::EnrollHybridPqTpm2Fido2 { .. }
         )
     }
+
+    /// Big headline shown above the pulsing dot in the pending-auth
+    /// overlay. Was hardcoded "TOUCH YOUR YUBIKEY" — wrong for
+    /// Nitrokey / SoloKey / Titan / Token2 / etc. owners (we support
+    /// every CTAP2 device), and wrong for Windows Hello users (no
+    /// touch at all — face, fingerprint, or PIN, with the OS putting
+    /// up its own modal). The verb-phrase tracks the selected device.
+    fn headline(&self) -> &'static str {
+        let is_winhello = ops::selected_fido2_device()
+            .as_deref()
+            .map(luksbox_fido2::is_windows_hello_path)
+            .unwrap_or(false);
+        if is_winhello {
+            "RESPOND TO WINDOWS HELLO"
+        } else {
+            "TOUCH YOUR SECURITY KEY"
+        }
+    }
 }
 
 // ---- toast ----------------------------------------------------------------
@@ -6564,7 +6582,7 @@ impl LuksboxApp {
                                     .circle_filled(dot_rect.center(), 10.0, theme::ACCENT);
                                 ui.add_space(8.0);
                                 ui.label(
-                                    RichText::new("TOUCH YOUR YUBIKEY")
+                                    RichText::new(p.headline())
                                         .strong()
                                         .color(theme::ACCENT)
                                         .size(15.0),
@@ -8551,6 +8569,13 @@ fn start_mount_subprocess(
     let vault_path = opened.vault_path.clone();
     let header_path = opened.header_path.clone();
     let mvk = opened.vfs.container().mvk_clone();
+    // Deniable handoff state (None for standard vaults). Captured
+    // before the drop so we still have access to the open container.
+    // The child can't re-derive the inner header from just the MVK
+    // (it's AEAD'd under a credential-derived key), so the parent
+    // must hand the recovered state over the pipe — see helper
+    // protocol v2 docs in cmd_mount_fuse_t_helper.
+    let deniable_handoff = opened.vfs.container().deniable_handoff_state();
 
     // 2. Drop the OpenedVault now to release the file lock. After
     // this point the .lbx file has no flock holder; the child can
@@ -8596,17 +8621,39 @@ fn start_mount_subprocess(
         .take()
         .ok_or_else(|| "child stdin was not piped".to_string())?;
 
-    // 4. Local copy on the stack so we can zeroize after writing.
-    // `mvk.as_bytes()` returns &[u8; 32] borrowed from the
-    // SecretBox; the dereference + array copy is the brief
-    // exposure documented in docs/MACOS_FUSE_T.md.
-    let mut bytes: [u8; 32] = *mvk.as_bytes();
-    let write_res = stdin.write_all(&bytes);
-    bytes.zeroize();
+    // 4. Helper handoff protocol (versioned). v1 = standard MVK-only;
+    // v2 = MVK + deniable state. See `cmd_mount_fuse_t_helper` for
+    // the full byte layout.
+    //
+    // Local copy of the MVK on the stack so we can zeroize after
+    // writing. `mvk.as_bytes()` returns &[u8; 32] borrowed from the
+    // SecretBox; the dereference + array copy is the brief exposure
+    // documented in docs/MACOS_FUSE_T.md.
+    let mut mvk_bytes: [u8; 32] = *mvk.as_bytes();
+    let write_res = (|| -> std::io::Result<()> {
+        match deniable_handoff {
+            None => {
+                stdin.write_all(&[0x01u8])?;
+                stdin.write_all(&mvk_bytes)?;
+            }
+            Some((salt, inner, slot_idx)) => {
+                stdin.write_all(&[0x02u8])?;
+                stdin.write_all(&mvk_bytes)?;
+                stdin.write_all(&salt)?;
+                // slot_idx is bounded by DENIABLE_SLOT_COUNT (= 8),
+                // so it always fits in a u8. The helper also
+                // validates the upper bound after parsing.
+                stdin.write_all(&[slot_idx as u8])?;
+                stdin.write_all(&inner.serialise_for_handoff())?;
+            }
+        }
+        Ok(())
+    })();
+    mvk_bytes.zeroize();
     // Close stdin so the child's read_exact completes; without
     // this the child would block forever waiting for more bytes.
     drop(stdin);
-    write_res.map_err(|e| format!("could not write MVK to child stdin: {e}"))?;
+    write_res.map_err(|e| format!("could not write handoff to child stdin: {e}"))?;
 
     // 5. Drain stderr in a background thread so the OS pipe buffer
     // can't deadlock the child if libfuse-t (or our own diagnostic
