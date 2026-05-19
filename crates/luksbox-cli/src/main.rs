@@ -5392,20 +5392,12 @@ fn cli_open_deniable_v2(
 ) -> Result<luksbox_format::Container> {
     use luksbox_core::deniable::{DeniableCredential, DeniableKindTag};
 
-    // Phase 1: passphrase-only credential for envelope discovery.
-    let pass = rpassword::prompt_password("Passphrase: ")?;
-    let pass_zeroizing = zeroize::Zeroizing::new(pass);
-    let env_cred = DeniableCredential::Passphrase {
-        passphrase: pass_zeroizing.as_bytes(),
-        argon2,
-    };
-    let envelope =
-        luksbox_format::Container::try_open_envelope_v2_deniable(path, None, &env_cred, cipher)?;
-
-    // Sanity-check the slot's actual kind tag against the variant
-    // the user asked for. If they don't match, fail with the same
-    // opaque error as a wrong passphrase rather than leaking which
-    // mismatch happened.
+    // Resolve the user-intended slot kind first so we can pass it
+    // as the discovery hint. The envelope-discovery loop prefers
+    // slots whose stored kind byte matches this hint -- otherwise,
+    // when multiple slots share the same envelope passphrase, an
+    // admin Passphrase slot at index 0 would always shadow a
+    // later-enrolled non-Passphrase slot.
     let expected_tag = match cred {
         CliDenCred::Passphrase => DeniableKindTag::Passphrase,
         CliDenCred::Fido2 => DeniableKindTag::Fido2Passphrase,
@@ -5416,6 +5408,28 @@ fn cli_open_deniable_v2(
         CliDenCred::PqTpm => DeniableKindTag::HybridPqTpmPassphrase,
         CliDenCred::PqTpmFido2 => DeniableKindTag::HybridPqTpmFido2Passphrase,
     };
+
+    // Phase 1: passphrase-only credential for envelope discovery,
+    // hinted with the user's intended slot kind.
+    let pass = rpassword::prompt_password("Passphrase: ")?;
+    let pass_zeroizing = zeroize::Zeroizing::new(pass);
+    let env_cred = DeniableCredential::Passphrase {
+        passphrase: pass_zeroizing.as_bytes(),
+        argon2,
+    };
+    let envelope = luksbox_format::Container::try_open_envelope_v2_deniable(
+        path,
+        None,
+        &env_cred,
+        cipher,
+        Some(expected_tag),
+    )?;
+
+    // Belt-and-suspenders: discovery already prefers slots whose
+    // kind byte matches `expected_tag`, so honest inputs will not
+    // hit this branch. Kept to refuse pathological cases (e.g.,
+    // forged headers with a Passphrase-AEAD-OK slot tagged as a
+    // different kind).
     if envelope.payload().kind != expected_tag {
         return Err(cli_err!(
             "credential kind mismatch (vault expects a different variant)"

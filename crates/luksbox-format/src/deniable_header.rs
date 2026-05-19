@@ -424,6 +424,7 @@ pub fn try_open_envelope_v2(
     header_bytes: &[u8],
     credential: &luksbox_core::deniable::DeniableCredential,
     cipher_suite: CipherSuite,
+    want_kind: Option<luksbox_core::deniable::DeniableKindTag>,
 ) -> Result<OpenedDeniableEnvelope, Error> {
     use luksbox_core::deniable::{DENIABLE_SLOT_COUNT, slot_payload::SlotPayload};
 
@@ -470,7 +471,25 @@ pub fn try_open_envelope_v2(
     // slot's plaintext. That way the heap-allocator activity is the
     // same regardless of which slot index matched.
     const PT_LEN: usize = luksbox_core::deniable::slot_payload::PAYLOAD_PLAINTEXT_LEN;
-    let want_kind_u8: u8 = credential.kind_tag().into();
+    // Production phase-1 callers pass the user's intended unlock
+    // kind via `want_kind`. They CANNOT pass it through
+    // `credential.kind_tag()` because they construct a
+    // passphrase-only `DeniableCredential::Passphrase` here --
+    // they don't yet have the FIDO2 / TPM / ML-KEM secondaries
+    // that distinguish the higher variants. If callers relied on
+    // credential.kind_tag() instead, kind-preference below would
+    // always pick a Passphrase slot, so a freshly-enrolled FIDO2 /
+    // TPM / hybrid-PQ slot whose envelope passphrase matches an
+    // existing Passphrase slot 0 would never win discovery and the
+    // wizard / GUI would surface "credential kind mismatch (vault
+    // expects a different variant)".
+    //
+    // Tests / fuzzers / benches pass `None`, which means
+    // "fall back to credential.kind_tag() (legacy v2 behavior)".
+    // That is safe in those contexts because they build a
+    // fully-typed credential with all secondaries up front, so
+    // kind_tag() is already correct.
+    let want_kind_u8: u8 = want_kind.unwrap_or_else(|| credential.kind_tag()).into();
 
     let mut all_pt: [Zeroizing<[u8; PT_LEN]>; DENIABLE_SLOT_COUNT] =
         std::array::from_fn(|_| Zeroizing::new([0u8; PT_LEN]));
@@ -966,7 +985,8 @@ mod tests {
         assert_eq!(header.len(), DENIABLE_HEADER_SIZE);
 
         // Open: phase 1 trial-decrypt + phase 2 unwrap MVK.
-        let opened_env = try_open_envelope_v2(&header, &cred, CipherSuite::Aes256GcmSiv).unwrap();
+        let opened_env =
+            try_open_envelope_v2(&header, &cred, CipherSuite::Aes256GcmSiv, None).unwrap();
         assert_eq!(opened_env.matched_slot_idx, 3);
         assert_eq!(
             opened_env.payload.kind,
@@ -996,7 +1016,8 @@ mod tests {
             create_with_credential_v2(&cred, &material, 0, CipherSuite::Aes256GcmSiv, inner)
                 .unwrap();
 
-        let opened_env = try_open_envelope_v2(&header, &cred, CipherSuite::Aes256GcmSiv).unwrap();
+        let opened_env =
+            try_open_envelope_v2(&header, &cred, CipherSuite::Aes256GcmSiv, None).unwrap();
         // The recovered payload exposes cred_id + hmac_salt the host
         // needs to drive the FIDO2 authenticator (which would then
         // produce the hmac_output the caller already has).
@@ -1027,7 +1048,7 @@ mod tests {
                 .unwrap();
 
         let opened_env =
-            try_open_envelope_v2(&header, &cred, CipherSuite::ChaCha20Poly1305).unwrap();
+            try_open_envelope_v2(&header, &cred, CipherSuite::ChaCha20Poly1305, None).unwrap();
         assert_eq!(opened_env.payload.tpm_blob, blob);
         assert!(opened_env.payload.cred_id.is_empty());
         let opened = complete_open_v2(opened_env, &cred, CipherSuite::ChaCha20Poly1305).unwrap();
@@ -1054,7 +1075,7 @@ mod tests {
             passphrase: b"wrong",
             argon2: cheap_test_params(),
         };
-        let err = try_open_envelope_v2(&header, &wrong, CipherSuite::Aes256GcmSiv)
+        let err = try_open_envelope_v2(&header, &wrong, CipherSuite::Aes256GcmSiv, None)
             .err()
             .unwrap();
         assert!(matches!(err, Error::OpaqueUnlockFailed));
@@ -1079,7 +1100,7 @@ mod tests {
         .unwrap();
 
         let opened_env =
-            try_open_envelope_v2(&header, &cred_pp, CipherSuite::Aes256GcmSiv).unwrap();
+            try_open_envelope_v2(&header, &cred_pp, CipherSuite::Aes256GcmSiv, None).unwrap();
         let hmac_out = [0x00u8; 32];
         let wrong_kind = luksbox_core::deniable::DeniableCredential::Fido2Passphrase {
             passphrase: b"hunter2",
@@ -1204,7 +1225,7 @@ mod tests {
 
         // Open with the same credential against the rotated header
         // and confirm we recover the new MVK.
-        let env = try_open_envelope_v2(&header, &cred, CipherSuite::Aes256GcmSiv).unwrap();
+        let env = try_open_envelope_v2(&header, &cred, CipherSuite::Aes256GcmSiv, None).unwrap();
         let opened = complete_open_v2(env, &cred, CipherSuite::Aes256GcmSiv).unwrap();
         assert_eq!(opened.mvk.as_bytes(), new_mvk.as_bytes());
         assert_eq!(opened.matched_slot_idx, 2);
@@ -1234,7 +1255,8 @@ mod tests {
         // Install Bob at slot 4 using the v2 install path. Need to
         // recover the per_vault_salt + MVK first.
         let salt: [u8; DENIABLE_SALT_SIZE] = header[..DENIABLE_SALT_SIZE].try_into().unwrap();
-        let env_open = try_open_envelope_v2(&header, &admin, CipherSuite::Aes256GcmSiv).unwrap();
+        let env_open =
+            try_open_envelope_v2(&header, &admin, CipherSuite::Aes256GcmSiv, None).unwrap();
         let opened_admin = complete_open_v2(env_open, &admin, CipherSuite::Aes256GcmSiv).unwrap();
         let admin_mvk = opened_admin.mvk;
         let header_arr: &mut [u8; DENIABLE_HEADER_SIZE] = (&mut header[..]).try_into().unwrap();
@@ -1264,12 +1286,13 @@ mod tests {
         .unwrap();
 
         // Admin still opens at slot 0.
-        let env_admin = try_open_envelope_v2(&header, &admin, CipherSuite::Aes256GcmSiv).unwrap();
+        let env_admin =
+            try_open_envelope_v2(&header, &admin, CipherSuite::Aes256GcmSiv, None).unwrap();
         assert_eq!(env_admin.matched_slot_idx, 0);
         complete_open_v2(env_admin, &admin, CipherSuite::Aes256GcmSiv).unwrap();
 
         // Bob's envelope is now random noise.
-        let bob_err = try_open_envelope_v2(&header, &bob, CipherSuite::Aes256GcmSiv)
+        let bob_err = try_open_envelope_v2(&header, &bob, CipherSuite::Aes256GcmSiv, None)
             .err()
             .unwrap();
         assert!(matches!(bob_err, Error::OpaqueUnlockFailed));

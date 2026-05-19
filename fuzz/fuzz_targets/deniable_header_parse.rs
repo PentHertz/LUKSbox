@@ -81,7 +81,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Phase 1: envelope discovery. Must collapse every failure into
     // OpaqueUnlockFailed.
-    let envelope = match try_open_envelope_v2(header, &cred, cipher) {
+    let envelope = match try_open_envelope_v2(header, &cred, cipher, None) {
         Ok(env) => env,
         Err(Error::OpaqueUnlockFailed) => {
             // Expected outcome for the overwhelming majority of

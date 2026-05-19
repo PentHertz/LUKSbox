@@ -2896,6 +2896,7 @@ mod tests {
             None,
             &cred_reopen,
             CipherSuite::Aes256Gcm,
+            None,
         )
         .unwrap();
         let cont = Container::complete_open_v2_deniable(env, &cred_reopen).unwrap();

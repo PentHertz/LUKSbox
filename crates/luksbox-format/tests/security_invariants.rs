@@ -427,15 +427,26 @@ fn deniable_open_envelope_refuses_symlink_under_no_follow() {
 
     // Sanity: without the env var the symlink opens fine.
     {
-        let _env =
-            Container::try_open_envelope_v2_deniable(&link, None, &cred, CipherSuite::Aes256GcmSiv)
-                .expect("baseline: symlink opens without env var");
+        let _env = Container::try_open_envelope_v2_deniable(
+            &link,
+            None,
+            &cred,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )
+        .expect("baseline: symlink opens without env var");
     }
 
     unsafe {
         std::env::set_var("LUKSBOX_NO_FOLLOW_SYMLINKS", "1");
     }
-    let r = Container::try_open_envelope_v2_deniable(&link, None, &cred, CipherSuite::Aes256GcmSiv);
+    let r = Container::try_open_envelope_v2_deniable(
+        &link,
+        None,
+        &cred,
+        CipherSuite::Aes256GcmSiv,
+        None,
+    );
     unsafe {
         std::env::remove_var("LUKSBOX_NO_FOLLOW_SYMLINKS");
     }
@@ -455,8 +466,13 @@ fn deniable_open_envelope_refuses_symlink_under_no_follow() {
     unsafe {
         std::env::set_var("LUKSBOX_NO_FOLLOW_SYMLINKS", "1");
     }
-    let r2 =
-        Container::try_open_envelope_v2_deniable(&real, None, &cred, CipherSuite::Aes256GcmSiv);
+    let r2 = Container::try_open_envelope_v2_deniable(
+        &real,
+        None,
+        &cred,
+        CipherSuite::Aes256GcmSiv,
+        None,
+    );
     unsafe {
         std::env::remove_var("LUKSBOX_NO_FOLLOW_SYMLINKS");
     }

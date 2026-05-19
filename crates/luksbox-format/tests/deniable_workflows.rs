@@ -106,14 +106,14 @@ fn multi_slot_mixed_kinds_each_credential_opens_its_own_slot() {
 
     // Open as passphrase-only: must land on slot 0 (kind=Passphrase),
     // not slot 3 (kind=Fido2Passphrase), even though both env-decrypt.
-    let env_pp = try_open_envelope_v2(&header, &admin, CIPHER).unwrap();
+    let env_pp = try_open_envelope_v2(&header, &admin, CIPHER, None).unwrap();
     assert_eq!(env_pp.matched_slot_idx, 0);
     assert_eq!(env_pp.payload.kind, DeniableKindTag::Passphrase);
     let opened_pp = complete_open_v2(env_pp, &admin, CIPHER).unwrap();
     assert_eq!(opened_pp.mvk.as_bytes(), mvk.as_bytes());
 
     // Open as FIDO2: must land on slot 3, kind=Fido2Passphrase.
-    let env_fido = try_open_envelope_v2(&header, &fido, CIPHER).unwrap();
+    let env_fido = try_open_envelope_v2(&header, &fido, CIPHER, None).unwrap();
     assert_eq!(env_fido.matched_slot_idx, 3);
     assert_eq!(env_fido.payload.kind, DeniableKindTag::Fido2Passphrase);
     assert_eq!(env_fido.payload.cred_id, fido_mat.cred_id);
@@ -163,7 +163,7 @@ fn cross_vault_slot_splice_is_rejected() {
     // Try to open vault B with the same passphrase. The envelope
     // AEAD outer AAD binds vault B's salt; the spliced slot was
     // sealed with vault A's salt; verification MUST fail.
-    let err = try_open_envelope_v2(&vault_b, &cred, CIPHER)
+    let err = try_open_envelope_v2(&vault_b, &cred, CIPHER, None)
         .err()
         .expect("spliced vault must not open");
     assert!(matches!(err, Error::OpaqueUnlockFailed));
@@ -227,7 +227,7 @@ fn hybrid_envelope_pass_and_mlkem_shared_are_independent_inputs() {
         argon2: cheap_params(),
         mlkem_shared: &wrong_shared,
     };
-    let env = try_open_envelope_v2(&header, &cred_wrong_shared, CIPHER)
+    let env = try_open_envelope_v2(&header, &cred_wrong_shared, CIPHER, None)
         .expect("phase 1 envelope discovery depends only on passphrase");
     let err = complete_open_v2(env, &cred_wrong_shared, CIPHER)
         .err()
@@ -245,7 +245,7 @@ fn hybrid_envelope_pass_and_mlkem_shared_are_independent_inputs() {
         argon2: cheap_params(),
         mlkem_shared: &shared2_arr,
     };
-    let env = try_open_envelope_v2(&header, &cred_mixed, CIPHER).unwrap();
+    let env = try_open_envelope_v2(&header, &cred_mixed, CIPHER, None).unwrap();
     let err = complete_open_v2(env, &cred_mixed, CIPHER).err().unwrap();
     assert!(matches!(err, Error::OpaqueUnlockFailed));
 
@@ -255,13 +255,13 @@ fn hybrid_envelope_pass_and_mlkem_shared_are_independent_inputs() {
         argon2: cheap_params(),
         mlkem_shared: &shared_arr,
     };
-    let err = try_open_envelope_v2(&header, &cred_wrong_pass, CIPHER)
+    let err = try_open_envelope_v2(&header, &cred_wrong_pass, CIPHER, None)
         .err()
         .expect("wrong pass must fail envelope discovery");
     assert!(matches!(err, Error::OpaqueUnlockFailed));
 
     // Sanity: positive open with correct (pass, shared).
-    let env = try_open_envelope_v2(&header, &cred_create, CIPHER).unwrap();
+    let env = try_open_envelope_v2(&header, &cred_create, CIPHER, None).unwrap();
     let _ = complete_open_v2(env, &cred_create, CIPHER).unwrap();
 }
 
@@ -340,20 +340,20 @@ fn rotation_with_mixed_kept_set_preserves_kept_and_drops_others() {
     assert_ne!(new_mvk.as_bytes(), mvk.as_bytes());
 
     // Admin still opens, recovers new MVK.
-    let env = try_open_envelope_v2(&header, &admin, CIPHER).unwrap();
+    let env = try_open_envelope_v2(&header, &admin, CIPHER, None).unwrap();
     let opened = complete_open_v2(env, &admin, CIPHER).unwrap();
     assert_eq!(opened.mvk.as_bytes(), new_mvk.as_bytes());
     assert_eq!(opened.matched_slot_idx, 0);
 
     // TPM still opens, recovers same new MVK.
-    let env = try_open_envelope_v2(&header, &tpm, CIPHER).unwrap();
+    let env = try_open_envelope_v2(&header, &tpm, CIPHER, None).unwrap();
     let opened = complete_open_v2(env, &tpm, CIPHER).unwrap();
     assert_eq!(opened.mvk.as_bytes(), new_mvk.as_bytes());
     assert_eq!(opened.matched_slot_idx, 6);
 
     // FIDO is gone: try_open must opaquely fail (the slot bytes are
     // fresh OsRng now; envelope decryption produces nothing).
-    let err = try_open_envelope_v2(&header, &fido, CIPHER)
+    let err = try_open_envelope_v2(&header, &fido, CIPHER, None)
         .err()
         .expect("dropped credential must not open");
     assert!(matches!(err, Error::OpaqueUnlockFailed));
@@ -407,15 +407,118 @@ fn add_slot_of_different_kind_after_init_round_trips_both_slots() {
     }
 
     // Admin still opens.
-    let env = try_open_envelope_v2(&header, &admin, CIPHER).unwrap();
+    let env = try_open_envelope_v2(&header, &admin, CIPHER, None).unwrap();
     let opened = complete_open_v2(env, &admin, CIPHER).unwrap();
     assert_eq!(opened.mvk.as_bytes(), mvk.as_bytes());
 
     // TPM slot opens with the same MVK, recovers the embedded blob.
-    let env = try_open_envelope_v2(&header, &tpm, CIPHER).unwrap();
+    let env = try_open_envelope_v2(&header, &tpm, CIPHER, None).unwrap();
     assert_eq!(env.payload.kind, DeniableKindTag::TpmPassphrase);
     assert_eq!(env.payload.tpm_blob, tpm_mat.tpm_blob);
     let opened = complete_open_v2(env, &tpm, CIPHER).unwrap();
     assert_eq!(opened.mvk.as_bytes(), mvk.as_bytes());
     assert_eq!(opened.matched_slot_idx, 4);
+}
+
+// -----------------------------------------------------------------
+// Test #6: regression for the reported "slot 0 passphrase + non-
+// default cipher + second passphrase slot won't unlock" issue.
+//
+// Reproduces the user's reported flow at the format layer:
+//   1. Create a vault with cipher = AES-256-GCM (not the AES-GCM-SIV
+//      default).
+//   2. Enroll a second passphrase at slot 1 using
+//      install_slot_v2 (the same primitive Container::enroll_*
+//      uses, with the create-time cipher carried via
+//      self.header.cipher_suite).
+//   3. Unlock slot 1 with its own passphrase under AES-256-GCM and
+//      assert it actually returns slot 1's MVK.
+//
+// If this test passes, the format layer is innocent and any
+// observed unlock failure is in the GUI / CLI plumbing
+// (cipher choice not threaded through, or unlock-form default
+// shadowing the create-time choice).
+// -----------------------------------------------------------------
+
+#[test]
+fn second_passphrase_slot_unlocks_under_non_default_cipher() {
+    // AES-256-GCM, deliberately not the AES-GCM-SIV default.
+    const NON_DEFAULT: CipherSuite = CipherSuite::Aes256Gcm;
+
+    let inner = DeniableInnerHeader {
+        format_version_minor: 0,
+        cipher_suite: NON_DEFAULT,
+        kdf_id: luksbox_core::KdfId::Argon2id,
+        flags: 0,
+        metadata_offset: DENIABLE_HEADER_SIZE as u64,
+        metadata_size: 4096,
+        data_offset: DENIABLE_HEADER_SIZE as u64 + 4096,
+        chunk_size: 4096,
+    };
+
+    let admin = DeniableCredential::Passphrase {
+        passphrase: b"admin-pass-aes-gcm",
+        argon2: cheap_params(),
+    };
+    let (mut header, mvk) = create_with_credential_v2(
+        &admin,
+        &DeniableMaterial::passphrase_only(),
+        0,
+        NON_DEFAULT,
+        inner,
+    )
+    .unwrap();
+
+    let salt: [u8; DENIABLE_SALT_SIZE] = header[..DENIABLE_SALT_SIZE].try_into().unwrap();
+    let second_pp = b"second-slot-different-pass";
+    let second = DeniableCredential::Passphrase {
+        passphrase: second_pp,
+        argon2: cheap_params(),
+    };
+    {
+        let header_arr: &mut [u8; DENIABLE_HEADER_SIZE] = (&mut header[..]).try_into().unwrap();
+        install_slot_v2(
+            header_arr,
+            1,
+            &second,
+            &DeniableMaterial::passphrase_only(),
+            &mvk,
+            NON_DEFAULT,
+            &salt,
+        )
+        .unwrap();
+    }
+
+    // Admin still opens at slot 0 under the non-default cipher.
+    let env_admin = try_open_envelope_v2(&header, &admin, NON_DEFAULT, None).unwrap();
+    assert_eq!(env_admin.matched_slot_idx, 0);
+    let opened_admin = complete_open_v2(env_admin, &admin, NON_DEFAULT).unwrap();
+    assert_eq!(opened_admin.mvk.as_bytes(), mvk.as_bytes());
+
+    // Slot 1 (the freshly-enrolled second passphrase) must open
+    // under the same cipher.
+    let env_second = try_open_envelope_v2(&header, &second, NON_DEFAULT, None).unwrap();
+    assert_eq!(env_second.matched_slot_idx, 1);
+    assert_eq!(env_second.payload.kind, DeniableKindTag::Passphrase);
+    let opened_second = complete_open_v2(env_second, &second, NON_DEFAULT).unwrap();
+    assert_eq!(
+        opened_second.mvk.as_bytes(),
+        mvk.as_bytes(),
+        "second-passphrase slot must recover the same MVK as admin"
+    );
+    assert_eq!(opened_second.matched_slot_idx, 1);
+
+    // Also verify the kind-hint path (production CLI/GUI flow): with
+    // Some(Passphrase) the second slot is still picked under its own
+    // passphrase (slot 0 fails AEAD with the wrong env_kek).
+    let env_hinted = try_open_envelope_v2(
+        &header,
+        &second,
+        NON_DEFAULT,
+        Some(DeniableKindTag::Passphrase),
+    )
+    .unwrap();
+    assert_eq!(env_hinted.matched_slot_idx, 1);
+    let opened_hinted = complete_open_v2(env_hinted, &second, NON_DEFAULT).unwrap();
+    assert_eq!(opened_hinted.mvk.as_bytes(), mvk.as_bytes());
 }

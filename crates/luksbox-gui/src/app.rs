@@ -2217,6 +2217,22 @@ impl LuksboxApp {
         // Header is unencrypted (no auth needed); a few-KB read +
         // parse, fast enough to do synchronously.
         let slot_inspection = Some(ops::inspect_slot_kinds(&r.path, r.header_path.as_deref()));
+        // Pre-populate the deniable cipher dropdown from the recent
+        // entry's recorded cipher when present. Deniable vaults have
+        // no on-disk magic, so the user MUST tell the open path which
+        // cipher to use; if the dropdown silently snaps back to the
+        // AES-256-GCM-SIV default while the vault was actually
+        // created under AES-256-GCM or ChaCha20-Poly1305, every
+        // unlock attempt fails opaquely (the user has no way to tell
+        // which knob is wrong). Fall back to the SIV default when
+        // the recent entry has no recorded cipher (legacy
+        // recent.json from before the field existed, or a freshly
+        // picked path).
+        let deniable_cipher = match r.cipher.as_str() {
+            "AES-256-GCM" => CipherChoice::Aes,
+            "ChaCha20-Poly1305" => CipherChoice::Chacha,
+            _ => CipherChoice::AesSiv,
+        };
         self.unlock = UnlockForm {
             path: r.path.display().to_string(),
             header_path: r
@@ -2238,7 +2254,7 @@ impl LuksboxApp {
             hybrid_seed_pw: Zeroizing::default(),
             slot_inspection,
             use_deniable: false,
-            deniable_cipher: CipherChoice::AesSiv,
+            deniable_cipher,
             deniable_kdf: KdfStrength::Interactive,
         };
         self.view = View::Unlock;
@@ -7140,13 +7156,17 @@ impl LuksboxApp {
                     let r = if is_den {
                         // v2 deniable: TPM blob lives in the slot
                         // envelope; the TPM PIN binds the chip-side
-                        // userAuth but the envelope passphrase is
-                        // the only thing the slot lookup needs.
-                        // enroll_tpm2_deniable seals without a PIN
-                        // currently; the TPM+PIN deniable variant
-                        // routes here as TPM-only-with-envelope.
-                        // The PIN typed by the user is ignored.
-                        let _ = pin;
+                        // userAuth and MUST be threaded through to
+                        // the seal call so the unlock-side
+                        // `UnlockMethod::Tpm2Pin` (which calls
+                        // `unseal_with_pin(blob, Some(pin))`) finds
+                        // a matching userAuth. Without this, the
+                        // TPM rejects every unlock with
+                        // TPM_RC_AUTH_FAIL (0x098e) and increments
+                        // the dictionary-attack counter on each
+                        // attempt -- the exact symptom that earlier
+                        // versions of this dispatch produced by
+                        // discarding the PIN.
                         #[cfg(all(feature = "hardware", target_os = "linux"))]
                         {
                             ops::enroll_tpm2_deniable(
@@ -7154,11 +7174,12 @@ impl LuksboxApp {
                                 extras.slot_idx,
                                 &extras.passphrase,
                                 extras.kdf.params(),
+                                Some(pin.as_bytes()),
                             )
                         }
                         #[cfg(not(all(feature = "hardware", target_os = "linux")))]
                         {
-                            let _ = &extras;
+                            let _ = (&extras, &pin);
                             Err::<usize, String>(
                                 "deniable TPM enrollment requires the Linux hardware build".into(),
                             )
@@ -7228,12 +7249,19 @@ impl LuksboxApp {
                     // unused there.
                     #[allow(unused_mut)]
                     let mut v = v;
+                    // No-PIN TPM-only deniable modal: pass None so
+                    // the sealed blob has no userAuth. The user
+                    // must unlock via `UnlockMethod::Tpm2` (not
+                    // `Tpm2Pin`); the latter would fail because
+                    // the unseal call would supply an auth value
+                    // the TPM-side policy rejects.
                     #[cfg(all(feature = "hardware", target_os = "linux"))]
                     let r = ops::enroll_tpm2_deniable(
                         &mut v.vfs,
                         extras.slot_idx,
                         &extras.passphrase,
                         extras.kdf.params(),
+                        None,
                     );
                     #[cfg(not(all(feature = "hardware", target_os = "linux")))]
                     let r = {
@@ -9557,8 +9585,14 @@ fn deniable_verify_worker(
         passphrase,
         argon2: params,
     };
-    let envelope = Container::try_open_envelope_v2_deniable(path, None, &cred, cipher_suite)
-        .map_err(|_| "unlock failed".to_string())?;
+    let envelope = Container::try_open_envelope_v2_deniable(
+        path,
+        None,
+        &cred,
+        cipher_suite,
+        Some(luksbox_core::deniable::DeniableKindTag::Passphrase),
+    )
+    .map_err(|_| "unlock failed".to_string())?;
     let opened = Container::complete_open_v2_deniable(envelope, &cred)
         .map_err(|_| "unlock failed".to_string())?;
     let h = &opened.header;

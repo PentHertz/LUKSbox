@@ -80,7 +80,7 @@ fn r12_01_envelope_open_works_for_first_and_last_slot() {
                 .expect("create");
         let mut header_arr = [0u8; DENIABLE_HEADER_SIZE];
         header_arr.copy_from_slice(&header[..DENIABLE_HEADER_SIZE]);
-        let opened = try_open_envelope_v2(&header_arr, &cred, CIPHER)
+        let opened = try_open_envelope_v2(&header_arr, &cred, CIPHER, None)
             .unwrap_or_else(|_| panic!("envelope must open for slot {slot_idx}"));
         assert_eq!(opened.matched_slot_idx, slot_idx);
     }
@@ -346,7 +346,7 @@ fn round12_multi_slot_install_smoke() {
     install_slot_v2(&mut header_arr, 7, &cred, &material, &mvk, CIPHER, &salt)
         .expect("install slot 7");
 
-    let opened = try_open_envelope_v2(&header_arr, &cred, CIPHER).expect("open succeeds");
+    let opened = try_open_envelope_v2(&header_arr, &cred, CIPHER, None).expect("open succeeds");
     // Kind-matching tiebreak picks the first match in slot-index order.
     assert!(opened.matched_slot_idx == 0 || opened.matched_slot_idx == 7);
 }

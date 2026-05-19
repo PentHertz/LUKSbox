@@ -1033,15 +1033,15 @@ fn open_deniable_by_kind(
         .with_prompt("Passphrase")
         .interact()?;
 
-    // Phase 1.
-    let env_cred = DeniableCredential::Passphrase {
-        passphrase: pass.as_bytes(),
-        argon2,
-    };
-    let envelope =
-        luksbox_format::Container::try_open_envelope_v2_deniable(vault, None, &env_cred, cipher)?;
-
-    // Cross-check kind vs payload.
+    // Resolve the user's intended unlock kind FIRST so we can pass
+    // it into phase 1 as the discovery hint. Without this hint
+    // (phase 1 used to hardcode Passphrase as want_kind) the
+    // envelope discovery preferred any Passphrase slot it found
+    // under the same envelope passphrase, returning e.g. the admin
+    // slot 0 instead of the freshly-enrolled FIDO2 / TPM / hybrid
+    // slot the user is actually trying to open. The post-discovery
+    // kind-validation then fired with "credential kind mismatch"
+    // even though the user typed the correct unlock kind.
     let expected = match kind {
         DenCredKind::Passphrase => DeniableKindTag::Passphrase,
         DenCredKind::Fido2 => DeniableKindTag::Fido2Passphrase,
@@ -1056,6 +1056,29 @@ fn open_deniable_by_kind(
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         DenCredKind::HybridPqTpmFido2 => DeniableKindTag::HybridPqTpmFido2Passphrase,
     };
+
+    // Phase 1.
+    let env_cred = DeniableCredential::Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+    };
+    let envelope = luksbox_format::Container::try_open_envelope_v2_deniable(
+        vault,
+        None,
+        &env_cred,
+        cipher,
+        Some(expected),
+    )?;
+
+    // Defense-in-depth: the discovery above prefers slots whose
+    // stored kind byte matches `expected`, so this validation
+    // should never fire under non-adversarial inputs. Keep it as a
+    // belt-and-suspenders check for the case where a vault was
+    // forged with a slot whose AEAD opens under the user's
+    // envelope passphrase but whose kind byte differs (only
+    // possible with MVK-level access; preserves the legacy
+    // semantic of refusing to drive secondary factors against
+    // a slot of the wrong variant).
     if envelope.payload().kind != expected {
         return Err("credential kind mismatch (vault expects a different variant)".into());
     }
@@ -4201,7 +4224,24 @@ fn enroll_tpm2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Result
     let slot_idx = ask_deniable_slot_idx(theme, c)?;
     let argon2 = ask_den_kdf(theme, "Argon2id strength for the new envelope")?;
     let pass = ask_new_passphrase(theme, "Envelope passphrase for the new TPM slot")?;
-    let (secret, blob) = tpm_seal_blob_to_bytes(None)?;
+    // Optional userAuth on the TPM-sealed object. An empty input
+    // means "no PIN", matching the seal/unseal asymmetry: the
+    // unseal-side path must call `unseal` (no PIN), not
+    // `unseal_with_pin`, or the TPM rejects with
+    // TPM_RC_AUTH_FAIL. We surface this as a single prompt with
+    // an explicit "leave blank for no PIN" hint so callers can't
+    // accidentally seal-with-empty-string and trip the same
+    // asymmetry on the unseal side.
+    let pin_input: String = Password::with_theme(theme)
+        .with_prompt("TPM PIN (leave blank for no PIN)")
+        .allow_empty_password(true)
+        .interact()?;
+    let pin_bytes: Option<&[u8]> = if pin_input.is_empty() {
+        None
+    } else {
+        Some(pin_input.as_bytes())
+    };
+    let (secret, blob) = tpm_seal_blob_to_bytes(pin_bytes)?;
     let cred = luksbox_core::deniable::DeniableCredential::TpmPassphrase {
         passphrase: pass.as_bytes(),
         argon2,

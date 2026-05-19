@@ -1289,13 +1289,15 @@ pub fn create_vault_with_tpm_bootstrap(
             // Slot 1: the admin's deniable passphrase is at slot 0,
             // TPM lands at slot 1 (matches the standard TPM
             // bootstrap convention).
-            enroll_tpm2_deniable(&mut opened.vfs, 1, &bootstrap_pw, bootstrap_argon2)
+            enroll_tpm2_deniable(&mut opened.vfs, 1, &bootstrap_pw, bootstrap_argon2, None)
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
-        (TpmBootstrapKind::Tpm2Pin { pin: _ }, true) => Err(
-            "Tpm2Pin deniable bootstrap is not supported in v2; use Tpm2 \
-             (envelope passphrase substitutes for the TPM-side PIN)"
-                .into(),
+        (TpmBootstrapKind::Tpm2Pin { pin }, true) => enroll_tpm2_deniable(
+            &mut opened.vfs,
+            1,
+            &bootstrap_pw,
+            bootstrap_argon2,
+            Some(pin.as_bytes()),
         ),
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         (TpmBootstrapKind::Tpm2Fido2 { pin }, true) => {
@@ -2154,21 +2156,14 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
             .as_ref()
             .ok_or("passphrase required for deniable v2 envelope discovery")?;
 
-        // Phase 1: envelope discovery via passphrase-only credential.
-        let env_cred = luksbox_core::deniable::DeniableCredential::Passphrase {
-            passphrase: pw.as_bytes(),
-            argon2: kdf_params,
-        };
-        let envelope =
-            Container::try_open_envelope_v2_deniable(&opts.path, None, &env_cred, cipher)
-                .map_err(estr)?;
-
-        // Variant cross-check. The catch-all below covers
-        // platform/feature combos where some `UnlockMethod` variants
-        // are unreachable (e.g., TPM on macOS without the Linux
-        // hardware build). On Linux+hardware every variant is
-        // listed explicitly and the catch-all is structurally
-        // unreachable - allow the lint so the match stays portable.
+        // Resolve the user's intended unlock kind BEFORE phase 1 so
+        // we can pass it as the discovery hint. Without this hint,
+        // phase 1 used to hardcode Passphrase as want_kind and
+        // discovery preferred any Passphrase slot under the same
+        // envelope passphrase -- so enrolling a new FIDO2 / TPM /
+        // hybrid slot with the admin's passphrase and trying to
+        // unlock with the new slot's kind returned slot 0
+        // (Passphrase) and tripped "credential kind mismatch".
         use luksbox_core::deniable::DeniableKindTag;
         #[allow(unreachable_patterns)]
         let expected = match opts.method {
@@ -2191,6 +2186,29 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
                 ));
             }
         };
+
+        // Phase 1: envelope discovery via passphrase-only credential
+        // + explicit kind hint so the discovery prefers the
+        // user-intended slot variant when multiple slots share the
+        // same envelope passphrase.
+        let env_cred = luksbox_core::deniable::DeniableCredential::Passphrase {
+            passphrase: pw.as_bytes(),
+            argon2: kdf_params,
+        };
+        let envelope = Container::try_open_envelope_v2_deniable(
+            &opts.path,
+            None,
+            &env_cred,
+            cipher,
+            Some(expected),
+        )
+        .map_err(estr)?;
+
+        // Belt-and-suspenders: discovery prefers slots whose kind
+        // byte matches `expected`, so this should never fire under
+        // honest inputs. Kept to refuse MVK-forged blobs that
+        // present a Passphrase-AEAD-OK slot with a mismatched
+        // stored kind byte.
         if envelope.payload().kind != expected {
             return Err("credential kind mismatch (vault expects a different variant)".into());
         }
@@ -3701,18 +3719,40 @@ fn tpm_seal_to_bytes_for_deniable(
 /// embeds the sealed blob in the slot envelope, installs a
 /// `DeniableCredential::TpmPassphrase` slot at `slot_idx`. Returns
 /// the new slot index.
+///
+/// `tpm_pin` is the optional userAuth bound to the TPM-sealed blob:
+/// `Some(pin)` for the "TPM + PIN" UI flow (unlock will require
+/// the same PIN), `None` for "TPM only" (unlock uses the
+/// chip-bound primary key without any user secret). Note that the
+/// envelope passphrase is independent of `tpm_pin` -- it's always
+/// required by v2 deniable's envelope discovery.
+///
+/// Mismatch warning: the GUI's unlock-side `UnlockMethod::Tpm2Pin`
+/// calls `unseal_with_pin(blob, Some(pin))`, which fails with
+/// `TPM_RC_AUTH_FAIL` (0x098e) and increments the dictionary-
+/// attack counter if the blob was sealed without a PIN. Earlier
+/// versions of this function unconditionally sealed with `None`
+/// and silently discarded any PIN typed in the "Add TPM+PIN
+/// (deniable)" modal, producing the exact symptom above.
 #[cfg(all(feature = "hardware", target_os = "linux"))]
 pub fn enroll_tpm2_deniable(
     vfs: &mut Vfs,
     slot_idx: usize,
     passphrase: &str,
     argon2: Argon2idParams,
+    tpm_pin: Option<&[u8]>,
 ) -> Result<usize, String> {
     use luksbox_format::deniable_header::DeniableMaterial;
     if passphrase.is_empty() {
         return Err("v2 deniable enroll requires an envelope passphrase for the new slot".into());
     }
-    let (secret, blob) = tpm_seal_to_bytes_for_deniable(None)?;
+    // Refuse empty `Some(pin)` so a stray Default::default() in a
+    // form can't silently downgrade the slot to no-PIN. Caller
+    // should pass `None` for the TPM-only flow.
+    if matches!(tpm_pin, Some(p) if p.is_empty()) {
+        return Err("TPM PIN cannot be empty; pass None for the no-PIN variant".into());
+    }
+    let (secret, blob) = tpm_seal_to_bytes_for_deniable(tpm_pin)?;
     let cred = luksbox_core::deniable::DeniableCredential::TpmPassphrase {
         passphrase: passphrase.as_bytes(),
         argon2,

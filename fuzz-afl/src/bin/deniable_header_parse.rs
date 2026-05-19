@@ -42,7 +42,7 @@ fn main() {
             argon2: params,
         };
 
-        let envelope = match try_open_envelope_v2(header, &cred, cipher) {
+        let envelope = match try_open_envelope_v2(header, &cred, cipher, None) {
             Ok(env) => env,
             Err(Error::OpaqueUnlockFailed) => return,
             Err(other) => panic!(

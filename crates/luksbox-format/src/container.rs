@@ -974,7 +974,20 @@ impl Container {
             passphrase,
             argon2: kdf_params,
         };
-        let envelope = Self::try_open_envelope_v2_deniable(path, header_path, &cred, cipher)?;
+        // This wrapper is dedicated to passphrase deniable slots, so
+        // hint discovery at Passphrase. Without the hint, a vault
+        // that has both a Passphrase and a higher-variant slot under
+        // the same envelope passphrase could non-deterministically
+        // dispatch into the higher slot (which then fails phase 2
+        // for missing FIDO2 / TPM / ML-KEM secondaries) instead of
+        // unlocking the passphrase slot the user explicitly chose.
+        let envelope = Self::try_open_envelope_v2_deniable(
+            path,
+            header_path,
+            &cred,
+            cipher,
+            Some(luksbox_core::deniable::DeniableKindTag::Passphrase),
+        )?;
         Self::complete_open_v2_deniable(envelope, &cred)
     }
 
@@ -1099,6 +1112,7 @@ impl Container {
         header_path: Option<&Path>,
         credential: &luksbox_core::deniable::DeniableCredential,
         cipher: CipherSuite,
+        want_kind: Option<luksbox_core::deniable::DeniableKindTag>,
     ) -> Result<DeniableV2EnvelopeHandle, Error> {
         use crate::deniable_header::try_open_envelope_v2;
         use luksbox_core::deniable::DENIABLE_HEADER_SIZE;
@@ -1129,7 +1143,7 @@ impl Container {
         file.read_exact(&mut header_buf)
             .map_err(|_| Error::OpaqueUnlockFailed)?;
 
-        let opened = try_open_envelope_v2(&header_buf, credential, cipher)?;
+        let opened = try_open_envelope_v2(&header_buf, credential, cipher, want_kind)?;
 
         Ok(DeniableV2EnvelopeHandle {
             file,
@@ -4248,6 +4262,68 @@ mod tests {
         );
     }
 
+    /// Regression: vault created with a non-default cipher, second
+    /// passphrase slot enrolled, then re-opened with second slot's
+    /// passphrase under the same cipher MUST succeed. Pins the
+    /// container-level cipher-threading so the wizard / GUI cipher
+    /// dropdown not being the default is never enough on its own to
+    /// break later enroll / unlock.
+    #[test]
+    fn second_passphrase_slot_unlocks_under_aes_gcm() {
+        const NON_DEFAULT: CipherSuite = CipherSuite::Aes256Gcm;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let mut c = Container::create_with_passphrase_deniable(
+            &path,
+            None,
+            NON_DEFAULT,
+            cheap_argon2(),
+            0,
+            b"admin-pp",
+        )
+        .unwrap();
+        c.enroll_passphrase_deniable(2, b"second-pp", cheap_argon2())
+            .unwrap();
+        c.persist_header().unwrap();
+        drop(c);
+
+        // Admin still opens under the non-default cipher.
+        Container::open_with_passphrase_deniable(
+            &path,
+            None,
+            b"admin-pp",
+            cheap_argon2(),
+            NON_DEFAULT,
+        )
+        .expect("admin slot 0 must reopen under create-time cipher");
+
+        // Second passphrase opens under the same cipher.
+        Container::open_with_passphrase_deniable(
+            &path,
+            None,
+            b"second-pp",
+            cheap_argon2(),
+            NON_DEFAULT,
+        )
+        .expect("freshly-enrolled second passphrase must open under create-time cipher");
+
+        // Cross-check: opening either slot under the wrong cipher
+        // fails cleanly (no slot-specific oracle).
+        for pw in [b"admin-pp" as &[u8], b"second-pp"] {
+            assert!(matches!(
+                Container::open_with_passphrase_deniable(
+                    &path,
+                    None,
+                    pw,
+                    cheap_argon2(),
+                    CipherSuite::Aes256GcmSiv,
+                ),
+                Err(Error::OpaqueUnlockFailed)
+            ));
+        }
+    }
+
     #[test]
     fn deniable_container_fido2_round_trip() {
         // v2: FIDO2 deniable slot must be FIDO2 + envelope passphrase
@@ -4285,9 +4361,14 @@ mod tests {
 
         // v2 open: two-phase. The matched slot index is recovered
         // from the envelope payload, not supplied by the caller.
-        let env =
-            Container::try_open_envelope_v2_deniable(&path, None, &cred, CipherSuite::Aes256GcmSiv)
-                .unwrap();
+        let env = Container::try_open_envelope_v2_deniable(
+            &path,
+            None,
+            &cred,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )
+        .unwrap();
         assert_eq!(env.opened.matched_slot_idx, 2);
         // Material round-trips through the envelope.
         assert_eq!(env.payload().cred_id, material.cred_id);
@@ -4331,9 +4412,14 @@ mod tests {
         let mvk_before = c.mvk_clone();
         drop(c);
 
-        let env =
-            Container::try_open_envelope_v2_deniable(&path, None, &cred, CipherSuite::Aes256GcmSiv)
-                .unwrap();
+        let env = Container::try_open_envelope_v2_deniable(
+            &path,
+            None,
+            &cred,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )
+        .unwrap();
         assert_eq!(env.payload().tpm_blob, blob);
         let c = Container::complete_open_v2_deniable(env, &cred).unwrap();
         assert_eq!(c.mvk_clone().as_bytes(), mvk_before.as_bytes());
@@ -4374,9 +4460,14 @@ mod tests {
         let mvk_before = c.mvk_clone();
         drop(c);
 
-        let env =
-            Container::try_open_envelope_v2_deniable(&path, None, &cred, CipherSuite::Aes256GcmSiv)
-                .unwrap();
+        let env = Container::try_open_envelope_v2_deniable(
+            &path,
+            None,
+            &cred,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )
+        .unwrap();
         let c = Container::complete_open_v2_deniable(env, &cred).unwrap();
         assert_eq!(c.mvk_clone().as_bytes(), mvk_before.as_bytes());
     }
@@ -4428,6 +4519,7 @@ mod tests {
             None,
             &fido2_cred,
             CipherSuite::Aes256GcmSiv,
+            None,
         )
         .unwrap();
         assert_eq!(env.opened.matched_slot_idx, 4);
@@ -4441,6 +4533,7 @@ mod tests {
             None,
             &admin_cred,
             CipherSuite::Aes256GcmSiv,
+            None,
         )
         .unwrap();
         assert_eq!(env_admin.opened.matched_slot_idx, 0);
@@ -4485,6 +4578,7 @@ mod tests {
             None,
             &cred,
             CipherSuite::Aes256GcmSiv,
+            None,
         )
         .unwrap();
         let mut c = Container::complete_open_v2_deniable(env, &cred).unwrap();
@@ -4540,6 +4634,7 @@ mod tests {
             None,
             &cred,
             CipherSuite::Aes256GcmSiv,
+            None,
         )
         .unwrap();
         let mut cb = Container::complete_open_v2_deniable(env_b, &cred).unwrap();
@@ -4592,6 +4687,7 @@ mod tests {
             None,
             &wrong_cred,
             CipherSuite::Aes256GcmSiv,
+            None,
         )
         .unwrap();
         let err = Container::complete_open_v2_deniable(env, &wrong_cred)
@@ -4649,6 +4745,7 @@ mod tests {
             None,
             &admin,
             CipherSuite::Aes256GcmSiv,
+            None,
         )
         .unwrap();
         assert_eq!(env_admin.opened.matched_slot_idx, 0);
@@ -4656,9 +4753,14 @@ mod tests {
         assert_eq!(c_admin.mvk_clone().as_bytes(), new_mvk.as_bytes());
         drop(c_admin);
 
-        let env_bob =
-            Container::try_open_envelope_v2_deniable(&path, None, &bob, CipherSuite::Aes256GcmSiv)
-                .unwrap();
+        let env_bob = Container::try_open_envelope_v2_deniable(
+            &path,
+            None,
+            &bob,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )
+        .unwrap();
         assert_eq!(env_bob.opened.matched_slot_idx, 3);
         let c_bob = Container::complete_open_v2_deniable(env_bob, &bob).unwrap();
         assert_eq!(c_bob.mvk_clone().as_bytes(), new_mvk.as_bytes());
@@ -4701,10 +4803,15 @@ mod tests {
 
         // Bob's slot is now random noise; opening with Bob's
         // credential fails opaquely.
-        let err =
-            Container::try_open_envelope_v2_deniable(&path, None, &bob, CipherSuite::Aes256GcmSiv)
-                .err()
-                .unwrap();
+        let err = Container::try_open_envelope_v2_deniable(
+            &path,
+            None,
+            &bob,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )
+        .err()
+        .unwrap();
         assert!(matches!(err, Error::OpaqueUnlockFailed));
     }
 

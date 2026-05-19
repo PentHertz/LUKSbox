@@ -104,6 +104,7 @@ fn envelope_open_bench(runner: &mut CtRunner, rng: &mut BenchRng) {
                 std::hint::black_box(&header),
                 std::hint::black_box(&cred),
                 std::hint::black_box(CIPHER),
+                std::hint::black_box(None),
             ));
             std::hint::black_box(r.is_ok())
         });

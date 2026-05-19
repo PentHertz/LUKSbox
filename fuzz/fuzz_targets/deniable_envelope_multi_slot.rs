@@ -150,7 +150,7 @@ fuzz_target!(|data: &[u8]| {
 
     // Drive the envelope-discovery loop with the attacker passphrase
     // against the multi-slot header.
-    match try_open_envelope_v2(&header_arr, &attacker_cred, cipher) {
+    match try_open_envelope_v2(&header_arr, &attacker_cred, cipher, None) {
         Ok(_envelope) => {
             // Fuzzer matched the harness's known passphrase by chance.
             // No panic = invariant 3 holds.

@@ -109,7 +109,7 @@ fn main() {
             argon2: CHEAP_KDF,
         };
 
-        match try_open_envelope_v2(&header_arr, &attacker_cred, cipher) {
+        match try_open_envelope_v2(&header_arr, &attacker_cred, cipher, None) {
             Ok(_envelope) => {}
             Err(Error::OpaqueUnlockFailed) => {}
             Err(other) => {
