@@ -978,7 +978,13 @@ mod tests {
         // The victim file must NOT have been touched.
         assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
         // The symlink itself must still be there, untouched.
-        assert!(attack_path.symlink_metadata().unwrap().file_type().is_symlink());
+        assert!(
+            attack_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
         // And no stale tempfile should have leaked into the directory.
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()

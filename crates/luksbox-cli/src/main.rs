@@ -3108,17 +3108,14 @@ fn cmd_create(
     // drop, so a panic between here and the create_with_* call below
     // can't leak the override to a subsequent unrelated create on this
     // thread.
-    let _meta_guard = luksbox_format::metadata::set_create_metadata_region_size_override(
-        metadata_size_override,
-    );
+    let _meta_guard =
+        luksbox_format::metadata::set_create_metadata_region_size_override(metadata_size_override);
     // Install the v3-metadata-format override for the same lifetime.
     // The Vfs reads this thread-local on first open of the freshly-
     // created vault and locks in the format choice by writing the
     // matching LBM2 / LBM3 magic on first flush.
-    let _format_guard = luksbox_vfs::set_format_v3_override(Some(matches!(
-        format,
-        VaultFormatArg::V3
-    )));
+    let _format_guard =
+        luksbox_vfs::set_format_v3_override(Some(matches!(format, VaultFormatArg::V3)));
     if let Some(hp) = header_path {
         if hp.exists() {
             return Err(format!("header file {} already exists", hp.display()).into());
@@ -4956,8 +4953,8 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
             std::io::stdin()
                 .read_exact(&mut slot_byte)
                 .map_err(|e| format!("could not read slot index from stdin: {e}"))?;
-            let mut inner_buf = [0u8;
-                luksbox_format::deniable_header::DENIABLE_INNER_HEADER_SERIALIZED_LEN];
+            let mut inner_buf =
+                [0u8; luksbox_format::deniable_header::DENIABLE_INNER_HEADER_SERIALIZED_LEN];
             std::io::stdin()
                 .read_exact(&mut inner_buf)
                 .map_err(|e| format!("could not read inner header from stdin: {e}"))?;

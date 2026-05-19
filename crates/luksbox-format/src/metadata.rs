@@ -91,7 +91,9 @@ thread_local! {
 /// enforced by the header parser at create time, so callers that set
 /// an absurd override get a clean rejection.
 pub fn resolved_create_metadata_region_size() -> u64 {
-    CREATE_METADATA_SIZE_OVERRIDE.with(|c| c.get()).unwrap_or(DEFAULT_METADATA_REGION_SIZE)
+    CREATE_METADATA_SIZE_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or(DEFAULT_METADATA_REGION_SIZE)
 }
 
 /// RAII guard returned by [`set_create_metadata_region_size_override`].

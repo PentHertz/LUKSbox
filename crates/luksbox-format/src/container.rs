@@ -3780,8 +3780,7 @@ mod tests {
         // Simulate the wire transit: serialize + parse inner header.
         let inner_wire = inner.serialise_for_handoff();
         let inner_parsed =
-            crate::deniable_header::DeniableInnerHeader::parse_from_handoff(&inner_wire)
-                .unwrap();
+            crate::deniable_header::DeniableInnerHeader::parse_from_handoff(&inner_wire).unwrap();
         assert_eq!(inner, inner_parsed);
 
         let c_helper = Container::open_with_mvk_deniable(
@@ -3799,7 +3798,10 @@ mod tests {
         // And the helper-side handoff state must match what the parent
         // exported, so a future re-handoff (e.g. unmount-then-remount)
         // sees the same image.
-        assert_eq!(c_helper.deniable_handoff_state(), Some((salt, inner, slot_idx)));
+        assert_eq!(
+            c_helper.deniable_handoff_state(),
+            Some((salt, inner, slot_idx))
+        );
     }
 
     #[test]
@@ -3825,16 +3827,9 @@ mod tests {
         drop(c);
 
         let wrong_salt = [0xABu8; luksbox_core::deniable::DENIABLE_SALT_SIZE];
-        let err = Container::open_with_mvk_deniable(
-            &path,
-            None,
-            mvk,
-            wrong_salt,
-            inner,
-            slot_idx,
-        )
-        .err()
-        .expect("must refuse wrong salt");
+        let err = Container::open_with_mvk_deniable(&path, None, mvk, wrong_salt, inner, slot_idx)
+            .err()
+            .expect("must refuse wrong salt");
         assert!(matches!(err, Error::OpaqueUnlockFailed), "got {err:?}");
     }
 
@@ -3856,12 +3851,7 @@ mod tests {
         drop(c);
 
         let err = Container::open_with_mvk_deniable(
-            &path,
-            None,
-            mvk,
-            salt,
-            inner,
-            999, // > DENIABLE_SLOT_COUNT
+            &path, None, mvk, salt, inner, 999, // > DENIABLE_SLOT_COUNT
         )
         .err()
         .expect("must refuse out-of-range slot");
@@ -3889,16 +3879,10 @@ mod tests {
         let (salt, inner, slot_idx) = c.deniable_handoff_state().unwrap();
         drop(c);
 
-        let err = Container::open_with_mvk_deniable(
-            &path,
-            Some(&header_p),
-            mvk,
-            salt,
-            inner,
-            slot_idx,
-        )
-        .err()
-        .expect("must refuse detached header path for deniable");
+        let err =
+            Container::open_with_mvk_deniable(&path, Some(&header_p), mvk, salt, inner, slot_idx)
+                .err()
+                .expect("must refuse detached header path for deniable");
         assert!(matches!(err, Error::Crypto(_)), "got {err:?}");
     }
 
