@@ -8,10 +8,10 @@ group** can use it. You should NOT need to run `luksbox` or
 
 This doc covers:
 
-1. [Quick check](#quick-check) — am I already set up?
-2. [The standard fix](#standard-fix-add-yourself-to-the-tss-group) —
+1. [Quick check](#quick-check) -- am I already set up?
+2. [The standard fix](#standard-fix-add-yourself-to-the-tss-group) --
    add yourself to the `tss` group.
-3. [Distros without a `tss` group](#distros-without-a-tss-group) —
+3. [Distros without a `tss` group](#distros-without-a-tss-group) --
    write a udev rule.
 4. [Verifying the fix](#verifying-the-fix).
 5. [Common errors and what they mean](#common-errors).
@@ -27,11 +27,11 @@ ls -l /dev/tpmrm0      # should print:  crw-rw---- 1 root tss ...
 id -nG | tr ' ' '\n' | grep -x tss   # should print: tss
 ```
 
-If both succeed, you're done — close this doc and use LUKSbox normally.
+If both succeed, you're done -- close this doc and use LUKSbox normally.
 
 If the first command says **"No such file or directory"**, your
 machine doesn't expose a TPM 2.0 device. That's not a permission
-issue — see
+issue -- see
 [`SECURITY.md`](../SECURITY.md) for non-TPM keyslot options
 (passphrase, FIDO2, hybrid-PQ).
 
@@ -74,7 +74,7 @@ install the udev rule manually.
 Some minimal / server / immutable installs don't ship the `tss`
 group. Two options:
 
-### Option A — create the group + udev rule (recommended)
+### Option A -- create the group + udev rule (recommended)
 
 ```bash
 # Create the group if it doesn't exist
@@ -99,7 +99,7 @@ sudo udevadm trigger /dev/tpm* /dev/tpmrm*
 
 Then log out + back in.
 
-### Option B — your own group (e.g. `wheel`)
+### Option B -- your own group (e.g. `wheel`)
 
 Same as A but substitute the group name:
 

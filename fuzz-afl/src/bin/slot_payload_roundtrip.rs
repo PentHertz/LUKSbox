@@ -1,4 +1,4 @@
-//! AFL++ harness: `SlotPayload::new` → `encode` → `decode` round-trip
+//! AFL++ harness: `SlotPayload::new` -> `encode` -> `decode` round-trip
 //! with attacker-controlled length triples. Mirrors
 //! `fuzz/fuzz_targets/slot_payload_roundtrip.rs` (libfuzzer variant).
 

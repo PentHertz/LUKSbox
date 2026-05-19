@@ -17,7 +17,7 @@
 #   RUSTSEC-2021-0154  fuser ≤ 0.15 unsound, bumped to 0.16
 #                      (advisory `versions.patched = [">= 0.16.0"]`).
 #   RUSTSEC-2026-0009  time 0.3.45 DoS, bumped to 0.3.47 (audit
-#                      round 7); MSRV moved 1.85 → 1.88 to permit it.
+#                      round 7); MSRV moved 1.85 -> 1.88 to permit it.
 #
 # Add new exemptions ONLY with a written justification. Default policy
 # should be: fix it, not ignore it.

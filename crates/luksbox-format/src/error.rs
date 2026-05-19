@@ -64,4 +64,20 @@ pub enum Error {
          the env var to allow symlink resolution."
     )]
     SymlinkRefused { path: String },
+
+    /// `Container::rotate_mvk_v2_deniable` was called on a deniable
+    /// vault that already has user content (the metadata blob is
+    /// populated). That entry point ONLY rotates the slot envelope +
+    /// MVK; it does not re-encrypt chunks, so calling it on a vault
+    /// with chunks would leave the chunks encrypted under the OLD
+    /// MVK's file_keys and unreadable on next open. Use
+    /// `luksbox_vfs::Vfs::rotate_mvk_deniable` instead -- it pairs the
+    /// envelope rewrap with a full chunk + chunk-list-block +
+    /// metadata re-encryption under the new MVK.
+    #[error(
+        "deniable envelope-only rotation refused: vault already has content. \
+         Use luksbox_vfs::Vfs::rotate_mvk_deniable for the full rotation that \
+         re-encrypts chunks under the new MVK."
+    )]
+    DeniableRotationRequiresEmptyVault,
 }

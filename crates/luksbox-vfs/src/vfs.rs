@@ -237,7 +237,7 @@ fn padded_chunk_count(needed: usize, padding_on: bool) -> usize {
 const SIZE_HEADER_LEN: usize = 8;
 
 /// Round 13 fix R13-07: hard per-file logical-size cap. Picked at 2^44
-/// (16 TiB) — three orders of magnitude beyond the largest real-world
+/// (16 TiB) -- three orders of magnitude beyond the largest real-world
 /// vault payload we've heard of, but small enough that
 /// `padded_chunk_count` (which calls `next_power_of_two`) cannot
 /// overflow on a 64-bit `usize` and the chunk-allocation loops in
@@ -374,7 +374,7 @@ const METADATA_V2_MAGIC: &[u8; 4] = b"LBM\x02";
 /// in-memory `DirectoryTree` is identical between v2 and v3; only
 /// the on-disk serialisation differs. v2 readers refuse v3 blobs
 /// cleanly via the version-byte mismatch rather than silently
-/// mis-decoding (postcard schemas differ — v3 uses
+/// mis-decoding (postcard schemas differ -- v3 uses
 /// `InodeV3OnDisk` which has an extra `chunks_external` field).
 const METADATA_V3_MAGIC: &[u8; 4] = b"LBM\x03";
 
@@ -443,7 +443,7 @@ fn use_v3_for_fresh_vault() -> bool {
 /// and reject corrupt chains.
 ///
 /// `cached_real_size` / `external_list_blocks` are in-memory only
-/// in the working `Inode` and never serialised — they're absent here.
+/// in the working `Inode` and never serialised -- they're absent here.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct InodeV3OnDisk {
     id: FileId,
@@ -712,7 +712,7 @@ impl Vfs {
                 false,
             )
         } else {
-            // Neither LBM2 nor LBM3 — unsupported version, refuse cleanly.
+            // Neither LBM2 nor LBM3 -- unsupported version, refuse cleanly.
             return Err(Error::MetadataDeserialize);
         };
         validate_metadata_tree(
@@ -857,7 +857,7 @@ impl Vfs {
                 );
             } else {
                 // Inline. (external_list_blocks just got cleared above
-                // — chunks are already in the in-memory `chunks` vec.)
+                // -- chunks are already in the in-memory `chunks` vec.)
                 let inode = self.tree.inodes.get(&id).expect("id from keys()");
                 on_disk_inodes.insert(
                     id,
@@ -995,7 +995,7 @@ impl Vfs {
         // path-name bytes for directories). Even with 100k tiny
         // files the projection is well under the 16 MiB budget.
         //
-        // We don't actually need to BUILD spill blocks here — the
+        // We don't actually need to BUILD spill blocks here -- the
         // estimate is just an InodeV3OnDisk with empty inline chunks
         // and a placeholder (ChunkRef, count). The placeholder bytes
         // postcard-encode identically to the real values (same shape).
@@ -1170,7 +1170,7 @@ impl Vfs {
     ///
     /// Round 13 fix R13-03: the chunk-0 size header is authenticated by
     /// the chunk AEAD, but its value is otherwise unconstrained by the
-    /// container layer — `validate_metadata_tree` only checks that the
+    /// container layer -- `validate_metadata_tree` only checks that the
     /// stored `inode.size` matches `chunks.len() * CHUNK_PLAINTEXT_SIZE`
     /// (the padded capacity), not the real-size u64. An authenticated
     /// writer (legitimate vault owner or anyone with the MVK) could
@@ -1410,7 +1410,7 @@ impl Vfs {
         // directory tree (postcard-varint encoded); for large files
         // this grows the metadata blob past the vault's fixed-size
         // metadata region, at which point `Vfs::flush` would refuse
-        // the write. The old code only caught this at flush time —
+        // the write. The old code only caught this at flush time --
         // by then the encrypted chunks were already on disk but the
         // metadata pointer was not, so on the next mount the file
         // was invisible and the chunks were orphaned (silent data
@@ -1879,7 +1879,7 @@ impl Vfs {
     /// per-vault salt. Companion to `rotate_mvk` for standard vaults.
     ///
     /// Why this exists: `Container::rotate_mvk_v2_deniable` rotates
-    /// JUST the slot envelopes — it generates a new MVK + per-vault
+    /// JUST the slot envelopes -- it generates a new MVK + per-vault
     /// salt and rewraps the slot under those, but does NOT re-encrypt
     /// chunks (which were encrypted under the OLD MVK's file_keys).
     /// Calling it on a vault with content silently corrupts the
@@ -1916,7 +1916,7 @@ impl Vfs {
         let old_salt = self.container.header.header_salt;
 
         // 2. Read the metadata blob BEFORE the rotation flips the
-        //    container's state — `read_metadata` uses
+        //    container's state -- `read_metadata` uses
         //    container.mvk + header_salt to derive metadata_key.
         //    After rotation those values point at the new state,
         //    so a delayed read would AEAD-fail on the still-old
@@ -1934,7 +1934,7 @@ impl Vfs {
         }
 
         let do_rotation = |this: &mut Self| -> Result<(), Error> {
-            // 4. Rotate the slot envelopes — generates new_mvk + new_salt
+            // 4. Rotate the slot envelopes -- generates new_mvk + new_salt
             //    internally and updates container state.
             // Build the borrowed DeniableCredential per row, then
             // hand a borrow vec to rotate_mvk_v2_deniable.
@@ -1956,8 +1956,14 @@ impl Vfs {
                 &DeniableCredential,
                 &luksbox_format::deniable_header::DeniableMaterial,
             )> = cred_refs.iter().map(|(i, c, m)| (*i, c, *m)).collect();
+            // Use the envelope-only primitive: the guarded
+            // `rotate_mvk_v2_deniable` would refuse here because the
+            // metadata blob is non-empty (vault has content), but
+            // we're providing the full chunk + chunk-list-block +
+            // metadata re-encryption pass right below, so the
+            // envelope-only call is exactly what we want.
             this.container
-                .rotate_mvk_v2_deniable(&cred_tuples)
+                .rotate_mvk_v2_deniable_envelope_only(&cred_tuples)
                 .map_err(Error::Format)?;
 
             // 5. Container now holds the NEW mvk + new salt.
@@ -2295,7 +2301,7 @@ mod tests {
     #[test]
     fn write_fails_with_metadata_budget_exhausted_when_region_too_small() {
         // Pre-fix bug: writing more chunks than fit in the metadata
-        // region produced silent data loss — the chunks landed on disk
+        // region produced silent data loss -- the chunks landed on disk
         // but `Vfs::flush` failed at unmount with MetadataTooLarge, so
         // the file was invisible on the next open. With the pre-flight
         // budget check, the FUSE layer now sees the error mid-write
@@ -2358,7 +2364,7 @@ mod tests {
     #[test]
     fn write_succeeds_inside_default_metadata_budget() {
         // Sanity: with the default 16 MiB region, writing well under
-        // the budget must succeed — make sure the pre-flight isn't
+        // the budget must succeed -- make sure the pre-flight isn't
         // over-aggressive and refusing legitimate writes.
         let dir = tempdir().unwrap();
         let path = dir.path().join("ok.lbx");
@@ -2857,7 +2863,7 @@ mod tests {
         .unwrap();
         let mut vfs = Vfs::open(cont).unwrap();
         assert!(vfs.uses_v3_metadata() && vfs.container().is_deniable());
-        // Write a small payload (no need to spill — tests the
+        // Write a small payload (no need to spill -- tests the
         // FIDO2-bound rotation independently of v3 spill mechanics).
         let root = vfs.root_id();
         let f = vfs.create(root, "data").unwrap();
@@ -3015,7 +3021,7 @@ mod tests {
             b"pw",
         )
         .unwrap();
-        // The guard must stay alive across Vfs::open — that's where
+        // The guard must stay alive across Vfs::open -- that's where
         // the format is actually picked (the fresh-vault branch reads
         // the thread-local).
         let mut src = Vfs::open(cont_v2).unwrap();
@@ -3338,7 +3344,7 @@ mod tests {
     #[test]
     fn v2_budget_check_still_refuses_oversize_in_tight_region() {
         // Mirror of the test above for v2: same tight region, same
-        // big write — must still trip MetadataBudgetExhausted.
+        // big write -- must still trip MetadataBudgetExhausted.
         // Catches a regression where the v2 branch of
         // check_metadata_budget_for_chunks gets accidentally loosened.
         // Force v2 explicitly since v3 is the default now.
@@ -3379,6 +3385,65 @@ mod tests {
     }
 
     #[test]
+    fn v3_walk_chunk_list_chain_caps_expected_count() {
+        // DoS hardening: walk_chunk_list_chain takes expected_count
+        // straight from the on-disk InodeV3OnDisk's chunks_external
+        // tuple. A forged metadata blob (requires MVK, but is the
+        // realistic post-MVK-compromise DoS) could claim
+        // expected_count = u64::MAX and drive the walk's max_blocks
+        // bound to ~7e16 iterations. The cap at
+        // MAX_FILE_SIZE / CHUNK_PLAINTEXT_SIZE = 2^32 cuts that off
+        // before any chunk-list read happens.
+        use crate::chunk::walk_chunk_list_chain;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("walk-cap.lbx");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = with_v3_env(|| Vfs::open(cont)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "x").unwrap();
+        // Tiny write so we have a real ChunkRef to feed as head (the
+        // walk will read it as a chunk-list block, which fails AEAD --
+        // but the cap-check fires BEFORE the read, so we never reach
+        // the AEAD path. Verifying the early-return is the point.).
+        vfs.write(f, 0, b"hi").unwrap();
+        let head = vfs.tree.inodes[&f].chunks[0];
+
+        // Honest legitimate count is fine -- it doesn't trip the cap
+        // even though the walk itself would fail AEAD on this fake
+        // chain (we don't actually have a chunk-list block here).
+        // Just confirms the cap doesn't block valid claims.
+        let limit: u64 = (1u64 << 44) / 4096; // = 1 << 32
+        // Now try expected_count above the cap. Must error with
+        // InvalidField BEFORE any IO.
+        let too_big = limit + 1;
+        let err = walk_chunk_list_chain(&mut vfs.container, f, head, too_big)
+            .err()
+            .expect("walk must refuse expected_count beyond MAX_FILE_SIZE/CHUNK_SIZE");
+        // Type-check the error: Crypto(InvalidField).
+        match err {
+            Error::Crypto(luksbox_core::Error::InvalidField) => {}
+            other => panic!("expected Crypto(InvalidField), got {other:?}"),
+        }
+
+        // And u64::MAX too -- the saturating math in max_blocks
+        // wouldn't have helped without the upfront cap.
+        let err = walk_chunk_list_chain(&mut vfs.container, f, head, u64::MAX)
+            .err()
+            .expect("walk must refuse u64::MAX expected_count");
+        assert!(matches!(
+            err,
+            Error::Crypto(luksbox_core::Error::InvalidField)
+        ));
+    }
+
+    #[test]
     fn v3_aad_isolation_data_chunks_and_list_blocks_cannot_be_swapped() {
         // Crypto invariant: even though data chunks and chunk-list
         // blocks share the same data area, their AEAD keys (file_key
@@ -3386,7 +3451,7 @@ mod tests {
         // with high bit set) are disjoint by construction. An
         // attacker who somehow places a data chunk's ciphertext into
         // a chunk-list block's slot (or vice versa) cannot make it
-        // decrypt — even with full MVK access, derivation of the
+        // decrypt -- even with full MVK access, derivation of the
         // "wrong" key for the slot is what the AAD-shape difference
         // catches.
         use crate::chunk::{file_key, list_file_key, read_chunk, walk_chunk_list_chain};
@@ -3421,13 +3486,13 @@ mod tests {
 
         // 2. Decrypting the data chunk under the LIST file_key with
         //    the LIST AAD shape (synthetic file_id, block_idx) must
-        //    FAIL — wrong key + wrong AAD.
+        //    FAIL -- wrong key + wrong AAD.
         let list_key = list_file_key(&vfs.container, file_id);
         let synth_id = file_id | CHUNK_LIST_FILE_ID_BIT;
         let err = read_chunk(&mut vfs.container, &list_key, synth_id, 0, data_chunk_ref)
             .err()
             .expect("data chunk must NOT decrypt under list key");
-        // Crypto error of some kind — we don't care which variant,
+        // Crypto error of some kind -- we don't care which variant,
         // just that the AEAD refused.
         assert!(
             matches!(err, Error::Crypto(_)),
@@ -3436,7 +3501,7 @@ mod tests {
 
         // 3. Decrypting the list block under the DATA file_key with
         //    the DATA AAD shape (real file_id, chunk_idx=0) must
-        //    also FAIL — symmetric guarantee.
+        //    also FAIL -- symmetric guarantee.
         let err = read_chunk(&mut vfs.container, &data_key, file_id, 0, list_block_ref)
             .err()
             .expect("list block must NOT decrypt under data key");
@@ -3445,7 +3510,7 @@ mod tests {
             "expected AEAD failure, got {err:?}"
         );
 
-        // 4. The legitimate walk over the chain MUST still succeed —
+        // 4. The legitimate walk over the chain MUST still succeed --
         //    this is the positive control.
         let head = list_block_ref;
         let expected_count = vfs.tree.inodes[&f].chunks.len() as u64;

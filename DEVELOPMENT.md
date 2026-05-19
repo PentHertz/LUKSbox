@@ -251,9 +251,9 @@ scripts/clean_for_push.sh --check
 
 | Tier | Cadence | Driver |
 |---|---|---|
-| Per-PR smoke | every PR (`.github/workflows/ci.yml`) | 5 min × N libFuzzer targets |
-| Nightly | scheduled (`.github/workflows/fuzz-nightly.yml`) | 30 min × target |
-| Pre-release gate | manual before tagging | `scripts/release_fuzz.sh` (24 h × target × N forks; default 4) |
+| Per-PR smoke | every PR (`.github/workflows/ci.yml`) | 5 min x N libFuzzer targets |
+| Nightly | scheduled (`.github/workflows/fuzz-nightly.yml`) | 30 min x target |
+| Pre-release gate | manual before tagging | `scripts/release_fuzz.sh` (24 h x target x N forks; default 4) |
 | Server campaign | weekly on dedicated hardware | `scripts/fuzz_server.sh all 16 86400` (AFL++, 16 cores, 24 h) |
 
 Triage and seed-promotion procedure: [`FUZZING.md`](FUZZING.md).
@@ -266,7 +266,7 @@ Triage and seed-promotion procedure: [`FUZZING.md`](FUZZING.md).
 LUKSBOX_FIDO2_PIN=<your-pin> scripts/fido2_smoke.sh
 ```
 
-Walks four flows × six touches against a connected authenticator:
+Walks four flows x six touches against a connected authenticator:
 fido2 wrap, fido2 direct, hybrid-pq-fido2 (ML-KEM-768),
 hybrid-pq1024-fido2 (ML-KEM-1024). Non-destructive (creates fresh
 test vaults under `/tmp/luksbox-fido2-smoke/`). Burns no PIN
@@ -279,7 +279,7 @@ retries, the script will not run wrong-PIN paths.
 1. **Pre-flight on a clean checkout**:
    ```bash
    scripts/clean_for_push.sh
-   scripts/release_fuzz.sh 86400 16   # 24 h × 7 targets × 16 forks; or 3600 for a smoke
+   scripts/release_fuzz.sh 86400 16   # 24 h x 7 targets x 16 forks; or 3600 for a smoke
    scripts/fido2_smoke.sh             # if a YubiKey is at hand
    ```
 2. Update SECURITY.md §2 (supported versions) if cutting a maintenance branch.

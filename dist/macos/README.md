@@ -9,7 +9,7 @@ a `LUKSbox.app` bundle by hand.
 The hardened-runtime entitlements applied to `luksbox` and
 `luksbox-gui` inside the `.app` bundle. Two entitlements only:
 
-- `com.apple.security.cs.disable-library-validation` — required
+- `com.apple.security.cs.disable-library-validation` -- required
   because LUKSbox bundles `libfido2` and its transitive dylibs
   (`libcbor`, `libcrypto`, `libssl`) into `Contents/Frameworks/`
   via `dylibbundler`. Those dylibs are signed by us
@@ -18,7 +18,7 @@ The hardened-runtime entitlements applied to `luksbox` and
   Team ID does not match the main binary's, and the app fails
   at launch with `Library Validation failed`.
 
-- `com.apple.security.device.usb` — `libfido2` opens USB-HID
+- `com.apple.security.device.usb` -- `libfido2` opens USB-HID
   devices to talk to FIDO2 authenticators (YubiKey, Google Titan,
   SoloKey, Nitrokey). Without this entitlement, `hidd` refuses
   the `open()` call and the device list is empty.
@@ -74,6 +74,6 @@ codesign --force --timestamp --options runtime \
 codesign --verify --deep --strict --verbose=2 "$APP"
 ```
 
-Notarise via `xcrun notarytool submit … --wait` and
-`xcrun stapler staple` — see the `Notarize macOS .dmg` step
+Notarise via `xcrun notarytool submit ... --wait` and
+`xcrun stapler staple` -- see the `Notarize macOS .dmg` step
 in `.github/workflows/release.yml` for the full invocation.

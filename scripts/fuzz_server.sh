@@ -113,7 +113,7 @@ if [[ -r /proc/sys/kernel/core_pattern ]]; then
     fi
 fi
 
-# CPU governor check, performance mode gives ~1.5-2× throughput.
+# CPU governor check, performance mode gives ~1.5-2x throughput.
 if compgen -G "/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor" >/dev/null; then
     govs="$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null \
             | sort -u | tr '\n' ',' | sed 's/,$//')"

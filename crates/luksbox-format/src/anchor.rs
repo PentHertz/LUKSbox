@@ -179,7 +179,7 @@ fn build_anchor_buf(
 /// counter. Crash between temp write and rename leaves the previous
 /// anchor intact (good).
 ///
-/// For the FIRST write of a new anchor use `write_initial` — it uses
+/// For the FIRST write of a new anchor use `write_initial` -- it uses
 /// no-clobber commit semantics that refuse to follow a pre-planted
 /// symlink at `path`.
 pub fn write(
@@ -334,7 +334,7 @@ fn build_deniable_anchor_buf(
 /// cipher; the anchor uses the same AEAD.
 ///
 /// For the FIRST write of a new deniable anchor use
-/// `deniable_write_initial` — no-clobber commit semantics.
+/// `deniable_write_initial` -- no-clobber commit semantics.
 pub fn deniable_write(
     path: &Path,
     generation: u64,

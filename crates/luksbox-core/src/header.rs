@@ -59,7 +59,7 @@ const OFF_HMAC: usize = HEADER_SIZE - HMAC_LEN;
 /// Bit 0 of `Header::flags`. When set, the VFS allocates chunks for each
 /// file in power-of-2-sized buckets (1, 2, 4, 8, 16, 32, ...) instead of
 /// `ceil(size/CHUNK)`. Hides per-file chunk count from a disk-level
-/// observer (forensics, untrusted storage, etc.) within a 2× bucket.
+/// observer (forensics, untrusted storage, etc.) within a 2x bucket.
 ///
 /// On its own this leaves `Inode.size` exact in the AEAD-encrypted metadata
 /// blob, an MVK-holder still reads precise sizes. To also hide the

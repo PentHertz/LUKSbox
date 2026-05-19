@@ -214,13 +214,13 @@ random padding.
 The METADATA BLOB's encrypted plaintext starts with a 4-byte magic
 that identifies the metadata format inside the encrypted region:
 
-- `LBM\x02` ("v2") — the per-inode chunk list is stored inline as
+- `LBM\x02` ("v2") -- the per-inode chunk list is stored inline as
   `Vec<ChunkRef>` inside the postcard-encoded directory tree. Every
   ChunkRef costs ~4-6 varint bytes inside the metadata budget; a
   vault with many large files runs out of budget around 8-10 GiB
   total stored content at the default 16 MiB region size.
-- `LBM\x03` ("v3", opt-in) — inodes whose chunk count exceeds
-  `V3_INLINE_CHUNK_THRESHOLD` (1024 chunks ≈ 4 MiB file) carry a
+- `LBM\x03` ("v3", opt-in) -- inodes whose chunk count exceeds
+  `V3_INLINE_CHUNK_THRESHOLD` (1024 chunks ~ 4 MiB file) carry a
   `chunks_external = Some((head, count))` field instead, pointing
   at the **chunk-list block chain** described below. Inodes under
   the threshold stay inline (same wire shape as v2).
@@ -235,7 +235,7 @@ Old binaries presented with an `LBM\x03` blob fail with a clean
 
 Each chunk-list block is a regular 4 KiB encrypted chunk in the
 data area whose AEAD key and AAD are derived from a **synthetic
-file_id** — the real `file_id` with the high bit set:
+file_id** -- the real `file_id` with the high bit set:
 
 ```
 list_file_id(F)     = F | (1 << 63)
@@ -245,7 +245,7 @@ list_block_AAD(F,i) = list_file_id(F) || block_idx_u32(i) || generation_u64
 
 Real file_ids are allocated from `ROOT_ID + 1 = 2` upward
 sequentially. The vault would need 2⁶³ files for a real ID to enter
-the reserved range — physically impossible — so the high bit safely
+the reserved range -- physically impossible -- so the high bit safely
 disambiguates the two chunk kinds. `Vfs::validate_metadata_tree`
 additionally refuses any tree whose `next_file_id >= 1 << 63` as
 defense in depth.
@@ -255,7 +255,7 @@ The 4 KiB plaintext layout of a chunk-list block:
 ```
 +----------------------------------------------------------------+
 | 0..4     u32 LE  count (0..=254)                               |
-| 4..N     count × ChunkRef (16 B each: id_u64 || gen_u64)       |
+| 4..N     count x ChunkRef (16 B each: id_u64 || gen_u64)       |
 | N..N+16  next ChunkRef (or zero if last block in chain)        |
 | N+16..   random padding (12 B)                                 |
 +----------------------------------------------------------------+
@@ -566,7 +566,7 @@ The three layers are:
 
 | Layer | Width | Where it lives | Failure mode it defends against |
 |---|---|---|---|
-| **Random nonce** | 96 bits | Prepended to ciphertext on disk; fresh `OsRng` draw on every `write_chunk` (`crates/luksbox-vfs/src/chunk.rs:88-91`). | Two encryptions of the same chunk slot at different times use independent nonces. Without this, AES-GCM nonce reuse leaks the keystream and the GHASH key — a catastrophic break of confidentiality and integrity. |
+| **Random nonce** | 96 bits | Prepended to ciphertext on disk; fresh `OsRng` draw on every `write_chunk` (`crates/luksbox-vfs/src/chunk.rs:88-91`). | Two encryptions of the same chunk slot at different times use independent nonces. Without this, AES-GCM nonce reuse leaks the keystream and the GHASH key -- a catastrophic break of confidentiality and integrity. |
 | **Binding AAD** | 20 bytes (never on disk) | Reconstructed at read time from `file_id ‖ chunk_idx ‖ generation` (`crates/luksbox-vfs/src/chunk.rs:35-44`). The AAD itself isn't stored, only its effect on the AEAD tag is. | Cut-and-paste / chunk-shuffling: an attacker swapping chunk 7 of file A onto chunk 12 of file B fails the AEAD tag because `file_id` and `chunk_idx` no longer match. Replay of an older version of the *same* slot fails because the inode now records a higher `generation` than the saved AAD bytes. |
 | **Per-file derived key** | 256 bits | `file_key = HKDF-Expand(MVK, info = "lbx:file/v1:" ‖ file_id_le, len = 32)` (`crates/luksbox-vfs/src/chunk.rs:125-130`). | The MVK never directly encrypts user data. Even a hypothetical nonce collision *within* one file leaves every other file untouched, and the same file_key is structurally never derivable for two distinct `file_id` values. |
 
@@ -574,10 +574,10 @@ The three layers are:
 
 - Removing the **per-file key** would let a within-vault nonce
   collision affect every file at once. With it, the birthday bound
-  on random 96-bit nonces (≈ 2⁴⁸ writes for 2⁻³² collision
+  on random 96-bit nonces (~ 2⁴⁸ writes for 2⁻³² collision
   probability under AES-GCM) is **per file**, not vault-wide. The
   default cipher suite, AES-256-GCM-SIV, makes this even safer:
-  GCM-SIV is misuse-resistant — a nonce collision under GCM-SIV
+  GCM-SIV is misuse-resistant -- a nonce collision under GCM-SIV
   reveals only that two messages had the same plaintext, never the
   keystream or the GHASH key. Vaults created with the legacy
   `Aes256Gcm` suite still inherit the original NIST bound (2³² writes
@@ -607,7 +607,7 @@ The three layers are:
 - **Does not protect against vault-wide rollback:** an attacker
   with read+write access to the `.lbx` who saves a snapshot at time
   T0 and restores it wholesale at time T1 sees every chunk, every
-  AAD field, and every generation counter consistent with T0 — by
+  AAD field, and every generation counter consistent with T0 -- by
   design. The `.anchor` sidecar (§3 listing, §17) closes this gap
   by storing the current vault generation under a separate MAC and
   having `Container::open` cross-check it. Without the anchor, the
@@ -1405,7 +1405,7 @@ per file).
 
 For the consolidated breakdown of why the chunk layer combines a
 random nonce, a binding AAD, **and** a per-file derived key, see
-**§3.9 Per-chunk encryption layering** — that's the canonical
+**§3.9 Per-chunk encryption layering** -- that's the canonical
 reference for the three-layer property and what each layer does
 and does not defend against.
 

@@ -41,7 +41,7 @@ cryptographic break in the stolen-vault / no-unlock-factor model.
 
 ### HIGH
 
-**R13-01 — plaintext extraction still has an intermediate-directory
+**R13-01 -- plaintext extraction still has an intermediate-directory
 symlink/TOCTOU overwrite path.**
 `crates/luksbox-core/src/file_util.rs::secure_create_or_truncate`
 applies `O_NOFOLLOW` to the FINAL component only. Intermediate
@@ -59,11 +59,11 @@ parent with `O_DIRECTORY` BEFORE the final basename open. The
 basename is then resolved against the directory inode we already
 inspected, not against the path the caller supplied. Closes the
 intermediate-symlink swap window. Residual race
-(canonicalize → parent_fd open) is documented in the comment and
+(canonicalize -> parent_fd open) is documented in the comment and
 deferred to a future Linux-only `openat2(RESOLVE_NO_SYMLINKS)`
 pass.
 
-**R13-02 — inline header restore verifies one path, then reopens the
+**R13-02 -- inline header restore verifies one path, then reopens the
 vault path unsafely.**
 `crates/luksbox-cli/src/main.rs::cmd_header_restore` opens the
 container to HMAC-verify the new header under the current MVK,
@@ -84,7 +84,7 @@ passes `O_NOFOLLOW` on Unix and rejects reparse points on Windows.
 
 ### MEDIUM
 
-**R13-03 — hide-size real-size metadata is trusted enough to panic
+**R13-03 -- hide-size real-size metadata is trusted enough to panic
 readers.**
 `crates/luksbox-vfs/src/vfs.rs::validate_metadata_tree` checks that
 `inode.size == chunks.len() * CHUNK_PLAINTEXT_SIZE` in `hide_size`
@@ -104,7 +104,7 @@ reject when the decoded u64 exceeds
 `Error::MetadataDeserialize` for the offending file before the
 value reaches the cache.
 
-**R13-04 — normal header mutations are not durably committed.**
+**R13-04 -- normal header mutations are not durably committed.**
 `crates/luksbox-format/src/container.rs::persist_header` uses
 `flush()` (returns from kernel page cache) rather than `sync_all()`
 (commits to stable storage). Detached headers are overwritten in
@@ -117,7 +117,7 @@ detached path goes through `atomic_secure_write` (temp+fsync+rename
 + sync_parent_dir), then re-opens the lock handle to the new inode
 so subsequent persists are against the new sidecar.
 
-**R13-05 — `.kyber` seed reads follow symlinks and read unbounded
+**R13-05 -- `.kyber` seed reads follow symlinks and read unbounded
 data before size validation.**
 `crates/luksbox-pq/src/seed_file.rs::read` calls `fs::read(path)`,
 which (a) follows symlinks (no `O_NOFOLLOW`), (b) reads the entire
@@ -131,7 +131,7 @@ Fix scope: open with `O_NOFOLLOW` on Unix and
 Windows; `stat` first and require a regular file of exactly
 `FILE_LEN` bytes; then `read_exact`.
 
-**R13-06 — hybrid sidecar reads are also unbounded.**
+**R13-06 -- hybrid sidecar reads are also unbounded.**
 `crates/luksbox-format/src/hybrid_sidecar.rs::read_sidecar_bytes`
 on Unix uses `O_NOFOLLOW` (good) but `read_to_end` with no upper
 bound. Non-Unix takes a plain `fs::read`. A hostile sidecar at
@@ -144,7 +144,7 @@ about 25 KiB), then `read_exact`. Windows path mirrors the
 `secure_create_or_truncate` reparse-point rejection and the same
 size cap.
 
-**R13-07 — VFS write/truncate permits pathological logical sizes.**
+**R13-07 -- VFS write/truncate permits pathological logical sizes.**
 `crates/luksbox-vfs/src/vfs.rs::write` /`::truncate` compute
 `padded_chunk_count(required_chunks(new_real, hide_size),
 padding_on)` without a vault-wide max-file-size guard. A buggy
@@ -162,7 +162,7 @@ with a new `Error::FileSizeExceedsCap` variant.
 
 ### LOW
 
-**R13-08 — FUSE read allocates the requester-provided size directly.**
+**R13-08 -- FUSE read allocates the requester-provided size directly.**
 `crates/luksbox-mount/src/fuse.rs::read` does `vec![0u8; size as
 usize]` where `size: u32` comes from the kernel. FUSE normally
 caps `size` at the negotiated `max_read` value, but defence in
@@ -174,9 +174,9 @@ Fix scope: cap `size` at 16 MiB internally before the vec
 allocation. Larger reads get truncated to the cap (the kernel
 re-issues for the remainder).
 
-**R13-09 — secret-copy hygiene still leaves avoidable stack copies.**
+**R13-09 -- secret-copy hygiene still leaves avoidable stack copies.**
 `crates/luksbox-core/src/secret_box.rs::Clone for SecretBox` goes
-through `Self::from_bytes(*self.as_array())` — the deref produces
+through `Self::from_bytes(*self.as_array())` -- the deref produces
 a `[u8; KEY_LEN]` by-value temporary on the caller's stack before
 the new SecretBox absorbs it. Same shape pattern (less avoidable
 without a `from_zeroizing`-style constructor on every type) at a
@@ -185,7 +185,7 @@ arrays.
 
 Fix scope: rewrite `SecretBox::clone` to allocate a fresh
 secret-memory backing first, then `copy_from_slice` directly from
-one allocator-owned region to the other — no stack-resident
+one allocator-owned region to the other -- no stack-resident
 `[u8; 32]` ever exists. Keyslot call sites adopt
 `MasterVolumeKey::from_zeroizing` / `KeyEncryptionKey::from_zeroizing`
 already introduced in R12-17 wherever the bytes are held in
@@ -193,7 +193,7 @@ already introduced in R12-17 wherever the bytes are held in
 
 ### INFO
 
-**R13-INFO-1 — one accepted unmaintained dependency remains.**
+**R13-INFO-1 -- one accepted unmaintained dependency remains.**
 `cargo audit` reports only RUSTSEC-2025-0026 for `registry 1.3.0`,
 via `winfsp_wrs_sys -> winfsp_wrs -> luksbox-mount`. Already
 documented in `audit.toml:19`; no exploitable CVE has been filed
@@ -234,15 +234,15 @@ cargo test --test round13_seed_file -p luksbox-pq
 
 | ID | Severity | Status | Fix location |
 |---|---|---|---|
-| R13-01 | HIGH | **Fixed** | `crates/luksbox-core/src/file_util.rs::secure_create_or_truncate` — Unix path uses `openat(parent_dir_fd, basename, O_RDWR\|O_CREAT\|O_TRUNC\|O_NOFOLLOW, 0600)` against a canonical parent fd; permission narrowed via `fchmod` on the open fd. Windows path keeps `FILE_FLAG_OPEN_REPARSE_POINT` + `FILE_ATTRIBUTE_REPARSE_POINT` rejection. |
-| R13-02 | HIGH | **Fixed** | `crates/luksbox-format/src/container.rs::restore_header_bytes` + `crates/luksbox-cli/src/main.rs::cmd_header_restore` — inline path reuses container's verified `self.file`; detached path goes through `atomic_secure_write`. `--no-verify` direct write path adds `O_NOFOLLOW` + Windows reparse-point rejection. |
+| R13-01 | HIGH | **Fixed** | `crates/luksbox-core/src/file_util.rs::secure_create_or_truncate` -- Unix path uses `openat(parent_dir_fd, basename, O_RDWR\|O_CREAT\|O_TRUNC\|O_NOFOLLOW, 0600)` against a canonical parent fd; permission narrowed via `fchmod` on the open fd. Windows path keeps `FILE_FLAG_OPEN_REPARSE_POINT` + `FILE_ATTRIBUTE_REPARSE_POINT` rejection. |
+| R13-02 | HIGH | **Fixed** | `crates/luksbox-format/src/container.rs::restore_header_bytes` + `crates/luksbox-cli/src/main.rs::cmd_header_restore` -- inline path reuses container's verified `self.file`; detached path goes through `atomic_secure_write`. `--no-verify` direct write path adds `O_NOFOLLOW` + Windows reparse-point rejection. |
 | R13-03 | MEDIUM | **Fixed** | `crates/luksbox-vfs/src/vfs.rs::real_size` clamps chunk-0 size header against allocated capacity; values past `chunks.len() * CHUNK_PLAINTEXT_SIZE - SIZE_HEADER_LEN` return `Error::MetadataDeserialize`. |
 | R13-04 | MEDIUM | **Fixed** | `crates/luksbox-format/src/container.rs::persist_header` uses `sync_all()` on inline + deniable, `atomic_secure_write` on detached, then re-opens the lock handle to the new inode. |
 | R13-05 | MEDIUM | **Fixed** | `crates/luksbox-pq/src/seed_file.rs::read` opens with `O_NOFOLLOW` (Unix) / reparse-point rejection (Windows), requires a regular file of exactly `FILE_LEN`, `read_exact`. |
 | R13-06 | MEDIUM | **Fixed** | `crates/luksbox-format/src/hybrid_sidecar.rs::read_sidecar_bytes` preflight `metadata().len() <= 32 KiB`, regular-file required, Windows path adds reparse-point rejection. |
-| R13-07 | MEDIUM | **Fixed** | `crates/luksbox-vfs/src/vfs.rs` — new `MAX_FILE_SIZE = 1 << 44` constant, `Error::FileSizeExceedsCap` variant, gated in both `write()` and `truncate()`. |
+| R13-07 | MEDIUM | **Fixed** | `crates/luksbox-vfs/src/vfs.rs` -- new `MAX_FILE_SIZE = 1 << 44` constant, `Error::FileSizeExceedsCap` variant, gated in both `write()` and `truncate()`. |
 | R13-08 | LOW | **Fixed** | `crates/luksbox-mount/src/fuse.rs::read` caps the requester-supplied `size` at 16 MiB before the vec allocation. |
-| R13-09 | LOW | **Fixed** | `crates/luksbox-core/src/secret_box.rs::Clone for SecretBox` allocates a fresh `SecretBox` and `copy_from_slice`s directly from one secret-memory backing to the other — no by-value `[u8; KEY_LEN]` temporary. |
+| R13-09 | LOW | **Fixed** | `crates/luksbox-core/src/secret_box.rs::Clone for SecretBox` allocates a fresh `SecretBox` and `copy_from_slice`s directly from one secret-memory backing to the other -- no by-value `[u8; KEY_LEN]` temporary. |
 | R13-INFO-1 | INFO | **Documented** | `audit.toml:19` already ignores RUSTSEC-2025-0026 with rationale. No action this round. |
 
 ## Next steps
@@ -251,6 +251,6 @@ cargo test --test round13_seed_file -p luksbox-pq
 - Future hardening for `secure_create_or_truncate`: switch the
   Linux path to `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH)`
   when available (Linux ≥ 5.6) to close the residual
-  canonicalize→parent_fd race. Tracked as a follow-up.
+  canonicalize->parent_fd race. Tracked as a follow-up.
 - Round 14 scope to be driven by the planned external pentest
   engagement (see `SECURITY.md` Tier 1).

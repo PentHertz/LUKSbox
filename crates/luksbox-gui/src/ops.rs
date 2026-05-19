@@ -6,7 +6,7 @@
 //! happen elsewhere). Each long op spawns a `std::thread`, returns a
 //! `Receiver` the UI polls every frame.
 
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
@@ -2759,7 +2759,8 @@ fn unlock_with_fido2(
 ) -> Result<Container, String> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID};
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src).map_err(estr)?;
+    let mut f =
+        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes).map_err(estr)?;
     drop(f);
@@ -2817,7 +2818,8 @@ fn unlock_with_tpm2(path: &Path, header_path: Option<&Path>) -> Result<Container
     // friendly rather than "TPM unsealed something but it didn't
     // match anything".
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src).map_err(estr)?;
+    let mut f =
+        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes).map_err(estr)?;
     drop(f);
@@ -2876,7 +2878,8 @@ fn unlock_with_tpm2_fido2(
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src).map_err(estr)?;
+    let mut f =
+        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes).map_err(estr)?;
     drop(f);
@@ -2966,7 +2969,8 @@ fn unlock_with_hybrid_pq_tpm2(
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src).map_err(estr)?;
+    let mut f =
+        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes).map_err(estr)?;
     drop(f);
@@ -3072,7 +3076,8 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src).map_err(estr)?;
+    let mut f =
+        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes).map_err(estr)?;
     drop(f);
@@ -3251,7 +3256,8 @@ fn unlock_with_hybrid_pq_fido2(
     use luksbox_pq::seed_file;
 
     let header_src = header_path.unwrap_or(path);
-    let mut f = std::fs::File::open(header_src).map_err(estr)?;
+    let mut f =
+        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes).map_err(estr)?;
     drop(f);
@@ -3458,33 +3464,48 @@ pub fn panic_destroy(
     header_path: Option<&Path>,
     wipe_data: bool,
 ) -> Result<(), String> {
-    if !vault.is_file() {
-        return Err(format!("{} is not a file", vault.display()));
-    }
+    use luksbox_core::file_util::secure_open_existing_no_follow;
+    // No-follow opens for both targets BEFORE any write, closing
+    // the TOCTOU window where a symlink swap in the parent dir
+    // could redirect the random-bytes overwrite to an arbitrary
+    // file (e.g. /etc/shadow if the GUI is somehow running as
+    // root, or the user's own SSH keys if not).
     let header_target = header_path.unwrap_or(vault);
-    let mut hf = OpenOptions::new()
-        .write(true)
-        .open(header_target)
-        .map_err(estr)?;
+    let mut hf = secure_open_existing_no_follow(header_target).map_err(|e| {
+        format!(
+            "refusing to open {} for destructive overwrite: {e}",
+            header_target.display()
+        )
+    })?;
+    let mut vf_opt = if wipe_data && header_target != vault {
+        Some(
+            secure_open_existing_no_follow(vault)
+                .map_err(|e| format!("refusing to open {} for data wipe: {e}", vault.display()))?,
+        )
+    } else {
+        None
+    };
+    let len_hint = std::fs::metadata(vault).map(|m| m.len()).unwrap_or(0);
+
     let mut buf = [0u8; HEADER_SIZE];
     OsRng.fill_bytes(&mut buf);
     hf.seek(SeekFrom::Start(0)).map_err(estr)?;
     hf.write_all(&buf).map_err(estr)?;
     hf.flush().map_err(estr)?;
     if wipe_data {
-        let mut vf = OpenOptions::new().write(true).open(vault).map_err(estr)?;
-        let len = std::fs::metadata(vault).map_err(estr)?.len();
-        vf.seek(SeekFrom::Start(0)).map_err(estr)?;
+        let writer: &mut std::fs::File = vf_opt.as_mut().unwrap_or(&mut hf);
+        let len = len_hint;
+        writer.seek(SeekFrom::Start(0)).map_err(estr)?;
         let mut chunk = vec![0u8; 1 << 20];
         let mut written = 0u64;
         while written < len {
             OsRng.fill_bytes(&mut chunk);
             let to_write = ((len - written) as usize).min(chunk.len());
-            vf.write_all(&chunk[..to_write]).map_err(estr)?;
+            writer.write_all(&chunk[..to_write]).map_err(estr)?;
             written += to_write as u64;
         }
-        vf.flush().map_err(estr)?;
-        let _ = vf.sync_all();
+        writer.flush().map_err(estr)?;
+        let _ = writer.sync_all();
     }
     Ok(())
 }
@@ -4315,7 +4336,8 @@ fn unlock_with_tpm2_pin(
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src).map_err(estr)?;
+    let mut f =
+        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes).map_err(estr)?;
     drop(f);
@@ -4481,13 +4503,13 @@ pub fn rotate_mvk_passphrase_only(
 /// richer credential modal and is deferred.
 ///
 /// The user must supply the SAME Argon2 params they picked at create
-/// time (deniable vaults don't persist the KDF params on disk —
+/// time (deniable vaults don't persist the KDF params on disk --
 /// that would be a beacon). The GUI's rotate-MVK form passes the
 /// currently-selected `KdfStrength` here; if it doesn't match what
 /// was used at create, the slot envelope rebuild will succeed but
 /// SUBSEQUENT unlocks with the saved KDF preset will fail until the
 /// user picks the right one. (Note: this is a latent issue for the
-/// envelope-only rewrap too — adding a real-time verification step
+/// envelope-only rewrap too -- adding a real-time verification step
 /// during rotation is on the roadmap.)
 fn rotate_mvk_deniable_passphrase_only(
     vfs: &mut Vfs,
@@ -4505,7 +4527,7 @@ fn rotate_mvk_deniable_passphrase_only(
     let (supplied_idx, passphrase) = creds.into_iter().next().unwrap();
 
     // The slot we MUST rotate is the one the open ceremony unlocked
-    // — that's the only envelope whose credentials we have. Refuse
+    // -- that's the only envelope whose credentials we have. Refuse
     // a mismatch instead of silently re-wrapping a different slot.
     let unlocked_idx = vfs
         .container()

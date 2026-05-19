@@ -100,7 +100,7 @@ cd "$WORK"
 
 info "luksbox binary: $BIN"
 info "test work dir:  $WORK"
-info "expected total touches: ~10 (5 enrolls × ~2 each, varies by mode)"
+info "expected total touches: ~10 (5 enrolls x ~2 each, varies by mode)"
 echo
 
 # ---- Test 1: fido2 wrap mode --------------------------------------------

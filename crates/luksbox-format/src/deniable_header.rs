@@ -103,7 +103,7 @@ const _: () = assert!(DENIABLE_HEADER_SIZE == 36864);
 const _: () = assert!(INNER_PLAINTEXT_LEN == 4036);
 
 /// Serialised size of the inner header's public fields. Stable
-/// on-disk shape — also stable on the wire when the GUI hands off
+/// on-disk shape -- also stable on the wire when the GUI hands off
 /// deniable state to the FUSE-T mount helper subprocess.
 pub const DENIABLE_INNER_HEADER_SERIALIZED_LEN: usize = 38;
 

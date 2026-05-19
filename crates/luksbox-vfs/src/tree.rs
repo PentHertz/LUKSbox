@@ -27,7 +27,7 @@ pub const CHUNK_LIST_FILE_ID_BIT: FileId = 1 << 63;
 /// blocks in v3 metadata format. Files at or below this size keep
 /// their `ChunkRef` list inline inside the metadata region (fast,
 /// no extra reads on open); files above spill to a chain of encrypted
-/// chunk-list blocks in the data area. 1024 chunks at 4 KiB ≈ 4 MiB,
+/// chunk-list blocks in the data area. 1024 chunks at 4 KiB ~ 4 MiB,
 /// chosen so the cumulative inline cost across many small files
 /// never blows the metadata region but tiny files don't pay an
 /// extra-read penalty per access.

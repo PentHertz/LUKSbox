@@ -196,7 +196,7 @@
              MSI WriteEnvironmentStrings WM_SETTINGCHANGE broadcast
              is unreliably honored by recent Windows builds. So we
              ALSO copy winfsp-x64.dll next to luksbox.exe via the
-             WinFspDllSibling component below — the app directory is
+             WinFspDllSibling component below -- the app directory is
              the FIRST entry in the loader search order and is
              checked before PATH, so first-launch works regardless
              of whether explorer ever picks up the new PATH. -->
@@ -225,7 +225,7 @@
         <!-- First-launch race fix: even with PATH updated above,
              explorer's env cache lags behind the registry write and
              a shortcut clicked right after install spawns a process
-             that inherits stale PATH → STATUS_DLL_NOT_FOUND. The
+             that inherits stale PATH -> STATUS_DLL_NOT_FOUND. The
              Windows DLL search order ALWAYS checks the application
              directory FIRST (before PATH), so dropping a copy of
              winfsp-x64.dll there means the loader finds it

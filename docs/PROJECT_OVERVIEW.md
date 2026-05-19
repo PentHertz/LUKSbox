@@ -247,19 +247,19 @@ Existing V1/V2 vaults remain readable; new slots default to V3.
 
 | Property                              | LUKSbox          | VeraCrypt           | LUKS2 / cryptsetup | age              | Cryptomator       | gocryptfs         |
 |---------------------------------------|------------------|---------------------|--------------------|------------------|-------------------|-------------------|
-| **Single-file vault**                 | ✅               | ✅                  | ✅ (with detached) | ✅               | ❌ (per-file)     | ❌ (per-file)     |
-| **Hardware-key support**              | FIDO2 (CTAP2)    | YubiKey HMAC-SHA1   | systemd-cryptenroll FIDO2 | ❌        | ❌                | ❌                |
-| **Post-quantum hybrid**               | ✅ ML-KEM-768/1024 | ❌                | ❌ (LUKS3 planned) | ❌ [1]             | ❌                | ❌                |
-| **Detached header**                   | ✅               | ✅                  | ✅                 | n/a              | ❌                | ❌                |
-| **Rollback detection (anchor)**       | ✅               | ❌                  | ❌                 | ❌               | ❌                | ❌                |
-| **Per-chunk AEAD with replay AAD**    | ✅ (file_id||idx||gen, default GCM-SIV) | XTS (no AAD)    | XTS (no AAD)       | n/a              | per-chunk AES-GCM | per-chunk AES-GCM |
-| **memfd_secret for MVK**              | ✅ (Linux >= 5.14)| ❌                  | ✅ (kernel keyring)| n/a              | ❌                | ❌                |
-| **Crash-safe master-key rotation**    | ✅               | ❌                  | ✅                 | n/a              | ❌                | ❌                |
-| **Open source**                       | ✅               | ✅                  | ✅                 | ✅               | ✅                | ✅                |
-| **Pure memory-safe language**         | ✅ Rust          | ❌ C/C++            | ❌ C               | ✅ Go            | ❌ Java + JNI     | ✅ Go             |
+| **Single-file vault**                 |               |                  | (with detached) |               | (per-file)     | (per-file)     |
+| **Hardware-key support**              | FIDO2 (CTAP2)    | YubiKey HMAC-SHA1   | systemd-cryptenroll FIDO2 |        |                |                |
+| **Post-quantum hybrid**               | ML-KEM-768/1024 |                | (LUKS3 planned) | [1]             |                |                |
+| **Detached header**                   |               |                  |                 | n/a              |                |                |
+| **Rollback detection (anchor)**       |               |                  |                 |               |                |                |
+| **Per-chunk AEAD with replay AAD**    | (file_id||idx||gen, default GCM-SIV) | XTS (no AAD)    | XTS (no AAD)       | n/a              | per-chunk AES-GCM | per-chunk AES-GCM |
+| **memfd_secret for MVK**              | (Linux >= 5.14)|                  | (kernel keyring)| n/a              |                |                |
+| **Crash-safe master-key rotation**    |               |                  |                 | n/a              |                |                |
+| **Open source**                       |               |                  |                 |               |                |                |
+| **Pure memory-safe language**         | Rust          | C/C++            | C               | Go            | Java + JNI     | Go             |
 | **`unsafe` Rust surface**             | 1,400 LOC [2]    | n/a                 | n/a                | n/a              | n/a               | n/a               |
-| **Single-file format with mount**     | ✅ FUSE          | ✅ block device     | ✅ block device    | ❌               | ✅ FUSE / Dokany  | ✅ FUSE           |
-| **Audit log in-tree**                 | ✅ 7 rounds      | not in repo         | upstream papers    | ❌               | external          | external          |
+| **Single-file format with mount**     | FUSE          | block device     | block device    |               | FUSE / Dokany  | FUSE           |
+| **Audit log in-tree**                 | 7 rounds      | not in repo         | upstream papers    |               | external          | external          |
 
 [1] age supports plugin-based PQ via `age-plugin-yubikey` and similar
 external tooling, but no native ML-KEM hybrid.
@@ -515,7 +515,7 @@ caught.
 
 ## 9. When LUKSbox is the right pick
 
-✅ **Yes**, choose LUKSbox if:
+**Yes**, choose LUKSbox if:
 
 - You want a single-file encrypted vault for offline use
   (USB-stick, cloud-storage object, separate backup drive).
@@ -528,7 +528,7 @@ caught.
   bolted on by user practice.
 - You're on Linux or macOS (Windows port exists but is less tested).
 
-❌ **No**, look elsewhere if:
+**No**, look elsewhere if:
 
 - You need plausible-deniability hidden volumes -> VeraCrypt.
 - You need full-disk encryption -> LUKS2 / cryptsetup.

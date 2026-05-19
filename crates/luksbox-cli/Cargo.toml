@@ -111,7 +111,7 @@ path = "examples/passphrase_crack.rs"
 
 [package.metadata.deb]
 name = "luksbox"
-maintainer = "Penthertz <sebastien.dudek@penthertz.com>"
+maintainer = "Penthertz <security@penthertz.com>"
 copyright = "2026, Penthertz <https://penthertz.com>"
 # No `license-file` on purpose. The workspace SPDX id
 # `Apache-2.0` (in [workspace.package].license) lets cargo-deb 3.x
@@ -166,7 +166,7 @@ assets = [
     # Binaries. The literal `target/release/` prefix is a cargo-deb
     # sentinel: it auto-rewrites to `target/<triple>/<profile>/<bin>`
     # at packaging time (here `target/<triple>/release-hardened/`).
-    # Don't expand it manually — the literal expanded path is NOT
+    # Don't expand it manually -- the literal expanded path is NOT
     # detected as a Cargo build artifact and the asset lookup fails.
     ["target/release/luksbox",     "usr/bin/luksbox",     "755"],
     ["target/release/luksbox-gui", "usr/bin/luksbox-gui", "755"],
@@ -211,7 +211,7 @@ url = "https://github.com/penthertz/LUKSbox"
 # (no-packager-tag). "Applications/System" is the closest standard
 # Fedora group for system-utility CLIs / file-system managers.
 group = "Applications/System"
-packager = "Penthertz <sebastien.dudek@penthertz.com>"
+packager = "Penthertz <security@penthertz.com>"
 vendor = "Penthertz"
 # No `requires` line. cargo-generate-rpm's default `--auto-req auto`
 # scans the ELF binaries for DT_NEEDED entries and emits the
@@ -275,6 +275,6 @@ assets = [
 # of these tables and writes them into the CHANGELOG_* RPM tags.
 # Date format is RPM's "%a %b %d %Y" (e.g. "Wed May 06 2026").
 [[package.metadata.generate-rpm.changelog]]
-author = "Penthertz <sebastien.dudek@penthertz.com>"
+author = "Penthertz <security@penthertz.com>"
 time = "Wed May 06 2026"
 text = "- 0.1.0-1: initial public release."

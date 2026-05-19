@@ -114,7 +114,7 @@ jobs:
           # - target: x86_64-apple-darwin
           #   runner: macos-13         # last Intel macOS runner
           #   archive: luksbox-${{ github.ref_name }}-x86_64-macos.tar.gz
-          # macOS Apple Silicon, two parallel builds — one per FUSE
+          # macOS Apple Silicon, two parallel builds -- one per FUSE
           # backend. Each runner installs ONLY the matching provider
           # (no fallback) and produces a backend-suffixed .dmg + .tar.gz.
           # End users on the download page pick the variant matching
@@ -151,7 +151,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Include fuse_backend so the two macOS variants (fuset /
-          # macfuse) don't share a cache slot — they link different
+          # macfuse) don't share a cache slot -- they link different
           # libfuse families so cached artifacts would poison each
           # other. Empty for non-macOS targets, no behavior change.
           key: ${{ matrix.target }}-${{ matrix.fuse_backend }}

@@ -230,7 +230,7 @@ fn main() {
 
         // Tail layout the harness expects: rest[0] = pass len,
         // rest[1..] = passphrase, rest[257] = cipher byte (=0 here,
-        // which maps to Aes256GcmSiv — matches what we created with).
+        // which maps to Aes256GcmSiv -- matches what we created with).
         let mut tail = vec![0u8; 64];
         tail[0] = pass.len() as u8;
         tail[1..1 + pass.len()].copy_from_slice(pass);

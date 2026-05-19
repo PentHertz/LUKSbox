@@ -168,7 +168,7 @@ fn run_daemonized(fs: LuksboxFs, mountpoint: &Path, config: Config) -> std::io::
             // the mountpoint above) won't be visible here. Users can
             // verify by running `mount | grep luksbox` or by listing
             // the mountpoint.
-            eprintln!("✓ mounting {} (pid {n})", mountpoint.display());
+            eprintln!("mounting {} (pid {n})", mountpoint.display());
             eprintln!("  unmount: luksbox umount {}", mountpoint.display());
             std::process::exit(0);
         }
@@ -429,7 +429,7 @@ fn errno(e: &VfsError) -> Errno {
         // hold any more chunk references) and triggers the
         // "no space left on device" message users already know.
         VfsError::MetadataBudgetExhausted => Errno::ENOSPC,
-        // File-size cap is "exceeds the maximum file size" → EFBIG.
+        // File-size cap is "exceeds the maximum file size" -> EFBIG.
         VfsError::FileSizeExceedsCap => Errno::EFBIG,
         _ => Errno::EIO,
     }

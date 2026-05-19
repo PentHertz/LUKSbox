@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: luksbox
-Upstream-Contact: Penthertz <sebastien.dudek@penthertz.com>
+Upstream-Contact: Penthertz <security@penthertz.com>
 Source: https://github.com/penthertz/LUKSbox
 
 Files: *

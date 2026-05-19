@@ -388,7 +388,7 @@ enum Command {
         ///   than v2 (a 100 GiB single-file vault touches ~100k
         ///   chunk-list blocks at open).
         /// - Old LUKSbox binaries (pre-v0.2.0) cannot read v3
-        ///   vaults — they refuse the `LBM\x03` metadata magic.
+        ///   vaults -- they refuse the `LBM\x03` metadata magic.
         ///
         /// Default v2 stays the default; v3 is opt-in until
         /// deniable + fuzz coverage land in a later release. Once
@@ -753,7 +753,7 @@ enum Command {
     /// Reads the source vault, creates a new vault at `--dst` with
     /// the same cipher / KDF / keyslots / data, then writes it in
     /// v3 format. The source vault is left untouched (no in-place
-    /// migration — too risky on a format change). After verifying
+    /// migration -- too risky on a format change). After verifying
     /// the destination opens cleanly the user can delete the source.
     ///
     /// Requires the unlock material for the source vault. The
@@ -1402,7 +1402,12 @@ fn read_header_bytes(path: &Path, offset: u64) -> Result<([u8; HEADER_SIZE], Hea
 }
 
 fn cmd_header_backup(vault: &Path, out: &Path, header_sidecar: Option<&Path>) -> Result<()> {
-    use std::io::Write as _;
+    // Pre-check is advisory only -- the commit step
+    // (`atomic_secure_create_new` -> POSIX `link(2)` / Windows
+    // `MoveFileExW(0)`) is the actual no-clobber barrier and is
+    // race-free. Keep the pre-check so the user gets the friendly
+    // "already exists" message in the common case instead of the
+    // io::ErrorKind::AlreadyExists bubbling up from the commit.
     if out.exists() {
         return Err(format!(
             "output file {} already exists; refusing to overwrite an earlier backup",
@@ -1412,15 +1417,17 @@ fn cmd_header_backup(vault: &Path, out: &Path, header_sidecar: Option<&Path>) ->
     }
     let (src, offset) = resolve_header_location(vault, header_sidecar);
     let (bytes, parsed) = read_header_bytes(&src, offset)?;
-    // Mode 0600 on Unix, no symlink follow at the final component
-    // (matches the same hardening cmd_get applies to plaintext exports).
-    let mut dst = luksbox_core::file_util::secure_create_or_truncate(out)
-        .map_err(|e| format!("creating {}: {e}", out.display()))?;
-    dst.write_all(&bytes)
+    // atomic_secure_create_new: race-free no-clobber via
+    // POSIX `link(2)` / Windows `MoveFileExW(0)`. Replaces the
+    // earlier `secure_create_or_truncate` path which was vulnerable
+    // to a TOCTOU between the `out.exists()` check above and the
+    // create: an attacker who created `out` in the window would
+    // have had it truncated by the create. The atomic variant
+    // fails the rename if the destination has appeared since the
+    // pre-check, regardless of whether it's a regular file or a
+    // symlink to elsewhere.
+    luksbox_core::file_util::atomic_secure_create_new(out, &bytes)
         .map_err(|e| format!("writing {}: {e}", out.display()))?;
-    dst.flush()
-        .map_err(|e| format!("flushing {}: {e}", out.display()))?;
-    drop(dst);
     println!(
         "wrote {} bytes from {} to {}",
         HEADER_SIZE,
@@ -2302,7 +2309,7 @@ fn open_container(path: &Path, unlock: &UnlockArgs) -> Result<Container> {
         //   --fido2      > hybrid-pq-fido2
         //   default      > hybrid-pq-passphrase
         let header_src = unlock.header.as_deref().unwrap_or(path);
-        let mut f = File::open(header_src)?;
+        let mut f = luksbox_core::file_util::open_existing_read_no_follow_policy(header_src)?;
         let mut buf = [0u8; HEADER_SIZE];
         f.read_exact(&mut buf)?;
         drop(f);
@@ -2363,7 +2370,7 @@ fn open_container_hybrid_pq_fido2(
     use luksbox_pq::seed_file;
 
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src)?;
+    let mut f = luksbox_core::file_util::open_existing_read_no_follow_policy(header_src)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes)?;
     drop(f);
@@ -2554,7 +2561,7 @@ fn open_container_fido2(path: &Path, header_path: Option<&Path>) -> Result<Conta
 
     // Read header (from sidecar if --header given, else from vault file).
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src)?;
+    let mut f = luksbox_core::file_util::open_existing_read_no_follow_policy(header_src)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes)?;
     drop(f);
@@ -2633,7 +2640,7 @@ fn open_container_tpm2(path: &Path, header_path: Option<&Path>) -> Result<Contai
     // the (potentially slow) TPM open. Same pattern as the FIDO2
     // helper above.
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src)?;
+    let mut f = luksbox_core::file_util::open_existing_read_no_follow_policy(header_src)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes)?;
     drop(f);
@@ -2742,7 +2749,7 @@ fn open_container_tpm2_fido2(path: &Path, header_path: Option<&Path>) -> Result<
     // Pre-scan header for any Tpm2Fido2 slot before doing TPM /
     // FIDO2 setup work.
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src)?;
+    let mut f = luksbox_core::file_util::open_existing_read_no_follow_policy(header_src)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes)?;
     drop(f);
@@ -2857,7 +2864,7 @@ fn open_container_hybrid_pq_tpm2(
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src)?;
+    let mut f = luksbox_core::file_util::open_existing_read_no_follow_policy(header_src)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes)?;
     drop(f);
@@ -2946,7 +2953,7 @@ fn open_container_hybrid_pq_tpm2_fido2(
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src)?;
+    let mut f = luksbox_core::file_util::open_existing_read_no_follow_policy(header_src)?;
     let mut header_bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut header_bytes)?;
     drop(f);
@@ -4714,6 +4721,26 @@ fn cmd_mount(
     #[cfg(not(target_os = "windows"))]
     let (mp_abs, probe_inode) = mp_abs;
 
+    // LUKSBOX_NO_FOLLOW_SYMLINKS preflight: refuse a symlinked vault
+    // path BEFORE canonicalize() resolves it. Without this, the user
+    // passes `/tmp/symlink.lbx`, canonicalize() expands it to the
+    // real target, and the no-follow check inside `open_rw_checked`
+    // (which sees the canonical path, not the user's symlink) never
+    // fires -- silent policy bypass. The check below mirrors the one
+    // at the top of `open_rw_checked` so behavior is consistent
+    // whether the user supplied the path directly or via a flag.
+    #[cfg(unix)]
+    if std::env::var_os("LUKSBOX_NO_FOLLOW_SYMLINKS").is_some()
+        && std::fs::symlink_metadata(path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+    {
+        return Err(format!(
+            "path {} is a symlink and LUKSBOX_NO_FOLLOW_SYMLINKS=1 is set",
+            path.display()
+        )
+        .into());
+    }
     let path_abs = path
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
@@ -4868,6 +4895,36 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
     #[cfg(not(unix))]
     let mp_abs: std::path::PathBuf = mountpoint.to_path_buf();
 
+    // Same LUKSBOX_NO_FOLLOW_SYMLINKS preflight as cmd_mount: refuse
+    // a symlinked vault/header BEFORE canonicalize() resolves it.
+    #[cfg(unix)]
+    {
+        let no_follow = std::env::var_os("LUKSBOX_NO_FOLLOW_SYMLINKS").is_some();
+        if no_follow
+            && std::fs::symlink_metadata(vault)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+        {
+            return Err(format!(
+                "vault {} is a symlink and LUKSBOX_NO_FOLLOW_SYMLINKS=1 is set",
+                vault.display()
+            )
+            .into());
+        }
+        if let Some(hp) = header {
+            if no_follow
+                && std::fs::symlink_metadata(hp)
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(false)
+            {
+                return Err(format!(
+                    "header {} is a symlink and LUKSBOX_NO_FOLLOW_SYMLINKS=1 is set",
+                    hp.display()
+                )
+                .into());
+            }
+        }
+    }
     let vault_abs = vault
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", vault.display()))?;
@@ -4905,7 +4962,7 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
     //     bytes 66..104:  serialised DeniableInnerHeader (38 bytes)
     //
     // Why v2 exists: deniable vaults have no plaintext magic and no
-    // standard HMAC header — `Container::open_with_mvk` always fails
+    // standard HMAC header -- `Container::open_with_mvk` always fails
     // with "invalid magic bytes". The parent already decrypted the
     // inner header with the user's credential; the helper can't
     // re-derive it from just the MVK, so the parent hands the
@@ -5231,17 +5288,37 @@ fn cmd_deniable_mount(
     let argon2_params = parse_deniable_argon2(m, t, p)?;
     let cred = parse_cli_den_cred(credential)?;
 
+    // Same hardened mountpoint check as `cmd_mount`: open with
+    // `O_DIRECTORY | O_NOFOLLOW` so the kernel atomically refuses
+    // symlinks (a `is_dir()` + later `canonicalize()` pattern is
+    // TOCTOU-racy -- an attacker writable parent dir could swap a
+    // real directory for a symlink to a sensitive path between the
+    // is_dir() check and the canonicalize). The deny-list +
+    // post-open inode re-probe protect the residual race between
+    // our drop(fd) and the kernel's mount-path lookup.
     #[cfg(not(target_os = "windows"))]
     let mp_abs: std::path::PathBuf = {
-        if !mountpoint.is_dir() {
-            return Err(cli_err!(
-                "mountpoint {} is not a directory",
-                mountpoint.display()
-            ));
-        }
-        mountpoint
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let probe = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(mountpoint)
+            .map_err(|e| {
+                let kind = if e.raw_os_error() == Some(libc::ELOOP) {
+                    "is a symbolic link (refused: open the underlying directory directly)"
+                } else if e.raw_os_error() == Some(libc::ENOTDIR) {
+                    "is not a directory"
+                } else {
+                    "could not be opened"
+                };
+                cli_err!("mountpoint {} {kind}: {e}", mountpoint.display())
+            })?;
+        drop(probe);
+        let canonical = mountpoint
             .canonicalize()
-            .map_err(|e| cli_err!("cannot resolve {}: {e}", mountpoint.display()))?
+            .map_err(|e| cli_err!("cannot resolve {}: {e}", mountpoint.display()))?;
+        validate_mountpoint_safety(mountpoint, &canonical)?;
+        canonical
     };
     #[cfg(target_os = "windows")]
     let mp_abs: std::path::PathBuf = mountpoint.to_path_buf();
@@ -6444,14 +6521,37 @@ fn cmd_panic(
     wipe_data: bool,
     skip_confirm: bool,
 ) -> Result<()> {
+    use luksbox_core::file_util::secure_open_existing_no_follow;
     use rand_core::{OsRng, RngCore};
-    use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write};
 
-    if !vault.is_file() {
-        return Err(format!("{} is not a file", vault.display()).into());
-    }
+    // Open the destructive targets FIRST, with no-follow semantics,
+    // and hold the handles across the confirmation prompt. This
+    // eliminates the TOCTOU window where a `vault.is_file()` check
+    // (which follows symlinks) followed by a confirmation prompt
+    // and a later `OpenOptions::open(...)` (which also follows
+    // symlinks) would let an attacker with write access to the
+    // parent directory swap in a symlink and redirect the random-
+    // bytes overwrite to an arbitrary file (e.g. /etc/shadow if
+    // luksbox runs as root). The open holds the inode for the
+    // duration of the prompt; even if the path is later renamed,
+    // our writes still land in the originally-opened file.
     let header_target = header_path.unwrap_or(vault);
+    let mut hf = secure_open_existing_no_follow(header_target).map_err(|e| {
+        format!(
+            "refusing to open {} for destructive overwrite: {e}",
+            header_target.display()
+        )
+    })?;
+    let mut vf_opt = if wipe_data && header_target != vault {
+        Some(
+            secure_open_existing_no_follow(vault)
+                .map_err(|e| format!("refusing to open {} for data wipe: {e}", vault.display()))?,
+        )
+    } else {
+        None
+    };
+    let len_hint = std::fs::metadata(vault).map(|m| m.len()).unwrap_or(0);
 
     if !skip_confirm {
         eprintln!(
@@ -6461,7 +6561,7 @@ fn cmd_panic(
         if wipe_data {
             eprintln!(
                 "       ALSO overwriting the entire vault file ({} bytes).",
-                std::fs::metadata(vault).map(|m| m.len()).unwrap_or(0)
+                len_hint
             );
         }
         eprintln!("   This is IRREVERSIBLE. There is NO undo. There is NO recovery.");
@@ -6474,25 +6574,26 @@ fn cmd_panic(
             return Err("aborted".into());
         }
     }
-    let mut hf = OpenOptions::new().write(true).open(header_target)?;
     let mut buf = [0u8; HEADER_SIZE];
     OsRng.fill_bytes(&mut buf);
     hf.seek(SeekFrom::Start(0))?;
     hf.write_all(&buf)?;
     hf.flush()?;
     if wipe_data {
-        let mut vf = OpenOptions::new().write(true).open(vault)?;
-        let len = std::fs::metadata(vault)?.len();
-        vf.seek(SeekFrom::Start(0))?;
+        // Inline-header case: vf_opt is None, reuse hf for the full
+        // wipe. Detached-header case: write through vf_opt which
+        // was opened above with the same no-follow semantics.
+        let writer: &mut std::fs::File = vf_opt.as_mut().unwrap_or(&mut hf);
+        writer.seek(SeekFrom::Start(0))?;
         let mut chunk = vec![0u8; 1 << 20];
         let mut written = 0u64;
-        while written < len {
+        while written < len_hint {
             OsRng.fill_bytes(&mut chunk);
-            let n = ((len - written) as usize).min(chunk.len());
-            vf.write_all(&chunk[..n])?;
+            let n = ((len_hint - written) as usize).min(chunk.len());
+            writer.write_all(&chunk[..n])?;
             written += n as u64;
         }
-        let _ = vf.sync_all();
+        let _ = writer.sync_all();
     }
     println!("done.");
     Ok(())

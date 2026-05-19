@@ -1107,8 +1107,23 @@ impl Container {
             return Err(Error::Crypto(luksbox_core::Error::InvalidField));
         }
 
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        // Route through `open_rw_checked` so this path honors
+        // `LUKSBOX_NO_FOLLOW_SYMLINKS=1` (refuses if `path` is a
+        // symlink) and captures the canonical path + inode for the
+        // post-lock TOCTOU re-verification, matching the standard
+        // (non-deniable) open. A direct `OpenOptions::open` would
+        // silently follow a symlink and skip the path-substitution
+        // check.
+        let (mut file, file_inode, canonical_path) = open_rw_checked(path, None)?;
         lock_handles(&[(&file, path)])?;
+        // Post-lock TOCTOU re-verification: between the open above
+        // and the lock just taken, an attacker who can write to the
+        // parent directory could have renamed a different file over
+        // `path`. Our handle still points at the originally-opened
+        // inode, locked, but the path now resolves to a different
+        // file. Refuse with `PathSubstituted` so the user can
+        // investigate. Mirrors the same check in `load_locked_header`.
+        verify_path_inode(&canonical_path, file_inode)?;
 
         let mut header_buf = vec![0u8; DENIABLE_HEADER_SIZE];
         file.read_exact(&mut header_buf)
@@ -1178,12 +1193,32 @@ impl Container {
         })
     }
 
-    /// v2 deniable MVK rotation. Generates a fresh per-vault salt
-    /// and MVK, re-installs each kept slot under the new salt as a
-    /// v2 two-layer envelope. Slots not in `keep_slots` get fresh
-    /// `OsRng` bytes so a before/after diff of the on-disk header
-    /// reveals nothing about which slots were occupied (security
-    /// invariant #4).
+    /// **Envelope-only** deniable MVK rotation. Generates a fresh
+    /// per-vault salt and MVK, re-installs each kept slot under the
+    /// new salt as a v2 two-layer envelope. Slots not in
+    /// `keep_slots` get fresh `OsRng` bytes so a before/after diff
+    /// of the on-disk header reveals nothing about which slots were
+    /// occupied (security invariant #4).
+    ///
+    /// **SAFETY**: this entry point ONLY rewraps the slot envelope.
+    /// It does NOT re-encrypt chunks, chunk-list blocks (v3), or the
+    /// metadata blob under the new MVK. Calling this on a vault that
+    /// already has user content leaves those bytes encrypted under
+    /// the OLD MVK's file_keys, and the vault becomes unreadable on
+    /// next open. The guard at the top of this function rejects such
+    /// calls with `Error::DeniableRotationRequiresEmptyVault`.
+    ///
+    /// **For non-empty deniable vaults use
+    /// [`luksbox_vfs::Vfs::rotate_mvk_deniable`] instead** -- it pairs
+    /// the envelope rewrap with a full chunk + chunk-list-block +
+    /// metadata re-encryption.
+    ///
+    /// Legitimate use cases for this direct entry point are narrow:
+    ///   - immediately after `create_with_credential_v2_deniable` to
+    ///     re-randomize the slot envelope before any data is written
+    ///     (e.g., for deterministic-test setup);
+    ///   - low-level format tests that drive rotation without going
+    ///     through the Vfs.
     ///
     /// `keep_slots = [(slot_idx, credential, material)]`. Caller is
     /// responsible for re-supplying every credential's secondary
@@ -1199,6 +1234,54 @@ impl Container {
     ///
     /// On error the Container is left untouched.
     pub fn rotate_mvk_v2_deniable(
+        &mut self,
+        keep_slots: &[(
+            usize,
+            &luksbox_core::deniable::DeniableCredential,
+            &crate::deniable_header::DeniableMaterial,
+        )],
+    ) -> Result<MasterVolumeKey, Error> {
+        // Footgun guard: refuse if the vault has any user content.
+        // The metadata blob is empty exactly when no Vfs::flush has
+        // ever happened -- i.e. no files have been written. Any
+        // non-empty blob means there are chunks on disk that this
+        // envelope-only rotation would NOT re-encrypt under the new
+        // MVK, leaving the vault unreadable on next open.
+        //
+        // The check is cheap (one AEAD decrypt of the metadata
+        // region) and runs BEFORE any state mutation, so the
+        // refusal is fully atomic -- caller sees a typed error and
+        // the container is unchanged.
+        //
+        // Read uses the CURRENT MVK + salt (the rotation hasn't
+        // started yet); the plaintext is dropped immediately, only
+        // its length matters here.
+        let pt_len = self.read_metadata()?.len();
+        if pt_len > 0 {
+            return Err(Error::DeniableRotationRequiresEmptyVault);
+        }
+        // Empty-vault path: delegate to the unguarded primitive.
+        self.rotate_mvk_v2_deniable_envelope_only(keep_slots)
+    }
+
+    /// Envelope-only rotation primitive **without** the
+    /// empty-vault guard. Used by
+    /// [`luksbox_vfs::Vfs::rotate_mvk_deniable`], which couples this
+    /// call with a chunk + chunk-list-block + metadata
+    /// re-encryption pass under the new MVK to deliver a full
+    /// rotation. The Vfs wrapper has its own atomicity envelope
+    /// (`begin_atomic_rotation` / `commit_atomic_rotation`) so a
+    /// crash between this call and the chunk-rekey loop leaves the
+    /// original vault intact.
+    ///
+    /// **DO NOT CALL THIS DIRECTLY** unless you have a chunk-rekey
+    /// loop ready to follow. Calling this and then opening the
+    /// vault will fail because the chunks are still encrypted under
+    /// the OLD MVK. The guarded public entry point
+    /// `rotate_mvk_v2_deniable` is the one external code should
+    /// reach for; this is `pub` only because cross-crate access from
+    /// `luksbox-vfs` is needed.
+    pub fn rotate_mvk_v2_deniable_envelope_only(
         &mut self,
         keep_slots: &[(
             usize,
@@ -1530,11 +1613,11 @@ impl Container {
     ///
     /// The parent process that already unlocked the vault must
     /// therefore hand the helper:
-    ///   - `mvk` — the recovered MVK,
-    ///   - `per_vault_salt` — first 32 B of the on-disk file (public,
+    ///   - `mvk` -- the recovered MVK,
+    ///   - `per_vault_salt` -- first 32 B of the on-disk file (public,
     ///     but needed to derive any secondary keys),
-    ///   - `inner` — the already-decrypted public layout fields,
-    ///   - `unlocked_slot_idx` — which slot's envelope the parent
+    ///   - `inner` -- the already-decrypted public layout fields,
+    ///   - `unlocked_slot_idx` -- which slot's envelope the parent
     ///     opened (used for downstream enroll/rotate refusals).
     ///
     /// On disk: re-opens `path` with `O_RDWR`, takes the exclusive
@@ -1545,7 +1628,7 @@ impl Container {
     ///
     /// `header_path` is rejected with `InvalidField`: deniable vaults
     /// store the header inline by definition (every byte must look
-    /// uniformly random — a detached header file would be a
+    /// uniformly random -- a detached header file would be a
     /// distinguishability beacon).
     pub fn open_with_mvk_deniable(
         path: &Path,
@@ -1564,8 +1647,13 @@ impl Container {
             return Err(Error::Crypto(luksbox_core::Error::InvalidField));
         }
 
-        let mut file = OpenOptions::new().read(true).write(true).open(path)?;
+        // Same hardening as `try_open_envelope_v2_deniable` and the
+        // standard `open_with_mvk` -- go through `open_rw_checked` so
+        // `LUKSBOX_NO_FOLLOW_SYMLINKS` and the post-lock inode
+        // re-verification apply to this deniable open path too.
+        let (mut file, file_inode, canonical_path) = open_rw_checked(path, None)?;
         lock_handles(&[(&file, path)])?;
+        verify_path_inode(&canonical_path, file_inode)?;
 
         let mut header_buf = Box::new([0u8; DENIABLE_HEADER_SIZE]);
         file.read_exact(header_buf.as_mut_slice())
@@ -1624,7 +1712,7 @@ impl Container {
 
     /// Snapshot of the open-deniable state needed to hand off to a
     /// mount-helper subprocess. Returns `None` for standard (non-
-    /// deniable) containers. The MVK is NOT included — the caller
+    /// deniable) containers. The MVK is NOT included -- the caller
     /// already has it via `mvk_clone()`. The salt, inner header, and
     /// slot index together are the minimum a helper needs to re-open
     /// the same vault image without re-running envelope discovery.
@@ -4618,6 +4706,108 @@ mod tests {
                 .err()
                 .unwrap();
         assert!(matches!(err, Error::OpaqueUnlockFailed));
+    }
+
+    #[test]
+    fn deniable_rotate_mvk_v2_refuses_non_empty_vault() {
+        // Footgun guard: rotate_mvk_v2_deniable does an envelope-only
+        // rewrap. Calling it on a vault that has chunks would silently
+        // corrupt the vault (chunks stay encrypted under the OLD MVK).
+        // The guard must refuse with DeniableRotationRequiresEmptyVault
+        // before any state mutation, pointing the caller at
+        // Vfs::rotate_mvk_deniable which does the full re-encryption.
+        use crate::deniable_header::DeniableMaterial;
+        use crate::metadata;
+        use luksbox_core::deniable::DeniableCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nonempty.lbx");
+        let cred = DeniableCredential::Passphrase {
+            passphrase: b"pw",
+            argon2: cheap_argon2(),
+        };
+        let mut c = Container::create_with_passphrase_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            cheap_argon2(),
+            0,
+            b"pw",
+        )
+        .unwrap();
+        // Simulate a flush by writing a non-empty metadata blob.
+        // The real Vfs::flush would write the postcard-encoded tree
+        // here; any non-empty plaintext triggers the guard.
+        c.write_metadata(b"LBM\x02fake-tree-bytes").unwrap();
+        let mvk_before = c.mvk_clone();
+        let salt_before = c.header.header_salt;
+
+        let err = c
+            .rotate_mvk_v2_deniable(&[(0, &cred, &DeniableMaterial::passphrase_only())])
+            .err()
+            .expect("guard must refuse rotation on non-empty deniable vault");
+        assert!(
+            matches!(err, Error::DeniableRotationRequiresEmptyVault),
+            "expected DeniableRotationRequiresEmptyVault, got {err:?}"
+        );
+        // Container state must be untouched.
+        assert_eq!(c.mvk_clone().as_bytes(), mvk_before.as_bytes());
+        assert_eq!(c.header.header_salt, salt_before);
+        // And we can still read the (fake) metadata back -- proving
+        // the guard didn't touch on-disk state either.
+        let _ = metadata::read_metadata(
+            c.header.cipher_suite,
+            &c.mvk_clone(),
+            &c.header.header_salt,
+            // Just call read_metadata to confirm the AEAD still verifies:
+            &{
+                let mut region = vec![0u8; c.header.metadata_size as usize];
+                use std::io::{Read, Seek, SeekFrom};
+                c.file
+                    .seek(SeekFrom::Start(c.header.metadata_offset))
+                    .unwrap();
+                c.file.read_exact(&mut region).unwrap();
+                region
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn deniable_rotate_mvk_v2_envelope_only_skips_guard() {
+        // The unguarded primitive used by Vfs::rotate_mvk_deniable
+        // must still work on non-empty vaults -- it's the building
+        // block of the full rotation path. This test pins that
+        // the rename + split didn't accidentally re-add the guard.
+        use crate::deniable_header::DeniableMaterial;
+        use luksbox_core::deniable::DeniableCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nonempty2.lbx");
+        let cred = DeniableCredential::Passphrase {
+            passphrase: b"pw",
+            argon2: cheap_argon2(),
+        };
+        let mut c = Container::create_with_passphrase_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            cheap_argon2(),
+            0,
+            b"pw",
+        )
+        .unwrap();
+        c.write_metadata(b"non-empty-fake").unwrap();
+        let mvk_before = c.mvk_clone();
+        // Should succeed (no guard on this primitive). The caller
+        // is responsible for re-encrypting chunks afterward; this
+        // test only validates the entry point.
+        let new_mvk = c
+            .rotate_mvk_v2_deniable_envelope_only(&[(
+                0,
+                &cred,
+                &DeniableMaterial::passphrase_only(),
+            )])
+            .expect("envelope-only primitive must succeed on non-empty vault");
+        assert_ne!(new_mvk.as_bytes(), mvk_before.as_bytes());
     }
 
     #[test]

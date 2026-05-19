@@ -25,15 +25,15 @@ question is which API surface to wire up.
 
 | Path | Pros | Cons | Verdict |
 |---|---|---|---|
-| **A. `tss-esapi 8.0.0-alpha.2` + `TctiNameConf::Tbs`** | Same Rust API as Linux. The `Tpm2Sealer` impl already works against `Tcti::Tbs`; on-disk slot bytes are byte-identical between Linux and Windows. A vault sealed with the same chip on either OS would unseal on either OS. | tss-esapi 8.0 is alpha (3-year-old alpha line, alpha.2 published 2026-02-26 after a 2-year gap). Requires `tpm2-tss` ≥ 4.1.3 — drops Debian 12, Ubuntu 22.04/24.04 LTS, RHEL 9 unless we ship the `bundled` feature (vendored static link, +5 MB binary, needs C toolchain at build time). | **Recommended once tss-esapi 8.0 stable lands**, OR sooner if we accept the alpha risk. |
-| **B. `windows` crate + NCrypt + Microsoft Platform Crypto KSP** | Most idiomatic Microsoft API; what BitLocker / Windows Hello use internally. No tpm2-tss dependency at all. | Entirely separate code path from Linux. Different on-disk wire format (NCrypt PCP key blobs ≠ TPM2B blobs), so a vault sealed on Windows with the same TPM model wouldn't unseal on Linux. Breaks the cross-platform-vault-portability principle. | Not recommended — the wire-format split is a worse user-facing outcome than no Windows TPM at all. |
-| **C. Direct raw FFI bypass via `tss-esapi-sys`** | Stays on tss-esapi 7.7 stable; no alpha-crate risk. | Hundreds of lines of unsafe C-FFI to construct an Esys context manually around `Tss2_TctiLdr_Initialize_Ex(b"tcti-tbs\0", ...)`. Untestable from any non-Windows dev box. Maintenance burden. | Not recommended — the cost vs. just waiting for tss-esapi 8.0 stable is wrong. |
+| **A. `tss-esapi 8.0.0-alpha.2` + `TctiNameConf::Tbs`** | Same Rust API as Linux. The `Tpm2Sealer` impl already works against `Tcti::Tbs`; on-disk slot bytes are byte-identical between Linux and Windows. A vault sealed with the same chip on either OS would unseal on either OS. | tss-esapi 8.0 is alpha (3-year-old alpha line, alpha.2 published 2026-02-26 after a 2-year gap). Requires `tpm2-tss` ≥ 4.1.3 -- drops Debian 12, Ubuntu 22.04/24.04 LTS, RHEL 9 unless we ship the `bundled` feature (vendored static link, +5 MB binary, needs C toolchain at build time). | **Recommended once tss-esapi 8.0 stable lands**, OR sooner if we accept the alpha risk. |
+| **B. `windows` crate + NCrypt + Microsoft Platform Crypto KSP** | Most idiomatic Microsoft API; what BitLocker / Windows Hello use internally. No tpm2-tss dependency at all. | Entirely separate code path from Linux. Different on-disk wire format (NCrypt PCP key blobs ≠ TPM2B blobs), so a vault sealed on Windows with the same TPM model wouldn't unseal on Linux. Breaks the cross-platform-vault-portability principle. | Not recommended -- the wire-format split is a worse user-facing outcome than no Windows TPM at all. |
+| **C. Direct raw FFI bypass via `tss-esapi-sys`** | Stays on tss-esapi 7.7 stable; no alpha-crate risk. | Hundreds of lines of unsafe C-FFI to construct an Esys context manually around `Tss2_TctiLdr_Initialize_Ex(b"tcti-tbs\0", ...)`. Untestable from any non-Windows dev box. Maintenance burden. | Not recommended -- the cost vs. just waiting for tss-esapi 8.0 stable is wrong. |
 
 ### Path A specifics (when we go)
 
 Code changes in `crates/luksbox-tpm/src/real.rs` are tiny:
 
-1. One import-line rename: `interface_types::resource_handles` →
+1. One import-line rename: `interface_types::resource_handles` ->
    `interface_types::reserved_handles`. `Hierarchy` is otherwise
    unchanged.
 2. New `cfg(target_os = "windows")` arm in `Tpm2Sealer::new()` that
@@ -45,7 +45,7 @@ Code changes in `crates/luksbox-tpm/src/real.rs` are tiny:
    confirmed by an attempted migration (rolled back; see "Lessons
    from the failed migration attempt" below).
 
-`Cargo.toml` changes — **DO NOT do the simple version-bump alone**:
+`Cargo.toml` changes -- **DO NOT do the simple version-bump alone**:
 
 The naive change `tss-esapi = "8.0.0-alpha.2"` makes default
 `cargo build` BREAK on Debian 12, Ubuntu 22.04/24.04 LTS, RHEL 9,
@@ -91,7 +91,7 @@ CI (release.yml + ci.yml):
 - Linux job: switch to `--features hardware` only on runners that
   ship modern tpm2-tss (Debian 13 / Ubuntu 24.10+ when GitHub
   starts offering them), otherwise `--features bundled-tpm`. As of
-  2026-05, GitHub's Ubuntu 24.04 ships 4.0.1 → use `bundled-tpm`.
+  2026-05, GitHub's Ubuntu 24.04 ships 4.0.1 -> use `bundled-tpm`.
 - Windows job: `--features bundled-tpm`. Build needs `clang`
   (LLVM) on the runner; install via `choco install llvm`.
 - macOS job: stay on `--features hardware` for the FIDO2 part if
@@ -111,7 +111,7 @@ problem with tss-esapi 8.0 itself:
   `cargo build` start requiring `tpm2-tss >= 4.1.3` for ANYONE,
   including users who don't care about TPM and just want FIDO2
   unlock. On Ubuntu 22.04/24.04 LTS the build then dies with
-  `Failed to find tss2-sys library of version 4.1.3 or greater` —
+  `Failed to find tss2-sys library of version 4.1.3 or greater` --
   including this dev box (Ubuntu 24.04, tpm2-tss 4.0.1) and the
   GitHub Ubuntu 24.04 runners.
 - **The fix**: the feature reorganization shown above. `default =
@@ -132,13 +132,13 @@ Distro-floor bump (4.1.3 minimum tpm2-tss):
 
 | Distro | tpm2-tss | OK with 8.0 directly? |
 |---|---|---|
-| Debian 13 trixie | 4.1.x | ✓ |
-| Ubuntu 24.10+ | 4.1.x | ✓ |
-| Fedora 40+ | 4.1.x | ✓ |
-| Arch rolling | 4.1.x | ✓ |
-| **Debian 12 bookworm** | 4.0.1 | ❌ — needs `bundled-tpm` |
-| **Ubuntu 22.04 / 24.04 LTS** | 3.2.0 / 4.0.1 | ❌ — needs `bundled-tpm` |
-| **RHEL 9** | 3.0.3 | ❌ — needs `bundled-tpm` |
+| Debian 13 trixie | 4.1.x | |
+| Ubuntu 24.10+ | 4.1.x | |
+| Fedora 40+ | 4.1.x | |
+| Arch rolling | 4.1.x | |
+| **Debian 12 bookworm** | 4.0.1 | -- needs `bundled-tpm` |
+| **Ubuntu 22.04 / 24.04 LTS** | 3.2.0 / 4.0.1 | -- needs `bundled-tpm` |
+| **RHEL 9** | 3.0.3 | -- needs `bundled-tpm` |
 
 Estimated effort: **~1 day** focused work + a Windows VM smoke test
 (the swtpm CI suite proves the Linux path is unchanged; Windows TBS
@@ -151,19 +151,19 @@ A common confusion: "Windows TPM access needs signed binaries." **It
 does not.** The signing question on Windows is about two unrelated
 things:
 
-- **Authenticode signing** — what we already do for the MSI installer
+- **Authenticode signing** -- what we already do for the MSI installer
   to make SmartScreen trust the download. Doesn't gate any runtime
   capability; just a UX hint to the user.
-- **Protected Process Light (PPL)** — process memory isolation that
+- **Protected Process Light (PPL)** -- process memory isolation that
   prevents other processes (including admin ones) from reading our
   RAM. The Windows analog of Linux's `memfd_secret`. PPL DOES require
   a Microsoft-issued cert that's only available to AV vendors. We're
-  NOT using PPL — that's a future-improvements item separate from TPM
+  NOT using PPL -- that's a future-improvements item separate from TPM
   access, tracked in the Tier 3 list of `SECURITY.md`.
 
 Neither is involved in calling `tcti-tbs.dll` to seal/unseal data.
 Any user-mode app, no admin, no elevation, no special cert. The
-same applies to NCrypt + Platform Crypto KSP — also no signing
+same applies to NCrypt + Platform Crypto KSP -- also no signing
 required, despite the misconception.
 
 ---
@@ -184,7 +184,7 @@ Intel Macs. Distinct from TPM in:
 
 A `SlotKind::SepSealed` variant would mirror `Tpm2Sealed` at the
 format-layer level. The closure-based `UnlockMaterial::Tpm2`
-abstraction we use for Linux can be reused for SEP — same shape:
+abstraction we use for Linux can be reused for SEP -- same shape:
 "give me an opaque blob, return 32 bytes."
 
 Estimated effort: ~2 weeks (different API surface, manual signing
@@ -208,7 +208,7 @@ Trade-offs:
 - **Pro**: vault refuses to open if the boot chain has been tampered
   (someone swapped your kernel for a backdoored one).
 - **Con**: legitimate kernel/initramfs/firmware updates change PCR
-  values, so the user must re-enroll the slot after every update —
+  values, so the user must re-enroll the slot after every update --
   bad UX.
 - **Mitigation**: systemd-cryptenroll's approach uses
   PCR-policy-signing: a long-lived signing key authorises "any of
@@ -243,12 +243,12 @@ proving "I am chip X, at boot state Y." Useful in two scenarios:
 Estimated effort: ~3 weeks (EK cert validation, CA chain handling,
 out-of-band verification UX, separate from the wrap path).
 
-Probably not worth it for v1.x — pushes too much complexity onto the
+Probably not worth it for v1.x -- pushes too much complexity onto the
 user without a clearly distinct threat-model gain over PCR sealing.
 
 ---
 
-## 5. Recovery UX: "the TPM died" — better than today
+## 5. Recovery UX: "the TPM died" -- better than today
 
 Today, if a user's TPM chip dies and they only have a `Tpm2Sealed`
 slot, the vault is unrecoverable. The wizard + GUI both warn about
@@ -263,7 +263,7 @@ Improvements still worth shipping:
   they need it.
 - **Pre-revoke check**: if the user clicks "Revoke slot N" and that
   slot is the LAST non-TPM slot, hard-fail with "this would leave
-  the vault TPM-only and unrecoverable on chip failure" — let them
+  the vault TPM-only and unrecoverable on chip failure" -- let them
   override only after explicitly typing the vault path.
 - **Chip-replacement migration wizard**: one-shot CLI/GUI flow
   "I'm migrating to a new machine, unwrap with the backup
@@ -308,7 +308,7 @@ Estimated effort: ~2 hours.
 ### Windows
 - Status: not implemented. See section 1 above.
 - Workaround for users: every other LUKSbox keyslot kind works on
-  Windows today (passphrase, FIDO2 wrap/direct, hybrid-PQ ×4).
+  Windows today (passphrase, FIDO2 wrap/direct, hybrid-PQ x4).
   Windows Hello via webauthn.dll routes through the platform's
   TPM-backed authenticator, so a `Fido2HmacSecret` slot enrolled
   with `--fido2-device windows://hello` is implicitly TPM-anchored
@@ -316,7 +316,7 @@ Estimated effort: ~2 hours.
 
 ### macOS
 - Status: not implemented. See section 2 above.
-- Workaround: same as Windows — passphrase / FIDO2 / hybrid-PQ all
+- Workaround: same as Windows -- passphrase / FIDO2 / hybrid-PQ all
   work; FIDO2 with a hardware authenticator is the closest analog
   to Linux's TPM slot until Secure Enclave wrapping ships.
 
@@ -326,15 +326,15 @@ Estimated effort: ~2 hours.
 
 Based on user impact and implementation cost:
 
-1. **Section 6** (CLI 1024 flags) — 2 hours, useful for scripted
+1. **Section 6** (CLI 1024 flags) -- 2 hours, useful for scripted
    enrollment. Ship anytime.
-2. **Section 1 path A** (Windows TPM via tss-esapi 8.0) — 1 day,
+2. **Section 1 path A** (Windows TPM via tss-esapi 8.0) -- 1 day,
    wait for 8.0 stable OR ship now with alpha-pin if there's user
    demand.
-3. **Section 5** (recovery UX) — 1 week, improves the safety story
+3. **Section 5** (recovery UX) -- 1 week, improves the safety story
    for everyone.
-4. **Section 3** (PCR sealing, opt-in) — 1 week, advanced users
+4. **Section 3** (PCR sealing, opt-in) -- 1 week, advanced users
    only.
-5. **Section 2** (macOS Secure Enclave) — 2 weeks, blocked on
+5. **Section 2** (macOS Secure Enclave) -- 2 weeks, blocked on
    Apple Developer enrollment.
-6. **Section 4** (attestation) — 3 weeks, niche threat-model gain.
+6. **Section 4** (attestation) -- 3 weeks, niche threat-model gain.

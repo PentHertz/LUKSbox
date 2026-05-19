@@ -357,7 +357,7 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
     // files via out-of-line chunk-list blocks; the blocks are
     // encrypted chunks like any other so the deniability
     // (every-byte-looks-random) story is preserved. Choice is
-    // permanent for the vault — you must remember it alongside the
+    // permanent for the vault -- you must remember it alongside the
     // cipher + KDF params.
     let format_choice = Select::with_theme(theme)
         .with_prompt("On-disk metadata format (you must remember this choice)")
@@ -1326,20 +1326,17 @@ fn ask_optional_seed_pw(
 /// vault path, optional sidecar header path, and uses the same shred
 /// procedure as `panic_action`.
 fn panic_by_path(theme: &ColorfulTheme) -> Result<()> {
+    use luksbox_core::file_util::secure_open_existing_no_follow;
+    use rand_core::{OsRng, RngCore};
+    use std::io::{Seek, SeekFrom, Write};
+
     let vault = ask_path(theme, "Path to vault to destroy")?;
-    if !vault.is_file() {
-        return Err(format!("{} is not a file", vault.display()).into());
-    }
-    let header_target = if Confirm::with_theme(theme)
+    let detached = Confirm::with_theme(theme)
         .with_prompt("Does this vault use a detached header (sidecar)?")
         .default(false)
-        .interact()?
-    {
-        let p = ask_path(theme, "Path to the sidecar header file")?;
-        if !p.is_file() {
-            return Err(format!("{} is not a file", p.display()).into());
-        }
-        p
+        .interact()?;
+    let header_target = if detached {
+        ask_path(theme, "Path to the sidecar header file")?
     } else {
         vault.clone()
     };
@@ -1347,6 +1344,30 @@ fn panic_by_path(theme: &ColorfulTheme) -> Result<()> {
         .with_prompt("ALSO overwrite the entire vault data area? (slow)")
         .default(false)
         .interact()?;
+
+    // Open the destructive targets BEFORE the confirmation prompt
+    // with no-follow semantics. Closes the TOCTOU window where an
+    // attacker who controls the parent dir could swap in a symlink
+    // between the path-resolution and the open, redirecting the
+    // random-bytes overwrite to /etc/shadow or similar. Holding
+    // the handles across the prompt also prevents a path-rename
+    // race during user interaction.
+    let mut hf = secure_open_existing_no_follow(&header_target).map_err(|e| {
+        format!(
+            "refusing to open {} for destructive overwrite: {e}",
+            header_target.display()
+        )
+    })?;
+    let mut vf_opt = if wipe_data && header_target != vault {
+        Some(
+            secure_open_existing_no_follow(&vault)
+                .map_err(|e| format!("refusing to open {} for data wipe: {e}", vault.display()))?,
+        )
+    } else {
+        None
+    };
+    let len_hint = std::fs::metadata(&vault).map(|m| m.len()).unwrap_or(0);
+
     eprintln!(
         "PANIC: about to overwrite the {} of {} with random bytes.",
         if header_target == vault {
@@ -1366,11 +1387,6 @@ fn panic_by_path(theme: &ColorfulTheme) -> Result<()> {
         return Err("aborted (confirmation string did not match)".into());
     }
 
-    use rand_core::{OsRng, RngCore};
-    use std::fs::OpenOptions;
-    use std::io::{Seek, SeekFrom, Write};
-
-    let mut hf = OpenOptions::new().write(true).open(&header_target)?;
     let mut buf = [0u8; HEADER_SIZE];
     OsRng.fill_bytes(&mut buf);
     hf.seek(SeekFrom::Start(0))?;
@@ -1379,20 +1395,21 @@ fn panic_by_path(theme: &ColorfulTheme) -> Result<()> {
     eprintln!("OK header at {} overwritten", header_target.display());
 
     if wipe_data {
-        let mut vf = OpenOptions::new().write(true).open(&vault)?;
-        let len = std::fs::metadata(&vault)?.len();
-        vf.seek(SeekFrom::Start(0))?;
+        // Inline-header case: vf_opt is None, write through hf
+        // (which IS the vault). Detached-header case: separate vf.
+        let writer: &mut std::fs::File = vf_opt.as_mut().unwrap_or(&mut hf);
+        writer.seek(SeekFrom::Start(0))?;
         let mut chunk = vec![0u8; 1 << 20];
         let mut written = 0u64;
-        while written < len {
+        while written < len_hint {
             OsRng.fill_bytes(&mut chunk);
-            let to_write = ((len - written) as usize).min(chunk.len());
-            vf.write_all(&chunk[..to_write])?;
+            let to_write = ((len_hint - written) as usize).min(chunk.len());
+            writer.write_all(&chunk[..to_write])?;
             written += to_write as u64;
         }
-        vf.flush()?;
-        let _ = vf.sync_all();
-        eprintln!("OK vault {} ({} bytes) wiped", vault.display(), len);
+        writer.flush()?;
+        let _ = writer.sync_all();
+        eprintln!("OK vault {} ({} bytes) wiped", vault.display(), len_hint);
     }
     println!("done.");
     Ok(())
@@ -3550,7 +3567,7 @@ fn rotate_mvk_action(theme: &ColorfulTheme, cont: Container) -> Result<Container
 /// Deniable counterpart to `rotate_mvk_action`. Dispatched when the
 /// container is deniable. v1 supports passphrase-only deniable slots
 /// (the most common deniable setup). The user must remember the
-/// Argon2 params they used at create time — those aren't persisted
+/// Argon2 params they used at create time -- those aren't persisted
 /// anywhere on disk for deniable vaults (the format requires every
 /// byte to look random; storing the KDF params would be a beacon).
 fn rotate_mvk_deniable_action(theme: &ColorfulTheme, cont: Container) -> Result<Container> {
@@ -3585,7 +3602,7 @@ fn rotate_mvk_deniable_action(theme: &ColorfulTheme, cont: Container) -> Result<
     // The Argon2 params + cipher are not persisted; user must remember.
     // The cipher we CAN recover from cont.header.cipher_suite (synthesized
     // from the inner header at open time), but the Argon2 params are
-    // gone — ask. Re-using the wizard's existing deniable KDF picker.
+    // gone -- ask. Re-using the wizard's existing deniable KDF picker.
     let argon2_params = ask_den_kdf(theme, "Argon2id params used at create time")?;
     let pp = dialoguer::Password::with_theme(theme)
         .with_prompt(format!(

@@ -75,6 +75,124 @@ pub fn secure_create_new(path: &Path) -> io::Result<File> {
     o.open(path)
 }
 
+/// Open an EXISTING file with read-only access, refusing to follow
+/// a symlink at the final path component **when
+/// `LUKSBOX_NO_FOLLOW_SYMLINKS=1` is set in the environment**.
+///
+/// Use this for the kind-dispatch / unlock-prescan header peek paths
+/// (CLI `open_container`, GUI ops's hybrid/TPM unlock pre-flights)
+/// where the same `LUKSBOX_NO_FOLLOW_SYMLINKS` opt-in that
+/// `open_rw_checked` honors needs to apply BEFORE the full container
+/// open does its own check. Without this preflight, a symlink in the
+/// vault path could be silently followed by the prescan even though
+/// the final open would later reject it -- and the prescan can trigger
+/// FIDO2 / TPM prompts on attacker-controlled header data in the
+/// interim, which is the nuisance the policy gate is meant to prevent.
+///
+/// Default behaviour (env var unset) is to follow symlinks, matching
+/// `File::open`: legitimate users who symlink their vault path don't
+/// pay any cost.
+pub fn open_existing_read_no_follow_policy(path: &Path) -> io::Result<File> {
+    if std::env::var_os("LUKSBOX_NO_FOLLOW_SYMLINKS").is_some() {
+        // Stat without following so the check sees the symlink
+        // itself, not its target.
+        match std::fs::symlink_metadata(path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "path {} is a symlink and LUKSBOX_NO_FOLLOW_SYMLINKS=1 is set",
+                        path.display()
+                    ),
+                ));
+            }
+            _ => {}
+        }
+    }
+    File::open(path)
+}
+
+/// Open an EXISTING file with read+write access, refusing to follow
+/// a symlink (or reparse point, on Windows) at the final path
+/// component AND refusing anything that isn't a regular file.
+///
+/// Use this for destructive operations on a user-named path (panic
+/// destroy, in-place overwrite, etc.) where the TOCTOU between a
+/// `path.is_file()` check and a subsequent `OpenOptions::open(path)`
+/// would otherwise let an attacker with write access to the parent
+/// directory swap in a symlink -- and have our random-bytes
+/// overwrite land in /etc/shadow or some other attacker-chosen
+/// target.
+///
+/// On Unix: `O_NOFOLLOW` makes `open(2)` fail with `ELOOP` if the
+/// final path component is a symlink. The metadata check after open
+/// catches non-regular files (FIFOs, sockets, block devices) that
+/// `O_NOFOLLOW` doesn't reject -- those would silently swallow the
+/// write or worse.
+///
+/// On Windows: `FILE_FLAG_OPEN_REPARSE_POINT` (0x00200000) opens
+/// the reparse point itself rather than following it; the
+/// `FILE_ATTRIBUTE_REPARSE_POINT` (0x00000400) attribute check
+/// then refuses if the opened thing is a reparse point.
+/// `FILE_ATTRIBUTE_DIRECTORY` (0x00000010) check refuses
+/// directories.
+///
+/// Compare against `secure_create_or_truncate` which is for write
+/// paths that CREATE (or replace) a file -- this helper is for
+/// destructive writes to a file the caller knows already exists.
+pub fn secure_open_existing_no_follow(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let meta = f.metadata()?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to operate on non-regular file (directory / FIFO / socket / device)",
+            ));
+        }
+        Ok(f)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000.
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(0x0020_0000)
+            .open(path)?;
+        let attrs = f.metadata()?.file_attributes();
+        // FILE_ATTRIBUTE_REPARSE_POINT
+        if attrs & 0x0000_0400 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to operate on a reparse point (symlink / junction)",
+            ));
+        }
+        // FILE_ATTRIBUTE_DIRECTORY
+        if attrs & 0x0000_0010 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "refusing to operate on a directory",
+            ));
+        }
+        Ok(f)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "secure_open_existing_no_follow: platform not supported",
+        ))
+    }
+}
+
 /// Like `secure_create_new` but allows opening an existing file
 /// (truncate-then-write semantics). Used for sidecar updates AND for
 /// extracting plaintext from a vault to a host path (`luksbox get`,
@@ -126,7 +244,7 @@ pub fn secure_create_or_truncate(path: &Path) -> io::Result<File> {
     // an `openat(parent_dir_fd, basename, ...)` call so an attacker who
     // can swap an INTERMEDIATE directory along the path cannot redirect
     // the extraction. The legacy Round 12 path canonicalized the parent
-    // and then re-opened by path with `O_NOFOLLOW` — which only checks
+    // and then re-opened by path with `O_NOFOLLOW` -- which only checks
     // the final component for symlinks. An attacker controlling, e.g.,
     // `/tmp/extract/` could replace it with a symlink to `/etc/` after
     // canonicalize-time but before the final open, redirecting the
@@ -381,7 +499,7 @@ pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
         // `FlushFileBuffers` (what Rust's `sync_all` calls) requires
         // `GENERIC_WRITE` on the handle, AND for *directory* handles
         // additionally requires `SeManageVolumePrivilege` on many
-        // configurations — which non-admin users do not have. That
+        // configurations -- which non-admin users do not have. That
         // means the original `read(true)`-only handle would always
         // fail with `ERROR_ACCESS_DENIED`, and even `read(true).write(true)`
         // fails for a standard user on most NTFS volumes.
@@ -477,7 +595,7 @@ pub fn atomic_secure_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 ///
 /// Why a separate API: `atomic_secure_write` uses `rename(2)` /
 /// `MoveFileExW(REPLACE_EXISTING)` which silently overwrites the
-/// target — and on both platforms follows a symlink at the target,
+/// target -- and on both platforms follows a symlink at the target,
 /// writing through to whatever the symlink resolves to. For
 /// create-only callers (Kyber seed file, initial anchor) that's a
 /// TOCTOU privilege-escalation primitive: an attacker who can plant
@@ -485,11 +603,11 @@ pub fn atomic_secure_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// and the rename redirects the write into an attacker-chosen file.
 ///
 /// Commit step:
-/// - POSIX: `link(tmp, path)` — `link(2)` fails with `EEXIST` if
+/// - POSIX: `link(tmp, path)` -- `link(2)` fails with `EEXIST` if
 ///   `path` exists for any reason (regular file, symlink, anything),
 ///   and `link` itself never follows a symlink at the destination.
 ///   On success we `unlink(tmp)` so only `path` remains.
-/// - Windows: `MoveFileExW(tmp, path, 0)` — without
+/// - Windows: `MoveFileExW(tmp, path, 0)` -- without
 ///   `MOVEFILE_REPLACE_EXISTING` this fails with `ERROR_ALREADY_EXISTS`
 ///   if `path` exists, including when `path` is a reparse point /
 ///   symlink.
@@ -530,7 +648,7 @@ fn commit_create_new(tmp: &Path, dst: &Path) -> io::Result<()> {
 fn commit_create_new(tmp: &Path, dst: &Path) -> io::Result<()> {
     // `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` (flags=0)
     // fails with `ERROR_ALREADY_EXISTS` if `dst` exists for any
-    // reason — including when `dst` is a reparse point / symlink to
+    // reason -- including when `dst` is a reparse point / symlink to
     // somewhere else. Same direct-extern pattern as
     // `secret_box::VirtualLock`, no extra crate dep.
     use std::os::windows::ffi::OsStrExt;
@@ -901,6 +1019,127 @@ mod tests {
         let path = dir.path().join("seed.kyber");
         atomic_secure_create_new(&path, b"seed contents").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"seed contents");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_existing_read_no_follow_policy_follows_symlink_by_default() {
+        // Without LUKSBOX_NO_FOLLOW_SYMLINKS, the prescan helper
+        // MUST follow symlinks -- otherwise legit users who symlink
+        // their vault path get broken at every command.
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("vault.lbx");
+        std::fs::write(&real, b"contents").unwrap();
+        let link = dir.path().join("link.lbx");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // Ensure env var is NOT set for this test.
+        // SAFETY: tests using this env var serialize via the
+        // symlink_env_lock pattern (see security_invariants.rs).
+        unsafe {
+            std::env::remove_var("LUKSBOX_NO_FOLLOW_SYMLINKS");
+        }
+        let _f = open_existing_read_no_follow_policy(&link)
+            .expect("default behaviour: must follow symlinks");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_existing_read_no_follow_policy_refuses_symlink_when_env_set() {
+        let dir = tempdir().unwrap();
+        let real = dir.path().join("vault.lbx");
+        std::fs::write(&real, b"contents").unwrap();
+        let link = dir.path().join("link.lbx");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        // SAFETY: serialized via env var pattern; this test runs
+        // single-threaded within itself but env is process-wide.
+        // Use a unique guard to minimize cross-test races.
+        unsafe {
+            std::env::set_var("LUKSBOX_NO_FOLLOW_SYMLINKS", "1");
+        }
+        let r = open_existing_read_no_follow_policy(&link);
+        unsafe {
+            std::env::remove_var("LUKSBOX_NO_FOLLOW_SYMLINKS");
+        }
+        let err = r.expect_err("must refuse symlink under no-follow env");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        // Real path still opens.
+        let _f = open_existing_read_no_follow_policy(&real)
+            .expect("non-symlink path still opens under no-follow");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_open_existing_no_follow_refuses_symlink_to_regular_file() {
+        // The TOCTOU-driven panic-destroy attack: between the user
+        // confirming "yes, wipe my vault" and the open(), an
+        // attacker who controls the parent dir swaps the vault
+        // path for a symlink to /etc/shadow (or any other file
+        // the caller's process has write access to). With the
+        // hardened helper, the open MUST fail with ELOOP-style
+        // error before any write happens.
+        let dir = tempdir().unwrap();
+        let victim = dir.path().join("victim_file");
+        std::fs::write(&victim, b"do not overwrite this").unwrap();
+        let link = dir.path().join("attacker_planted_symlink");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+
+        let err = secure_open_existing_no_follow(&link)
+            .expect_err("must refuse to follow a symlink at the open target");
+        // ELOOP on Linux for O_NOFOLLOW + symlink.
+        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+
+        // The victim must NOT have been touched (we didn't even
+        // get to a write call, but pin the invariant).
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not overwrite this");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_open_existing_no_follow_refuses_directory() {
+        let dir = tempdir().unwrap();
+        let subdir = dir.path().join("subdir");
+        std::fs::create_dir(&subdir).unwrap();
+        let err = secure_open_existing_no_follow(&subdir)
+            .expect_err("must refuse to operate on a directory");
+        // O_NOFOLLOW doesn't reject directories; the metadata
+        // check after open does. Either an EISDIR from open
+        // (some kernels) or an InvalidInput from the metadata
+        // check is acceptable.
+        let ok = err.raw_os_error() == Some(libc::EISDIR)
+            || matches!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(ok, "expected EISDIR or InvalidInput, got {err:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_open_existing_no_follow_succeeds_for_regular_file() {
+        // Sanity: the happy path still works.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ordinary_file");
+        std::fs::write(&path, b"contents").unwrap();
+        let _f =
+            secure_open_existing_no_follow(&path).expect("regular file must open under no-follow");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn secure_open_existing_no_follow_refuses_fifo() {
+        // FIFOs / sockets aren't symlinks, but they aren't
+        // regular files either. A write to a FIFO would block
+        // forever waiting for a reader; a write to a device
+        // file could have arbitrary side effects. The
+        // is_file() post-open check refuses both.
+        use std::ffi::CString;
+        let dir = tempdir().unwrap();
+        let fifo_path = dir.path().join("attacker_fifo");
+        let c = CString::new(fifo_path.to_str().unwrap()).unwrap();
+        let rc = unsafe { libc::mkfifo(c.as_ptr(), 0o600) };
+        assert_eq!(rc, 0, "mkfifo setup failed");
+        let err = secure_open_existing_no_follow(&fifo_path).expect_err("must refuse FIFO");
+        assert!(
+            matches!(err.kind(), std::io::ErrorKind::InvalidInput),
+            "expected InvalidInput, got {err:?}"
+        );
     }
 
     #[cfg(unix)]

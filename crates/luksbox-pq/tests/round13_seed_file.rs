@@ -36,7 +36,7 @@ fn r13_05_seed_file_read_refuses_symlink_swap() {
     // across platforms (Linux: "Too many levels of symbolic links",
     // FreeBSD: "Too many levels of symbolic links", macOS: "Too many
     // levels of symbolic links"), so we deliberately do NOT match on
-    // message contents — the test passes iff the read fails.
+    // message contents -- the test passes iff the read fails.
     let _err = read(&attacked, b"pw").expect_err("symlinked seed path must be refused");
 }
 

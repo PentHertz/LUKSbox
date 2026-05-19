@@ -140,15 +140,15 @@ pub fn file_key(container: &Container, file_id: u64) -> SubKey {
 // the owning file, plus a single "next" ChunkRef that points to the
 // follow-on block (or zero if last). Blocks are encrypted with the
 // SAME chunk-AEAD machinery as data chunks but under a SYNTHETIC
-// file_id derived by setting the high bit of the real file_id —
+// file_id derived by setting the high bit of the real file_id --
 // so the AEAD AAD intrinsically distinguishes "chunk-list block for
 // file F" from "data chunk for file F" without any AAD-shape change.
 //
 // Plaintext layout (4096 bytes total):
 //   [ 0..  4]  u32 LE  count of valid ChunkRef entries in this block
-//   [ 4..  N]  count * 16 bytes:  count × ChunkRef (8 B id, 8 B gen)
+//   [ 4..  N]  count * 16 bytes:  count x ChunkRef (8 B id, 8 B gen)
 //   [ N..N+16] next ChunkRef (zero if last block; non-zero points at
-//              the next block in the chain — chunk-list blocks are
+//              the next block in the chain -- chunk-list blocks are
 //              themselves chunks, so a ChunkRef into the same data area)
 //   [N+16..4096]  random padding
 //
@@ -192,7 +192,7 @@ pub fn list_file_key(container: &Container, file_id: u64) -> SubKey {
 
 /// Encode a ChunkRef into 16 bytes: u64 LE id ‖ u64 LE generation.
 /// Used by chunk-list block (de)serialisation. Zero (id=0, gen=0)
-/// is the canonical "no entry" / "end of chain" sentinel — chunk_id
+/// is the canonical "no entry" / "end of chain" sentinel -- chunk_id
 /// 0 is reserved (the first real chunk id is 0 too, BUT chunk_id
 /// allocation in `DirectoryTree::alloc_chunk_id` returns
 /// `next_chunk_id` starting at 0, so a freshly-allocated chunk-list
@@ -301,12 +301,31 @@ pub fn parse_chunk_list_block(
 ///
 /// `max_blocks = ceil(expected_count / CHUNK_LIST_ENTRIES_PER_BLOCK) + 2`
 /// allows slack for an empty trailing block but caps DoS.
+///
+/// **Hard ceiling**: `expected_count` is capped at
+/// `MAX_FILE_SIZE / CHUNK_PLAINTEXT_SIZE` (the largest chunk count
+/// any honest writer could produce -- per-file size cap is enforced
+/// at write/truncate time). A blob claiming a count past that limit
+/// can only come from a forged metadata (requires MVK) or on-disk
+/// corruption (cosmic ray / bad block). In either case the right
+/// behaviour is to fail fast with `InvalidField` instead of letting
+/// the loop run for ~7x10¹⁶ iterations under a `u64::MAX` claim.
 pub fn walk_chunk_list_chain(
     container: &mut Container,
     file_id: u64,
     head: ChunkRef,
     expected_count: u64,
 ) -> Result<(Vec<ChunkRef>, Vec<ChunkRef>), Error> {
+    // Hard ceiling on expected_count. Mirrors the per-file size cap
+    // enforced by Vfs::write / Vfs::truncate: MAX_FILE_SIZE = 1<<44,
+    // CHUNK_PLAINTEXT_SIZE = 4096, so max legitimate chunk count is
+    // 1<<32. Reject anything beyond it as structurally invalid
+    // BEFORE entering the loop so a forged or corrupted metadata
+    // blob can't drive an unbounded walk.
+    const MAX_LEGITIMATE_CHUNK_COUNT: u64 = (1u64 << 44) / 4096; // = 1 << 32
+    if expected_count > MAX_LEGITIMATE_CHUNK_COUNT {
+        return Err(Error::Crypto(luksbox_core::Error::InvalidField));
+    }
     let list_key = list_file_key(container, file_id);
     let synth_id = list_file_id(file_id);
     let max_entries = expected_count as usize;
@@ -378,7 +397,7 @@ pub fn file_key_for_mvk(
 /// rotation derives both the old and new list-file-keys via this
 /// helper to re-encrypt each chunk-list block under the new MVK
 /// alongside the data chunks. Without this, post-rotation reads
-/// would silently fail to decrypt the chunk-list chain — losing the
+/// would silently fail to decrypt the chunk-list chain -- losing the
 /// file's chunk pointers permanently.
 pub fn list_file_key_for_mvk(
     mvk: &luksbox_core::MasterVolumeKey,

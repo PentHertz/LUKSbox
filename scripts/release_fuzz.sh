@@ -23,9 +23,9 @@
 #                         Use $(nproc) for full host occupation.
 #
 # Examples:
-#   scripts/release_fuzz.sh                  # 24h × 7 targets, 4 workers each
-#   scripts/release_fuzz.sh 3600             # 1h × 7 targets, smoke
-#   scripts/release_fuzz.sh 86400 16         # 24h × 7 × 16-fork (heavy)
+#   scripts/release_fuzz.sh                  # 24h x 7 targets, 4 workers each
+#   scripts/release_fuzz.sh 3600             # 1h x 7 targets, smoke
+#   scripts/release_fuzz.sh 86400 16         # 24h x 7 x 16-fork (heavy)
 #   scripts/release_fuzz.sh 0                # ∞ (Ctrl-C to stop)
 #
 # Findings layout under fuzz/release-runs/<utc-stamp>/:
@@ -198,7 +198,7 @@ done
         echo "  result:              ALL OK"
     else
         echo "  result:              FAIL, see per-target lines above"
-        echo "  triage:              docs/FUZZING.md → 'Triage a crash'"
+        echo "  triage:              docs/FUZZING.md -> 'Triage a crash'"
     fi
 } | tee -a "$SUMMARY"
 

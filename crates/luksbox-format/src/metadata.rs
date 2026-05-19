@@ -49,7 +49,7 @@ pub const METADATA_MAGIC_LEN: usize = 4;
 /// Used by `Vfs::write` (and friends) to fail mid-write with ENOSPC as soon
 /// as the dirty tree would no longer serialize within the on-disk budget,
 /// instead of letting `cp` claim success and only surfacing the failure at
-/// flush time — which causes silent data loss because the chunks are
+/// flush time -- which causes silent data loss because the chunks are
 /// already on disk but the metadata pointer is not.
 pub fn payload_budget_for(region_size: u64) -> usize {
     let cap = region_size as usize;

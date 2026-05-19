@@ -44,7 +44,7 @@ const PASS: &[u8] = b"correct horse battery staple";
 fn build_vault(dir: &TempDir) -> PathBuf {
     let path = dir.path().join("v.lbx");
     // The header-tamper test below writes ~480 full vault copies. With
-    // the default 16 MiB metadata region that's ~7.5 GiB on disk —
+    // the default 16 MiB metadata region that's ~7.5 GiB on disk --
     // enough to ENOSPC the CI runner. Shrink the metadata region for
     // this test (the test only touches the 8 KiB header, never the
     // metadata blob, so a 64 KiB region is fine).
@@ -381,6 +381,152 @@ fn nofollow_symlinks_env_var_refuses_symlinked_vault() {
         r2.is_ok(),
         "non-symlink path must still open under no-follow mode"
     );
+}
+
+// ---- F2. Deniable open path now honors LUKSBOX_NO_FOLLOW_SYMLINKS --------
+//
+// Regression test for an audit finding: the deniable open paths
+// (`try_open_envelope_v2_deniable` and `open_with_mvk_deniable`) used
+// raw OpenOptions and skipped the hardened `open_rw_checked` path,
+// so a user who set LUKSBOX_NO_FOLLOW_SYMLINKS=1 still had symlinks
+// silently followed for deniable vaults. The fix routes both deniable
+// open methods through `open_rw_checked`. This test pins that the
+// fix sticks across both deniable entry points.
+
+#[test]
+#[cfg(unix)]
+fn deniable_open_envelope_refuses_symlink_under_no_follow() {
+    use luksbox_core::Argon2idParams;
+    use luksbox_core::deniable::DeniableCredential;
+    let _env_lock = symlink_env_lock();
+    let dir = TempDir::new().unwrap();
+    let real = dir.path().join("real-deniable.lbx");
+    let cred = DeniableCredential::Passphrase {
+        passphrase: b"hunter2",
+        argon2: Argon2idParams {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        },
+    };
+    Container::create_with_passphrase_deniable(
+        &real,
+        None,
+        CipherSuite::Aes256GcmSiv,
+        Argon2idParams {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        },
+        0,
+        b"hunter2",
+    )
+    .unwrap();
+    let link = dir.path().join("link-deniable.lbx");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+
+    // Sanity: without the env var the symlink opens fine.
+    {
+        let _env =
+            Container::try_open_envelope_v2_deniable(&link, None, &cred, CipherSuite::Aes256GcmSiv)
+                .expect("baseline: symlink opens without env var");
+    }
+
+    unsafe {
+        std::env::set_var("LUKSBOX_NO_FOLLOW_SYMLINKS", "1");
+    }
+    let r = Container::try_open_envelope_v2_deniable(&link, None, &cred, CipherSuite::Aes256GcmSiv);
+    unsafe {
+        std::env::remove_var("LUKSBOX_NO_FOLLOW_SYMLINKS");
+    }
+    let err = match r {
+        Ok(_) => panic!(
+            "BUG: deniable open followed symlink despite LUKSBOX_NO_FOLLOW_SYMLINKS=1 \
+             (regression of audit finding)"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("symlink"),
+        "expected SymlinkRefused on deniable open, got: {err}"
+    );
+
+    // Real path still works under no-follow.
+    unsafe {
+        std::env::set_var("LUKSBOX_NO_FOLLOW_SYMLINKS", "1");
+    }
+    let r2 =
+        Container::try_open_envelope_v2_deniable(&real, None, &cred, CipherSuite::Aes256GcmSiv);
+    unsafe {
+        std::env::remove_var("LUKSBOX_NO_FOLLOW_SYMLINKS");
+    }
+    assert!(
+        r2.is_ok(),
+        "non-symlink deniable path must still open under no-follow mode"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn deniable_open_with_mvk_refuses_symlink_under_no_follow() {
+    use luksbox_core::Argon2idParams;
+    use luksbox_core::deniable::DeniableCredential;
+    let _env_lock = symlink_env_lock();
+    let dir = TempDir::new().unwrap();
+    let real = dir.path().join("real-deniable.lbx");
+    let cred = DeniableCredential::Passphrase {
+        passphrase: b"hunter2",
+        argon2: Argon2idParams {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        },
+    };
+    let c_orig = Container::create_with_passphrase_deniable(
+        &real,
+        None,
+        CipherSuite::Aes256GcmSiv,
+        Argon2idParams {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        },
+        0,
+        b"hunter2",
+    )
+    .unwrap();
+    let mvk = c_orig.mvk_clone();
+    let (salt, inner, slot_idx) = c_orig
+        .deniable_handoff_state()
+        .expect("deniable handoff state");
+    drop(c_orig);
+
+    let link = dir.path().join("link-deniable.lbx");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    // Baseline: opens without env var.
+    {
+        let _c = Container::open_with_mvk_deniable(&link, None, mvk.clone(), salt, inner, slot_idx)
+            .expect("baseline: symlink opens without env var");
+    }
+
+    unsafe {
+        std::env::set_var("LUKSBOX_NO_FOLLOW_SYMLINKS", "1");
+    }
+    let r = Container::open_with_mvk_deniable(&link, None, mvk.clone(), salt, inner, slot_idx);
+    unsafe {
+        std::env::remove_var("LUKSBOX_NO_FOLLOW_SYMLINKS");
+    }
+    let err = match r {
+        Ok(_) => panic!(
+            "BUG: open_with_mvk_deniable followed symlink despite LUKSBOX_NO_FOLLOW_SYMLINKS=1"
+        ),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("symlink"),
+        "expected SymlinkRefused, got: {err}"
+    );
+    let _ = cred; // silence unused
 }
 
 // ---- G (Windows). Path-substitution detection on NTFS / ReFS -----------

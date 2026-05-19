@@ -57,8 +57,8 @@ fn is_weak(passphrase: &str) -> bool {
     estimate(passphrase).score < MIN_ACCEPTABLE_SCORE
 }
 
-/// Length (in characters) of a generated passphrase. 20 chars × about 4.95
-/// bits/char ≈ 99 bits of entropy from `OsRng`. The reason for "20 not 16":
+/// Length (in characters) of a generated passphrase. 20 chars x about 4.95
+/// bits/char ~ 99 bits of entropy from `OsRng`. The reason for "20 not 16":
 /// zxcvbn's heuristics sometimes find sub-patterns in random strings and
 /// score them lower than theoretical entropy, so we keep generous headroom.
 pub const GENERATED_LEN: usize = 20;

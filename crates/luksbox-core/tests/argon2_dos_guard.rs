@@ -89,7 +89,7 @@ fn accepts_sensible_argon2_params_at_top_of_safe_envelope() {
     // The PARSER must accept anything within the safe envelope. We
     // can't actually call `new_passphrase` with 4 GiB / 64 / 16,
     // that would run Argon2id with those params and allocate 4 GiB +
-    // burn 64 iterations × 16 lanes for hours. Instead, build a
+    // burn 64 iterations x 16 lanes for hours. Instead, build a
     // small slot with tiny params, then mutate the on-disk bytes to
     // the maximum safe values and verify `from_bytes` accepts them.
     let mut bytes = build_passphrase_slot_with_params(Argon2idParams {

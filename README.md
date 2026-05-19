@@ -184,7 +184,7 @@ luksbox create my-vault.lbx --kind hybrid-pq \
     --pq-hybrid /media/usb/my.kyber
 
 # v3 format: no per-vault size ceiling (default v2 caps around 10 GiB).
-# Old LUKSbox binaries refuse v3 vaults — opt in only when you need
+# Old LUKSbox binaries refuse v3 vaults -- opt in only when you need
 # bigger vaults than the v2 default can hold.
 luksbox create my-vault.lbx --format v3
 
@@ -405,5 +405,5 @@ information.
 Maintained by **Sébastien Dudek**, Penthertz
 ([penthertz.com](https://penthertz.com),
 [@PentHertz](https://x.com/PentHertz),
-`security@penthertz.com` / `sebastien.dudek@penthertz.com`).
+`security@penthertz.com`).
 See [`SECURITY.md`](SECURITY.md) sec.1 for the responsible-disclosure flow.

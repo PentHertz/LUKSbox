@@ -774,10 +774,10 @@ impl Pending {
     }
 
     /// Big headline shown above the pulsing dot in the pending-auth
-    /// overlay. Was hardcoded "TOUCH YOUR YUBIKEY" — wrong for
+    /// overlay. Was hardcoded "TOUCH YOUR YUBIKEY" -- wrong for
     /// Nitrokey / SoloKey / Titan / Token2 / etc. owners (we support
     /// every CTAP2 device), and wrong for Windows Hello users (no
-    /// touch at all — face, fingerprint, or PIN, with the OS putting
+    /// touch at all -- face, fingerprint, or PIN, with the OS putting
     /// up its own modal). The verb-phrase tracks the selected device.
     fn headline(&self) -> &'static str {
         let is_winhello = ops::selected_fido2_device()
@@ -8612,7 +8612,7 @@ fn start_mount_subprocess(
     // before the drop so we still have access to the open container.
     // The child can't re-derive the inner header from just the MVK
     // (it's AEAD'd under a credential-derived key), so the parent
-    // must hand the recovered state over the pipe — see helper
+    // must hand the recovered state over the pipe -- see helper
     // protocol v2 docs in cmd_mount_fuse_t_helper.
     let deniable_handoff = opened.vfs.container().deniable_handoff_state();
 

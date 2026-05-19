@@ -285,7 +285,7 @@ fi
 #
 # LUKSbox's TPM 2.0 keyslots talk to /dev/tpmrm0. The kernel's resource
 # manager is designed for unprivileged use, but the device node ships
-# owned by `root:tss` mode 0660 — so the user has to be in the `tss`
+# owned by `root:tss` mode 0660 -- so the user has to be in the `tss`
 # group. Most desktop distros add the desktop user automatically; minimal
 # / server / immutable installs do not.
 #
@@ -368,7 +368,7 @@ setup_tpm_perms() {
         fi
     fi
 
-    # Install the udev rule (idempotent — overwrite on re-run is safe).
+    # Install the udev rule (idempotent -- overwrite on re-run is safe).
     local udev_rule="/etc/udev/rules.d/60-tpm.rules"
     echo "    installing ${udev_rule}..."
     sudo tee "$udev_rule" >/dev/null <<'EOF'

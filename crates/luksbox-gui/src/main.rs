@@ -52,7 +52,7 @@ fn main() -> eframe::Result<()> {
             // egui_extras handles `Image::from_bytes(...)` decoding.
             egui_extras::install_image_loaders(&cc.egui_ctx);
             // Manual zoom override for fractional-DPI displays.
-            //   LUKSBOX_GUI_ZOOM=1.5  -> render at 1.5× (e.g. for GPD-class
+            //   LUKSBOX_GUI_ZOOM=1.5  -> render at 1.5x (e.g. for GPD-class
             //   handhelds where the OS reports 200% but the actual pixel
             //   density makes egui's hit-rect rounding drift on the
             //   right/bottom of long pages).
@@ -72,7 +72,7 @@ fn main() -> eframe::Result<()> {
 }
 
 /// Decode a PNG into the (raw RGBA, width, height) shape eframe wants.
-/// Falls back to a 1×1 transparent icon if the PNG is malformed.
+/// Falls back to a 1x1 transparent icon if the PNG is malformed.
 fn decode_icon(bytes: &[u8]) -> egui::IconData {
     match image::load_from_memory(bytes) {
         Ok(img) => {

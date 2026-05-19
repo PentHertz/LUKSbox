@@ -155,7 +155,7 @@ When enabled, the helper child process can only:
 - Read/write the vault file's parent directory and the
   mountpoint's parent directory.
 - Bind/connect on `127.0.0.1` only (FUSE-T's NFS loopback). NO
-  internet egress — if libfuse-t tried to phone home, this
+  internet egress -- if libfuse-t tried to phone home, this
   blocks it.
 - Exec FUSE-T's helper binaries + `/sbin/mount{,_nfs,_nfs4}` /
   `/sbin/umount`. NO arbitrary shell execution.
