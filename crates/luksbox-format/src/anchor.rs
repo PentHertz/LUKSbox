@@ -57,7 +57,7 @@ use std::path::Path;
 
 use hmac::{Hmac, Mac};
 use luksbox_core::MasterVolumeKey;
-use luksbox_core::file_util::atomic_secure_write;
+use luksbox_core::file_util::{atomic_secure_create_new, atomic_secure_write};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
@@ -160,29 +160,52 @@ pub fn read_and_verify(
     })
 }
 
-/// Write a fresh anchor file containing the given generation counter,
-/// MAC'd under the MVK-derived anchor key. Atomic via temp-file +
-/// rename, a crash between the temp write and the rename leaves the
-/// previous anchor intact (good).
-pub fn write(
-    path: &Path,
+fn build_anchor_buf(
     generation: u64,
     mvk: &MasterVolumeKey,
     header_salt: &[u8; 32],
-) -> Result<(), Error> {
+) -> [u8; ANCHOR_SIZE] {
     let mut buf = [0u8; ANCHOR_SIZE];
     buf[..8].copy_from_slice(&MAGIC);
     buf[8..16].copy_from_slice(&generation.to_le_bytes());
     let key = anchor_key(mvk, header_salt);
     let tag = compute_mac(&key, &buf[..16]);
     buf[16..48].copy_from_slice(&tag);
+    buf
+}
 
-    // Round 9E: atomic_secure_write produces a 0600 tmpfile with
-    // a random suffix, fsyncs, then renames atomically. Replaces the
-    // previous "fixed-name .tmp + plain OpenOptions" path which left
-    // the tmpfile world-readable for the brief window before rename
-    // (under default umask 022).
+/// Update an existing anchor file (replace semantics). Used by
+/// `Container::write_anchor` on every vfs flush to bump the generation
+/// counter. Crash between temp write and rename leaves the previous
+/// anchor intact (good).
+///
+/// For the FIRST write of a new anchor use `write_initial` — it uses
+/// no-clobber commit semantics that refuse to follow a pre-planted
+/// symlink at `path`.
+pub fn write(
+    path: &Path,
+    generation: u64,
+    mvk: &MasterVolumeKey,
+    header_salt: &[u8; 32],
+) -> Result<(), Error> {
+    let buf = build_anchor_buf(generation, mvk, header_salt);
     atomic_secure_write(path, &buf)?;
+    Ok(())
+}
+
+/// Create a brand-new anchor file at `path`. Fails if `path` already
+/// exists (including as a symlink). Used by `Container::init_anchor`
+/// at vault-creation time so an attacker who can plant a symlink in
+/// the user-supplied anchor directory cannot redirect the first
+/// MAC write into an attacker-chosen file.
+pub fn write_initial(
+    path: &Path,
+    generation: u64,
+    mvk: &MasterVolumeKey,
+    header_salt: &[u8; 32],
+) -> Result<(), Error> {
+    let buf = build_anchor_buf(generation, mvk, header_salt);
+    atomic_secure_create_new(path, &buf)?;
     Ok(())
 }
 
@@ -277,26 +300,14 @@ fn deniable_anchor_aad(per_vault_salt: &[u8; 32]) -> Vec<u8> {
     aad
 }
 
-/// Write a fresh deniable anchor file containing the given generation
-/// counter. The whole 256-byte file is computationally indistinguishable
-/// from random output (no magic, no fixed structure).
-///
-/// `cipher_suite` is the vault's cipher; the anchor uses the same AEAD
-/// so a vault built with AES-GCM-SIV gets a SIV-encrypted anchor, etc.
-/// Atomic via the same `atomic_secure_write` path as the standard
-/// anchor.
-pub fn deniable_write(
-    path: &Path,
+fn build_deniable_anchor_buf(
     generation: u64,
     mvk: &MasterVolumeKey,
     per_vault_salt: &[u8; 32],
     cipher_suite: CipherSuite,
-) -> Result<(), Error> {
+) -> Result<[u8; DENIABLE_ANCHOR_SIZE], Error> {
     use zeroize::Zeroizing;
 
-    // Plaintext: generation + random padding. Wrapped in Zeroizing
-    // so the padding (which carries no secret per se, but might in
-    // a future format) is wiped on drop.
     let mut plaintext = Zeroizing::new([0u8; DENIABLE_ANCHOR_PLAINTEXT_LEN]);
     plaintext[..8].copy_from_slice(&generation.to_le_bytes());
     fill_random(&mut plaintext[8..]).map_err(Error::Crypto)?;
@@ -312,14 +323,41 @@ pub fn deniable_write(
     let mut buf = [0u8; DENIABLE_ANCHOR_SIZE];
     buf[..DENIABLE_ANCHOR_NONCE_LEN].copy_from_slice(&nonce);
     buf[DENIABLE_ANCHOR_NONCE_LEN..DENIABLE_ANCHOR_NONCE_LEN + ct.len()].copy_from_slice(&ct);
-    // Trailing random padding. The 240..256 region is just OsRng
-    // bytes - kept after the AEAD output so the on-disk file is a
-    // fixed 256 B and an analyst can't distinguish "AEAD output is
-    // exactly 228 B" from any other random-looking blob.
     fill_random(&mut buf[DENIABLE_ANCHOR_SIZE - DENIABLE_ANCHOR_TRAILING_PAD..])
         .map_err(Error::Crypto)?;
+    Ok(buf)
+}
 
+/// Update an existing deniable anchor file (replace semantics). The
+/// 256-byte file is computationally indistinguishable from random
+/// output (no magic, no fixed structure). `cipher_suite` is the vault's
+/// cipher; the anchor uses the same AEAD.
+///
+/// For the FIRST write of a new deniable anchor use
+/// `deniable_write_initial` — no-clobber commit semantics.
+pub fn deniable_write(
+    path: &Path,
+    generation: u64,
+    mvk: &MasterVolumeKey,
+    per_vault_salt: &[u8; 32],
+    cipher_suite: CipherSuite,
+) -> Result<(), Error> {
+    let buf = build_deniable_anchor_buf(generation, mvk, per_vault_salt, cipher_suite)?;
     atomic_secure_write(path, &buf)?;
+    Ok(())
+}
+
+/// Create a brand-new deniable anchor file at `path`. Refuses to
+/// overwrite or to follow a pre-planted symlink at `path`.
+pub fn deniable_write_initial(
+    path: &Path,
+    generation: u64,
+    mvk: &MasterVolumeKey,
+    per_vault_salt: &[u8; 32],
+    cipher_suite: CipherSuite,
+) -> Result<(), Error> {
+    let buf = build_deniable_anchor_buf(generation, mvk, per_vault_salt, cipher_suite)?;
+    atomic_secure_create_new(path, &buf)?;
     Ok(())
 }
 

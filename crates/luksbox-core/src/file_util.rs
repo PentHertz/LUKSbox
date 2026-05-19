@@ -344,6 +344,21 @@ pub fn secure_create_dir_all(path: &Path) -> io::Result<()> {
 /// directory paths without it) and calling `FlushFileBuffers` via
 /// `sync_all()`. Other non-Unix targets (none built today) fall through to
 /// a no-op rather than silently breaking the rename.
+#[cfg(windows)]
+fn is_windows_dir_sync_skippable(e: &io::Error) -> bool {
+    // ERROR_ACCESS_DENIED (5), ERROR_INVALID_FUNCTION (1),
+    // ERROR_INVALID_HANDLE (6), ERROR_NOT_SUPPORTED (50): all observed
+    // when FlushFileBuffers is called on a directory handle without
+    // SeManageVolumePrivilege, or on filesystems (FAT/exFAT, network
+    // shares) that don't support the operation. Treat them as
+    // "Windows can't do the equivalent of fsync(dirfd) here", not as
+    // a real failure of the write itself.
+    matches!(
+        e.kind(),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput | io::ErrorKind::Unsupported
+    ) || matches!(e.raw_os_error(), Some(1) | Some(5) | Some(6) | Some(50))
+}
+
 pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
     fn parent_for(path: &Path) -> &Path {
         path.parent()
@@ -361,16 +376,45 @@ pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
         use std::os::windows::fs::OpenOptionsExt;
         // FILE_FLAG_BACKUP_SEMANTICS (winnt.h: 0x02000000) is the documented
         // flag that lets `CreateFileW` open a directory handle. Without it,
-        // open() on a directory path returns ERROR_ACCESS_DENIED. With it,
-        // `sync_all()` issues `FlushFileBuffers` against the directory,
-        // committing pending rename/create entries to the on-disk metadata
-        // log. Same crash-durability guarantee as the POSIX branch.
+        // open() on a directory path returns ERROR_ACCESS_DENIED.
+        //
+        // `FlushFileBuffers` (what Rust's `sync_all` calls) requires
+        // `GENERIC_WRITE` on the handle, AND for *directory* handles
+        // additionally requires `SeManageVolumePrivilege` on many
+        // configurations — which non-admin users do not have. That
+        // means the original `read(true)`-only handle would always
+        // fail with `ERROR_ACCESS_DENIED`, and even `read(true).write(true)`
+        // fails for a standard user on most NTFS volumes.
+        //
+        // Make it best-effort on Windows: open with write access if we
+        // can, try to flush, and swallow `PermissionDenied` /
+        // `InvalidInput` / "not supported" errors. The rename has
+        // already been committed to the NTFS journal via `MoveFileExW`,
+        // which is what an interactive Windows tool can realistically
+        // promise without elevating. The Unix branch keeps its strict
+        // fsync-the-directory contract.
         const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        let dir = OpenOptions::new()
+        let opened = OpenOptions::new()
             .read(true)
+            .write(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(parent_for(path))?;
-        dir.sync_all()
+            .open(parent_for(path))
+            .or_else(|_| {
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                    .open(parent_for(path))
+            });
+        let dir = match opened {
+            Ok(d) => d,
+            Err(e) if is_windows_dir_sync_skippable(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        match dir.sync_all() {
+            Ok(()) => Ok(()),
+            Err(e) if is_windows_dir_sync_skippable(&e) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -379,16 +423,13 @@ pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Atomic, owner-only file replacement: write `bytes` to a unique
-/// `<path>.tmp.<rand>` neighbour with mode 0600, fsync it, then
-/// `rename(2)` over `path`, then fsync the parent directory. Replaces
-/// the unsafe pattern of
-/// `fs::write(tmp); fs::rename(tmp, path)` which produces tmp
-/// files with `0644` permissions during the window before rename.
-pub fn atomic_secure_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Build a `<path>.tmp.<16hex>` neighbour path, write `bytes` to it
+/// with `secure_create_new` (mode 0600 on POSIX), fsync the file, and
+/// return the temp path. The caller is responsible for commit
+/// (rename or hard-link) and cleanup on failure.
+fn write_secure_tmp_for(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     use std::io::Write as _;
 
-    // Random suffix so concurrent writers don't collide.
     let mut rand_bytes = [0u8; 8];
     use rand_core::{OsRng, RngCore};
     OsRng
@@ -406,15 +447,119 @@ pub fn atomic_secure_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut f = secure_create_new(&tmp_path)?;
     f.write_all(bytes)?;
     f.flush()?;
-    // Force the bytes to disk before rename so a crash mid-rename
-    // doesn't leave a half-written file at `path`.
     f.sync_all()?;
     drop(f);
+    Ok(tmp_path)
+}
 
-    // POSIX rename is atomic on the same filesystem. Windows has
-    // ReplaceFileW which is similar.
-    std::fs::rename(&tmp_path, path)?;
+/// Atomic, owner-only file replacement: write `bytes` to a unique
+/// `<path>.tmp.<rand>` neighbour with mode 0600, fsync it, then
+/// `rename(2)` over `path`, then fsync the parent directory. Replaces
+/// the unsafe pattern of
+/// `fs::write(tmp); fs::rename(tmp, path)` which produces tmp
+/// files with `0644` permissions during the window before rename.
+///
+/// Replace semantics: if `path` exists it will be overwritten. For
+/// no-clobber semantics (refuses to overwrite, and refuses to follow
+/// a pre-existing symlink at `path`), use `atomic_secure_create_new`.
+pub fn atomic_secure_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp_path = write_secure_tmp_for(path, bytes)?;
+    // POSIX rename is atomic on the same filesystem. Windows uses
+    // MoveFileExW with MOVEFILE_REPLACE_EXISTING.
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
     sync_parent_dir(path)
+}
+
+/// Atomic, owner-only file creation that **refuses to overwrite**.
+///
+/// Why a separate API: `atomic_secure_write` uses `rename(2)` /
+/// `MoveFileExW(REPLACE_EXISTING)` which silently overwrites the
+/// target — and on both platforms follows a symlink at the target,
+/// writing through to whatever the symlink resolves to. For
+/// create-only callers (Kyber seed file, initial anchor) that's a
+/// TOCTOU privilege-escalation primitive: an attacker who can plant
+/// a symlink at the target path between a `path.exists()` pre-check
+/// and the rename redirects the write into an attacker-chosen file.
+///
+/// Commit step:
+/// - POSIX: `link(tmp, path)` — `link(2)` fails with `EEXIST` if
+///   `path` exists for any reason (regular file, symlink, anything),
+///   and `link` itself never follows a symlink at the destination.
+///   On success we `unlink(tmp)` so only `path` remains.
+/// - Windows: `MoveFileExW(tmp, path, 0)` — without
+///   `MOVEFILE_REPLACE_EXISTING` this fails with `ERROR_ALREADY_EXISTS`
+///   if `path` exists, including when `path` is a reparse point /
+///   symlink.
+///
+/// On any failure after the temp file is written, the temp is
+/// best-effort cleaned up so a retry doesn't trip its own
+/// `create_new(true)` guard.
+pub fn atomic_secure_create_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp_path = write_secure_tmp_for(path, bytes)?;
+    match commit_create_new(&tmp_path, path) {
+        Ok(()) => {
+            // POSIX `link(2)` leaves tmp_path pointing at the same
+            // inode; unlink so only `path` survives. On Windows,
+            // `MoveFileExW` already moved the entry; tmp_path is gone.
+            #[cfg(unix)]
+            {
+                let _ = std::fs::remove_file(&tmp_path);
+            }
+            sync_parent_dir(path)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn commit_create_new(tmp: &Path, dst: &Path) -> io::Result<()> {
+    // `std::fs::hard_link` is `link(2)` on POSIX. `link` fails with
+    // EEXIST if `dst` exists (any file type, including symlinks), and
+    // never follows a symlink at `dst`. tmp and dst sit in the same
+    // directory so they're guaranteed on the same filesystem.
+    std::fs::hard_link(tmp, dst)
+}
+
+#[cfg(windows)]
+fn commit_create_new(tmp: &Path, dst: &Path) -> io::Result<()> {
+    // `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING` (flags=0)
+    // fails with `ERROR_ALREADY_EXISTS` if `dst` exists for any
+    // reason — including when `dst` is a reparse point / symlink to
+    // somewhere else. Same direct-extern pattern as
+    // `secret_box::VirtualLock`, no extra crate dep.
+    use std::os::windows::ffi::OsStrExt;
+    fn to_wide(p: &Path) -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+    let src = to_wide(tmp);
+    let dst_w = to_wide(dst);
+    unsafe extern "system" {
+        fn MoveFileExW(src: *const u16, dst: *const u16, flags: u32) -> i32;
+    }
+    let rc = unsafe { MoveFileExW(src.as_ptr(), dst_w.as_ptr(), 0) };
+    if rc == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn commit_create_new(tmp: &Path, dst: &Path) -> io::Result<()> {
+    let _ = (tmp, dst);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic_secure_create_new: platform not supported",
+    ))
 }
 
 // ----------------------------------------------------------------------
@@ -748,6 +893,106 @@ mod tests {
             .map(|e| e.file_name().into_string().unwrap())
             .collect();
         assert_eq!(entries, vec!["vault.hdr".to_string()]);
+    }
+
+    #[test]
+    fn atomic_secure_create_new_writes_to_fresh_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("seed.kyber");
+        atomic_secure_create_new(&path, b"seed contents").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"seed contents");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_secure_create_new_yields_0600() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("seed.kyber");
+        unsafe {
+            libc::umask(0o022);
+        }
+        atomic_secure_create_new(&path, b"seed").unwrap();
+        assert_eq!(mode_of(&path), 0o600);
+    }
+
+    #[test]
+    fn atomic_secure_create_new_refuses_to_overwrite_regular_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("existing.kyber");
+        std::fs::write(&path, b"original").unwrap();
+
+        let err = atomic_secure_create_new(&path, b"replacement")
+            .expect_err("must refuse to overwrite an existing regular file");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+
+        // Original contents must be intact.
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    #[test]
+    fn atomic_secure_create_new_cleans_up_tempfile_on_eexist() {
+        // A failed commit must not leave the temp file behind: otherwise
+        // a retry would either trip its own create_new(true) guard or
+        // accumulate stale .tmp.<hex> orphans next to user files.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("existing.kyber");
+        std::fs::write(&path, b"original").unwrap();
+
+        let _ = atomic_secure_create_new(&path, b"replacement");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().into_string().unwrap())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic_secure_create_new must clean up the temp file on \
+             commit failure; found leftovers: {leftovers:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_secure_create_new_refuses_to_follow_symlink_target() {
+        // The TOCTOU-driven attack: between the caller's `path.exists()`
+        // pre-check and the commit, an attacker swaps `path` for a
+        // symlink to an attacker-chosen file (e.g. `/etc/sudoers` if
+        // luksbox is running as root via sudo). With the old
+        // rename-replace commit, the write would follow the symlink and
+        // clobber the target. With `link(2)`-based no-clobber commit,
+        // the symlink itself counts as an existing destination and the
+        // write fails.
+        let dir = tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"do not touch").unwrap();
+
+        let attack_path = dir.path().join("attacker_planted_symlink.kyber");
+        std::os::unix::fs::symlink(&victim, &attack_path).unwrap();
+
+        let err = atomic_secure_create_new(&attack_path, b"vault secret material")
+            .expect_err("must refuse to follow a symlink at the destination");
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+
+        // The victim file must NOT have been touched.
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch");
+        // The symlink itself must still be there, untouched.
+        assert!(
+            attack_path
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        // And no stale tempfile should have leaked into the directory.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().into_string().unwrap())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "leftover tempfiles: {leftovers:?}");
     }
 
     // ------------------------------------------------------------------

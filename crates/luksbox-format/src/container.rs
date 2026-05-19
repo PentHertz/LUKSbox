@@ -2333,9 +2333,18 @@ impl Container {
     /// generation. Used right after `create_*` to bootstrap a vault
     /// with anchor protection from the start.
     pub fn init_anchor(&mut self, anchor_path: PathBuf, generation: u64) -> Result<(), Error> {
+        // Use the no-clobber variants: `init_anchor` is only called at
+        // vault-creation time on a path the user just supplied.
+        // `write_initial` / `deniable_write_initial` commit via POSIX
+        // `link(2)` / Windows `MoveFileExW(0)`, which refuse to follow
+        // a symlink an attacker may have planted between the CLI-level
+        // `path.exists()` pre-check and this call. Subsequent updates
+        // (`write_anchor`, called on every vfs flush) use the rename-
+        // replace path, which is safe because the path was validated
+        // at unlock time and `self.anchor_path` is bound to it.
         if self.is_deniable() {
             let den = self.deniable.as_ref().expect("is_deniable() implies Some");
-            crate::anchor::deniable_write(
+            crate::anchor::deniable_write_initial(
                 &anchor_path,
                 generation,
                 &self.mvk,
@@ -2343,7 +2352,7 @@ impl Container {
                 self.header.cipher_suite,
             )?;
         } else {
-            crate::anchor::write(
+            crate::anchor::write_initial(
                 &anchor_path,
                 generation,
                 &self.mvk,

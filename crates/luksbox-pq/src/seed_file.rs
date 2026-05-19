@@ -35,7 +35,7 @@ use std::fs;
 use std::io::Read as _;
 use std::path::Path;
 
-use luksbox_core::file_util::atomic_secure_write;
+use luksbox_core::file_util::atomic_secure_create_new;
 
 use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
@@ -84,6 +84,12 @@ pub fn write(
     passphrase: &[u8],
     kdf: KdfParams,
 ) -> Result<(), Error> {
+    // Pre-check is advisory only; the commit step
+    // (`atomic_secure_create_new` -> `link(2)` / `MoveFileExW(0)`) is
+    // the actual no-clobber barrier and is race-free. We keep the
+    // pre-check so the user gets the friendly "already exists" message
+    // in the common non-adversarial case instead of an io::ErrorKind::AlreadyExists
+    // bubbling up from the commit.
     if path.exists() {
         return Err(Error::SeedFile(format!(
             "{} already exists; refusing to overwrite",
@@ -127,14 +133,24 @@ pub fn write(
     out.extend_from_slice(&ct);
     debug_assert_eq!(out.len(), FILE_LEN);
 
-    // Round 9E: atomic_secure_write produces a random-named 0600
-    // tmpfile, fsyncs, renames atomically. Replaces the prior
-    // fixed-name `*.kyber.tmp` + `fs::write` (which inherited the
-    // umask, leaving the tmp world-readable on default 022 systems).
-    // The seed bytes inside this file are passphrase-encrypted, but
-    // narrowing the on-disk permission removes a brute-force vector
-    // for non-owner users on multi-user systems.
-    atomic_secure_write(path, &out)?;
+    // Round 9E: write to a 0600 temp file and commit atomically.
+    // Round 14: switched from `atomic_secure_write` (rename-replace,
+    // follows symlinks at the target) to `atomic_secure_create_new`
+    // (POSIX `link(2)` / Windows `MoveFileExW(0)`) so an attacker
+    // who races a symlink in at the destination between the pre-check
+    // above and the commit cannot redirect the seed write into an
+    // attacker-chosen file (e.g. `/etc/sudoers` when luksbox is run
+    // as root via sudo).
+    atomic_secure_create_new(path, &out).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            Error::SeedFile(format!(
+                "{} already exists; refusing to overwrite",
+                path.display()
+            ))
+        } else {
+            Error::Io(e)
+        }
+    })?;
     Ok(())
 }
 
