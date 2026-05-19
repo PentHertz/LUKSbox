@@ -7,7 +7,7 @@ use rand_core::{OsRng, RngCore};
 use zeroize::Zeroizing;
 
 use crate::error::Error;
-use crate::tree::{CHUNK_LIST_FILE_ID_BIT, ChunkRef};
+use crate::tree::{ChunkRef, CHUNK_LIST_FILE_ID_BIT};
 
 /// Plaintext bytes per chunk. Every on-disk chunk slot stores exactly this many
 /// plaintext bytes (zero-padded as needed); logical file size in the inode
@@ -163,7 +163,8 @@ pub const CHUNK_LIST_ENTRIES_PER_BLOCK: usize = 254;
 
 const CHUNK_LIST_COUNT_OFFSET: usize = 0;
 const CHUNK_LIST_ENTRIES_OFFSET: usize = 4;
-const CHUNK_LIST_NEXT_OFFSET: usize = CHUNK_LIST_ENTRIES_OFFSET + CHUNK_LIST_ENTRIES_PER_BLOCK * 16;
+const CHUNK_LIST_NEXT_OFFSET: usize =
+    CHUNK_LIST_ENTRIES_OFFSET + CHUNK_LIST_ENTRIES_PER_BLOCK * 16;
 const _: () = assert!(CHUNK_LIST_NEXT_OFFSET + 16 <= CHUNK_PLAINTEXT_SIZE);
 
 /// Synthetic file_id used for the chunk-list-block chain of a file
@@ -238,7 +239,8 @@ pub fn encode_chunk_list_block(
         .try_fill_bytes(&mut buf)
         .map_err(|e| Error::Crypto(luksbox_core::Error::OsRng(e.to_string())))?;
     let count = entries.len() as u32;
-    buf[CHUNK_LIST_COUNT_OFFSET..CHUNK_LIST_COUNT_OFFSET + 4].copy_from_slice(&count.to_le_bytes());
+    buf[CHUNK_LIST_COUNT_OFFSET..CHUNK_LIST_COUNT_OFFSET + 4]
+        .copy_from_slice(&count.to_le_bytes());
     for (i, cr) in entries.iter().enumerate() {
         let start = CHUNK_LIST_ENTRIES_OFFSET + i * 16;
         buf[start..start + 16].copy_from_slice(&encode_chunk_ref(*cr));
@@ -274,8 +276,7 @@ pub fn parse_chunk_list_block(
         let start = CHUNK_LIST_ENTRIES_OFFSET + i * 16;
         entries.push(decode_chunk_ref(&plaintext[start..start + 16]));
     }
-    let next_ref =
-        decode_chunk_ref(&plaintext[CHUNK_LIST_NEXT_OFFSET..CHUNK_LIST_NEXT_OFFSET + 16]);
+    let next_ref = decode_chunk_ref(&plaintext[CHUNK_LIST_NEXT_OFFSET..CHUNK_LIST_NEXT_OFFSET + 16]);
     // Sentinel: generation=0 means "no next block". Generation
     // values are allocated starting at 1 by `alloc_chunk_gen`, so
     // 0 cannot legitimately appear in a real ChunkRef.

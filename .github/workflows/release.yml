@@ -235,17 +235,23 @@ jobs:
         # on Linux. libfuse3-dev is here so the `mount` subcommand
         # works on the resulting binary. imagemagick is here for
         # scripts/build_icons.sh.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libfido2-dev \
-            libssl-dev \
-            libudev-dev \
-            zlib1g-dev \
-            libfuse3-dev \
-            libgtk-3-dev \
-            libtss2-dev \
+        #
+        # ./.github/actions/apt-install forces IPv4 + retries on
+        # transient mirror failures. Without IPv4 forcing the arm64
+        # runners (ubuntu-22.04-arm / ubuntu-24.04-arm) frequently
+        # time out trying to fetch from ports.ubuntu.com's IPv6
+        # addresses, which the runner network can't route to.
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
+            pkg-config
+            libfido2-dev
+            libssl-dev
+            libudev-dev
+            zlib1g-dev
+            libfuse3-dev
+            libgtk-3-dev
+            libtss2-dev
             imagemagick
 
       - name: macOS deps (Homebrew)
@@ -834,21 +840,30 @@ jobs:
 
       - name: Lint .deb (lintian)
         if: runner.os == 'Linux'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: lintian
+
+      - name: Run lintian against the .deb
+        if: runner.os == 'Linux'
+        # `--fail-on error` exits non-zero only on errors, not on
+        # warnings/info/pedantic. cargo-deb output trips a few
+        # benign warnings (no source package, no upstream changelog)
+        # that we accept; real bugs (missing field, bad mode) are
+        # errors and will fail the job.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq lintian
-          # `--fail-on error` exits non-zero only on errors, not on
-          # warnings/info/pedantic. cargo-deb output trips a few
-          # benign warnings (no source package, no upstream changelog)
-          # that we accept; real bugs (missing field, bad mode) are
-          # errors and will fail the job.
           lintian --no-tag-display-limit --info --display-info \
             --fail-on error "$DEB_PATH"
 
       - name: Lint .rpm (rpmlint)
         if: runner.os == 'Linux' && matrix.build_rpm
+        uses: ./.github/actions/apt-install
+        with:
+          packages: rpmlint
+
+      - name: Run rpmlint against the .rpm
+        if: runner.os == 'Linux' && matrix.build_rpm
         run: |
-          sudo apt-get install -y -qq rpmlint
           # `-c dist/rpm/rpmlint.toml` filters the small set of
           # cargo-generate-rpm 0.16.x output limitations + the
           # unsigned-RPM warning we accept on dev artifacts. Each

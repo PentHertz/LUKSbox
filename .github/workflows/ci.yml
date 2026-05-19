@@ -36,10 +36,10 @@ jobs:
         with:
           shared-key: ci-lint
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
             libtss2-dev
       - run: cargo fmt --all -- --check
       # Workspace-wide clippy. NOT `-D warnings` yet, there's a backlog of
@@ -69,10 +69,10 @@ jobs:
         with:
           shared-key: ci-test-${{ matrix.profile }}
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
             libtss2-dev
       - name: Run ${{ matrix.profile }} tests
         run: ${{ matrix.cmd }}
@@ -185,10 +185,10 @@ jobs:
         with:
           shared-key: ci-security-regressions
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
             libtss2-dev
       - name: Argon2id DoS guard (luksbox-core)
         run: cargo test -p luksbox-core --test argon2_dos_guard
@@ -254,11 +254,11 @@ jobs:
         with:
           shared-key: ci-build-${{ matrix.target }}
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev \
-            libtss2-dev \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
+            libtss2-dev
             ${{ matrix.extra_apt }}
       - name: Build
         run: ${{ matrix.cmd }}
@@ -320,9 +320,9 @@ jobs:
           shared-key: ci-fuzz-smoke
           workspaces: "fuzz"
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
             pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev clang
       # NB: no `--locked`. cargo-fuzz 0.13.x ships a Cargo.lock that
       # pins `rustix = 0.36.5`, which uses internal rustc attributes

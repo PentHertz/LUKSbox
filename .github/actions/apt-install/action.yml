@@ -1,0 +1,58 @@
+name: apt-install
+description: >-
+  Install Debian/Ubuntu packages with IPv4 forced and a retry loop.
+  Works around the recurring failure on GitHub Actions arm64 runners
+  where DNS for ports.ubuntu.com returns AAAA records but the runner
+  cannot route IPv6 to Canonical's mirrors; apt's default
+  IPv6-then-IPv4 fallback takes ~120s per failed host and ultimately
+  times out instead of using the working IPv4 path. The retry loop
+  also covers transient mirror outages on x86_64 runners.
+inputs:
+  packages:
+    description: >-
+      Whitespace-separated list of package names to install with
+      --no-install-recommends. Can be a multi-line string; whitespace
+      is collapsed.
+    required: true
+  attempts:
+    description: How many install attempts before giving up.
+    required: false
+    default: "5"
+  retry-delay-seconds:
+    description: Sleep between failed attempts.
+    required: false
+    default: "10"
+runs:
+  using: composite
+  steps:
+    - name: Configure apt for IPv4
+      shell: bash
+      run: |
+        # Idempotent: re-running this action in the same job (or
+        # across multiple `uses:` in one job) is safe.
+        echo 'Acquire::ForceIPv4 "true";' | \
+          sudo tee /etc/apt/apt.conf.d/99force-ipv4 > /dev/null
+    - name: apt-get install with retry
+      shell: bash
+      env:
+        APT_PACKAGES: ${{ inputs.packages }}
+        APT_ATTEMPTS: ${{ inputs.attempts }}
+        APT_RETRY_DELAY: ${{ inputs.retry-delay-seconds }}
+      run: |
+        set -u
+        # Collapse whitespace + newlines so callers can pass the
+        # package list on multiple lines for readability.
+        pkgs=$(echo "$APT_PACKAGES" | tr '\n' ' ' | tr -s ' ')
+        for attempt in $(seq 1 "$APT_ATTEMPTS"); do
+          if sudo apt-get update && \
+             sudo apt-get install -y --no-install-recommends $pkgs; then
+            echo "apt install succeeded on attempt $attempt"
+            exit 0
+          fi
+          if [ "$attempt" -lt "$APT_ATTEMPTS" ]; then
+            echo "apt install attempt $attempt failed; retry in ${APT_RETRY_DELAY}s..."
+            sleep "$APT_RETRY_DELAY"
+          fi
+        done
+        echo "apt install failed after $APT_ATTEMPTS attempts"
+        exit 1

@@ -2284,7 +2284,10 @@ fn create_single_slot_tpm_vault(
 
             let mut hmac_salt = [0u8; 32];
             OsRng.fill_bytes(&mut hmac_salt);
-            eprintln!("{}", crate::auth_prompt("again to derive the FIDO2 half"));
+            eprintln!(
+                "{}",
+                crate::auth_prompt("again to derive the FIDO2 half")
+            );
             let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
 
             Container::create_with_tpm2_fido2(
@@ -2402,7 +2405,10 @@ fn create_single_slot_tpm_vault(
 
             let mut hmac_salt = [0u8; 32];
             OsRng.fill_bytes(&mut hmac_salt);
-            eprintln!("{}", crate::auth_prompt("again to derive the FIDO2 half"));
+            eprintln!(
+                "{}",
+                crate::auth_prompt("again to derive the FIDO2 half")
+            );
             let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
 
             let (pk, seed) = keygen_with(params);
@@ -4780,7 +4786,10 @@ fn enroll_tpm2_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()
 
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
-    eprintln!("{}", crate::auth_prompt("again to derive the FIDO2 half"));
+    eprintln!(
+        "{}",
+        crate::auth_prompt("again to derive the FIDO2 half")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
 
     let blob_bytes = blob.to_bytes();
@@ -4956,7 +4965,10 @@ fn enroll_hybrid_pq_tpm2_fido2_into(
 
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
-    eprintln!("{}", crate::auth_prompt("again to derive the FIDO2 half"));
+    eprintln!(
+        "{}",
+        crate::auth_prompt("again to derive the FIDO2 half")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
 
     eprintln!("generating {level_label} keypair...");

@@ -78,6 +78,7 @@
             <ComponentRef Id="StartMenuShortcut" />
             <ComponentRef Id="PathEntry" />
             <ComponentRef Id="WinFspPathEntry" />
+            <ComponentRef Id="WinFspDllSibling" />
             <ComponentRef Id="LbxAssociation" />
         </Feature>
 
@@ -187,7 +188,18 @@
              RegistrySearch above and ends in a backslash, so the bin
              subdir is "[WINFSPINSTALLDIR]bin". Part="last" appends
              without disturbing other PATH entries; Permanent="no" lets
-             our uninstaller cleanly remove it. -->
+             our uninstaller cleanly remove it.
+
+             NB the PATH update alone is NOT enough on first launch:
+             the user's running explorer.exe inherits its env block
+             from winlogon at session-start time, and the standard
+             MSI WriteEnvironmentStrings WM_SETTINGCHANGE broadcast
+             is unreliably honored by recent Windows builds. So we
+             ALSO copy winfsp-x64.dll next to luksbox.exe via the
+             WinFspDllSibling component below — the app directory is
+             the FIRST entry in the loader search order and is
+             checked before PATH, so first-launch works regardless
+             of whether explorer ever picks up the new PATH. -->
         <Component Id="WinFspPathEntry"
                    Directory="INSTALLFOLDER"
                    Guid="b4f8c2e1-7a3d-4e5f-9b1c-3d8e7a2c4f6b"
@@ -208,6 +220,74 @@
                 Value="1"
                 KeyPath="yes" />
         </Component>
+
+        <!-- ===== copy winfsp-x64.dll next to luksbox.exe ========== -->
+        <!-- First-launch race fix: even with PATH updated above,
+             explorer's env cache lags behind the registry write and
+             a shortcut clicked right after install spawns a process
+             that inherits stale PATH → STATUS_DLL_NOT_FOUND. The
+             Windows DLL search order ALWAYS checks the application
+             directory FIRST (before PATH), so dropping a copy of
+             winfsp-x64.dll there means the loader finds it
+             unconditionally.
+
+             We use deferred CustomActions instead of WiX <CopyFile>
+             because CopyFile's source path resolution is fragile
+             when the source directory is computed at runtime from a
+             RegistrySearch property. A pair of `cmd /c copy` /
+             `cmd /c del` actions is dumb but robust across WiX
+             versions. The RegistryValue gives the component a stable
+             KeyPath so MSI tracks install/uninstall correctly.
+
+             Condition gated on WINFSPINSTALLDIR so the action only
+             runs when WinFsp is present at install time. The Launch
+             condition above already refuses install without WinFsp,
+             so this is belt-and-suspenders. -->
+        <Component Id="WinFspDllSibling"
+                   Directory="INSTALLFOLDER"
+                   Guid="d2c4a5f0-1b8e-4f7d-a3c2-9e5b8d4f1a6c"
+                   Condition="WINFSPINSTALLDIR">
+            <RegistryValue
+                Root="HKLM"
+                Key="Software\Penthertz\LUKSbox"
+                Name="winfsp_dll_sibling"
+                Type="integer"
+                Value="1"
+                KeyPath="yes" />
+        </Component>
+
+        <!-- Schedule the copy/remove. Deferred so they run with
+             elevated context (INSTALLFOLDER is %ProgramFiles%); the
+             non-elevated immediate-mode would fail on the write. -->
+        <CustomAction
+            Id="CopyWinFspDll"
+            Directory="INSTALLFOLDER"
+            Execute="deferred"
+            Impersonate="no"
+            Return="check"
+            ExeCommand='"cmd.exe" /D /C copy /Y "[WINFSPINSTALLDIR]bin\winfsp-x64.dll" "[INSTALLFOLDER]winfsp-x64.dll"' />
+        <CustomAction
+            Id="RemoveWinFspDll"
+            Directory="INSTALLFOLDER"
+            Execute="deferred"
+            Impersonate="no"
+            Return="ignore"
+            ExeCommand='"cmd.exe" /D /C del /F /Q "[INSTALLFOLDER]winfsp-x64.dll"' />
+
+        <InstallExecuteSequence>
+            <!-- Copy after the LUKSbox files land so INSTALLFOLDER
+                 exists, before InstallFinalize closes the install. -->
+            <Custom Action="CopyWinFspDll"
+                    After="InstallFiles"
+                    Condition="NOT REMOVE AND WINFSPINSTALLDIR" />
+            <!-- Remove BEFORE RemoveFiles so MSI's directory-empty
+                 check on INSTALLFOLDER succeeds and the directory
+                 gets cleaned up. Run on uninstall only (REMOVE=ALL
+                 covers full uninstall; an upgrade reinstalls below). -->
+            <Custom Action="RemoveWinFspDll"
+                    Before="RemoveFiles"
+                    Condition="REMOVE=&quot;ALL&quot;" />
+        </InstallExecuteSequence>
 
         <!-- ===== .lbx file association =========================== -->
         <!-- Maps Explorer's right-click "Open with" + double-click on

@@ -65,9 +65,9 @@ jobs:
           shared-key: fuzz-nightly
           workspaces: "fuzz"
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
             pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev clang
       # NB: no `--locked`. cargo-fuzz 0.13.x ships a Cargo.lock pinning
       # rustix 0.36.5, which uses internal `rustc_*` attributes without

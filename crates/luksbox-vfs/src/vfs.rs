@@ -11,7 +11,8 @@ use zeroize::Zeroizing;
 use crate::chunk::{self, CHUNK_PLAINTEXT_SIZE};
 use crate::error::Error;
 use crate::tree::{
-    ChunkId, ChunkRef, DirectoryTree, FileId, Inode, InodeKind, ROOT_ID, V3_INLINE_CHUNK_THRESHOLD,
+    ChunkId, ChunkRef, DirectoryTree, FileId, Inode, InodeKind, ROOT_ID,
+    V3_INLINE_CHUNK_THRESHOLD,
 };
 
 /// Credentials for one keyslot during MVK rotation. Caller (typically the
@@ -753,7 +754,8 @@ impl Vfs {
             // bookkeeping; old external_list_blocks (from a
             // previous flush) are freed during the spill.
             let v3 = self.spill_to_v3_on_disk()?;
-            let payload = postcard::to_allocvec(&v3).map_err(|_| Error::MetadataSerialize)?;
+            let payload =
+                postcard::to_allocvec(&v3).map_err(|_| Error::MetadataSerialize)?;
             if payload.len() > METADATA_DECODE_LIMIT_BYTES {
                 return Err(Error::MetadataSerialize);
             }
@@ -807,7 +809,8 @@ impl Vfs {
                 let inode = self.tree.inodes.get(&id).expect("id from keys()");
                 (
                     inode.chunks.len(),
-                    inode.kind == InodeKind::File && inode.chunks.len() > V3_INLINE_CHUNK_THRESHOLD,
+                    inode.kind == InodeKind::File
+                        && inode.chunks.len() > V3_INLINE_CHUNK_THRESHOLD,
                 )
             };
             // Free any previously-allocated external_list_blocks; we
@@ -840,7 +843,11 @@ impl Vfs {
                     self.write_external_chain_for(id, &chunks_snapshot)?;
                 debug_assert_eq!(count as usize, chunks_len);
                 // Record the new external_list_blocks on the inode.
-                let inode_mut = self.tree.inodes.get_mut(&id).expect("id from keys()");
+                let inode_mut = self
+                    .tree
+                    .inodes
+                    .get_mut(&id)
+                    .expect("id from keys()");
                 inode_mut.external_list_blocks = new_externals;
                 on_disk_inodes.insert(
                     id,
@@ -900,8 +907,14 @@ impl Vfs {
         let block_count = entries.len().div_ceil(CHUNK_LIST_ENTRIES_PER_BLOCK);
         let mut block_refs: Vec<ChunkRef> = Vec::with_capacity(block_count);
         for _ in 0..block_count {
-            let id = self.tree.alloc_chunk_id().ok_or(Error::IdSpaceExhausted)?;
-            let generation = self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?;
+            let id = self
+                .tree
+                .alloc_chunk_id()
+                .ok_or(Error::IdSpaceExhausted)?;
+            let generation = self
+                .tree
+                .alloc_chunk_gen()
+                .ok_or(Error::IdSpaceExhausted)?;
             block_refs.push(ChunkRef { id, generation });
         }
         // Write the blocks. Each block_idx is its position in the
@@ -999,10 +1012,7 @@ impl Vfs {
         // estimate is just an InodeV3OnDisk with empty inline chunks
         // and a placeholder (ChunkRef, count). The placeholder bytes
         // postcard-encode identically to the real values (same shape).
-        let placeholder = ChunkRef {
-            id: 0,
-            generation: 1,
-        };
+        let placeholder = ChunkRef { id: 0, generation: 1 };
         let mut on_disk_inodes: std::collections::BTreeMap<FileId, InodeV3OnDisk> =
             std::collections::BTreeMap::new();
         for (&inode_id, inode) in self.tree.inodes.iter() {
@@ -1014,8 +1024,8 @@ impl Vfs {
             } else {
                 inode.chunks.len()
             };
-            let renders_external =
-                inode.kind == InodeKind::File && projected_chunk_count > V3_INLINE_CHUNK_THRESHOLD;
+            let renders_external = inode.kind == InodeKind::File
+                && projected_chunk_count > V3_INLINE_CHUNK_THRESHOLD;
             on_disk_inodes.insert(
                 inode_id,
                 if renders_external {
@@ -2445,10 +2455,7 @@ mod tests {
         drop(vfs);
         let cont = Container::open(&path, None, UnlockMaterial::Passphrase(b"pw")).unwrap();
         let mut vfs = Vfs::open(cont).unwrap();
-        assert!(
-            vfs.uses_v3_metadata(),
-            "reopen must detect v3 from LBM3 magic"
-        );
+        assert!(vfs.uses_v3_metadata(), "reopen must detect v3 from LBM3 magic");
         let f = vfs.lookup(vfs.root_id(), "small").unwrap();
         let mut buf = vec![0u8; 64 * 1024];
         let n = vfs.read(f, 0, &mut buf).unwrap();
@@ -2508,10 +2515,7 @@ mod tests {
         // populated from the walked chain so a follow-on unlink
         // would correctly free them.
         assert_eq!(vfs.tree.inodes[&f].chunks.len(), chunks_in_inode);
-        assert_eq!(
-            vfs.tree.inodes[&f].external_list_blocks.len(),
-            externals.len()
-        );
+        assert_eq!(vfs.tree.inodes[&f].external_list_blocks.len(), externals.len());
         let mut readback = vec![0u8; size];
         let n = vfs.read(f, 0, &mut readback).unwrap();
         assert_eq!(n, size);
@@ -2543,10 +2547,7 @@ mod tests {
         )
         .unwrap();
         let mut vfs = Vfs::open(cont).unwrap();
-        assert!(
-            vfs.uses_v3_metadata(),
-            "deniable vault must respect the v3 override"
-        );
+        assert!(vfs.uses_v3_metadata(), "deniable vault must respect the v3 override");
         assert!(vfs.container().is_deniable());
         let root = vfs.root_id();
         let f = vfs.create(root, "big").unwrap();
@@ -2577,10 +2578,7 @@ mod tests {
         let f = vfs.lookup(vfs.root_id(), "big").unwrap();
         let mut got = vec![0u8; size];
         vfs.read(f, 0, &mut got).unwrap();
-        assert_eq!(
-            got, payload,
-            "deniable v3 file must round-trip byte-for-byte"
-        );
+        assert_eq!(got, payload, "deniable v3 file must round-trip byte-for-byte");
     }
 
     #[test]
@@ -3429,10 +3427,7 @@ mod tests {
             .expect("data chunk must NOT decrypt under list key");
         // Crypto error of some kind — we don't care which variant,
         // just that the AEAD refused.
-        assert!(
-            matches!(err, Error::Crypto(_)),
-            "expected AEAD failure, got {err:?}"
-        );
+        assert!(matches!(err, Error::Crypto(_)), "expected AEAD failure, got {err:?}");
 
         // 3. Decrypting the list block under the DATA file_key with
         //    the DATA AAD shape (real file_id, chunk_idx=0) must
@@ -3440,10 +3435,7 @@ mod tests {
         let err = read_chunk(&mut vfs.container, &data_key, file_id, 0, list_block_ref)
             .err()
             .expect("list block must NOT decrypt under data key");
-        assert!(
-            matches!(err, Error::Crypto(_)),
-            "expected AEAD failure, got {err:?}"
-        );
+        assert!(matches!(err, Error::Crypto(_)), "expected AEAD failure, got {err:?}");
 
         // 4. The legitimate walk over the chain MUST still succeed —
         //    this is the positive control.
@@ -3486,10 +3478,7 @@ mod tests {
         vfs.write(f, 0, &payload).unwrap();
         vfs.flush().unwrap();
         let blocks_before = vfs.tree.inodes[&f].external_list_blocks.len();
-        assert!(
-            blocks_before > 0,
-            "test precondition: file must have spilled"
-        );
+        assert!(blocks_before > 0, "test precondition: file must have spilled");
 
         // Rotate.
         let creds = vec![SlotCredential::Passphrase {
