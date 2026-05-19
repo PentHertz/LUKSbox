@@ -19,6 +19,10 @@ rand_core.workspace = true
 thiserror.workspace = true
 subtle.workspace = true
 
+# R13-05: O_NOFOLLOW on the .kyber sidecar open. Unix-only target.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 luksbox-format = { path = "../luksbox-format" }
 luksbox-vfs = { path = "../luksbox-vfs" }

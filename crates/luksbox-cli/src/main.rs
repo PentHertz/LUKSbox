@@ -1363,7 +1363,6 @@ fn cmd_header_restore(
     unlock: &UnlockArgs,
     no_verify: bool,
 ) -> Result<()> {
-    use std::io::Write as _;
     // 1. Parse the backup file (catches "this isn't even a header").
     let (new_bytes, new_header) = read_header_bytes(input, 0)?;
     println!(
@@ -1378,13 +1377,27 @@ fn cmd_header_restore(
             .collect::<String>(),
     );
 
-    // 2. Optional HMAC verify under the current MVK. This catches the
-    //    case where someone replaces your backup file with one that
-    //    authenticates under THEIR MVK; without this check you'd
-    //    silently install an attacker's keyslot table. Skipped only
-    //    when the on-disk header is too damaged to even unlock with.
+    // 2. Round 13 fix R13-02: we open the container UP FRONT (when not
+    //    in --no-verify mode) and reuse the same verified handle for
+    //    the rewrite. Previously the restore re-opened the vault path
+    //    with plain `OpenOptions::open` after verify, creating a
+    //    symlink-swap window between the two opens; an attacker who
+    //    could race the path between verify and rewrite could redirect
+    //    the first 8 KiB into another writable target. The new flow
+    //    routes the rewrite through `Container::restore_header_bytes`,
+    //    which uses the already-locked, already-inode-verified
+    //    `self.file` for inline mode, and `atomic_secure_write` for
+    //    detached mode (so the sidecar swap is temp+fsync+rename
+    //    rather than in-place truncation).
+    //
+    //    In --no-verify mode the on-disk header may itself be too
+    //    broken to unlock with, so we cannot route through Container
+    //    (which would refuse to open the vault). For that path we
+    //    keep the legacy direct-open, but add `O_NOFOLLOW` so an
+    //    attacker who pre-created a symlink at `vault` cannot
+    //    redirect the rewrite.
     if !no_verify {
-        let container = open_container(vault, unlock).map_err(|e| {
+        let mut container = open_container(vault, unlock).map_err(|e| {
             format!(
                 "could not unlock the vault to HMAC-verify the new header against the current MVK: {e}. \
                  If the on-disk header is itself too damaged to unlock with, re-run with `--no-verify` \
@@ -1392,10 +1405,6 @@ fn cmd_header_restore(
                  trusted source)."
             )
         })?;
-        // verify_hmac re-derives the header MAC key from the MVK + the
-        // header_salt embedded in `new_bytes` and compares against the
-        // tag that's also embedded. If it returns Ok, the backup file
-        // was written under the same MVK as the vault currently uses.
         let mvk = container.mvk_clone();
         new_header.verify_hmac(&new_bytes, &mvk).map_err(|e| {
             format!(
@@ -1407,24 +1416,36 @@ fn cmd_header_restore(
             )
         })?;
         println!("  HMAC verify: OK (the backup was sealed under this vault's current MVK)");
-    } else {
-        eprintln!(
-            "warning: --no-verify is set; the backup file is NOT being HMAC-checked \
-             against the current MVK. Use this only if you trust the source of the \
-             backup file."
-        );
+
+        container
+            .restore_header_bytes(&new_bytes)
+            .map_err(|e| format!("installing verified backup header: {e}"))?;
+        match header_sidecar {
+            Some(hp) => println!(
+                "restored detached header to {} (atomic rename via container)",
+                hp.display()
+            ),
+            None => println!(
+                "restored inline header to {} (in-place fsynced write via container)",
+                vault.display()
+            ),
+        }
+        // Drop the container; the in-memory header is stale relative
+        // to disk after the rewrite, so we don't keep using it.
+        drop(container);
+        return Ok(());
     }
 
-    // 3. Write to disk. Inline mode rewrites bytes 0..8192 of the
-    //    vault file in place; detached mode atomic-replaces the
-    //    sidecar (temp+fsync+rename+sync_parent_dir). Inline path is
-    //    intentionally NOT atomic across crashes - if the user wants
-    //    crash safety they can keep the existing on-disk header as a
-    //    rollback before running this; the inline restore is a
-    //    targeted byte-region rewrite.
+    // --no-verify path: write the bytes directly. We can't route
+    // through Container here because the on-disk header may be too
+    // damaged to unlock.
+    eprintln!(
+        "warning: --no-verify is set; the backup file is NOT being HMAC-checked \
+         against the current MVK. Use this only if you trust the source of the \
+         backup file."
+    );
     match header_sidecar {
         Some(hp) => {
-            // Detached: atomic-replace the .hdr sidecar.
             luksbox_core::file_util::atomic_secure_write(hp, &new_bytes)
                 .map_err(|e| format!("atomic-replace of {}: {e}", hp.display()))?;
             println!(
@@ -1433,14 +1454,44 @@ fn cmd_header_restore(
             );
         }
         None => {
-            // Inline: open vault rw, pwrite bytes 0..8192, fsync.
+            // Direct open, with `O_NOFOLLOW` on Unix and
+            // `FILE_FLAG_OPEN_REPARSE_POINT` + reparse-attribute
+            // refusal on Windows, so the rewrite cannot be
+            // redirected through a symlink an attacker pre-created
+            // at the vault path.
             use std::fs::OpenOptions;
-            use std::io::{Seek as _, SeekFrom};
-            let mut f = OpenOptions::new()
-                .read(true)
-                .write(true)
+            use std::io::{Seek as _, SeekFrom, Write as _};
+            let mut o = OpenOptions::new();
+            o.read(true).write(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt as _;
+                o.custom_flags(libc::O_NOFOLLOW);
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt as _;
+                // FILE_FLAG_OPEN_REPARSE_POINT
+                o.custom_flags(0x0020_0000);
+            }
+            let mut f = o
                 .open(vault)
                 .map_err(|e| format!("opening {} for inline restore: {e}", vault.display()))?;
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt as _;
+                let attrs = f
+                    .metadata()
+                    .map_err(|e| format!("stat {} for restore: {e}", vault.display()))?
+                    .file_attributes();
+                if attrs & 0x0000_0400 != 0 {
+                    return Err(format!(
+                        "{} is a reparse point (symlink / junction); refusing to overwrite header",
+                        vault.display()
+                    )
+                    .into());
+                }
+            }
             f.seek(SeekFrom::Start(0))
                 .map_err(|e| format!("seek to 0 in {}: {e}", vault.display()))?;
             f.write_all(&new_bytes)

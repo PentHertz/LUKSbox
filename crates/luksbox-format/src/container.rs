@@ -6,7 +6,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use fs2::FileExt;
-use luksbox_core::file_util::{secure_create_new, sync_parent_dir};
+use luksbox_core::file_util::{atomic_secure_write, secure_create_new, sync_parent_dir};
 use luksbox_core::{
     Argon2idParams, CipherSuite, HEADER_SIZE, Header, KdfId, Keyslot, MAX_KEYSLOTS,
     MasterVolumeKey, SlotKind, SubKey,
@@ -2146,19 +2146,33 @@ impl Container {
     /// For deniable-mode containers writes the cached 8 KiB buffer instead
     /// of re-serialising `self.header`, because the wrapped-MVK ciphertext
     /// lives inside the opaque slot bytes (not in `self.header.keyslots`).
+    ///
+    /// Round 13 fix R13-04: durability + atomicity.
+    ///   - Inline (and deniable): we use `sync_all()` instead of `flush()`
+    ///     so the kernel commits the rewritten header bytes to the disk's
+    ///     stable storage before we return. Without this, a power loss
+    ///     between `flush()` and the next vault open could leave the
+    ///     keyslot table half-updated (e.g. a revoke whose ciphertext is
+    ///     gone from page cache but whose on-disk bytes still contain the
+    ///     old wrap), reintroducing the revoked credential.
+    ///   - Detached: we go through `atomic_secure_write`, which writes a
+    ///     `.tmp.<16hex>` neighbour at mode 0600, fsyncs it, atomically
+    ///     renames over the sidecar, then fsyncs the parent directory.
+    ///     This replaces the prior in-place rewrite path, which could
+    ///     leave the sidecar half-overwritten on crash.
     pub fn persist_header(&mut self) -> Result<(), Error> {
         if !self.header_dirty {
             return Ok(());
         }
         if let Some(deniable) = &self.deniable {
-            // Deniable-mode persist: write the cached 8 KiB header
+            // Deniable-mode persist: write the cached 36 KiB header
             // buffer wholesale. Detached headers are not yet
             // supported in deniable mode (constructors reject
             // header_path), so we always write to offset 0 of
             // `self.file`.
             self.file.seek(SeekFrom::Start(0))?;
             self.file.write_all(&deniable.bytes[..])?;
-            self.file.flush()?;
+            self.file.sync_all()?;
             self.header_dirty = false;
             return Ok(());
         }
@@ -2167,14 +2181,72 @@ impl Container {
             HeaderStorage::Inline => {
                 self.file.seek(SeekFrom::Start(0))?;
                 self.file.write_all(&bytes)?;
-                self.file.flush()?;
+                self.file.sync_all()?;
             }
-            HeaderStorage::Detached(hf, _) => {
-                hf.seek(SeekFrom::Start(0))?;
-                hf.write_all(&bytes)?;
-                hf.flush()?;
+            HeaderStorage::Detached(_, hp) => {
+                // Replace the sidecar atomically. The existing
+                // `HeaderStorage::Detached` handle is held only so we
+                // keep an OS-level lock on the path while the
+                // container is live; the actual write goes through
+                // the temp+fsync+rename helper so a crash mid-write
+                // never leaves the sidecar truncated.
+                let hp = hp.clone();
+                atomic_secure_write(&hp, &bytes)?;
+                // Re-open the handle so it points at the new inode
+                // (the old handle still refers to the unlinked
+                // pre-rename inode on POSIX). Without this the
+                // existing lock is on the wrong file going forward.
+                let new_hf = OpenOptions::new().read(true).write(true).open(&hp)?;
+                if let HeaderStorage::Detached(hf, _) = &mut self.header_storage {
+                    *hf = new_hf;
+                }
             }
         }
+        self.header_dirty = false;
+        Ok(())
+    }
+
+    /// Round 13 fix R13-02: install a 8 KiB header backup safely.
+    ///
+    /// The CLI's `luksbox header restore` previously opened the vault
+    /// path with `OpenOptions::open(path)` after verifying the new
+    /// header's HMAC against the currently-open container. That second
+    /// open re-traversed the path with no `O_NOFOLLOW` and no inode
+    /// check, so an attacker who could race the path between the verify
+    /// and the write was able to redirect the first 8 KiB of the
+    /// rewrite into another file the caller had write access to.
+    ///
+    /// This method reuses the container's already-verified `self.file`
+    /// handle (opened with `O_NOFOLLOW` + canonical-path-bound + inode
+    /// check at `open_rw_checked`) for the inline path, and routes the
+    /// detached path through `atomic_secure_write` so the sidecar swap
+    /// happens via temp+fsync+rename rather than in-place truncation.
+    ///
+    /// Caller is responsible for having ALREADY verified the backup
+    /// bytes against the vault's current MVK (or having opted out via
+    /// `--no-verify`); this method is byte-for-byte and does not
+    /// re-parse. After it returns, the in-memory `self.header` is
+    /// stale relative to disk; the caller should drop the container
+    /// rather than continue using it.
+    pub fn restore_header_bytes(&mut self, bytes: &[u8; HEADER_SIZE]) -> Result<(), Error> {
+        match &mut self.header_storage {
+            HeaderStorage::Inline => {
+                self.file.seek(SeekFrom::Start(0))?;
+                self.file.write_all(bytes)?;
+                self.file.sync_all()?;
+            }
+            HeaderStorage::Detached(_, hp) => {
+                let hp = hp.clone();
+                atomic_secure_write(&hp, bytes)?;
+                let new_hf = OpenOptions::new().read(true).write(true).open(&hp)?;
+                if let HeaderStorage::Detached(hf, _) = &mut self.header_storage {
+                    *hf = new_hf;
+                }
+            }
+        }
+        // The in-memory header is now out of sync with disk. Mark it
+        // clean so the `Drop` impl's `persist_header()` doesn't write
+        // the stale in-memory copy back on top of the restored bytes.
         self.header_dirty = false;
         Ok(())
     }

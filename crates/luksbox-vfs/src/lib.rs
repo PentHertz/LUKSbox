@@ -24,4 +24,4 @@ pub mod vfs;
 pub use crate::chunk::{CHUNK_PLAINTEXT_SIZE, CHUNK_SLOT_SIZE};
 pub use crate::error::Error;
 pub use crate::tree::{ChunkRef, DirectoryTree, FileId, InodeKind};
-pub use crate::vfs::{DirEntry, SlotCredential, Stat, TreeCounters, Vfs};
+pub use crate::vfs::{DirEntry, MAX_FILE_SIZE, SlotCredential, Stat, TreeCounters, Vfs};

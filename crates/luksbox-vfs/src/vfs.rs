@@ -68,6 +68,26 @@ fn padded_chunk_count(needed: usize, padding_on: bool) -> usize {
 /// is set: u64 LE of the file's real byte length.
 const SIZE_HEADER_LEN: usize = 8;
 
+/// Round 13 fix R13-07: hard per-file logical-size cap. Picked at 2^44
+/// (16 TiB) — three orders of magnitude beyond the largest real-world
+/// vault payload we've heard of, but small enough that
+/// `padded_chunk_count` (which calls `next_power_of_two`) cannot
+/// overflow on a 64-bit `usize` and the chunk-allocation loops in
+/// `write`/`truncate` cannot exhaust RAM before returning.
+///
+/// Without this cap, an attacker (or a buggy caller) supplying
+/// `offset + buf.len()` close to `u64::MAX` would reach
+/// `required_chunks` and `padded_chunk_count` with a value whose
+/// next-power-of-two is `usize::MAX/2 + 1`, then either panic
+/// (next_power_of_two debug-assert) or commit gigabytes of zero-filled
+/// chunk allocations before the host runs out of space.
+///
+/// The CLI/FUSE/WinFsp surfaces never legitimately produce sizes
+/// anywhere near this cap; legitimate workloads bottom out at TiB-class
+/// payloads which fit comfortably. Callers exceeding the cap receive
+/// `Error::FileSizeExceedsCap` instead of a panic / OOM.
+pub const MAX_FILE_SIZE: u64 = 1u64 << 44;
+
 /// Number of chunks needed to hold a file of `real_size` bytes, accounting
 /// for the chunk-0 size-header in `hide_size` mode.
 ///
@@ -462,6 +482,18 @@ impl Vfs {
     /// Get the real (logical) byte length of a file, decoding the chunk-0
     /// header in `FLAG_HIDE_SIZE_HEADER` mode (cached after first lookup).
     /// In normal mode this is just `inode.size`.
+    ///
+    /// Round 13 fix R13-03: the chunk-0 size header is authenticated by
+    /// the chunk AEAD, but its value is otherwise unconstrained by the
+    /// container layer — `validate_metadata_tree` only checks that the
+    /// stored `inode.size` matches `chunks.len() * CHUNK_PLAINTEXT_SIZE`
+    /// (the padded capacity), not the real-size u64. An authenticated
+    /// writer (legitimate vault owner or anyone with the MVK) could
+    /// craft a chunk-0 whose size header decodes to a value far larger
+    /// than the allocated chunk capacity. The cached value would then
+    /// flow into `read()` / `write()` / `stat()`, where
+    /// `inode.chunks[chunk_idx]` panics on out-of-range access. We
+    /// reject hostile values here, before they reach the cache.
     fn real_size(&mut self, id: FileId) -> Result<u64, Error> {
         let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?;
         if inode.kind != InodeKind::File {
@@ -482,11 +514,23 @@ impl Vfs {
         }
         // Decrypt chunk 0 to extract the size header.
         let chunk0 = inode.chunks[0];
+        let chunks_len = inode.chunks.len();
         let key = chunk::file_key(&self.container, id);
         let pt = chunk::read_chunk(&mut self.container, &key, id, 0, chunk0)?;
         let mut size_buf = [0u8; SIZE_HEADER_LEN];
         size_buf.copy_from_slice(&pt[..SIZE_HEADER_LEN]);
         let size = u64::from_le_bytes(size_buf);
+        // R13-03: the maximum legal real-size is the allocated chunk
+        // capacity minus the 8-byte chunk-0 size header. Bigger values
+        // are corrupt (or attacker-supplied) and must be refused before
+        // any downstream offset calculation reaches `inode.chunks[idx]`.
+        let max_real = (chunks_len as u64)
+            .checked_mul(CHUNK_PLAINTEXT_SIZE as u64)
+            .and_then(|cap| cap.checked_sub(SIZE_HEADER_LEN as u64))
+            .ok_or(Error::MetadataDeserialize)?;
+        if size > max_real {
+            return Err(Error::MetadataDeserialize);
+        }
         self.tree.inodes.get_mut(&id).unwrap().cached_real_size = Some(size);
         Ok(size)
     }
@@ -655,6 +699,13 @@ impl Vfs {
         let new_end = offset
             .checked_add(buf.len() as u64)
             .ok_or(Error::OffsetOverflow)?;
+        // R13-07: refuse writes whose target logical size exceeds the
+        // per-file cap before we feed `padded_chunk_count` /
+        // `next_power_of_two` something that would panic or allocate
+        // astronomic amounts of disk.
+        if new_end > MAX_FILE_SIZE {
+            return Err(Error::FileSizeExceedsCap);
+        }
         let new_real = old_real.max(new_end);
 
         let hide_size = self.container.header.hide_size_header();
@@ -755,6 +806,14 @@ impl Vfs {
     }
 
     pub fn truncate(&mut self, id: FileId, new_size: u64) -> Result<(), Error> {
+        // R13-07: refuse oversize truncates for the same reason as
+        // write(): the chunk-allocation loop below would otherwise
+        // commit zeros for billions of chunks before the host runs
+        // out of space, and `padded_chunk_count`'s
+        // `next_power_of_two` would panic.
+        if new_size > MAX_FILE_SIZE {
+            return Err(Error::FileSizeExceedsCap);
+        }
         let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?.clone();
         if inode.kind != InodeKind::File {
             return Err(Error::NotAFile);

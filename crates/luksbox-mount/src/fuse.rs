@@ -564,7 +564,16 @@ impl Filesystem for LuksboxFs {
         _lock: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let mut buf = vec![0u8; size as usize];
+        // Round 13 fix R13-08: the kernel passes `size` straight from the
+        // userspace caller's read() request and FUSE normally caps it at
+        // its `max_read` negotiated value, but a buggy or hostile module
+        // along the kernel path could in principle hand us a u32 close
+        // to 4 GiB. `vec![0u8; size as usize]` would then commit that
+        // much memory before we even reach the decrypt path. Bound it
+        // here as defence-in-depth.
+        const READ_SIZE_CAP: usize = 16 * 1024 * 1024; // 16 MiB
+        let size = (size as usize).min(READ_SIZE_CAP);
+        let mut buf = vec![0u8; size];
         let r = match self.vfs.lock() {
             Ok(mut v) => v.read(ino.0, offset, &mut buf),
             Err(_) => {

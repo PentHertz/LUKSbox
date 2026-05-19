@@ -122,85 +122,190 @@ fn is_denied_extract_root(canonical_parent: &Path) -> bool {
 }
 
 pub fn secure_create_or_truncate(path: &Path) -> io::Result<File> {
-    // Round 12 fix R12-09 (partial): canonicalize the parent directory
-    // first and reject extraction paths whose CANONICAL parent lands
-    // inside a deny-listed system root. `O_NOFOLLOW` on the final
-    // component does not protect against an attacker who symlinks an
-    // intermediate component (e.g. `/tmp/extract` -> `/etc`). Full
-    // `openat()`-based directory-fd traversal is the long-term answer
-    // and is tracked for Round 13; the deny-list below is the minimum
-    // bar against shipping plaintext into `/etc`, `/usr`, `/System`,
-    // or `/bin` from a root-privileged extract.
+    // Round 13 fix R13-01: on Unix, perform the create+truncate through
+    // an `openat(parent_dir_fd, basename, ...)` call so an attacker who
+    // can swap an INTERMEDIATE directory along the path cannot redirect
+    // the extraction. The legacy Round 12 path canonicalized the parent
+    // and then re-opened by path with `O_NOFOLLOW` — which only checks
+    // the final component for symlinks. An attacker controlling, e.g.,
+    // `/tmp/extract/` could replace it with a symlink to `/etc/` after
+    // canonicalize-time but before the final open, redirecting the
+    // 0600 write into `/etc/<basename>`.
     //
-    // Skip the check if the parent does not yet exist (the caller is
-    // expected to have created it via `secure_create_dir_all` already,
-    // but tolerate the order). Skip on Windows where the equivalent
-    // ACL story differs (tracked under R12-15).
+    // New flow on Unix:
+    //   1. Decompose path into (parent_dir, basename).
+    //   2. Canonicalize parent_dir (resolves all intermediate
+    //      symlinks once, with the kernel handling races at each
+    //      step). On the resolved path there are no symlinks left.
+    //   3. Re-run the system-directory deny-list against the
+    //      canonical parent.
+    //   4. Open the canonical parent as a `O_DIRECTORY` fd. If an
+    //      attacker swapped a directory on the path between
+    //      canonicalize and open, this open fails (directory missing)
+    //      or returns an fd that doesn't point at the original
+    //      directory; the basename openat will then fail loudly.
+    //   5. `openat(parent_fd, basename, O_RDWR|O_CREAT|O_TRUNC|O_NOFOLLOW, 0600)`.
+    //      `O_NOFOLLOW` on the final component refuses a symlinked
+    //      basename. The parent_fd binding means the basename is
+    //      resolved against the directory we already inspected,
+    //      not against the path we got from the caller.
+    //
+    // Residual race: between (2) canonicalize and (4) parent_fd
+    // open, an attacker who can write to one of canon_parent's
+    // ancestors can swap canon_parent itself. Closing this fully
+    // requires `openat2()` with `RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH`
+    // (Linux >= 5.6) and is left as a future enhancement. The
+    // realistic attacker who could win that race already has write
+    // access to a system-controlled ancestor, which is a much
+    // bigger privilege than redirecting one extraction.
+    //
+    // Windows: keep the existing `FILE_FLAG_OPEN_REPARSE_POINT` +
+    // `FILE_ATTRIBUTE_REPARSE_POINT` rejection. The intermediate-
+    // junction problem on Windows is tracked separately under R12-15.
     #[cfg(unix)]
     {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                if let Ok(canon) = parent.canonicalize() {
-                    if is_denied_extract_root(&canon) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!(
-                                "refusing to write under a system directory: {} \
-                                 (parent symlink may have redirected the extraction; \
-                                 resolve the path manually with readlink -f)",
-                                canon.display()
-                            ),
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    let mut o = OpenOptions::new();
-    o.read(true).write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(SECURE_FILE_MODE);
-        o.custom_flags(libc::O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        // Round 12 fix R12-15: open reparse points directly rather
-        // than dereferencing them, then refuse the file if the
-        // resulting attribute set says it is one (symlink / junction).
-        // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000.
-        use std::os::windows::fs::OpenOptionsExt;
-        o.custom_flags(0x0020_0000);
-    }
-    let f = o.open(path)?;
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt as _;
-        // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
-        let attrs = f.metadata()?.file_attributes();
-        if attrs & 0x0000_0400 != 0 {
-            return Err(io::Error::new(
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let basename = path.file_name().ok_or_else(|| {
+            io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "extraction destination is a reparse point (symlink / junction); refused",
+                "extraction path has no file name",
+            )
+        })?;
+
+        let canon = parent.canonicalize().map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("canonicalizing extraction parent {}: {e}", parent.display()),
+            )
+        })?;
+        if is_denied_extract_root(&canon) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "refusing to write under a system directory: {} \
+                     (parent symlink may have redirected the extraction; \
+                     resolve the path manually with readlink -f)",
+                    canon.display()
+                ),
             ));
         }
+
+        // Open the canonical parent. `O_DIRECTORY` rejects non-dir
+        // targets (TOCTOU defense: the canon was a dir at
+        // canonicalize time; if it isn't now, the open fails).
+        let parent_cstr = CString::new(canon.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "parent path contains NUL byte")
+        })?;
+        // SAFETY: parent_cstr is a valid NUL-terminated C string and
+        // outlives the open() call.
+        let parent_fd =
+            unsafe { libc::open(parent_cstr.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+        if parent_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // Make sure parent_fd is closed on every return path.
+        // SAFETY: parent_fd is a valid fd we just opened; the wrapper
+        // takes ownership.
+        let parent_owned = unsafe { ParentDirFd::from_raw(parent_fd) };
+
+        let bn_cstr = CString::new(basename.as_bytes()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "extraction basename contains NUL",
+            )
+        })?;
+        // openat(2): O_NOFOLLOW refuses a symlinked basename.
+        // SAFETY: parent_owned.raw() is a valid open fd; bn_cstr is
+        // a valid NUL-terminated C string outliving the call.
+        let fd = unsafe {
+            libc::openat(
+                parent_owned.raw(),
+                bn_cstr.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                SECURE_FILE_MODE as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a fresh fd; File takes ownership.
+        let f = unsafe { File::from_raw_fd(fd) };
+
+        // If the file pre-existed with a wider mode, openat's `mode`
+        // arg only applies on creation. Force-narrow via fchmod
+        // (operates on the open fd, no path traversal, so no TOCTOU
+        // window vs. the original `std::fs::set_permissions(path)`).
+        // SAFETY: fd is owned by `f`; AsRawFd reads it safely.
+        use std::os::unix::io::AsRawFd as _;
+        let rc = unsafe { libc::fchmod(f.as_raw_fd(), SECURE_FILE_MODE as libc::mode_t) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        return Ok(f);
     }
 
-    // If the file pre-existed with a wider mode, the .mode() above
-    // is a no-op (umask only applies on creation, not on truncate).
-    // Force-narrow it. `set_permissions` follows symlinks, but we've
-    // already established via `O_NOFOLLOW` above that the path is not
-    // a symlink, so this can only chmod the regular file we just
-    // opened, not an attacker-controlled symlink target.
-    #[cfg(unix)]
+    // Non-Unix path: preserve the prior Windows-only flow.
+    #[cfg(not(unix))]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(SECURE_FILE_MODE);
-        std::fs::set_permissions(path, perms)?;
+        let mut o = OpenOptions::new();
+        o.read(true).write(true).create(true).truncate(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000.
+            o.custom_flags(0x0020_0000);
+        }
+        let f = o.open(path)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+            let attrs = f.metadata()?.file_attributes();
+            if attrs & 0x0000_0400 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "extraction destination is a reparse point (symlink / junction); refused",
+                ));
+            }
+        }
+        Ok(f)
     }
+}
 
-    Ok(f)
+/// Owned wrapper around a raw parent-directory file descriptor for the
+/// `secure_create_or_truncate` Unix path. Closes the fd on drop; the
+/// only operation we ever do with it is `openat()`, which doesn't move
+/// ownership.
+#[cfg(unix)]
+struct ParentDirFd(libc::c_int);
+
+#[cfg(unix)]
+impl ParentDirFd {
+    /// SAFETY: caller must pass a freshly-opened, non-negative fd.
+    /// Ownership transfers to the wrapper.
+    unsafe fn from_raw(fd: libc::c_int) -> Self {
+        Self(fd)
+    }
+    fn raw(&self) -> libc::c_int {
+        self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ParentDirFd {
+    fn drop(&mut self) {
+        // SAFETY: `from_raw` invariant: we own the fd.
+        unsafe {
+            libc::close(self.0);
+        }
+    }
 }
 
 /// Recursive directory creation with the LUKSbox secure permission

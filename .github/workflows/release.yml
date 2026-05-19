@@ -162,8 +162,14 @@ jobs:
           # restored artifacts can produce `error[E0463]: can't find
           # crate for X` even though Cargo.toml looks correct. Bumping
           # the suffix forces a clean rebuild across every matrix entry.
-          # Last bump: 2026-05-16 (statvfs module split + WinFsp bundle).
-          shared-key: release-v2
+          # Last bump: 2026-05-19 (Round 12 reshaped luksbox-fido2 +
+          # luksbox-mount: new `subtle` workspace dep on fido2,
+          # HmacSecret newtype, MasterVolumeKey::from_zeroizing
+          # constructor, new windows-sys features on mount. Stale jammy
+          # artifacts then reported "can't find crate for fuser" and
+          # "can't find crate for zbus" because the cached luksbox-mount
+          # rlib was built before the dep graph was reshaped.).
+          shared-key: release-v3
 
       - name: Derive LUKSBOX_VERSION
         # On a tag push (`refs/tags/vX.Y.Z`), GITHUB_REF_NAME is the tag

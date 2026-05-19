@@ -47,4 +47,12 @@ pub enum Error {
 
     #[error("metadata id/generation space exhausted")]
     IdSpaceExhausted,
+
+    /// Refused a write / truncate whose target logical size exceeds the
+    /// per-file cap (`luksbox_vfs::MAX_FILE_SIZE`). Round 13 R13-07
+    /// guard against pathological inputs that would push
+    /// `padded_chunk_count` past `next_power_of_two`'s safe range or
+    /// allocate astronomic amounts of disk / RAM.
+    #[error("file size exceeds the per-file maximum")]
+    FileSizeExceedsCap,
 }

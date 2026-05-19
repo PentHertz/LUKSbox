@@ -32,6 +32,7 @@
 //! ```
 
 use std::fs;
+use std::io::Read as _;
 use std::path::Path;
 
 use luksbox_core::file_util::atomic_secure_write;
@@ -139,13 +140,81 @@ pub fn write(
 
 /// Read and decrypt a `.kyber` file. Returns the 64-byte seed.
 pub fn read(path: &Path, passphrase: &[u8]) -> Result<Zeroizing<[u8; SEED_LEN]>, Error> {
-    let bytes = fs::read(path)?;
-    if bytes.len() != FILE_LEN {
-        return Err(Error::SeedFile(format!(
-            "wrong file size: got {} bytes, expected {}",
-            bytes.len(),
-            FILE_LEN
-        )));
+    // Round 13 fix R13-05: open the seed file with `O_NOFOLLOW` on Unix
+    // so an attacker who swapped the user's `.kyber` for a symlink to,
+    // say, `/etc/shadow` or a FIFO that stalls forever cannot redirect
+    // or hang the unlock path. On Windows we add
+    // `FILE_FLAG_OPEN_REPARSE_POINT` and refuse the file if its
+    // attributes report a reparse point (symlink / junction).
+    //
+    // We also size-bound the read: the `.kyber` file is a fixed 133
+    // bytes; we stat first, refuse anything other than a regular file
+    // of exactly that length, and then `read_exact` rather than
+    // `fs::read`. Without this preflight an attacker could swap the
+    // sidecar for a multi-gigabyte file (or a `/dev/zero`-style
+    // device) and watch the unlock path allocate before the
+    // length-check rejection.
+    let mut bytes = vec![0u8; FILE_LEN];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let meta = f.metadata()?;
+        if !meta.is_file() {
+            return Err(Error::SeedFile(format!(
+                "{}: not a regular file (refusing to read FIFO / device / dir)",
+                path.display()
+            )));
+        }
+        if meta.len() != FILE_LEN as u64 {
+            return Err(Error::SeedFile(format!(
+                "wrong file size: got {} bytes, expected {}",
+                meta.len(),
+                FILE_LEN
+            )));
+        }
+        f.read_exact(&mut bytes)?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000 mirrors the policy
+        // in `luksbox-core::file_util::secure_create_or_truncate`.
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000)
+            .open(path)?;
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+        let attrs = f.metadata()?.file_attributes();
+        if attrs & 0x0000_0400 != 0 {
+            return Err(Error::SeedFile(format!(
+                "{}: is a reparse point (symlink / junction); refused",
+                path.display()
+            )));
+        }
+        let len = f.metadata()?.len();
+        if len != FILE_LEN as u64 {
+            return Err(Error::SeedFile(format!(
+                "wrong file size: got {} bytes, expected {}",
+                len, FILE_LEN
+            )));
+        }
+        f.read_exact(&mut bytes)?;
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        bytes = fs::read(path)?;
+        if bytes.len() != FILE_LEN {
+            return Err(Error::SeedFile(format!(
+                "wrong file size: got {} bytes, expected {}",
+                bytes.len(),
+                FILE_LEN
+            )));
+        }
     }
     if bytes[..8] != MAGIC {
         return Err(Error::SeedFile(

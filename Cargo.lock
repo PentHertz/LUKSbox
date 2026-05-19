@@ -2643,6 +2643,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "libc",
  "luksbox-core",
  "luksbox-format",
  "luksbox-vfs",

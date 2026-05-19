@@ -20,6 +20,73 @@ Slot-policy revisit for the multi-factor combos. Existing v0.1.1
 vaults open unchanged; the behavior change is entirely at create
 time.
 
+### Security audit, Round 13 - closed cleanly
+
+Internal Round-13 sweep across filesystem-boundary races, header
+durability, sidecar DoS surfaces, and remaining secret-copy
+hygiene. Full per-finding report at
+[docs/SECURITY_AUDIT_ROUND_13.md](docs/SECURITY_AUDIT_ROUND_13.md).
+
+**Total findings: 2 HIGH, 5 MEDIUM, 2 LOW, 1 INFO. No CRITICAL.
+ALL shipped fixes this revision.**
+
+**Fixed**
+
+- **R13-01 (HIGH)** `secure_create_or_truncate` (the helper behind
+  `luksbox get` and GUI extract) now opens the destination through
+  `openat(parent_dir_fd, basename, ...)` against a canonical
+  parent fd on Unix, closing the intermediate-directory symlink-swap
+  window. Permission narrowed via `fchmod` on the open fd (no path
+  traversal). Windows reparse-point rejection retained.
+- **R13-02 (HIGH)** `luksbox header restore` no longer re-opens the
+  vault path after the HMAC verify. New
+  `Container::restore_header_bytes` reuses the container's
+  already-verified, already-inode-bound `self.file` handle (inline)
+  or routes through `atomic_secure_write` (detached). The
+  `--no-verify` direct write adds `O_NOFOLLOW` (Unix) / reparse-point
+  rejection (Windows).
+- **R13-03 (MEDIUM)** `Vfs::real_size` now clamps the chunk-0
+  authenticated u64 against the inode's chunk capacity. Hostile
+  hide-size vaults can no longer panic stat / read / mount via an
+  out-of-range `inode.chunks[idx]`.
+- **R13-04 (MEDIUM)** `Container::persist_header` uses `sync_all()`
+  on inline + deniable, and `atomic_secure_write` (temp + fsync +
+  rename + sync_parent_dir) on detached, then re-opens the lock
+  handle to the new inode. A power loss mid-persist no longer
+  leaves a half-rewritten header / sidecar.
+- **R13-05 (MEDIUM)** `.kyber` seed-file reads open with
+  `O_NOFOLLOW` (Unix) / reparse-point rejection (Windows), require
+  a regular file of exactly the fixed format length, then
+  `read_exact`. Refuses FIFO / device / oversize swaps.
+- **R13-06 (MEDIUM)** Hybrid sidecar reader preflights `metadata()`,
+  requires a regular file under 32 KiB, then `read_exact`. Closes
+  the unbounded `read_to_end` path on both Unix and Windows
+  (Windows now also rejects reparse points).
+- **R13-07 (MEDIUM)** New `luksbox_vfs::MAX_FILE_SIZE = 1 << 44`
+  cap + `Error::FileSizeExceedsCap` variant. `write` and `truncate`
+  refuse oversize targets BEFORE `padded_chunk_count` can feed
+  `next_power_of_two` a panicking value or the chunk-allocation
+  loop can exhaust RAM / disk.
+- **R13-08 (LOW)** `luksbox-mount`'s FUSE `read` caps the
+  requester-supplied `size` at 16 MiB internally before the vec
+  allocation. Defence-in-depth against a buggy or hostile kernel
+  module along the path.
+- **R13-09 (LOW)** `SecretBox::clone` now allocates a fresh
+  secret-memory backing and `copy_from_slice`s directly between
+  the two allocator-owned regions. No by-value `[u8; KEY_LEN]`
+  Copy temporary on the caller's stack.
+
+**New tests + harnesses**
+
+- `crates/luksbox-core/tests/round13_file_util.rs` (4 tests)
+- `crates/luksbox-format/tests/round13_findings.rs` (4 tests)
+- `crates/luksbox-vfs/tests/round13_findings.rs` (3 tests)
+- `crates/luksbox-pq/tests/round13_seed_file.rs` (3 tests)
+
+Run any of them locally with `cargo test --test round13_findings -p
+<crate>`; the workspace-wide `cargo test --workspace
+--exclude luksbox-gui` exercises them as part of CI's normal flow.
+
 ### Security audit, Round 12 - closed cleanly
 
 Four-axis adversarial sweep across the FUSE-T subprocess path, the

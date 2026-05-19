@@ -63,15 +63,28 @@ use luksbox_pq::PqParams;
 
 use crate::Error;
 
-/// Round 12 fix R12-06: read the hybrid sidecar with `O_NOFOLLOW`
-/// so an attacker who swapped the `.hybrid` file for a symlink (e.g.
-/// to `/etc/passwd` or to a FIFO that stalls forever) is refused at
-/// the format layer. Mirrors `anchor::open_anchor_for_read`.
+/// Round 12 fix R12-06 / Round 13 fix R13-06: read the hybrid sidecar
+/// with `O_NOFOLLOW` so an attacker who swapped the `.hybrid` file for
+/// a symlink (e.g. to `/etc/passwd` or to a FIFO that stalls forever)
+/// is refused at the format layer. Mirrors `anchor::open_anchor_for_read`.
 ///
-/// Windows: plain read. The reparse-point equivalent is invasive and
-/// the threat model differs (hybrid sidecars under `%LOCALAPPDATA%`
-/// rely on ACL inheritance); tracked under R12-15 as a follow-up.
+/// R13-06: also size-bound the read. The hybrid sidecar is at most
+/// `HEADER_LEN_V3 + MAX_ENTRIES * MAX_ENTRY_LEN` bytes (about 23 KiB).
+/// Without an upper bound a hostile sidecar (or a device file) could
+/// cause `read_to_end` to allocate gigabytes before the length-check
+/// rejects it. We `stat` first, refuse non-regular files, refuse files
+/// larger than the cap, then `read_exact`.
+///
+/// Windows: open with `FILE_FLAG_OPEN_REPARSE_POINT` and refuse the
+/// file if `FILE_ATTRIBUTE_REPARSE_POINT` is set (mirrors
+/// `luksbox-core::file_util::secure_create_or_truncate`). Closes the
+/// R12-15 follow-up that left Windows hybrid sidecars exposed to
+/// reparse-point swaps under `%LOCALAPPDATA%`.
 fn read_sidecar_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    // Upper bound: v3 header + 8 entries each at the larger ML-KEM-1024
+    // shape (1 + 1 + 1568 + 1568 = 3138 B). Cap rounded up to 32 KiB
+    // for headroom against future entry-shape growth.
+    const MAX_SIDECAR_BYTES: u64 = 32 * 1024;
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -79,13 +92,61 @@ fn read_sidecar_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
             .open(path)?;
-        let mut buf = Vec::new();
-        f.read_to_end(&mut buf)?;
+        let meta = f.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other(format!(
+                "hybrid sidecar {}: not a regular file (refusing FIFO/device/dir)",
+                path.display()
+            )));
+        }
+        if meta.len() > MAX_SIDECAR_BYTES {
+            return Err(std::io::Error::other(format!(
+                "hybrid sidecar {}: {} bytes exceeds max {} (DoS preflight)",
+                path.display(),
+                meta.len(),
+                MAX_SIDECAR_BYTES
+            )));
+        }
+        let mut buf = vec![0u8; meta.len() as usize];
+        f.read_exact(&mut buf)?;
         Ok(buf)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        fs::read(path)
+        use std::os::windows::fs::MetadataExt as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000)
+            .open(path)?;
+        let meta = f.metadata()?;
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+        if meta.file_attributes() & 0x0000_0400 != 0 {
+            return Err(std::io::Error::other(format!(
+                "hybrid sidecar {}: is a reparse point (symlink/junction); refused",
+                path.display()
+            )));
+        }
+        if meta.len() > MAX_SIDECAR_BYTES {
+            return Err(std::io::Error::other(format!(
+                "hybrid sidecar {}: {} bytes exceeds max {} (DoS preflight)",
+                path.display(),
+                meta.len(),
+                MAX_SIDECAR_BYTES
+            )));
+        }
+        let mut buf = vec![0u8; meta.len() as usize];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let bytes = fs::read(path)?;
+        if bytes.len() as u64 > MAX_SIDECAR_BYTES {
+            return Err(std::io::Error::other("hybrid sidecar exceeds size cap"));
+        }
+        Ok(bytes)
     }
 }
 
