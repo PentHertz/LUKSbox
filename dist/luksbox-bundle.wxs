@@ -58,23 +58,22 @@
              We probe TWO things and AND them in the chain's
              InstallCondition because the registry value alone is
              not enough:
-               (a) `WinFspRegistryPresent` -- the install-dir
-                   REG_SZ exists. The official WinFsp MSI writes
-                   this on success; if a previous WinFsp install
-                   ran cache-only or rolled back, the key can
-                   survive without the dll behind it.
-               (b) `WinFspDllPresent` -- the actual
-                   `winfsp-x64.dll` that the upstream
-                   `winfsp_wrs::init` `LoadLibraryW`'s by absolute
-                   path resolved from that registry value. If a
-                   user uninstalled WinFsp via the chip-side
-                   driver removal but the registry entry was left
-                   behind (observed on real machines), a registry-
-                   only probe would say "yes" and our chain would
-                   skip the reinstall -- exactly the silent path
-                   that produced the `WinFSPNotFound` toast and
-                   forced users to hit "Repair" on
-                   `LUKSboxSetup.exe` as a workaround. -->
+               (a) WinFspRegistryPresent: the install-dir REG_SZ
+                   exists. The official WinFsp MSI writes this on
+                   success; if a previous WinFsp install ran
+                   cache-only or rolled back, the key can survive
+                   without the dll behind it.
+               (b) WinFspDllPresent: the actual winfsp-x64.dll
+                   that the upstream winfsp_wrs::init loads via
+                   LoadLibraryW by absolute path resolved from
+                   that registry value. If a user removed WinFsp
+                   via the chip-side driver removal but the
+                   registry entry was left behind (observed on
+                   real machines), a registry-only probe would
+                   say yes and our chain would skip the reinstall,
+                   which is the silent path that produced the
+                   WinFSPNotFound toast and forced users to hit
+                   Repair on LUKSboxSetup.exe as a workaround. -->
         <util:RegistrySearch
             Id="WinFspInstalled"
             Root="HKLM"
@@ -148,9 +147,9 @@
                  (managing it via GPO/Choco/etc.) they set
                  InstallWinFsp=0 explicitly, which short-
                  circuits the chain and accepts the no-WinFsp
-                 state up front -- the runtime mount preflight
-                 then surfaces the clear "install WinFsp" hint
-                 we wired into the GUI.
+                 state up front. The runtime mount preflight then
+                 surfaces the clear "install WinFsp" hint we
+                 wired into the GUI.
 
                  NB MsiPackage in WiX v4 Burn has no DetectCondition
                  attribute (that's ExePackage-only) - Burn auto-
