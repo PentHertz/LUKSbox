@@ -234,7 +234,17 @@ vendor = "Penthertz"
 # Post-install the user MUST `sudo usermod -aG tss $USER` and log
 # back in - Fedora/RHEL convention is the same as Debian's, no
 # silent privileged-group additions from a scriptlet.
-recommends = "tpm2-tss, tpm2-tools"
+#
+# cargo-generate-rpm 0.16+ deserialises `recommends` (and the other
+# weak-dep fields: `requires`, `suggests`, `enhances`, `supplements`)
+# as a TOML *table* mapping `package-name -> version-constraint`,
+# NOT as a comma-separated string and NOT as a string array. Passing
+# either of the latter triggers the misleading
+#   Field package.metadata.generate-rpm.recommends must be string or integer
+# error - the "string or integer" refers to the version-constraint
+# *value* inside the expected map, not the field itself. `"*"` means
+# "no version constraint" (any version satisfies).
+recommends = { tpm2-tss = "*", tpm2-tools = "*" }
 assets = [
     # Same sentinel convention as cargo-deb above: cargo-generate-rpm
     # rewrites `target/release/<bin>` to the real `target/<triple>/<profile>/<bin>`

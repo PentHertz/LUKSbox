@@ -30,17 +30,14 @@ fn r13_05_seed_file_read_refuses_symlink_swap() {
     let attacked = dir.path().join("victim.kyber");
     symlink(&real, &attacked).unwrap();
 
-    let err = read(&attacked, b"pw").expect_err("symlinked seed path must be refused");
-    let msg = format!("{err}");
-    assert!(
-        msg.to_lowercase().contains("symbolic")
-            || msg.to_lowercase().contains("loop")
-            || msg.contains("ELOOP")
-            // io::Error from the open() will surface with the system
-            // strerror; accept any error that is NOT a successful read.
-            || true,
-        "expected an open-failure error, got: {msg}"
-    );
+    // `expect_err` carries the real assertion: with `O_NOFOLLOW` set on
+    // the `read()` open, the symlink target is never followed and the
+    // open returns ELOOP. The specific kernel strerror text varies
+    // across platforms (Linux: "Too many levels of symbolic links",
+    // FreeBSD: "Too many levels of symbolic links", macOS: "Too many
+    // levels of symbolic links"), so we deliberately do NOT match on
+    // message contents — the test passes iff the read fails.
+    let _err = read(&attacked, b"pw").expect_err("symlinked seed path must be refused");
 }
 
 #[cfg(unix)]
