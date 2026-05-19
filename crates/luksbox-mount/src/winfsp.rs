@@ -152,6 +152,14 @@ fn split_parent_name(path: &str) -> Result<(&str, &str), NTSTATUS> {
     split_parent_name_inner(path).map_err(path_err_to_nt)
 }
 
+// Two NTSTATUSes not re-exported by winfsp_wrs but needed for the
+// metadata-budget and per-file-cap errors. Standard Win32 codes:
+//   STATUS_DISK_FULL       = 0xC000007F  (-> "There is not enough space on the disk.")
+//   STATUS_FILE_TOO_LARGE  = 0xC0000904  (-> "The file size exceeds the limit allowed and cannot be saved.")
+// `winfsp_wrs::NTSTATUS` is a type alias for `LONG` (i32), so build via cast.
+const STATUS_DISK_FULL: NTSTATUS = 0xC000_007Fu32 as NTSTATUS;
+const STATUS_FILE_TOO_LARGE: NTSTATUS = 0xC000_0904u32 as NTSTATUS;
+
 fn vfs_err_to_nt(e: &luksbox_vfs::Error) -> NTSTATUS {
     use luksbox_vfs::Error as E;
     match e {
@@ -160,6 +168,8 @@ fn vfs_err_to_nt(e: &luksbox_vfs::Error) -> NTSTATUS {
         E::NotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
         E::NotADirectory => STATUS_NOT_A_DIRECTORY,
         E::InvalidPath(_) => STATUS_OBJECT_PATH_NOT_FOUND,
+        E::MetadataBudgetExhausted => STATUS_DISK_FULL,
+        E::FileSizeExceedsCap => STATUS_FILE_TOO_LARGE,
         _ => STATUS_ACCESS_DENIED,
     }
 }

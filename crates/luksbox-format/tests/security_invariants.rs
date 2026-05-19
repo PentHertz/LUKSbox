@@ -43,6 +43,12 @@ const PASS: &[u8] = b"correct horse battery staple";
 
 fn build_vault(dir: &TempDir) -> PathBuf {
     let path = dir.path().join("v.lbx");
+    // The header-tamper test below writes ~480 full vault copies. With
+    // the default 16 MiB metadata region that's ~7.5 GiB on disk —
+    // enough to ENOSPC the CI runner. Shrink the metadata region for
+    // this test (the test only touches the 8 KiB header, never the
+    // metadata blob, so a 64 KiB region is fine).
+    let _g = luksbox_format::metadata::set_create_metadata_region_size_override(Some(64 * 1024));
     let _ = Container::create_with_passphrase_flags(
         &path,
         None,

@@ -211,6 +211,83 @@ random padding.
 +----------------------------------------------------------------+
 ```
 
+The METADATA BLOB's encrypted plaintext starts with a 4-byte magic
+that identifies the metadata format inside the encrypted region:
+
+- `LBM\x02` ("v2") — the per-inode chunk list is stored inline as
+  `Vec<ChunkRef>` inside the postcard-encoded directory tree. Every
+  ChunkRef costs ~4-6 varint bytes inside the metadata budget; a
+  vault with many large files runs out of budget around 8-10 GiB
+  total stored content at the default 16 MiB region size.
+- `LBM\x03` ("v3", opt-in) — inodes whose chunk count exceeds
+  `V3_INLINE_CHUNK_THRESHOLD` (1024 chunks ≈ 4 MiB file) carry a
+  `chunks_external = Some((head, count))` field instead, pointing
+  at the **chunk-list block chain** described below. Inodes under
+  the threshold stay inline (same wire shape as v2).
+
+Choice of v2 vs v3 is locked at vault creation time and stamped
+implicitly via the magic byte (which is itself inside the
+AEAD-encrypted region, so an attacker without MVK cannot flip it).
+Old binaries presented with an `LBM\x03` blob fail with a clean
+`MetadataDeserialize` error rather than silently mis-parsing.
+
+#### V3: chunk-list blocks
+
+Each chunk-list block is a regular 4 KiB encrypted chunk in the
+data area whose AEAD key and AAD are derived from a **synthetic
+file_id** — the real `file_id` with the high bit set:
+
+```
+list_file_id(F)     = F | (1 << 63)
+list_file_key(F)    = HKDF(MVK, salt, "lbx:file/v1:" || list_file_id(F))
+list_block_AAD(F,i) = list_file_id(F) || block_idx_u32(i) || generation_u64
+```
+
+Real file_ids are allocated from `ROOT_ID + 1 = 2` upward
+sequentially. The vault would need 2⁶³ files for a real ID to enter
+the reserved range — physically impossible — so the high bit safely
+disambiguates the two chunk kinds. `Vfs::validate_metadata_tree`
+additionally refuses any tree whose `next_file_id >= 1 << 63` as
+defense in depth.
+
+The 4 KiB plaintext layout of a chunk-list block:
+
+```
++----------------------------------------------------------------+
+| 0..4     u32 LE  count (0..=254)                               |
+| 4..N     count × ChunkRef (16 B each: id_u64 || gen_u64)       |
+| N..N+16  next ChunkRef (or zero if last block in chain)        |
+| N+16..   random padding (12 B)                                 |
++----------------------------------------------------------------+
+```
+
+The block carries up to 254 entries; the 255th 16-byte slot is the
+**next-pointer**. A non-zero next-pointer's `generation` is the
+"more blocks" sentinel; a `generation == 0` next-pointer marks the
+end of the chain. Generation 0 is impossible for a legitimate
+ChunkRef because `alloc_chunk_gen` starts at 1.
+
+Walking a chain is bounded by `walk_chunk_list_chain` to
+`ceil(expected_count / 254) + 2` blocks and `expected_count` total
+entries, both derived from the inode's own claimed count. A forged
+chain (which would require MVK access in the first place) cannot
+drive unbounded allocation or infinite traversal.
+
+Two chunk kinds coexist in the data area but cannot be confused
+for each other: `file_key(F) ≠ list_file_key(F)` (HKDF info
+strings differ by the high bit) AND the AAD's `file_id` field
+differs by the high bit. A data chunk's ciphertext placed into a
+chunk-list block's slot will AEAD-fail decryption under
+`list_file_key`, and vice versa. The `v3_aad_isolation_*` test in
+`crates/luksbox-vfs/src/vfs.rs` pins this invariant.
+
+MVK rotation re-encrypts every chunk-list block under the new MVK
+in the same loop that re-encrypts data chunks (`Vfs::rotate_mvk`,
+regression-tested in `v3_rotate_mvk_reencrypts_chunk_list_blocks`).
+Without this, post-rotation reads of a spilled file would
+AEAD-fail at the first chunk-list block lookup and the file's data
+chunks would be permanently unreachable.
+
 ### 3.2 Keyslot internal layout (512 bytes)
 
 ```

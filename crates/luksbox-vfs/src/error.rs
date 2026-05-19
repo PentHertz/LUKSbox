@@ -55,4 +55,21 @@ pub enum Error {
     /// allocate astronomic amounts of disk / RAM.
     #[error("file size exceeds the per-file maximum")]
     FileSizeExceedsCap,
+
+    /// Refused a write / truncate because the directory tree, once
+    /// serialised, would no longer fit in the vault's metadata region.
+    /// Caught BEFORE any chunk write so the data area isn't polluted
+    /// with chunks the metadata blob can't point at. The FUSE layer
+    /// maps this to `ENOSPC` so `cp` / `dd` fails mid-copy with the
+    /// right errno — instead of the previous behaviour where chunks
+    /// landed on disk, flush failed at unmount, and the file was
+    /// invisible on the next mount (silent data loss).
+    ///
+    /// User-visible fix: re-create the vault with a larger
+    /// `--metadata-size`. Default is 16 MiB, which is also the
+    /// format-level cap (`MAX_METADATA_SIZE`) in this version —
+    /// sufficient for roughly 8-10 GiB of stored content per
+    /// vault. Larger vaults need a format-version bump.
+    #[error("metadata region exhausted (vault holds too many chunks for its metadata budget)")]
+    MetadataBudgetExhausted,
 }

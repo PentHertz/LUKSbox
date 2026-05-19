@@ -183,6 +183,14 @@ luksbox enroll my-vault.lbx --kind tpm2
 luksbox create my-vault.lbx --kind hybrid-pq \
     --pq-hybrid /media/usb/my.kyber
 
+# v3 format: no per-vault size ceiling (default v2 caps around 10 GiB).
+# Old LUKSbox binaries refuse v3 vaults — opt in only when you need
+# bigger vaults than the v2 default can hold.
+luksbox create my-vault.lbx --format v3
+
+# Migrate an existing v2 vault to v3 (source untouched)
+luksbox migrate-to-v3 old-v2.lbx --dst new-v3.lbx
+
 # Interactive walkthrough, no flags to remember
 luksbox wizard
 ```

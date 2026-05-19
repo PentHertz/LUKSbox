@@ -20,6 +20,63 @@ Slot-policy revisit for the multi-factor combos. Existing v0.1.1
 vaults open unchanged; the behavior change is entirely at create
 time.
 
+### v3 metadata format (NEW DEFAULT) + bigger v2 default
+
+A new on-disk metadata format ("v3", magic `LBM\x03`) moves per-file
+chunk lists out of the fixed metadata region into encrypted
+**chunk-list blocks** stored in the data area alongside the file's
+data chunks. The previous format (v2, `LBM\x02`) capped per-vault
+content at roughly 8–10 GiB because the inline `Vec<ChunkRef>` for
+large files would overflow the 16 MiB metadata budget; v3 removes
+that ceiling.
+
+- **Default for new vaults.** v3 is now the default on `luksbox create`,
+  in the wizard, and in the GUI. Pre-v0.2.0 LUKSbox binaries cannot
+  open v3 vaults (LBM3 magic mismatch yields a clean
+  `metadata blob deserialization failed`, not silent corruption).
+  Pass `--format v2` (or pick v2 in the wizard / GUI) when you need
+  to keep a new vault readable by an older LUKSbox install.
+- **Opt-out via env var.** `LUKSBOX_FORMAT_V2=0` (or `false`/`no`/`off`)
+  in the environment forces v2 for any fresh create on that process.
+  The historic env var name is kept so scripts that opted IN to v3
+  during the v0.2-dev cycle still work unchanged.
+- **Performance.** Measured open at 1 GiB / 262K chunks ≈ 19 ms;
+  extrapolates to ~2 s at 100 GiB. Lazy loading not needed.
+  See `crates/luksbox-vfs/src/vfs.rs::v3_open_perf_baseline` (run with
+  `cargo test --release -- --ignored --nocapture v3_open_perf_baseline`).
+- **Forward-compat break.** LUKSbox binaries older than this
+  release refuse v3 vaults cleanly (`metadata blob deserialization
+  failed` — the magic byte mismatch is the safe failure mode, not
+  silent corruption).
+- **Migration.** `luksbox migrate-to-v3 <src> --dst <new>` reads a
+  v2 vault and writes a fresh v3 vault with the same cipher and
+  data; source vault is left untouched. The destination is created
+  with a single passphrase keyslot; other keyslots can be
+  re-enrolled afterward via `luksbox enroll`. Deniable vaults can
+  now be created in v3 format directly (wizard prompts for it after
+  the cipher/KDF choice); a `migrate-to-v3` path for deniable is
+  not yet wired (deniable open is interactive — re-create as v3
+  using your existing cipher/KDF params and copy your files in).
+- **MVK rotation** for v3 vaults now also re-keys the chunk-list
+  blocks under the new MVK (regression-tested in
+  `v3_rotate_mvk_reencrypts_chunk_list_blocks`).
+- **AAD isolation** between data chunks and chunk-list blocks is
+  guaranteed by deriving the list-block file_key from a synthetic
+  file_id (real `file_id | (1 << 63)`); a data chunk's ciphertext
+  cannot be reinterpreted as a chunk-list block or vice versa.
+- **Default metadata-region size bumped from 1 MiB → 16 MiB.** The
+  previous 1 MiB default silently lost data around ~800 MiB of
+  stored content because the metadata region overflowed at flush
+  but the data chunks had already landed on disk. The new 16 MiB
+  default + the mid-write `ENOSPC` pre-flight check together
+  eliminate both the ceiling shrinkage and the silent-loss bug.
+- **New CLI flag**: `luksbox create --metadata-size <BYTES>`
+  (64 KiB – 16 MiB) lets advanced users tune the metadata region
+  for v2 vaults.
+
+See `docs/CRYPTO_SPEC.md` for the on-disk layout and AEAD
+construction of chunk-list blocks.
+
 ### Security audit, Round 13 - closed cleanly
 
 Internal Round-13 sweep across filesystem-boundary races, header

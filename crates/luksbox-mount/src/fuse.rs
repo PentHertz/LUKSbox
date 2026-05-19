@@ -422,6 +422,15 @@ fn errno(e: &VfsError) -> Errno {
         VfsError::NotAFile => Errno::EISDIR,
         VfsError::NotEmpty => Errno::ENOTEMPTY,
         VfsError::InvalidPath(_) => Errno::EINVAL,
+        // Metadata budget exhausted: surface as ENOSPC so cp / dd /
+        // rsync abort with the right errno mid-copy. EIO would also
+        // be safe but ENOSPC matches the actual condition (the
+        // vault's fixed-size metadata region has filled up and can't
+        // hold any more chunk references) and triggers the
+        // "no space left on device" message users already know.
+        VfsError::MetadataBudgetExhausted => Errno::ENOSPC,
+        // File-size cap is "exceeds the maximum file size" → EFBIG.
+        VfsError::FileSizeExceedsCap => Errno::EFBIG,
         _ => Errno::EIO,
     }
 }

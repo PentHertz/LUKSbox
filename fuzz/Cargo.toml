@@ -195,6 +195,18 @@ test = false
 doc = false
 bench = false
 
+# v3 metadata format: fuzz the chunk-list-block parser. The function
+# is called with attacker-influenced bytes (a malicious vault author
+# with MVK could craft a chunk-list block with out-of-range count,
+# generation=0 in the next-pointer, etc.). Parser must never panic
+# and must never return invariant-violating output.
+[[bin]]
+name = "chunk_list_block_parse"
+path = "fuzz_targets/chunk_list_block_parse.rs"
+test = false
+doc = false
+bench = false
+
 # Fuzz binaries should not be part of the workspace; cargo-fuzz expects to
 # build them with sanitizers and -C codegen-units=1. Excluding from the
 # workspace lets us keep workspace-wide `cargo build` fast and unsanitized.

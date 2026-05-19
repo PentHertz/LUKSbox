@@ -10,6 +10,29 @@ pub type ChunkId = u64;
 
 pub const ROOT_ID: FileId = 1;
 
+/// High bit of `FileId` reserved for synthetic IDs that name a file's
+/// **chunk-list blocks** (v3 metadata format). For a regular file
+/// `file_id = F`, its chunk-list blocks live under the synthetic
+/// `F | CHUNK_LIST_FILE_ID_BIT`. Used by `chunk::chunk_aad` so the
+/// AEAD AAD distinguishes a chunk-list block from a data chunk
+/// without changing the AAD shape.
+///
+/// Real file IDs are allocated sequentially from `ROOT_ID + 1`; a
+/// vault would have to hold > 2⁶³ files for a real ID to land in the
+/// reserved range, which is well past the format's other practical
+/// limits (chunk_id space, metadata region, etc.).
+pub const CHUNK_LIST_FILE_ID_BIT: FileId = 1 << 63;
+
+/// Inode's chunk count threshold for spilling to external chunk-list
+/// blocks in v3 metadata format. Files at or below this size keep
+/// their `ChunkRef` list inline inside the metadata region (fast,
+/// no extra reads on open); files above spill to a chain of encrypted
+/// chunk-list blocks in the data area. 1024 chunks at 4 KiB ≈ 4 MiB,
+/// chosen so the cumulative inline cost across many small files
+/// never blows the metadata region but tiny files don't pay an
+/// extra-read penalty per access.
+pub const V3_INLINE_CHUNK_THRESHOLD: usize = 1024;
+
 /// Reference to a chunk slot on disk, with a monotonic per-vault generation
 /// counter for replay protection. The generation is included in the
 /// per-chunk AAD; an attacker who has an old encrypted chunk and tries to
@@ -48,6 +71,13 @@ pub struct Inode {
     pub mtime_ns: u64,
     /// Ordered list of chunk references holding this file's data, indexed
     /// by chunk position within the file. Always empty for directories.
+    ///
+    /// In-memory representation is ALWAYS the fully-materialized list,
+    /// regardless of whether the on-disk metadata stored it inline (v2
+    /// format) or as an external chain of chunk-list blocks (v3 format).
+    /// The Vfs read path expands external chains into this Vec at open
+    /// time; the flush path decides per inode whether to write inline
+    /// or external based on `V3_INLINE_CHUNK_THRESHOLD` (v3 vaults only).
     pub chunks: Vec<ChunkRef>,
     /// Directory-only: name -> child file_id.
     pub children: BTreeMap<String, FileId>,
@@ -56,6 +86,15 @@ pub struct Inode {
     /// blob; populated lazily on first stat / read by decrypting chunk 0.
     #[serde(skip, default)]
     pub cached_real_size: Option<u64>,
+    /// V3 format only: ChunkRefs of the chunk-list blocks this inode
+    /// currently owns in the data area. Populated by the v3 read path
+    /// when expanding an External chain into `chunks`; updated by the
+    /// v3 flush path when re-writing the chain; consumed by `unlink`
+    /// to free the blocks. Always empty for v2-format vaults and for
+    /// v3 inodes that fit inline. Serde-skipped: it's bookkeeping for
+    /// the in-memory representation, not part of either on-disk shape.
+    #[serde(skip, default)]
+    pub external_list_blocks: Vec<ChunkRef>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -87,6 +126,7 @@ impl DirectoryTree {
                 chunks: Vec::new(),
                 children: BTreeMap::new(),
                 cached_real_size: None,
+                external_list_blocks: Vec::new(),
             },
         );
         Self {

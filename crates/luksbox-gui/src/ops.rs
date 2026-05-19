@@ -265,6 +265,12 @@ pub struct CreateOpts {
     /// `self.kdf` already; remembering them is the user's
     /// responsibility (without them the vault is unopenable).
     pub use_deniable: bool,
+    /// On-disk metadata format. `false` (default) = v2 (LBM2), inline
+    /// chunk lists in the metadata region, ~10 GiB practical ceiling,
+    /// works with every LUKSbox binary. `true` = v3 (LBM3), out-of-line
+    /// chunk-list blocks in the data area, no practical ceiling,
+    /// requires LUKSbox v0.2.0+ to open. Permanent for the vault.
+    pub use_v3_format: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1492,6 +1498,13 @@ pub fn create_vault(opts: CreateOpts) -> Result<OpenedVault, String> {
     {
         return Err(format!("anchor file {} already exists", ap.display()));
     }
+    // Install the v3 format override for the lifetime of this create
+    // call. The Vfs reads the thread-local on first open of the new
+    // vault and locks the format choice by writing the matching
+    // LBM2/LBM3 magic on first flush. The RAII guard restores the
+    // previous override on drop so a panic mid-create can't leak v3
+    // into an unrelated subsequent create on this thread.
+    let _format_guard = luksbox_vfs::set_format_v3_override(Some(opts.use_v3_format));
     let mut flags = 0u32;
     if opts.pad_files || opts.hide_sizes {
         flags |= FLAG_PAD_FILES_POW2;
@@ -4382,6 +4395,17 @@ pub fn rotate_mvk_passphrase_only(
     creds: Vec<(usize, zeroize::Zeroizing<String>)>,
     kdf: KdfStrength,
 ) -> Result<(), String> {
+    // Deniable vaults route through the deniable-specific rotation
+    // path: their slot envelopes don't live in `header.keyslots`
+    // (synthetic header is all Empty), and the full rotation has to
+    // pair Container::rotate_mvk_v2_deniable's envelope rewrap with
+    // a chunk + chunk-list-block + metadata re-encryption. The
+    // standard `Vfs::rotate_mvk` would silently no-op for deniable
+    // (empty populated set) and leave the user thinking rotation
+    // succeeded when in fact nothing changed.
+    if vfs.container().is_deniable() {
+        return rotate_mvk_deniable_passphrase_only(vfs, creds, kdf);
+    }
     // Pre-flight: refuse the kinds we don't handle here.
     let header = vfs.container().header.clone();
     for (i, slot) in header.keyslots.iter().enumerate() {
@@ -4447,5 +4471,63 @@ pub fn rotate_mvk_passphrase_only(
 
     vfs.rotate_mvk(credentials, kdf.params()).map_err(estr)?;
     vfs.flush().map_err(estr)?;
+    Ok(())
+}
+
+/// Deniable counterpart of `rotate_mvk_passphrase_only`. Dispatched
+/// from there when the open container is deniable. v1 supports a
+/// single passphrase-only deniable slot (the most common deniable
+/// setup); FIDO2 / TPM / hybrid deniable slot rotation requires a
+/// richer credential modal and is deferred.
+///
+/// The user must supply the SAME Argon2 params they picked at create
+/// time (deniable vaults don't persist the KDF params on disk —
+/// that would be a beacon). The GUI's rotate-MVK form passes the
+/// currently-selected `KdfStrength` here; if it doesn't match what
+/// was used at create, the slot envelope rebuild will succeed but
+/// SUBSEQUENT unlocks with the saved KDF preset will fail until the
+/// user picks the right one. (Note: this is a latent issue for the
+/// envelope-only rewrap too — adding a real-time verification step
+/// during rotation is on the roadmap.)
+fn rotate_mvk_deniable_passphrase_only(
+    vfs: &mut Vfs,
+    creds: Vec<(usize, zeroize::Zeroizing<String>)>,
+    kdf: KdfStrength,
+) -> Result<(), String> {
+    use luksbox_format::deniable_header::DeniableMaterial;
+
+    if creds.len() != 1 {
+        return Err(format!(
+            "deniable rotation v1 supports exactly one passphrase slot; got {}",
+            creds.len()
+        ));
+    }
+    let (supplied_idx, passphrase) = creds.into_iter().next().unwrap();
+
+    // The slot we MUST rotate is the one the open ceremony unlocked
+    // — that's the only envelope whose credentials we have. Refuse
+    // a mismatch instead of silently re-wrapping a different slot.
+    let unlocked_idx = vfs
+        .container()
+        .deniable_unlocked_slot()
+        .ok_or("deniable container has no unlocked-slot index; reopen the vault")?;
+    if supplied_idx != unlocked_idx {
+        return Err(format!(
+            "deniable rotation must target the unlocked slot ({unlocked_idx}); got slot {supplied_idx}"
+        ));
+    }
+
+    let argon2 = kdf.params();
+    let cred = luksbox_vfs::DeniableRotationCredential {
+        slot_idx: unlocked_idx,
+        kind: luksbox_core::deniable::DeniableKindTag::Passphrase,
+        passphrase: zeroize::Zeroizing::new(passphrase.as_bytes().to_vec()),
+        argon2,
+        material: DeniableMaterial::passphrase_only(),
+        hmac_secret_output: None,
+        unsealed: None,
+        mlkem_shared: None,
+    };
+    vfs.rotate_mvk_deniable(vec![cred]).map_err(estr)?;
     Ok(())
 }

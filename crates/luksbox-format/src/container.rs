@@ -258,7 +258,7 @@ enum HeaderStorage {
 }
 
 use crate::error::Error;
-use crate::metadata::{self, DEFAULT_METADATA_REGION_SIZE, METADATA_OVERHEAD};
+use crate::metadata::{self, METADATA_OVERHEAD};
 
 pub enum UnlockMaterial<'a> {
     Passphrase(&'a [u8]),
@@ -597,7 +597,7 @@ impl Container {
         hmac_secret: &[u8; 32],
         hmac_salt: [u8; 32],
     ) -> Result<Self, Error> {
-        let metadata_region_size = DEFAULT_METADATA_REGION_SIZE;
+        let metadata_region_size = crate::metadata::resolved_create_metadata_region_size();
         let metadata_offset = if header_path.is_some() {
             0
         } else {
@@ -1021,7 +1021,7 @@ impl Container {
         use crate::deniable_header::{DeniableInnerHeader, create_with_credential_v2};
         use luksbox_core::deniable::DENIABLE_HEADER_SIZE;
 
-        let metadata_region_size = DEFAULT_METADATA_REGION_SIZE;
+        let metadata_region_size = crate::metadata::resolved_create_metadata_region_size();
         if header_path.is_some() {
             return Err(Error::Crypto(luksbox_core::Error::InvalidField));
         }
@@ -1370,7 +1370,7 @@ impl Container {
     where
         F: FnOnce(&MasterVolumeKey, &Header) -> Result<Keyslot, luksbox_core::Error>,
     {
-        let metadata_region_size = DEFAULT_METADATA_REGION_SIZE;
+        let metadata_region_size = crate::metadata::resolved_create_metadata_region_size();
         // Detached: vault file starts directly with the metadata region.
         // Inline: vault file has the 8 KB header at offset 0.
         let metadata_offset = if header_path.is_some() {

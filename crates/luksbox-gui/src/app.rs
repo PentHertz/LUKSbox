@@ -293,6 +293,12 @@ struct CreateForm {
     /// path: anyone with it can open the vault without ANY of the
     /// hardware factors.
     enable_recovery_passphrase: bool,
+    /// On-disk metadata format. v2 (`false`) keeps inline chunk lists
+    /// and works with every LUKSbox binary; v3 (`true`) moves chunk
+    /// lists out-of-line into encrypted chunk-list blocks so a single
+    /// vault can hold arbitrarily-large files. Requires LUKSbox v0.2.0+
+    /// to open. Choice is permanent for the vault.
+    use_v3_format: bool,
 }
 
 impl Default for CreateForm {
@@ -317,6 +323,10 @@ impl Default for CreateForm {
             enable_backup_passphrase: false,
             skip_tpm_bootstrap_passphrase: false,
             enable_recovery_passphrase: false,
+            // v3 default from v0.2.0 onward. The create dialog's
+            // "On-disk format" panel still lets the user pick v2
+            // explicitly for cross-version compatibility scenarios.
+            use_v3_format: true,
         }
     }
 }
@@ -3622,6 +3632,34 @@ impl LuksboxApp {
                             ui.checkbox(&mut self.create.hide_sizes, "Hide exact sizes (encrypts size in chunk-0 plaintext; implies padding)");
                         },
                     );
+                    ui.collapsing(
+                        RichText::new("On-disk format (advanced)").color(theme::DIM).size(12.0),
+                        |ui| {
+                            ui.checkbox(
+                                &mut self.create.use_v3_format,
+                                "Use v3 metadata format (default; out-of-line chunk lists; no per-vault size ceiling)",
+                            );
+                            if !self.create.use_v3_format {
+                                ui.label(
+                                    RichText::new(
+                                        "v2 (compat): inline chunk lists, ~10 GiB practical per-vault ceiling. \
+                                         Readable by pre-v0.2.0 LUKSbox. Choice is permanent.",
+                                    )
+                                    .color(theme::DIM)
+                                    .size(11.0),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new(
+                                        "v3: no per-vault size ceiling. Requires LUKSbox v0.2.0+ to open. \
+                                         Choice is permanent.",
+                                    )
+                                    .color(theme::DIM)
+                                    .size(11.0),
+                                );
+                            }
+                        },
+                    );
                 }
             });
 
@@ -3811,6 +3849,7 @@ impl LuksboxApp {
             kdf: self.create.kdf,
             use_deniable: self.create.use_deniable,
             enable_recovery_passphrase: self.create.enable_recovery_passphrase,
+            use_v3_format: self.create.use_v3_format,
         };
         let needs_touch = self.create.kind.needs_fido2();
 

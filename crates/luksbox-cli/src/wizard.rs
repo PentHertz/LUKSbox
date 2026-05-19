@@ -352,6 +352,23 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
     let argon2_params = ask_den_kdf(theme, "Argon2id strength (you must remember this choice)")?;
     let kind = ask_den_credential_kind(theme, "Credential type for the initial slot")?;
 
+    // Metadata format for the deniable vault. Default v2 (matches
+    // every existing LUKSbox binary). v3 unlocks arbitrarily-large
+    // files via out-of-line chunk-list blocks; the blocks are
+    // encrypted chunks like any other so the deniability
+    // (every-byte-looks-random) story is preserved. Choice is
+    // permanent for the vault — you must remember it alongside the
+    // cipher + KDF params.
+    let format_choice = Select::with_theme(theme)
+        .with_prompt("On-disk metadata format (you must remember this choice)")
+        .items(&[
+            "v3 (default; out-of-line chunk lists, no per-vault ceiling; requires LUKSbox v0.2.0+ to open)",
+            "v2 (compat; inline chunk lists, ~10 GiB practical per-vault ceiling; readable by pre-v0.2.0 LUKSbox)",
+        ])
+        .default(0)
+        .interact()?;
+    let _format_guard = luksbox_vfs::set_format_v3_override(Some(format_choice == 0));
+
     // Anchor prompt before any device touches so the user isn't asked
     // mid-Argon2 / mid-FIDO2-touch. Matches the GUI's create form
     // where "Anchor" is a checkbox next to "Detached header" and is
@@ -1801,6 +1818,23 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
         2 => CipherSuite::ChaCha20Poly1305,
         _ => unreachable!(),
     };
+
+    // Metadata format choice. v2 stays the default (interoperates with
+    // every existing LUKSbox binary); v3 unlocks arbitrarily-large
+    // single files via out-of-line chunk-list blocks but requires
+    // LUKSbox v0.2.0+ to open. The choice is permanent for the vault.
+    // We install the thread-local override here so the create_*
+    // helpers below pick it up transparently via `luksbox-vfs`'s
+    // first-flush format selection.
+    let format_choice = Select::with_theme(theme)
+        .with_prompt("On-disk metadata format")
+        .items(&[
+            "v3 (default; out-of-line chunk lists, no per-vault ceiling; requires LUKSbox v0.2.0+ to open)",
+            "v2 (compat; inline chunk lists, ~10 GiB practical per-vault ceiling; readable by pre-v0.2.0 LUKSbox)",
+        ])
+        .default(0)
+        .interact()?;
+    let _format_guard = luksbox_vfs::set_format_v3_override(Some(format_choice == 0));
 
     // Show the selected FIDO2 authenticator above the kind picker so
     // the user knows whether the FIDO2 / hybrid-fido kinds will work
@@ -3401,6 +3435,14 @@ pub(crate) fn run_rotate_mvk_interactive(
 }
 
 fn rotate_mvk_action(theme: &ColorfulTheme, cont: Container) -> Result<Container> {
+    // Deniable vaults have no enumerable slots in `header.keyslots`
+    // (synthetic header with all Empty entries); their slot envelopes
+    // live in `self.deniable.bytes` and rotation goes through the
+    // deniable-specific path. Dispatch here so the standard-slot
+    // walker below doesn't silently no-op on deniable vaults.
+    if cont.is_deniable() {
+        return rotate_mvk_deniable_action(theme, cont);
+    }
     for (i, s) in cont.header.keyslots.iter().enumerate() {
         if s.kind == SlotKind::Fido2DerivedMvk {
             return Err(format!(
@@ -3501,6 +3543,72 @@ fn rotate_mvk_action(theme: &ColorfulTheme, cont: Container) -> Result<Container
         "OK MVK rotated. {} keyslot(s) rebuilt with fresh salts.",
         populated.len()
     );
+    let cont = vfs.close()?;
+    Ok(cont)
+}
+
+/// Deniable counterpart to `rotate_mvk_action`. Dispatched when the
+/// container is deniable. v1 supports passphrase-only deniable slots
+/// (the most common deniable setup). The user must remember the
+/// Argon2 params they used at create time — those aren't persisted
+/// anywhere on disk for deniable vaults (the format requires every
+/// byte to look random; storing the KDF params would be a beacon).
+fn rotate_mvk_deniable_action(theme: &ColorfulTheme, cont: Container) -> Result<Container> {
+    use luksbox_format::deniable_header::DeniableMaterial;
+    use luksbox_vfs::{DeniableRotationCredential, Vfs};
+
+    let slot_idx = cont.deniable_unlocked_slot().ok_or(
+        "container is deniable but no unlocked-slot index is set; cannot identify \
+         which slot to rotate. Re-open the vault via the deniable open path.",
+    )?;
+
+    eprintln!(
+        "About to rotate the master volume key on this deniable vault.\n  \
+         This re-encrypts every chunk, every chunk-list block (v3), and the\n  \
+         metadata blob under a freshly-generated MVK + per-vault salt; the\n  \
+         slot envelope at index {slot_idx} (the one your credentials unlocked)\n  \
+         is rebuilt under fresh randomness. v1 of this flow supports\n  \
+         passphrase-only deniable slots; for FIDO2 / TPM / hybrid deniable\n  \
+         slots see the project roadmap.\n  \
+         Crash-safety: inline-header vault uses the .rotating temp-file\n  \
+         pattern; a crash before commit leaves the original intact."
+    );
+
+    if !Confirm::with_theme(theme)
+        .with_prompt("Proceed with deniable MVK rotation?")
+        .default(false)
+        .interact()?
+    {
+        return Ok(cont);
+    }
+
+    // The Argon2 params + cipher are not persisted; user must remember.
+    // The cipher we CAN recover from cont.header.cipher_suite (synthesized
+    // from the inner header at open time), but the Argon2 params are
+    // gone — ask. Re-using the wizard's existing deniable KDF picker.
+    let argon2_params = ask_den_kdf(theme, "Argon2id params used at create time")?;
+    let pp = dialoguer::Password::with_theme(theme)
+        .with_prompt(format!(
+            "passphrase for the unlocked deniable slot (slot {slot_idx})"
+        ))
+        .interact()?;
+
+    let creds = vec![DeniableRotationCredential {
+        slot_idx,
+        kind: luksbox_core::deniable::DeniableKindTag::Passphrase,
+        passphrase: zeroize::Zeroizing::new(pp.into_bytes()),
+        argon2: argon2_params,
+        material: DeniableMaterial::passphrase_only(),
+        hmac_secret_output: None,
+        unsealed: None,
+        mlkem_shared: None,
+    }];
+
+    let mut vfs = Vfs::open(cont)?;
+    eprintln!();
+    eprintln!("rotating deniable vault...");
+    vfs.rotate_mvk_deniable(creds)?;
+    println!("OK deniable MVK rotated. Slot envelope at index {slot_idx} rebuilt.");
     let cont = vfs.close()?;
     Ok(cont)
 }

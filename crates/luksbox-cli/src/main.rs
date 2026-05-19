@@ -174,6 +174,26 @@ impl KdfStrengthArg {
     }
 }
 
+/// On-disk metadata format selection for `--format` on `create`.
+/// Each vault picks its format once at create time; format is
+/// fixed for the lifetime of the vault. Default flipped to v3 in
+/// the v0.2.0 release after end-to-end validation across standard
+/// + deniable, MVK rotation across all deniable credential kinds,
+/// and a perf baseline showing sub-2s open at 100 GiB.
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq, Default)]
+pub(crate) enum VaultFormatArg {
+    /// Inline chunk lists in the metadata region. Practical ~10 GiB
+    /// per-vault ceiling. Readable by every LUKSbox binary
+    /// (including pre-v0.2.0 readers). Pick this if you need to
+    /// share the vault with someone on an older LUKSbox.
+    V2,
+    /// External chunk-list blocks in the data area (default). No
+    /// practical per-vault ceiling. Requires LUKSbox v0.2.0 or
+    /// newer to open.
+    #[default]
+    V3,
+}
+
 /// Keyslot kind, used by `create`, `enroll`, and `update`.
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 enum SlotKindArg {
@@ -341,6 +361,41 @@ enum Command {
         /// target, the closest fit is used.
         #[arg(long, conflicts_with = "kdf")]
         kdf_target_time: Option<String>,
+        /// Override the encrypted metadata region size. Accepts a
+        /// human-readable byte count: `4M`, `8M`, `16777216`, etc.
+        /// Default and cap are both 16 MiB (the on-disk format
+        /// limit); practical vault-data headroom is roughly 8-10 GiB
+        /// before the chunk-reference list overflows. Lower this only
+        /// for tiny demo vaults where 16 MiB of minimum file size is
+        /// too much; higher values are rejected here at the CLI
+        /// boundary because the on-disk parser would also reject them.
+        /// The value is stored in the header at create time and used
+        /// unchanged on every later open; you cannot resize an
+        /// existing vault.
+        #[arg(long, value_name = "BYTES")]
+        metadata_size: Option<String>,
+        /// Opt the new vault into the **v3 metadata format**, which
+        /// stores per-file chunk lists out-of-line in encrypted
+        /// chunk-list blocks in the data area rather than inline in
+        /// the metadata region. Removes the practical ~10 GiB
+        /// per-vault ceiling of the v2 format (which capped at the
+        /// 16 MiB metadata region size) and lets a vault hold
+        /// arbitrarily-large files.
+        ///
+        /// Trade-offs:
+        /// - On open, every spilled file's chunk-list chain is
+        ///   walked from disk, so opens of huge vaults are slower
+        ///   than v2 (a 100 GiB single-file vault touches ~100k
+        ///   chunk-list blocks at open).
+        /// - Old LUKSbox binaries (pre-v0.2.0) cannot read v3
+        ///   vaults — they refuse the `LBM\x03` metadata magic.
+        ///
+        /// Default v2 stays the default; v3 is opt-in until
+        /// deniable + fuzz coverage land in a later release. Once
+        /// chosen at create, the format is permanent for that
+        /// vault (re-create to switch).
+        #[arg(long, default_value = "v2")]
+        format: VaultFormatArg,
     },
     /// Show container header / keyslot summary (no unlock required).
     Info { path: PathBuf },
@@ -694,6 +749,28 @@ enum Command {
         #[arg(long)]
         delete: bool,
     },
+    /// Migrate a v2-format vault to v3 (out-of-line chunk lists).
+    /// Reads the source vault, creates a new vault at `--dst` with
+    /// the same cipher / KDF / keyslots / data, then writes it in
+    /// v3 format. The source vault is left untouched (no in-place
+    /// migration — too risky on a format change). After verifying
+    /// the destination opens cleanly the user can delete the source.
+    ///
+    /// Requires the unlock material for the source vault. The
+    /// destination inherits the SAME initial keyslot kind as the
+    /// source's slot 0 (other slots can be re-enrolled afterward).
+    /// v3 unlocks bigger-than-10-GiB vaults; for smaller vaults the
+    /// migration is mostly a format change with no capacity benefit.
+    MigrateToV3 {
+        /// Path to the existing v2 vault to read from.
+        src: PathBuf,
+        /// Path for the new v3 vault. Must not already exist.
+        #[arg(long)]
+        dst: PathBuf,
+        /// Unlock material for the source vault.
+        #[command(flatten)]
+        unlock: UnlockArgs,
+    },
     /// Save a copy of the 8 KiB header bytes (offsets, keyslots, salts,
     /// HMAC) to a separate file. Equivalent to `cryptsetup luksHeaderBackup`.
     /// Does NOT require the unlock material: it just dumps the bytes that
@@ -950,6 +1027,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             pq_hybrid,
             kdf,
             kdf_target_time,
+            metadata_size,
+            format,
         } => {
             // Round 9G: if --kdf-target-time was supplied, calibrate
             // params on this CPU; otherwise resolve from the static
@@ -957,6 +1036,13 @@ fn dispatch(cli: Cli) -> Result<()> {
             let resolved_params = match kdf_target_time {
                 Some(t) => calibrate_kdf_for_target(&t)?,
                 None => kdf_params_for(kdf),
+            };
+            // Resolve --metadata-size to a byte count (or None for default).
+            // The override is installed in thread-local state by cmd_create
+            // before calling Container::create_with_*.
+            let resolved_metadata_size = match metadata_size {
+                Some(s) => Some(parse_byte_size(&s)?),
+                None => None,
             };
             cmd_create(
                 &path,
@@ -968,6 +1054,8 @@ fn dispatch(cli: Cli) -> Result<()> {
                 anchor,
                 pq_hybrid,
                 resolved_params,
+                resolved_metadata_size,
+                format,
             )
         }
         Command::Info { path } => cmd_info(&path),
@@ -1155,6 +1243,7 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::RotateMvk { path, unlock } => cmd_rotate_mvk(&path, &unlock),
         Command::ListFido2Devices => cmd_list_fido2_devices(),
         Command::CleanupOrphans { path, delete } => cmd_cleanup_orphans(&path, delete),
+        Command::MigrateToV3 { src, dst, unlock } => cmd_migrate_to_v3(&src, &dst, &unlock),
         Command::HeaderBackup { path, out, header } => {
             cmd_header_backup(&path, &out, header.as_deref())
         }
@@ -3007,11 +3096,26 @@ fn cmd_create(
     anchor_path: Option<PathBuf>,
     pq_hybrid_path: Option<PathBuf>,
     kdf_p: Argon2idParams,
+    metadata_size_override: Option<u64>,
+    format: VaultFormatArg,
 ) -> Result<()> {
     let suite = parse_cipher(cipher)?;
     if path.exists() {
         return Err(format!("{} already exists", path.display()).into());
     }
+    // Install the metadata-region-size override (if any) for the lifetime
+    // of this create. The guard restores the previous value (None) on
+    // drop, so a panic between here and the create_with_* call below
+    // can't leak the override to a subsequent unrelated create on this
+    // thread.
+    let _meta_guard =
+        luksbox_format::metadata::set_create_metadata_region_size_override(metadata_size_override);
+    // Install the v3-metadata-format override for the same lifetime.
+    // The Vfs reads this thread-local on first open of the freshly-
+    // created vault and locks in the format choice by writing the
+    // matching LBM2 / LBM3 magic on first flush.
+    let _format_guard =
+        luksbox_vfs::set_format_v3_override(Some(matches!(format, VaultFormatArg::V3)));
     if let Some(hp) = header_path {
         if hp.exists() {
             return Err(format!("header file {} already exists", hp.display()).into());
@@ -5876,6 +5980,129 @@ fn cli_create_pq_tpm_fido2_deniable_v2(
     Ok(cont)
 }
 
+/// Migrate a v2 vault to v3: opens the source, creates a fresh v3
+/// vault at `dst`, and copies the full directory tree + file contents
+/// through the VFS read API. The source is left untouched so the
+/// migration is fully reversible (just delete `dst` and retry).
+///
+/// Limitations:
+/// - The destination vault is created with a **single passphrase
+///   keyslot**, even if the source had multiple slots or non-
+///   passphrase kinds. The migrating user is prompted for a fresh
+///   passphrase. Other keyslots can be re-enrolled afterwards via
+///   `luksbox enroll`.
+/// - Deniable vaults are not yet supported (deniable v3 parity is
+///   pending in a separate release).
+/// - Anchor sidecars on the source are NOT re-bound: the destination
+///   starts without an anchor; the user can re-init via the next
+///   write or via `luksbox` flags.
+fn cmd_migrate_to_v3(src: &Path, dst: &Path, unlock: &UnlockArgs) -> Result<()> {
+    use luksbox_format::Container;
+    use luksbox_vfs::{Vfs, set_format_v3_override};
+
+    if !src.exists() {
+        return Err(format!("source vault {} not found", src.display()).into());
+    }
+    if dst.exists() {
+        return Err(format!(
+            "destination {} already exists; refusing to overwrite",
+            dst.display()
+        )
+        .into());
+    }
+
+    // 1. Open the source (any format).
+    let mut src_vfs = open_vfs(src, unlock)?;
+    if src_vfs.uses_v3_metadata() {
+        return Err("source vault is already in v3 format; nothing to migrate".into());
+    }
+    if src_vfs.container().is_deniable() {
+        return Err(
+            "deniable vaults cannot be migrated to v3 yet (deniable v3 parity is a \
+             planned follow-up). Stick with v2 for deniable mode for now."
+                .into(),
+        );
+    }
+    // Same cipher + a fresh interactive Argon2id preset for the dst.
+    let src_cipher = src_vfs.container().header.cipher_suite;
+
+    eprintln!(
+        "Migrating v2 vault {} -> v3 vault {}",
+        src.display(),
+        dst.display()
+    );
+    eprintln!("Pick a passphrase for the new vault (can differ from the source).");
+    let new_pw = read_passphrase_confirmed("new-vault passphrase: ")?;
+
+    // 2. Create the destination as v3. The format override is
+    // installed BEFORE Container::create_with_passphrase so the new
+    // Vfs writes the LBM3 magic on its first flush.
+    let _format_guard = set_format_v3_override(Some(true));
+    let dst_cont = Container::create_with_passphrase(
+        dst,
+        None,
+        src_cipher,
+        Argon2idParams::INTERACTIVE,
+        new_pw.as_bytes(),
+    )?;
+    let mut dst_vfs = Vfs::open(dst_cont)?;
+    debug_assert!(dst_vfs.uses_v3_metadata());
+
+    // 3. Walk the source tree depth-first and recreate in dst.
+    let src_root = src_vfs.root_id();
+    let dst_root = dst_vfs.root_id();
+    copy_subtree(&mut src_vfs, src_root, &mut dst_vfs, dst_root)?;
+
+    dst_vfs.flush()?;
+    drop(dst_vfs);
+    eprintln!(
+        "OK migration complete. Verify {} opens cleanly (`luksbox info {}`), then \
+         delete the source vault if you no longer need it.",
+        dst.display(),
+        dst.display()
+    );
+    Ok(())
+}
+
+fn copy_subtree(
+    src_vfs: &mut luksbox_vfs::Vfs,
+    src_dir: luksbox_vfs::FileId,
+    dst_vfs: &mut luksbox_vfs::Vfs,
+    dst_dir: luksbox_vfs::FileId,
+) -> Result<()> {
+    use luksbox_vfs::tree::InodeKind;
+    // readdir gives us names + ids; we recurse per-entry.
+    let entries = src_vfs.readdir(src_dir)?;
+    for entry in entries {
+        let src_id = entry.id;
+        let st = src_vfs.stat(src_id)?;
+        match st.kind {
+            InodeKind::Directory => {
+                let new_dir = dst_vfs.mkdir(dst_dir, &entry.name)?;
+                copy_subtree(src_vfs, src_id, dst_vfs, new_dir)?;
+            }
+            InodeKind::File => {
+                let new_file = dst_vfs.create(dst_dir, &entry.name)?;
+                // Copy in 64 KiB chunks to keep memory bounded.
+                const COPY_BUF: usize = 64 * 1024;
+                let mut buf = vec![0u8; COPY_BUF];
+                let total = st.size;
+                let mut off = 0u64;
+                while off < total {
+                    let want = std::cmp::min(COPY_BUF as u64, total - off) as usize;
+                    let n = src_vfs.read(src_id, off, &mut buf[..want])?;
+                    if n == 0 {
+                        break;
+                    }
+                    dst_vfs.write(new_file, off, &buf[..n])?;
+                    off += n as u64;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn cmd_rotate_mvk(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     // Delegate to the wizard's interactive rotation flow.
     // Multi-slot credential collection is inherently interactive
@@ -5936,6 +6163,69 @@ fn parse_kdf_target(s: &str) -> Result<u64> {
 ///
 /// Bounded by available RAM (`Vec::try_reserve` pre-flight) and by
 /// `Argon2idParams::SAFE_M_COST_KIB_MAX` (4 GiB cap).
+/// Parse a human-readable byte count for `--metadata-size`. Accepts
+/// plain decimal (`16777216`) or a single-character binary unit suffix
+/// (`k` = KiB, `m` = MiB; case-insensitive).
+///
+/// Validates against BOTH:
+///   - lower floor (64 KiB): below this the AEAD overhead + magic +
+///     an empty directory tree wouldn't fit, the first write would
+///     fail and the user has created an unusable vault;
+///   - upper cap [`luksbox_core::header::MAX_METADATA_SIZE`] (16 MiB
+///     in this format version): values above it pass `Header::try_new`
+///     and end up serialised into the on-disk header, but the parser
+///     in `Header::from_bytes` rejects them, so the user would create
+///     a vault they could never re-open. Refuse at the CLI boundary
+///     instead.
+fn parse_byte_size(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("--metadata-size: empty value".into());
+    }
+    let (num_part, mult) = match s.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => {
+            let mult = match c.to_ascii_lowercase() {
+                'k' => 1024u64,
+                'm' => 1024u64 * 1024,
+                _ => {
+                    return Err(format!(
+                        "--metadata-size: unrecognised unit '{c}' (use K or M, e.g. 16M)"
+                    )
+                    .into());
+                }
+            };
+            (&s[..s.len() - 1], mult)
+        }
+        _ => (s, 1u64),
+    };
+    let n: u64 = num_part
+        .parse()
+        .map_err(|e| format!("--metadata-size: invalid number '{num_part}': {e}"))?;
+    let bytes = n
+        .checked_mul(mult)
+        .ok_or("--metadata-size: value overflows u64")?;
+    const FLOOR: u64 = 64 * 1024;
+    if bytes < FLOOR {
+        return Err(format!(
+            "--metadata-size: {bytes} bytes is below the {FLOOR} byte floor \
+             (would not fit AEAD overhead + an empty directory tree)"
+        )
+        .into());
+    }
+    if bytes > luksbox_core::header::MAX_METADATA_SIZE {
+        return Err(format!(
+            "--metadata-size: {bytes} bytes exceeds the on-disk format cap of {} bytes \
+             ({} MiB). A vault created with a larger value would be unopenable. \
+             The cap is set in luksbox-core::header::MAX_METADATA_SIZE; raising it \
+             requires a format-version bump and is planned for a future release.",
+            luksbox_core::header::MAX_METADATA_SIZE,
+            luksbox_core::header::MAX_METADATA_SIZE / (1024 * 1024)
+        )
+        .into());
+    }
+    Ok(bytes)
+}
+
 fn calibrate_kdf_for_target(target_str: &str) -> Result<Argon2idParams> {
     use luksbox_core::kdf;
     use std::time::Instant;

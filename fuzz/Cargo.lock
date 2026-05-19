@@ -1187,6 +1187,7 @@ dependencies = [
  "argon2",
  "hkdf",
  "hmac",
+ "libc",
  "luksbox-core",
  "ml-kem",
  "rand_core 0.6.4",
