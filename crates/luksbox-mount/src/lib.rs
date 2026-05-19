@@ -36,6 +36,13 @@ mod unix_statvfs;
 #[cfg(all(target_os = "windows", feature = "winfsp"))]
 mod winfsp;
 
+/// Re-export of `winfsp::winfsp_preflight` so the GUI can fail the
+/// "Mount" button early with an actionable WinFsp-missing message
+/// instead of waiting for the dispatcher set-up to surface the
+/// upstream `WinFSPNotFound` debug string verbatim.
+#[cfg(all(target_os = "windows", feature = "winfsp"))]
+pub use winfsp::winfsp_preflight;
+
 // Pure-string parsing helpers used by the WinFsp adapter. Compiled on
 // every platform so unit tests + fuzz harnesses can exercise them
 // without the WinFsp SDK / kernel driver. See `winfsp_path.rs` for

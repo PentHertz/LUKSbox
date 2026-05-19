@@ -700,7 +700,23 @@ fn create_den_tpm(
 ) -> Result<luksbox_format::Container> {
     use luksbox_format::deniable_header::DeniableMaterial;
     let pass = ask_new_passphrase(theme, "Passphrase (outer envelope of the TPM slot)")?;
-    let (secret, blob) = tpm_seal_blob_to_bytes(None)?;
+    // Optional TPM userAuth. Must match the unlock-side choice
+    // exactly: an empty PIN here means the unseal call must use
+    // `unseal` (no PIN), otherwise the TPM rejects with
+    // TPM_RC_AUTH_FAIL (0x098e) and bumps the dictionary-attack
+    // counter. The CLI's `mount-deniable` subcommand selects the
+    // unseal variant from `--tpm-pin`; we surface the same toggle
+    // here so the seal/unseal sides stay symmetric.
+    let pin_input: String = Password::with_theme(theme)
+        .with_prompt("TPM PIN (leave blank for no PIN)")
+        .allow_empty_password(true)
+        .interact()?;
+    let pin_bytes: Option<&[u8]> = if pin_input.is_empty() {
+        None
+    } else {
+        Some(pin_input.as_bytes())
+    };
+    let (secret, blob) = tpm_seal_blob_to_bytes(pin_bytes)?;
     let cred = luksbox_core::deniable::DeniableCredential::TpmPassphrase {
         passphrase: pass.as_bytes(),
         argon2,

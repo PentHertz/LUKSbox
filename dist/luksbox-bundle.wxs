@@ -52,15 +52,49 @@
         <!-- Detect existing WinFsp install. Matches the same
              registry key the bare luksbox.wxs uses for its
              Launch Condition (HKLM\SOFTWARE\WOW6432Node\WinFsp).
-             Burn evaluates this BEFORE the chain and uses it to
-             gate the WinFsp MsiPackage InstallCondition. -->
+             Burn evaluates these BEFORE the chain and uses them
+             to gate the WinFsp MsiPackage InstallCondition.
+
+             We probe TWO things and AND them in the chain's
+             InstallCondition because the registry value alone is
+             not enough:
+               (a) `WinFspRegistryPresent` -- the install-dir
+                   REG_SZ exists. The official WinFsp MSI writes
+                   this on success; if a previous WinFsp install
+                   ran cache-only or rolled back, the key can
+                   survive without the dll behind it.
+               (b) `WinFspDllPresent` -- the actual
+                   `winfsp-x64.dll` that the upstream
+                   `winfsp_wrs::init` `LoadLibraryW`'s by absolute
+                   path resolved from that registry value. If a
+                   user uninstalled WinFsp via the chip-side
+                   driver removal but the registry entry was left
+                   behind (observed on real machines), a registry-
+                   only probe would say "yes" and our chain would
+                   skip the reinstall -- exactly the silent path
+                   that produced the `WinFSPNotFound` toast and
+                   forced users to hit "Repair" on
+                   `LUKSboxSetup.exe` as a workaround. -->
         <util:RegistrySearch
             Id="WinFspInstalled"
             Root="HKLM"
             Key="SOFTWARE\WOW6432Node\WinFsp"
             Value="InstallDir"
             Result="exists"
-            Variable="WinFspAlreadyInstalled" />
+            Variable="WinFspRegistryPresent" />
+        <util:RegistrySearch
+            Id="WinFspInstallDirValue"
+            Root="HKLM"
+            Key="SOFTWARE\WOW6432Node\WinFsp"
+            Value="InstallDir"
+            Variable="WinFspInstallDir"
+            After="WinFspInstalled" />
+        <util:FileSearch
+            Id="WinFspDllOnDisk"
+            Path="[WinFspInstallDir]bin\winfsp-x64.dll"
+            Result="exists"
+            Variable="WinFspDllPresent"
+            After="WinFspInstallDirValue" />
 
         <!-- Optional opt-out for admins who want LUKSbox without
              WinFsp (e.g., they manage WinFsp via Group Policy).
@@ -100,26 +134,37 @@
         </BootstrapperApplication>
 
         <Chain>
-            <!-- WinFsp v2.0.23075 (pinned). Skipped if already
-                 present OR if the user opted out via
-                 InstallWinFsp=0. Vital="no" so a WinFsp install
-                 failure doesn't roll back the LUKSbox install
-                 (the user can install WinFsp later and mount will
-                 start working without a LUKSbox reinstall).
+            <!-- WinFsp v2.0.23075 (pinned). Skipped only when
+                 BOTH the registry key AND the dll file are
+                 present (i.e., a real working WinFsp install),
+                 OR when the admin opted out via InstallWinFsp=0.
+
+                 Vital="yes" because the bundle's whole reason
+                 for existing is "ship LUKSbox + a working
+                 WinFsp"; a silent skip-then-fail-at-mount-time
+                 was the exact failure mode that forced users
+                 to Repair the bundle after first install. If
+                 an admin really wants LUKSbox without WinFsp
+                 (managing it via GPO/Choco/etc.) they set
+                 InstallWinFsp=0 explicitly, which short-
+                 circuits the chain and accepts the no-WinFsp
+                 state up front -- the runtime mount preflight
+                 then surfaces the clear "install WinFsp" hint
+                 we wired into the GUI.
 
                  NB MsiPackage in WiX v4 Burn has no DetectCondition
                  attribute (that's ExePackage-only) - Burn auto-
                  detects MSI install state via the inner MSI's
                  ProductCode. The InstallCondition below handles
                  the "WinFsp already installed by some other route
-                 (choco / portable)" case via the util:RegistrySearch
-                 variable defined above. -->
+                 (choco / portable)" case via the util:* searches
+                 defined above. -->
             <MsiPackage
                 Id="WinFspMsi"
                 SourceFile="$(var.WinFspMsiPath)"
                 DisplayName="WinFsp 2.0.23075 (required for the mount feature)"
-                InstallCondition="InstallWinFsp = 1 AND NOT WinFspAlreadyInstalled"
-                Vital="no"
+                InstallCondition="InstallWinFsp = 1 AND NOT (WinFspRegistryPresent AND WinFspDllPresent)"
+                Vital="yes"
                 Cache="keep"
                 ForcePerMachine="yes" />
 

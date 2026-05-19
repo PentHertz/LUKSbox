@@ -5881,7 +5881,16 @@ fn cli_create_tpm_deniable_v2(
 ) -> Result<luksbox_format::Container> {
     use luksbox_format::deniable_header::DeniableMaterial;
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
+    // Optional TPM userAuth. Empty input means "no PIN" -- the
+    // unlock side must then use `unseal` (no PIN) or the TPM
+    // rejects with TPM_RC_AUTH_FAIL and bumps the DA counter.
+    let pin_in = rpassword::prompt_password("TPM PIN (empty for none): ")?;
+    let pin_bytes: Option<&[u8]> = if pin_in.is_empty() {
+        None
+    } else {
+        Some(pin_in.as_bytes())
+    };
+    let (secret, blob) = cli_tpm_seal_to_bytes(pin_bytes)?;
     let cred = luksbox_core::deniable::DeniableCredential::TpmPassphrase {
         passphrase: pass.as_bytes(),
         argon2,

@@ -5292,6 +5292,20 @@ impl LuksboxApp {
     /// The Vfs is moved into the thread; the GUI no longer owns it
     /// while mounted, hence the dedicated "mounted" UI in `draw_mounted`.
     fn start_mount_picker(&mut self, private: bool) {
+        // Fail-fast on Windows when WinFsp isn't installed. The
+        // upstream `winfsp_wrs::init()` looks up the DLL via
+        // HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir and returns
+        // a bare `WinFSPNotFound` debug string on failure. Without
+        // this preflight the user sees a cryptic toast AFTER the
+        // file dialog + drive-letter scan + worker spawn; with it
+        // they get an actionable message before any of that.
+        #[cfg(all(target_os = "windows", feature = "winfsp"))]
+        {
+            if let Err(e) = luksbox_mount::winfsp_preflight() {
+                self.toast_err(e.to_string());
+                return;
+            }
+        }
         // Mountpoint semantics differ by OS:
         //
         // - Linux / macOS: FUSE mounts onto an existing directory.

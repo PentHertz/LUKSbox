@@ -121,6 +121,46 @@ use crate::winfsp_path::{
 
 const VOLUME_LABEL: &str = "luksbox";
 
+/// Turn `winfsp_wrs::InitError` into a user-facing message. The
+/// upstream `Debug` impl prints bare identifiers like
+/// `WinFSPNotFound`, which we used to forward verbatim -- users
+/// then saw "winfsp init failed: WinFSPNotFound" with no hint
+/// about what to install or why. The binding resolves the DLL
+/// strictly via `HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir`, so
+/// placing `winfsp-x64.dll` next to luksbox.exe is NOT a fallback;
+/// the only real fix is "install WinFsp 2.x". Surface that.
+fn map_init_error(e: winfsp_wrs::InitError) -> MountError {
+    let msg = match e {
+        winfsp_wrs::InitError::WinFSPNotFound => {
+            "WinFsp 2.x is not installed on this machine, so LUKSbox \
+             cannot create a Windows volume. Install WinFsp from \
+             https://winfsp.dev/rel/, reboot if prompted, then try \
+             again. (Detection looks for HKLM\\SOFTWARE\\\
+             WOW6432Node\\WinFsp\\InstallDir; if you installed WinFsp \
+             but still see this, reinstall using the official MSI so \
+             the registry entry is created.)"
+                .to_string()
+        }
+        winfsp_wrs::InitError::CannotLoadDLL { dll_path } => format!(
+            "WinFsp's registry entry points at {} but the DLL could \
+             not be loaded. Common causes: WinFsp install corrupted, \
+             64-bit / ARM64 mismatch, or a broken upgrade. Reinstall \
+             WinFsp from https://winfsp.dev/rel/.",
+            dll_path.to_string_lossy()
+        ),
+    };
+    MountError::Io(std::io::Error::other(msg))
+}
+
+/// Returns `Ok(())` if WinFsp 2.x is installed and the DLL loads.
+/// Used by the GUI to pre-flight the mount button so it can show
+/// the install-WinFsp hint without first spinning up the FUSE
+/// dispatch and friends. Idempotent; calling it before
+/// `mount()` is fine because `winfsp_wrs::init` itself is.
+pub fn winfsp_preflight() -> Result<(), MountError> {
+    winfsp_wrs::init().map_err(map_init_error)
+}
+
 /// Map a `winfsp_path::PathParseError` to the closest NTSTATUS we can
 /// return from a WinFsp callback. Centralized so every helper that
 /// calls into the parser uses the same mapping - keeps Explorer error
@@ -778,8 +818,7 @@ impl FileSystemInterface for LuksboxFs {
 /// mount are the in-process `stop()` (handled here) or letting the
 /// process exit, which the kernel driver detects and unwinds.
 pub fn mount(vfs: Vfs, mountpoint: &Path) -> Result<(), MountError> {
-    winfsp_wrs::init()
-        .map_err(|e| MountError::Io(std::io::Error::other(format!("WinFsp init failed: {e:?}"))))?;
+    winfsp_wrs::init().map_err(map_init_error)?;
 
     // Default OperationGuardStrategy (Coarse) matches our `Mutex<Vfs>`:
     // WinFsp serializes dispatch under a single internal lock, which is
