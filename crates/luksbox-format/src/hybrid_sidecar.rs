@@ -413,6 +413,13 @@ fn validate_entries(entries: &[HybridEntry]) -> Result<(), Error> {
             ))));
         }
     }
+    // Reject duplicate slot_idx BEFORE writing so an enroll wrapper
+    // that forgot to dedupe stale entries fails fast at write time
+    // instead of producing a sidecar that subsequent reads will
+    // reject with "duplicate entry for slot N". The read path also
+    // calls `reject_duplicate_slot_idx` after parse for defense
+    // against hostile / corrupted on-disk files.
+    reject_duplicate_slot_idx(entries)?;
     Ok(())
 }
 
@@ -702,21 +709,72 @@ mod tests {
     /// first; garbage pq_shared still causes AEAD reject (no key
     /// leak) but the ambiguity is itself a smell.
     #[test]
-    fn duplicate_slot_idx_rejected() {
-        let path = tmp("dup-slot");
+    fn duplicate_slot_idx_rejected_at_write() {
+        // The writer rejects duplicates so an enroll wrapper that
+        // forgot to dedupe stale entries fails fast at write time
+        // instead of producing a sidecar that subsequent reads will
+        // refuse with the same error. This was the user-visible
+        // bug behind "io: hybrid sidecar: duplicate entry for slot
+        // N (rejected to eliminate find()-returns-first ambiguity;
+        // rebuild the sidecar from the wizard)" -- the duplicate
+        // got onto disk silently and only surfaced at the next
+        // enroll's read step.
+        let path = tmp("dup-slot-write");
         let entries = vec![fake_768(3, 0x11, 0x22), fake_768(3, 0xaa, 0xbb)];
-        write(&path, &entries).unwrap();
-        let count_or_err = match read(&path) {
-            Ok(v) => Err(v.len()),
-            Err(e) => Ok(e),
-        };
-        let err = count_or_err.unwrap_or_else(|n| {
-            panic!("two entries with slot_idx=3 must be rejected at parse, got {n} entries")
-        });
-        let msg = format!("{err:?}");
+        let r = write(&path, &entries);
+        assert!(
+            r.is_err(),
+            "two entries with slot_idx=3 must be rejected at write, got Ok"
+        );
+        let msg = format!("{:?}", r.unwrap_err());
         assert!(
             msg.contains("duplicate"),
             "error must mention 'duplicate', got: {msg}"
+        );
+        // The temp file must NOT have been created (atomic_secure_write
+        // only renames on success).
+        assert!(!path.exists(), "failed write must not leave a partial file");
+    }
+
+    #[test]
+    fn duplicate_slot_idx_rejected_at_read_hostile_bytes() {
+        // Hostile / corrupted on-disk sidecar: an attacker (or a
+        // pre-fix LUKSbox writer) could have produced a file with
+        // duplicate slot_idx entries. The reader's
+        // reject_duplicate_slot_idx defense MUST still catch that
+        // even though the writer now refuses to produce one.
+        use crate::hybrid_sidecar::{HEADER_LEN, MAGIC, VERSION_V2};
+
+        let path = tmp("dup-slot-read");
+        // Build a v2 sidecar by hand with two entries both at
+        // slot_idx 3. Magic + version + count + reserved =
+        // HEADER_LEN bytes, then two (slot_idx | level | pk | ct)
+        // entries.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.push(VERSION_V2);
+        bytes.push(2u8); // count
+        bytes.extend_from_slice(&[0u8; HEADER_LEN - MAGIC.len() - 2]);
+        for _ in 0..2 {
+            bytes.push(3u8); // slot_idx (DUPLICATE)
+            bytes.push(luksbox_pq::PqParams::Ml768.level_byte());
+            bytes.extend_from_slice(&vec![0x11u8; 1184]); // pubkey
+            bytes.extend_from_slice(&vec![0x22u8; 1088]); // ciphertext
+        }
+        fs::write(&path, &bytes).unwrap();
+
+        let err = match read(&path) {
+            Ok(v) => panic!(
+                "duplicate slot_idx in hostile sidecar must be rejected at read, \
+                 got {} entries",
+                v.len()
+            ),
+            Err(e) => e,
+        };
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("duplicate"),
+            "read-time error must mention 'duplicate', got: {msg}"
         );
         let _ = fs::remove_file(&path);
     }

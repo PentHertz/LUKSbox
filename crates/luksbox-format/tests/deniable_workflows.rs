@@ -522,3 +522,165 @@ fn second_passphrase_slot_unlocks_under_non_default_cipher() {
     let opened_hinted = complete_open_v2(env_hinted, &second, NON_DEFAULT).unwrap();
     assert_eq!(opened_hinted.mvk.as_bytes(), mvk.as_bytes());
 }
+
+// -----------------------------------------------------------------
+// Test #7: deniable HybridPqPassphrase enroll round-trips through
+// the Container-level `enroll_credential_v2_deniable` (the path the
+// GUI/TUI's "Add passphrase + ML-KEM keyslot" buttons take when the
+// vault is deniable). Pins:
+//   - Slot installed in memory by enroll_credential_v2_deniable
+//     persists through persist_header to disk.
+//   - The new slot's payload kind tag is HybridPqPassphrase (so the
+//     CLI/GUI's kind-hint dispatch picks it).
+//   - The original passphrase slot still opens (no clobber).
+//   - Closing and reopening with the HybridPqPassphrase credential
+//     recovers the same MVK.
+// -----------------------------------------------------------------
+
+#[test]
+fn deniable_enroll_hybrid_pq_passphrase_round_trips() {
+    use luksbox_format::deniable_header::DeniableMaterial;
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{PqParams, encapsulate_with, keygen_with};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("vault.lbx");
+
+    // Create a deniable vault with an admin passphrase at slot 0.
+    let mut cont = luksbox_format::Container::create_with_passphrase_deniable(
+        &path,
+        None,
+        CIPHER,
+        cheap_params(),
+        0,
+        b"admin-envelope-pp",
+    )
+    .unwrap();
+
+    // Enroll a passphrase + ML-KEM-768 slot at index 3.
+    let (pk, _seed) = keygen_with(PqParams::Ml768);
+    let (ct, shared) = encapsulate_with(PqParams::Ml768, &pk).unwrap();
+    let cred = DeniableCredential::HybridPqPassphrase {
+        passphrase: b"hybrid-slot-envelope-pp",
+        argon2: cheap_params(),
+        mlkem_shared: &shared,
+    };
+    let material = DeniableMaterial::passphrase_only();
+    let idx = cont
+        .enroll_credential_v2_deniable(3, &cred, &material)
+        .expect("hybrid-pq deniable enroll succeeds");
+    assert_eq!(idx, 3);
+    cont.persist_header().unwrap();
+
+    // Write the matching sidecar entry so the format-layer test can
+    // mirror the GUI's atomic-enroll dance (slot install -> sidecar
+    // write -> persist).
+    let sidecar = hybrid_sidecar::sidecar_path(&path);
+    hybrid_sidecar::write(
+        &sidecar,
+        &[HybridEntry {
+            slot_idx: idx as u8,
+            level: PqParams::Ml768,
+            pubkey: pk,
+            ciphertext: ct,
+        }],
+    )
+    .unwrap();
+    drop(cont);
+
+    // Reopen with the hybrid-pq passphrase credential. Two-phase v2
+    // deniable open: phase 1 picks the matching slot via envelope
+    // discovery (hinted on `HybridPqPassphrase`), phase 2 unwraps
+    // the MVK using the ML-KEM shared secret.
+    let mut header_bytes = vec![0u8; DENIABLE_HEADER_SIZE];
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(&path).unwrap();
+        f.read_exact(&mut header_bytes).unwrap();
+    }
+    let env = try_open_envelope_v2(
+        &header_bytes,
+        &cred,
+        CIPHER,
+        Some(DeniableKindTag::HybridPqPassphrase),
+    )
+    .unwrap();
+    assert_eq!(env.matched_slot_idx, 3, "discovery must pick slot 3");
+    assert_eq!(env.payload.kind, DeniableKindTag::HybridPqPassphrase);
+
+    let opened = complete_open_v2(env, &cred, CIPHER).unwrap();
+    let original_mvk = opened.mvk.as_bytes().to_vec();
+
+    // Sanity: admin slot 0 still opens with the original credential.
+    // Use a FRESH header buffer read since the env above moved out
+    // of the prior parse.
+    let admin = DeniableCredential::Passphrase {
+        passphrase: b"admin-envelope-pp",
+        argon2: cheap_params(),
+    };
+    let env_admin = try_open_envelope_v2(
+        &header_bytes,
+        &admin,
+        CIPHER,
+        Some(DeniableKindTag::Passphrase),
+    )
+    .unwrap();
+    assert_eq!(env_admin.matched_slot_idx, 0);
+    let opened_admin = complete_open_v2(env_admin, &admin, CIPHER).unwrap();
+    assert_eq!(
+        opened_admin.mvk.as_bytes(),
+        original_mvk.as_slice(),
+        "admin and hybrid-pq slots must wrap the SAME vault MVK"
+    );
+}
+
+// -----------------------------------------------------------------
+// Test #8: hybrid-PQ sidecar duplicate-slot rejection.
+//
+// Pins the format invariant the GUI/TUI's enroll wrappers now
+// defend against: a `.hybrid` sidecar with two `HybridEntry`s
+// carrying the same `slot_idx` is REJECTED at write time
+// (validate_entries -> reject_duplicate_slot_idx). The wrappers
+// must filter out any prior entry at the target slot index before
+// appending the new one, otherwise enrolling a second PQ-bearing
+// slot at an already-occupied index fails with
+// "duplicate entry for slot N".
+// -----------------------------------------------------------------
+
+#[test]
+fn hybrid_sidecar_rejects_duplicate_slot_idx_at_write() {
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::PqParams;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("evil.hybrid");
+
+    // Two entries both at slot_idx 1, with distinct (pk, ct) pairs
+    // so the duplicate isn't a value-level collision the writer
+    // could deduplicate. The format rejects the slot_idx clash
+    // outright.
+    let entries = vec![
+        HybridEntry {
+            slot_idx: 1,
+            level: PqParams::Ml768,
+            pubkey: vec![0xa1u8; 1184],
+            ciphertext: vec![0xa2u8; 1088],
+        },
+        HybridEntry {
+            slot_idx: 1,
+            level: PqParams::Ml768,
+            pubkey: vec![0xb1u8; 1184],
+            ciphertext: vec![0xb2u8; 1088],
+        },
+    ];
+    let r = hybrid_sidecar::write(&path, &entries);
+    assert!(
+        r.is_err(),
+        "two entries at slot_idx 1 must be rejected, got Ok"
+    );
+    let msg = format!("{}", r.unwrap_err());
+    assert!(
+        msg.contains("duplicate") && msg.contains("slot 1"),
+        "error must mention 'duplicate' + 'slot 1', got: {msg}"
+    );
+}

@@ -1102,6 +1102,13 @@ fn open_deniable_by_kind(
     let cred_id = envelope.payload().cred_id.clone();
     let salt_opt = envelope.payload().hmac_salt;
     let tpm_blob = envelope.payload().tpm_blob.clone();
+    // Captured before `complete_open_v2_deniable` consumes the
+    // envelope. Threaded into `ask_pq_decap_for_deniable` so the
+    // sidecar lookup picks the entry matching THIS slot rather
+    // than `entries.first()`, which used to break unlock on any
+    // deniable vault with two PQC-bearing slots whose user seed
+    // belonged to the non-first one.
+    let matched_slot_idx = envelope.opened.matched_slot_idx as u8;
 
     match kind {
         DenCredKind::Passphrase => {
@@ -1132,7 +1139,7 @@ fn open_deniable_by_kind(
             Err("FIDO2 hardware support not compiled in".into())
         }
         DenCredKind::HybridPqPassphrase => {
-            let shared = ask_pq_decap_for_deniable(theme, vault, &pass)?;
+            let shared = ask_pq_decap_for_deniable(theme, vault, &pass, matched_slot_idx)?;
             let cred = DeniableCredential::HybridPqPassphrase {
                 passphrase: pass.as_bytes(),
                 argon2,
@@ -1145,7 +1152,7 @@ fn open_deniable_by_kind(
         DenCredKind::HybridPqFido2 => {
             #[cfg(feature = "hardware")]
             {
-                let shared = ask_pq_decap_for_deniable(theme, vault, &pass)?;
+                let shared = ask_pq_decap_for_deniable(theme, vault, &pass, matched_slot_idx)?;
                 let salt = salt_opt
                     .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
                 let hmac_secret = wizard_fido2_hmac_from_payload(theme, &cred_id, &salt)?;
@@ -1192,7 +1199,7 @@ fn open_deniable_by_kind(
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         DenCredKind::HybridPqTpm2 => {
-            let shared = ask_pq_decap_for_deniable(theme, vault, &pass)?;
+            let shared = ask_pq_decap_for_deniable(theme, vault, &pass, matched_slot_idx)?;
             let unsealed = wizard_tpm_unseal_from_bytes(&tpm_blob, None)?;
             let cred = DeniableCredential::HybridPqTpmPassphrase {
                 passphrase: pass.as_bytes(),
@@ -1206,7 +1213,7 @@ fn open_deniable_by_kind(
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         DenCredKind::HybridPqTpmFido2 => {
-            let shared = ask_pq_decap_for_deniable(theme, vault, &pass)?;
+            let shared = ask_pq_decap_for_deniable(theme, vault, &pass, matched_slot_idx)?;
             let unsealed = wizard_tpm_unseal_from_bytes(&tpm_blob, None)?;
             let salt = salt_opt
                 .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
@@ -1279,6 +1286,7 @@ fn ask_pq_decap_for_deniable(
     theme: &ColorfulTheme,
     vault: &Path,
     envelope_pw_for_fallback: &str,
+    matched_slot_idx: u8,
 ) -> Result<[u8; 32]> {
     use luksbox_format::hybrid_sidecar;
     use luksbox_pq::seed_file;
@@ -1298,9 +1306,19 @@ fn ask_pq_decap_for_deniable(
     let seed = seed_file::read(&kyber_path, pw_bytes)?;
     let sidecar = hybrid_sidecar::sidecar_path(vault);
     let entries = hybrid_sidecar::read(&sidecar)?;
-    let entry = entries
-        .first()
-        .ok_or_else(|| "hybrid sidecar is empty".to_string())?;
+    // Match the sidecar entry to the deniable slot the envelope
+    // discovery resolved. Falling back to `entries.first()` (the
+    // old behaviour) silently produced a garbage shared secret via
+    // ML-KEM's implicit rejection whenever the user's seed was for
+    // a non-first slot, and the final AEAD then rejected the
+    // unlock with no indication of where things went wrong.
+    let entry = hybrid_sidecar::find(&entries, matched_slot_idx).ok_or_else(|| {
+        format!(
+            "no .hybrid sidecar entry for slot {matched_slot_idx} (envelope \
+             discovery resolved this slot but the matching ML-KEM (pk, ct) \
+             pair is missing from the sidecar)"
+        )
+    })?;
     let shared = luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext)?;
     Ok(*shared)
 }
@@ -3798,13 +3816,21 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
         }
         println!();
 
-        // TPM-bound add options only on Linux. Build the menu list
-        // dynamically and remap the choice index back to the static
-        // 0..=11 dispatch positions so the existing match arms stay
-        // unchanged.
+        // TPM-bound add options only on Linux. The four pure-PQ
+        // (passphrase|FIDO2) + ML-KEM-768|1024 options are
+        // available on every platform: they need no TPM and the
+        // FIDO2 ones go through whichever CTAP2 stack the build
+        // provides (libfido2 on Linux/macOS, webauthn.dll on
+        // Windows). Build the menu list dynamically and remap the
+        // choice index back to fixed action numbers so the match
+        // arms below stay stable.
         let mut menu: Vec<&'static str> = vec![
             "Add a passphrase keyslot",
             "Add a FIDO2 keyslot (wrap-style)",
+            "Add a passphrase + ML-KEM-768 keyslot",
+            "Add a passphrase + ML-KEM-1024 keyslot",
+            "Add a FIDO2 + ML-KEM-768 keyslot",
+            "Add a FIDO2 + ML-KEM-1024 keyslot",
         ];
         #[cfg(target_os = "linux")]
         {
@@ -3829,17 +3855,31 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             .default(0)
             .interact()?;
 
-        // Index remap: on Linux, choice == action. On non-Linux, the
-        // 7 TPM entries are absent so action 9..=11 (update/revoke/
-        // back) come at choice 2..=4.
+        // Action-number mapping. Menu choices 0..=5 are always the
+        // six "no TPM needed" rows (passphrase, FIDO2, and the four
+        // pure-PQ variants). On Linux choices 6..=12 are the TPM
+        // combos and choices 13..=15 are update/revoke/back. On
+        // non-Linux the TPM block is absent so update/revoke/back
+        // come right after the PQ rows (choices 6..=8). Remap to
+        // stable action numbers:
+        //   0..=1  -> Passphrase / FIDO2
+        //   2..=5  -> pure-PQ (passphrase|FIDO2 x 768|1024)
+        //   6..=12 -> TPM combos (linux only)
+        //   13     -> update
+        //   14     -> revoke
+        //   15     -> back
         #[cfg(target_os = "linux")]
-        let action = choice;
+        let action = match choice {
+            0..=12 => choice,
+            13 | 14 | 15 => choice,
+            _ => unreachable!(),
+        };
         #[cfg(not(target_os = "linux"))]
         let action = match choice {
-            0 | 1 => choice,
-            2 => 9,
-            3 => 10,
-            4 => 11,
+            0..=5 => choice,
+            6 => 13,
+            7 => 14,
+            8 => 15,
             _ => unreachable!(),
         };
 
@@ -3874,8 +3914,77 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     enroll_fido2_into(theme, &mut cont)
                 }
             }
-            #[cfg(target_os = "linux")]
+            // ===== pure-PQ rows (no TPM, all platforms) =====
+            // Actions 2..=5 cover the 4 pure-PQ variants. They
+            // mirror the GUI buttons of the same names. No
+            // `#[cfg(target_os = "linux")]` because there's
+            // nothing OS-specific about ML-KEM or about FIDO2
+            // (Linux/macOS use libfido2, Windows uses
+            // webauthn.dll).
             2 => {
+                let vp = cont.vault_path().to_path_buf();
+                if cont.is_deniable() {
+                    enroll_hybrid_pq_passphrase_deniable_into(
+                        theme,
+                        &mut cont,
+                        &vp,
+                        luksbox_pq::PqParams::Ml768,
+                    )
+                } else {
+                    enroll_hybrid_pq_passphrase_into(
+                        theme,
+                        &mut cont,
+                        &vp,
+                        luksbox_pq::PqParams::Ml768,
+                    )
+                }
+            }
+            3 => {
+                let vp = cont.vault_path().to_path_buf();
+                if cont.is_deniable() {
+                    enroll_hybrid_pq_passphrase_deniable_into(
+                        theme,
+                        &mut cont,
+                        &vp,
+                        luksbox_pq::PqParams::Ml1024,
+                    )
+                } else {
+                    enroll_hybrid_pq_passphrase_into(
+                        theme,
+                        &mut cont,
+                        &vp,
+                        luksbox_pq::PqParams::Ml1024,
+                    )
+                }
+            }
+            4 => {
+                let vp = cont.vault_path().to_path_buf();
+                if cont.is_deniable() {
+                    enroll_hybrid_pq_fido2_deniable_into(
+                        theme,
+                        &mut cont,
+                        &vp,
+                        luksbox_pq::PqParams::Ml768,
+                    )
+                } else {
+                    enroll_hybrid_pq_fido2_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml768)
+                }
+            }
+            5 => {
+                let vp = cont.vault_path().to_path_buf();
+                if cont.is_deniable() {
+                    enroll_hybrid_pq_fido2_deniable_into(
+                        theme,
+                        &mut cont,
+                        &vp,
+                        luksbox_pq::PqParams::Ml1024,
+                    )
+                } else {
+                    enroll_hybrid_pq_fido2_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml1024)
+                }
+            }
+            #[cfg(target_os = "linux")]
+            6 => {
                 if cont.is_deniable() {
                     enroll_tpm2_deniable_into(theme, &mut cont)
                 } else {
@@ -3883,16 +3992,16 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                 }
             }
             #[cfg(target_os = "linux")]
-            3 => {
+            7 => {
                 if cont.is_deniable() {
                     // The deniable slot envelope has no separate "TPM
                     // policy with PIN" variant - the envelope
                     // passphrase already acts as a knowledge factor on
-                    // top of the TPM unseal. Use action 2 (TPM) for
+                    // top of the TPM unseal. Use action 6 (TPM) for
                     // the equivalent posture in deniable vaults.
                     Err(
                         "TPM-PIN deniable enroll is not exposed: the deniable envelope already \
-                         requires a passphrase, so 'TPM' (action 2) gives the same knowledge+TPM \
+                         requires a passphrase, so 'TPM' gives the same knowledge+TPM \
                          requirement without a second PIN."
                             .into(),
                     )
@@ -3901,7 +4010,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                 }
             }
             #[cfg(target_os = "linux")]
-            4 => {
+            8 => {
                 if cont.is_deniable() {
                     enroll_tpm2_fido2_deniable_into(theme, &mut cont)
                 } else {
@@ -3909,7 +4018,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                 }
             }
             #[cfg(target_os = "linux")]
-            5 => {
+            9 => {
                 let vp = cont.vault_path().to_path_buf();
                 if cont.is_deniable() {
                     enroll_hybrid_pq_tpm2_deniable_into(
@@ -3923,7 +4032,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                 }
             }
             #[cfg(target_os = "linux")]
-            6 => {
+            10 => {
                 let vp = cont.vault_path().to_path_buf();
                 if cont.is_deniable() {
                     enroll_hybrid_pq_tpm2_deniable_into(
@@ -3937,7 +4046,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                 }
             }
             #[cfg(target_os = "linux")]
-            7 => {
+            11 => {
                 let vp = cont.vault_path().to_path_buf();
                 if cont.is_deniable() {
                     enroll_hybrid_pq_tpm2_fido2_deniable_into(
@@ -3956,7 +4065,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                 }
             }
             #[cfg(target_os = "linux")]
-            8 => {
+            12 => {
                 let vp = cont.vault_path().to_path_buf();
                 if cont.is_deniable() {
                     enroll_hybrid_pq_tpm2_fido2_deniable_into(
@@ -3974,8 +4083,8 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     )
                 }
             }
-            9 => update_keyslot_action(theme, &mut cont),
-            10 => {
+            13 => update_keyslot_action(theme, &mut cont),
+            14 => {
                 if cont.is_deniable() {
                     // Deniable vaults don't expose a populated/empty
                     // slot table (it's all opaque ciphertext); admin
@@ -4018,7 +4127,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     Ok(())
                 }
             }
-            11 => return Ok(cont),
+            15 => return Ok(cont),
             _ => unreachable!(),
         };
         if let Err(e) = r {
@@ -4363,15 +4472,30 @@ fn enroll_hybrid_pq_tpm2_deniable_into(
     let idx = c.enroll_credential_v2_deniable(slot_idx, &cred, &material)?;
     c.persist_header()?;
 
-    hybrid_sidecar::write(
-        &hybrid_sidecar::sidecar_path(vault_path),
-        &[HybridEntry {
-            slot_idx: idx as u8,
-            level: params,
-            pubkey: pk,
-            ciphertext: ct,
-        }],
-    )?;
+    // Merge with existing sidecar entries, replacing any stale
+    // entry for this slot index. Without the filter the sidecar
+    // could end up with two entries for the same slot (rejected
+    // by `validate_entries`) when the user re-enrolls at an
+    // occupied slot index.
+    let sidecar_path = hybrid_sidecar::sidecar_path(vault_path);
+    let prior_entries: Vec<HybridEntry> = if sidecar_path.exists() {
+        hybrid_sidecar::read(&sidecar_path)
+            .map_err(|e| format!("read existing hybrid sidecar: {e}"))?
+    } else {
+        Vec::new()
+    };
+    let mut entries: Vec<HybridEntry> = prior_entries
+        .iter()
+        .filter(|e| usize::from(e.slot_idx) != idx)
+        .cloned()
+        .collect();
+    entries.push(HybridEntry {
+        slot_idx: idx as u8,
+        level: params,
+        pubkey: pk,
+        ciphertext: ct,
+    });
+    hybrid_sidecar::write(&sidecar_path, &entries)?;
     seed_file::write(
         &kyber_path,
         &seed,
@@ -4452,15 +4576,27 @@ fn enroll_hybrid_pq_tpm2_fido2_deniable_into(
     let idx = c.enroll_credential_v2_deniable(slot_idx, &cred, &material)?;
     c.persist_header()?;
 
-    hybrid_sidecar::write(
-        &hybrid_sidecar::sidecar_path(vault_path),
-        &[HybridEntry {
-            slot_idx: idx as u8,
-            level: params,
-            pubkey: pk,
-            ciphertext: ct,
-        }],
-    )?;
+    // Merge with existing sidecar entries; see comment in the
+    // sibling `enroll_hybrid_pq_tpm2_deniable_into` above.
+    let sidecar_path = hybrid_sidecar::sidecar_path(vault_path);
+    let prior_entries: Vec<HybridEntry> = if sidecar_path.exists() {
+        hybrid_sidecar::read(&sidecar_path)
+            .map_err(|e| format!("read existing hybrid sidecar: {e}"))?
+    } else {
+        Vec::new()
+    };
+    let mut entries: Vec<HybridEntry> = prior_entries
+        .iter()
+        .filter(|e| usize::from(e.slot_idx) != idx)
+        .cloned()
+        .collect();
+    entries.push(HybridEntry {
+        slot_idx: idx as u8,
+        level: params,
+        pubkey: pk,
+        ciphertext: ct,
+    });
+    hybrid_sidecar::write(&sidecar_path, &entries)?;
     seed_file::write(
         &kyber_path,
         &seed,
@@ -5095,6 +5231,402 @@ fn enroll_hybrid_pq_tpm2_fido2_into(
     _params: luksbox_pq::PqParams,
 ) -> Result<()> {
     Err("hybrid-pq-tpm2-fido2 enroll requires --features hardware".into())
+}
+
+// ---- non-TPM hybrid PQ wizard helpers --------------------------------------
+//
+// These mirror the GUI's "Add passphrase + ML-KEM" and "Add FIDO2 +
+// ML-KEM" buttons one-for-one. No TPM, available on every platform
+// (FIDO2 variants need `--features hardware` for the CTAP2 stack).
+// The roll-back ordering (revoke / sidecar pop / .kyber unlink) is
+// the same one the TPM-bound siblings use; see
+// `enroll_hybrid_pq_tpm2_into` above for the rationale.
+
+fn enroll_hybrid_pq_passphrase_into(
+    theme: &ColorfulTheme,
+    c: &mut Container,
+    vault: &Path,
+    params: luksbox_pq::PqParams,
+) -> Result<()> {
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
+
+    let level_label = match params {
+        PqParams::Ml768 => "ML-KEM-768",
+        PqParams::Ml1024 => "ML-KEM-1024",
+    };
+    eprintln!(
+        "Hybrid passphrase + {level_label} keyslot. KEK = HKDF(salt,\n  \
+         Argon2id(passphrase) || pq_shared). Both the slot passphrase\n  \
+         AND a separate .kyber seed file will be required at every unlock."
+    );
+    let slot_pw = ask_new_passphrase(theme, "Slot passphrase")?;
+    let kyber_path = ask_path(theme, "Path for the new Kyber seed (.kyber) file")?;
+    if kyber_path.exists() {
+        return Err(format!("{} already exists", kyber_path.display()).into());
+    }
+    let seed_pw = ask_new_passphrase(theme, "Seed-file passphrase")?;
+
+    eprintln!("generating {level_label} keypair...");
+    let (pk, seed) = keygen_with(params);
+    let (ct, pq_shared) =
+        encapsulate_with(params, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
+
+    let idx = match params {
+        PqParams::Ml768 => {
+            c.enroll_hybrid_pq_passphrase(slot_pw.as_bytes(), &pq_shared, kdf_params())?
+        }
+        PqParams::Ml1024 => {
+            c.enroll_hybrid_pq_1024_passphrase(slot_pw.as_bytes(), &pq_shared, kdf_params())?
+        }
+    };
+    c.persist_header()?;
+
+    // Drop any stale sidecar entry at the same slot index. Standard
+    // mode uses `first_free_slot()` so this is normally a no-op,
+    // but defending against stale entries left over from a prior
+    // revoke + re-enroll cycle keeps the write idempotent.
+    let sidecar = hybrid_sidecar::sidecar_path(vault);
+    let prior_entries: Vec<HybridEntry> = if sidecar.exists() {
+        hybrid_sidecar::read(&sidecar).map_err(|e| format!("read existing hybrid sidecar: {e}"))?
+    } else {
+        Vec::new()
+    };
+    let mut entries: Vec<HybridEntry> = prior_entries
+        .iter()
+        .filter(|e| usize::from(e.slot_idx) != idx)
+        .cloned()
+        .collect();
+    entries.push(HybridEntry {
+        slot_idx: idx as u8,
+        level: params,
+        pubkey: pk,
+        ciphertext: ct,
+    });
+    hybrid_sidecar::write(&sidecar, &entries).map_err(|e| format!("write hybrid sidecar: {e}"))?;
+
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )
+    .map_err(|e| format!("write kyber seed: {e}"))?;
+
+    println!(
+        "OK enrolled hybrid passphrase + {level_label} keyslot in slot {idx}\n  \
+         Kyber seed: {} (MOVE TO SEPARATE STORAGE)",
+        kyber_path.display()
+    );
+    Ok(())
+}
+
+fn enroll_hybrid_pq_passphrase_deniable_into(
+    theme: &ColorfulTheme,
+    c: &mut Container,
+    vault: &Path,
+    params: luksbox_pq::PqParams,
+) -> Result<()> {
+    use luksbox_format::deniable_header::DeniableMaterial;
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
+
+    let slot_idx = ask_deniable_slot_idx(theme, c)?;
+    let level_label = match params {
+        PqParams::Ml768 => "ML-KEM-768",
+        PqParams::Ml1024 => "ML-KEM-1024",
+    };
+    let envelope_pw = ask_new_passphrase(theme, "Envelope passphrase for the new hybrid-PQ slot")?;
+    let kyber_path = ask_path(theme, "Path for the new Kyber seed (.kyber) file")?;
+    if kyber_path.exists() {
+        return Err(format!("{} already exists", kyber_path.display()).into());
+    }
+    let seed_pw = ask_new_passphrase(theme, "Seed-file passphrase")?;
+
+    eprintln!("generating {level_label} keypair...");
+    let (pk, seed) = keygen_with(params);
+    let (ct, pq_shared) =
+        encapsulate_with(params, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
+
+    let cred = luksbox_core::deniable::DeniableCredential::HybridPqPassphrase {
+        passphrase: envelope_pw.as_bytes(),
+        argon2: kdf_params(),
+        mlkem_shared: &pq_shared,
+    };
+    let material = DeniableMaterial::passphrase_only();
+    let idx = c.enroll_credential_v2_deniable(slot_idx, &cred, &material)?;
+    c.persist_header()?;
+
+    // Drop any stale sidecar entry for this slot index before
+    // appending the new one. Deniable mode lets the user pick an
+    // occupied slot_idx; install_slot_v2 overwrote it in-memory,
+    // so the old (pubkey, ciphertext) is useless for the new
+    // credential. Without the filter `validate_entries` would
+    // reject the duplicate slot_idx at write time.
+    let sidecar = hybrid_sidecar::sidecar_path(vault);
+    let prior_entries: Vec<HybridEntry> = if sidecar.exists() {
+        hybrid_sidecar::read(&sidecar).map_err(|e| format!("read existing hybrid sidecar: {e}"))?
+    } else {
+        Vec::new()
+    };
+    let mut entries: Vec<HybridEntry> = prior_entries
+        .iter()
+        .filter(|e| usize::from(e.slot_idx) != idx)
+        .cloned()
+        .collect();
+    entries.push(HybridEntry {
+        slot_idx: idx as u8,
+        level: params,
+        pubkey: pk,
+        ciphertext: ct,
+    });
+    hybrid_sidecar::write(&sidecar, &entries).map_err(|e| format!("write hybrid sidecar: {e}"))?;
+
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )
+    .map_err(|e| format!("write kyber seed: {e}"))?;
+
+    println!(
+        "OK enrolled deniable hybrid passphrase + {level_label} keyslot in slot {idx}\n  \
+         Kyber seed: {} (MOVE TO SEPARATE STORAGE)",
+        kyber_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(feature = "hardware")]
+fn enroll_hybrid_pq_fido2_into(
+    theme: &ColorfulTheme,
+    c: &mut Container,
+    vault: &Path,
+    params: luksbox_pq::PqParams,
+) -> Result<()> {
+    use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
+    use rand_core::{OsRng, RngCore};
+
+    fido2_preflight()?;
+    let level_label = match params {
+        PqParams::Ml768 => "ML-KEM-768",
+        PqParams::Ml1024 => "ML-KEM-1024",
+    };
+    eprintln!(
+        "Hybrid FIDO2 + {level_label} keyslot. KEK = HKDF(salt,\n  \
+         hmac_secret || pq_shared) [+ optional passphrase]. Both the\n  \
+         FIDO2 authenticator AND a separate .kyber seed file will be\n  \
+         required at every unlock."
+    );
+    let pin = Password::with_theme(theme)
+        .with_prompt("FIDO2 PIN")
+        .interact()?;
+    let slot_pw = Password::with_theme(theme)
+        .with_prompt("Optional extra passphrase (leave blank for none)")
+        .allow_empty_password(true)
+        .interact()?;
+    let slot_pw_opt: Option<&[u8]> = if slot_pw.is_empty() {
+        None
+    } else {
+        Some(slot_pw.as_bytes())
+    };
+    let kyber_path = ask_path(theme, "Path for the new Kyber seed (.kyber) file")?;
+    if kyber_path.exists() {
+        return Err(format!("{} already exists", kyber_path.display()).into());
+    }
+    let seed_pw = ask_new_passphrase(theme, "Seed-file passphrase")?;
+
+    let mut auth = crate::make_fido2_authenticator();
+    let user_handle = random_user_handle()?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
+    let cred_id = er.credential.id;
+    let mut hmac_salt = [0u8; 32];
+    OsRng
+        .try_fill_bytes(&mut hmac_salt)
+        .map_err(|e| format!("OS RNG: {e}"))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+
+    eprintln!("generating {level_label} keypair...");
+    let (pk, seed) = keygen_with(params);
+    let (ct, pq_shared) =
+        encapsulate_with(params, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
+
+    let idx = match params {
+        PqParams::Ml768 => c.enroll_hybrid_pq_fido2(
+            slot_pw_opt,
+            &hmac_secret,
+            &pq_shared,
+            &cred_id,
+            hmac_salt,
+            kdf_params(),
+        )?,
+        PqParams::Ml1024 => c.enroll_hybrid_pq_1024_fido2(
+            slot_pw_opt,
+            &hmac_secret,
+            &pq_shared,
+            &cred_id,
+            hmac_salt,
+            kdf_params(),
+        )?,
+    };
+    c.persist_header()?;
+
+    // Drop any stale entry at this slot index (defensive; standard
+    // mode uses first_free_slot which is normally Empty + has no
+    // prior sidecar entry).
+    let sidecar = hybrid_sidecar::sidecar_path(vault);
+    let prior_entries: Vec<HybridEntry> = if sidecar.exists() {
+        hybrid_sidecar::read(&sidecar).map_err(|e| format!("read existing hybrid sidecar: {e}"))?
+    } else {
+        Vec::new()
+    };
+    let mut entries: Vec<HybridEntry> = prior_entries
+        .iter()
+        .filter(|e| usize::from(e.slot_idx) != idx)
+        .cloned()
+        .collect();
+    entries.push(HybridEntry {
+        slot_idx: idx as u8,
+        level: params,
+        pubkey: pk,
+        ciphertext: ct,
+    });
+    hybrid_sidecar::write(&sidecar, &entries).map_err(|e| format!("write hybrid sidecar: {e}"))?;
+
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )
+    .map_err(|e| format!("write kyber seed: {e}"))?;
+
+    println!(
+        "OK enrolled hybrid FIDO2 + {level_label} keyslot in slot {idx}\n  \
+         Kyber seed: {} (MOVE TO SEPARATE STORAGE)",
+        kyber_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "hardware"))]
+fn enroll_hybrid_pq_fido2_into(
+    _theme: &ColorfulTheme,
+    _c: &mut Container,
+    _vault: &Path,
+    _params: luksbox_pq::PqParams,
+) -> Result<()> {
+    Err("hybrid-pq-fido2 enroll requires --features hardware".into())
+}
+
+#[cfg(feature = "hardware")]
+fn enroll_hybrid_pq_fido2_deniable_into(
+    theme: &ColorfulTheme,
+    c: &mut Container,
+    vault: &Path,
+    params: luksbox_pq::PqParams,
+) -> Result<()> {
+    use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::deniable_header::DeniableMaterial;
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
+    use rand_core::{OsRng, RngCore};
+
+    fido2_preflight()?;
+    let slot_idx = ask_deniable_slot_idx(theme, c)?;
+    let level_label = match params {
+        PqParams::Ml768 => "ML-KEM-768",
+        PqParams::Ml1024 => "ML-KEM-1024",
+    };
+    let envelope_pw = ask_new_passphrase(theme, "Envelope passphrase for the new slot")?;
+    let pin = Password::with_theme(theme)
+        .with_prompt("FIDO2 PIN")
+        .interact()?;
+    let kyber_path = ask_path(theme, "Path for the new Kyber seed (.kyber) file")?;
+    if kyber_path.exists() {
+        return Err(format!("{} already exists", kyber_path.display()).into());
+    }
+    let seed_pw = ask_new_passphrase(theme, "Seed-file passphrase")?;
+
+    let mut auth = crate::make_fido2_authenticator();
+    let user_handle = random_user_handle()?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
+    let cred_id = er.credential.id;
+    let mut hmac_salt = [0u8; 32];
+    OsRng
+        .try_fill_bytes(&mut hmac_salt)
+        .map_err(|e| format!("OS RNG: {e}"))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+
+    eprintln!("generating {level_label} keypair...");
+    let (pk, seed) = keygen_with(params);
+    let (ct, pq_shared) =
+        encapsulate_with(params, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
+
+    let cred = luksbox_core::deniable::DeniableCredential::HybridPqFido2Passphrase {
+        passphrase: envelope_pw.as_bytes(),
+        argon2: kdf_params(),
+        mlkem_shared: &pq_shared,
+        hmac_secret_output: &hmac_secret,
+    };
+    let material = DeniableMaterial {
+        cred_id: cred_id.clone(),
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: Vec::new(),
+    };
+    let idx = c.enroll_credential_v2_deniable(slot_idx, &cred, &material)?;
+    c.persist_header()?;
+
+    // Drop any stale entry at this slot index. Deniable mode lets
+    // the user pick an occupied index and `install_slot_v2`
+    // silently overwrote the old credential; the old sidecar
+    // entry's (pk, ct) is useless for the new credential.
+    let sidecar = hybrid_sidecar::sidecar_path(vault);
+    let prior_entries: Vec<HybridEntry> = if sidecar.exists() {
+        hybrid_sidecar::read(&sidecar).map_err(|e| format!("read existing hybrid sidecar: {e}"))?
+    } else {
+        Vec::new()
+    };
+    let mut entries: Vec<HybridEntry> = prior_entries
+        .iter()
+        .filter(|e| usize::from(e.slot_idx) != idx)
+        .cloned()
+        .collect();
+    entries.push(HybridEntry {
+        slot_idx: idx as u8,
+        level: params,
+        pubkey: pk,
+        ciphertext: ct,
+    });
+    hybrid_sidecar::write(&sidecar, &entries).map_err(|e| format!("write hybrid sidecar: {e}"))?;
+
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )
+    .map_err(|e| format!("write kyber seed: {e}"))?;
+
+    println!(
+        "OK enrolled deniable hybrid FIDO2 + {level_label} keyslot in slot {idx}\n  \
+         Kyber seed: {} (MOVE TO SEPARATE STORAGE)",
+        kyber_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "hardware"))]
+fn enroll_hybrid_pq_fido2_deniable_into(
+    _theme: &ColorfulTheme,
+    _c: &mut Container,
+    _vault: &Path,
+    _params: luksbox_pq::PqParams,
+) -> Result<()> {
+    Err("hybrid-pq-fido2 deniable enroll requires --features hardware".into())
 }
 
 // ---- TPM 2.0 unlock helpers ------------------------------------------------

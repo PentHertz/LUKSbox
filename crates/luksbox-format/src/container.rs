@@ -2045,6 +2045,125 @@ impl Container {
         Ok(idx)
     }
 
+    /// Append a passphrase + ML-KEM-768 hybrid keyslot. Mirrors the
+    /// CREATE-time `create_with_hybrid_pq_passphrase` but operates on
+    /// an already-open Container. The caller has already (a) generated
+    /// a fresh ML-KEM-768 keypair, (b) called `encapsulate` against it
+    /// to obtain `pq_shared`, and is responsible for (c) writing the
+    /// matching ciphertext + pubkey into the `.hybrid` sidecar and the
+    /// seed into the user's `.kyber` file. This function does NOT
+    /// touch either of those files; the GUI / CLI wrapper performs
+    /// the atomic-enroll dance (install-in-memory, write sidecars,
+    /// persist header, roll back on any failure) to keep the on-disk
+    /// vault consistent.
+    pub fn enroll_hybrid_pq_passphrase(
+        &mut self,
+        passphrase: &[u8],
+        pq_shared: &[u8; 32],
+        kdf_params: Argon2idParams,
+    ) -> Result<usize, Error> {
+        self.guard_no_deniable_slot_mutation()?;
+        let idx = self.header.first_free_slot()?;
+        let slot = Keyslot::new_hybrid_pq_passphrase(
+            self.header.cipher_suite,
+            &self.mvk,
+            passphrase,
+            pq_shared,
+            kdf_params,
+            &self.header.header_salt,
+        )?;
+        self.header.install_slot(idx, slot)?;
+        self.header_dirty = true;
+        Ok(idx)
+    }
+
+    /// ML-KEM-1024 variant of `enroll_hybrid_pq_passphrase`. Same
+    /// shape; only the slot's kind byte and the sidecar entry's level
+    /// byte differ on disk.
+    pub fn enroll_hybrid_pq_1024_passphrase(
+        &mut self,
+        passphrase: &[u8],
+        pq_shared: &[u8; 32],
+        kdf_params: Argon2idParams,
+    ) -> Result<usize, Error> {
+        self.guard_no_deniable_slot_mutation()?;
+        let idx = self.header.first_free_slot()?;
+        let slot = Keyslot::new_hybrid_pq_1024_passphrase(
+            self.header.cipher_suite,
+            &self.mvk,
+            passphrase,
+            pq_shared,
+            kdf_params,
+            &self.header.header_salt,
+        )?;
+        self.header.install_slot(idx, slot)?;
+        self.header_dirty = true;
+        Ok(idx)
+    }
+
+    /// Append a FIDO2 + ML-KEM-768 hybrid keyslot. Caller has already
+    /// (a) enrolled the FIDO2 credential to obtain `cred_id` +
+    /// `hmac_secret`, (b) generated an ML-KEM-768 keypair, (c) called
+    /// `encapsulate` to obtain `pq_shared`. The optional `passphrase`
+    /// folds into the KEK alongside the hmac_secret + pq_shared (it
+    /// is independent of the FIDO2 PIN; it protects the slot if the
+    /// FIDO2 token is stolen but the seed file is leaked). Pass
+    /// `None` for a pure FIDO2 + ML-KEM slot.
+    pub fn enroll_hybrid_pq_fido2(
+        &mut self,
+        passphrase: Option<&[u8]>,
+        hmac_secret: &[u8; 32],
+        pq_shared: &[u8; 32],
+        cred_id: &[u8],
+        hmac_salt: [u8; 32],
+        kdf_params: Argon2idParams,
+    ) -> Result<usize, Error> {
+        self.guard_no_deniable_slot_mutation()?;
+        let idx = self.header.first_free_slot()?;
+        let slot = Keyslot::new_hybrid_pq_fido2(
+            self.header.cipher_suite,
+            &self.mvk,
+            passphrase,
+            hmac_secret,
+            pq_shared,
+            cred_id,
+            hmac_salt,
+            kdf_params,
+            &self.header.header_salt,
+        )?;
+        self.header.install_slot(idx, slot)?;
+        self.header_dirty = true;
+        Ok(idx)
+    }
+
+    /// ML-KEM-1024 variant of `enroll_hybrid_pq_fido2`.
+    pub fn enroll_hybrid_pq_1024_fido2(
+        &mut self,
+        passphrase: Option<&[u8]>,
+        hmac_secret: &[u8; 32],
+        pq_shared: &[u8; 32],
+        cred_id: &[u8],
+        hmac_salt: [u8; 32],
+        kdf_params: Argon2idParams,
+    ) -> Result<usize, Error> {
+        self.guard_no_deniable_slot_mutation()?;
+        let idx = self.header.first_free_slot()?;
+        let slot = Keyslot::new_hybrid_pq_1024_fido2(
+            self.header.cipher_suite,
+            &self.mvk,
+            passphrase,
+            hmac_secret,
+            pq_shared,
+            cred_id,
+            hmac_salt,
+            kdf_params,
+            &self.header.header_salt,
+        )?;
+        self.header.install_slot(idx, slot)?;
+        self.header_dirty = true;
+        Ok(idx)
+    }
+
     /// Add the maximum-paranoia hybrid TPM 2.0 + FIDO2 + ML-KEM-768
     /// keyslot. Three independent factors required at every unlock.
     pub fn enroll_hybrid_pq_tpm2_fido2(

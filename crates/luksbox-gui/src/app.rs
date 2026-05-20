@@ -623,6 +623,67 @@ impl AddHybridTpm2Fido2Form {
     }
 }
 
+/// State for the "Add passphrase + ML-KEM keyslot" modal. Available
+/// on every platform (no TPM involved). The slot passphrase is the
+/// classical-side factor; the `.kyber` seed is the PQ-side factor.
+/// `seed_pw` encrypts the seed file at rest. `kem_size` is 768
+/// (FIPS 203 Cat 3) or 1024 (Cat 5).
+struct AddHybridPqPassphraseForm {
+    slot_pw: Zeroizing<String>,
+    slot_pw_confirm: Zeroizing<String>,
+    kyber_path: String,
+    seed_pw: Zeroizing<String>,
+    seed_pw_confirm: Zeroizing<String>,
+    kem_size: u16,
+    /// Deniable-only: envelope passphrase + target slot index. The
+    /// fields are ignored when the vault is standard mode (the slot
+    /// passphrase doubles as the only secret in that case).
+    extras: DeniableEnrollExtras,
+}
+
+impl AddHybridPqPassphraseForm {
+    fn new(kem_size: u16) -> Self {
+        Self {
+            slot_pw: Zeroizing::default(),
+            slot_pw_confirm: Zeroizing::default(),
+            kyber_path: String::new(),
+            seed_pw: Zeroizing::default(),
+            seed_pw_confirm: Zeroizing::default(),
+            kem_size,
+            extras: DeniableEnrollExtras::default(),
+        }
+    }
+}
+
+/// State for the "Add FIDO2 + ML-KEM keyslot" modal. `pin` is the
+/// FIDO2 PIN (CTAP2 enroll + hmac-secret). The slot KEK is
+/// `HKDF(salt, hmac_secret || pq_shared, "lbx:hybrid-fido-kek/v1")` -
+/// pure 2-factor, no slot passphrase. (An optional slot-side
+/// passphrase is supported at the format layer, but the standard
+/// unlock path doesn't surface it yet, so the modal doesn't expose
+/// the option to avoid an unopenable-slot footgun.)
+struct AddHybridPqFido2Form {
+    pin: Zeroizing<String>,
+    kyber_path: String,
+    seed_pw: Zeroizing<String>,
+    seed_pw_confirm: Zeroizing<String>,
+    kem_size: u16,
+    extras: DeniableEnrollExtras,
+}
+
+impl AddHybridPqFido2Form {
+    fn new(kem_size: u16) -> Self {
+        Self {
+            pin: Zeroizing::default(),
+            kyber_path: String::new(),
+            seed_pw: Zeroizing::default(),
+            seed_pw_confirm: Zeroizing::default(),
+            kem_size,
+            extras: DeniableEnrollExtras::default(),
+        }
+    }
+}
+
 // ---- pending op tracker ---------------------------------------------------
 
 /// Result envelope used by ops that take ownership of the Vfs on a
@@ -682,6 +743,18 @@ enum Pending {
         rx: Receiver<VaultRet<usize>>,
     },
     EnrollHybridPqTpm2Fido2 {
+        rx: Receiver<VaultRet<usize>>,
+    },
+    /// Non-TPM hybrid: passphrase + ML-KEM. Worker generates a
+    /// Kyber keypair, installs the slot, writes the .hybrid
+    /// sidecar entry and the .kyber seed file.
+    EnrollHybridPqPassphrase {
+        rx: Receiver<VaultRet<usize>>,
+    },
+    /// Non-TPM hybrid: FIDO2 + ML-KEM. Same shape as
+    /// `EnrollHybridPqPassphrase` but with a FIDO2 enroll on the
+    /// classical side.
+    EnrollHybridPqFido2 {
         rx: Receiver<VaultRet<usize>>,
     },
     Panic(Receiver<Result<(), String>>),
@@ -748,6 +821,13 @@ impl Pending {
             Pending::EnrollHybridPqTpm2Fido2 { .. } => {
                 format!("3-factor TPM+FIDO2+ML-KEM enroll - {auth_verb} + TPM seal + Kyber keygen")
             }
+            Pending::EnrollHybridPqPassphrase { .. } => {
+                "hybrid passphrase + ML-KEM enroll: stretching passphrase + generating Kyber keypair..."
+                    .to_string()
+            }
+            Pending::EnrollHybridPqFido2 { .. } => format!(
+                "hybrid FIDO2 + ML-KEM enroll - {auth_verb} + generating Kyber keypair"
+            ),
             Pending::Panic(_) => "wiping...".to_string(),
             Pending::RotateMvk(_) => {
                 "rotating master key (re-encrypting every chunk)...".to_string()
@@ -770,6 +850,7 @@ impl Pending {
             } | Pending::EnrollFido2 { .. }
                 | Pending::EnrollTpm2Fido2 { .. }
                 | Pending::EnrollHybridPqTpm2Fido2 { .. }
+                | Pending::EnrollHybridPqFido2 { .. }
         )
     }
 
@@ -858,6 +939,18 @@ pub struct LuksboxApp {
     /// Form state for the 3-factor "Add hybrid TPM + FIDO2 + ML-KEM"
     /// modal. Adds a FIDO2 PIN field on top of `AddHybridTpm2Form`.
     add_hybrid_tpm2_fido2_modal: Option<AddHybridTpm2Fido2Form>,
+    /// Form state for the "Add passphrase + ML-KEM" modal. Same
+    /// fields as `AddHybridTpm2Form` minus the TPM-bound parts, plus
+    /// an explicit slot-passphrase pair (TPM-bound variants don't
+    /// need a slot passphrase because the TPM is the classical-side
+    /// factor; without a TPM, the passphrase IS the classical side).
+    /// Available on every platform.
+    add_hybrid_pq_modal: Option<AddHybridPqPassphraseForm>,
+    /// Form state for the "Add FIDO2 + ML-KEM" modal. The FIDO2
+    /// hmac-secret plus an OPTIONAL slot passphrase plus the ML-KEM
+    /// shared secret derive the slot KEK. Available on every
+    /// platform with FIDO2 hardware support.
+    add_hybrid_pq_fido2_modal: Option<AddHybridPqFido2Form>,
     /// When a TPM-bootstrap CreateKind was selected, the create flow
     /// first creates the vault with a passphrase; once that succeeds
     /// and the vault is installed in `self.vault`, this field triggers
@@ -1182,6 +1275,8 @@ impl LuksboxApp {
             add_tpm2_deniable_modal: None,
             add_hybrid_tpm2_modal: None,
             add_hybrid_tpm2_fido2_modal: None,
+            add_hybrid_pq_modal: None,
+            add_hybrid_pq_fido2_modal: None,
             empty_passphrase_confirm: None,
             rotate_modal: None,
             mkdir_input: None,
@@ -1274,10 +1369,17 @@ impl LuksboxApp {
                         // open gets the path. Only one of these
                         // modals is open at a time (mutually
                         // exclusive in the UI flow).
+                        let s2 = s.clone();
                         if let Some(form) = self.add_hybrid_tpm2_modal.as_mut() {
-                            form.kyber_path = s.clone();
+                            form.kyber_path = s2.clone();
                         }
                         if let Some(form) = self.add_hybrid_tpm2_fido2_modal.as_mut() {
+                            form.kyber_path = s2.clone();
+                        }
+                        if let Some(form) = self.add_hybrid_pq_modal.as_mut() {
+                            form.kyber_path = s2.clone();
+                        }
+                        if let Some(form) = self.add_hybrid_pq_fido2_modal.as_mut() {
                             form.kyber_path = s;
                         }
                     }
@@ -1734,6 +1836,39 @@ impl LuksboxApp {
                     self.pending = Some(Pending::EnrollHybridPqTpm2Fido2 { rx });
                 }
                 Err(_) => self.toast_err("3-factor enroll task crashed"),
+            },
+            Pending::EnrollHybridPqPassphrase { rx } => match rx.try_recv() {
+                Ok((mut vault, result)) => {
+                    match result {
+                        Ok(idx) => {
+                            vault.has_hybrid_pq = true;
+                            self.toast_ok(format!("enrolled passphrase + ML-KEM in slot {idx}"));
+                        }
+                        Err(e) => self.toast_err(e),
+                    }
+                    self.vault = Some(vault);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Pending::EnrollHybridPqPassphrase { rx });
+                }
+                Err(_) => self.toast_err("hybrid passphrase+ML-KEM enroll task crashed"),
+            },
+            Pending::EnrollHybridPqFido2 { rx } => match rx.try_recv() {
+                Ok((mut vault, result)) => {
+                    match result {
+                        Ok(idx) => {
+                            vault.has_fido2 = true;
+                            vault.has_hybrid_pq = true;
+                            self.toast_ok(format!("enrolled FIDO2 + ML-KEM in slot {idx}"));
+                        }
+                        Err(e) => self.toast_err(e),
+                    }
+                    self.vault = Some(vault);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Pending::EnrollHybridPqFido2 { rx });
+                }
+                Err(_) => self.toast_err("hybrid FIDO2+ML-KEM enroll task crashed"),
             },
             Pending::Panic(rx) => match rx.try_recv() {
                 Ok(Ok(())) => {
@@ -4423,27 +4558,36 @@ impl LuksboxApp {
                                 .size(12.0),
                         );
                     } else {
-                        ui.label(RichText::new("Passphrase").color(theme::DIM).size(12.0));
+                        ui.label(
+                            RichText::new("Slot passphrase")
+                                .color(theme::DIM)
+                                .size(12.0),
+                        );
                     }
                     let te =
                         egui::TextEdit::singleline(&mut *self.unlock.passphrase).password(true);
                     ui.add_sized([form_width(ui), CONTROL_H], te);
-                    if use_deniable {
-                        ui.add_space(6.0);
-                        ui.label(
-                            RichText::new(
-                                ".kyber seed-file passphrase. Fill ONLY if you set a \
-                                 distinct seed-file passphrase at create time. Leave blank \
-                                 to reuse the envelope passphrase above (which is the \
-                                 default if you didn't fill the second create field).",
-                            )
-                            .color(theme::DIM)
-                            .size(12.0),
-                        );
-                        let te = egui::TextEdit::singleline(&mut *self.unlock.hybrid_seed_pw)
-                            .password(true);
-                        ui.add_sized([form_width(ui), CONTROL_H], te);
-                    }
+                    // Seed-file passphrase: surface on every variant
+                    // (standard + deniable). At "Add Passphrase +
+                    // ML-KEM" enroll time the user picks TWO
+                    // independent passphrases (slot passphrase and
+                    // seed-file passphrase) - hiding the seed-pw
+                    // field meant the unlock code defaulted to the
+                    // slot passphrase, which fails whenever the user
+                    // actually picked a distinct seed-pw.
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            ".kyber seed-file passphrase. Fill ONLY if you set a distinct \
+                             seed-file passphrase at create / enroll time. Leave blank to \
+                             reuse the passphrase above.",
+                        )
+                        .color(theme::DIM)
+                        .size(12.0),
+                    );
+                    let te =
+                        egui::TextEdit::singleline(&mut *self.unlock.hybrid_seed_pw).password(true);
+                    ui.add_sized([form_width(ui), CONTROL_H], te);
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new("Path to the .kyber seed file")
@@ -4863,18 +5007,22 @@ impl LuksboxApp {
             } else {
                 None
             },
-            // v2 deniable: optional separate seed-file passphrase
-            // when the user set distinct passphrases at create
-            // time. Empty here means "reuse opts.passphrase".
-            hybrid_seed_pw: if self.unlock.use_deniable
-                && matches!(
-                    self.unlock.method,
-                    UnlockMethod::HybridPq
-                        | UnlockMethod::HybridPqFido2
-                        | UnlockMethod::HybridPqTpm2
-                        | UnlockMethod::HybridPqTpm2Fido2
-                )
-                && !self.unlock.hybrid_seed_pw.is_empty()
+            // Optional separate seed-file passphrase. Surfaced on
+            // every HybridPq* variant (standard + deniable):
+            //   - Add Passphrase + ML-KEM (standard) lets the user
+            //     pick TWO distinct passphrases (slot + seed) at
+            //     enroll time; the same option must exist at unlock.
+            //   - Deniable HybridPq* also supports distinct
+            //     envelope-pw vs seed-pw at create / enroll time.
+            // Empty here means "reuse opts.passphrase" (the
+            // ergonomic "I used one passphrase for both" path).
+            hybrid_seed_pw: if matches!(
+                self.unlock.method,
+                UnlockMethod::HybridPq
+                    | UnlockMethod::HybridPqFido2
+                    | UnlockMethod::HybridPqTpm2
+                    | UnlockMethod::HybridPqTpm2Fido2
+            ) && !self.unlock.hybrid_seed_pw.is_empty()
             {
                 Some(std::mem::take(&mut self.unlock.hybrid_seed_pw))
             } else {
@@ -5674,10 +5822,10 @@ impl LuksboxApp {
         };
         ui.label(
             RichText::new(format!(
-                "Vault cipher: {cipher_label} (set at create, same for every slot). \
-                 Per-slot you can pick the KDF strength (passphrase) or hybrid PQ \
-                 parameter set (at create time). Hybrid-PQ slots can't be added \
-                 post-create, recreate the vault."
+                "Vault cipher: {cipher_label} (set at create, same for every slot \
+                 since the same MVK is wrapped under each keyslot). Per-slot you \
+                 can pick the KDF strength (passphrase slots) or the ML-KEM \
+                 parameter set (hybrid-PQ slots) below."
             ))
             .color(theme::FAINT)
             .size(12.0),
@@ -5841,6 +5989,80 @@ impl LuksboxApp {
                         self.toast_err(e);
                     } else {
                         self.add_fido2_pin_modal = Some(AddFido2Form::default());
+                    }
+                }
+                // ---- non-TPM hybrid PQ add-slot buttons ----
+                // Available on every platform: classical + ML-KEM
+                // (FIPS 203) hybrid slots that don't need a TPM. The
+                // .kyber seed file the user picks at enroll time is
+                // required at every unlock for that slot, alongside
+                // the slot passphrase (and FIDO2 token, for the *_fido2
+                // variants).
+                if ui
+                    .add_sized(
+                        [row_w, 32.0],
+                        ghost_button("+ Add passphrase + ML-KEM-768 keyslot"),
+                    )
+                    .on_hover_text(
+                        "2-factor: a slot passphrase AND a separate .kyber seed file (kept on \
+                 different storage from the .lbx). Closes the quantum-attack gap of a plain \
+                 passphrase slot. Generates a fresh ML-KEM-768 keypair and writes the seed \
+                 to a new passphrase-encrypted file you choose.",
+                    )
+                    .clicked()
+                {
+                    self.add_hybrid_pq_modal = Some(AddHybridPqPassphraseForm::new(768));
+                }
+                if ui
+                    .add_sized(
+                        [row_w, 32.0],
+                        ghost_button("+ Add passphrase + ML-KEM-1024 keyslot"),
+                    )
+                    .on_hover_text(
+                        "Same 2-factor shape as the ML-KEM-768 variant but uses ML-KEM-1024 \
+                 (NIST Cat-5, AES-256-equivalent PQ strength). Larger keys and ciphertexts; \
+                 same unlock cost.",
+                    )
+                    .clicked()
+                {
+                    self.add_hybrid_pq_modal = Some(AddHybridPqPassphraseForm::new(1024));
+                }
+                if ui
+                    .add_sized(
+                        [row_w, 32.0],
+                        ghost_button("+ Add FIDO2 + ML-KEM-768 keyslot"),
+                    )
+                    .on_hover_text(
+                        "2-factor: a FIDO2 authenticator AND a separate .kyber seed file. \
+                 Optional extra passphrase if you want a third factor; leave the slot \
+                 passphrase blank for pure FIDO2 + ML-KEM. Closes the PQ gap of the \
+                 ECDH-P256 inside CTAP2.",
+                    )
+                    .clicked()
+                {
+                    if let Err(e) = ops::pre_check_fido2() {
+                        self.toast_err(e);
+                    } else {
+                        self.add_hybrid_pq_fido2_modal =
+                            Some(AddHybridPqFido2Form::new(768));
+                    }
+                }
+                if ui
+                    .add_sized(
+                        [row_w, 32.0],
+                        ghost_button("+ Add FIDO2 + ML-KEM-1024 keyslot"),
+                    )
+                    .on_hover_text(
+                        "Same 2-factor shape as the ML-KEM-768 variant but uses ML-KEM-1024 \
+                 (NIST Cat-5, AES-256-equivalent PQ strength).",
+                    )
+                    .clicked()
+                {
+                    if let Err(e) = ops::pre_check_fido2() {
+                        self.toast_err(e);
+                    } else {
+                        self.add_hybrid_pq_fido2_modal =
+                            Some(AddHybridPqFido2Form::new(1024));
                     }
                 }
                 // TPM-bound "Add keyslot" buttons only on Linux. Each
@@ -7628,6 +7850,395 @@ impl LuksboxApp {
             }
         } else if close_h3 {
             self.add_hybrid_tpm2_fido2_modal = None;
+        }
+
+        // ===== Add passphrase + ML-KEM (non-TPM) modal =========
+        // Same shape as add_hybrid_tpm2_modal, minus TPM. The slot
+        // passphrase is the only classical-side secret (TPM-bound
+        // variants delegate that role to the chip; here it has to
+        // exist explicitly). For deniable vaults the envelope
+        // passphrase is collected via DeniableEnrollExtras.
+        let mut open_hp_picker = false;
+        let mut close_hp = false;
+        let mut submit_hp = false;
+        let mut hp_err: Option<String> = None;
+        let hp_is_deniable = self
+            .vault
+            .as_ref()
+            .is_some_and(|v| v.vfs.container().is_deniable());
+        if let Some(form) = self.add_hybrid_pq_modal.as_mut() {
+            let title = format!("Add passphrase + ML-KEM-{} keyslot", form.kem_size);
+            egui::Window::new(title)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    if hp_is_deniable {
+                        // Deniable mode: the envelope passphrase IS
+                        // the slot's classical-side secret (the
+                        // deniable HybridPqPassphrase credential
+                        // takes a single passphrase that drives both
+                        // the envelope KEK and the inner factors
+                        // KEK). Don't render a second passphrase
+                        // field that would just be discarded by the
+                        // dispatch.
+                        draw_deniable_extras(ui, &mut form.extras);
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(
+                                "The envelope passphrase above acts as the slot's \
+                                 classical-side secret; no separate slot passphrase \
+                                 is needed in deniable mode.",
+                            )
+                            .color(theme::FAINT)
+                            .size(11.0),
+                        );
+                        ui.add_space(10.0);
+                    } else {
+                        ui.label(
+                            RichText::new("Slot passphrase (classical side)")
+                                .color(theme::DIM)
+                                .size(12.0),
+                        );
+                        let te = egui::TextEdit::singleline(&mut *form.slot_pw).password(true);
+                        ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new("Confirm passphrase")
+                                .color(theme::DIM)
+                                .size(12.0),
+                        );
+                        let te =
+                            egui::TextEdit::singleline(&mut *form.slot_pw_confirm).password(true);
+                        ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                        ui.add_space(10.0);
+                    }
+                    ui.label(
+                        RichText::new("Path for the new .kyber seed file")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    ui.horizontal(|ui| {
+                        let (field_w, browse_w) = trailing_button_row_widths(ui, 320.0, 90.0);
+                        ui.add_sized(
+                            [field_w, CONTROL_H],
+                            egui::TextEdit::singleline(&mut form.kyber_path)
+                                .hint_text(path_hints::usb("vault.kyber")),
+                        );
+                        if ui
+                            .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
+                            .clicked()
+                        {
+                            open_hp_picker = true;
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Seed-file passphrase (encrypts the .kyber at rest)")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    let te = egui::TextEdit::singleline(&mut *form.seed_pw).password(true);
+                    ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Confirm seed passphrase")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    let te = egui::TextEdit::singleline(&mut *form.seed_pw_confirm).password(true);
+                    ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "MOVE THE .kyber FILE TO SEPARATE TRUSTED STORAGE (USB stick, \
+                             offline machine) so an attacker who steals the .lbx can't also \
+                             grab the seed. Lose the seed = lose this keyslot.",
+                        )
+                        .color(theme::WARN)
+                        .size(11.0),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(ghost_button("Cancel")).clicked() {
+                            close_hp = true;
+                        }
+                        if ui.add(primary_button("Enroll")).clicked() {
+                            // Slot-passphrase validation only applies
+                            // to standard mode. In deniable mode the
+                            // envelope passphrase from
+                            // DeniableEnrollExtras IS the slot's
+                            // classical-side secret, validated below.
+                            let slot_pw_err = if hp_is_deniable {
+                                None
+                            } else if form.slot_pw.is_empty() {
+                                Some("slot passphrase cannot be empty".to_string())
+                            } else if *form.slot_pw != *form.slot_pw_confirm {
+                                Some("slot passphrases do not match".to_string())
+                            } else {
+                                None
+                            };
+                            if let Some(e) = slot_pw_err {
+                                hp_err = Some(e);
+                            } else if form.kyber_path.trim().is_empty() {
+                                hp_err = Some(".kyber path cannot be empty".into());
+                            } else if form.seed_pw.is_empty() {
+                                hp_err = Some("seed-file passphrase cannot be empty".into());
+                            } else if *form.seed_pw != *form.seed_pw_confirm {
+                                hp_err = Some("seed passphrases do not match".into());
+                            } else if hp_is_deniable && form.extras.passphrase.is_empty() {
+                                hp_err = Some("deniable: envelope passphrase required".into());
+                            } else {
+                                submit_hp = true;
+                            }
+                        }
+                    });
+                });
+        }
+        if open_hp_picker {
+            self.start_save_picker(
+                "New .kyber seed file",
+                "vault.kyber",
+                PickerTarget::AddHybridKyber,
+            );
+        }
+        if let Some(e) = hp_err {
+            self.toast_err(e);
+        }
+        if submit_hp {
+            if let Some(form) = self.add_hybrid_pq_modal.take()
+                && let Some(v) = self.vault.take()
+            {
+                let kyber_path = std::path::PathBuf::from(form.kyber_path);
+                let slot_pw = form.slot_pw;
+                let seed_pw = form.seed_pw;
+                let kem_size = form.kem_size;
+                let extras = form.extras;
+                let vault_path = v.vault_path.clone();
+                let (tx, rx) = std::sync::mpsc::channel::<VaultRet<usize>>();
+                let is_den = hp_is_deniable;
+                std::thread::spawn(move || {
+                    let mut v = v;
+                    let r = if is_den {
+                        ops::enroll_hybrid_pq_passphrase_deniable(
+                            &mut v.vfs,
+                            &vault_path,
+                            extras.slot_idx,
+                            &kyber_path,
+                            &extras.passphrase,
+                            &seed_pw,
+                            kem_size,
+                        )
+                    } else {
+                        ops::enroll_hybrid_pq_passphrase(
+                            &mut v.vfs,
+                            &vault_path,
+                            &kyber_path,
+                            &slot_pw,
+                            &seed_pw,
+                            kem_size,
+                        )
+                    };
+                    let _ = tx.send((v, r));
+                });
+                self.pending = Some(Pending::EnrollHybridPqPassphrase { rx });
+            }
+        } else if close_hp {
+            self.add_hybrid_pq_modal = None;
+        }
+
+        // ===== Add FIDO2 + ML-KEM (non-TPM) modal ==============
+        // Two factors: FIDO2 hmac-secret + ML-KEM shared secret.
+        // The `slot_pw` field is OPTIONAL: empty = pure 2-factor;
+        // populated = add the passphrase as a third factor folded
+        // into the KEK (defense-in-depth if both the FIDO2 token
+        // AND the .kyber file are stolen at once).
+        let mut open_hpf_picker = false;
+        let mut close_hpf = false;
+        let mut submit_hpf = false;
+        let mut hpf_err: Option<String> = None;
+        let hpf_is_deniable = self
+            .vault
+            .as_ref()
+            .is_some_and(|v| v.vfs.container().is_deniable());
+        if let Some(form) = self.add_hybrid_pq_fido2_modal.as_mut() {
+            let title = format!("Add FIDO2 + ML-KEM-{} keyslot", form.kem_size);
+            egui::Window::new(title)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    if hpf_is_deniable {
+                        draw_deniable_extras(ui, &mut form.extras);
+                        ui.add_space(10.0);
+                    }
+                    ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                    let te = egui::TextEdit::singleline(&mut *form.pin).password(true);
+                    ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    ui.add_space(10.0);
+                    ui.label(
+                        RichText::new("Path for the new .kyber seed file")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    ui.horizontal(|ui| {
+                        let (field_w, browse_w) = trailing_button_row_widths(ui, 320.0, 90.0);
+                        ui.add_sized(
+                            [field_w, CONTROL_H],
+                            egui::TextEdit::singleline(&mut form.kyber_path)
+                                .hint_text(path_hints::usb("vault.kyber")),
+                        );
+                        if ui
+                            .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
+                            .clicked()
+                        {
+                            open_hpf_picker = true;
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Seed-file passphrase (encrypts the .kyber at rest)")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    let te = egui::TextEdit::singleline(&mut *form.seed_pw).password(true);
+                    ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Confirm seed passphrase")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    let te = egui::TextEdit::singleline(&mut *form.seed_pw_confirm).password(true);
+                    ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "MOVE THE .kyber FILE TO SEPARATE TRUSTED STORAGE. Lose the \
+                             seed = lose this keyslot (the FIDO2 alone can't unlock it).",
+                        )
+                        .color(theme::WARN)
+                        .size(11.0),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(ghost_button("Cancel")).clicked() {
+                            close_hpf = true;
+                        }
+                        if ui.add(primary_button("Enroll")).clicked() {
+                            if form.pin.is_empty() {
+                                hpf_err = Some("FIDO2 PIN cannot be empty".into());
+                            } else if form.kyber_path.trim().is_empty() {
+                                hpf_err = Some(".kyber path cannot be empty".into());
+                            } else if form.seed_pw.is_empty() {
+                                hpf_err = Some("seed-file passphrase cannot be empty".into());
+                            } else if *form.seed_pw != *form.seed_pw_confirm {
+                                hpf_err = Some("seed passphrases do not match".into());
+                            } else if hpf_is_deniable && form.extras.passphrase.is_empty() {
+                                hpf_err = Some("deniable: envelope passphrase required".into());
+                            } else {
+                                submit_hpf = true;
+                            }
+                        }
+                    });
+                });
+        }
+        if open_hpf_picker {
+            self.start_save_picker(
+                "New .kyber seed file",
+                "vault.kyber",
+                PickerTarget::AddHybridKyber,
+            );
+        }
+        if let Some(e) = hpf_err {
+            self.toast_err(e);
+        }
+        if submit_hpf {
+            if let Some(form) = self.add_hybrid_pq_fido2_modal.take()
+                && let Some(v) = self.vault.take()
+            {
+                let kyber_path = std::path::PathBuf::from(form.kyber_path);
+                let pin = form.pin;
+                let seed_pw = form.seed_pw;
+                let kem_size = form.kem_size;
+                let extras = form.extras;
+                let vault_path = v.vault_path.clone();
+                let (tx, rx) = std::sync::mpsc::channel::<VaultRet<usize>>();
+                let is_den = hpf_is_deniable;
+                // Pure-2-factor FIDO2 + ML-KEM: no slot passphrase
+                // folded into the KEK. The format layer's
+                // `enroll_hybrid_pq_fido2` takes `slot_pw: &str`;
+                // pass an empty string and the ops wrapper resolves
+                // that to `slot_pw_opt = None` for the slot KEK.
+                let slot_pw_empty = String::new();
+                std::thread::spawn(move || {
+                    let mut v = v;
+                    let r = if is_den {
+                        #[cfg(feature = "hardware")]
+                        {
+                            ops::enroll_hybrid_pq_fido2_deniable(
+                                &mut v.vfs,
+                                &vault_path,
+                                extras.slot_idx,
+                                &kyber_path,
+                                &pin,
+                                &extras.passphrase,
+                                &seed_pw,
+                                kem_size,
+                            )
+                        }
+                        #[cfg(not(feature = "hardware"))]
+                        {
+                            let _ = (
+                                &v.vfs,
+                                &extras,
+                                &vault_path,
+                                &kyber_path,
+                                &pin,
+                                &seed_pw,
+                                kem_size,
+                            );
+                            Err::<usize, String>(
+                                "deniable hybrid FIDO2 + ML-KEM enroll requires the \
+                                 hardware build feature"
+                                    .into(),
+                            )
+                        }
+                    } else {
+                        #[cfg(feature = "hardware")]
+                        {
+                            ops::enroll_hybrid_pq_fido2(
+                                &mut v.vfs,
+                                &vault_path,
+                                &kyber_path,
+                                &pin,
+                                &slot_pw_empty,
+                                &seed_pw,
+                                kem_size,
+                            )
+                        }
+                        #[cfg(not(feature = "hardware"))]
+                        {
+                            let _ = (
+                                &v.vfs,
+                                &vault_path,
+                                &kyber_path,
+                                &pin,
+                                &slot_pw_empty,
+                                &seed_pw,
+                                kem_size,
+                            );
+                            Err::<usize, String>(
+                                "FIDO2 + ML-KEM enroll requires the hardware build feature".into(),
+                            )
+                        }
+                    };
+                    let _ = tx.send((v, r));
+                });
+                self.pending = Some(Pending::EnrollHybridPqFido2 { rx });
+            }
+        } else if close_hpf {
+            self.add_hybrid_pq_fido2_modal = None;
         }
 
         // mkdir modal
