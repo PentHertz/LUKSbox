@@ -7,10 +7,10 @@
 //! a LUKSbox-flavoured byte-oriented API. Two parameter sets are
 //! supported, both NIST-standardized in FIPS 203 (August 2024):
 //!
-//! - **ML-KEM-768**, security category 3 (≈ AES-192 strength). The
+//! - **ML-KEM-768**, security category 3 (~ AES-192 strength). The
 //!   default for our hybrid keyslots; matches ANSSI's "Renforcé" /
 //!   NIST's recommended baseline.
-//! - **ML-KEM-1024**, security category 5 (≈ AES-256 strength). The
+//! - **ML-KEM-1024**, security category 5 (~ AES-256 strength). The
 //!   high-margin tier for ANSSI "Élevé" / long-life classified data /
 //!   anyone who wants the cryptographic-overkill option.
 //!
@@ -56,9 +56,9 @@ pub enum Error {
 /// Parameter-set selector. Mirrors FIPS 203 §7 parameter-set table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PqParams {
-    /// ML-KEM-768. NIST security category 3 (≈ AES-192). Default.
+    /// ML-KEM-768. NIST security category 3 (~ AES-192). Default.
     Ml768,
-    /// ML-KEM-1024. NIST security category 5 (≈ AES-256). High-tier.
+    /// ML-KEM-1024. NIST security category 5 (~ AES-256). High-tier.
     Ml1024,
 }
 

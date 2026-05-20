@@ -68,9 +68,9 @@ Audit of every FUSE crate on crates.io as of 2026-05-03:
 
 | Crate | Latest | macOS strategy | FUSE-T support |
 |---|---|---|---|
-| [`fuser`](https://crates.io/crates/fuser) | 0.17.0 | Hard-coded `pkg-config fuse` (libfuse2) + macFUSE link | ❌ |
-| [`fuse3`](https://crates.io/crates/fuse3) | 0.9.0 | `find_macfuse_mount()` checks `/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse` | ❌ |
-| [`rfuse3`](https://crates.io/crates/rfuse3) | 0.0.7 (fork of fuse3) | Same hard-coded macFUSE path | ❌ |
+| [`fuser`](https://crates.io/crates/fuser) | 0.17.0 | Hard-coded `pkg-config fuse` (libfuse2) + macFUSE link | |
+| [`fuse3`](https://crates.io/crates/fuse3) | 0.9.0 | `find_macfuse_mount()` checks `/Library/Filesystems/macfuse.fs/Contents/Resources/mount_macfuse` | |
+| [`rfuse3`](https://crates.io/crates/rfuse3) | 0.0.7 (fork of fuse3) | Same hard-coded macFUSE path | |
 
 The macFUSE-only assumption appears to be load-bearing across the
 whole Rust FUSE ecosystem. FUSE-T's first stable release was 2022,
@@ -113,12 +113,12 @@ mount helper. It's why no Rust crate has it yet.
 
 ### Option A: Stick with macFUSE (current state)
 
-- ✅ Ships today.
-- ✅ Same UX as every other FUSE-on-macOS app the user has likely
+- Ships today.
+- Same UX as every other FUSE-on-macOS app the user has likely
   used (sshfs, rclone mount, ntfs-3g).
-- ❌ Kext approval friction on first install. Apple Silicon also
+- Kext approval friction on first install. Apple Silicon also
   needs Recovery Mode -> Reduced Security.
-- ❌ Long-term risk: Apple has been deprecating kernel extensions
+- Long-term risk: Apple has been deprecating kernel extensions
   since macOS Big Sur (11.0). They haven't broken kext-based
   filesystems yet, but they've signaled intent.
 
@@ -159,9 +159,9 @@ Add FUSE-T detection + mount-protocol support to the existing
 
 ### Option D: Just ship `mount` only on Linux + Windows, no mount on macOS
 
-- ✅ Zero work; instant.
-- ❌ Drops a feature LUKSbox advertises.
-- ❌ macOS users get the worst experience.
+- Zero work; instant.
+- Drops a feature LUKSbox advertises.
+- macOS users get the worst experience.
 
 **Not a serious option** unless mount turns out to be barely used.
 

@@ -434,6 +434,25 @@ pub struct Keyslot {
     pub fido2_hmac_salt: [u8; 32],
 }
 
+// Custom Drop so the heap-allocated cred_id buffer is wiped before
+// the allocator reuses its pages. cred_id is a public CTAP2 handle
+// (not cryptographically secret), but the rest of the codebase
+// uniformly zeroizes its heap-resident byte buffers and not doing it
+// here is a defense-in-depth inconsistency flagged in a security
+// review. `Vec::zeroize` from the zeroize crate writes zeros across
+// the full capacity (not just the active length) and then truncates,
+// so any over-allocation from `to_vec()` / `combined` builders is
+// cleared too. The fixed-size [u8; N] arrays on this struct live in
+// the struct's own storage; they are zeroed by Rust's automatic drop
+// glue when the Keyslot is destructured (no allocator handoff), so
+// no extra wiping is needed for those.
+impl Drop for Keyslot {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.fido2_cred_id.zeroize();
+    }
+}
+
 impl Keyslot {
     pub fn empty() -> Self {
         Self {
@@ -751,7 +770,7 @@ impl Keyslot {
     /// already obtained `tpm_unsealed` (via the slot's blob through
     /// `Tpm2Sealer::unseal`) AND `hmac_secret` (via a FIDO2 touch
     /// using the slot's cred_id + hmac_salt). Either factor wrong
-    /// → AEAD failure.
+    /// -> AEAD failure.
     pub fn unlock_tpm2_fido2(
         &self,
         suite: CipherSuite,

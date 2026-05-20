@@ -19,7 +19,7 @@ pub type SubKey = Zeroizing<[u8; KEY_LEN]>;
 /// Master Volume Key. Encrypts file content (indirectly, via per-file subkeys).
 /// Stored only as wrapped ciphertext in keyslots; never persisted in cleartext.
 ///
-/// Backed by `memfd_secret(2)` on Linux ≥ 5.14 when available, pages are
+/// Backed by `memfd_secret(2)` on Linux >= 5.14 when available, pages are
 /// unmappable in any other process and excluded from coredumps and
 /// hibernate images. Falls back to a `Box<[u8; 32]>` with `Zeroize` on drop
 /// when `memfd_secret` isn't available.
@@ -43,6 +43,16 @@ impl MasterVolumeKey {
         Self(SecretBox::from_bytes(bytes))
     }
 
+    /// Round 12 fix R12-17: construct an MVK from a `Zeroizing`-wrapped
+    /// byte array without exposing the bytes as a `Copy` parameter on
+    /// the caller's stack. Production callers that hold MVK material
+    /// in `Zeroizing<[u8;KEY_LEN]>` should prefer this over `from_bytes`
+    /// to avoid the by-value-Copy stack-residence pattern the audit
+    /// catalogued under R12-17.
+    pub fn from_zeroizing(bytes: &Zeroizing<[u8; KEY_LEN]>) -> Self {
+        Self(SecretBox::from_bytes(**bytes))
+    }
+
     pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
         self.0.as_array()
     }
@@ -60,7 +70,7 @@ impl MasterVolumeKey {
         let hk = Hkdf::<Sha256>::new(Some(salt), self.0.as_array());
         let mut out = Zeroizing::new([0u8; KEY_LEN]);
         hk.expand(info, out.as_mut_slice())
-            .expect("32 ≤ 255 * HashLen");
+            .expect("32 <= 255 * HashLen");
         out
     }
 }
@@ -86,6 +96,11 @@ pub struct KeyEncryptionKey([u8; KEY_LEN]);
 impl KeyEncryptionKey {
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
         Self(bytes)
+    }
+    /// Round 12 fix R12-17: same rationale as
+    /// `MasterVolumeKey::from_zeroizing`.
+    pub fn from_zeroizing(bytes: &Zeroizing<[u8; KEY_LEN]>) -> Self {
+        Self(**bytes)
     }
     pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
         &self.0

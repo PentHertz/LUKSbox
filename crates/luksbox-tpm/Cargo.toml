@@ -43,7 +43,7 @@ rand_core = { workspace = true }
 # Target-gated: tss-esapi 7.x's -sys crate hard-panics in build.rs
 # on every non-Linux target, so we restrict the dep to Linux. The
 # `hardware` cargo feature still references it via `dep:tss-esapi`,
-# but on non-Linux that dep simply doesn't exist for the target —
+# but on non-Linux that dep simply doesn't exist for the target --
 # the feature flag stays settable (no error from parents that turn
 # it on unconditionally) but the optional dep is not pulled.
 [target.'cfg(target_os = "linux")'.dependencies]

@@ -136,6 +136,15 @@ impl Errno {
     pub const EIO: Errno = Errno(libc::EIO);
     pub const EACCES: Errno = Errno(libc::EACCES);
     pub const ENOSYS: Errno = Errno(libc::ENOSYS);
+    /// "No space left on device". `luksbox-mount` returns this from
+    /// write/truncate when the v2 metadata budget would be exceeded
+    /// by the in-flight write (`Vfs::Error::MetadataBudgetExhausted`).
+    /// userspace sees the right errno mid-copy instead of a silent
+    /// "vault is corrupt next time you open it".
+    pub const ENOSPC: Errno = Errno(libc::ENOSPC);
+    /// "File too large". Returned when a write/truncate would push a
+    /// single file past `luksbox_vfs::MAX_FILE_SIZE`.
+    pub const EFBIG: Errno = Errno(libc::EFBIG);
 
     pub const fn from_raw(e: libc::c_int) -> Errno {
         Errno(e)

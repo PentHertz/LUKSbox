@@ -55,12 +55,100 @@
 //! accidentally cross-pollinated sidecars between vaults.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use luksbox_core::file_util::atomic_secure_write;
 use luksbox_pq::PqParams;
 
 use crate::Error;
+
+/// Round 12 fix R12-06 / Round 13 fix R13-06: read the hybrid sidecar
+/// with `O_NOFOLLOW` so an attacker who swapped the `.hybrid` file for
+/// a symlink (e.g. to `/etc/passwd` or to a FIFO that stalls forever)
+/// is refused at the format layer. Mirrors `anchor::open_anchor_for_read`.
+///
+/// R13-06: also size-bound the read. The hybrid sidecar is at most
+/// `HEADER_LEN_V3 + MAX_ENTRIES * MAX_ENTRY_LEN` bytes (about 23 KiB).
+/// Without an upper bound a hostile sidecar (or a device file) could
+/// cause `read_to_end` to allocate gigabytes before the length-check
+/// rejects it. We `stat` first, refuse non-regular files, refuse files
+/// larger than the cap, then `read_exact`.
+///
+/// Windows: open with `FILE_FLAG_OPEN_REPARSE_POINT` and refuse the
+/// file if `FILE_ATTRIBUTE_REPARSE_POINT` is set (mirrors
+/// `luksbox-core::file_util::secure_create_or_truncate`). Closes the
+/// R12-15 follow-up that left Windows hybrid sidecars exposed to
+/// reparse-point swaps under `%LOCALAPPDATA%`.
+fn read_sidecar_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+    // Upper bound: v3 header + 8 entries each at the larger ML-KEM-1024
+    // shape (1 + 1 + 1568 + 1568 = 3138 B). Cap rounded up to 32 KiB
+    // for headroom against future entry-shape growth.
+    const MAX_SIDECAR_BYTES: u64 = 32 * 1024;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let meta = f.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other(format!(
+                "hybrid sidecar {}: not a regular file (refusing FIFO/device/dir)",
+                path.display()
+            )));
+        }
+        if meta.len() > MAX_SIDECAR_BYTES {
+            return Err(std::io::Error::other(format!(
+                "hybrid sidecar {}: {} bytes exceeds max {} (DoS preflight)",
+                path.display(),
+                meta.len(),
+                MAX_SIDECAR_BYTES
+            )));
+        }
+        let mut buf = vec![0u8; meta.len() as usize];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000)
+            .open(path)?;
+        let meta = f.metadata()?;
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+        if meta.file_attributes() & 0x0000_0400 != 0 {
+            return Err(std::io::Error::other(format!(
+                "hybrid sidecar {}: is a reparse point (symlink/junction); refused",
+                path.display()
+            )));
+        }
+        if meta.len() > MAX_SIDECAR_BYTES {
+            return Err(std::io::Error::other(format!(
+                "hybrid sidecar {}: {} bytes exceeds max {} (DoS preflight)",
+                path.display(),
+                meta.len(),
+                MAX_SIDECAR_BYTES
+            )));
+        }
+        let mut buf = vec![0u8; meta.len() as usize];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let bytes = fs::read(path)?;
+        if bytes.len() as u64 > MAX_SIDECAR_BYTES {
+            return Err(std::io::Error::other("hybrid sidecar exceeds size cap"));
+        }
+        Ok(bytes)
+    }
+}
 
 const MAGIC: [u8; 8] = *b"lbxhybr1";
 const VERSION_V1: u8 = 0x01;
@@ -162,7 +250,7 @@ pub fn write_with_binding(
 /// Existing call sites that don't yet plumb the vault salt should use
 /// `read` instead; both functions share the same parser.
 pub fn read_bundle(path: &Path) -> Result<SidecarBundle, Error> {
-    let bytes = fs::read(path)?;
+    let bytes = read_sidecar_bytes(path)?;
     parse_bundle(&bytes)
 }
 
@@ -215,6 +303,65 @@ pub fn parse_bundle(bytes: &[u8]) -> Result<SidecarBundle, Error> {
 /// Returns `Ok(())` if the sidecar is v3 and the binding matches, OR
 /// if the sidecar is v1/v2 (no binding to check, older format).
 /// Returns `Err` only on a v3 sidecar with a mismatching binding.
+/// Convenience wrapper for unlock-time call sites: peek at the vault
+/// header to recover `header_salt`, read the sidecar bundle, and
+/// verify the v3 binding matches. Returns just the entries on
+/// success (the bundle is consumed). v1/v2 sidecars (no binding to
+/// check) pass through unchanged.
+///
+/// Use this instead of `read()` at every site where a sidecar load
+/// immediately precedes a `Container::open` against the same vault.
+/// Catches cross-vault sidecar swaps at sidecar load time, before
+/// the wrong decap output flows into ML-KEM and the wrong combined
+/// KEK reaches AEAD verification (which would have caught it
+/// anyway, but later and with a worse error message).
+pub fn read_for_vault(
+    sidecar_path: &Path,
+    vault_path: &Path,
+    header_path: Option<&Path>,
+) -> Result<Vec<HybridEntry>, Error> {
+    let bundle = read_bundle(sidecar_path)?;
+    // v1/v2 sidecars: no binding to verify; trust falls back to the
+    // downstream AEAD tag the way it always has on older vaults.
+    if bundle.binding.is_none() {
+        return Ok(bundle.entries);
+    }
+    let salt = peek_vault_header_salt(vault_path, header_path)?;
+    verify_binding(&bundle, &salt)?;
+    Ok(bundle.entries)
+}
+
+/// Read just the 32-byte `header_salt` from a vault file (or its
+/// detached-header sidecar). Used by `read_for_vault` to load the
+/// vault binding without a full `Container::open` (which would
+/// need credentials we don't have yet at this point).
+fn peek_vault_header_salt(
+    vault_path: &Path,
+    header_path: Option<&Path>,
+) -> Result<[u8; BINDING_LEN], Error> {
+    use luksbox_core::HEADER_SIZE;
+    let src = header_path.unwrap_or(vault_path);
+    // Round 12 fix R12-06 (continued): pre-binding header peek also
+    // refuses symlinks via `O_NOFOLLOW`. Without this an attacker
+    // who controls the path between the GUI's preflight and
+    // `read_for_vault`'s arrival could divert the salt read.
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(src)?
+    };
+    #[cfg(not(unix))]
+    let mut f = fs::File::open(src)?;
+    let mut buf = [0u8; HEADER_SIZE];
+    f.read_exact(&mut buf)?;
+    let header = luksbox_core::Header::from_bytes(&buf)
+        .map_err(|e| Error::Io(std::io::Error::other(format!("peek header: {e}"))))?;
+    Ok(header.header_salt)
+}
+
 pub fn verify_binding(
     bundle: &SidecarBundle,
     expected_salt: &[u8; BINDING_LEN],
@@ -266,6 +413,13 @@ fn validate_entries(entries: &[HybridEntry]) -> Result<(), Error> {
             ))));
         }
     }
+    // Reject duplicate slot_idx BEFORE writing so an enroll wrapper
+    // that forgot to dedupe stale entries fails fast at write time
+    // instead of producing a sidecar that subsequent reads will
+    // reject with "duplicate entry for slot N". The read path also
+    // calls `reject_duplicate_slot_idx` after parse for defense
+    // against hostile / corrupted on-disk files.
+    reject_duplicate_slot_idx(entries)?;
     Ok(())
 }
 
@@ -555,21 +709,72 @@ mod tests {
     /// first; garbage pq_shared still causes AEAD reject (no key
     /// leak) but the ambiguity is itself a smell.
     #[test]
-    fn duplicate_slot_idx_rejected() {
-        let path = tmp("dup-slot");
+    fn duplicate_slot_idx_rejected_at_write() {
+        // The writer rejects duplicates so an enroll wrapper that
+        // forgot to dedupe stale entries fails fast at write time
+        // instead of producing a sidecar that subsequent reads will
+        // refuse with the same error. This was the user-visible
+        // bug behind "io: hybrid sidecar: duplicate entry for slot
+        // N (rejected to eliminate find()-returns-first ambiguity;
+        // rebuild the sidecar from the wizard)" -- the duplicate
+        // got onto disk silently and only surfaced at the next
+        // enroll's read step.
+        let path = tmp("dup-slot-write");
         let entries = vec![fake_768(3, 0x11, 0x22), fake_768(3, 0xaa, 0xbb)];
-        write(&path, &entries).unwrap();
-        let count_or_err = match read(&path) {
-            Ok(v) => Err(v.len()),
-            Err(e) => Ok(e),
-        };
-        let err = count_or_err.unwrap_or_else(|n| {
-            panic!("two entries with slot_idx=3 must be rejected at parse, got {n} entries")
-        });
-        let msg = format!("{err:?}");
+        let r = write(&path, &entries);
+        assert!(
+            r.is_err(),
+            "two entries with slot_idx=3 must be rejected at write, got Ok"
+        );
+        let msg = format!("{:?}", r.unwrap_err());
         assert!(
             msg.contains("duplicate"),
             "error must mention 'duplicate', got: {msg}"
+        );
+        // The temp file must NOT have been created (atomic_secure_write
+        // only renames on success).
+        assert!(!path.exists(), "failed write must not leave a partial file");
+    }
+
+    #[test]
+    fn duplicate_slot_idx_rejected_at_read_hostile_bytes() {
+        // Hostile / corrupted on-disk sidecar: an attacker (or a
+        // pre-fix LUKSbox writer) could have produced a file with
+        // duplicate slot_idx entries. The reader's
+        // reject_duplicate_slot_idx defense MUST still catch that
+        // even though the writer now refuses to produce one.
+        use crate::hybrid_sidecar::{HEADER_LEN, MAGIC, VERSION_V2};
+
+        let path = tmp("dup-slot-read");
+        // Build a v2 sidecar by hand with two entries both at
+        // slot_idx 3. Magic + version + count + reserved =
+        // HEADER_LEN bytes, then two (slot_idx | level | pk | ct)
+        // entries.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&MAGIC);
+        bytes.push(VERSION_V2);
+        bytes.push(2u8); // count
+        bytes.extend_from_slice(&[0u8; HEADER_LEN - MAGIC.len() - 2]);
+        for _ in 0..2 {
+            bytes.push(3u8); // slot_idx (DUPLICATE)
+            bytes.push(luksbox_pq::PqParams::Ml768.level_byte());
+            bytes.extend_from_slice(&vec![0x11u8; 1184]); // pubkey
+            bytes.extend_from_slice(&vec![0x22u8; 1088]); // ciphertext
+        }
+        fs::write(&path, &bytes).unwrap();
+
+        let err = match read(&path) {
+            Ok(v) => panic!(
+                "duplicate slot_idx in hostile sidecar must be rejected at read, \
+                 got {} entries",
+                v.len()
+            ),
+            Err(e) => e,
+        };
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("duplicate"),
+            "read-time error must mention 'duplicate', got: {msg}"
         );
         let _ = fs::remove_file(&path);
     }

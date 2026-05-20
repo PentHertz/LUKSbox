@@ -105,6 +105,44 @@ else
         "${OUT_ICNS}"
 fi
 
+# ---- Windows Burn bundle sidebar PNG -------------------------------------
+#
+# LUKSboxSetup.exe (the Burn bundle) uses WiX's
+# `hyperlinkSidebarLicense` theme. The theme XML
+# (HyperlinkSidebarLicenseTheme.xml in the WiX v4 source) reserves
+# EXACTLY a 151x324 px portrait strip for `LogoSideFile`:
+#
+#   <Image Name="LogoSide" X="0" Y="0" Width="151" Height="324" .../>
+#
+# Any other dimension forces WiX to scale the source image to fit,
+# and even small mismatches show as a visibly stretched logo
+# (165x315 was close but produced "a bit stretched" -- horizontally
+# squished by ~10%, vertically stretched by ~3%). Matching 151x324
+# exactly avoids the scaling pass entirely.
+#
+# Inside that canvas we render the square icon at 110x110, leaving
+# ~20 px horizontal padding and ~107 px vertical padding, centered.
+# A smaller inner icon also keeps the result undeformed even if a
+# future WiX theme tweaks the reserved slot by a few pixels: any
+# tiny re-scale stays within the white padding rather than touching
+# the icon itself.
+#
+# White (not transparent) because the WiX theme draws the image on
+# top of its own background panel and PNG alpha composites
+# inconsistently across the GDI+ paths Burn uses on Win10 / Win11.
+# `-alpha remove -alpha off` flattens any source alpha onto white
+# so the output is opaque RGB.
+OUT_SIDE_PNG="${ASSETS_DIR}/icon-bundle-side.png"
+log "writing ${OUT_SIDE_PNG} (Burn sidebar, 151x324 portrait)"
+"${IM[@]}" "${SRC_PNG}" \
+    -resize 110x110 \
+    -background white \
+    -gravity center \
+    -extent 151x324 \
+    -alpha remove \
+    -alpha off \
+    "${OUT_SIDE_PNG}"
+
 # ---- Linux hicolor PNGs --------------------------------------------------
 #
 # GNOME / KDE / Xfce all read from $XDG_DATA_DIRS/icons/hicolor/<size>/apps/.
@@ -124,4 +162,5 @@ done
 log "done"
 log "  ico         : $(stat -c '%s bytes' "${OUT_ICO}" 2>/dev/null || stat -f '%z bytes' "${OUT_ICO}")"
 log "  icns        : $(stat -c '%s bytes' "${OUT_ICNS}" 2>/dev/null || stat -f '%z bytes' "${OUT_ICNS}")"
+log "  bundle-side : $(stat -c '%s bytes' "${OUT_SIDE_PNG}" 2>/dev/null || stat -f '%z bytes' "${OUT_SIDE_PNG}")"
 log "  linux pngs  : ${LINUX_DIR}/{16,24,32,48,64,128,256,512}x*.png"

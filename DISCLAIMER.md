@@ -45,7 +45,16 @@ protection requires:
 2. **At least one backup keyslot** in advance: a second FIDO2
    device, a backup passphrase printed on paper kept in a safe,
    anything that means losing one factor does not lose the vault.
-   See [Recovery](https://luksbox.penthertz.com/docs/operations/recovery/).
+   Note: the create flow no longer enrolls a backup passphrase
+   by default for FIDO2-direct and for 3-factor TPM combos
+   (Tpm2Fido2, HybridPqTpm2, HybridPqTpm2Fido2 and their 1024
+   variants). You must tick "Enable backup / recovery passphrase"
+   at create time, or add a backup slot afterwards via "Add slot".
+   Note: **deniable mode (v2) requires a passphrase for every
+   credential combo** as the slot envelope discovery factor. Lose
+   the passphrase or the secondary device (FIDO2 / TPM) and the
+   deniable vault is unrecoverable; v2 has no recovery path by
+   design. See [Recovery](https://luksbox.penthertz.com/docs/operations/recovery/).
 
 3. A **header backup** on separate media. Run
    `luksbox header-backup` after every `enroll` / `revoke` /

@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 # Apache-2.0 is the SPDX identifier; crates.io and `cargo publish`
 # recognise it directly. Each crate's Cargo.toml inherits this via

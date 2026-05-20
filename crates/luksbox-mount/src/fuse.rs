@@ -168,7 +168,7 @@ fn run_daemonized(fs: LuksboxFs, mountpoint: &Path, config: Config) -> std::io::
             // the mountpoint above) won't be visible here. Users can
             // verify by running `mount | grep luksbox` or by listing
             // the mountpoint.
-            eprintln!("✓ mounting {} (pid {n})", mountpoint.display());
+            eprintln!("mounting {} (pid {n})", mountpoint.display());
             eprintln!("  unmount: luksbox umount {}", mountpoint.display());
             std::process::exit(0);
         }
@@ -422,6 +422,15 @@ fn errno(e: &VfsError) -> Errno {
         VfsError::NotAFile => Errno::EISDIR,
         VfsError::NotEmpty => Errno::ENOTEMPTY,
         VfsError::InvalidPath(_) => Errno::EINVAL,
+        // Metadata budget exhausted: surface as ENOSPC so cp / dd /
+        // rsync abort with the right errno mid-copy. EIO would also
+        // be safe but ENOSPC matches the actual condition (the
+        // vault's fixed-size metadata region has filled up and can't
+        // hold any more chunk references) and triggers the
+        // "no space left on device" message users already know.
+        VfsError::MetadataBudgetExhausted => Errno::ENOSPC,
+        // File-size cap is "exceeds the maximum file size" -> EFBIG.
+        VfsError::FileSizeExceedsCap => Errno::EFBIG,
         _ => Errno::EIO,
     }
 }
@@ -564,7 +573,16 @@ impl Filesystem for LuksboxFs {
         _lock: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        let mut buf = vec![0u8; size as usize];
+        // Round 13 fix R13-08: the kernel passes `size` straight from the
+        // userspace caller's read() request and FUSE normally caps it at
+        // its `max_read` negotiated value, but a buggy or hostile module
+        // along the kernel path could in principle hand us a u32 close
+        // to 4 GiB. `vec![0u8; size as usize]` would then commit that
+        // much memory before we even reach the decrypt path. Bound it
+        // here as defence-in-depth.
+        const READ_SIZE_CAP: usize = 16 * 1024 * 1024; // 16 MiB
+        let size = (size as usize).min(READ_SIZE_CAP);
+        let mut buf = vec![0u8; size];
         let r = match self.vfs.lock() {
             Ok(mut v) => v.read(ino.0, offset, &mut buf),
             Err(_) => {

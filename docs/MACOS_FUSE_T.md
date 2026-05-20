@@ -71,35 +71,32 @@ When the LUKSbox GUI mounts a vault on a FUSE-T build, it does NOT
 call `luksbox_mount::mount` directly on a worker thread. Instead it
 spawns the bundled CLI binary as a child process:
 
-```
-GUI process                                Child process
------------                                -------------
-1. user clicks "Mount as volume"
-2. mvk = vfs.container().mvk_clone()
-3. drop vfs (release file lock)
-4. spawn child:
-     LUKSbox.app/Contents/MacOS/luksbox \
-       mount-fuse-t-helper \
-       <vault.lbx> [--header HDR] <mountpoint>
-5. write 32 bytes of mvk to child.stdin
-6. zeroize parent's mvk copy
-                                          1. read 32 bytes from stdin
-                                          2. mvk = MasterVolumeKey::from_bytes(bytes)
-                                          3. zeroize stdin buffer
-                                          4. Container::open_with_mvk(...)
-                                          5. Vfs::open(container)
-                                          6. luksbox_mount::mount(vfs, mp, false)
-                                             -> blocks in fuse_main_real
-7. poll child status via try_wait()
-   each frame
-8. user clicks "Unmount":
-     /sbin/umount <mountpoint>
-                                          7. fuse_main_real returns
-                                             (or libfuse-t aborts the
-                                              child - GUI doesn't care)
-                                          8. exit(N)
-9. try_wait() -> Some(status):
-     view = Welcome, toast based on status
+```mermaid
+sequenceDiagram
+    actor User
+    participant GUI as GUI process
+    participant Child as Child process<br/>(mount-fuse-t-helper)
+    participant Kernel
+
+    User->>GUI: clicks "Mount as volume"
+    Note over GUI: mvk = vfs.container().mvk_clone()<br/>drop vfs (release file lock)
+    GUI->>+Child: spawn LUKSbox.app/Contents/MacOS/luksbox<br/>mount-fuse-t-helper [--header HDR] vault mp
+    GUI->>Child: write 32 bytes of MVK to stdin
+    Note over GUI: zeroize parent's MVK copy
+    Note over Child: read 32 bytes from stdin<br/>mvk = MasterVolumeKey::from_bytes(bytes)<br/>zeroize stdin buffer
+    Child->>Kernel: Container::open_with_mvk(...)<br/>Vfs::open(container)
+    Child->>Kernel: luksbox_mount::mount(vfs, mp, false)<br/>(blocks in fuse_main_real)
+
+    loop every frame
+        GUI->>Child: try_wait() (non-blocking poll)
+    end
+
+    User->>GUI: clicks "Unmount"
+    GUI->>Kernel: /sbin/umount mountpoint
+    Kernel-->>Child: triggers unmount; fuse_main_real returns<br/>(or libfuse-t aborts the child -<br/>GUI doesn't care)
+    Child-->>-Kernel: exit(N)
+    Kernel-->>GUI: try_wait() returns Some(status)
+    Note over GUI: view = Welcome,<br/>toast based on status
 ```
 
 **Why this is necessary**: libfuse-t.dylib's mount-teardown path
@@ -158,7 +155,7 @@ When enabled, the helper child process can only:
 - Read/write the vault file's parent directory and the
   mountpoint's parent directory.
 - Bind/connect on `127.0.0.1` only (FUSE-T's NFS loopback). NO
-  internet egress — if libfuse-t tried to phone home, this
+  internet egress -- if libfuse-t tried to phone home, this
   blocks it.
 - Exec FUSE-T's helper binaries + `/sbin/mount{,_nfs,_nfs4}` /
   `/sbin/umount`. NO arbitrary shell execution.

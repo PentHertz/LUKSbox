@@ -12,6 +12,7 @@
 
 pub mod anchor;
 pub mod container;
+pub mod deniable_header;
 pub mod error;
 pub mod hybrid_sidecar;
 pub mod metadata;

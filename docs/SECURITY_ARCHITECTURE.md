@@ -197,7 +197,7 @@ Current limitation:
 - CLI FIDO2 unlock now passes `--header` through to detached-header opens.
 - Atomic sidecar writes and inline MVK rotation now fsync the parent directory
   after rename on both Unix (via `sync_all` on a directory handle) and Windows
-  (via `FILE_FLAG_BACKUP_SEMANTICS` + `sync_all` → `FlushFileBuffers`).
+  (via `FILE_FLAG_BACKUP_SEMANTICS` + `sync_all` -> `FlushFileBuffers`).
 - VFS chunk offsets and MVK rotation chunk offsets use checked arithmetic.
 - Authenticated metadata trees are validated for root/parent/child integrity,
   duplicate chunks, free-list sanity, generation sanity, and chunk offset bounds.

@@ -36,6 +36,10 @@ zxcvbn = "3"
 # GUI crate; reused here.
 serde_json = "1"
 serde = { workspace = true }
+# Used by deniable-mode wizard + CLI subcommands to render the
+# FIDO2 cred_id + hmac_salt as hex (recovery card) and to parse
+# the same hex strings back at unlock time.
+hex = "0.4"
 
 # Used by the FUSE-T mount-helper subprocess to set SIGPIPE = SIG_IGN
 # at startup so libfuse-t's internal pipe writes during teardown don't
@@ -107,7 +111,7 @@ path = "examples/passphrase_crack.rs"
 
 [package.metadata.deb]
 name = "luksbox"
-maintainer = "Penthertz <sebastien.dudek@penthertz.com>"
+maintainer = "Penthertz <security@penthertz.com>"
 copyright = "2026, Penthertz <https://penthertz.com>"
 # No `license-file` on purpose. The workspace SPDX id
 # `Apache-2.0` (in [workspace.package].license) lets cargo-deb 3.x
@@ -138,12 +142,31 @@ priority = "optional"
 # transitively by libfido2 but listed explicitly so apt can satisfy
 # it before libfido2's postinst.
 depends = "$auto, libfido2-1, libfuse3-3"
-recommends = "fuse3"
+# `tpm-udev` is the package that ships `/etc/udev/rules.d/60-tpm.rules`
+# and creates the `tss` system group on Debian / Ubuntu. Without it,
+# /dev/tpm0 and /dev/tpmrm0 are root-only and `luksbox enroll --tpm2`
+# fails with EACCES. We pull it in via Recommends (not Depends) so
+# users without a TPM aren't forced to install it and so users on
+# distros that don't ship the package (e.g. some derivatives) can
+# still install luksbox.
+#
+# `tpm2-tools` provides the `tpm2_*` CLI binaries (tpm2_getcap,
+# tpm2_pcrread, etc.) which are useful for debugging TPM availability
+# and for one-off operations outside luksbox. Not load-bearing for
+# luksbox itself (we link against libtss2-* directly via luksbox-tpm),
+# but a strict superset of what a TPM-using luksbox user typically
+# wants on the host.
+#
+# After install, the user MUST `sudo usermod -aG tss $USER` and log
+# back in for the new group to take effect. We do NOT do this
+# automatically (Debian convention: no silent privileged-group
+# membership changes in a postinst).
+recommends = "fuse3, tpm-udev, tpm2-tools"
 assets = [
     # Binaries. The literal `target/release/` prefix is a cargo-deb
     # sentinel: it auto-rewrites to `target/<triple>/<profile>/<bin>`
     # at packaging time (here `target/<triple>/release-hardened/`).
-    # Don't expand it manually — the literal expanded path is NOT
+    # Don't expand it manually -- the literal expanded path is NOT
     # detected as a Cargo build artifact and the asset lookup fails.
     ["target/release/luksbox",     "usr/bin/luksbox",     "755"],
     ["target/release/luksbox-gui", "usr/bin/luksbox-gui", "755"],
@@ -188,13 +211,40 @@ url = "https://github.com/penthertz/LUKSbox"
 # (no-packager-tag). "Applications/System" is the closest standard
 # Fedora group for system-utility CLIs / file-system managers.
 group = "Applications/System"
-packager = "Penthertz <sebastien.dudek@penthertz.com>"
+packager = "Penthertz <security@penthertz.com>"
 vendor = "Penthertz"
 # No `requires` line. cargo-generate-rpm's default `--auto-req auto`
 # scans the ELF binaries for DT_NEEDED entries and emits the
 # distro-correct shared-library dependencies (libfido2.so.1,
 # libfuse3.so.3, etc.) automatically. Listing them by package name
 # here trips rpmlint's `explicit-lib-dependency` rule.
+#
+# `recommends` mirrors the .deb's Recommends: tpm2-tss is the package
+# that ships /usr/lib/udev/rules.d/60-tpm-udev.rules and creates the
+# `tss` system group on Fedora / RHEL / openSUSE; without it the
+# /dev/tpm* devices stay root-only and `luksbox enroll --tpm2` fails
+# with EACCES. The auto-req above only pulls in tpm2-tss-libs (just
+# the .so), not the higher-level tpm2-tss that owns the udev rules.
+# `tpm2-tools` provides the tpm2_* CLI binaries for debugging
+# (tpm2_getcap, tpm2_pcrread, etc.) - same rationale as the .deb.
+# Both are Recommends (not Requires) so users without a TPM aren't
+# forced to install them, and so the RPM still installs on stripped-
+# down systems where these packages aren't available.
+#
+# Post-install the user MUST `sudo usermod -aG tss $USER` and log
+# back in - Fedora/RHEL convention is the same as Debian's, no
+# silent privileged-group additions from a scriptlet.
+#
+# cargo-generate-rpm 0.16+ deserialises `recommends` (and the other
+# weak-dep fields: `requires`, `suggests`, `enhances`, `supplements`)
+# as a TOML *table* mapping `package-name -> version-constraint`,
+# NOT as a comma-separated string and NOT as a string array. Passing
+# either of the latter triggers the misleading
+#   Field package.metadata.generate-rpm.recommends must be string or integer
+# error - the "string or integer" refers to the version-constraint
+# *value* inside the expected map, not the field itself. `"*"` means
+# "no version constraint" (any version satisfies).
+recommends = { tpm2-tss = "*", tpm2-tools = "*" }
 assets = [
     # Same sentinel convention as cargo-deb above: cargo-generate-rpm
     # rewrites `target/release/<bin>` to the real `target/<triple>/<profile>/<bin>`
@@ -225,6 +275,6 @@ assets = [
 # of these tables and writes them into the CHANGELOG_* RPM tags.
 # Date format is RPM's "%a %b %d %Y" (e.g. "Wed May 06 2026").
 [[package.metadata.generate-rpm.changelog]]
-author = "Penthertz <sebastien.dudek@penthertz.com>"
+author = "Penthertz <security@penthertz.com>"
 time = "Wed May 06 2026"
 text = "- 0.1.0-1: initial public release."

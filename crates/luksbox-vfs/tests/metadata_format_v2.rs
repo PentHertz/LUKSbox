@@ -101,7 +101,7 @@ fn postcard_decoder_rejects_oversized_payload() {
     //
     // postcard varint encoding for usize is leb128: each byte
     // contributes 7 bits with high bit = continuation. To encode
-    // 5 * 1024^3 ≈ 5.4e9, we need about 5 bytes. We just dump 10 bytes of
+    // 5 * 1024^3 ~ 5.4e9, we need about 5 bytes. We just dump 10 bytes of
     // 0xff which decodes to a very large length the decoder must
     // refuse to allocate against.
     let hostile = vec![0xffu8; 10];

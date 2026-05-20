@@ -18,8 +18,7 @@
 // Run with: cargo bench --bench dudect_hmac_verify -p luksbox-core
 
 use luksbox_core::{
-    AAD_VERSION_V1, Argon2idParams, CipherSuite, HEADER_SIZE, Header, KdfId, Keyslot,
-    MasterVolumeKey,
+    Argon2idParams, CipherSuite, HEADER_SIZE, Header, KdfId, Keyslot, MasterVolumeKey,
 };
 use luksbox_ct_bench::rand::prelude::*;
 use luksbox_ct_bench::{BenchRng, Class, CtRunner, ctbench_main};

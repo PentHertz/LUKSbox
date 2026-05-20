@@ -20,8 +20,7 @@ The companion documents are:
 
 **Please do not open a public GitHub issue for security-relevant findings.**
 
-Send a report to **`security@penthertz.com`**, or directly to the maintainer at
-**`sebastien.dudek@penthertz.com`**.
+Send a report to **`security@penthertz.com`**.
 
 If your finding contains exploit details, sample vault files, or anything else
 you'd rather not send in cleartext, request our PGP key first by asking on the
@@ -225,6 +224,53 @@ how strong the cryptography is.
       an untrusted source silently installs the attacker's keyslot
       table.
 
+- **Filesystem snapshots taken while the vault is unlocked.** APFS
+  local snapshots, Time Machine, btrfs / ZFS snapshots, LVM snapshots,
+  and equivalent backup mechanisms capture the disk as it is at the
+  moment they run. If a snapshot is taken *while a vault is mounted*,
+  the underlying `.lbx` blocks captured are still encrypted (FUSE does
+  not materialize plaintext on disk), but a snapshot of the process's
+  RAM / swap (e.g. `vmss` images, hibernate files, full-VM snapshots)
+  captures the MVK in cleartext. Mitigations: disable hibernation on
+  hosts holding live vaults; verify swap is encrypted (default on
+  macOS 10.7+, manual on Linux); on macOS prefer FileVault so swap
+  files inherit volume encryption.
+
+- **Kernel-resident attacker.** A privileged module / rootkit / kernel
+  exploit can read userspace process memory, intercept FUSE traffic
+  before decryption, and substitute on-disk bytes between read and
+  AEAD-verify. LUKSbox is userspace; the kernel is in its trusted
+  computing base. Same statement applies to hypervisors on virtualized
+  hosts.
+
+- **Hardware tampering beyond the FIDO2 device.** Cold-boot RAM
+  attacks (extracting an unlocked MVK from de-energizing DRAM within
+  seconds of power-off), JTAG / debug-port access, DMA over
+  Thunderbolt with IOMMU disabled, supply-chain-implanted SPI flash.
+  None of these are mitigated by software. Mitigations are physical:
+  lock screens with zeroize-on-lock (not currently implemented; see
+  6.x Tier 1), full-memory encryption (Intel TME / AMD SME, where
+  available), IOMMU enforcement.
+
+- **Evil-maid attack on the LUKSbox binary itself.** An attacker with
+  brief physical access to an unattended unlocked machine can replace
+  `luksbox` / `luksbox-gui` with a trojan that exfiltrates the next
+  passphrase typed into it. The defense is full-disk encryption with
+  pre-boot authentication (FileVault on macOS, BitLocker on Windows,
+  LUKS on Linux) so the binary cannot be modified while the machine
+  is off. LUKSbox does not (and cannot) verify its own binary at
+  runtime against a tamper-resistant root of trust.
+
+- **Supply-chain attack on the LUKSbox build pipeline or dependencies.**
+  A malicious Cargo dep (RustSec-disclosed or zero-day), a compromised
+  crates.io account, or a tampered release artifact would compromise
+  the resulting binary. We pin via `Cargo.lock`, run `cargo audit` in
+  CI, and have begun a SLSA-track release pipeline (signed `.dmg`,
+  WiX-signed `.msi`, GitHub-attested artifacts), but a determined
+  supply-chain attacker is out of scope for source-level review. Users
+  at high risk should build from source against a verified Cargo.lock,
+  on a system they fully control.
+
 ---
 
 ## 4. Cryptographic primitives
@@ -265,14 +311,18 @@ vaults default to SIV (cipher_suite=0x0003).
 |---|---|---|
 | Unit tests | every commit | per-module crypto round-trips, parser correctness, `[u8]` round-trips |
 | Functional tests | every commit | end-to-end CLI workflows via subprocess |
-| Security-regression tests | every commit | 65+ tests pinning each known-fix invariant, Argon2 DoS guard, rogue authenticator, slot AAD coverage, generation rollback, lock contention, symlink swap, AES-NI warning, bincode OOM, and more |
-| Fuzz smoke (libFuzzer) | every PR | 5 min per target x 9 targets, cheap parser bugs |
+| Security-regression tests | every commit | 65+ tests pinning each known-fix invariant, Argon2 DoS guard, rogue authenticator, slot AAD coverage, generation rollback, lock contention, symlink swap, AES-NI warning, bincode OOM, and more. Round 12 added `crates/luksbox-format/tests/round12_findings.rs` with 2 always-run smoke tests plus 5 `#[ignore]`-gated regression placeholders (one per open HIGH finding) |
+| Fuzz smoke (libFuzzer) | every PR | 5 min per target x 17 targets including the Round 12 `deniable_envelope_multi_slot` target (multi-slot deniable envelope opacity) |
 | FIPS-203 conformance | every commit | 17 tests against published test vectors |
 | Hardware FIDO2 smoke | manual, before each release | wrap, direct, hybrid-pq-fido2, 4 flows x 6 touches against real authenticator |
-| Long-running fuzz | not yet automated | recommended pre-release: 24h x 9 targets |
+| Long-running fuzz | nightly via `.github/workflows/fuzz-nightly.yml` | 30 min per target x 17 targets including the Round 12 addition |
+| Constant-time bench (dudect) | on demand via `cargo bench` | 4 production benches (`dudect_hmac_verify`, `dudect_aead_open`, `dudect_slot_unlock`, Round 12's `dudect_deniable_envelope`) + 1 known-leaky control |
 
 Total automated test count at last run: **183 passing, 0 failing, 0 ignored**.
-30M+ fuzz iterations across all targets to date.
+30M+ fuzz iterations across all targets to date. The Round 12
+`dudect_deniable_envelope` bench is documented in
+`docs/SECURITY_AUDIT_ROUND_12.md` and expected to FAIL on the
+current branch (large |t|) until R12-01 fix lands.
 
 ### What we do NOT test
 
@@ -430,7 +480,7 @@ get in touch.
     with `HeaderAuthFailed` instead of producing garbled
     metadata reads.
   - Full architectural detail in
-    [`docs/MACOS_FUSE_T.md` § Subprocess isolation](docs/MACOS_FUSE_T.md#subprocess-isolation-gui-mount-on-macosfuse-t).
+    [`docs/MACOS_FUSE_T.md` sec. Subprocess isolation](docs/MACOS_FUSE_T.md#subprocess-isolation-gui-mount-on-macosfuse-t).
   This pathway exists ONLY for GUI mounts on macOS+FUSE-T
   builds. CLI mounts (`luksbox mount ...`) and all other
   backends keep the legacy in-process flow with no MVK
@@ -660,7 +710,7 @@ risk first.
       `tss-esapi 8.0.0-alpha.2`'s `TctiNameConf::Tbs` variant. The
       NCrypt + Platform Crypto KSP API (which BitLocker / Windows
       Hello use) was considered as an alternative but rejected: it
-      uses a different on-disk wire format (NCrypt PCP key blobs ≠
+      uses a different on-disk wire format (NCrypt PCP key blobs !=
       TPM2B blobs), so a vault sealed on Windows would not unseal on
       Linux even with the same chip - that breaks the cross-platform
       vault-portability principle. See
@@ -815,6 +865,9 @@ for the full per-round log.
 | 4 | Live YubiKey detection layer | no findings; thread-safety verified |
 | 5 | End-to-end hardware + rogue edge cases | round-2 fix verified on real hardware; 6 additional rogue tests |
 | 6 | Invariant lockdown across the stack | no new vulns; HKDF info-string uniqueness, header-tamper coverage, slot AEAD AAD field-by-field, cross-file substitution, generation rollback, concurrent-open enforcement (flock), symlink TOCTOU defense, AES-NI startup warning |
+| 11 | Deniable v2 cryptographic sweep | 3 fixes (per-vault salt in inner-header AAD, `Zeroizing` for envelope plaintext, propagated `Zeroizing<[u8;32]>` through `deniable_pq_decap`); 5 new workflow tests + 3 new fuzz targets |
+| 12 | FUSE-T subprocess + deniable v2 timing + filesystem TOCTOU + memory safety | 1 CRITICAL + 5 HIGH + 7 MEDIUM + 6 LOW; **all 19 findings shipped fixes in the same revision** (R12-14 formally superseded by R12-11). Full report + Fix-status table at [docs/SECURITY_AUDIT_ROUND_12.md](docs/SECURITY_AUDIT_ROUND_12.md). Headline fix: R12-01's deniable envelope discovery loop is now constant-time via `subtle::Choice`-driven byte selection + single-shot `SlotPayload::decode` on the chosen slot. New regression coverage: `dudect_deniable_envelope` bench + `deniable_envelope_multi_slot` libFuzzer + AFL++ target + `round12_findings.rs` deterministic regression suite (7 tests, 0 `#[ignore]`d). |
+| 13 | Local filesystem boundary races + header durability + sidecar DoS + secret-copy hygiene | 0 CRITICAL + 2 HIGH + 5 MEDIUM + 2 LOW + 1 INFO; **all 9 findings shipped fixes in the same revision**. Full report + Fix-status table at [docs/SECURITY_AUDIT_ROUND_13.md](docs/SECURITY_AUDIT_ROUND_13.md). Headline fixes: R13-01 closes the intermediate-directory symlink swap in `secure_create_or_truncate` via `openat(parent_dir_fd, basename, O_NOFOLLOW)`; R13-02 routes `luksbox header restore` through the container's verified handle (`Container::restore_header_bytes`); R13-04 promotes `persist_header` from `flush()` to `sync_all()` + `atomic_secure_write` on detached headers. New regression coverage: 4 test files (14 tests total, 0 `#[ignore]`d). |
 
 **Ad-hoc improvements** since the audit log was last updated:
 

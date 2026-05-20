@@ -1,5 +1,5 @@
 //! AFL++ harness: `.hybrid` sidecar parser (v1 + v2 with per-entry
-//! ML-KEM level byte → variable entry size).
+//! ML-KEM level byte -> variable entry size).
 
 use std::io::Write;
 

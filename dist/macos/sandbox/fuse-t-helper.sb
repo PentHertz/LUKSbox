@@ -13,6 +13,9 @@
 ;; Variables interpolated by the spawning code:
 ;;   ${VAULT_DIR}       parent directory of the .lbx file
 ;;   ${MOUNTPOINT_DIR}  parent directory of the mountpoint
+;;   ${HEADER_DIR}      parent directory of the detached header (if any);
+;;                      falls back to ${VAULT_DIR} when no header is set
+;;                      (Round 12 fix R12-03)
 ;;   ${HOME}            user's home directory
 ;;
 ;; Profile syntax: the macOS sandbox profile language is a
@@ -71,6 +74,10 @@
     (subpath "${VAULT_DIR}")
     ;; The mountpoint
     (subpath "${MOUNTPOINT_DIR}")
+    ;; Detached header parent (Round 12 R12-03). Same dir as
+    ;; ${VAULT_DIR} when no detached header is configured, so this
+    ;; subpath is always defined and the rule degenerates harmlessly.
+    (subpath "${HEADER_DIR}")
     ;; Our own .app bundle (so the binary can find adjacent resources)
     (subpath (param "BUNDLE_DIR")))
 
@@ -82,6 +89,9 @@
 (allow file-write*
     (subpath "${VAULT_DIR}")
     (subpath "${MOUNTPOINT_DIR}")
+    ;; Detached header parent: writes happen on rotation. Round 12
+    ;; R12-03; falls back to ${VAULT_DIR} when no header path is set.
+    (subpath "${HEADER_DIR}")
     ;; FUSE-T's helper sometimes writes to /tmp for its IPC sockets.
     (subpath "/tmp")
     (subpath "/private/tmp")

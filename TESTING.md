@@ -429,7 +429,7 @@ format.
 
 ### Expected results
 
-- Each `create` should complete with "✓ created" output and produce
+- Each `create` should complete with "created" output and produce
   the named files.
 - Each `ls` / `get` / `info` should succeed cleanly.
 - The YubiKey LED should blink (or however your device signals

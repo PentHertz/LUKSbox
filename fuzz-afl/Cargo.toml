@@ -26,9 +26,69 @@ afl = "0.15"
 luksbox-core = { path = "../crates/luksbox-core" }
 luksbox-format = { path = "../crates/luksbox-format" }
 luksbox-pq = { path = "../crates/luksbox-pq" }
+# Reachable from the chunk_aead_decrypt harness which calls
+# `chunk::file_key_for_mvk` to mirror the production file-key
+# derivation. Harness is otherwise self-contained (no Vfs::open,
+# no DirectoryTree walk), so this dep doesn't drag in the heavy
+# Container init cost on every fuzz iteration.
+luksbox-vfs = { path = "../crates/luksbox-vfs" }
 tempfile = "3"
+# bincode kept for any legacy harness that hasn't migrated yet;
+# new harnesses prefer postcard to match the production decoder.
 bincode = { version = "2.0", features = ["serde"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
+
+# Explicit [[bin]] entries so each new harness shows up in
+# `cargo afl build` without relying on the implicit src/bin/ rule.
+# Order kept alphabetical so additions are obvious in diffs.
+[[bin]]
+name = "anchor_parse"
+path = "src/bin/anchor_parse.rs"
+
+[[bin]]
+name = "auth_then_process"
+path = "src/bin/auth_then_process.rs"
+
+[[bin]]
+name = "chunk_aead_decrypt"
+path = "src/bin/chunk_aead_decrypt.rs"
+
+[[bin]]
+name = "deniable_header_parse"
+path = "src/bin/deniable_header_parse.rs"
+
+[[bin]]
+name = "header_parse"
+path = "src/bin/header_parse.rs"
+
+[[bin]]
+name = "hybrid_sidecar_parse"
+path = "src/bin/hybrid_sidecar_parse.rs"
+
+[[bin]]
+name = "keyslot_parse"
+path = "src/bin/keyslot_parse.rs"
+
+[[bin]]
+name = "metadata_parse"
+path = "src/bin/metadata_parse.rs"
+
+[[bin]]
+name = "seed_file_parse"
+path = "src/bin/seed_file_parse.rs"
+
+[[bin]]
+name = "slot_payload_decode"
+path = "src/bin/slot_payload_decode.rs"
+
+[[bin]]
+name = "slot_payload_roundtrip"
+path = "src/bin/slot_payload_roundtrip.rs"
+
+[[bin]]
+name = "deniable_envelope_multi_slot"
+path = "src/bin/deniable_envelope_multi_slot.rs"
 
 [profile.release]
 # AFL needs branch coverage instrumentation; opt-level 3 is fine but

@@ -89,7 +89,7 @@ endorsement** by Penthertz. Phrases like "based on LUKSbox" or
 If you want to do something this policy doesn't clearly allow, or
 if you want to license use of the LUKSbox name for a derivative
 product or service, ask:
-<https://penthertz.com> / <sebastien.dudek@penthertz.com>. We're
+<https://penthertz.com> / <security@penthertz.com>. We're
 happy to discuss case-by-case arrangements when the use is in good
 faith.
 

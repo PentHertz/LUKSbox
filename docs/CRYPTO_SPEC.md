@@ -211,6 +211,83 @@ random padding.
 +----------------------------------------------------------------+
 ```
 
+The METADATA BLOB's encrypted plaintext starts with a 4-byte magic
+that identifies the metadata format inside the encrypted region:
+
+- `LBM\x02` ("v2") -- the per-inode chunk list is stored inline as
+  `Vec<ChunkRef>` inside the postcard-encoded directory tree. Every
+  ChunkRef costs ~4-6 varint bytes inside the metadata budget; a
+  vault with many large files runs out of budget around 8-10 GiB
+  total stored content at the default 16 MiB region size.
+- `LBM\x03` ("v3", opt-in) -- inodes whose chunk count exceeds
+  `V3_INLINE_CHUNK_THRESHOLD` (1024 chunks ~ 4 MiB file) carry a
+  `chunks_external = Some((head, count))` field instead, pointing
+  at the **chunk-list block chain** described below. Inodes under
+  the threshold stay inline (same wire shape as v2).
+
+Choice of v2 vs v3 is locked at vault creation time and stamped
+implicitly via the magic byte (which is itself inside the
+AEAD-encrypted region, so an attacker without MVK cannot flip it).
+Old binaries presented with an `LBM\x03` blob fail with a clean
+`MetadataDeserialize` error rather than silently mis-parsing.
+
+#### V3: chunk-list blocks
+
+Each chunk-list block is a regular 4 KiB encrypted chunk in the
+data area whose AEAD key and AAD are derived from a **synthetic
+file_id** -- the real `file_id` with the high bit set:
+
+```
+list_file_id(F)     = F | (1 << 63)
+list_file_key(F)    = HKDF(MVK, salt, "lbx:file/v1:" || list_file_id(F))
+list_block_AAD(F,i) = list_file_id(F) || block_idx_u32(i) || generation_u64
+```
+
+Real file_ids are allocated from `ROOT_ID + 1 = 2` upward
+sequentially. The vault would need 2⁶³ files for a real ID to enter
+the reserved range -- physically impossible -- so the high bit safely
+disambiguates the two chunk kinds. `Vfs::validate_metadata_tree`
+additionally refuses any tree whose `next_file_id >= 1 << 63` as
+defense in depth.
+
+The 4 KiB plaintext layout of a chunk-list block:
+
+```
++----------------------------------------------------------------+
+| 0..4     u32 LE  count (0..=254)                               |
+| 4..N     count x ChunkRef (16 B each: id_u64 || gen_u64)       |
+| N..N+16  next ChunkRef (or zero if last block in chain)        |
+| N+16..   random padding (12 B)                                 |
++----------------------------------------------------------------+
+```
+
+The block carries up to 254 entries; the 255th 16-byte slot is the
+**next-pointer**. A non-zero next-pointer's `generation` is the
+"more blocks" sentinel; a `generation == 0` next-pointer marks the
+end of the chain. Generation 0 is impossible for a legitimate
+ChunkRef because `alloc_chunk_gen` starts at 1.
+
+Walking a chain is bounded by `walk_chunk_list_chain` to
+`ceil(expected_count / 254) + 2` blocks and `expected_count` total
+entries, both derived from the inode's own claimed count. A forged
+chain (which would require MVK access in the first place) cannot
+drive unbounded allocation or infinite traversal.
+
+Two chunk kinds coexist in the data area but cannot be confused
+for each other: `file_key(F) ≠ list_file_key(F)` (HKDF info
+strings differ by the high bit) AND the AAD's `file_id` field
+differs by the high bit. A data chunk's ciphertext placed into a
+chunk-list block's slot will AEAD-fail decryption under
+`list_file_key`, and vice versa. The `v3_aad_isolation_*` test in
+`crates/luksbox-vfs/src/vfs.rs` pins this invariant.
+
+MVK rotation re-encrypts every chunk-list block under the new MVK
+in the same loop that re-encrypts data chunks (`Vfs::rotate_mvk`,
+regression-tested in `v3_rotate_mvk_reencrypts_chunk_list_blocks`).
+Without this, post-rotation reads of a spilled file would
+AEAD-fail at the first chunk-list block lookup and the file's data
+chunks would be permanently unreachable.
+
 ### 3.2 Keyslot internal layout (512 bytes)
 
 ```
@@ -489,7 +566,7 @@ The three layers are:
 
 | Layer | Width | Where it lives | Failure mode it defends against |
 |---|---|---|---|
-| **Random nonce** | 96 bits | Prepended to ciphertext on disk; fresh `OsRng` draw on every `write_chunk` (`crates/luksbox-vfs/src/chunk.rs:88-91`). | Two encryptions of the same chunk slot at different times use independent nonces. Without this, AES-GCM nonce reuse leaks the keystream and the GHASH key — a catastrophic break of confidentiality and integrity. |
+| **Random nonce** | 96 bits | Prepended to ciphertext on disk; fresh `OsRng` draw on every `write_chunk` (`crates/luksbox-vfs/src/chunk.rs:88-91`). | Two encryptions of the same chunk slot at different times use independent nonces. Without this, AES-GCM nonce reuse leaks the keystream and the GHASH key -- a catastrophic break of confidentiality and integrity. |
 | **Binding AAD** | 20 bytes (never on disk) | Reconstructed at read time from `file_id ‖ chunk_idx ‖ generation` (`crates/luksbox-vfs/src/chunk.rs:35-44`). The AAD itself isn't stored, only its effect on the AEAD tag is. | Cut-and-paste / chunk-shuffling: an attacker swapping chunk 7 of file A onto chunk 12 of file B fails the AEAD tag because `file_id` and `chunk_idx` no longer match. Replay of an older version of the *same* slot fails because the inode now records a higher `generation` than the saved AAD bytes. |
 | **Per-file derived key** | 256 bits | `file_key = HKDF-Expand(MVK, info = "lbx:file/v1:" ‖ file_id_le, len = 32)` (`crates/luksbox-vfs/src/chunk.rs:125-130`). | The MVK never directly encrypts user data. Even a hypothetical nonce collision *within* one file leaves every other file untouched, and the same file_key is structurally never derivable for two distinct `file_id` values. |
 
@@ -497,10 +574,10 @@ The three layers are:
 
 - Removing the **per-file key** would let a within-vault nonce
   collision affect every file at once. With it, the birthday bound
-  on random 96-bit nonces (≈ 2⁴⁸ writes for 2⁻³² collision
+  on random 96-bit nonces (~ 2⁴⁸ writes for 2⁻³² collision
   probability under AES-GCM) is **per file**, not vault-wide. The
   default cipher suite, AES-256-GCM-SIV, makes this even safer:
-  GCM-SIV is misuse-resistant — a nonce collision under GCM-SIV
+  GCM-SIV is misuse-resistant -- a nonce collision under GCM-SIV
   reveals only that two messages had the same plaintext, never the
   keystream or the GHASH key. Vaults created with the legacy
   `Aes256Gcm` suite still inherit the original NIST bound (2³² writes
@@ -530,7 +607,7 @@ The three layers are:
 - **Does not protect against vault-wide rollback:** an attacker
   with read+write access to the `.lbx` who saves a snapshot at time
   T0 and restores it wholesale at time T1 sees every chunk, every
-  AAD field, and every generation counter consistent with T0 — by
+  AAD field, and every generation counter consistent with T0 -- by
   design. The `.anchor` sidecar (§3 listing, §17) closes this gap
   by storing the current vault generation under a separate MAC and
   having `Container::open` cross-check it. Without the anchor, the
@@ -1328,7 +1405,7 @@ per file).
 
 For the consolidated breakdown of why the chunk layer combines a
 random nonce, a binding AAD, **and** a per-file derived key, see
-**§3.9 Per-chunk encryption layering** — that's the canonical
+**§3.9 Per-chunk encryption layering** -- that's the canonical
 reference for the three-layer property and what each layer does
 and does not defend against.
 
@@ -1736,7 +1813,17 @@ sequenceDiagram
 
 7. **Lost device with backup enrolled**. If the user enrolled either
    (a) a backup passphrase slot or (b) a second device's keyslot, the
-   vault is recoverable from the backup material alone.
+   vault is recoverable from the backup material alone. **Note**: as
+   of 2026-05, the create flow defaults to **no backup passphrase**
+   for `Fido2Direct` and for every 3-factor TPM combo (`Tpm2Fido2`,
+   `HybridPqTpm2*`, `HybridPqTpm2Fido2*`). The user must explicitly
+   tick "Enable recovery passphrase" at create time to get the
+   passphrase fallback; ticking it adds an OR-attack path that
+   defeats the "all factors required" guarantee. The trade-off is
+   intentional: users who pick these multi-factor combos are usually
+   asking for AND-semantics, not for any single-secret recovery
+   path. See the "Default slot policy for multi-factor combos"
+   subsection below.
 
 #### What we explicitly do NOT defend against
 
@@ -1876,6 +1963,85 @@ who want to defend against it.
 | Rogue-authenticator regression tests | `crates/luksbox-fido2/tests/rogue_authenticator.rs` |
 | Hardware probe (single device) | `crates/luksbox-fido2/examples/probe.rs` (run with `--features hardware --example probe`) |
 | Hardware probe (multi-device V3 roundtrip) | `crates/luksbox-fido2/examples/multidev_probe.rs` |
+
+### 19.10 Default slot policy for multi-factor combos
+
+Until 2026-05 every create flow went through `create_with_passphrase`
+first and then enrolled the requested keyslot (FIDO2, TPM, hybrid) as
+slot 1. Resulting vault: 2 slots, passphrase at slot 0 and the
+multi-factor slot at slot 1. Convenient (any forgotten factor still
+leaves the passphrase) but it leaks an OR-attack path: anyone with the
+passphrase opens the vault without any of the hardware factors. For
+`Fido2Direct` and the 3-factor TPM combos (`Tpm2Fido2`,
+`HybridPqTpm2`, `HybridPq1024Tpm2`, `HybridPqTpm2Fido2`,
+`HybridPq1024Tpm2Fido2`) this directly defeats the design intent of
+the combo: these users picked them precisely because they want
+AND-semantics.
+
+The 2026-05 change ships new single-slot create constructors that
+place the requested credential at slot 0 with no passphrase fallback:
+
+| Constructor | Slot kind | Use |
+|---|---|---|
+| `Container::create_with_tpm2` | `Tpm2Sealed` | Plain TPM, single slot |
+| `Container::create_with_tpm2_pin` | `Tpm2SealedPin` | TPM + chip-PIN, single slot |
+| `Container::create_with_tpm2_fido2` | `Tpm2Fido2` | Fused TPM + FIDO2, single slot |
+| `Container::create_with_hybrid_pq_tpm2` | `HybridPqKemTpm2` | TPM + ML-KEM-768 |
+| `Container::create_with_hybrid_pq_1024_tpm2` | `HybridPqKem1024Tpm2` | TPM + ML-KEM-1024 |
+| `Container::create_with_hybrid_pq_tpm2_fido2` | `HybridPqKemTpm2Fido2` | TPM + FIDO2 + ML-KEM-768 |
+| `Container::create_with_hybrid_pq_1024_tpm2_fido2` | `HybridPqKem1024Tpm2Fido2` | TPM + FIDO2 + ML-KEM-1024 |
+
+These produce a vault with exactly one keyslot at index 0. Opening
+with any passphrase fails cleanly with `UnlockFailed`. If any factor
+is lost the vault is permanently unrecoverable.
+
+#### Defaults by combo
+
+| Combo family | Default at create | Opt-in |
+|---|---|---|
+| Passphrase, FIDO2-wrapped, HybridPqPassphrase, HybridPqFido2 | 1 slot (unchanged) | n/a |
+| `Fido2Direct` | 1 slot (FIDO2-derived MVK only) | "Enable backup passphrase" adds a passphrase slot |
+| `Tpm2`, `Tpm2Pin` | 2 slots (passphrase + TPM) | "Skip bootstrap passphrase" gives a single TPM slot |
+| `Tpm2Fido2`, `HybridPqTpm2*`, `HybridPqTpm2Fido2*` | 1 slot (multi-factor only) | "Enable recovery passphrase" adds a passphrase slot |
+| Any of the above + deniable mode | 1 slot, no UI checkbox (forced single-slot in deniable to avoid the invisible-second-slot foot-gun) | n/a |
+
+Read: the single-factor TPM kinds default to the recovery-friendly
+2-slot shape because the recovery argument (chip dies, passphrase
+gets you back in) outweighs the OR-attack downside for the average
+user. The multi-factor combos default to single-slot because the
+combo's only reason to exist is the AND-semantics, and a default-on
+passphrase slot would silently undermine that.
+
+#### Threat model implications
+
+When the user picks a multi-factor combo and does not tick
+"Enable recovery passphrase":
+
+- The vault has exactly one keyslot.
+- An attacker with the `.lbx` file alone has no offline passphrase
+  brute-force target. The only attack surface is the multi-factor
+  unwrap path (TPM chip + FIDO2 device + ML-KEM seed, as applicable).
+- Loss of any factor is unrecoverable.
+- Adding factors later via "Add slot" creates new keyslots whose
+  threat model is each independently considered. Adding a passphrase
+  slot re-introduces the OR-attack path the default avoided.
+
+In deniable mode the multi-factor combos are always single-slot
+regardless of UI state. The deniable second-slot foot-gun (invisible
+and unrevokable) is worse than the lost-vault-if-factor-lost
+trade-off; see `docs/DENIABLE_HEADER.md`.
+
+**Deniable v2 also makes a passphrase mandatory for every credential
+combo** (envelope discovery factor). The pure-`Fido2`, pure-`Tpm`,
+and non-passphrase multi-factor combos that existed in v1 are
+removed from the deniable path: all v2 deniable slots are encoded as
+`*Passphrase` variants (`Passphrase`, `Fido2Passphrase`,
+`TpmPassphrase`, `TpmFido2Passphrase`, `HybridPq*Passphrase`). The
+v1 enum variants are retained for the standard (non-deniable) Container
+API and for backwards compatibility wrappers; they are no longer
+reachable through deniable create / open. See
+`docs/DENIABLE_HEADER.md` for the slot envelope layout and the
+chicken-and-egg constraint that forces the passphrase requirement.
 
 ---
 

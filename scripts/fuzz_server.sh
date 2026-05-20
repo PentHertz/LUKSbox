@@ -9,7 +9,9 @@
 #
 #     target          one of: header_parse, keyslot_parse,
 #                     metadata_parse, hybrid_sidecar_parse,
-#                     seed_file_parse, auth_then_process
+#                     seed_file_parse, auth_then_process,
+#                     deniable_header_parse, slot_payload_decode,
+#                     slot_payload_roundtrip
 #                     OR "all" to run every target sequentially
 #                     OR "list" to print the set
 #     cores           number of parallel fuzzer instances (master + N-1 slaves).
@@ -51,7 +53,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 AFL_DIR="$REPO_ROOT/fuzz-afl"
-TARGETS=(header_parse keyslot_parse metadata_parse hybrid_sidecar_parse seed_file_parse auth_then_process)
+TARGETS=(header_parse keyslot_parse metadata_parse hybrid_sidecar_parse seed_file_parse auth_then_process deniable_header_parse slot_payload_decode slot_payload_roundtrip chunk_aead_decrypt anchor_parse deniable_envelope_multi_slot)
 
 # ---- arg parse ------------------------------------------------------------
 
@@ -111,7 +113,7 @@ if [[ -r /proc/sys/kernel/core_pattern ]]; then
     fi
 fi
 
-# CPU governor check, performance mode gives ~1.5-2× throughput.
+# CPU governor check, performance mode gives ~1.5-2x throughput.
 if compgen -G "/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor" >/dev/null; then
     govs="$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null \
             | sort -u | tr '\n' ',' | sed 's/,$//')"

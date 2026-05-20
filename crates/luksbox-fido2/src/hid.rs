@@ -413,7 +413,7 @@ impl Fido2Authenticator for HidAuthenticator {
             }
             let mut out = [0u8; 32];
             out.copy_from_slice(std::slice::from_raw_parts(secret_ptr, 32));
-            Ok(out)
+            Ok(HmacSecret(out))
         }
     }
 }

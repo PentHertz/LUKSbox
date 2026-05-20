@@ -93,7 +93,7 @@ if [[ "$DO_CLEAN" -eq 1 ]]; then
         -not -path './.git/*' -print -delete 2>/dev/null || true
 
     echo
-    green "✓ cleanup complete"
+    green "cleanup complete"
 fi
 
 # ---- 2. Verify no obvious local state files would get pushed --------------
@@ -109,7 +109,7 @@ for path in .env .env.local .envrc .vscode .idea .claude/settings.local.json; do
 done
 
 if [[ "${#UNTRACKED_RISKY[@]}" -gt 0 ]]; then
-    yellow "⚠ found local-only files; verify .gitignore covers them all:"
+    yellow "found local-only files; verify .gitignore covers them all:"
     for p in "${UNTRACKED_RISKY[@]}"; do
         printf '    %s\n' "$p"
     done
@@ -155,7 +155,7 @@ LARGE=$(find . -type f -size +5M \
     -not -path './fuzz-afl/target/*' \
     2>/dev/null || true)
 if [[ -n "$LARGE" ]]; then
-    yellow "⚠ large files (>5 MiB):"
+    yellow "large files (>5 MiB):"
     echo "$LARGE" | sed 's/^/    /'
     echo "  Confirm each is intended for the repo (logos, audited test fixtures)"
     echo "  before pushing."
@@ -171,7 +171,7 @@ run() {
     echo
     echo "=== $label ==="
     if "$@"; then
-        green "✓ $label OK"
+        green "$label OK"
     else
         red "✗ $label FAILED"
         EXIT=1
@@ -190,7 +190,7 @@ if [[ "$DO_TEST" -eq 1 ]]; then
         --workspace \
         --exclude luksbox-fuzz --exclude luksbox-fuzz-afl
 else
-    yellow "⚠ skipping cargo test (--no-test)"
+    yellow "skipping cargo test (--no-test)"
 fi
 
 # cargo audit is "best-effort", it requires the advisory DB to be
@@ -201,19 +201,19 @@ echo
 echo "=== cargo audit ==="
 if command -v cargo-audit >/dev/null 2>&1 || cargo audit --version >/dev/null 2>&1; then
     if cargo audit --deny warnings 2>&1 | tee /tmp/luksbox-audit.log; then
-        green "✓ cargo audit: clean (0 vulns, 0 unsound, 0 unmaintained)"
+        green "cargo audit: clean (0 vulns, 0 unsound, 0 unmaintained)"
     else
         # Distinguish vulns (block) from unmaintained warnings (note).
         if grep -qE '^Crate:.*Title:.*Vulnerability' /tmp/luksbox-audit.log; then
             red "✗ cargo audit reported a vulnerability, fix before pushing"
             EXIT=1
         else
-            yellow "⚠ cargo audit reported only unmaintained-warnings, review SECURITY.md §6 then proceed"
+            yellow "cargo audit reported only unmaintained-warnings, review SECURITY.md §6 then proceed"
         fi
     fi
     rm -f /tmp/luksbox-audit.log
 else
-    yellow "⚠ cargo-audit not installed. Install with: cargo install cargo-audit"
+    yellow "cargo-audit not installed. Install with: cargo install cargo-audit"
 fi
 
 # ---- 4. Final summary -----------------------------------------------------

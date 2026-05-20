@@ -1,0 +1,208 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+    WiX v4 Burn bundle: builds LUKSboxSetup.exe, a bootstrapper that
+    chains WinFsp.msi (if absent) then LUKSbox.msi. Replaces the
+    earlier "user must install WinFsp from winfsp.dev first" UX.
+
+    Why a Burn bundle and not a nested-MSI CustomAction:
+    -   Microsoft officially discourages nested MSI tables (the
+        "another install in progress" failure mode). Burn shells out
+        between packages so each MSI runs as a top-level install,
+        exactly like Windows Update or Visual Studio's installer.
+    -   Burn natively supports DetectCondition (skip a package if
+        already installed) and ForcePerMachine, which we need for
+        WinFsp (a per-machine kernel driver, never per-user).
+
+    Why we still ship the bare LUKSbox.msi as a separate release
+    asset:
+    -   IT admins who deploy via Group Policy / SCCM / Intune
+        manage WinFsp as a separate dependency and want a plain MSI
+        for unattended `msiexec /i LUKSbox.msi /qn`. The bundle
+        is the friendly path; the bare MSI is the admin path.
+
+    Build:
+        wix build dist\luksbox-bundle.wxs `
+            -ext WixToolset.Bal.wixext `
+            -ext WixToolset.Util.wixext `
+            -d Version=$env:LUKSBOX_VERSION `
+            -d StagingDir=staging `
+            -d LuksboxMsiPath=$env:MSI_PATH `
+            -d WinFspMsiPath=$env:WINFSP_MSI_PATH `
+            -arch x64 `
+            -o LUKSboxSetup.exe
+
+    NB the UpgradeCode below MUST NOT change. It identifies the
+    bundle product across versions; bumping it would let two copies
+    of LUKSbox install side-by-side (the "phantom uninstall" bug).
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+
+    <!-- Bundle Name includes the "+ WinFsp" suffix so users see in the
+         Burn window title AND in Windows Add/Remove Programs that the
+         install bundles WinFsp alongside LUKSbox. The transparency
+         matters: WinFsp is a kernel-mode filesystem driver, and the
+         standard Burn UI shows the chain stepping through it but the
+         default bundle name "LUKSbox" alone doesn't telegraph that an
+         additional driver is part of the install. -->
+    <Bundle
+        Name="LUKSbox (includes WinFsp)"
+        Manufacturer="Penthertz"
+        Version="$(var.Version)"
+        UpgradeCode="a7479a2a-37ba-4e06-bcf5-d285d686987e"
+        IconSourceFile="$(var.StagingDir)\luksbox-installer.ico"
+        AboutUrl="https://luksbox.penthertz.com/"
+        HelpUrl="https://luksbox.penthertz.com/docs/"
+        Compressed="yes">
+
+        <!-- Detect existing WinFsp install. Matches the same
+             registry key the bare luksbox.wxs uses for its
+             Launch Condition (HKLM\SOFTWARE\WOW6432Node\WinFsp).
+             Burn evaluates these BEFORE the chain and uses them
+             to gate the WinFsp MsiPackage InstallCondition.
+
+             We probe TWO things and AND them in the chain's
+             InstallCondition because the registry value alone is
+             not enough:
+               (a) WinFspRegistryPresent: the install-dir REG_SZ
+                   exists. The official WinFsp MSI writes this on
+                   success; if a previous WinFsp install ran
+                   cache-only or rolled back, the key can survive
+                   without the dll behind it.
+               (b) WinFspDllPresent: the actual winfsp-x64.dll
+                   that the upstream winfsp_wrs::init loads via
+                   LoadLibraryW by absolute path resolved from
+                   that registry value. If a user removed WinFsp
+                   via the chip-side driver removal but the
+                   registry entry was left behind (observed on
+                   real machines), a registry-only probe would
+                   say yes and our chain would skip the reinstall,
+                   which is the silent path that produced the
+                   WinFSPNotFound toast and forced users to hit
+                   Repair on LUKSboxSetup.exe as a workaround. -->
+        <util:RegistrySearch
+            Id="WinFspInstalled"
+            Root="HKLM"
+            Key="SOFTWARE\WOW6432Node\WinFsp"
+            Value="InstallDir"
+            Result="exists"
+            Variable="WinFspRegistryPresent" />
+        <util:RegistrySearch
+            Id="WinFspInstallDirValue"
+            Root="HKLM"
+            Key="SOFTWARE\WOW6432Node\WinFsp"
+            Value="InstallDir"
+            Variable="WinFspInstallDir"
+            After="WinFspInstalled" />
+        <util:FileSearch
+            Id="WinFspDllOnDisk"
+            Path="[WinFspInstallDir]bin\winfsp-x64.dll"
+            Result="exists"
+            Variable="WinFspDllPresent"
+            After="WinFspInstallDirValue" />
+
+        <!-- Optional opt-out for admins who want LUKSbox without
+             WinFsp (e.g., they manage WinFsp via Group Policy).
+             Override on the command line:
+                 LUKSboxSetup.exe InstallWinFsp=0
+             Default is 1 (install WinFsp if absent). When 0, the
+             user gets the same "WinFsp required at runtime" path
+             as the bare MSI; mount-feature errors become a clear
+             "install WinFsp from winfsp.dev/rel/" message. -->
+        <Variable
+            Name="InstallWinFsp"
+            Type="numeric"
+            Value="1"
+            bal:Overridable="yes" />
+
+        <!-- Standard Burn UI: Welcome -> License -> Install ->
+             Progress -> Done. The license shown is LUKSbox's
+             Apache 2.0; WinFsp's GPLv3 + linking-exception text
+             ships in the install dir as LICENSE-WINFSP.txt and is
+             referenced in the LUKSbox NOTICE. We do NOT show a
+             separate WinFsp EULA page because the linking
+             exception explicitly permits this kind of bundled
+             distribution and a second EULA would confuse users
+             into thinking LUKSbox is GPL-licensed.
+
+             Theme: `hyperlinkSidebarLicense` (was
+             `hyperlinkLicense`). The sidebar variant adds a left-
+             hand panel that surfaces the installer icon prominently
+             and gives the chain progress screen more vertical room
+             to display BOTH "WinFsp 2.0.23075" AND "LUKSbox" rows
+             as the install proceeds. The previous `hyperlinkLicense`
+             theme had a narrow window where the WinFsp install step
+             flashed by quickly and users could miss it (the exact
+             confusion that led to the "WinFsp not installed" toast
+             post-install).
+
+             NB the `hyperlinkSidebarLicense` theme uses
+             `LicenseUrl` (same as `hyperlinkLicense`). It also
+             reserves a 165x315 px portrait strip for the sidebar
+             via `LogoSideFile`. Pointing that at the square .ico
+             stretches it vertically and looks broken; we instead
+             feed it a 165x315 PNG with the icon centered on white,
+             generated by scripts/build_icons.sh and copied to
+             staging by the Windows packaging step in release.yml.
+             `LogoFile` (the small top-right icon) keeps using the
+             square .ico because that slot is sized for it. -->
+        <BootstrapperApplication>
+            <bal:WixStandardBootstrapperApplication
+                LicenseUrl="https://www.apache.org/licenses/LICENSE-2.0"
+                Theme="hyperlinkSidebarLicense"
+                LogoFile="$(var.StagingDir)\luksbox-installer.ico"
+                LogoSideFile="$(var.StagingDir)\luksbox-installer-side.png" />
+        </BootstrapperApplication>
+
+        <Chain>
+            <!-- WinFsp v2.0.23075 (pinned). Skipped only when
+                 BOTH the registry key AND the dll file are
+                 present (i.e., a real working WinFsp install),
+                 OR when the admin opted out via InstallWinFsp=0.
+
+                 Vital="yes" because the bundle's whole reason
+                 for existing is "ship LUKSbox + a working
+                 WinFsp"; a silent skip-then-fail-at-mount-time
+                 was the exact failure mode that forced users
+                 to Repair the bundle after first install. If
+                 an admin really wants LUKSbox without WinFsp
+                 (managing it via GPO/Choco/etc.) they set
+                 InstallWinFsp=0 explicitly, which short-
+                 circuits the chain and accepts the no-WinFsp
+                 state up front. The runtime mount preflight then
+                 surfaces the clear "install WinFsp" hint we
+                 wired into the GUI.
+
+                 NB MsiPackage in WiX v4 Burn has no DetectCondition
+                 attribute (that's ExePackage-only) - Burn auto-
+                 detects MSI install state via the inner MSI's
+                 ProductCode. The InstallCondition below handles
+                 the "WinFsp already installed by some other route
+                 (choco / portable)" case via the util:* searches
+                 defined above. -->
+            <!-- DisplayName is what the Burn install-progress UI
+                 shows for this row. Made ultra-explicit so users
+                 reading the install screen know exactly what is
+                 being installed alongside LUKSbox and why. The
+                 standard hyperlinkSidebarLicense theme shows this
+                 string verbatim during chain execution. -->
+            <MsiPackage
+                Id="WinFspMsi"
+                SourceFile="$(var.WinFspMsiPath)"
+                DisplayName="WinFsp 2.0.23075 -- Windows kernel filesystem driver required for LUKSbox's 'Mount as volume' feature (skipped if already installed)"
+                InstallCondition="InstallWinFsp = 1 AND NOT (WinFspRegistryPresent AND WinFspDllPresent)"
+                Vital="yes"
+                Cache="keep"
+                ForcePerMachine="yes" />
+
+            <!-- LUKSbox itself. Vital="yes" because there's no
+                 point continuing past a failed LUKSbox install. -->
+            <MsiPackage
+                Id="LuksboxMsi"
+                SourceFile="$(var.LuksboxMsiPath)"
+                Vital="yes"
+                ForcePerMachine="yes" />
+        </Chain>
+    </Bundle>
+</Wix>

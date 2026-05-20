@@ -46,15 +46,18 @@ bundles them subject to their own terms; their licenses do not
 affect or override the Apache 2.0 license that governs LUKSbox
 itself.
 
-- WinFsp (Windows portable .zip artifact only):
+- WinFsp (Windows portable .zip artifact and -setup.exe bundle):
   Copyright (c) 2015-present Bill Zissimopoulos / WinFsp project.
   Licensed under GPLv3 with a special linking exception that permits
   bundling alongside non-GPL software. The unmodified winfsp-x64.dll
-  is redistributed in luksbox-*-x86_64-windows.zip; full license at
-  LICENSE-WINFSP.txt inside that archive. Source code:
-  https://github.com/winfsp/winfsp. The Windows MSI artifact does NOT
-  bundle WinFsp (users install it separately from
-  https://winfsp.dev/rel/).
+  is redistributed in luksbox-*-x86_64-windows.zip, and the unmodified
+  upstream WinFsp installer (winfsp-2.0.23075.msi) is embedded in the
+  luksbox-*-x86_64-windows-setup.exe Burn bootstrapper. Full license:
+  LICENSE-WINFSP.txt inside the .zip archive and inside the install
+  directory after running -setup.exe. Source code:
+  https://github.com/winfsp/winfsp. The bare LUKSbox.msi artifact
+  does NOT bundle WinFsp; for that path users install WinFsp
+  separately from https://winfsp.dev/rel/.
 
 - libfido2 + libcbor + OpenSSL + zlib + hidapi:
   Statically linked into all Windows artifacts (via vcpkg's

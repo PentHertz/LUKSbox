@@ -36,10 +36,10 @@ jobs:
         with:
           shared-key: ci-lint
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
             libtss2-dev
       - run: cargo fmt --all -- --check
       # Workspace-wide clippy. NOT `-D warnings` yet, there's a backlog of
@@ -69,10 +69,10 @@ jobs:
         with:
           shared-key: ci-test-${{ matrix.profile }}
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
             libtss2-dev
       - name: Run ${{ matrix.profile }} tests
         run: ${{ matrix.cmd }}
@@ -185,10 +185,10 @@ jobs:
         with:
           shared-key: ci-security-regressions
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
             libtss2-dev
       - name: Argon2id DoS guard (luksbox-core)
         run: cargo test -p luksbox-core --test argon2_dos_guard
@@ -254,11 +254,11 @@ jobs:
         with:
           shared-key: ci-build-${{ matrix.target }}
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev \
-            libtss2-dev \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
+            libtss2-dev
             ${{ matrix.extra_apt }}
       - name: Build
         run: ${{ matrix.cmd }}
@@ -299,6 +299,19 @@ jobs:
           - header_roundtrip
           - winfsp_path_parse
           - webauthn_device_path
+          - deniable_header_parse
+          - slot_payload_decode
+          - slot_payload_roundtrip
+          # 2026-05 additions: chunk AEAD callsite + anchor parsers.
+          # Both are cheap per iteration, fit comfortably in the 5-min
+          # smoke budget. See FUZZING.md for the threat model.
+          - chunk_aead_decrypt
+          - anchor_parse
+          # Round 12 addition: multi-slot envelope opacity. Builds a
+          # real deniable header with a fuzzer-selected subset of slots
+          # enrolled, then drives the envelope-discovery loop with
+          # attacker input. Pins R12-01's opacity invariant.
+          - deniable_envelope_multi_slot
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -307,9 +320,9 @@ jobs:
           shared-key: ci-fuzz-smoke
           workspaces: "fuzz"
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
             pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev clang
       # NB: no `--locked`. cargo-fuzz 0.13.x ships a Cargo.lock that
       # pins `rustix = 0.36.5`, which uses internal rustc attributes
@@ -323,6 +336,12 @@ jobs:
       - name: Fuzz ${{ matrix.target }} for 5 minutes
         run: |
           cd "$GITHUB_WORKSPACE"
+          # Defensively create the corpus dir if the repo doesn't ship
+          # one yet (cargo-fuzz refuses with "required directory does
+          # not exist" otherwise). Empty dirs aren't tracked by git so
+          # a freshly-added target without seeds would otherwise fail
+          # CI on its first run.
+          mkdir -p fuzz/corpus/${{ matrix.target }}
           cargo +nightly fuzz run ${{ matrix.target }} \
             fuzz/corpus/${{ matrix.target }} \
             -- -max_total_time=300

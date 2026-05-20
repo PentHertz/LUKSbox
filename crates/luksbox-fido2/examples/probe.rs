@@ -46,21 +46,21 @@ fn main() {
     let s_a1 = auth
         .hmac_secret(rp, &er.credential.id, &salt_a, pin.as_deref())
         .expect("assert A1 failed");
-    println!("hmac_secret = {}", hexdump(&s_a1, 32));
+    println!("hmac_secret = {}", hexdump(&*s_a1, 32));
 
     println!("\n--- ASSERT 2: salt = 0x55..55 (same as #1) ---");
     println!("TOUCH YOUR KEY (3/4)");
     let s_a2 = auth
         .hmac_secret(rp, &er.credential.id, &salt_a, pin.as_deref())
         .expect("assert A2 failed");
-    println!("hmac_secret = {}", hexdump(&s_a2, 32));
+    println!("hmac_secret = {}", hexdump(&*s_a2, 32));
 
     println!("\n--- ASSERT 3: salt = 0xaa..aa (different) ---");
     println!("TOUCH YOUR KEY (4/4)");
     let s_b = auth
         .hmac_secret(rp, &er.credential.id, &salt_b, pin.as_deref())
         .expect("assert B failed");
-    println!("hmac_secret = {}", hexdump(&s_b, 32));
+    println!("hmac_secret = {}", hexdump(&*s_b, 32));
 
     println!("\n=== Verification ===");
     let det_ok = s_a1 == s_a2;

@@ -54,6 +54,10 @@ zxcvbn = "3"
 # Hash-compare the clipboard contents at auto-clear time so we don't
 # wipe a user's subsequent unrelated copy (the KeePassXC pattern).
 sha2 = { workspace = true }
+# Used by the deniable-FIDO2 unlock path to decode user-pasted
+# cred_id + hmac_salt hex strings (and by the create-success
+# modal to render them as hex for the user to save).
+hex = "0.4"
 # Direct OS clipboard access - egui's `ctx.copy_text` is write-only,
 # we need a read path to compare hashes before clearing. arboard is
 # the standard cross-platform crate, ~2k LoC pure-Rust on each backend.
@@ -69,6 +73,14 @@ luksbox-vfs = { path = "../luksbox-vfs" }
 # disables luksbox-mount's `winfsp` default. Re-enabled via the
 # `winfsp = ["luksbox-mount/winfsp"]` feature above.
 luksbox-mount = { path = "../luksbox-mount", default-features = false }
+
+# Used by the pre-flight check in `start_mount_subprocess` to detect
+# when another process (e.g. a stale helper from a previous mount or
+# a CLI `luksbox mount`) already holds an exclusive lock on the vault
+# file. Catches the conflict in the parent with a friendly toast
+# instead of letting the helper subprocess fail with VaultLocked +
+# exit code 1.
+fs2 = "0.4"
 
 # SIGPIPE constant for exit_status_is_clean_unmount on macOS
 # (FUSE-T helper subprocess sometimes exits with signal 13 during

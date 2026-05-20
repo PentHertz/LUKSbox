@@ -52,22 +52,99 @@ cargo +nightly fuzz run header_parse -- -max_total_time=60
 
 ## Available targets
 
-Each target appears in both setups under the same name:
+Targets in **bold** appear in both setups under the same name (the
+shared subset that the orchestration scripts and CI both know
+about). A target listed only in `fuzz/` is libfuzzer-only.
 
-| Target | Parser tested | Attack surface |
-|---|---|---|
-| `header_parse` | `Header::from_bytes` (8 KB header) | Magic / version / slot table / offsets |
-| `keyslot_parse` | `Keyslot::from_bytes` (512 B slot) | Kind, KDF params, V1/V2/V3 layout selector, cred_id length cap (128 B for V1/V2, 352 B for V3), aad_version-driven offset dispatch |
-| `metadata_parse` | `metadata::read_metadata` pre-AEAD | Nonce, ct_len framing |
-| `header_roundtrip` | `Header::from_bytes` -> `to_bytes` -> `from_bytes` | Serializer/parser asymmetry. Asserts `aad_version`, `fido2_cred_id`, and `fido2_hmac_salt` round-trip byte-identical (catches V1/V2 vs V3 layout drift between read and write paths). |
-| `hybrid_sidecar_parse` | `hybrid_sidecar::read` (v1/v2) | Per-entry level byte -> variable entry size dispatch |
-| `seed_file_parse` | `seed_file::read` (`.kyber` files) | Magic, version, on-disk Argon2id params |
-| `auth_then_process` | post-AEAD bincode-decode of `DirectoryTree` (with fixed MVK) | Decoder length-cap, BTreeMap construction, UTF-8 child names |
+| Target | Parser tested | Attack surface | libfuzzer | AFL++ |
+|---|---|---|---|---|
+| **`header_parse`** | `Header::from_bytes` (8 KB header) | Magic / version / slot table / offsets | OK | OK |
+| **`keyslot_parse`** | `Keyslot::from_bytes` (512 B slot) | Kind, KDF params, V1/V2/V3 layout selector, cred_id length cap (128 B for V1/V2, 352 B for V3), aad_version-driven offset dispatch | OK | OK |
+| **`metadata_parse`** | `metadata::read_metadata` pre-AEAD | Nonce, ct_len framing | OK | OK |
+| `header_roundtrip` | `Header::from_bytes` -> `to_bytes` -> `from_bytes` | Serializer/parser asymmetry. Asserts `aad_version`, `fido2_cred_id`, and `fido2_hmac_salt` round-trip byte-identical (catches V1/V2 vs V3 layout drift between read and write paths). | OK | - |
+| **`hybrid_sidecar_parse`** | `hybrid_sidecar::read` (v1/v2) | Per-entry level byte -> variable entry size dispatch | OK | OK |
+| `hybrid_sidecar_adversarial` | `hybrid_sidecar::read` driven against a real vault | Duplicate-slot-idx, overrun, level-byte-mutation rejection | OK | - |
+| **`seed_file_parse`** | `seed_file::read` (`.kyber` files) | Magic, version, on-disk Argon2id params | OK | OK |
+| **`auth_then_process`** | post-AEAD bincode-decode of `DirectoryTree` (with fixed MVK) | Decoder length-cap, BTreeMap construction, UTF-8 child names | OK | OK |
+| `vfs_ops` | `Vfs::{mkdir,create,rename,unlink,lookup,readdir,write,flush}` with attacker-controlled name strings | UTF-8 garbage, embedded NUL, slashes, oversized, control chars, `..`, reserved Windows names | OK | - |
+| `webauthn_device_path` | `luksbox_fido2::webauthn_paths` device-path classifier | Windows-style FIDO HID path strings | OK | - |
+| `winfsp_path_parse` | `luksbox_mount::winfsp_path` parsers | Cross-platform path normalization (no FFI) | OK | - |
+| **`deniable_header_parse`** | v2 deniable open path (`try_open_envelope_v2` + `complete_open_v2`) | No-oracle property: every failure collapses to `Error::OpaqueUnlockFailed` | OK | OK |
+| **`slot_payload_decode`** | `SlotPayload::decode` (bypasses Argon2id) | Per-field caps, reserved-bytes-zero check, joint material budget, in-buffer offset arithmetic | OK | OK |
+| **`slot_payload_roundtrip`** | `SlotPayload::new` -> `encode` -> `decode` with attacker-controlled length triples | Encoder/decoder symmetry; constructor rejections always justified | OK | OK |
+| **`chunk_aead_decrypt`** | `aead::open` at the production chunk callsite with constructed AAD (`file_id || chunk_idx || generation`) | Per-chunk decrypt with attacker-controlled nonce + ct + tag (raw block device / NFS middlebox / ZFS snapshot rollback threat). Every read from a mounted vault flows through this AEAD call; previously only fuzzed transitively via `vfs_ops` with locally-produced ct. Added 2026-05. | OK | OK |
+| **`anchor_parse`** | `anchor::read_and_verify` (48 B standard) + `anchor::deniable_read_and_verify` (256 B deniable) | Random bytes through both readers; truncation, magic-match-but-garbage, AEAD-fail. Added after the O_NOFOLLOW hardening in 2026-05 - defenses are most useful when fuzzed. | OK | OK |
+| **`deniable_envelope_multi_slot`** | `try_open_envelope_v2` on real headers with fuzzer-selected slot occupancy | Multi-slot deniable open: builds a valid deniable header with a fuzzer-chosen subset of the 8 slots enrolled under a shared envelope passphrase, then drives the envelope-discovery loop with an attacker-supplied passphrase / cipher. Catches regressions to a NON-OPAQUE error variant or a panic on the multi-slot path. Added Round 12 (R12-01). | OK | OK |
 
 `auth_then_process` is special: it requires a known MVK to encrypt
 fuzz bytes into a "valid" metadata blob, then exercises the decoder
-that runs **after** AEAD verification. The other six exercise
-attacker-pre-auth surfaces.
+that runs **after** AEAD verification. The other parser targets
+exercise attacker-pre-auth surfaces.
+
+The three deniable-v2 targets (`slot_payload_decode`,
+`slot_payload_roundtrip`, `deniable_header_parse`) were added after
+the 2026-05 cryptographic audit. They cover the trust boundary the
+audit hardened - `slot_payload_decode` directly fuzzes the structural
+validator on AEAD-verified envelope plaintext, `slot_payload_roundtrip`
+catches encoder/decoder asymmetries that would corrupt legitimate
+vaults across save/load, and `deniable_header_parse` exercises the
+full envelope-open flow with attacker-controlled passphrase + header
+buffer + cipher choice.
+
+The two 2026-05 additions (`chunk_aead_decrypt` and `anchor_parse`,
+added after the post-audit hardening pass) cover surfaces that
+previously had no direct fuzz coverage - every read from a mounted
+vault flows through `chunk_aead_decrypt`'s callsite, and the anchor
+readers gained `O_NOFOLLOW` + a GUI preflight that benefit from
+adversarial coverage.
+
+The Round 12 addition (`deniable_envelope_multi_slot`) is structurally
+different from the existing `deniable_header_parse` target: instead
+of feeding 36 KiB of fuzzer-controlled bytes, it builds a real, valid
+deniable header at the start of each iteration with a fuzzer-chosen
+slot occupancy bitmap, then drives the envelope-discovery loop with
+an attacker passphrase / cipher. This covers the kind-disambiguation
+path through `try_open_envelope_v2` that the (currently leaky, see
+R12-01) constant-time invariant must protect. The timing-leak proper
+is measured separately by the dudect bench
+`crates/luksbox-format/benches/dudect_deniable_envelope.rs` - run
+`cargo bench --bench dudect_deniable_envelope -p luksbox-format` to
+reproduce.
+
+### Constant-time verification (dudect benches)
+
+| Bench | What it pins | How to run |
+|---|---|---|
+| `dudect_hmac_verify` | `Header::verify_hmac`, `subtle::ConstantTimeEq` | `cargo bench --bench dudect_hmac_verify -p luksbox-core` |
+| `dudect_aead_open` | AEAD-open rejection path, no MAC-comparison oracle | `cargo bench --bench dudect_aead_open -p luksbox-core` |
+| `dudect_slot_unlock` | Keyslot post-Argon2id unwrap | `cargo bench --bench dudect_slot_unlock -p luksbox-core` |
+| `dudect_deniable_envelope` | Deniable envelope discovery loop (Round 12 R12-01) | `cargo bench --bench dudect_deniable_envelope -p luksbox-format` |
+| `dudect_reference_leaky` | Known-leaky control for t-stat calibration | `cargo bench --bench dudect_reference_leaky -p luksbox-core` |
+
+The acceptance bar is |t| < 3.0 sustained across 5 K - 50 K samples
+per class. `dudect_deniable_envelope` is expected to FAIL on the
+current branch (large |t|) until the R12-01 fix lands; the bench is
+the regression gate the fix needs to satisfy.
+
+### Dual-engine policy + shared corpus
+
+libFuzzer (sancov-driven, in-process) and AFL++ (queue + havoc,
+fork-based) find different bug classes on the same target. The repo
+keeps both engines wired for the highest-grammar-density targets
+(everything marked OK in both columns of the table above) and shares
+the corpus directories between them:
+
+- libFuzzer reads/writes `fuzz/corpus/<target>/`
+- AFL++ reads `fuzz-afl/seeds/<target>/` as initial corpus and writes
+  discovered inputs to `fuzz-afl/runs/<target>/<stamp>/sync/`
+- Cross-pollination: after a campaign, copy interesting AFL-discovered
+  inputs into the libFuzzer corpus (and vice versa) with
+  `rsync -a --ignore-existing`. This lets each engine warm-start from
+  the other's frontier.
+
+When promoting a regression seed for a fixed bug, **always copy into
+both directories** (see "Triage" above for the exact `cp` lines) so
+the next campaign on either engine confirms the fix.
 
 ---
 
@@ -106,17 +183,19 @@ cargo +nightly fuzz run header_parse fuzz/corpus/header_parse/regression_X -- -r
 
 ### Output layout
 
-```
-fuzz/
-├── fuzz_targets/<target>.rs        the harness source
-├── corpus/<target>/                inputs libFuzzer found OR you seeded
-│   ├── seed_file_001               <- human-curated seed (commit these!)
-│   ├── 06a19d05b0db...             <- libFuzzer-discovered, sha1-named
-│   ├── regression_oom_unbounded_bincode    <- post-fix regression seed
-│   └── ...
-└── artifacts/<target>/             crash artifacts and slow-units
-    ├── crash-XXX                   <- libFuzzer-saved crash inputs
-    └── slow-unit-XXX               <- inputs slower than 100 ms
+```mermaid
+flowchart LR
+    Fuzz["fuzz/"]
+    Fuzz --> Targets["fuzz_targets/&lt;target&gt;.rs<br/>the harness source"]
+    Fuzz --> Corpus["corpus/&lt;target&gt;/<br/>inputs libFuzzer found OR you seeded"]
+    Fuzz --> Artifacts["artifacts/&lt;target&gt;/<br/>crash artifacts and slow-units"]
+
+    Corpus --> Seed["seed_file_001<br/>(human-curated, commit these)"]
+    Corpus --> Found["06a19d05b0db...<br/>(libFuzzer-discovered, sha1-named)"]
+    Corpus --> Regression["regression_oom_unbounded_bincode<br/>(post-fix regression seed)"]
+
+    Artifacts --> Crash["crash-XXX<br/>libFuzzer-saved crash inputs"]
+    Artifacts --> Slow["slow-unit-XXX<br/>inputs slower than 100 ms"]
 ```
 
 ### Triage a crash
@@ -282,7 +361,7 @@ The script:
 
 1. Pre-flight checks (toolchain present; warns about kernel/governor).
 2. Builds the harnesses (idempotent).
-3. Spawns 1 master + (cores−1) slaves via `afl-fuzz -M/-S`, all
+3. Spawns 1 master + (cores-1) slaves via `afl-fuzz -M/-S`, all
    writing to a shared sync dir so AFL's queue-sync picks up new
    corpus inputs from siblings every few seconds.
 4. Periodic `afl-whatsup` snapshots to `campaign.log`.
@@ -296,17 +375,17 @@ for a clean restart.
 
 ```
 fuzz-afl/runs/<target>/<UTC-timestamp>/
-├── master.log                  stdout from master fuzzer
-├── slave_*.log                 stdout from each slave
-├── campaign.log                aggregated whatsup + final summary
-└── sync/
-    ├── master/
-    │   ├── queue/              corpus discovered by master
-    │   ├── crashes/            inputs that crashed (THIS IS THE BUG)
-    │   ├── hangs/              inputs exceeding the per-input timeout
-    │   ├── fuzzer_stats        machine-readable progress
-    │   └── plot_data           for `afl-plot`
-    └── slave_1/, slave_2/, ...   same shape per slave
++-- master.log                  stdout from master fuzzer
++-- slave_*.log                 stdout from each slave
++-- campaign.log                aggregated whatsup + final summary
++-- sync/
+    +-- master/
+    |   +-- queue/              corpus discovered by master
+    |   +-- crashes/            inputs that crashed (THIS IS THE BUG)
+    |   +-- hangs/              inputs exceeding the per-input timeout
+    |   +-- fuzzer_stats        machine-readable progress
+    |   +-- plot_data           for `afl-plot`
+    +-- slave_1/, slave_2/, ...   same shape per slave
 ```
 
 ### Triage an AFL crash

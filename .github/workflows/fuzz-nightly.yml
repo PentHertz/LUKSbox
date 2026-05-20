@@ -40,10 +40,23 @@ jobs:
           - metadata_parse
           - header_roundtrip
           - hybrid_sidecar_parse
+          - hybrid_sidecar_adversarial
           - seed_file_parse
           - auth_then_process
           - winfsp_path_parse
           - webauthn_device_path
+          - vfs_ops
+          - deniable_header_parse
+          - slot_payload_decode
+          - slot_payload_roundtrip
+          # 2026-05 additions: per-chunk AEAD callsite + standard +
+          # deniable anchor readers. See FUZZING.md table.
+          - chunk_aead_decrypt
+          - anchor_parse
+          # Round 12 addition: multi-slot envelope opacity. Catches
+          # any regression to a non-opaque error variant on the
+          # multi-slot deniable open path. See R12-01.
+          - deniable_envelope_multi_slot
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
@@ -52,9 +65,9 @@ jobs:
           shared-key: fuzz-nightly
           workspaces: "fuzz"
       - name: Linux deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
             pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev clang
       # NB: no `--locked`. cargo-fuzz 0.13.x ships a Cargo.lock pinning
       # rustix 0.36.5, which uses internal `rustc_*` attributes without

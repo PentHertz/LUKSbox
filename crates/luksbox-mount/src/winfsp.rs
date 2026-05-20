@@ -121,6 +121,46 @@ use crate::winfsp_path::{
 
 const VOLUME_LABEL: &str = "luksbox";
 
+/// Turn `winfsp_wrs::InitError` into a user-facing message. The
+/// upstream `Debug` impl prints bare identifiers like
+/// `WinFSPNotFound`, which we used to forward verbatim -- users
+/// then saw "winfsp init failed: WinFSPNotFound" with no hint
+/// about what to install or why. The binding resolves the DLL
+/// strictly via `HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir`, so
+/// placing `winfsp-x64.dll` next to luksbox.exe is NOT a fallback;
+/// the only real fix is "install WinFsp 2.x". Surface that.
+fn map_init_error(e: winfsp_wrs::InitError) -> MountError {
+    let msg = match e {
+        winfsp_wrs::InitError::WinFSPNotFound => {
+            "WinFsp 2.x is not installed on this machine, so LUKSbox \
+             cannot create a Windows volume. Install WinFsp from \
+             https://winfsp.dev/rel/, reboot if prompted, then try \
+             again. (Detection looks for HKLM\\SOFTWARE\\\
+             WOW6432Node\\WinFsp\\InstallDir; if you installed WinFsp \
+             but still see this, reinstall using the official MSI so \
+             the registry entry is created.)"
+                .to_string()
+        }
+        winfsp_wrs::InitError::CannotLoadDLL { dll_path } => format!(
+            "WinFsp's registry entry points at {} but the DLL could \
+             not be loaded. Common causes: WinFsp install corrupted, \
+             64-bit / ARM64 mismatch, or a broken upgrade. Reinstall \
+             WinFsp from https://winfsp.dev/rel/.",
+            dll_path.to_string_lossy()
+        ),
+    };
+    MountError::Io(std::io::Error::other(msg))
+}
+
+/// Returns `Ok(())` if WinFsp 2.x is installed and the DLL loads.
+/// Used by the GUI to pre-flight the mount button so it can show
+/// the install-WinFsp hint without first spinning up the FUSE
+/// dispatch and friends. Idempotent; calling it before
+/// `mount()` is fine because `winfsp_wrs::init` itself is.
+pub fn winfsp_preflight() -> Result<(), MountError> {
+    winfsp_wrs::init().map_err(map_init_error)
+}
+
 /// Map a `winfsp_path::PathParseError` to the closest NTSTATUS we can
 /// return from a WinFsp callback. Centralized so every helper that
 /// calls into the parser uses the same mapping - keeps Explorer error
@@ -152,6 +192,14 @@ fn split_parent_name(path: &str) -> Result<(&str, &str), NTSTATUS> {
     split_parent_name_inner(path).map_err(path_err_to_nt)
 }
 
+// Two NTSTATUSes not re-exported by winfsp_wrs but needed for the
+// metadata-budget and per-file-cap errors. Standard Win32 codes:
+//   STATUS_DISK_FULL       = 0xC000007F  (-> "There is not enough space on the disk.")
+//   STATUS_FILE_TOO_LARGE  = 0xC0000904  (-> "The file size exceeds the limit allowed and cannot be saved.")
+// `winfsp_wrs::NTSTATUS` is a type alias for `LONG` (i32), so build via cast.
+const STATUS_DISK_FULL: NTSTATUS = 0xC000_007Fu32 as NTSTATUS;
+const STATUS_FILE_TOO_LARGE: NTSTATUS = 0xC000_0904u32 as NTSTATUS;
+
 fn vfs_err_to_nt(e: &luksbox_vfs::Error) -> NTSTATUS {
     use luksbox_vfs::Error as E;
     match e {
@@ -160,6 +208,8 @@ fn vfs_err_to_nt(e: &luksbox_vfs::Error) -> NTSTATUS {
         E::NotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
         E::NotADirectory => STATUS_NOT_A_DIRECTORY,
         E::InvalidPath(_) => STATUS_OBJECT_PATH_NOT_FOUND,
+        E::MetadataBudgetExhausted => STATUS_DISK_FULL,
+        E::FileSizeExceedsCap => STATUS_FILE_TOO_LARGE,
         _ => STATUS_ACCESS_DENIED,
     }
 }
@@ -249,22 +299,28 @@ pub struct OpenContext {
 
 pub struct LuksboxFs {
     inner: Mutex<Vfs>,
-    /// Permissive default security descriptor returned for every
-    /// inode in the volume. With `PersistentAcls=false` (we don't
-    /// store ACLs in the vault), every `get_security_by_name` call
-    /// MUST return a non-null security descriptor, otherwise WinFsp
-    /// hands the file off with a null SD and Windows refuses access
-    /// ("Z:\ is unavailable" in Explorer, even from the user that
-    /// mounted the FS - empirically observed). The previous code
-    /// returned `PSecurityDescriptor::default()` (a null pointer)
-    /// hoping WinFsp would substitute a default; it does not.
+    /// Default security descriptor returned for every inode in the
+    /// volume. With `PersistentAcls=false` (we don't store ACLs in
+    /// the vault), every `get_security_by_name` call MUST return a
+    /// non-null security descriptor, otherwise WinFsp hands the
+    /// file off with a null SD and Windows refuses access ("Z:\ is
+    /// unavailable" in Explorer, even from the user that mounted
+    /// the FS - empirically observed). The previous code returned
+    /// `PSecurityDescriptor::default()` (a null pointer) hoping
+    /// WinFsp would substitute a default; it does not.
     ///
     /// SDDL grants Full Access to BUILTIN\Administrators, NT
-    /// AUTHORITY\SYSTEM, and Everyone (`WD`). Owner/Group set to
-    /// SYSTEM. This is the most permissive practical descriptor:
-    /// the .lbx file itself is what gates access (you need read
-    /// access to the .lbx to mount in the first place), so volume-
-    /// internal ACLs would only get in the way of legitimate use.
+    /// AUTHORITY\SYSTEM, and the **current user** (the SID of the
+    /// process that mounted the volume, resolved at construction
+    /// via `current_user_sid`). Owner/Group set to the same user.
+    /// Earlier versions granted Full Access to Everyone (`WD`)
+    /// which let any local logon session read decrypted contents
+    /// while the volume was mounted - that ACE has been removed.
+    /// The .lbx file itself still gates initial access (you need
+    /// read access to the .lbx to mount in the first place), and
+    /// the per-volume ACL now enforces single-user isolation on
+    /// the mountpoint side too.
+    ///
     /// Boxed because `Vec<u8>` (which `SecurityDescriptor` wraps)
     /// can reallocate; the pointer we hand to WinFsp must stay
     /// valid for the FS lifetime, so we pin it via `Box`.
@@ -279,11 +335,20 @@ pub struct LuksboxFs {
 
 impl LuksboxFs {
     pub fn new(vfs: Vfs) -> Self {
-        // Build the default SD from SDDL. The SDDL string is fixed
-        // ASCII, so `unwrap()` here cannot fail except via OOM.
-        let sddl_str = U16CString::from_str("O:SYG:SYD:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;FA;;;WD)")
-            .expect("SDDL string is ASCII, no NUL");
-        let sd = SecurityDescriptor::from_wstr(&sddl_str).expect("hardcoded SDDL must parse");
+        // Build the default SD from SDDL. Owner/Group/extra-DACL-entry
+        // = the current process's user SID, resolved at runtime via
+        // `current_user_sid` so volume-internal ACLs match the user
+        // who actually mounted the volume. Falls back to a strict
+        // "Administrators + SYSTEM only" SDDL if SID resolution fails
+        // (e.g. token query rejected in some sandboxed contexts) -
+        // strictly tighter than the previous Everyone (`WD`) default.
+        let sddl_string = match current_user_sid() {
+            Some(sid) => format!("O:{sid}G:{sid}D:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;FA;;;{sid})"),
+            None => String::from("O:BAG:SYD:P(A;;FA;;;BA)(A;;FA;;;SY)"),
+        };
+        let sddl_str =
+            U16CString::from_str(&sddl_string).expect("constructed SDDL is ASCII, no NUL");
+        let sd = SecurityDescriptor::from_wstr(&sddl_str).expect("constructed SDDL must parse");
         let vault_parent = vfs
             .container()
             .vault_path()
@@ -753,8 +818,7 @@ impl FileSystemInterface for LuksboxFs {
 /// mount are the in-process `stop()` (handled here) or letting the
 /// process exit, which the kernel driver detects and unwinds.
 pub fn mount(vfs: Vfs, mountpoint: &Path) -> Result<(), MountError> {
-    winfsp_wrs::init()
-        .map_err(|e| MountError::Io(std::io::Error::other(format!("WinFsp init failed: {e:?}"))))?;
+    winfsp_wrs::init().map_err(map_init_error)?;
 
     // Default OperationGuardStrategy (Coarse) matches our `Mutex<Vfs>`:
     // WinFsp serializes dispatch under a single internal lock, which is
@@ -918,6 +982,78 @@ fn normalize_mountpoint(mountpoint: &Path) -> Result<String, MountError> {
 /// can fall back to a roomy nominal value. Used by `get_volume_info`
 /// to surface honest disk space to Windows Explorer instead of a
 /// hardcoded 1 TiB lie. Counterpart to `host_fs_statvfs` on Linux/macOS.
+/// Return the string-form SID (`S-1-5-21-...`) of the current
+/// process's primary token user. Used to build the volume's default
+/// security descriptor so it grants Full Access to the user that
+/// mounted the volume rather than to Everyone.
+///
+/// Returns `None` on any Win32-API failure; the caller falls back to
+/// an Administrators+SYSTEM-only ACL in that case (strictly tighter
+/// than the previous Everyone default, so a failure-mode never
+/// regresses security).
+fn current_user_sid() -> Option<String> {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        // 1. Open the current process's primary token for TOKEN_QUERY.
+        let mut token: HANDLE = ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return None;
+        }
+
+        // 2. Two-call pattern: first call returns the required buffer
+        //    size in `len`; second call fills the buffer with a
+        //    TOKEN_USER struct.
+        let mut len: u32 = 0;
+        let _ = GetTokenInformation(token, TokenUser, ptr::null_mut(), 0, &mut len);
+        if len == 0 {
+            CloseHandle(token);
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        if GetTokenInformation(
+            token,
+            TokenUser,
+            buf.as_mut_ptr() as *mut c_void,
+            len,
+            &mut len,
+        ) == 0
+        {
+            CloseHandle(token);
+            return None;
+        }
+        CloseHandle(token);
+
+        // 3. Convert the binary SID to the canonical "S-1-..." string
+        //    form. ConvertSidToStringSidW allocates the result via
+        //    LocalAlloc; we must LocalFree it after copying.
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut sid_ptr: *mut u16 = ptr::null_mut();
+        if ConvertSidToStringSidW(user.User.Sid, &mut sid_ptr) == 0 || sid_ptr.is_null() {
+            return None;
+        }
+
+        // Find the NUL terminator (max 184 chars per Microsoft docs for
+        // ConvertSidToStringSid; the bound caps a runaway scan if the
+        // returned buffer is somehow not NUL-terminated).
+        let mut count = 0usize;
+        while count < 256 && *sid_ptr.add(count) != 0 {
+            count += 1;
+        }
+        let slice = std::slice::from_raw_parts(sid_ptr, count);
+        let sid_string = String::from_utf16_lossy(slice);
+        LocalFree(sid_ptr as *mut c_void);
+
+        Some(sid_string)
+    }
+}
+
 fn host_disk_space(path: &Path) -> Option<(u64, u64)> {
     use std::os::windows::ffi::OsStrExt;
     // GetDiskFreeSpaceExW takes a wide-string path; convert and NUL-terminate.

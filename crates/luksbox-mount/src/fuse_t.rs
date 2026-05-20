@@ -86,6 +86,8 @@ impl LuksboxFuseTFs {
             VfsError::NotAFile => Errno::EISDIR,
             VfsError::NotEmpty => Errno::ENOTEMPTY,
             VfsError::InvalidPath(_) => Errno::EINVAL,
+            VfsError::MetadataBudgetExhausted => Errno::ENOSPC,
+            VfsError::FileSizeExceedsCap => Errno::EFBIG,
             _ => Errno::EIO,
         }
     }

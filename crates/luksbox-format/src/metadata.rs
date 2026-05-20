@@ -8,12 +8,124 @@ use luksbox_core::{CipherSuite, MasterVolumeKey, SubKey, aead};
 
 use crate::error::Error;
 
-/// Default metadata region size: 1 MiB. Holds the encrypted directory tree and
-/// any small global metadata. Re-encrypted on every write.
-pub const DEFAULT_METADATA_REGION_SIZE: u64 = 1024 * 1024;
+/// Default metadata region size: 16 MiB. Holds the encrypted directory tree
+/// and any small global metadata, re-encrypted on every write.
+///
+/// Sized to fill the format-level cap [`luksbox_core::header::MAX_METADATA_SIZE`]
+/// (also 16 MiB). Practical vault-data headroom before the chunk-ref list
+/// overflows: **~8-10 GiB**, depending on directory depth, file count, and
+/// how big the chunk IDs grow (a single ChunkRef is two u64 postcard varints,
+/// 4-6 B at realistic IDs; plus per-inode + Vec-length overhead). The
+/// original 1 MiB default silently lost data around ~800 MiB of total stored
+/// content. Bumping to 16 MiB pushes the ceiling out by ~12x.
+///
+/// To support vaults beyond ~10 GiB the on-disk format itself needs work:
+/// either raise `MAX_METADATA_SIZE` (forward-compat-breaking change for old
+/// readers) or move the per-file chunk list out-of-line into the data area
+/// (proper format v2). Both are deferred to a future release.
+///
+/// On-disk cost: an empty vault is at least `metadata_offset + 16 MiB`. For
+/// the typical "encrypted backup of $HOME on a USB stick" use case this is
+/// rounding error; for very small demo vaults, override via the
+/// `--metadata-size` CLI flag.
+pub const DEFAULT_METADATA_REGION_SIZE: u64 = 16 * 1024 * 1024;
 
 /// Per-blob fixed overhead on disk: 12 B nonce + 8 B ciphertext-length + 16 B tag.
 pub const METADATA_OVERHEAD: usize = 12 + 8 + 16;
+
+/// Magic prefix written ahead of the postcard payload in v2 metadata blobs
+/// (`b"LBM2"`). Counted alongside the postcard size when budgeting the AEAD
+/// plaintext, but defined in `luksbox-vfs::vfs`. Kept here as a known
+/// upper-bound constant for the fail-fast check in `Vfs::write`:
+/// any caller estimating the metadata budget should subtract this too.
+pub const METADATA_MAGIC_LEN: usize = 4;
+
+/// Maximum useful postcard payload that fits in a metadata region of the given
+/// size. Returns the largest `plaintext.len()` for which `write_metadata`
+/// would NOT return `Error::MetadataTooLarge`, minus the magic prefix the
+/// VFS layer prepends to the postcard payload. Saturates at zero for
+/// pathologically small regions.
+///
+/// Used by `Vfs::write` (and friends) to fail mid-write with ENOSPC as soon
+/// as the dirty tree would no longer serialize within the on-disk budget,
+/// instead of letting `cp` claim success and only surfacing the failure at
+/// flush time -- which causes silent data loss because the chunks are
+/// already on disk but the metadata pointer is not.
+pub fn payload_budget_for(region_size: u64) -> usize {
+    let cap = region_size as usize;
+    cap.saturating_sub(METADATA_OVERHEAD)
+        .saturating_sub(METADATA_MAGIC_LEN)
+}
+
+// ----------------------------------------------------------------------
+// Thread-local override for the per-vault metadata region size at create
+// time. The 17 `Container::create_with_*` constructors all funnel through
+// `create_internal` (or a parallel path for the FIDO2-derived-MVK and
+// deniable creates); rather than threading an `Option<u64>` through every
+// signature, the CLI / GUI / wizard layer sets this override on the
+// thread that's about to call create. `create_internal` reads it and
+// resets it on drop so a leaked override can't poison a later create on
+// the same thread.
+//
+// Why thread-local and not a parameter: parameter plumbing through 17
+// public function signatures was rejected (large API surface change,
+// breaks every external consumer). Why thread-local and not process-
+// global: lets concurrent creates on different threads pick different
+// sizes (e.g. a GUI background worker creating one vault while the user
+// inspects another from a different code path). Reset-on-drop via a
+// guard makes leaks impossible.
+//
+// Scope: ONLY used at create time. Open / read / write paths read the
+// metadata region size from the on-disk header field, never from this
+// override. So an existing vault always uses its written-at-create
+// size regardless of what's been set here later.
+// ----------------------------------------------------------------------
+thread_local! {
+    static CREATE_METADATA_SIZE_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Read the current thread-local metadata-region-size override, or
+/// fall back to `DEFAULT_METADATA_REGION_SIZE`. The on-disk cap
+/// [`luksbox_core::header::MAX_METADATA_SIZE`] (16 MiB today) is also
+/// enforced by the header parser at create time, so callers that set
+/// an absurd override get a clean rejection.
+pub fn resolved_create_metadata_region_size() -> u64 {
+    CREATE_METADATA_SIZE_OVERRIDE
+        .with(|c| c.get())
+        .unwrap_or(DEFAULT_METADATA_REGION_SIZE)
+}
+
+/// RAII guard returned by [`set_create_metadata_region_size_override`].
+/// Restores the previous override on drop so a panic between set and
+/// create-call can't poison a later create on the same thread.
+pub struct CreateMetadataSizeOverrideGuard {
+    previous: Option<u64>,
+}
+
+impl Drop for CreateMetadataSizeOverrideGuard {
+    fn drop(&mut self) {
+        CREATE_METADATA_SIZE_OVERRIDE.with(|c| c.set(self.previous));
+    }
+}
+
+/// Set the metadata-region size for any `Container::create_with_*` call
+/// made on this thread until the returned guard is dropped. `None`
+/// restores the default. Stacking guards is supported (Drop restores
+/// the previous value, not unconditionally `None`).
+///
+/// Example (CLI flag):
+/// ```ignore
+/// let _g = set_create_metadata_region_size_override(Some(8 * 1024 * 1024));
+/// Container::create_with_passphrase(/* ... */)?;
+/// // guard drops here, override clears
+/// ```
+pub fn set_create_metadata_region_size_override(
+    size: Option<u64>,
+) -> CreateMetadataSizeOverrideGuard {
+    let previous = CREATE_METADATA_SIZE_OVERRIDE.with(|c| c.replace(size));
+    CreateMetadataSizeOverrideGuard { previous }
+}
 
 const NONCE_LEN: usize = 12;
 const LEN_FIELD_LEN: usize = 8;

@@ -334,8 +334,18 @@ impl Drop for SecretBox {
 }
 
 impl Clone for SecretBox {
+    /// Round 13 R13-09: copy directly between two `SecretBox` buffers
+    /// without going through `Self::from_bytes(*self.as_array())`. The
+    /// old path created a `[u8; KEY_LEN]` by-value temporary on the
+    /// caller's stack, leaving 32 bytes of key material readable in
+    /// the previous stack frame until the next reuse. The new path
+    /// allocates a fresh secret-memory backing first and then
+    /// `copy_from_slice`s from one allocator-owned buffer to another,
+    /// so no stack-resident copy ever exists.
     fn clone(&self) -> Self {
-        Self::from_bytes(*self.as_array())
+        let mut s = Self::zeroed();
+        s.as_mut_array().copy_from_slice(self.as_array());
+        s
     }
 }
 

@@ -114,7 +114,7 @@ jobs:
           # - target: x86_64-apple-darwin
           #   runner: macos-13         # last Intel macOS runner
           #   archive: luksbox-${{ github.ref_name }}-x86_64-macos.tar.gz
-          # macOS Apple Silicon, two parallel builds — one per FUSE
+          # macOS Apple Silicon, two parallel builds -- one per FUSE
           # backend. Each runner installs ONLY the matching provider
           # (no fallback) and produces a backend-suffixed .dmg + .tar.gz.
           # End users on the download page pick the variant matching
@@ -151,13 +151,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           # Include fuse_backend so the two macOS variants (fuset /
-          # macfuse) don't share a cache slot — they link different
+          # macfuse) don't share a cache slot -- they link different
           # libfuse families so cached artifacts would poison each
           # other. Empty for non-macOS targets, no behavior change.
           key: ${{ matrix.target }}-${{ matrix.fuse_backend }}
           # cache hit-rate matters most on Windows where vcpkg also
           # builds OpenSSL from source; the rust-cache covers ~/.cargo.
-          shared-key: release
+          # The `-vN` suffix is a manual cache-bust knob: when a feature
+          # set / dep version / workspace member changes shape, stale
+          # restored artifacts can produce `error[E0463]: can't find
+          # crate for X` even though Cargo.toml looks correct. Bumping
+          # the suffix forces a clean rebuild across every matrix entry.
+          # Last bump: 2026-05-19 (Round 12 reshaped luksbox-fido2 +
+          # luksbox-mount: new `subtle` workspace dep on fido2,
+          # HmacSecret newtype, MasterVolumeKey::from_zeroizing
+          # constructor, new windows-sys features on mount. Stale jammy
+          # artifacts then reported "can't find crate for fuser" and
+          # "can't find crate for zbus" because the cached luksbox-mount
+          # rlib was built before the dep graph was reshaped.).
+          shared-key: release-v3
 
       - name: Derive LUKSBOX_VERSION
         # On a tag push (`refs/tags/vX.Y.Z`), GITHUB_REF_NAME is the tag
@@ -223,17 +235,23 @@ jobs:
         # on Linux. libfuse3-dev is here so the `mount` subcommand
         # works on the resulting binary. imagemagick is here for
         # scripts/build_icons.sh.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config \
-            libfido2-dev \
-            libssl-dev \
-            libudev-dev \
-            zlib1g-dev \
-            libfuse3-dev \
-            libgtk-3-dev \
-            libtss2-dev \
+        #
+        # ./.github/actions/apt-install forces IPv4 + retries on
+        # transient mirror failures. Without IPv4 forcing the arm64
+        # runners (ubuntu-22.04-arm / ubuntu-24.04-arm) frequently
+        # time out trying to fetch from ports.ubuntu.com's IPv6
+        # addresses, which the runner network can't route to.
+        uses: ./.github/actions/apt-install
+        with:
+          packages: |
+            pkg-config
+            libfido2-dev
+            libssl-dev
+            libudev-dev
+            zlib1g-dev
+            libfuse3-dev
+            libgtk-3-dev
+            libtss2-dev
             imagemagick
 
       - name: macOS deps (Homebrew)
@@ -822,21 +840,30 @@ jobs:
 
       - name: Lint .deb (lintian)
         if: runner.os == 'Linux'
+        uses: ./.github/actions/apt-install
+        with:
+          packages: lintian
+
+      - name: Run lintian against the .deb
+        if: runner.os == 'Linux'
+        # `--fail-on error` exits non-zero only on errors, not on
+        # warnings/info/pedantic. cargo-deb output trips a few
+        # benign warnings (no source package, no upstream changelog)
+        # that we accept; real bugs (missing field, bad mode) are
+        # errors and will fail the job.
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq lintian
-          # `--fail-on error` exits non-zero only on errors, not on
-          # warnings/info/pedantic. cargo-deb output trips a few
-          # benign warnings (no source package, no upstream changelog)
-          # that we accept; real bugs (missing field, bad mode) are
-          # errors and will fail the job.
           lintian --no-tag-display-limit --info --display-info \
             --fail-on error "$DEB_PATH"
 
       - name: Lint .rpm (rpmlint)
         if: runner.os == 'Linux' && matrix.build_rpm
+        uses: ./.github/actions/apt-install
+        with:
+          packages: rpmlint
+
+      - name: Run rpmlint against the .rpm
+        if: runner.os == 'Linux' && matrix.build_rpm
         run: |
-          sudo apt-get install -y -qq rpmlint
           # `-c dist/rpm/rpmlint.toml` filters the small set of
           # cargo-generate-rpm 0.16.x output limitations + the
           # unsigned-RPM warning we accept on dev artifacts. Each
@@ -1629,6 +1656,29 @@ jobs:
               exit 1
           }
 
+      - name: Stage upstream WinFsp license text
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Pulled verbatim from the same WinFsp tag (v2.0) that the
+          # Burn bundle install-time chains. Staged into staging/ so
+          # BOTH artifacts pick it up:
+          #   - the bare LUKSbox.msi installs it via LuksboxFiles
+          #     (LUKSbox.exe links winfsp-x64.dll at runtime regardless
+          #     of how WinFsp got there, so the license is relevant in
+          #     either install path);
+          #   - the Burn bundle reuses the same MSI so the file lands
+          #     under %ProgramFiles%\LUKSbox\LICENSE-WINFSP.txt.
+          $url = "https://raw.githubusercontent.com/winfsp/winfsp/v2.0/License.txt"
+          $dst = "staging\LICENSE-WINFSP.txt"
+          Write-Host "==> fetching $url -> $dst"
+          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $dst
+          if (-not (Test-Path $dst) -or (Get-Item $dst).Length -lt 1000) {
+              throw "WinFsp license fetch failed or returned an unexpectedly tiny file"
+          }
+          $bytes = (Get-Item $dst).Length
+          Write-Host "==> staged $bytes bytes of WinFsp license text"
+
       - name: Build Windows MSI (WiX v4)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -1651,6 +1701,21 @@ jobs:
               # The real icon should always be there in CI thanks to
               # the "Generate platform icons" step.
               New-Item -ItemType File -Path "staging\luksbox-installer.ico" -Force | Out-Null
+          }
+          # The Burn bundle (`luksbox-bundle.wxs`) uses
+          # staging\luksbox-installer-side.png for the
+          # `hyperlinkSidebarLicense` theme's LogoSideFile. It's a
+          # 165x315 portrait PNG with the icon centered on white,
+          # generated by scripts/build_icons.sh. Without this the
+          # bundle either falls back to a default WiX side image
+          # (no LUKSbox branding) or, if LogoSideFile points at a
+          # square asset, stretches it vertically.
+          if (Test-Path "crates\luksbox-gui\assets\icon-bundle-side.png") {
+              Copy-Item "crates\luksbox-gui\assets\icon-bundle-side.png" `
+                        "staging\luksbox-installer-side.png"
+          } else {
+              Write-Warning "no icon-bundle-side.png, bundle sidebar will use default WiX image"
+              New-Item -ItemType File -Path "staging\luksbox-installer-side.png" -Force | Out-Null
           }
           # MSI requires a 4-part version. The earlier "Derive
           # LUKSBOX_VERSION (Windows)" step already resolved this from
@@ -1702,6 +1767,142 @@ jobs:
           if (Test-Path "${{ matrix.archive }}") { Remove-Item "${{ matrix.archive }}" }
           Compress-Archive -Path staging/* -DestinationPath "${{ matrix.archive }}"
 
+      - name: Fetch + verify pinned WinFsp MSI (for the Burn bundle)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          # Pinned WinFsp version. Bump when WinFsp ships a new
+          # stable; CI's mount-integration tests also reference
+          # this exact version (search for "23075" in ci.yml +
+          # release.yml + scripts/setup_mingw_winfsp.sh and bump
+          # in lock-step). The two safety nets below catch
+          # tampering:
+          #   1. Authenticode signature check: WinFsp's MSI is
+          #      Authenticode-signed by Bill Zissimopoulos; we
+          #      reject anything not signed by that subject.
+          #   2. Optional SHA-256 pin: set WINFSP_MSI_SHA256 to
+          #      the known-good hash of this exact MSI to also
+          #      defense-in-depth against a compromised
+          #      Authenticode chain. Empty = signature check only.
+          WINFSP_VERSION:      "2.0.23075"
+          WINFSP_MSI_SHA256:   ""
+        run: |
+          $msi = "$env:RUNNER_TEMP\winfsp-bundled.msi"
+          $url = "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-$env:WINFSP_VERSION.msi"
+          Write-Host "==> downloading $url"
+          Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $msi
+          if (-not (Test-Path $msi)) { throw "WinFsp MSI download failed" }
+          $size = (Get-Item $msi).Length
+          Write-Host "==> downloaded $size bytes"
+
+          # Defense 1: Authenticode signature check. Rejects
+          # anything not signed by the WinFsp publisher.
+          $sig = Get-AuthenticodeSignature -FilePath $msi
+          Write-Host "==> Authenticode status: $($sig.Status) ($($sig.StatusMessage))"
+          if ($sig.Status -ne 'Valid') {
+              throw "WinFsp MSI Authenticode invalid: $($sig.Status) - $($sig.StatusMessage)"
+          }
+          $subj = $sig.SignerCertificate.Subject
+          Write-Host "==> signer subject: $subj"
+          # WinFsp's MSI is Authenticode-signed by Bill Zissimopoulos's
+          # company NAVIMATICS LLC (Kirkland, WA) with an EV code-signing
+          # cert. The other names are kept as fallback in case a future
+          # WinFsp release rotates to a personal cert or a project-named
+          # cert. CN-only match is fine, the cert is also EV-checked
+          # implicitly via the Authenticode status above (a self-signed
+          # cert with the same CN would have Status != Valid).
+          if ($subj -notmatch 'NAVIMATICS|Zissimopoulos|WinFsp') {
+              throw "WinFsp MSI signed by unexpected party: $subj"
+          }
+
+          # Defense 2: optional SHA-256 pin. Skipped on first
+          # build (pin is empty); on subsequent builds the hash
+          # is pinned and any drift fails the workflow.
+          $hash = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLowerInvariant()
+          Write-Host "==> downloaded SHA-256: $hash"
+          if ($env:WINFSP_MSI_SHA256) {
+              $pin = $env:WINFSP_MSI_SHA256.ToLowerInvariant()
+              if ($hash -ne $pin) {
+                  throw "WinFsp MSI hash mismatch. expected: $pin actual: $hash"
+              }
+              Write-Host "==> SHA-256 pin matches."
+          } else {
+              Write-Warning "WINFSP_MSI_SHA256 is empty; relying on Authenticode only. Pin '$hash' in release.yml to enable defense #2."
+          }
+
+          # Surface the path so the bundle build step can find it.
+          echo "WINFSP_MSI_PATH=$msi" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Build Windows Burn bundle (LUKSboxSetup.exe)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # WiX v4 + Bal extension. The Util extension is for the
+          # RegistrySearch element used by the bundle's WinFsp
+          # detect-already-installed gate.
+          if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
+              dotnet tool install --global wix --version 4.0.5
+              $env:PATH = "$env:USERPROFILE\.dotnet\tools;" + $env:PATH
+          }
+          wix extension add -g WixToolset.Bal.wixext/4.0.5
+          wix extension add -g WixToolset.Util.wixext/4.0.5
+
+          $version = $env:LUKSBOX_VERSION
+          $bundleName = "luksbox-v$version-x86_64-windows-setup.exe"
+          wix build dist\luksbox-bundle.wxs `
+              -ext WixToolset.Bal.wixext `
+              -ext WixToolset.Util.wixext `
+              -d "Version=$version" `
+              -d "StagingDir=staging" `
+              -d "LuksboxMsiPath=$env:MSI_PATH" `
+              -d "WinFspMsiPath=$env:WINFSP_MSI_PATH" `
+              -arch x64 `
+              -o $bundleName
+          Get-Item $bundleName | Format-List
+          echo "BUNDLE_PATH=$bundleName" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Code-sign Windows bundle (only if signing cert present)
+        if: runner.os == 'Windows' && env.WINDOWS_PFX_BASE64 != ''
+        shell: pwsh
+        env:
+          WINDOWS_PFX_BASE64:    ${{ secrets.WINDOWS_PFX_BASE64 }}
+          WINDOWS_PFX_PASSWORD:  ${{ secrets.WINDOWS_PFX_PASSWORD }}
+        run: |
+          # Burn bundles must be signed AFTER `wix build` because
+          # the inner MSIs are embedded by the build (signing
+          # before would corrupt the Authenticode signature; the
+          # bundle's own Authenticode signature covers the whole
+          # .exe including the embedded payload). Bill Z's
+          # WinFsp.msi inside keeps its own Authenticode
+          # signature, our outer .exe signature is what makes
+          # SmartScreen happy on first download.
+          $pfx = "$env:RUNNER_TEMP\codesign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_PFX_BASE64))
+          $signtool = (Get-Command signtool -ErrorAction SilentlyContinue).Source
+          if (-not $signtool) {
+              $candidates = Get-ChildItem -Recurse -Filter signtool.exe `
+                  "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -ErrorAction SilentlyContinue |
+                  Where-Object { $_.FullName -like '*\x64\*' } |
+                  Sort-Object LastWriteTime -Descending
+              $signtool = $candidates[0].FullName
+          }
+          # `insignia` is WiX's bundle-aware signing helper. It
+          # rebuilds the bundle's Authenticode signature so the
+          # embedded MSIs and the outer bundle agree on what was
+          # signed, which signtool alone cannot do for a Burn
+          # bundle.
+          & insignia -ib $env:BUNDLE_PATH -o "$env:RUNNER_TEMP\bundle-engine.exe"
+          & $signtool sign /fd sha256 /td sha256 `
+              /tr http://timestamp.digicert.com `
+              /f $pfx /p $env:WINDOWS_PFX_PASSWORD `
+              "$env:RUNNER_TEMP\bundle-engine.exe"
+          & insignia -ab "$env:RUNNER_TEMP\bundle-engine.exe" $env:BUNDLE_PATH -o $env:BUNDLE_PATH
+          & $signtool sign /fd sha256 /td sha256 `
+              /tr http://timestamp.digicert.com `
+              /f $pfx /p $env:WINDOWS_PFX_PASSWORD `
+              $env:BUNDLE_PATH
+          & $signtool verify /pa /v $env:BUNDLE_PATH
+
       - name: Upload Windows MSI
         if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
@@ -1712,6 +1913,17 @@ jobs:
           # in artifacts/.
           name: ${{ matrix.target }}-msi
           path: ${{ env.MSI_PATH }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows Burn bundle
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          # Separate artifact so the release job can list both
+          # .msi (admin path) and -setup.exe (default user path).
+          name: ${{ matrix.target }}-setup
+          path: ${{ env.BUNDLE_PATH }}
           if-no-files-found: error
           retention-days: 14
 
@@ -2017,25 +2229,25 @@ jobs:
               `.github/workflows/release.yml`, GitHub's `macos-13`
               runner has been intermittently blocking releases.
 
-            **Windows prerequisite (both flavors below):** install
-              **WinFsp 2.x** first from <https://winfsp.dev/rel/>.
-              The LUKSbox binary statically links against
-              `winfsp-x64.dll` (provided by WinFsp), so without it the
-              binary fails to start with `STATUS_DLL_NOT_FOUND`. The
-              MSI refuses to install if WinFsp is missing and shows a
-              clear message; the portable .zip has no installer to
-              warn you, so install WinFsp first either way.
-
             **Windows (x86_64), recommended:** download
-              `luksbox-${{ github.ref_name }}-x86_64-windows.msi`,
-              double-click. The MSI installs LUKSbox to
-              `C:\Program Files\LUKSbox\`, prepends both
-              `C:\Program Files\LUKSbox\` and `<WinFspInstall>\bin`
-              to the system PATH (so the loader resolves
-              `winfsp-x64.dll` and `luksbox` works in cmd /
-              PowerShell), drops a Start menu shortcut, and registers
-              the `.lbx` file extension (double-click any `.lbx` in
-              Explorer to open it). Uninstall via Apps & Features.
+              `luksbox-${{ github.ref_name }}-x86_64-windows-setup.exe`,
+              double-click. The bootstrapper installs WinFsp 2.0.23075
+              (if not already present) AND LUKSbox in one wizard.
+              Unattended deploy: `LUKSboxSetup.exe /quiet`. To skip
+              WinFsp (e.g., you manage it via Group Policy):
+              `LUKSboxSetup.exe InstallWinFsp=0`. WinFsp is bundled
+              under its non-GPL-app linking exception; full license
+              ships as `LICENSE-WINFSP.txt` in the install dir.
+
+            **Windows (x86_64), IT-admin / bare MSI:** download
+              `luksbox-${{ github.ref_name }}-x86_64-windows.msi`. This
+              MSI does **not** include WinFsp; install WinFsp 2.x
+              separately from <https://winfsp.dev/rel/> first
+              (LUKSbox statically links `winfsp-x64.dll` and the MSI
+              refuses to install without it). For unattended deploy
+              behind Group Policy / SCCM / Intune where WinFsp is
+              managed as a separate dependency, this is the right
+              artifact. Otherwise the `-setup.exe` above is easier.
 
             **Windows (x86_64), portable:** unzip
               `luksbox-${{ github.ref_name }}-x86_64-windows.zip`

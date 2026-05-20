@@ -107,7 +107,7 @@ impl Fido2Authenticator for MockAuthenticator {
         if let Some(forced) = self.hmac_secret_override {
             // Hostile mode: ignore (cred_id, salt) entirely and return
             // attacker-chosen bytes. Models a rogue / MITM device.
-            return Ok(forced);
+            return Ok(HmacSecret(forced));
         }
         let secret = self
             .creds
@@ -118,7 +118,7 @@ impl Fido2Authenticator for MockAuthenticator {
         let out = mac.finalize().into_bytes();
         let mut hmac = [0u8; 32];
         hmac.copy_from_slice(&out);
-        Ok(hmac)
+        Ok(HmacSecret(hmac))
     }
 }
 

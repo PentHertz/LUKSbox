@@ -609,6 +609,54 @@ fn panic_destroy_overwrites_header() {
     assert_err(&out, "info on panic-destroyed vault must fail");
 }
 
+#[test]
+#[cfg(unix)]
+fn panic_destroy_refuses_symlinked_vault_path() {
+    // Audit regression: the panic-destroy paths used to do
+    // `vault.is_file()` (follows symlinks) then `OpenOptions::open`
+    // (also follows symlinks), letting an attacker who controls the
+    // parent dir swap in a symlink between the check and the write
+    // to redirect the random-bytes overwrite to /etc/shadow or
+    // similar. The fix routes through `secure_open_existing_no_follow`
+    // which refuses symlinks at the open syscall via O_NOFOLLOW.
+    //
+    // This test plants a symlink at the vault path pointing at a
+    // sentinel file, runs `panic -y --wipe-data`, and verifies:
+    //   1. the command exits non-zero (refused to operate)
+    //   2. the sentinel file is byte-for-byte unchanged
+    //   3. the symlink itself is still a symlink (untouched)
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let sentinel = dir.join("sentinel-do-not-touch");
+    let sentinel_content = b"this file must survive the panic attempt";
+    std::fs::write(&sentinel, sentinel_content).unwrap();
+
+    let attacker_path = dir.join("symlinked-vault.lbx");
+    std::os::unix::fs::symlink(&sentinel, &attacker_path).unwrap();
+
+    let mut env = test_env();
+    env.insert("LUKSBOX_TEST_FAST_KDF", "1");
+    let out = run_with(
+        dir,
+        &env,
+        &["panic", "symlinked-vault.lbx", "-y", "--wipe-data"],
+    );
+    assert_err(
+        &out,
+        "panic on a symlinked vault path must refuse, not redirect the overwrite",
+    );
+
+    // Sentinel must be byte-for-byte unchanged.
+    let sentinel_after = std::fs::read(&sentinel).unwrap();
+    assert_eq!(
+        sentinel_after, sentinel_content,
+        "BUG: panic destroy followed a symlink and overwrote the target file"
+    );
+    // Symlink itself is still a symlink.
+    let meta = std::fs::symlink_metadata(&attacker_path).unwrap();
+    assert!(meta.file_type().is_symlink());
+}
+
 // ---- info on missing / malformed ----------------------------------------
 
 #[test]
@@ -1118,7 +1166,7 @@ fn header_backup_writes_8192_bytes_mode_0600() {
     {
         use std::os::unix::fs::PermissionsExt;
         // Backup is a plaintext copy of secrets-adjacent header bytes
-        // (keyslots, salts) — must NOT be world-readable.
+        // (keyslots, salts) -- must NOT be world-readable.
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
     }
 }

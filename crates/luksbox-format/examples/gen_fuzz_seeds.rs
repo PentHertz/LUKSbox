@@ -180,5 +180,126 @@ fn main() {
     fs::write(format!("{base}/metadata_parse/seed_short"), &region[..40]).unwrap();
     fs::write(format!("{base}/metadata_parse/seed_zero"), vec![0u8; 4096]).unwrap();
 
-    println!("seeds written under {base}/");
+    // -------------------------------------------------------------
+    // Deniable v2 seeds. Written to BOTH the libfuzzer corpus and
+    // the AFL++ seeds directory so the two parallel setups share
+    // their human-curated regression inputs (see FUZZING.md).
+    // -------------------------------------------------------------
+    let afl_base = "/home/user/luksbox/fuzz-afl/seeds";
+    for d in [
+        "deniable_header_parse",
+        "slot_payload_decode",
+        "slot_payload_roundtrip",
+    ] {
+        fs::create_dir_all(format!("{base}/{d}")).unwrap();
+        fs::create_dir_all(format!("{afl_base}/{d}")).unwrap();
+    }
+
+    // deniable_header_parse seed: a real v2 header built from a
+    // Passphrase credential, appended with a passphrase length byte +
+    // the passphrase + padding. Matches the harness's expected input
+    // shape (`DENIABLE_HEADER_SIZE + 64` bytes minimum).
+    {
+        use luksbox_core::deniable::DeniableCredential;
+        use luksbox_format::deniable_header::{
+            DeniableInnerHeader, DeniableMaterial, create_with_credential_v2,
+        };
+        let pass: &[u8] = b"seed-corpus-pass";
+        let cred = DeniableCredential::Passphrase {
+            passphrase: pass,
+            argon2: weak,
+        };
+        let inner = DeniableInnerHeader {
+            format_version_minor: 0,
+            cipher_suite: CipherSuite::Aes256GcmSiv,
+            kdf_id: KdfId::Argon2id,
+            flags: 0,
+            metadata_offset: luksbox_core::deniable::DENIABLE_HEADER_SIZE as u64,
+            metadata_size: 4096,
+            data_offset: luksbox_core::deniable::DENIABLE_HEADER_SIZE as u64 + 4096,
+            chunk_size: 4096,
+        };
+        let (hdr, _mvk) = create_with_credential_v2(
+            &cred,
+            &DeniableMaterial::passphrase_only(),
+            0,
+            CipherSuite::Aes256GcmSiv,
+            inner,
+        )
+        .unwrap();
+
+        // Tail layout the harness expects: rest[0] = pass len,
+        // rest[1..] = passphrase, rest[257] = cipher byte (=0 here,
+        // which maps to Aes256GcmSiv -- matches what we created with).
+        let mut tail = vec![0u8; 64];
+        tail[0] = pass.len() as u8;
+        tail[1..1 + pass.len()].copy_from_slice(pass);
+
+        let mut seed = hdr.clone();
+        seed.extend_from_slice(&tail);
+        fs::write(
+            format!("{base}/deniable_header_parse/seed_passphrase"),
+            &seed,
+        )
+        .unwrap();
+        fs::write(
+            format!("{afl_base}/deniable_header_parse/seed_passphrase"),
+            &seed,
+        )
+        .unwrap();
+    }
+
+    // slot_payload_decode seed: a valid encoded `SlotPayload` whose
+    // length is exactly `PAYLOAD_PLAINTEXT_LEN`. Decoder will accept
+    // and the harness's round-trip assertion will hold.
+    {
+        use luksbox_core::deniable::DeniableKindTag;
+        use luksbox_core::deniable::slot_payload::{HMAC_SALT_LEN, SlotPayload};
+        let payload = SlotPayload::new(
+            DeniableKindTag::Fido2Passphrase,
+            vec![0x42; 32],
+            Some([0x99; HMAC_SALT_LEN]),
+            Vec::new(),
+            [0xab; 12],
+            [0xcd; 48],
+        )
+        .unwrap();
+        let encoded = payload.encode().unwrap();
+        fs::write(
+            format!("{base}/slot_payload_decode/seed_fido2_payload"),
+            &encoded,
+        )
+        .unwrap();
+        fs::write(
+            format!("{afl_base}/slot_payload_decode/seed_fido2_payload"),
+            &encoded,
+        )
+        .unwrap();
+        // Pure-zero buffer: decoder must reject (kind=0 is not a
+        // valid `DeniableKindTag`); good for AFL to learn the
+        // fail-fast path.
+        let zeros = vec![0u8; encoded.len()];
+        fs::write(format!("{base}/slot_payload_decode/seed_zeros"), &zeros).unwrap();
+        fs::write(format!("{afl_base}/slot_payload_decode/seed_zeros"), &zeros).unwrap();
+    }
+
+    // slot_payload_roundtrip seed: a minimal-length buffer that
+    // satisfies the harness's `data.len() >= 1 + 2 + 2 + 1 + 12 +
+    // 32 + 16 = 65` precondition. Picks kind=0 (Passphrase) with
+    // empty material to hit the simplest in-budget branch.
+    {
+        let mut seed = vec![0u8; 96];
+        seed[0] = 0; // data[0] % 8 -> Passphrase
+        // cred_id_len = 0, tpm_blob_len = 0, has_salt = false; nonce
+        // + ct_and_tag stay zero. Constructor accepts; round-trip
+        // assertion holds.
+        fs::write(format!("{base}/slot_payload_roundtrip/seed_minimal"), &seed).unwrap();
+        fs::write(
+            format!("{afl_base}/slot_payload_roundtrip/seed_minimal"),
+            &seed,
+        )
+        .unwrap();
+    }
+
+    println!("seeds written under {base}/ and {afl_base}/");
 }

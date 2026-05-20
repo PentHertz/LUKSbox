@@ -36,7 +36,7 @@ impl Argon2idParams {
     /// could otherwise set `m_cost_kib = u32::MAX` (about 4 TiB allocation
     /// request -> instant OOM) on every unlock attempt.
     pub const SAFE_M_COST_KIB_MAX: u32 = 4 * 1024 * 1024;
-    /// DoS guard: maximum iteration count. 16 is about 3× our `SENSITIVE`
+    /// DoS guard: maximum iteration count. 16 is about 3x our `SENSITIVE`
     /// preset (t=5), still gives plenty of headroom for any future
     /// preset that wants extra stretching, while bounding compute cost
     /// from a hostile on-disk value. Tightened from 64 in audit
