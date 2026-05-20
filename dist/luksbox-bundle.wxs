@@ -39,8 +39,15 @@
      xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
      xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
 
+    <!-- Bundle Name includes the "+ WinFsp" suffix so users see in the
+         Burn window title AND in Windows Add/Remove Programs that the
+         install bundles WinFsp alongside LUKSbox. The transparency
+         matters: WinFsp is a kernel-mode filesystem driver, and the
+         standard Burn UI shows the chain stepping through it but the
+         default bundle name "LUKSbox" alone doesn't telegraph that an
+         additional driver is part of the install. -->
     <Bundle
-        Name="LUKSbox"
+        Name="LUKSbox (includes WinFsp)"
         Manufacturer="Penthertz"
         Version="$(var.Version)"
         UpgradeCode="a7479a2a-37ba-4e06-bcf5-d285d686987e"
@@ -119,17 +126,29 @@
              distribution and a second EULA would confuse users
              into thinking LUKSbox is GPL-licensed.
 
-             NB the `hyperlinkLicense` theme requires `LicenseUrl`
-             (a clickable hyperlink), NOT `LicenseFile`. The
-             `Rtf*License` themes require `LicenseFile` instead
-             and need an RTF, not the plaintext Apache LICENSE we
-             ship. Linking to apache.org is the most authoritative
-             reference and avoids the build-time RTF conversion. -->
+             Theme: `hyperlinkSidebarLicense` (was
+             `hyperlinkLicense`). The sidebar variant adds a left-
+             hand panel that surfaces the installer icon prominently
+             and gives the chain progress screen more vertical room
+             to display BOTH "WinFsp 2.0.23075" AND "LUKSbox" rows
+             as the install proceeds. The previous `hyperlinkLicense`
+             theme had a narrow window where the WinFsp install step
+             flashed by quickly and users could miss it (the exact
+             confusion that led to the "WinFsp not installed" toast
+             post-install).
+
+             NB the `hyperlinkSidebarLicense` theme uses
+             `LicenseUrl` (same as `hyperlinkLicense`); it also
+             uses `LogoSideFile` for the left-panel image. We
+             reuse the installer icon for both `LogoFile` (small,
+             top-right) and `LogoSideFile` (larger, left panel)
+             rather than maintaining two assets. -->
         <BootstrapperApplication>
             <bal:WixStandardBootstrapperApplication
                 LicenseUrl="https://www.apache.org/licenses/LICENSE-2.0"
-                Theme="hyperlinkLicense"
-                LogoFile="$(var.StagingDir)\luksbox-installer.ico" />
+                Theme="hyperlinkSidebarLicense"
+                LogoFile="$(var.StagingDir)\luksbox-installer.ico"
+                LogoSideFile="$(var.StagingDir)\luksbox-installer.ico" />
         </BootstrapperApplication>
 
         <Chain>
@@ -158,10 +177,16 @@
                  the "WinFsp already installed by some other route
                  (choco / portable)" case via the util:* searches
                  defined above. -->
+            <!-- DisplayName is what the Burn install-progress UI
+                 shows for this row. Made ultra-explicit so users
+                 reading the install screen know exactly what is
+                 being installed alongside LUKSbox and why. The
+                 standard hyperlinkSidebarLicense theme shows this
+                 string verbatim during chain execution. -->
             <MsiPackage
                 Id="WinFspMsi"
                 SourceFile="$(var.WinFspMsiPath)"
-                DisplayName="WinFsp 2.0.23075 (required for the mount feature)"
+                DisplayName="WinFsp 2.0.23075 -- Windows kernel filesystem driver required for LUKSbox's 'Mount as volume' feature (skipped if already installed)"
                 InstallCondition="InstallWinFsp = 1 AND NOT (WinFspRegistryPresent AND WinFspDllPresent)"
                 Vital="yes"
                 Cache="keep"
