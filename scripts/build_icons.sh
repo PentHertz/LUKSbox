@@ -105,6 +105,32 @@ else
         "${OUT_ICNS}"
 fi
 
+# ---- Windows Burn bundle sidebar PNG -------------------------------------
+#
+# LUKSboxSetup.exe (the Burn bundle) uses WiX's
+# `hyperlinkSidebarLicense` theme, which reserves a 165x315 px
+# portrait strip on the left of the installer window for
+# `LogoSideFile`. Pointing that at the square icon stretches it
+# vertically and the logo looks broken; instead we render a 165x315
+# PNG with the icon resized to a square 140x140 centered on a
+# white canvas (matches the theme's default sidebar fill).
+#
+# White rather than transparent because the WiX theme draws the
+# image on top of its own panel and PNG alpha composites
+# inconsistently across the GDI+ paths Burn uses on Win10 / Win11.
+# `-alpha remove -alpha off` flattens any source alpha onto white
+# so the output is opaque RGB.
+OUT_SIDE_PNG="${ASSETS_DIR}/icon-bundle-side.png"
+log "writing ${OUT_SIDE_PNG} (Burn sidebar, 165x315 portrait)"
+"${IM[@]}" "${SRC_PNG}" \
+    -resize 140x140 \
+    -background white \
+    -gravity center \
+    -extent 165x315 \
+    -alpha remove \
+    -alpha off \
+    "${OUT_SIDE_PNG}"
+
 # ---- Linux hicolor PNGs --------------------------------------------------
 #
 # GNOME / KDE / Xfce all read from $XDG_DATA_DIRS/icons/hicolor/<size>/apps/.
@@ -124,4 +150,5 @@ done
 log "done"
 log "  ico         : $(stat -c '%s bytes' "${OUT_ICO}" 2>/dev/null || stat -f '%z bytes' "${OUT_ICO}")"
 log "  icns        : $(stat -c '%s bytes' "${OUT_ICNS}" 2>/dev/null || stat -f '%z bytes' "${OUT_ICNS}")"
+log "  bundle-side : $(stat -c '%s bytes' "${OUT_SIDE_PNG}" 2>/dev/null || stat -f '%z bytes' "${OUT_SIDE_PNG}")"
 log "  linux pngs  : ${LINUX_DIR}/{16,24,32,48,64,128,256,512}x*.png"
