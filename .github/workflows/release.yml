@@ -46,6 +46,16 @@ jobs:
   build:
     name: ${{ matrix.target }}${{ matrix.ubuntu_codename && format(' ({0})', matrix.ubuntu_codename) || '' }}
     runs-on: ${{ matrix.runner }}
+    # Per-matrix container: most entries run on the host runner
+    # (container is null / unset). The Trixie entries set
+    # `container: debian:trixie` which moves the entire job inside a
+    # fresh Debian 13 container so cargo-deb's `$auto` ELF-derived
+    # dependencies pin trixie-correct package names instead of
+    # noble-shaped ones (libfuse3-4 vs libfuse3-3, etc.). The
+    # bootstrap step below installs the minimum tooling a
+    # `debian:trixie` base image lacks (git for checkout, curl + ca-
+    # certificates for rustup, build-essential for native deps).
+    container: ${{ matrix.container || null }}
     strategy:
       fail-fast: false
       matrix:
@@ -86,9 +96,13 @@ jobs:
             build_rpm: true
             archive: luksbox-${{ github.ref_name }}-aarch64-linux-jammy.tar.gz
           # Linux x86_64 - Ubuntu 24.04 (noble). Covers Ubuntu 24.04+
-          # and Debian 13 (trixie) where the t64 transition renamed
-          # libssl3 -> libssl3t64, libfido2-1 -> libfido2-1t64,
-          # libtss2-* -> libtss2-*-<ver>-0t64, etc.
+          # where the t64 transition renamed libssl3 -> libssl3t64,
+          # libfido2-1 -> libfido2-1t64, libtss2-* -> libtss2-*-0t64.
+          # Debian 13 (trixie) is handled by the dedicated trixie
+          # matrix entries below (containerised build) because trixie
+          # bumped libfuse3 from SONAME libfuse3.so.3 (`libfuse3-3`)
+          # to libfuse3.so.4 (`libfuse3-4`), which cargo-deb's
+          # `$auto` pins exactly per build host.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             ubuntu_codename: noble
@@ -101,6 +115,33 @@ jobs:
             ubuntu_codename: noble
             build_rpm: false
             archive: luksbox-${{ github.ref_name }}-aarch64-linux-noble.tar.gz
+          # Linux x86_64 - Debian 13 (trixie). Built INSIDE a
+          # `debian:trixie` Docker container on the Ubuntu 24.04
+          # runner because GitHub Actions has no native Debian
+          # runner image. Inside the container, cargo-deb's `$auto`
+          # resolves the trixie-correct package names automatically:
+          # libfuse3-4 (was libfuse3-3 in earlier Debian), libssl3t64,
+          # libfido2-1t64, libtss2-*-0t64. No post-process dep
+          # rewriting needed; the .deb installs cleanly on Debian 13
+          # without "unmet dependencies: libfuse3-3 but it is not
+          # installable" errors that pre-fix releases produced when
+          # users tried the noble artifact on trixie.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            ubuntu_codename: trixie
+            container: debian:trixie
+            build_rpm: false
+            archive: luksbox-${{ github.ref_name }}-x86_64-linux-trixie.tar.gz
+          # Linux aarch64 - Debian 13 (trixie). Native ARM64 runner
+          # + ARM64 `debian:trixie` container (Docker pulls the
+          # matching `linux/arm64` variant when run on ARM hardware,
+          # no QEMU translation involved -- the runner IS arm64).
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            ubuntu_codename: trixie
+            container: debian:trixie
+            build_rpm: false
+            archive: luksbox-${{ github.ref_name }}-aarch64-linux-trixie.tar.gz
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             archive: luksbox-${{ github.ref_name }}-x86_64-windows.zip
@@ -141,6 +182,21 @@ jobs:
             archive: luksbox-${{ github.ref_name }}-aarch64-macos-macfuse.dmg
 
     steps:
+      # Trixie-only: install minimum tooling the `debian:trixie` base
+      # image lacks. Must run BEFORE actions/checkout (needs git) and
+      # before dtolnay/rust-toolchain (needs curl + ca-certificates
+      # for rustup's installer download). build-essential pulls in
+      # gcc + linker so cargo can link the resulting binaries against
+      # the native shared libs we install in the "Linux deps (apt)"
+      # step below. No-op (skipped) on every other matrix entry
+      # because they run on the host runner where these are
+      # pre-installed.
+      - name: Bootstrap Trixie container
+        if: matrix.container
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl build-essential
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
