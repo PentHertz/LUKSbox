@@ -863,7 +863,12 @@ jobs:
           ls -lh "$DEB_PATH"
           # Quick sanity check: list contents so a missing asset
           # surfaces in the CI log instead of in user bug reports.
-          dpkg-deb -c "$DEB_PATH" | head -40
+          # `|| true` because `head -40` closes the pipe early after
+          # the .deb grew past 40 entries (new icon set), giving
+          # dpkg-deb's internal tar a SIGPIPE -> exit 2, which
+          # bash's pipefail then propagates. This is diagnostic
+          # output, not a build gate; mask the truncation error.
+          dpkg-deb -c "$DEB_PATH" | head -40 || true
           # Show the resolved Depends so it's visible in the CI log
           # (this is what determines per-distro compatibility).
           echo "--- Depends: ---"
