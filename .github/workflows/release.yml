@@ -823,6 +823,12 @@ jobs:
 
       - name: Build .deb (Linux)
         if: runner.os == 'Linux'
+        # `shell: bash` is explicit because container-based steps
+        # (debian:trixie matrix entry) default to `sh -e` = dash, which
+        # doesn't support the `${VAR/old/new}` parameter expansion used
+        # below. Hosted ubuntu runners default to bash already; this
+        # keeps both flows identical.
+        shell: bash
         run: |
           # --no-build: reuse the binaries the previous step built.
           # --profile release-hardened: tells cargo-deb where to find
@@ -833,13 +839,22 @@ jobs:
             --no-build \
             --profile release-hardened \
             --target ${{ matrix.target }}
-          # cargo-deb produces target/<triple>/debian/luksbox_<ver>_<arch>.deb.
-          # Inject the Ubuntu codename so users can pick the .deb that
-          # matches their distro (jammy vs noble - see the matrix
-          # comment for why this matters). The two parameter expansions
-          # below cover both architectures: only the matching one
-          # rewrites; the other is a no-op.
-          DEB_PATH=$(ls target/${{ matrix.target }}/debian/luksbox_*.deb | head -n1)
+          # cargo-deb's output path varies between versions: 3.x with
+          # `--target` historically wrote to target/<triple>/debian/,
+          # but in practice (observed on debian:trixie + cargo-deb
+          # 3.x) the file lands in plain target/debian/. Use `find`
+          # so we pick up the .deb wherever cargo-deb put it instead
+          # of assuming a specific layout.
+          DEB_PATH=$(find target -path '*debian/luksbox_*.deb' -type f | head -n1)
+          if [ -z "$DEB_PATH" ]; then
+              echo "::error::cargo-deb produced no .deb under target/"
+              find target -name '*.deb' -print
+              exit 1
+          fi
+          # Inject the distro codename so users can pick the .deb that
+          # matches their distro (jammy / noble / trixie). The two
+          # parameter expansions below cover both architectures: only
+          # the matching one rewrites; the other is a no-op.
           NEW_DEB_PATH="${DEB_PATH/_amd64.deb/_${{ matrix.ubuntu_codename }}_amd64.deb}"
           NEW_DEB_PATH="${NEW_DEB_PATH/_arm64.deb/_${{ matrix.ubuntu_codename }}_arm64.deb}"
           mv "$DEB_PATH" "$NEW_DEB_PATH"
