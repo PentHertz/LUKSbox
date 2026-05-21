@@ -290,7 +290,13 @@ jobs:
         # because luksbox-gui's `rfd` file picker links against GTK3
         # on Linux. libfuse3-dev is here so the `mount` subcommand
         # works on the resulting binary. imagemagick is here for
-        # scripts/build_icons.sh.
+        # scripts/build_icons.sh. libclang-dev is here because the
+        # `libfido2-sys` build script runs `bindgen` to generate
+        # Rust FFI bindings against the system libfido2 headers, and
+        # bindgen needs libclang to parse C. The Ubuntu hosted
+        # runners ship clang/libclang preinstalled (no-op), but the
+        # bare debian:trixie container we use for the Trixie .deb
+        # matrix entry does not, so the package has to be listed.
         #
         # ./.github/actions/apt-install forces IPv4 + retries on
         # transient mirror failures. Without IPv4 forcing the arm64
@@ -308,6 +314,7 @@ jobs:
             libfuse3-dev
             libgtk-3-dev
             libtss2-dev
+            libclang-dev
             imagemagick
 
       - name: macOS deps (Homebrew)
