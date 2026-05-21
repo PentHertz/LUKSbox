@@ -957,19 +957,40 @@ jobs:
           # none of which are real packaging defects.
           rpmlint -c dist/rpm/rpmlint.toml "$RPM_PATH"
 
-      - name: Install .deb + smoke test (Ubuntu runner)
+      - name: Install .deb + smoke test (Linux)
         if: runner.os == 'Linux'
         run: |
           # apt resolves transitive deps (libfido2-1 -> libssl3,
           # libfuse3-3 -> fuse3, etc.) so this is the real test of
           # whether we declared the right runtime deps.
           #
+          # SUDO handling: hosted ubuntu runners run as a regular
+          # user with passwordless sudo. The container-based Trixie
+          # matrix entries (`container: debian:trixie`) run as root
+          # inside the container and don't have `sudo` installed.
+          # Same EUID-detect trick as ./.github/actions/apt-install
+          # so both flows work without conditional copies of every
+          # apt-get line. `${EUID:-$(id -u)}` is portable: bash
+          # populates $EUID, dash leaves it unset and falls through
+          # to `id -u`.
+          if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+              SUDO=""
+          else
+              SUDO="sudo"
+          fi
           # apt-get only auto-detects a local .deb when the path is
           # absolute or begins with `./`; a bare `target/.../foo.deb`
           # is interpreted as a package NAME (apt error: "Unable to
           # locate package target/..."). Resolve to absolute first.
           DEB_ABS="$(realpath "$DEB_PATH")"
-          sudo apt-get install -y "$DEB_ABS"
+          # Some Trixie containers haven't fetched the package index
+          # in this step yet (bootstrap only installed the bare set
+          # needed for checkout); refresh so apt-get install can pull
+          # the transitive runtime deps. No-op cost on Ubuntu where
+          # the index is already warm from the earlier apt-install
+          # composite action.
+          $SUDO apt-get update
+          $SUDO apt-get install -y "$DEB_ABS"
 
           # Binary-launchability smoke.
           which luksbox
