@@ -27,7 +27,7 @@ pub const MIN_CHUNK_SIZE: u32 = 512;
 /// allows future growth while refusing pathological values that could
 /// trigger huge per-chunk allocations.
 pub const MAX_CHUNK_SIZE: u32 = 1 << 20;
-/// Largest accepted `metadata_size` field. Raised in v0.3.0 from 16 MiB
+/// Largest accepted `metadata_size` field. Raised in v0.2.1 from 16 MiB
 /// to 64 MiB so the encoded directory tree for vaults with thousands of
 /// inodes plus their inline chunk-ref tables fits without spilling to
 /// `MetadataBudgetExhausted` (the underlying cause of v0.2.0's surface
@@ -39,7 +39,7 @@ pub const MAX_METADATA_SIZE: u64 = 64 << 20;
 
 /// On-disk magic byte sequence used by LUKSbox v0.2.0 and earlier.
 pub const MAGIC_V1: [u8; 8] = *b"LUKSBOX1";
-/// On-disk magic byte sequence introduced in v0.3.0 alongside the
+/// On-disk magic byte sequence introduced in v0.2.1 alongside the
 /// sidecar-mirror durability fix. Old binaries reject this magic via
 /// the version-major check in `Header::from_bytes`, which is the
 /// correct behavior (they'd silently miss the recovery sidecars).
@@ -125,7 +125,7 @@ pub struct Header {
     pub data_offset: u64,
     pub keyslots: [Keyslot; MAX_KEYSLOTS],
     /// On-disk format major version. `1` = LUKSBOX1 (v0.2.0 and earlier,
-    /// no sidecar mirrors). `2` = LUKSBOX2 (v0.3.0+, supports the
+    /// no sidecar mirrors). `2` = LUKSBOX2 (v0.2.1+, supports the
     /// header/metadata mirror sidecars guarded by FLAG_HAS_*_MIRROR).
     /// Default `try_new` builds a v1 header for back-compat; container
     /// code that wants new vaults on v2 sets this explicitly.
@@ -181,14 +181,14 @@ impl Header {
     }
 
     /// Whether a previous-good header copy is persisted at the sidecar
-    /// `<storage_path>.header-bak`. v0.3.0+ vaults set this on first
+    /// `<storage_path>.header-bak`. v0.2.1+ vaults set this on first
     /// flush after open.
     pub fn has_header_mirror(&self) -> bool {
         (self.flags & FLAG_HAS_HEADER_MIRROR) != 0
     }
 
     /// Whether a previous-good metadata copy is persisted at the
-    /// sidecar `<vault>.lbx.meta-bak`. v0.3.0+ vaults set this on first
+    /// sidecar `<vault>.lbx.meta-bak`. v0.2.1+ vaults set this on first
     /// flush after open.
     pub fn has_metadata_mirror(&self) -> bool {
         (self.flags & FLAG_HAS_METADATA_MIRROR) != 0

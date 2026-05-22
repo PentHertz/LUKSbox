@@ -265,11 +265,17 @@ pub struct CreateOpts {
     /// `self.kdf` already; remembering them is the user's
     /// responsibility (without them the vault is unopenable).
     pub use_deniable: bool,
-    /// On-disk metadata format. `false` (default) = v2 (LBM2), inline
-    /// chunk lists in the metadata region, ~10 GiB practical ceiling,
-    /// works with every LUKSbox binary. `true` = v3 (LBM3), out-of-line
-    /// chunk-list blocks in the data area, no practical ceiling,
-    /// requires LUKSbox v0.2.0+ to open. Permanent for the vault.
+    /// On-disk format envelope for the new vault.
+    /// `false`: v2 legacy (LBM2 + LUKSBOX1, inline chunk lists, no
+    /// sidecar mirrors, ~10 GiB practical ceiling, NOT crash-safe,
+    /// readable by pre-v0.3 LUKSbox binaries). Auto-upgrades to v0.2.1
+    /// on first flush unless `LUKSBOX_FORMAT_V2=1` is set in the env.
+    /// `true` (default): v0.2.1 format (LBM5 + LUKSBOX2 header +
+    /// sidecar mirrors at `<vault>.lbx.{header,meta}-bak` for
+    /// crash-safety recovery). Requires LUKSbox v0.2.1+ to open.
+    /// Permanent for the vault.
+    /// The boolean name predates the broader v0.2.1 envelope but is
+    /// kept for API stability across the GUI -> ops boundary.
     pub use_v3_format: bool,
 }
 

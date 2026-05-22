@@ -16,9 +16,14 @@ canonical record.
 
 ## [Unreleased]
 
-Slot-policy revisit for the multi-factor combos. Existing v0.1.1
-vaults open unchanged; the behavior change is entirely at create
-time.
+## [v0.2.1] - 2026-05-22
+
+Slot-policy revisit for the multi-factor combos plus the v0.2.1
+durability fix (LBM5 + LUKSBOX2 sidecar mirrors, raised metadata
+cap, capacity notification, tested-boundary advisory). Existing
+v0.1.1 vaults open unchanged; the behavior change is entirely at
+create time for the slot-policy work, and auto-upgrades on first
+flush for the durability envelope.
 
 ### Durability fix: crash-safe header + metadata writes (LBM5 / LUKSBOX2)
 
@@ -85,7 +90,7 @@ metadata cap, all cross-platform (Linux, macOS, Windows):
   `MoveFileExW(REPLACE_EXISTING)` on Windows. Directory fsync is
   strict on POSIX, best-effort on Windows (NTFS journals the
   rename via `MoveFileExW`, so the rename is durable on return).
-- **Disk cost.** Each v0.3.0+ vault keeps one 8 KiB header-bak plus
+- **Disk cost.** Each v0.2.1+ vault keeps one 8 KiB header-bak plus
   one `metadata_size`-bytes meta-bak alongside the .lbx file
   (16 MiB for upgraded v0.2.0 vaults, 64 MiB for new vaults). For
   the typical encrypted-backup-on-USB use case this is rounding
@@ -121,7 +126,7 @@ exhaust host disk space. Without a notification, the first sign
 the user would see is a hard "no space left on device" error
 mid-copy (the exact failure that motivated the durability fix).
 
-v0.3.0 emits a soft notification BEFORE the hard ENOSPC, on two
+v0.2.1 emits a soft notification BEFORE the hard ENOSPC, on two
 thresholds:
 
 - **>=75% used**: informational. CLI users see a one-line
@@ -144,12 +149,12 @@ the `MetadataBudgetExhausted` -> ENOSPC backstop and the
 `Vfs::metadata_budget_status` API for in-app status display.
 
 See `docs/CRYPTO_SPEC.md` -- "Metadata budget and capacity
-notification (v0.3.0+)" for the full design and mitigation
+notification (v0.2.1+)" for the full design and mitigation
 options once a warning fires.
 
-### Tested-boundary advisory (v0.3.0)
+### Tested-boundary advisory (v0.2.1)
 
-v0.3.0 has been ground-truth validated end-to-end (real FUSE
+v0.2.1 has been ground-truth validated end-to-end (real FUSE
 mount, write, force-quit, reopen, verify) up to roughly **30 GiB
 of stored content** with several thousand files. The format is
 engineered for larger vaults but usage beyond that boundary has

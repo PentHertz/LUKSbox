@@ -654,8 +654,8 @@ impl Filesystem for LuksboxFs {
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
@@ -663,6 +663,17 @@ impl Filesystem for LuksboxFs {
             reply.error(Errno::EINVAL);
             return;
         };
+        // Honor `open(O_CREAT, mode)`: take the requested permission
+        // bits, mask off any S_IF* file-type bits the kernel may have
+        // included (we always create regular files via this path),
+        // then apply the per-process umask. This is the POSIX-defined
+        // result for `creat(2)` / `open(O_CREAT)` and is what makes
+        // `git clone` preserve the executable bit on scripts and
+        // binaries: git uses `open(O_CREAT, 0o100755)` for executables
+        // in the index, and without this the file landed at the VFS
+        // default 0o644, losing +x until/unless git issued a follow-up
+        // chmod (which not all versions of git do).
+        let effective_mode = (mode & 0o7777) & !(umask & 0o7777);
         let id = {
             let mut vfs = match self.vfs.lock() {
                 Ok(v) => v,
@@ -671,7 +682,7 @@ impl Filesystem for LuksboxFs {
                     return;
                 }
             };
-            match vfs.create(parent.0, name) {
+            match vfs.create_with_mode(parent.0, name, effective_mode) {
                 Ok(id) => {
                     let _ = vfs.flush();
                     id

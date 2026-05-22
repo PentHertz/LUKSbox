@@ -189,10 +189,10 @@ pub(crate) enum VaultFormatArg {
     /// with someone on a pre-v0.3 LUKSbox AND can suppress the
     /// auto-upgrade trigger via `LUKSBOX_FORMAT_V2=1`.
     V2,
-    /// LBM5 + LUKSBOX2 (v0.3.0 default). External chunk-list blocks
+    /// LBM5 + LUKSBOX2 (v0.2.1 default). External chunk-list blocks
     /// in the data area, 64 MiB metadata cap, sidecar mirrors at
     /// `<vault>.lbx.{header,meta}-bak` for crash-safety. Requires
-    /// LUKSbox v0.3.0+ to open.
+    /// LUKSbox v0.2.1+ to open.
     #[default]
     V3,
 }
@@ -379,13 +379,13 @@ enum Command {
         metadata_size: Option<String>,
         /// Metadata format for the new vault.
         ///
-        /// - `v3` (NEW DEFAULT in v0.3.0): LBM5 on disk, paired with
+        /// - `v3` (NEW DEFAULT in v0.2.1): LBM5 on disk, paired with
         ///   the LUKSBOX2 header + sidecar mirrors at
         ///   `<vault>.lbx.header-bak` and `<vault>.lbx.meta-bak`.
         ///   External chunk-list blocks for large files; lower
         ///   inline-spill threshold; 64 MiB metadata region. Crash
         ///   mid-write to either critical region is recovered
-        ///   automatically on next open. Requires LUKSbox v0.3.0+
+        ///   automatically on next open. Requires LUKSbox v0.2.1+
         ///   to open.
         /// - `v2`: inline chunk lists, LBM2 magic, no mirrors. Kept
         ///   for backward compatibility when sharing vaults with
@@ -393,7 +393,7 @@ enum Command {
         ///   ceiling; no crash-safety guarantees on header/metadata
         ///   writes. Even when chosen at create time, any operation
         ///   that triggers a flush will auto-upgrade the vault to
-        ///   the v0.3.0 format unless `LUKSBOX_FORMAT_V2=1` is set
+        ///   the v0.2.1 format unless `LUKSBOX_FORMAT_V2=1` is set
         ///   in the environment to suppress the upgrade trigger.
         ///
         /// Once the auto-upgrade fires, the format is permanent.
@@ -3307,7 +3307,7 @@ fn cmd_create(
             luksbox_format::hybrid_sidecar::sidecar_path(path).display()
         );
     }
-    // One-time tested-boundary advisory. v0.3.0 has been validated
+    // One-time tested-boundary advisory. v0.2.1 has been validated
     // end-to-end up to ~30 GiB of stored content with thousands of
     // files; beyond that boundary the format is expected to work but
     // has not been ground-truth tested. Surface this at create time
@@ -3315,7 +3315,7 @@ fn cmd_create(
     // past the boundary.
     eprintln!();
     eprintln!(
-        "  note: v0.3.0 has been validated end-to-end up to ~30 GiB of stored\n  \
+        "  note: v0.2.1 has been validated end-to-end up to ~30 GiB of stored\n  \
               content with several thousand files. If you plan to store more,\n  \
               please periodically verify the vault still unlocks (close and\n  \
               reopen) and report any anomalies at\n  \

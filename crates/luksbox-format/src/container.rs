@@ -2040,7 +2040,7 @@ impl Container {
 
     /// Mark the header dirty so the next `persist_header` (e.g. via
     /// `Drop` or an explicit call) writes the in-memory header back to
-    /// disk. Used by `Vfs::flush` to commit the v0.3.0 LUKSBOX1 ->
+    /// disk. Used by `Vfs::flush` to commit the v0.2.1 LUKSBOX1 ->
     /// LUKSBOX2 auto-upgrade.
     pub fn mark_header_dirty(&mut self) {
         self.header_dirty = true;
@@ -2048,7 +2048,7 @@ impl Container {
 
     /// Encrypt and write the metadata blob.
     ///
-    /// v0.3.0 crash-safety protocol: before overwriting the live region,
+    /// v0.2.1 crash-safety protocol: before overwriting the live region,
     /// rotate a previous-good copy into the `<vault>.lbx.meta-bak`
     /// sidecar via temp+rename. On the first call for a v2 vault this
     /// also sets `FLAG_HAS_METADATA_MIRROR` so the next `persist_header`
@@ -2073,12 +2073,37 @@ impl Container {
             plaintext,
             &mut region,
         )?;
-        // v2 vaults: rotate previous-good before overwriting live.
-        // If the mirror rotate fails we MUST NOT proceed with the live
-        // overwrite; otherwise a crash mid-live-write would destroy
-        // both copies. Propagate the error and leave live untouched.
+        // v2 vaults: **intended-state mirror protocol**. Commit the
+        // mirror to the NEW bytes BEFORE overwriting live. This is
+        // the load-bearing security property of v0.2.1+:
+        //
+        //   - The mirror NEVER holds bytes that the user does not
+        //     currently want as the authoritative state. It is not a
+        //     "previous-good" snapshot; it is a "what live should
+        //     become" buffer.
+        //   - Consequence: a revoked credential cannot be resurrected
+        //     by forcing the recovery path. The mirror reflects the
+        //     post-revoke keyslot table, same as live.
+        //   - Crash mid-mirror-commit: atomic_secure_write uses
+        //     temp+rename, so the mirror is either old-committed or
+        //     new-committed; never partial. Live is untouched.
+        //     Reopen reads live (still old, valid). Lost: the
+        //     in-progress write's content (which never made it to
+        //     either copy). No bypass.
+        //   - Crash mid-live-overwrite (after mirror commit): live
+        //     partial, mirror = new bytes. Recovery: mirror unlocks
+        //     under the new keyslot table; revoked credentials stay
+        //     revoked.
+        //
+        // The earlier "rotate-before-overwrite" design (kept a
+        // previous-good copy) was reviewed and found to permit an
+        // auth-bypass: an attacker who corrupted the live header
+        // could force the recovery path and the mirror's stale
+        // keyslot table would accept a previously-revoked
+        // credential. Regression-tested by
+        // `v2_corrupted_live_after_revoke_does_not_unlock_via_mirror`.
         if self.is_v2_format() {
-            self.rotate_metadata_mirror()?;
+            self.write_metadata_mirror(&region)?;
         }
         self.file
             .seek(SeekFrom::Start(self.header.metadata_offset))?;
@@ -2088,7 +2113,7 @@ impl Container {
         Ok(())
     }
 
-    /// True iff the in-memory header is v0.3.0+ format (LUKSBOX2 magic)
+    /// True iff the in-memory header is v0.2.1+ format (LUKSBOX2 magic)
     /// AND the container is NOT a deniable vault. Deniable vaults
     /// explicitly opt out of the sidecar-mirror protocol because:
     ///
@@ -2128,27 +2153,21 @@ impl Container {
         self.header.version_major == luksbox_core::VERSION_MAJOR_V2 && self.deniable.is_none()
     }
 
-    /// Rotate the metadata mirror: read the current on-disk region
-    /// bytes, write them to `<vault>.lbx.meta-bak` via temp+rename,
-    /// fsync parent dir. On first call also marks the in-memory header
-    /// flag so the next `persist_header` records the mirror's presence
-    /// on disk (purely an optimization hint; recovery walks the
-    /// conventional path regardless).
+    /// Write the metadata mirror to the **intended new bytes** (NOT
+    /// the previous-good ones) via temp+rename, fsync parent dir. On
+    /// first call also marks the in-memory header flag so the next
+    /// `persist_header` records the mirror's presence on disk.
     ///
-    /// Caller must ensure the live region is still intact (the rotation
-    /// reads from it). This is true at the top of `write_metadata`
-    /// before any write happens.
-    fn rotate_metadata_mirror(&mut self) -> Result<(), Error> {
-        let region_size = self.header.metadata_size as usize;
-        let mut prev_live = zeroize::Zeroizing::new(vec![0u8; region_size]);
-        self.file
-            .seek(SeekFrom::Start(self.header.metadata_offset))?;
-        self.file.read_exact(&mut prev_live)?;
+    /// Caller commits this BEFORE overwriting live. If a crash
+    /// happens after this returns but before live is fully overwritten,
+    /// the mirror is the recovery source and decrypts to the intended
+    /// state -- including any in-progress credential revocations.
+    fn write_metadata_mirror(&mut self, new_region_bytes: &[u8]) -> Result<(), Error> {
         let mirror_path = self.metadata_mirror_path();
         // atomic_secure_write: 0600 temp neighbour, fsync, rename,
         // fsync parent. If a stale `.tmp.<hex>` is left from a prior
         // crashed write it will be cleaned up by the helper.
-        atomic_secure_write(&mirror_path, &prev_live)?;
+        atomic_secure_write(&mirror_path, new_region_bytes)?;
         if !self.header.has_metadata_mirror() {
             self.header.flags |= FLAG_HAS_METADATA_MIRROR;
             self.header_dirty = true;
@@ -2836,27 +2855,26 @@ impl Container {
             self.header_dirty = false;
             return Ok(());
         }
-        // v2 vaults: rotate previous-good header bytes into the mirror
-        // BEFORE we overwrite the live region. Same crash-safety
-        // protocol as `write_metadata`: any mid-write failure on live
-        // leaves a recoverable copy at `<storage_path>.header-bak`.
-        // If the rotate itself fails we must NOT proceed with the live
-        // overwrite; aborting preserves the live region intact.
+        // v2 vaults: **intended-state mirror protocol**. Commit the
+        // mirror to the NEW header bytes BEFORE we overwrite live.
+        // See the long-form comment in `write_metadata` for the
+        // rationale; the short version: a "previous-good" mirror is
+        // an auth-bypass surface for revoked credentials, so the
+        // mirror MUST reflect the post-write keyslot table.
         //
-        // On first persist after auto-upgrade the FLAG_HAS_HEADER_MIRROR
-        // bit was already toggled in-memory by the upgrade trigger, so
-        // the bytes we're about to serialize already advertise the
-        // mirror's presence on disk to future opens.
-        if self.is_v2_format() {
-            self.rotate_header_mirror()?;
-            // Mark the flag in-memory if this is the very first time.
-            // The serialized bytes (computed below) will then carry
-            // the bit through to disk.
-            if !self.header.has_header_mirror() {
-                self.header.flags |= FLAG_HAS_HEADER_MIRROR;
-            }
+        // Ordering subtlety: we need the FLAG_HAS_HEADER_MIRROR bit
+        // set in the serialized bytes BEFORE we write them to the
+        // mirror, otherwise the mirror's header would advertise "no
+        // mirror exists" which is the opposite of reality. Flip the
+        // flag in-memory first, then serialize, then write mirror,
+        // then overwrite live.
+        if self.is_v2_format() && !self.header.has_header_mirror() {
+            self.header.flags |= FLAG_HAS_HEADER_MIRROR;
         }
         let bytes = self.header.to_bytes(&self.mvk);
+        if self.is_v2_format() {
+            self.write_header_mirror(&bytes)?;
+        }
         match &mut self.header_storage {
             HeaderStorage::Inline => {
                 self.file.seek(SeekFrom::Start(0))?;
@@ -2887,29 +2905,19 @@ impl Container {
         Ok(())
     }
 
-    /// Rotate the header mirror: read the current live HEADER_SIZE
-    /// bytes (from inline offset 0 or from the detached sidecar),
-    /// write them to `<storage_path>.header-bak` via temp+rename.
-    /// Caller must ensure the live header is still intact (we read
-    /// from it). This is true at the top of `persist_header` before
-    /// any live overwrite.
-    fn rotate_header_mirror(&mut self) -> Result<(), Error> {
-        let mut prev_live = [0u8; HEADER_SIZE];
-        match &self.header_storage {
-            HeaderStorage::Inline => {
-                self.file.seek(SeekFrom::Start(0))?;
-                self.file.read_exact(&mut prev_live)?;
-            }
-            HeaderStorage::Detached(hf, _) => {
-                // Use the existing detached handle (it's the same fd
-                // we hold the flock on); read from its start.
-                let mut hf_dup = hf.try_clone()?;
-                hf_dup.seek(SeekFrom::Start(0))?;
-                hf_dup.read_exact(&mut prev_live)?;
-            }
-        }
+    /// Write the header mirror to the **intended new bytes** via
+    /// temp+rename. Same intended-state protocol as the metadata
+    /// mirror: the mirror reflects what live SHOULD become, not what
+    /// live WAS. Prevents the revoke-then-corrupt-then-recover
+    /// auth-bypass class.
+    ///
+    /// Caller commits this BEFORE overwriting live. If a crash
+    /// happens after this returns but before live is fully
+    /// overwritten, the mirror is the recovery source and decrypts
+    /// with the post-write keyslot table.
+    fn write_header_mirror(&mut self, new_bytes: &[u8; HEADER_SIZE]) -> Result<(), Error> {
         let mirror_path = self.header_mirror_path();
-        atomic_secure_write(&mirror_path, &prev_live)?;
+        atomic_secure_write(&mirror_path, new_bytes)?;
         Ok(())
     }
 
@@ -5685,13 +5693,15 @@ mod tests {
     #[test]
     fn v2_recovers_metadata_after_corrupting_live_region() {
         // Simulates the user's "blob deserialization failed" scenario:
-        // a crash corrupted the live metadata bytes; the mirror still
-        // holds previous-good. Open should fall back to the mirror,
-        // mark `metadata_recovered_from_mirror`, and surface the
-        // previous-good payload.
+        // a crash corrupted the live metadata bytes; the mirror holds
+        // the intended new bytes (v0.2.1 intended-state protocol:
+        // mirror is written with the INTENDED-NEW payload before live
+        // overwrite, so the mirror reflects what live should hold).
+        // Open should fall back to the mirror and surface the LATEST
+        // payload (not a stale previous-good).
         let dir = tempdir().unwrap();
         let path = dir.path().join("recover.lbx");
-        // Phase 1: create v2 vault, write known payload, persist.
+        // Phase 1: create v2 vault, write known payload.
         {
             let mut c = Container::create_with_passphrase(
                 &path,
@@ -5705,46 +5715,42 @@ mod tests {
             c.header_dirty = true;
             c.write_metadata(b"alpha").unwrap();
             c.persist_header().unwrap();
-            // Second write so the mirror holds "alpha" (previous-good)
-            // and the live region holds "beta". The crash injection
-            // below targets live; the recovery path should rebuild
-            // "beta" -> no, actually the mirror holds the bytes that
-            // were live before the SECOND write, which is "alpha".
+            // Second write: mirror is now written with "beta" first
+            // (atomic temp+rename), then live is overwritten with
+            // "beta". Both copies equal "beta" on success.
             c.write_metadata(b"beta").unwrap();
             c.persist_header().unwrap();
         }
         // Phase 2: simulate a crash mid-write to the LIVE metadata
-        // region by truncating the encrypted blob's AEAD tag area.
-        // The live region now fails AEAD verification; the mirror
-        // still holds the encrypted "alpha" blob.
+        // region by overwriting AEAD bytes. The live region now fails
+        // AEAD verification; the mirror still holds the encrypted
+        // "beta" blob (intended-state).
         {
             let mut f = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(&path)
                 .unwrap();
-            // Read the existing header to learn metadata_offset.
             let header = {
                 let mut hb = [0u8; HEADER_SIZE];
                 f.seek(SeekFrom::Start(0)).unwrap();
                 f.read_exact(&mut hb).unwrap();
                 Header::from_bytes(&hb).unwrap()
             };
-            // Overwrite the first 64 bytes of the metadata region
-            // with garbage; that's well past the AEAD nonce + len
-            // prefix and far enough into the ciphertext to make AEAD
-            // verification fail without question.
             f.seek(SeekFrom::Start(header.metadata_offset)).unwrap();
             f.write_all(&[0xAA; 64]).unwrap();
             f.sync_all().unwrap();
         }
-        // Phase 3: reopen and confirm recovery returns "alpha" (the
-        // previous-good payload from the mirror), not the live garbage.
+        // Phase 3: reopen and confirm recovery returns "beta" (the
+        // LATEST committed payload from the mirror), not the live
+        // garbage and not a stale "alpha". The intended-state
+        // protocol means the mirror tracks live forward, never
+        // backward.
         let mut c = Container::open(&path, None, UnlockMaterial::Passphrase(b"recover")).unwrap();
         let blob = c.read_metadata().unwrap();
         assert_eq!(
-            &**blob, b"alpha",
-            "must recover from mirror, not garbled live"
+            &**blob, b"beta",
+            "must recover latest committed payload, not stale"
         );
         assert!(c.metadata_was_recovered_from_mirror());
     }
@@ -5807,7 +5813,7 @@ mod tests {
     /// otherwise-parseable header must NOT fall back to the mirror,
     /// because the mirror still carries the revoked slot.
     ///
-    /// First reviewer-found auth-bypass in the v0.3.0 durability
+    /// First reviewer-found auth-bypass in the v0.2.1 durability
     /// fix. This test pins the gating so a future regression is
     /// caught immediately.
     /// **Deniability invariant**: a deniable vault must NEVER create
@@ -5863,6 +5869,81 @@ mod tests {
              and defeat deniability",
             mirror_meta.display()
         );
+    }
+
+    /// **CRITICAL REGRESSION TEST** (revoke + crash + mirror
+    /// recovery): an attacker who corrupts the live header MUST NOT
+    /// resurrect a revoked credential by forcing the recovery path.
+    /// The v0.2.1 intended-state mirror protocol commits the mirror
+    /// to NEW bytes BEFORE overwriting live, so the mirror always
+    /// reflects the post-write keyslot table. Even a successful
+    /// mirror recovery cannot accept a revoked credential.
+    ///
+    /// This is the deeper bypass: parse-fail-only gating prevents
+    /// the recovery path from firing on a healthy live header, but
+    /// if the attacker corrupts live, recovery WILL fire, and the
+    /// protocol must be safe at that point too.
+    #[test]
+    fn v2_corrupted_live_after_revoke_does_not_unlock_via_mirror() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("revoke-crash.lbx");
+        // Phase 1: create v2 vault, enroll second slot, persist
+        // (mirror is committed to the current keyslot table).
+        {
+            let mut c = Container::create_with_passphrase(
+                &path,
+                None,
+                CipherSuite::Aes256Gcm,
+                test_params(),
+                b"pass-A",
+            )
+            .unwrap();
+            c.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+            c.header_dirty = true;
+            c.enroll_passphrase(b"pass-B", test_params()).unwrap();
+            c.persist_header().unwrap();
+        }
+        // Phase 2: revoke A. Mirror must be rewritten to the
+        // post-revoke header bytes.
+        {
+            let mut c =
+                Container::open(&path, None, UnlockMaterial::Passphrase(b"pass-A")).unwrap();
+            c.header.revoke_slot(0).unwrap();
+            c.header_dirty = true;
+            c.persist_header().unwrap();
+        }
+        // Phase 3: attacker corrupts live header to force recovery.
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0xCC; 4096]).unwrap();
+            f.sync_all().unwrap();
+        }
+        // Phase 4: revoked pass-A must NOT unlock, even though the
+        // recovery path fires and reads the mirror.
+        let result = Container::open(&path, None, UnlockMaterial::Passphrase(b"pass-A"));
+        // The exact error variant depends on whether the recovery
+        // path bubbled the live parse failure (when mirror also
+        // rejects the credential) or the mirror unlock failure
+        // directly. Both are "user is locked out" outcomes; what
+        // matters for the security property is `Ok(_)` MUST NOT
+        // fire.
+        match result {
+            Ok(_) => panic!(
+                "AUTH BYPASS: revoked pass-A unlocked via mirror after live corruption. \
+                 Intended-state mirror protocol regressed; mirror is holding pre-revoke \
+                 keyslots instead of the current post-revoke state."
+            ),
+            Err(_) => {}
+        }
+        // Phase 5: pass-B must still work via mirror recovery
+        // (sanity: recovery path itself is functional).
+        let _ = Container::open(&path, None, UnlockMaterial::Passphrase(b"pass-B"))
+            .expect("pass-B must still unlock via mirror recovery after live corruption");
     }
 
     #[test]
@@ -6075,13 +6156,15 @@ mod tests {
     }
 
     #[test]
-    fn v2_repeated_writes_rotate_mirror_to_previous_good() {
-        // After two successful write_metadata calls on a v2 vault, the
-        // mirror should hold the PREVIOUS payload (rotated just before
-        // the most recent overwrite), and the live region should hold
-        // the LATEST payload. This is the load-bearing crash-safety
-        // invariant: at any moment, the mirror reflects what the live
-        // region looked like before the in-progress overwrite started.
+    fn v2_repeated_writes_keep_mirror_at_intended_new_state() {
+        // After two successful write_metadata calls on a v2 vault,
+        // the mirror MUST hold the LATEST committed payload, not a
+        // historical previous-good copy. This is the v0.2.1
+        // intended-state mirror protocol: a previous-good mirror
+        // would be an auth-bypass surface for revoked credentials
+        // (a corrupt-live attacker could force recovery from the
+        // mirror's pre-revoke keyslots). The mirror always tracks
+        // live forward.
         let dir = tempdir().unwrap();
         let path = dir.path().join("v2-rotate.lbx");
         let mut c = Container::create_with_passphrase(
@@ -6096,11 +6179,10 @@ mod tests {
         c.header_dirty = true;
         c.write_metadata(b"first").unwrap();
         c.persist_header().unwrap();
-        // Second write: live now holds "second", mirror should now
-        // hold "first" (the previous-good).
-        c.write_metadata(b"second").unwrap();
-        // Read the mirror by hand and verify the AEAD-decrypts to
+        // Second write: BOTH live and mirror MUST commit to "second"
+        // (intended-state protocol). The mirror does NOT retain
         // "first".
+        c.write_metadata(b"second").unwrap();
         let mirror_path = path.with_file_name(format!(
             "{}.meta-bak",
             path.file_name().unwrap().to_string_lossy()
@@ -6113,8 +6195,12 @@ mod tests {
             &mirror_bytes,
         )
         .expect("mirror must AEAD-decrypt under the live MVK");
-        assert_eq!(&**pt, b"first");
-        // Live still has "second".
+        assert_eq!(
+            &**pt, b"second",
+            "intended-state protocol: mirror must hold the LATEST committed bytes, \
+             not a historical previous-good"
+        );
+        // Live also has "second" (the intended state).
         let live = c.read_metadata().unwrap();
         assert_eq!(&**live, b"second");
     }

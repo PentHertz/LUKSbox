@@ -352,7 +352,7 @@ pub struct DirEntry {
 
 /// Snapshot of how much of the vault's metadata region is currently
 /// consumed by the encoded directory tree. The cap is configured at
-/// vault create time (default 64 MiB for v0.3.0+); used + spillover
+/// vault create time (default 64 MiB for v0.2.1+); used + spillover
 /// estimates approach the cap as inode count grows. CLI `info` prints
 /// this; the GUI polls it for an in-app low-capacity notification so
 /// users get an early warning before the hard `MetadataBudgetExhausted`
@@ -450,7 +450,7 @@ const METADATA_V3_MAGIC: &[u8; 4] = b"LBM\x03";
 /// LUKSbox binaries.
 const METADATA_V4_MAGIC: &[u8; 4] = b"LBM\x04";
 
-/// v5 metadata magic. Introduced in v0.3.0 alongside the durability
+/// v5 metadata magic. Introduced in v0.2.1 alongside the durability
 /// fix (sidecar mirrors). Structurally identical to LBM4 on disk; the
 /// difference is operational:
 ///   - the write path uses the lower `V5_INLINE_CHUNK_THRESHOLD` so
@@ -535,7 +535,7 @@ enum MetadataFormat {
 }
 
 impl MetadataFormat {
-    /// Format used by a freshly-created vault. Defaults to V5 (v0.3.0+
+    /// Format used by a freshly-created vault. Defaults to V5 (v0.2.1+
     /// durability layout: lower spill threshold, paired with LUKSBOX2
     /// header + mirror sidecars). Users who need backward compat with
     /// pre-v0.3 LUKSbox binaries can opt back to V2 via
@@ -1041,7 +1041,7 @@ pub struct Vfs {
     tree: DirectoryTree,
     dirty: bool,
     /// On-disk metadata format for this vault. New vaults default
-    /// to V5 (v0.3.0+ shape: lower spill threshold, paired with
+    /// to V5 (v0.2.1+ shape: lower spill threshold, paired with
     /// LUKSBOX2 header and sidecar mirrors). Existing V2/V3 vaults
     /// retain their format on open and auto-upgrade to V5 on the
     /// first flush against a dirty tree. Downgrade is not supported.
@@ -1054,7 +1054,7 @@ pub struct Vfs {
     /// subsequent flush.
     last_warned_pct: u32,
     /// Set once we've emitted the "vault size beyond the tested
-    /// boundary" advisory for this Vfs session. v0.3.0 has been
+    /// boundary" advisory for this Vfs session. v0.2.1 has been
     /// ground-truth tested up to ~30 GiB of stored content; beyond
     /// that the format is expected to work but is in untested
     /// territory and we ask users to verify unlocks + report issues.
@@ -1174,12 +1174,12 @@ impl Vfs {
         matches!(self.format, MetadataFormat::V4 | MetadataFormat::V5)
     }
 
-    /// Whether this vault is on the v0.3.0 v5 metadata format.
+    /// Whether this vault is on the v0.2.1 v5 metadata format.
     pub fn uses_v5_metadata(&self) -> bool {
         matches!(self.format, MetadataFormat::V5)
     }
 
-    /// Whether the vault's on-disk size is beyond the v0.3.0
+    /// Whether the vault's on-disk size is beyond the v0.2.1
     /// ground-truth-tested boundary (~30 GiB). GUI callers poll this
     /// to surface a one-shot advisory toast asking the user to verify
     /// the vault still unlocks and report issues if it doesn't.
@@ -1233,7 +1233,7 @@ impl Vfs {
             self.container.data_offset(),
             self.container.header.hide_size_header(),
         )?;
-        // v0.3.0 auto-upgrade: any flush against a LUKSBOX1 vault
+        // v0.2.1 auto-upgrade: any flush against a LUKSBOX1 vault
         // bumps it to LUKSBOX2 + LBM5. One-way; the next crash gets
         // mirror recovery, but the cost is that pre-v0.3 binaries
         // can no longer open the vault. The user picked auto-upgrade
@@ -1253,7 +1253,7 @@ impl Vfs {
             self.container.header.version_major = luksbox_core::VERSION_MAJOR_V2;
             self.container.mark_header_dirty();
             // Bump the metadata format too. V5 supersedes V2/V3/V4
-            // for the v0.3.0+ shape: lower spill threshold, paired
+            // for the v0.2.1+ shape: lower spill threshold, paired
             // with the LUKSBOX2 header.
             self.format = MetadataFormat::V5;
         }
@@ -1368,7 +1368,7 @@ impl Vfs {
             );
             self.last_warned_pct = pct;
         }
-        // Tested-boundary advisory. v0.3.0 was ground-truth tested
+        // Tested-boundary advisory. v0.2.1 was ground-truth tested
         // up to TESTED_VAULT_SIZE_BYTES (~30 GiB) of stored content.
         // Beyond that the format is expected to work but is in
         // untested territory; ask the user to verify unlocks +
@@ -1983,7 +1983,29 @@ impl Vfs {
         Ok(id)
     }
 
+    /// Create a regular file with the default mode (`0o644`).
+    /// Convenience wrapper preserved for CLI / GUI callers that
+    /// don't care about the mode; FUSE callers that get a mode from
+    /// `open(O_CREAT, mode)` should use [`Vfs::create_with_mode`] so
+    /// the executable bit on scripts and binaries survives a
+    /// `git clone` into a mounted vault (the previous path defaulted
+    /// every newly-created file to 0o644 regardless of what the
+    /// caller passed).
     pub fn create(&mut self, parent: FileId, name: &str) -> Result<FileId, Error> {
+        self.create_with_mode(parent, name, crate::tree::DEFAULT_FILE_MODE)
+    }
+
+    /// Create a regular file with a specific POSIX permission mode.
+    /// Mode is masked to `0o7777` (strips any S_IF* file-type bits a
+    /// FUSE caller might have included). The FUSE umask, if any, is
+    /// the caller's responsibility to apply BEFORE passing the mode
+    /// here; FUSE clients call us with the already-umasked value.
+    pub fn create_with_mode(
+        &mut self,
+        parent: FileId,
+        name: &str,
+        mode: u32,
+    ) -> Result<FileId, Error> {
         validate_name(name)?;
         self.require_dir(parent)?;
         if self.tree.inodes[&parent].children.contains_key(name) {
@@ -2002,7 +2024,7 @@ impl Vfs {
                 children: Default::default(),
                 cached_real_size: None,
                 external_list_blocks: Vec::new(),
-                mode: crate::tree::DEFAULT_FILE_MODE,
+                mode: mode & 0o7777,
                 link_count: 1,
                 symlink_target: None,
             },
@@ -3975,6 +3997,62 @@ mod tests {
 
     /// chmod stores the new mode and `stat` returns it. End-to-end:
     /// the typical git filemode probe (chmod 0o755, stat, expect
+    /// **Regression test for the v0.2.1 `git clone` executable-bit
+    /// bug**: `Vfs::create_with_mode(parent, name, 0o755)` must land
+    /// the file at 0o755 on first `stat`, WITHOUT any subsequent
+    /// chmod, and the mode must survive flush+reopen.
+    ///
+    /// Why this is the right test: git uses `open(O_CREAT, 0o100755)`
+    /// to materialise executable files from the index. The FUSE
+    /// `create` callback receives that mode and threads it through
+    /// `Vfs::create_with_mode`. Earlier code ignored the mode and
+    /// defaulted every newly-created file to 0o644, so `git clone`
+    /// of a repo containing executable scripts or binaries silently
+    /// dropped the +x bit unless git followed up with a chmod (and
+    /// not every git version does).
+    #[test]
+    fn create_with_mode_lands_at_requested_mode_then_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let f = {
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            let root = vfs.root_id();
+            // Simulate git: open(O_CREAT, 0o755) -> create with mode.
+            let f = vfs.create_with_mode(root, "setup.sh", 0o755).unwrap();
+            assert_eq!(
+                vfs.stat(f).unwrap().mode,
+                0o755,
+                "create_with_mode must land at the requested mode, not the default"
+            );
+            vfs.flush().unwrap();
+            assert!(
+                vfs.uses_v4_metadata(),
+                "non-default mode at create time must trigger LBM4+ format"
+            );
+            f
+        };
+        // Reopen and confirm the executable bit survived.
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        assert_eq!(
+            vfs.stat(f).unwrap().mode,
+            0o755,
+            "executable bit must round-trip through flush+reopen"
+        );
+    }
+
+    /// `Vfs::create` (no-mode convenience wrapper) still defaults to
+    /// 0o644 so CLI / GUI callers that don't care about the mode
+    /// get the legacy behavior.
+    #[test]
+    fn create_without_mode_defaults_to_0o644() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "doc.txt").unwrap();
+        assert_eq!(vfs.stat(f).unwrap().mode, 0o644);
+    }
+
     /// 0o755) succeeds across a flush+reopen cycle.
     #[test]
     fn chmod_persists_across_flush_and_reopen() {
@@ -4019,7 +4097,7 @@ mod tests {
         assert_eq!(s.mode, 0o644, "file-type bits must be masked out");
     }
 
-    /// In v0.3.0, the per-feature auto-upgrade to LBM4 (formerly the
+    /// In v0.2.1, the per-feature auto-upgrade to LBM4 (formerly the
     /// only auto-upgrade trigger) is superseded by the unconditional
     /// LBM5 + LUKSBOX2 upgrade on any flush against a LUKSBOX1 vault.
     /// So a v0.2.0-envelope vault always lands on V5 after the first
@@ -4039,7 +4117,7 @@ mod tests {
         vfs.write(f, 0, b"hi").unwrap();
         // Apply the default mode (no-op chmod). The v4-specific
         // trigger does NOT fire (mode is unchanged), but the
-        // v0.3.0 LUKSBOX1 -> LUKSBOX2 + LBM5 trigger does, because
+        // v0.2.1 LUKSBOX1 -> LUKSBOX2 + LBM5 trigger does, because
         // the vault was created with v1 header.
         vfs.chmod(f, 0o644).unwrap();
         vfs.flush().unwrap();
@@ -4538,7 +4616,7 @@ mod tests {
         //   - metadata magic LBM2 (set_format_v3_override(Some(false)))
         //   - no mirror sidecars
         //
-        // We can't construct that exact state via the v0.3.0 code path
+        // We can't construct that exact state via the v0.2.1 code path
         // because the first flush itself triggers the auto-upgrade.
         // What we test instead is that, given a freshly created vault
         // built with the v0.2.0 envelope (LUKSBOX1 + LBM2 + no
@@ -4561,7 +4639,7 @@ mod tests {
             let f = vfs.create(root, "before.txt").unwrap();
             vfs.write(f, 0, b"pre-upgrade").unwrap();
             // Force the v1 header + v2 metadata wire image. The flush
-            // we're about to call here would (with v0.3.0 logic)
+            // we're about to call here would (with v0.2.1 logic)
             // auto-upgrade -- we want this flush to NOT do that so we
             // can test the upgrade firing on a SECOND, post-reopen
             // flush. Temporarily revert the in-memory state right
@@ -4613,7 +4691,7 @@ mod tests {
                 "phase 1: on-disk header should carry LUKSBOX1 magic"
             );
         }
-        // Phase 2: reopen with the default v0.3.0 paths and trigger a
+        // Phase 2: reopen with the default v0.2.1 paths and trigger a
         // flush by writing a file. The flush must auto-upgrade to
         // LUKSBOX2 + V5 + mirrors-on-disk.
         {
@@ -4656,7 +4734,7 @@ mod tests {
                 "phase 3: header mirror must exist after upgrade"
             );
         }
-        // Phase 4: reopen with v0.3.0 binary one more time and check
+        // Phase 4: reopen with v0.2.1 binary one more time and check
         // the file written in phase 2 is still readable through the
         // upgraded format.
         {

@@ -293,11 +293,19 @@ struct CreateForm {
     /// path: anyone with it can open the vault without ANY of the
     /// hardware factors.
     enable_recovery_passphrase: bool,
-    /// On-disk metadata format. v2 (`false`) keeps inline chunk lists
-    /// and works with every LUKSbox binary; v3 (`true`) moves chunk
-    /// lists out-of-line into encrypted chunk-list blocks so a single
-    /// vault can hold arbitrarily-large files. Requires LUKSbox v0.2.0+
-    /// to open. Choice is permanent for the vault.
+    /// On-disk format choice for the new vault.
+    /// `false`: v2 (legacy LBM2 + LUKSBOX1, inline chunk lists, NO
+    /// sidecar mirrors). Readable by pre-v0.3 LUKSbox binaries but
+    /// NOT crash-safe; auto-upgrades to v0.2.1 on first flush unless
+    /// `LUKSBOX_FORMAT_V2=1` is set in the environment to suppress
+    /// the upgrade.
+    /// `true` (default): v0.2.1 format (LBM5 + LUKSBOX2 header +
+    /// `<vault>.lbx.{header,meta}-bak` mirrors for crash-safety).
+    /// Requires LUKSbox v0.2.1+ to open. Choice is permanent for the
+    /// vault.
+    /// The boolean name is preserved from v0.2.x for API stability;
+    /// the field actually toggles the broader v0.2.1 envelope, not
+    /// just LBM3.
     use_v3_format: bool,
 }
 
@@ -922,7 +930,7 @@ pub struct LuksboxApp {
     /// the same approaching-capacity heads-up that CLI users get
     /// via the eprintln in `Vfs::flush`.
     metadata_warned_pct: u32,
-    /// One-shot latch for the "vault size beyond the v0.3.0
+    /// One-shot latch for the "vault size beyond the v0.2.1
     /// ground-truth-tested boundary (~30 GiB)" advisory toast.
     /// Reset every time a different vault is opened (in
     /// `lock_and_drop_vault`) so a freshly-opened oversized vault
@@ -1328,7 +1336,7 @@ impl LuksboxApp {
 
     /// Flush the open vault's tree, then surface an in-app toast if
     /// the metadata region is approaching its 64 MiB cap (default for
-    /// v0.3.0+ vaults). The warning thresholds match the eprintln in
+    /// v0.2.1+ vaults). The warning thresholds match the eprintln in
     /// `Vfs::flush` (75% / 90%) so CLI and GUI users see the same
     /// signal; the toast is the user-visible channel for people
     /// driving the vault entirely through the GUI browser instead of
@@ -1365,14 +1373,14 @@ impl LuksboxApp {
                  vault created with a larger --metadata-size."
             ));
         }
-        // Tested-boundary advisory. v0.3.0 was ground-truth tested up
+        // Tested-boundary advisory. v0.2.1 was ground-truth tested up
         // to ~30 GiB; beyond that the format is expected to work but
         // we ask users to verify unlocks + report issues. One-shot
         // per session via the latch; resets in `lock_and_drop_vault`.
         if !self.tested_size_advisory_shown && beyond_tested {
             self.tested_size_advisory_shown = true;
             self.toast_warn(
-                "This vault is beyond the v0.3.0 ground-truth-tested boundary \
+                "This vault is beyond the v0.2.1 ground-truth-tested boundary \
                  (~30 GiB). The format is expected to handle larger vaults but \
                  your usage has not been explicitly tested. Please close and \
                  reopen the vault periodically to verify it still unlocks, and \
@@ -3868,13 +3876,17 @@ impl LuksboxApp {
                         |ui| {
                             ui.checkbox(
                                 &mut self.create.use_v3_format,
-                                "Use v3 metadata format (default; out-of-line chunk lists; no per-vault size ceiling)",
+                                "Use v0.2.1 format (default; LBM5 + LUKSBOX2 header + crash-safety mirrors)",
                             );
                             if !self.create.use_v3_format {
                                 ui.label(
                                     RichText::new(
-                                        "v2 (compat): inline chunk lists, ~10 GiB practical per-vault ceiling. \
-                                         Readable by pre-v0.2.0 LUKSbox. Choice is permanent.",
+                                        "v2 (legacy): inline chunk lists, no sidecar mirrors, \
+                                         ~10 GiB practical per-vault ceiling. Readable by pre-v0.3 \
+                                         LUKSbox binaries. NOT crash-safe: a force-quit mid-write \
+                                         can leave the vault permanently unopenable. Choice is \
+                                         permanent; auto-upgrades to v0.2.1 on first flush unless \
+                                         LUKSBOX_FORMAT_V2=1 is set in the environment.",
                                     )
                                     .color(theme::DIM)
                                     .size(11.0),
@@ -3882,8 +3894,11 @@ impl LuksboxApp {
                             } else {
                                 ui.label(
                                     RichText::new(
-                                        "v3: no per-vault size ceiling. Requires LUKSbox v0.2.0+ to open. \
-                                         Choice is permanent.",
+                                        "v0.2.1 format: 64 MiB metadata cap, lower spill threshold, \
+                                         and sidecar mirrors at <vault>.lbx.{header,meta}-bak that \
+                                         enable crash-safety recovery (the v0.2.0 'vault won't reopen \
+                                         after force-quit' class is fixed). Requires LUKSbox v0.2.1+ \
+                                         to open. Choice is permanent.",
                                     )
                                     .color(theme::DIM)
                                     .size(11.0),

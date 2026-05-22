@@ -391,7 +391,7 @@ get in touch.
 
 ### Operational gaps
 
-- **v0.3.0 durability fix (LUKSBOX2 / LBM5) excludes deniable
+- **v0.2.1 durability fix (LUKSBOX2 / LBM5) excludes deniable
   vaults.** The sidecar-mirror crash-safety protocol
   (`<vault>.lbx.header-bak` and `<vault>.lbx.meta-bak`) is
   deliberately disabled for deniable containers. Sidecar files at
@@ -408,7 +408,7 @@ get in touch.
   `Container::is_v2_format()` (write-side guard) and in
   `Vfs::flush` (auto-upgrade trigger guard). Regression-tested by
   `deniable_vault_never_creates_sidecar_mirrors`.
-- **v0.3.0 mirror recovery is gated on parse failure, not unlock
+- **v0.2.1 mirror recovery is gated on parse failure, not unlock
   failure.** Without this gating a previously-revoked credential
   would unlock against the previous-good keyslot still in the
   mirror, silently undoing every revoke. The trade-off: the rare

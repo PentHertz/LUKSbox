@@ -234,8 +234,8 @@ that identifies the metadata format inside the encrypted region:
   symlink target (absolute, `..`-bearing, NUL, oversize) is
   rejected at `Vfs::open` before any FUSE `readlink` callback
   can return it. New vaults stay on LBM4 only if explicitly opted
-  in via the v0.2.0 LUKSbox binary; v0.3.0+ defaults to LBM5.
-- `LBM\x05` ("v5", NEW DEFAULT in v0.3.0) -- byte-identical
+  in via the v0.2.0 LUKSbox binary; v0.2.1+ defaults to LBM5.
+- `LBM\x05` ("v5", NEW DEFAULT in v0.2.1) -- byte-identical
   on-disk shape to LBM4 (same inode fields, same chunk-list
   block layout). The differences are operational:
   - Inline chunk-ref spill threshold lowered from 1024 (V3/V4)
@@ -267,7 +267,7 @@ with an `LBM\x03` / `LBM\x04` / `LBM\x05` blob they don't
 understand fail with a clean `MetadataDeserialize` error rather
 than silently mis-parsing.
 
-#### Metadata budget and capacity notification (v0.3.0+)
+#### Metadata budget and capacity notification (v0.2.1+)
 
 The metadata region size is fixed at vault create time and held in
 the on-disk header (`metadata_size` field). Default 64 MiB for v5
@@ -332,7 +332,7 @@ Mitigations once a warning fires:
 
 #### Tested-boundary advisory
 
-v0.3.0 has been validated end-to-end with real FUSE mounts up to
+v0.2.1 has been validated end-to-end with real FUSE mounts up to
 roughly **30 GiB of stored content** with several thousand files.
 The format is engineered to handle much larger vaults, but
 LUKSbox surfaces a one-shot heads-up at create time AND when the

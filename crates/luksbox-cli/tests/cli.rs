@@ -131,7 +131,7 @@ fn wrong_passphrase_fails() {
 
 #[test]
 fn cross_dir_mv_succeeds_posix_semantics() {
-    // v0.3.0 supports POSIX `rename(2)` semantics including cross-
+    // v0.2.1 supports POSIX `rename(2)` semantics including cross-
     // directory moves (added when implementing `git clone` workflow
     // inside a mounted vault). This test pins the new behavior: a
     // file moved from /a to /b must disappear from /a and appear

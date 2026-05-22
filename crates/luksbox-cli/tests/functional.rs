@@ -1207,7 +1207,7 @@ fn header_restore_round_trip_inline_with_no_verify() {
     // OFF_HMAC = HEADER_SIZE - HMAC_LEN = 8192 - 32 = 8160.
     corrupt_bytes(&dir.join("v.lbx"), 8160, 32, 0xaa);
 
-    // v0.3.0+: a header-bak sidecar was written when the vault first
+    // v0.2.1+: a header-bak sidecar was written when the vault first
     // auto-upgraded to LUKSBOX2. To exercise the user-managed
     // header-restore path (rather than the automatic mirror
     // recovery), remove the sidecar first.

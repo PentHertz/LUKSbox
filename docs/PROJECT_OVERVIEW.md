@@ -400,20 +400,20 @@ stderr when running on non-accelerated CPUs, recommending
 | | Size |
 |---|---|
 | Header (constant) | 8 KiB |
-| Metadata region (v0.3.0+ default; configurable via `--metadata-size`) | 64 MiB |
+| Metadata region (v0.2.1+ default; configurable via `--metadata-size`) | 64 MiB |
 | Per-chunk overhead (12 B nonce + 16 B AEAD tag) | **28 B per 4096 B plaintext** = 0.7 % |
 | `.kyber` seed file (ML-KEM-768) | 122 B |
 | `.kyber` seed file (ML-KEM-1024) | 123 B |
 | `.hybrid` sidecar entry (ML-KEM-768) | 2.3 KB |
 | `.hybrid` sidecar entry (ML-KEM-1024) | 3.1 KB |
 | `.anchor` sidecar | 48 B |
-| `.lbx.header-bak` sidecar (v0.3.0+, NOT in deniable vaults) | 8 KiB |
-| `.lbx.meta-bak` sidecar (v0.3.0+, NOT in deniable vaults) | = metadata region size |
+| `.lbx.header-bak` sidecar (v0.2.1+, NOT in deniable vaults) | 8 KiB |
+| `.lbx.meta-bak` sidecar (v0.2.1+, NOT in deniable vaults) | = metadata region size |
 
 The two `*-bak` sidecars hold previous-good copies of the
 critical regions for crash-safety recovery. They are absent on
 deniable vaults to preserve the >=7.99 bits/byte entropy property
-of the on-disk artefact set. For new v0.3.0+ vaults the total
+of the on-disk artefact set. For new v0.2.1+ vaults the total
 crash-safety overhead is roughly **64 MiB + 8 KiB** alongside
 the .lbx file; for upgraded v0.2.0 vaults the mirror tracks the
 existing region size (typically 16 MiB).
@@ -443,9 +443,9 @@ Hard `MetadataBudgetExhausted` at 100% surfaces as ENOSPC at the
 FUSE / WinFsp / FUSE-T layer so the OS file manager surfaces a
 "no space left on device" error the user already understands.
 
-#### Tested boundary (v0.3.0)
+#### Tested boundary (v0.2.1)
 
-LUKSbox v0.3.0 has been ground-truth validated up to roughly
+LUKSbox v0.2.1 has been ground-truth validated up to roughly
 **30 GiB of stored content** with several thousand files via the
 real FUSE mount path (create, write, mount, copy, unmount,
 reopen, verify). The format is engineered for larger vaults but

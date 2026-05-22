@@ -34,7 +34,7 @@ pub const CHUNK_LIST_FILE_ID_BIT: FileId = 1 << 63;
 pub const V3_INLINE_CHUNK_THRESHOLD: usize = 1024;
 
 /// Inline chunk-list threshold used when writing LBM5 metadata
-/// (v0.3.0+ default). Lower than the V3/V4 value (1024) so the
+/// (v0.2.1+ default). Lower than the V3/V4 value (1024) so the
 /// encoded directory tree stays compact for very large vaults with
 /// thousands of files: 256 chunks at 4 KiB plaintext ~ 1 MiB per
 /// inode before spilling to an external chunk-list chain. The read

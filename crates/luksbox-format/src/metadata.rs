@@ -8,7 +8,7 @@ use luksbox_core::{CipherSuite, MasterVolumeKey, SubKey, aead};
 
 use crate::error::Error;
 
-/// Default metadata region size: 64 MiB (raised from 16 MiB in v0.3.0).
+/// Default metadata region size: 64 MiB (raised from 16 MiB in v0.2.1).
 /// Holds the encrypted directory tree and any small global metadata,
 /// re-encrypted on every write.
 ///

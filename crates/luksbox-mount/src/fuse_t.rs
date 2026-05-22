@@ -180,11 +180,18 @@ impl Filesystem for LuksboxFuseTFs {
         vfs.write(id, offset, data).map_err(|e| Self::vfs_errno(&e))
     }
 
-    fn create(&self, path: &Path, _mode: u32) -> Result<(), Errno> {
+    fn create(&self, path: &Path, mode: u32) -> Result<(), Errno> {
         let (parent, name) = Self::split_parent_name(path)?;
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
         let parent_id = self.lookup_id(&vfs, &parent)?;
-        vfs.create(parent_id, &name)
+        // Honor the caller-requested mode so the executable bit on
+        // scripts and binaries created via `open(O_CREAT, 0o755)`
+        // survives a `git clone` into a mounted vault. The FUSE-T
+        // trampoline at `crates/luksbox-fuse-t/src/ops.rs::op_create`
+        // does the same `mode & 0o7777` masking and umask handling
+        // before reaching this method, so we forward the value
+        // verbatim.
+        vfs.create_with_mode(parent_id, &name, mode & 0o7777)
             .map_err(|e| Self::vfs_errno(&e))?;
         let _ = vfs.flush();
         Ok(())
