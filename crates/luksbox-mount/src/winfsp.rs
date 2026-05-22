@@ -208,6 +208,8 @@ fn vfs_err_to_nt(e: &luksbox_vfs::Error) -> NTSTATUS {
         E::NotEmpty => STATUS_DIRECTORY_NOT_EMPTY,
         E::NotADirectory => STATUS_NOT_A_DIRECTORY,
         E::InvalidPath(_) => STATUS_OBJECT_PATH_NOT_FOUND,
+        // POSIX: rename(2) into own descendant -> EINVAL.
+        E::RenameCycle => STATUS_INVALID_PARAMETER,
         E::MetadataBudgetExhausted => STATUS_DISK_FULL,
         E::FileSizeExceedsCap => STATUS_FILE_TOO_LARGE,
         _ => STATUS_ACCESS_DENIED,
@@ -719,19 +721,32 @@ impl FileSystemInterface for LuksboxFs {
         _ctx: Self::FileContext,
         old_name: &U16CStr,
         new_name: &U16CStr,
-        _replace_if_exists: bool,
+        replace_if_exists: bool,
     ) -> Result<(), NTSTATUS> {
         let old = from_win_path(old_name)?;
         let new = from_win_path(new_name)?;
         let (op, ol) = split_parent_name(&old)?;
         let (np, nl) = split_parent_name(&new)?;
-        if op != np {
-            // luksbox-vfs only supports same-parent rename in v1.
-            return Err(STATUS_ACCESS_DENIED);
-        }
         let mut vfs = self.inner.lock().unwrap();
-        let parent = vfs.lookup_path(op).map_err(|e| vfs_err_to_nt(&e))?;
-        vfs.rename(parent, ol, nl).map_err(|e| vfs_err_to_nt(&e))?;
+        let from_parent = vfs.lookup_path(op).map_err(|e| vfs_err_to_nt(&e))?;
+        // Reuse the same id when both paths share a parent so the VFS
+        // takes its single-get_mut fast path; otherwise resolve the
+        // distinct destination directory.
+        let to_parent = if op == np {
+            from_parent
+        } else {
+            vfs.lookup_path(np).map_err(|e| vfs_err_to_nt(&e))?
+        };
+        // Honor the Win32 `MoveFileEx` semantics: if the caller did NOT
+        // pass MOVEFILE_REPLACE_EXISTING and the target already exists,
+        // surface STATUS_OBJECT_NAME_COLLISION instead of silently
+        // overwriting. The VFS layer's POSIX behavior is replace-on-
+        // conflict, so we enforce the no-replace contract here.
+        if !replace_if_exists && vfs.lookup(to_parent, nl).is_ok() {
+            return Err(STATUS_OBJECT_NAME_COLLISION);
+        }
+        vfs.rename(from_parent, ol, to_parent, nl)
+            .map_err(|e| vfs_err_to_nt(&e))?;
         let _ = vfs.flush();
         Ok(())
     }

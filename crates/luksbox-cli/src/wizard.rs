@@ -3448,14 +3448,11 @@ fn mv_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
         .with_prompt("Existing path inside vault")
         .interact_text()?;
     let new: String = Input::with_theme(theme)
-        .with_prompt("New path (must be in the same parent directory)")
+        .with_prompt("New path (same dir or any other dir inside the vault)")
         .interact_text()?;
     let (old_parent, old_name) = split_parent_name(vfs, &old)?;
     let (new_parent, new_name) = split_parent_name(vfs, &new)?;
-    if old_parent != new_parent {
-        return Err("cross-directory rename is not supported in v1".into());
-    }
-    vfs.rename(old_parent, &old_name, &new_name)?;
+    vfs.rename(old_parent, &old_name, new_parent, &new_name)?;
     vfs.flush()?;
     println!("OK renamed {old} -> {new}");
     Ok(())

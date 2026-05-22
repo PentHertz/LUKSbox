@@ -219,17 +219,34 @@ that identifies the metadata format inside the encrypted region:
   ChunkRef costs ~4-6 varint bytes inside the metadata budget; a
   vault with many large files runs out of budget around 8-10 GiB
   total stored content at the default 16 MiB region size.
-- `LBM\x03` ("v3", opt-in) -- inodes whose chunk count exceeds
+- `LBM\x03` ("v3") -- inodes whose chunk count exceeds
   `V3_INLINE_CHUNK_THRESHOLD` (1024 chunks ~ 4 MiB file) carry a
   `chunks_external = Some((head, count))` field instead, pointing
   at the **chunk-list block chain** described below. Inodes under
   the threshold stay inline (same wire shape as v2).
+- `LBM\x04` ("v4", NEW DEFAULT) -- superset of v3 that adds two
+  trailing per-inode fields:
+  - `mode: u32` (POSIX mode bits, persists `chmod`)
+  - `link_count: u32` (POSIX hardlink count, persists hardlinks)
+  Adds an `InodeKind::Symlink` variant with a `symlink_target:
+  Option<String>` field. Validated at load time by
+  `is_safe_symlink_target` -- a vault carrying a malicious
+  symlink target (absolute, `..`-bearing, NUL, oversize) is
+  rejected at `Vfs::open` before any FUSE `readlink` callback
+  can return it. New vaults default to LBM4; existing v2/v3
+  vaults auto-upgrade ONLY when an LBM4-only feature is used
+  (chmod to non-default mode, link producing nlink>1, or any
+  symlink creation). The upgrade is one-way: once a vault has
+  LBM4 magic, pre-v0.3 LUKSbox binaries can no longer open it.
+  Users who need to keep new vaults openable by older binaries
+  can opt back to LBM2 via `LUKSBOX_FORMAT_V2=1` at create time;
+  they then lose chmod/link/symlink.
 
-Choice of v2 vs v3 is locked at vault creation time and stamped
-implicitly via the magic byte (which is itself inside the
-AEAD-encrypted region, so an attacker without MVK cannot flip it).
-Old binaries presented with an `LBM\x03` blob fail with a clean
-`MetadataDeserialize` error rather than silently mis-parsing.
+Choice of v2 vs v3 vs v4 is stamped implicitly via the magic byte
+(which is itself inside the AEAD-encrypted region, so an attacker
+without MVK cannot flip it). Old binaries presented with an
+`LBM\x03` or `LBM\x04` blob they don't understand fail with a
+clean `MetadataDeserialize` error rather than silently mis-parsing.
 
 #### V3: chunk-list blocks
 
@@ -1843,7 +1860,7 @@ sequenceDiagram
 
 3. **Coerced user / rubber-hose decryption**. If the attacker has
    the device, the PIN, and a finger to apply, the vault opens.
-   Hidden-volume / duress-passphrase functionality is not in v1.
+   Hidden-volume / duress-passphrase functionality is not yet implemented.
 
 4. **Compromised host while vault is open**. If the host is
    already running attacker code, FIDO2 can't help - the MVK is in

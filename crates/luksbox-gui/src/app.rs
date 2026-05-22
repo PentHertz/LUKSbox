@@ -1161,8 +1161,8 @@ enum PickerTarget {
 }
 
 /// In-flight rename. The user picked a row; we keep the original name
-/// (so we can call `vfs.rename(parent, old, new)`) and a buffer the
-/// modal binds to.
+/// (so we can call `vfs.rename(parent, old, parent, new)` -- same-dir
+/// rename only from this entry point) and a buffer the modal binds to.
 struct RenameTarget {
     old_name: String,
     buf: String,
@@ -5245,6 +5245,13 @@ impl LuksboxApp {
                                             ui.close();
                                         }
                                     }
+                                    InodeKind::Symlink => {
+                                        // Symlinks: no extract action
+                                        // (the target is a vault-
+                                        // internal path, not file
+                                        // bytes). Rename + delete
+                                        // still appear below.
+                                    }
                                 }
                                 if ui.button("Rename...").clicked() {
                                     do_rename =
@@ -8348,7 +8355,7 @@ impl LuksboxApp {
                 } else if let Some(v) = self.vault.as_mut() {
                     let cwd = self.cwd.clone();
                     match v.vfs.lookup_path(&cwd) {
-                        Ok(parent) => match v.vfs.rename(parent, &rt.old_name, &new_name) {
+                        Ok(parent) => match v.vfs.rename(parent, &rt.old_name, parent, &new_name) {
                             Ok(()) => {
                                 let _ = v.vfs.flush();
                                 self.toast_ok(format!("renamed to {new_name}"));

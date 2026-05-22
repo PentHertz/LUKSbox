@@ -3465,6 +3465,36 @@ pub fn get_dir_recursive(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<u64
     let entries = vfs.readdir(id).map_err(estr)?;
     let mut total = 0u64;
     for ent in entries {
+        // Zip-slip / tar-slip defense-in-depth. luksbox-vfs's
+        // `validate_name` already rejects `/`, `\`, NUL, `.`, `..`
+        // and over-long names both at create-time AND at metadata-
+        // load time, so a well-formed vault can never reach this
+        // point with a name that resolves outside `local`. We
+        // re-check here because:
+        //
+        // 1. A future bug in `validate_metadata_tree` (or a new
+        //    inode-kind that bypasses the per-entry name walk)
+        //    would otherwise let a malicious vault write files
+        //    outside the user's chosen extract destination, under
+        //    the user's process privileges -- the classic archive-
+        //    extraction CVE pattern (CVE-2018-1002200 "zip slip",
+        //    a recurring source of supply-chain compromise via
+        //    Electron apps and code-signing tools).
+        //
+        // 2. Belt-and-suspenders against `Path::join` quirks --
+        //    on Windows a drive-letter prefix like `C:foo` makes
+        //    join discard the base path entirely; the format
+        //    layer's NAME_MAX + char allowlist catches the slash
+        //    forms but a windows-specific extra check here is
+        //    cheap and explicit.
+        if name_escapes_directory(&ent.name) {
+            return Err(format!(
+                "vault contains an entry name that would escape the destination \
+                 directory ('{}'); refusing to extract. This indicates a corrupt \
+                 or maliciously-constructed vault.",
+                ent.name
+            ));
+        }
         let inner_child = if inner == "/" {
             format!("/{}", ent.name)
         } else {
@@ -3478,9 +3508,133 @@ pub fn get_dir_recursive(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<u64
             InodeKind::Directory => {
                 total += get_dir_recursive(vfs, &inner_child, &local_child)?;
             }
+            InodeKind::Symlink => {
+                // Symlinks: re-create on the host filesystem with
+                // the validated target. `Vfs::readlink` returned
+                // a target that has already gone through
+                // `is_safe_symlink_target` (rejects absolute paths,
+                // `..` components, NULs, oversize) -- the resulting
+                // host-side symlink can only point to a sibling of
+                // `local_child` inside the extract destination. If
+                // a future bug let an unsafe target through, the
+                // host kernel would still resolve it inside the
+                // user's filesystem on later access, so the
+                // VFS-layer sanitization is the load-bearing
+                // defense (this is just the materialization step).
+                let target = vfs
+                    .readlink(vfs.lookup_path(&inner_child).map_err(estr)?)
+                    .map_err(estr)?;
+                // Defense-in-depth re-check at extract time, same
+                // class as `name_escapes_directory` above. Note:
+                // the equivalent check for symlink targets is
+                // looser than for entry names (relative `..`s
+                // bounded by parent depth would be safe), but the
+                // VFS already refuses any `..` so the check
+                // collapses to "redundant strict ban", which is
+                // fine.
+                if target.is_empty()
+                    || target.contains('\0')
+                    || target.starts_with('/')
+                    || target.starts_with('\\')
+                    || target.contains("..")
+                {
+                    return Err(format!(
+                        "vault contains a symlink with an escape target ('{target}'); \
+                         refusing to materialise"
+                    ));
+                }
+                #[cfg(unix)]
+                {
+                    if let Err(e) = std::os::unix::fs::symlink(&target, &local_child) {
+                        return Err(format!(
+                            "failed to materialise symlink {}: {e}",
+                            local_child.display()
+                        ));
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(format!(
+                        "vault contains a symlink ({inner_child}) but this host \
+                         does not support symlink creation in the extract path"
+                    ));
+                }
+            }
         }
     }
     Ok(total)
+}
+
+/// Returns true if joining `name` to a directory path could possibly
+/// resolve outside that directory. Conservative on purpose: any name
+/// that contains a path separator (`/` or `\`), looks like a
+/// directory-traversal component (`..` or `.`), is empty, or starts
+/// with a Windows drive-letter prefix triggers rejection. Cheap, no
+/// I/O.
+fn name_escapes_directory(name: &str) -> bool {
+    if name.is_empty() || name == "." || name == ".." {
+        return true;
+    }
+    if name.contains('/') || name.contains('\\') {
+        return true;
+    }
+    // Windows drive-letter prefix (e.g. "C:foo"). `Path::join` on
+    // Windows treats a string with this prefix as the new full path,
+    // discarding the base. POSIX paths can legitimately contain `:`
+    // so the check is windows-gated.
+    #[cfg(windows)]
+    {
+        let bytes = name.as_bytes();
+        if bytes.len() >= 2 && bytes[1] == b':' {
+            let c = bytes[0];
+            if c.is_ascii_alphabetic() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod name_escapes_directory_tests {
+    use super::name_escapes_directory;
+
+    #[test]
+    fn rejects_traversal_and_separator_chars() {
+        for bad in [
+            "",
+            ".",
+            "..",
+            "../etc/passwd",
+            "foo/bar",
+            "foo\\bar",
+            "..\\..\\Windows\\System32\\hosts",
+            "\\Windows",
+            "/etc/shadow",
+        ] {
+            assert!(
+                name_escapes_directory(bad),
+                "expected {bad:?} to be rejected as path-escaping",
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_ordinary_names() {
+        for good in ["README.md", "deadbeef", "file.tar.gz", "spaces in name"] {
+            assert!(
+                !name_escapes_directory(good),
+                "expected {good:?} to be accepted as a plain leaf name",
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_letter_prefix_is_rejected() {
+        assert!(name_escapes_directory("C:malicious"));
+        assert!(name_escapes_directory("d:foo"));
+    }
 }
 
 pub fn get_file(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<u64, String> {

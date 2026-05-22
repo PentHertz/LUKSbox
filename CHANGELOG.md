@@ -86,6 +86,129 @@ and `luksbox-cli::tests::functional` pin the regressions, including a
 real end-to-end `panic -y --wipe-data` against a symlinked path that
 verifies the sentinel file is byte-for-byte unchanged.
 
+### v4 metadata format (NEW DEFAULT) - persistent chmod, hardlinks, symlinks
+
+A new on-disk metadata format ("v4", magic `LBM\x04`) extends v3
+with two per-inode fields, `mode: u32` (POSIX mode bits) and
+`link_count: u32` (POSIX hardlink count), and a new
+`InodeKind::Symlink` variant carrying an in-vault target string.
+v4 is the default for newly-created vaults; existing v2/v3 vaults
+stay in their original format on flush UNLESS an LBM4-only feature
+is used (a chmod to a non-default mode, a link that produces
+nlink>1, or any symlink). The auto-upgrade is one-way: once a
+vault is written as LBM4, pre-v0.3 LUKSbox binaries can no longer
+open it. The env-var opt-out (`LUKSBOX_FORMAT_V2=1`) still works
+for users who need to keep new vaults openable by older binaries
+-- they just lose the new features.
+
+What the format change enables, end-user-visible:
+
+- **Persistent `chmod`**. `chmod 0o755 script.sh` survives unmount
+  and remount; mode bits are stored in the inode rather than
+  synthesised on every stat. `git`'s `core.filemode` probe sees
+  the change take effect, so executable bits on shell scripts /
+  cmd.com binaries / etc. survive a vault checkout.
+- **POSIX hardlinks**. `ln file linkname` creates a true hardlink
+  (shared inode, both names report `nlink=2`, writing through one
+  is visible through the other). The refcount-aware `unlink`
+  decrements `link_count` instead of freeing chunks on the first
+  removal -- a file with N hardlinks survives N-1 unlinks. Last
+  unlink frees chunks the same way pre-LBM4 vaults always did.
+- **Symlinks** (with strict target sanitization, see below).
+
+### Symlink supply-chain defense
+
+LUKSbox symlinks are validated by `is_safe_symlink_target` at three
+layers (create time, vault-open / load time, and flush time). The
+function rejects:
+
+- Absolute targets (start with `/`, `\`, or a Windows drive-letter
+  prefix like `C:foo`)
+- Targets containing `..` or `.` components (anywhere, not just
+  leading)
+- NUL bytes (would silently truncate at the C-string boundary
+  when crossing the FUSE callback)
+- Targets exceeding `MAX_SYMLINK_TARGET_LEN` (PATH_MAX = 4096)
+- Empty targets
+
+This closes the `secret -> /etc/shadow` supply-chain attack class:
+an attacker who distributes a vault with a passphrase they control
+cannot embed a symlink that would, when traversed by a victim's
+file manager or `cat`, exfiltrate host files under the victim's
+UID. The kernel surfaces `EINVAL` (LUKSbox `Error::InvalidPath`)
+to user-space, so `ln -s /etc/shadow evil` inside a mounted vault
+fails the same way as creating an invalid filename. The same
+defense fires at vault open time, so a vault forged outside
+LUKSbox (e.g. via a metadata-blob edit) is refused before any
+FUSE `readlink` callback can return the malicious bytes.
+
+Ground-truth verified: `git clone https://github.com/PentHertz/LUKSbox.git`
++ `chmod +x` + `ln target alias` + `ln -s real link` all work
+inside a mounted vault, survive unmount/remount, and the four
+attack-string symlink-creation attempts (`/etc/shadow`,
+`../../../etc/shadow`, `valid/../../etc/shadow`, `C:\Windows\...`)
+all return `EINVAL` immediately.
+
+### POSIX rename(2) semantics
+
+`Vfs::rename` was missing two cases POSIX requires; both are now
+fixed. Both affected git, sqlite WAL checkpointing, and every
+editor that uses the standard "write temp + rename onto target"
+atomic-write idiom -- the symptom that surfaced this was
+`git clone` failing with "could not write config file ... File
+exists".
+
+- **Replace-on-conflict**. Rename onto an existing target now
+  replaces (POSIX requirement). The displaced inode's data chunks
+  AND v3 chunk-list blocks return to `free_chunks` (same path as
+  `unlink`), so the replace never leaks ciphertext storage.
+  Pre-fix code returned `AlreadyExists` and broke every atomic-
+  write tool. Type compatibility is enforced first: file -> dir is
+  rejected with `IsADirectory`, dir -> file with `NotADirectory`,
+  dir -> non-empty dir with `NotEmpty`.
+- **Cross-directory rename**. `Vfs::rename` now takes
+  `(old_parent, old_name, new_parent, new_name)` and moves inodes
+  between parents in a single atomic operation. A new
+  `Vfs::is_descendant_of` cycle guard refuses moves that would
+  put a directory inside its own subtree (POSIX `EINVAL`), using
+  a visited-set so the traversal terminates even on a corrupt
+  vault with pre-existing cycles. FUSE / FUSE-T / WinFsp callers
+  all now honour cross-dir rename instead of returning
+  `ENOSYS` / `STATUS_ACCESS_DENIED`.
+- **`RENAME_NOREPLACE` flag honoured** on FUSE, **`MoveFileEx`
+  `MOVEFILE_REPLACE_EXISTING=false`** honoured on WinFsp:
+  applications that explicitly want EEXIST/COLLISION still get it.
+
+### Cross-platform zip-slip defense on vault entry names
+
+`validate_name` now rejects `\` (backslash) on every host, not just
+`/`. A vault entry name like `..\..\Windows\System32\drivers\etc\hosts`
+would pass the old `/`-only check on Linux but, when the GUI's
+"extract directory" feature ran `local.join(&ent.name)` on a
+Windows host, `Path::join` would treat `\` as a separator and
+escape the destination -- the classic CVE-2018-1002200 ("zip slip")
+class. The legitimate use-case cost is "Linux files containing
+`\` in their names can't be added to a vault", which we accept as
+a security/portability win. The GUI extract path also got a
+`name_escapes_directory` defense-in-depth check that re-rejects
+anything containing `/`, `\`, `..`, or `.` before joining.
+
+`validate_name` also gained a `MAX_NAME_LEN_BYTES = 255` cap (NAME_MAX)
+to prevent programmatic callers from bloating the metadata blob
+with megabyte-sized filenames.
+
+### Cycle-guard hardening against corrupted vaults
+
+The rename cycle guard (`is_descendant_of`) now walks `children`
+regardless of inode `kind`. The well-formed invariant says "only
+Directory inodes have non-empty `children`", but if a corrupted or
+attacker-influenced vault carries a File-kind inode with non-empty
+children (an LBM4 forgery, or a future bug), skipping by kind
+would let those children hide from the cycle check -- a rename
+into one of them would then create a real directory cycle, and the
+next readdir / flush / rotate_mvk traversal would loop forever.
+Walking unconditionally is free on well-formed vaults.
+
 ### v3 metadata format (NEW DEFAULT) + bigger v2 default
 
 A new on-disk metadata format ("v3", magic `LBM\x03`) moves per-file

@@ -1628,6 +1628,7 @@ fn cmd_header_dump(vault: &Path, unlock: &UnlockArgs, pretty: bool) -> Result<()
             "kind": match kind {
                 InodeKind::File => "file",
                 InodeKind::Directory => "dir",
+                InodeKind::Symlink => "symlink",
             },
             "size_raw": size,
         });
@@ -1671,6 +1672,14 @@ fn cmd_header_dump(vault: &Path, unlock: &UnlockArgs, pretty: bool) -> Result<()
                     stack.push((de.id, child_path));
                 }
                 entry["children"] = serde_json::Value::Array(children);
+            }
+            InodeKind::Symlink => {
+                // Forensic dump: include the validated symlink
+                // target. It's already passed `is_safe_symlink_target`
+                // at vault open time (in `v4_on_disk_to_in_memory`).
+                if let Ok(target) = vfs.readlink(id) {
+                    entry["symlink_target"] = serde_json::Value::String(target);
+                }
             }
         }
         inodes_json.push(entry);
@@ -1807,6 +1816,11 @@ fn cmd_check(
                         }
                     }
                 }
+            }
+            InodeKind::Symlink => {
+                // Symlinks have no chunks to verify; their target
+                // is validated at vault-open time. Nothing to do
+                // in `check`.
             }
         }
     }
@@ -4531,10 +4545,7 @@ fn cmd_mv(path: &Path, unlock: &UnlockArgs, old: &str, new: &str) -> Result<()> 
     let mut vfs = open_vfs(path, unlock)?;
     let (old_parent, old_name) = split_parent_name(&vfs, old)?;
     let (new_parent, new_name) = split_parent_name(&vfs, new)?;
-    if old_parent != new_parent {
-        return Err("cross-directory rename is not supported in v1".into());
-    }
-    vfs.rename(old_parent, &old_name, &new_name)?;
+    vfs.rename(old_parent, &old_name, new_parent, &new_name)?;
     vfs.flush()?;
     Ok(())
 }
@@ -6197,6 +6208,19 @@ fn copy_subtree(
                     dst_vfs.write(new_file, off, &buf[..n])?;
                     off += n as u64;
                 }
+            }
+            InodeKind::Symlink => {
+                // Copy the symlink with its validated target. The
+                // target survived the source vault's
+                // `validate_metadata_tree` -> `is_safe_symlink_target`
+                // check, so re-creating it in the destination via
+                // `Vfs::symlink` re-runs the check (defense-in-depth
+                // -- if the destination had a stricter version of
+                // the check, e.g. a future format-bump, we'd see
+                // the error and propagate rather than silently
+                // copy a now-unsafe target).
+                let target = src_vfs.readlink(src_id)?;
+                dst_vfs.symlink(dst_dir, &entry.name, &target)?;
             }
         }
     }
