@@ -1207,7 +1207,14 @@ fn header_restore_round_trip_inline_with_no_verify() {
     // OFF_HMAC = HEADER_SIZE - HMAC_LEN = 8192 - 32 = 8160.
     corrupt_bytes(&dir.join("v.lbx"), 8160, 32, 0xaa);
 
-    // Sanity: ls now fails because the header HMAC is wrong.
+    // v0.2.1+: a header-bak sidecar was written when the vault first
+    // auto-upgraded to LUKSBOX2. To exercise the user-managed
+    // header-restore path (rather than the automatic mirror
+    // recovery), remove the sidecar first.
+    let _ = std::fs::remove_file(dir.join("v.lbx.header-bak"));
+
+    // Sanity: ls now fails because the header HMAC is wrong AND
+    // there's no mirror to recover from.
     let out = run(dir, &["ls", "v.lbx", "/"]);
     assert_err(&out, "ls on corrupted-header vault must fail");
     assert!(

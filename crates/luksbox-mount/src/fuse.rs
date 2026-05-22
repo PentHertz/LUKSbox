@@ -379,15 +379,28 @@ impl LuksboxFs {
         let kind = match stat.kind {
             InodeKind::Directory => FileType::Directory,
             InodeKind::File => FileType::RegularFile,
+            InodeKind::Symlink => FileType::Symlink,
         };
-        let perm: u16 = match stat.kind {
-            InodeKind::Directory => 0o700,
-            InodeKind::File => 0o600,
-        };
+        // POSIX mode bits from the vault (persisted via LBM4; default
+        // for LBM2/LBM3). Mask to 0o7777 so we don't leak file-type
+        // bits into the perm field (fuser adds them separately based
+        // on `kind`). `stat.mode` already comes from the VFS as
+        // 0o7777-masked, but defensive truncation is cheap.
+        let perm: u16 = (stat.mode & 0o7777) as u16;
         let mtime = if stat.mtime_ns == 0 {
             UNIX_EPOCH
         } else {
             UNIX_EPOCH + Duration::from_nanos(stat.mtime_ns)
+        };
+        // Directories conventionally report nlink = 2 (self + ".")
+        // on POSIX even though our VFS stores link_count = 1 for
+        // them. Files report stat.link_count, which is >= 1 (== 1
+        // on pre-LBM4 vaults; can be > 1 if hardlinks have been
+        // created on LBM4 vaults).
+        let nlink = match stat.kind {
+            InodeKind::Directory => 2,
+            InodeKind::File => stat.link_count.max(1) as u32,
+            InodeKind::Symlink => 1,
         };
         Some(FileAttr {
             ino: INodeNo(id),
@@ -399,11 +412,7 @@ impl LuksboxFs {
             crtime: mtime,
             kind,
             perm,
-            nlink: if stat.kind == InodeKind::Directory {
-                2
-            } else {
-                1
-            },
+            nlink,
             uid: self.uid,
             gid: self.gid,
             rdev: 0,
@@ -422,6 +431,8 @@ fn errno(e: &VfsError) -> Errno {
         VfsError::NotAFile => Errno::EISDIR,
         VfsError::NotEmpty => Errno::ENOTEMPTY,
         VfsError::InvalidPath(_) => Errno::EINVAL,
+        // POSIX: rename(2) into own descendant -> EINVAL.
+        VfsError::RenameCycle => Errno::EINVAL,
         // Metadata budget exhausted: surface as ENOSPC so cp / dd /
         // rsync abort with the right errno mid-copy. EIO would also
         // be safe but ENOSPC matches the actual condition (the
@@ -472,7 +483,7 @@ impl Filesystem for LuksboxFs {
         &self,
         _req: &Request,
         ino: INodeNo,
-        _mode: Option<u32>,
+        mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
@@ -487,20 +498,36 @@ impl Filesystem for LuksboxFs {
         reply: ReplyAttr,
     ) {
         let ino = ino.0;
+        // Lock once and do both ops under the same lock to avoid
+        // an intermediate visible state where size has changed but
+        // mode hasn't (or vice versa).
+        let mut vfs = match self.vfs.lock() {
+            Ok(v) => v,
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
         if let Some(new_size) = size {
-            let mut vfs = match self.vfs.lock() {
-                Ok(v) => v,
-                Err(_) => {
-                    reply.error(Errno::EIO);
-                    return;
-                }
-            };
             if let Err(e) = vfs.truncate(ino, new_size) {
                 reply.error(errno(&e));
                 return;
             }
+        }
+        if let Some(new_mode) = mode {
+            // Persistent chmod, LBM4-only. On a pre-LBM4 vault this
+            // sets the mode in-memory; the next flush auto-upgrades
+            // to LBM4 if the new mode != the kind's default.
+            if let Err(e) = vfs.chmod(ino, new_mode) {
+                reply.error(errno(&e));
+                return;
+            }
+        }
+        if size.is_some() || mode.is_some() {
             let _ = vfs.flush();
         }
+        // attr() takes its own lock so drop ours first.
+        drop(vfs);
         match self.attr(ino) {
             Some(attr) => reply.attr(&TTL, &attr),
             None => reply.error(Errno::ENOENT),
@@ -546,6 +573,7 @@ impl Filesystem for LuksboxFs {
             let kind = match e.kind {
                 InodeKind::Directory => FileType::Directory,
                 InodeKind::File => FileType::RegularFile,
+                InodeKind::Symlink => FileType::Symlink,
             };
             all.push((e.id, kind, e.name));
         }
@@ -626,8 +654,8 @@ impl Filesystem for LuksboxFs {
         _req: &Request,
         parent: INodeNo,
         name: &OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
@@ -635,6 +663,17 @@ impl Filesystem for LuksboxFs {
             reply.error(Errno::EINVAL);
             return;
         };
+        // Honor `open(O_CREAT, mode)`: take the requested permission
+        // bits, mask off any S_IF* file-type bits the kernel may have
+        // included (we always create regular files via this path),
+        // then apply the per-process umask. This is the POSIX-defined
+        // result for `creat(2)` / `open(O_CREAT)` and is what makes
+        // `git clone` preserve the executable bit on scripts and
+        // binaries: git uses `open(O_CREAT, 0o100755)` for executables
+        // in the index, and without this the file landed at the VFS
+        // default 0o644, losing +x until/unless git issued a follow-up
+        // chmod (which not all versions of git do).
+        let effective_mode = (mode & 0o7777) & !(umask & 0o7777);
         let id = {
             let mut vfs = match self.vfs.lock() {
                 Ok(v) => v,
@@ -643,7 +682,7 @@ impl Filesystem for LuksboxFs {
                     return;
                 }
             };
-            match vfs.create(parent.0, name) {
+            match vfs.create_with_mode(parent.0, name, effective_mode) {
                 Ok(id) => {
                     let _ = vfs.flush();
                     id
@@ -754,7 +793,7 @@ impl Filesystem for LuksboxFs {
         name: &OsStr,
         newparent: INodeNo,
         newname: &OsStr,
-        _flags: fuser::RenameFlags,
+        flags: fuser::RenameFlags,
         reply: ReplyEmpty,
     ) {
         let Some(name) = name_str(name) else {
@@ -765,15 +804,49 @@ impl Filesystem for LuksboxFs {
             reply.error(Errno::EINVAL);
             return;
         };
-        if parent.0 != newparent.0 {
-            // Cross-directory rename intentionally not in v1.
-            reply.error(Errno::ENOSYS);
-            return;
-        }
+        // `RENAME_EXCHANGE` (atomic swap) and `RENAME_WHITEOUT`
+        // (overlayfs internal) aren't supported. Reject up front
+        // so the VFS doesn't silently treat them as plain replace.
+        // Also handle the Linux-only `RENAME_NOREPLACE` (caller
+        // explicitly wants EEXIST if the target already exists; the
+        // VFS layer's POSIX behavior is replace-on-conflict, so
+        // enforce the no-replace contract here before delegating).
+        //
+        // These flag constants come from Linux's `renameat2(2)` and
+        // are gated to `target_os = "linux"` inside the `fuser`
+        // crate; on macOS (macFUSE builds reach this file too via
+        // the `fuse` feature) the syscall doesn't exist and the
+        // FUSE protocol never carries the bits, so the whole check
+        // is moot. cfg-gate to Linux so the macOS build doesn't
+        // reference symbols that aren't compiled in.
+        #[cfg(target_os = "linux")]
+        let no_replace = {
+            let unsupported_flags =
+                fuser::RenameFlags::RENAME_EXCHANGE | fuser::RenameFlags::RENAME_WHITEOUT;
+            if flags.intersects(unsupported_flags) {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+            flags.contains(fuser::RenameFlags::RENAME_NOREPLACE)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let no_replace = {
+            // Suppress unused-variable on non-Linux. The kernel
+            // doesn't pass any renameat2 flags to FUSE on macOS, so
+            // there is nothing to inspect.
+            let _ = flags;
+            false
+        };
         let r = match self.vfs.lock() {
-            Ok(mut v) => v.rename(parent.0, name, newname).map(|_| {
-                let _ = v.flush();
-            }),
+            Ok(mut v) => {
+                if no_replace && v.lookup(newparent.0, newname).is_ok() {
+                    reply.error(Errno::EEXIST);
+                    return;
+                }
+                v.rename(parent.0, name, newparent.0, newname).map(|_| {
+                    let _ = v.flush();
+                })
+            }
             Err(_) => {
                 reply.error(Errno::EIO);
                 return;
@@ -898,26 +971,125 @@ impl Filesystem for LuksboxFs {
         reply.statfs(blocks, bfree, bavail, files, ffree, bsize, 255, frsize);
     }
 
+    /// Create a symlink under `parent` named `link_name` whose
+    /// target string is `target`. The target is sanitized by
+    /// `Vfs::symlink`'s `is_safe_symlink_target` -- absolute paths,
+    /// `..` / `.` components, NUL bytes, and over-long targets are
+    /// REFUSED with EINVAL. This is the supply-chain defense for
+    /// the `secret -> /etc/shadow` attack class (CVE-2018-1002200,
+    /// CVE-2017-1000117).
+    ///
+    /// The target is stored verbatim (subject to validation); when
+    /// the kernel later does `readlink` we return the stored bytes,
+    /// and the kernel resolves the path WITHIN THE MOUNTED VAULT
+    /// (FUSE's default behavior is to resolve relative symlinks
+    /// against the mount). Because we reject `..` components, the
+    /// resolution can never escape the symlink's parent directory.
     fn symlink(
         &self,
         _req: &Request,
-        _parent: INodeNo,
-        _link_name: &OsStr,
-        _target: &Path,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
         reply: ReplyEntry,
     ) {
-        reply.error(Errno::ENOSYS);
+        let Some(link_name) = name_str(link_name) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let Some(target_str) = target.to_str() else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let id = match self.vfs.lock() {
+            Ok(mut v) => match v.symlink(parent.0, link_name, target_str) {
+                Ok(id) => {
+                    let _ = v.flush();
+                    id
+                }
+                Err(e) => {
+                    reply.error(errno(&e));
+                    return;
+                }
+            },
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        match self.attr(id) {
+            Some(attr) => reply.entry(&TTL, &attr, fuser::Generation(0)),
+            None => reply.error(Errno::ENOENT),
+        }
     }
 
+    /// Read a symlink. Returns the validated target string the
+    /// vault stored; the kernel resolves the path within the
+    /// mount. Because targets are sanitized at create time and
+    /// re-validated at vault open, the bytes we return here cannot
+    /// represent an absolute path or a `..` escape.
+    fn readlink(&self, _req: &Request, ino: INodeNo, reply: fuser::ReplyData) {
+        let target = match self.vfs.lock() {
+            Ok(v) => match v.readlink(ino.0) {
+                Ok(t) => t,
+                Err(e) => {
+                    reply.error(errno(&e));
+                    return;
+                }
+            },
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        // Return as raw bytes; the kernel doesn't want a NUL
+        // terminator (the length is implicit in the reply size).
+        reply.data(target.as_bytes());
+    }
+
+    /// Hardlink (LBM4): create a new directory entry pointing at
+    /// `ino` under `newparent` with `newname`. Increments the
+    /// target's `link_count`; subsequent `unlink` calls decrement
+    /// the count and only free chunks at zero.
+    ///
+    /// **Security**: delegates to `Vfs::link` which validates the
+    /// target is a File (POSIX forbids dir hardlinks), the new
+    /// parent is a directory, the new name doesn't collide, and
+    /// the link_count doesn't overflow u32. Failed link returns
+    /// ENOENT/EEXIST/EISDIR per POSIX; callers like git fall back
+    /// to copy on EACCES, so we never emit EACCES from a successful
+    /// op-not-supported scenario (this code path IS supported).
     fn link(
         &self,
         _req: &Request,
-        _ino: INodeNo,
-        _newparent: INodeNo,
-        _newname: &OsStr,
+        ino: INodeNo,
+        newparent: INodeNo,
+        newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        reply.error(Errno::EACCES);
+        let Some(newname) = name_str(newname) else {
+            reply.error(Errno::EINVAL);
+            return;
+        };
+        let r = match self.vfs.lock() {
+            Ok(mut v) => v.link(ino.0, newparent.0, newname).map(|_| {
+                let _ = v.flush();
+            }),
+            Err(_) => {
+                reply.error(Errno::EIO);
+                return;
+            }
+        };
+        if let Err(e) = r {
+            reply.error(errno(&e));
+            return;
+        }
+        // FUSE expects a ReplyEntry for the new entry; build it
+        // from the existing inode's attrs.
+        match self.attr(ino.0) {
+            Some(attr) => reply.entry(&TTL, &attr, fuser::Generation(0)),
+            None => reply.error(Errno::ENOENT),
+        }
     }
 }
 

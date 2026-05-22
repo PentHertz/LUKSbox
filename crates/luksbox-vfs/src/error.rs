@@ -38,6 +38,14 @@ pub enum Error {
     #[error("invalid path: {0}")]
     InvalidPath(String),
 
+    /// Cross-directory rename that would move a directory into its
+    /// own descendant (or onto itself). POSIX `rename(2)` requires
+    /// EINVAL here -- without the guard the tree would gain a cycle
+    /// and the next traversal (read_directory, flush, rotate_mvk)
+    /// would loop forever. Surfaces to FUSE/WinFsp as EINVAL.
+    #[error("rename would create a directory cycle")]
+    RenameCycle,
+
     /// Refused a read/write whose `offset + length` would overflow u64.
     /// Realistic offsets are bounded by file size; this guard exists
     /// for hostile inputs and as a defense-in-depth against misuse of

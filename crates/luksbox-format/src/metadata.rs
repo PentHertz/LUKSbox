@@ -8,27 +8,28 @@ use luksbox_core::{CipherSuite, MasterVolumeKey, SubKey, aead};
 
 use crate::error::Error;
 
-/// Default metadata region size: 16 MiB. Holds the encrypted directory tree
-/// and any small global metadata, re-encrypted on every write.
+/// Default metadata region size: 64 MiB (raised from 16 MiB in v0.2.1).
+/// Holds the encrypted directory tree and any small global metadata,
+/// re-encrypted on every write.
 ///
-/// Sized to fill the format-level cap [`luksbox_core::header::MAX_METADATA_SIZE`]
-/// (also 16 MiB). Practical vault-data headroom before the chunk-ref list
-/// overflows: **~8-10 GiB**, depending on directory depth, file count, and
-/// how big the chunk IDs grow (a single ChunkRef is two u64 postcard varints,
-/// 4-6 B at realistic IDs; plus per-inode + Vec-length overhead). The
-/// original 1 MiB default silently lost data around ~800 MiB of total stored
-/// content. Bumping to 16 MiB pushes the ceiling out by ~12x.
+/// Sized to match the format-level cap
+/// [`luksbox_core::header::MAX_METADATA_SIZE`]. The bump from 16 MiB
+/// pushes the in-line chunk-ref table out from a ~10 GiB practical
+/// ceiling to ~40+ GiB and addresses the v0.2.0 user-visible
+/// "no space left on device" failure that hit when a directory tree
+/// with thousands of inodes plus their inline chunk-ref vectors
+/// overflowed the smaller region during a heavy copy.
 ///
-/// To support vaults beyond ~10 GiB the on-disk format itself needs work:
-/// either raise `MAX_METADATA_SIZE` (forward-compat-breaking change for old
-/// readers) or move the per-file chunk list out-of-line into the data area
-/// (proper format v2). Both are deferred to a future release.
+/// New-vault default; existing v0.2.0 vaults keep their on-disk
+/// `metadata_size` field (16 MiB) and never grow the region in place.
+/// Beyond the cap, the format-v5 spill threshold (256 chunks per inode
+/// instead of 1024) keeps the encoded tree compact for very large vaults.
 ///
-/// On-disk cost: an empty vault is at least `metadata_offset + 16 MiB`. For
-/// the typical "encrypted backup of $HOME on a USB stick" use case this is
-/// rounding error; for very small demo vaults, override via the
+/// On-disk cost: an empty new vault is at least `metadata_offset + 64 MiB`.
+/// For the typical "encrypted backup of $HOME on a USB stick" use case
+/// this is rounding error; for very small demo vaults, override via the
 /// `--metadata-size` CLI flag.
-pub const DEFAULT_METADATA_REGION_SIZE: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_METADATA_REGION_SIZE: u64 = 64 * 1024 * 1024;
 
 /// Per-blob fixed overhead on disk: 12 B nonce + 8 B ciphertext-length + 16 B tag.
 pub const METADATA_OVERHEAD: usize = 12 + 8 + 16;

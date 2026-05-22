@@ -130,7 +130,12 @@ fn wrong_passphrase_fails() {
 }
 
 #[test]
-fn cross_dir_mv_rejected() {
+fn cross_dir_mv_succeeds_posix_semantics() {
+    // v0.2.1 supports POSIX `rename(2)` semantics including cross-
+    // directory moves (added when implementing `git clone` workflow
+    // inside a mounted vault). This test pins the new behavior: a
+    // file moved from /a to /b must disappear from /a and appear
+    // at /b with its content intact.
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
     assert_ok(&run(dir, &["create", "v.lbx"]), "create");
@@ -138,6 +143,16 @@ fn cross_dir_mv_rejected() {
     assert_ok(&run(dir, &["mkdir", "v.lbx", "/b"]), "mkdir b");
     std::fs::write(dir.join("f"), b"x").unwrap();
     assert_ok(&run(dir, &["put", "v.lbx", "f", "/a/f"]), "put");
-    let out = run(dir, &["mv", "v.lbx", "/a/f", "/b/f"]);
-    assert!(!out.status.success(), "cross-dir rename should fail");
+    assert_ok(&run(dir, &["mv", "v.lbx", "/a/f", "/b/f"]), "cross-dir mv");
+    // Confirm the file is now at /b/f and gone from /a/f.
+    let out = run(dir, &["ls", "v.lbx", "/a"]);
+    assert!(
+        out.status.success() && !String::from_utf8_lossy(&out.stdout).contains("f"),
+        "file must be gone from source dir"
+    );
+    let out = run(dir, &["ls", "v.lbx", "/b"]);
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("f"),
+        "file must appear in destination dir"
+    );
 }

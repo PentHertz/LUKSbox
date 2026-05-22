@@ -46,6 +46,16 @@ jobs:
   build:
     name: ${{ matrix.target }}${{ matrix.ubuntu_codename && format(' ({0})', matrix.ubuntu_codename) || '' }}
     runs-on: ${{ matrix.runner }}
+    # Per-matrix container: most entries run on the host runner
+    # (container is null / unset). The Trixie entries set
+    # `container: debian:trixie` which moves the entire job inside a
+    # fresh Debian 13 container so cargo-deb's `$auto` ELF-derived
+    # dependencies pin trixie-correct package names instead of
+    # noble-shaped ones (libfuse3-4 vs libfuse3-3, etc.). The
+    # bootstrap step below installs the minimum tooling a
+    # `debian:trixie` base image lacks (git for checkout, curl + ca-
+    # certificates for rustup, build-essential for native deps).
+    container: ${{ matrix.container || null }}
     strategy:
       fail-fast: false
       matrix:
@@ -86,9 +96,13 @@ jobs:
             build_rpm: true
             archive: luksbox-${{ github.ref_name }}-aarch64-linux-jammy.tar.gz
           # Linux x86_64 - Ubuntu 24.04 (noble). Covers Ubuntu 24.04+
-          # and Debian 13 (trixie) where the t64 transition renamed
-          # libssl3 -> libssl3t64, libfido2-1 -> libfido2-1t64,
-          # libtss2-* -> libtss2-*-<ver>-0t64, etc.
+          # where the t64 transition renamed libssl3 -> libssl3t64,
+          # libfido2-1 -> libfido2-1t64, libtss2-* -> libtss2-*-0t64.
+          # Debian 13 (trixie) is handled by the dedicated trixie
+          # matrix entries below (containerised build) because trixie
+          # bumped libfuse3 from SONAME libfuse3.so.3 (`libfuse3-3`)
+          # to libfuse3.so.4 (`libfuse3-4`), which cargo-deb's
+          # `$auto` pins exactly per build host.
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
             ubuntu_codename: noble
@@ -101,6 +115,33 @@ jobs:
             ubuntu_codename: noble
             build_rpm: false
             archive: luksbox-${{ github.ref_name }}-aarch64-linux-noble.tar.gz
+          # Linux x86_64 - Debian 13 (trixie). Built INSIDE a
+          # `debian:trixie` Docker container on the Ubuntu 24.04
+          # runner because GitHub Actions has no native Debian
+          # runner image. Inside the container, cargo-deb's `$auto`
+          # resolves the trixie-correct package names automatically:
+          # libfuse3-4 (was libfuse3-3 in earlier Debian), libssl3t64,
+          # libfido2-1t64, libtss2-*-0t64. No post-process dep
+          # rewriting needed; the .deb installs cleanly on Debian 13
+          # without "unmet dependencies: libfuse3-3 but it is not
+          # installable" errors that pre-fix releases produced when
+          # users tried the noble artifact on trixie.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            ubuntu_codename: trixie
+            container: debian:trixie
+            build_rpm: false
+            archive: luksbox-${{ github.ref_name }}-x86_64-linux-trixie.tar.gz
+          # Linux aarch64 - Debian 13 (trixie). Native ARM64 runner
+          # + ARM64 `debian:trixie` container (Docker pulls the
+          # matching `linux/arm64` variant when run on ARM hardware,
+          # no QEMU translation involved -- the runner IS arm64).
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            ubuntu_codename: trixie
+            container: debian:trixie
+            build_rpm: false
+            archive: luksbox-${{ github.ref_name }}-aarch64-linux-trixie.tar.gz
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             archive: luksbox-${{ github.ref_name }}-x86_64-windows.zip
@@ -141,6 +182,21 @@ jobs:
             archive: luksbox-${{ github.ref_name }}-aarch64-macos-macfuse.dmg
 
     steps:
+      # Trixie-only: install minimum tooling the `debian:trixie` base
+      # image lacks. Must run BEFORE actions/checkout (needs git) and
+      # before dtolnay/rust-toolchain (needs curl + ca-certificates
+      # for rustup's installer download). build-essential pulls in
+      # gcc + linker so cargo can link the resulting binaries against
+      # the native shared libs we install in the "Linux deps (apt)"
+      # step below. No-op (skipped) on every other matrix entry
+      # because they run on the host runner where these are
+      # pre-installed.
+      - name: Bootstrap Trixie container
+        if: matrix.container
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl build-essential
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
@@ -234,7 +290,13 @@ jobs:
         # because luksbox-gui's `rfd` file picker links against GTK3
         # on Linux. libfuse3-dev is here so the `mount` subcommand
         # works on the resulting binary. imagemagick is here for
-        # scripts/build_icons.sh.
+        # scripts/build_icons.sh. libclang-dev is here because the
+        # `libfido2-sys` build script runs `bindgen` to generate
+        # Rust FFI bindings against the system libfido2 headers, and
+        # bindgen needs libclang to parse C. The Ubuntu hosted
+        # runners ship clang/libclang preinstalled (no-op), but the
+        # bare debian:trixie container we use for the Trixie .deb
+        # matrix entry does not, so the package has to be listed.
         #
         # ./.github/actions/apt-install forces IPv4 + retries on
         # transient mirror failures. Without IPv4 forcing the arm64
@@ -252,6 +314,7 @@ jobs:
             libfuse3-dev
             libgtk-3-dev
             libtss2-dev
+            libclang-dev
             imagemagick
 
       - name: macOS deps (Homebrew)
@@ -760,6 +823,12 @@ jobs:
 
       - name: Build .deb (Linux)
         if: runner.os == 'Linux'
+        # `shell: bash` is explicit because container-based steps
+        # (debian:trixie matrix entry) default to `sh -e` = dash, which
+        # doesn't support the `${VAR/old/new}` parameter expansion used
+        # below. Hosted ubuntu runners default to bash already; this
+        # keeps both flows identical.
+        shell: bash
         run: |
           # --no-build: reuse the binaries the previous step built.
           # --profile release-hardened: tells cargo-deb where to find
@@ -770,13 +839,22 @@ jobs:
             --no-build \
             --profile release-hardened \
             --target ${{ matrix.target }}
-          # cargo-deb produces target/<triple>/debian/luksbox_<ver>_<arch>.deb.
-          # Inject the Ubuntu codename so users can pick the .deb that
-          # matches their distro (jammy vs noble - see the matrix
-          # comment for why this matters). The two parameter expansions
-          # below cover both architectures: only the matching one
-          # rewrites; the other is a no-op.
-          DEB_PATH=$(ls target/${{ matrix.target }}/debian/luksbox_*.deb | head -n1)
+          # cargo-deb's output path varies between versions: 3.x with
+          # `--target` historically wrote to target/<triple>/debian/,
+          # but in practice (observed on debian:trixie + cargo-deb
+          # 3.x) the file lands in plain target/debian/. Use `find`
+          # so we pick up the .deb wherever cargo-deb put it instead
+          # of assuming a specific layout.
+          DEB_PATH=$(find target -path '*debian/luksbox_*.deb' -type f | head -n1)
+          if [ -z "$DEB_PATH" ]; then
+              echo "::error::cargo-deb produced no .deb under target/"
+              find target -name '*.deb' -print
+              exit 1
+          fi
+          # Inject the distro codename so users can pick the .deb that
+          # matches their distro (jammy / noble / trixie). The two
+          # parameter expansions below cover both architectures: only
+          # the matching one rewrites; the other is a no-op.
           NEW_DEB_PATH="${DEB_PATH/_amd64.deb/_${{ matrix.ubuntu_codename }}_amd64.deb}"
           NEW_DEB_PATH="${NEW_DEB_PATH/_arm64.deb/_${{ matrix.ubuntu_codename }}_arm64.deb}"
           mv "$DEB_PATH" "$NEW_DEB_PATH"
@@ -785,7 +863,12 @@ jobs:
           ls -lh "$DEB_PATH"
           # Quick sanity check: list contents so a missing asset
           # surfaces in the CI log instead of in user bug reports.
-          dpkg-deb -c "$DEB_PATH" | head -40
+          # `|| true` because `head -40` closes the pipe early after
+          # the .deb grew past 40 entries (new icon set), giving
+          # dpkg-deb's internal tar a SIGPIPE -> exit 2, which
+          # bash's pipefail then propagates. This is diagnostic
+          # output, not a build gate; mask the truncation error.
+          dpkg-deb -c "$DEB_PATH" | head -40 || true
           # Show the resolved Depends so it's visible in the CI log
           # (this is what determines per-distro compatibility).
           echo "--- Depends: ---"
@@ -874,19 +957,40 @@ jobs:
           # none of which are real packaging defects.
           rpmlint -c dist/rpm/rpmlint.toml "$RPM_PATH"
 
-      - name: Install .deb + smoke test (Ubuntu runner)
+      - name: Install .deb + smoke test (Linux)
         if: runner.os == 'Linux'
         run: |
           # apt resolves transitive deps (libfido2-1 -> libssl3,
           # libfuse3-3 -> fuse3, etc.) so this is the real test of
           # whether we declared the right runtime deps.
           #
+          # SUDO handling: hosted ubuntu runners run as a regular
+          # user with passwordless sudo. The container-based Trixie
+          # matrix entries (`container: debian:trixie`) run as root
+          # inside the container and don't have `sudo` installed.
+          # Same EUID-detect trick as ./.github/actions/apt-install
+          # so both flows work without conditional copies of every
+          # apt-get line. `${EUID:-$(id -u)}` is portable: bash
+          # populates $EUID, dash leaves it unset and falls through
+          # to `id -u`.
+          if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+              SUDO=""
+          else
+              SUDO="sudo"
+          fi
           # apt-get only auto-detects a local .deb when the path is
           # absolute or begins with `./`; a bare `target/.../foo.deb`
           # is interpreted as a package NAME (apt error: "Unable to
           # locate package target/..."). Resolve to absolute first.
           DEB_ABS="$(realpath "$DEB_PATH")"
-          sudo apt-get install -y "$DEB_ABS"
+          # Some Trixie containers haven't fetched the package index
+          # in this step yet (bootstrap only installed the bare set
+          # needed for checkout); refresh so apt-get install can pull
+          # the transitive runtime deps. No-op cost on Ubuntu where
+          # the index is already warm from the earlier apt-install
+          # composite action.
+          $SUDO apt-get update
+          $SUDO apt-get install -y "$DEB_ABS"
 
           # Binary-launchability smoke.
           which luksbox

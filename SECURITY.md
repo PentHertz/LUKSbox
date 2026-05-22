@@ -391,6 +391,43 @@ get in touch.
 
 ### Operational gaps
 
+- **v0.2.1 durability fix (LUKSBOX2 / LBM5) excludes deniable
+  vaults.** The sidecar-mirror crash-safety protocol
+  (`<vault>.lbx.header-bak` and `<vault>.lbx.meta-bak`) is
+  deliberately disabled for deniable containers. Sidecar files at
+  predictable names and lengths next to the vault would defeat the
+  deniability property the deniable header pays 36 KiB to
+  establish: a uniformly random byte distribution (>=7.99 bits per
+  byte) across the on-disk artefact set. An attacker listing files
+  in the directory would instantly identify the vault as a LUKSbox
+  deniable container. Crash safety for deniable vaults stays on
+  the existing path: the deniable header has internal slot-layout
+  redundancy and is rewritten wholesale on every persist, so a
+  crash mid-write is detectable and rejectable but does not
+  benefit from the additive A/B mirror semantics. Enforced in
+  `Container::is_v2_format()` (write-side guard) and in
+  `Vfs::flush` (auto-upgrade trigger guard). Regression-tested by
+  `deniable_vault_never_creates_sidecar_mirrors`.
+- **v0.2.1 mirror recovery is gated on parse failure, not unlock
+  failure.** Without this gating a previously-revoked credential
+  would unlock against the previous-good keyslot still in the
+  mirror, silently undoing every revoke. The trade-off: the rare
+  "live header parses but keyslot AEAD bytes are partially
+  corrupted" failure mode is recovered manually via
+  `luksbox header-restore <vault> <vault>.lbx.header-bak
+  --no-verify`. Test `v2_revoked_credential_does_not_unlock_via_mirror`
+  pins this gating; the `v2_mirror_recovery` libFuzzer target
+  fuzzes the property under arbitrary corruption + mirror
+  substitution patterns.
+- **Metadata-budget capacity notification is in-process only.**
+  The 75% / 90% warnings are emitted on the `Vfs` instance's
+  stderr (CLI) or via a one-shot toast on the AppState (GUI).
+  There is no system-wide notification channel: a user driving a
+  mounted vault via Finder / Nemo / Explorer who never opens the
+  GUI browser will only see the hard ENOSPC at 100% capacity.
+  Mitigation: the mount subprocess itself is the `luksbox mount`
+  CLI command whose stderr is captured by the GUI (when running
+  as a subprocess) or the system log (when run standalone).
 - **No reproducible builds.** Bit-for-bit reproducibility is not yet in
   place; build artifacts are not deterministic across machines.
 - **Per-platform signing posture (v0.1.1):**
@@ -485,6 +522,100 @@ get in touch.
   builds. CLI mounts (`luksbox mount ...`) and all other
   backends keep the legacy in-process flow with no MVK
   IPC.
+
+- **Per-platform parity of POSIX surface ops (LBM4).** The v4
+  metadata format adds persistent `chmod`, hardlinks, and
+  symlinks. Backend coverage:
+  - **Linux (libfuse3):** all three implemented and ground-
+    truth-verified (`chmod +x` persists across remount,
+    `ln file alias` creates a true shared-inode hardlink,
+    `ln -s target link` creates a sanitized symlink that
+    survives unmount and refuses unsafe targets at create
+    time).
+  - **macOS (FUSE-T):** all three wired through to the same
+    VFS primitives via the `chmod`, `link`, `symlink`,
+    `readlink` trampolines added to the
+    `luksbox-fuse-t` crate. Same security properties as the
+    Linux path.
+  - **Windows (WinFsp):** chmod is best-effort (NTFS does not
+    have POSIX mode bits; Windows applications use
+    `core.filemode=false`-style fallbacks anyway). Hardlinks
+    and symlinks are **NOT YET wired** through
+    `winfsp_wrs 0.4.1` because that binding only exposes
+    rename and reparse-resolution callbacks. Implementing
+    them requires either patching the binding upstream or
+    building a reparse-point support layer; both substantial
+    scope, deferred to a later release. Windows users see
+    `EACCES` / `ERROR_ACCESS_DENIED` for `ln` and `mklink`
+    inside a mounted vault until that work lands. Git on
+    Windows falls back to copy cleanly; the symptom is purely
+    feature-parity, not data loss or security regression.
+
+- **Symlink target sanitization (`is_safe_symlink_target`)
+  enforces three layers of defense** at create, vault-open
+  (load), and flush time. Rejects: absolute targets
+  (POSIX `/`, Windows `\` or drive-letter prefix), targets
+  with `..` or `.` components anywhere, NUL bytes, empty,
+  oversize (>`MAX_SYMLINK_TARGET_LEN` = 4096). This closes
+  the `secret -> /etc/shadow` supply-chain attack class
+  (CVE-2018-1002200 / CVE-2017-1000117 lineage). The
+  validation runs the same code in all three places so a
+  vault forged outside LUKSbox is refused at open before
+  any FUSE `readlink` callback can return the bytes. The
+  GUI's "extract directory" feature does an additional
+  defense-in-depth re-check on the materialized symlink's
+  target. Trade-off: legitimate symlinks that use `..` to
+  reach sibling directories (e.g. git's
+  `.git/objects/info/alternates`) are rejected. A future
+  "controlled-`..`" mode that resolves targets against the
+  symlink's parent inside the vault namespace is on the
+  followup list.
+
+- **Hardlink refcount and use-after-free defense.** LBM4
+  inodes carry a `link_count: u32`. `Vfs::link` increments
+  via `saturating_add` (caps at u32::MAX, returns the
+  EMLINK-equivalent rather than wrapping); `Vfs::unlink`
+  decrements via `saturating_sub` and frees chunks ONLY at
+  zero. A corrupt in-memory `link_count == 0` would have
+  wrapped to u32::MAX without `saturating_sub`, skipping
+  the free-on-zero branch and leaking chunks (a recoverable
+  space bug; far less bad than the alternative of "freed
+  chunks reallocated to another file, ciphertext
+  substitution"). `validate_metadata_tree` cross-checks
+  directory-entry count against `link_count` for every file
+  inode on load and flush, so a tree where the two diverge
+  is refused. Hardlinks to directories are rejected
+  (POSIX, cycle defense); hardlinks to symlinks are
+  rejected (LBM4 invariant: one entry per symlink inode).
+
+- **One-way format auto-upgrade (LBM4).** Vaults are not
+  auto-upgraded silently on open. They stay in their
+  original format (v2/v3) on flush UNTIL an LBM4-only
+  feature is used: a chmod to a non-default mode, a link
+  producing nlink>1, or any symlink creation. Once any of
+  these triggers, the next flush writes LBM4 magic and the
+  vault is no longer readable by pre-v0.3 LUKSbox binaries.
+  Users who need to keep new vaults openable by older
+  binaries can opt back to V2 via `LUKSBOX_FORMAT_V2=1` at
+  create time. The trade-off is they lose chmod/link/symlink.
+
+- **Windows MVK in-RAM hardening (CryptProtectMemory) NOT
+  YET implemented.** LUKSbox on Windows already calls
+  `VirtualLock` on the MVK page (prevents swap to the page
+  file) and `zeroize`s on drop. The proposed
+  `CryptProtectMemory` wrap (encrypt the MVK in-RAM between
+  vault operations, decrypt before each use) would add a
+  thin layer against an attacker who can capture a single
+  RAM snapshot at a specific instant. It does not defend
+  against a kernel-mode attacker (who can hook the decrypt
+  call) or against an attacker present during a vault op,
+  which is the realistic Windows "pass-the-MVK" threat
+  model. Marginal value vs implementation complexity;
+  deferred. The TPM-sealed wrap path (already shipped via
+  the `Tpm2*` keyslots) is the stronger Windows-side
+  hardening for the same threat class: even RAM-snapshot
+  theft of the unsealed MVK only opens the vault while
+  it stays unlocked.
 
 ### Cryptographic gaps
 
@@ -591,8 +722,8 @@ risk first.
 
 9. **Plausible-deniability hidden volumes.** No "duress
    passphrase" feature. A user under coercion has no way to open
-   a decoy vault while protecting the real one. Out of scope for
-   v1 by design; on the roadmap if there's user demand.
+   a decoy vault while protecting the real one. Out of scope by
+   design; on the roadmap if there's user demand.
 
 10. **Hardware-isolated MVK storage (Linux TPM / macOS Secure
     Enclave / Windows TPM).** Two distinct protection layers to
@@ -654,7 +785,7 @@ risk first.
 
     - **Linux**: **TPM 2.0** (discrete chip or firmware TPM via
       Intel PTT / AMD fTPM, present on most modern hardware) via
-      `tpm2-tss` + the `tss-esapi` Rust crate. **Shipped** in v1
+      `tpm2-tss` + the `tss-esapi` Rust crate. **Shipped today**
       as `SlotKind::Tpm2Sealed` (TPM-only), `SlotKind::Tpm2SealedPin`
       (PIN-protected via `userAuth`), `SlotKind::Tpm2Fido2` (fused
       TPM + FIDO2), and the four hybrid-PQ-TPM variants
@@ -759,6 +890,95 @@ risk first.
     TPM with a different API surface. Tracked here so a
     contributor has the design constraints written down before
     starting.
+
+11. **WinFsp `link` / `symlink` parity.** Linux (libfuse3) and
+    macOS (FUSE-T) backends ship full POSIX `link(2)` and
+    `symlink(2)` support as of LBM4. The Windows WinFsp backend
+    does NOT yet expose those callbacks because the
+    `winfsp_wrs 0.4.1` Rust binding only forwards `rename` and
+    reparse-resolution; the underlying WinFsp kernel driver
+    can do both via `Set` / `Get` reparse-point and the
+    `FspFileSystemAddHardLink*` family, but the binding has not
+    surfaced them. Path forward: either patch `winfsp_wrs`
+    upstream to add the missing hooks (preferred, the binding
+    is BSD-licensed and the maintainer accepts PRs) or
+    re-implement the bottom half against `winfsp-sys`
+    directly. Estimated effort: 1-2 weeks including round-trip
+    integration tests on the Windows runner. Until shipped,
+    Windows users see `ERROR_ACCESS_DENIED` for `mklink` and
+    `mklink /H`, and any application that requires hardlinks
+    or symlinks (some build systems, npm package layouts that
+    use junctions, etc.) falls back to copy. No data-loss or
+    security regression -- pure feature parity gap.
+
+12. **Windows MVK in-RAM hardening
+    (`CryptProtectMemory`).** LUKSbox on Windows currently
+    relies on `VirtualLock` + `zeroize` to keep the MVK out of
+    the page file and to scrub it on drop. A proposed
+    `CryptProtectMemory(CRYPTPROTECTMEMORY_SAME_PROCESS)` wrap
+    would keep the MVK encrypted in process memory between
+    vault operations, decrypted only for the microseconds of
+    each chunk-key derivation. The defense buys you "an
+    attacker with a single RAM snapshot at a random instant
+    sees ciphertext-of-MVK, not MVK". It does NOT defend
+    against:
+    - A kernel-mode attacker who can hook the decrypt call.
+    - An attacker present during a vault operation.
+    - A process injected into LUKSbox that calls
+      `CryptUnprotectMemory` itself (the wrap key is
+      per-process, shared by every thread in the process,
+      so any code running under LUKSbox's identity can
+      unwrap).
+
+    **Throughput cost on vault-internal transfers.** LUKSbox
+    is chunk-heavy by design (4 KiB per AEAD operation, with
+    a per-file `file_key` derived via HKDF(MVK, ...) for every
+    chunk). Wrap/unwrap-per-chunk pays a `CryptUnprotectMemory`
+    + `CryptProtectMemory` round trip per HKDF call. At ~5 us
+    per round trip, a 1 GiB read is ~262144 chunks and ~1.3
+    extra wall-clock seconds of pure wrap overhead; a 10 GiB
+    git clone is ~13 extra seconds on top of the actual AEAD
+    work. Wrap-per-FUSE-callback (instead of per-chunk)
+    cuts the overhead toward zero but defeats the defense
+    by leaving the MVK plaintext for the entire syscall
+    duration. The throughput cost vs the defense window is
+    the core trade-off and the reason the per-chunk version
+    is the only honest implementation.
+
+    **Per-platform memory-protection ladder.** Even after
+    `CryptProtectMemory`, Windows would NOT reach parity
+    with the other platforms:
+
+    | Platform | Current MVK protection | After CryptProtectMemory |
+    |---|---|---|
+    | Linux | `memfd_secret` + `mlock` (kernel refuses to map the page into other processes or for DMA/direct-I/O) | Not applicable; memfd_secret is strictly stronger than CryptProtectMemory because the bytes are not in the process's standard address space at all |
+    | macOS | `mlock` + system-level page protections; Apple Silicon adds hardware page encryption | Not applicable |
+    | Windows | `VirtualLock` only (prevents page-file swap; MVK is plaintext in RAM) | Encrypted at rest in RAM, but the wrap key is per-process and reachable by any code running in the LUKSbox process. A SYSTEM-level attacker who can `ReadProcessMemory` typically also has the privilege to DLL-inject or debug-attach and call `CryptUnprotectMemory` themselves |
+
+    The realistic "Windows pass-the-MVK" threat model assumes
+    the attacker already has the privilege to read process
+    memory, in which case they typically also have the
+    privilege to instrument calls. The hardware-bound TPM
+    wrap (item 10 above) is the stronger defense for the
+    same threat class: even RAM-snapshot theft of the
+    unsealed MVK only opens the vault while it stays
+    currently unlocked, since the wrapped form on disk
+    requires the TPM chip to re-derive, and the wrap is
+    non-portable across machines. Deferred as a marginal-
+    value addition; prioritise TPM-Windows integration
+    first.
+
+    Implementation cost if pursued anyway: roughly 3-4 days
+    of focused work (the Windows API itself is trivial; the
+    bulk of the change is refactoring every MVK access in
+    `crates/luksbox-format`, `luksbox-vfs`, `luksbox-pq`,
+    `luksbox-tpm` to go through a `with_bytes(|b| ...)`
+    callback that wraps the unwrap/use/rewrap in an RAII
+    guard). Recommended staged rollout: ship the
+    `with_bytes` refactor as a no-op first, migrate all
+    call sites, then add the Windows backend behind an
+    opt-in `LUKSBOX_WINDOWS_SECRET_PROTECT=1` env var so
+    users can A/B the throughput cost on their workload.
 
 ### What's specifically NOT on this list
 

@@ -444,6 +444,76 @@ unsafe extern "C" fn op_truncate(path: *const c_char, size: libc::off_t) -> c_in
     })
 }
 
+unsafe extern "C" fn op_chmod(path: *const c_char, mode: libc::mode_t) -> c_int {
+    with_fs(|holder| {
+        let Some(p) = cstr_to_path(path) else {
+            return -libc::EINVAL;
+        };
+        to_errno(holder.fs.chmod(&p, mode as u32))
+    })
+}
+
+unsafe extern "C" fn op_link(from: *const c_char, to: *const c_char) -> c_int {
+    with_fs(|holder| {
+        let Some(f) = cstr_to_path(from) else {
+            return -libc::EINVAL;
+        };
+        let Some(t) = cstr_to_path(to) else {
+            return -libc::EINVAL;
+        };
+        to_errno(holder.fs.link(&f, &t))
+    })
+}
+
+unsafe extern "C" fn op_symlink(target: *const c_char, linkpath: *const c_char) -> c_int {
+    with_fs(|holder| {
+        // libfuse signature: (target, path) -- target is the value
+        // stored in the symlink, path is where the symlink lives.
+        let Some(tgt) = cstr_to_path(target) else {
+            return -libc::EINVAL;
+        };
+        let Some(lp) = cstr_to_path(linkpath) else {
+            return -libc::EINVAL;
+        };
+        to_errno(holder.fs.symlink(&tgt, &lp))
+    })
+}
+
+unsafe extern "C" fn op_readlink(path: *const c_char, buf: *mut c_char, size: usize) -> c_int {
+    with_fs(|holder| {
+        let Some(p) = cstr_to_path(path) else {
+            return -libc::EINVAL;
+        };
+        if buf.is_null() || size == 0 {
+            return -libc::EINVAL;
+        }
+        // libfuse contract: readlink fills `buf` with the symlink
+        // target as a NUL-terminated C string and returns 0 on
+        // success (not the length). The buffer is at most `size`
+        // bytes; we MUST leave room for the trailing NUL. The
+        // length we write is the target bytes; we then NUL-
+        // terminate at min(target_len, size-1).
+        //
+        // Security: the buffer comes from libfuse and is sized to
+        // PATH_MAX = 4096 on macOS. Our adapter caps target length
+        // at SYMLINK_MAX_TARGET_LEN (~4 KiB) which is less; any
+        // longer target would be rejected at symlink-create time.
+        let mut local = vec![0u8; size.saturating_sub(1)];
+        match holder.fs.readlink(&p, &mut local) {
+            Ok(n) => {
+                let n = n.min(local.len());
+                unsafe {
+                    // Copy `n` bytes then NUL.
+                    core::ptr::copy_nonoverlapping(local.as_ptr() as *const c_char, buf, n);
+                    *buf.add(n) = 0;
+                }
+                0
+            }
+            Err(e) => -e.0,
+        }
+    })
+}
+
 unsafe extern "C" fn op_flush(path: *const c_char, _fi: *mut sys::fuse_file_info) -> c_int {
     with_fs(|holder| {
         let Some(p) = cstr_to_path(path) else {
@@ -590,6 +660,10 @@ fn build_operations() -> sys::fuse_operations {
     ops.rmdir = Some(op_rmdir);
     ops.rename = Some(op_rename);
     ops.truncate = Some(op_truncate);
+    ops.chmod = Some(op_chmod);
+    ops.link = Some(op_link);
+    ops.symlink = Some(op_symlink);
+    ops.readlink = Some(op_readlink);
     ops.flush = Some(op_flush);
     ops.fsync = Some(op_fsync);
     ops.release = Some(op_release);

@@ -352,18 +352,20 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
     let argon2_params = ask_den_kdf(theme, "Argon2id strength (you must remember this choice)")?;
     let kind = ask_den_credential_kind(theme, "Credential type for the initial slot")?;
 
-    // Metadata format for the deniable vault. Default v2 (matches
-    // every existing LUKSbox binary). v3 unlocks arbitrarily-large
-    // files via out-of-line chunk-list blocks; the blocks are
-    // encrypted chunks like any other so the deniability
-    // (every-byte-looks-random) story is preserved. Choice is
-    // permanent for the vault -- you must remember it alongside the
-    // cipher + KDF params.
+    // Metadata format for the DENIABLE vault. Deniable vaults
+    // explicitly opt out of the v0.2.1 sidecar-mirror protocol
+    // (mirrors at predictable names + lengths would defeat the
+    // deniability property), so "v3" here means LBM4 (out-of-line
+    // chunk lists, no per-vault ceiling, no mirrors) and "v2" means
+    // LBM2 (inline chunk lists, ~10 GiB ceiling, no mirrors). The
+    // LUKSBOX2 header magic is also not used in deniable mode; the
+    // deniable header has its own 36 KiB layout. Choice is permanent
+    // -- you must remember it alongside the cipher + KDF params.
     let format_choice = Select::with_theme(theme)
         .with_prompt("On-disk metadata format (you must remember this choice)")
         .items(&[
-            "v3 (default; out-of-line chunk lists, no per-vault ceiling; requires LUKSbox v0.2.0+ to open)",
-            "v2 (compat; inline chunk lists, ~10 GiB practical per-vault ceiling; readable by pre-v0.2.0 LUKSbox)",
+            "v3 (default; LBM4, out-of-line chunk lists, no per-vault ceiling; requires LUKSbox v0.2.0+ to open)",
+            "v2 (compat; LBM2, inline chunk lists, ~10 GiB practical per-vault ceiling; readable by pre-v0.2.0 LUKSbox)",
         ])
         .default(0)
         .interact()?;
@@ -3448,14 +3450,11 @@ fn mv_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
         .with_prompt("Existing path inside vault")
         .interact_text()?;
     let new: String = Input::with_theme(theme)
-        .with_prompt("New path (must be in the same parent directory)")
+        .with_prompt("New path (same dir or any other dir inside the vault)")
         .interact_text()?;
     let (old_parent, old_name) = split_parent_name(vfs, &old)?;
     let (new_parent, new_name) = split_parent_name(vfs, &new)?;
-    if old_parent != new_parent {
-        return Err("cross-directory rename is not supported in v1".into());
-    }
-    vfs.rename(old_parent, &old_name, &new_name)?;
+    vfs.rename(old_parent, &old_name, new_parent, &new_name)?;
     vfs.flush()?;
     println!("OK renamed {old} -> {new}");
     Ok(())

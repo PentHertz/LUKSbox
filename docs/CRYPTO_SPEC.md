@@ -219,17 +219,153 @@ that identifies the metadata format inside the encrypted region:
   ChunkRef costs ~4-6 varint bytes inside the metadata budget; a
   vault with many large files runs out of budget around 8-10 GiB
   total stored content at the default 16 MiB region size.
-- `LBM\x03` ("v3", opt-in) -- inodes whose chunk count exceeds
+- `LBM\x03` ("v3") -- inodes whose chunk count exceeds
   `V3_INLINE_CHUNK_THRESHOLD` (1024 chunks ~ 4 MiB file) carry a
   `chunks_external = Some((head, count))` field instead, pointing
   at the **chunk-list block chain** described below. Inodes under
   the threshold stay inline (same wire shape as v2).
+- `LBM\x04` ("v4") -- superset of v3 that adds two trailing
+  per-inode fields:
+  - `mode: u32` (POSIX mode bits, persists `chmod`)
+  - `link_count: u32` (POSIX hardlink count, persists hardlinks)
+  Adds an `InodeKind::Symlink` variant with a `symlink_target:
+  Option<String>` field. Validated at load time by
+  `is_safe_symlink_target` -- a vault carrying a malicious
+  symlink target (absolute, `..`-bearing, NUL, oversize) is
+  rejected at `Vfs::open` before any FUSE `readlink` callback
+  can return it. New vaults stay on LBM4 only if explicitly opted
+  in via the v0.2.0 LUKSbox binary; v0.2.1+ defaults to LBM5.
+- `LBM\x05` ("v5", NEW DEFAULT in v0.2.1) -- byte-identical
+  on-disk shape to LBM4 (same inode fields, same chunk-list
+  block layout). The differences are operational:
+  - Inline chunk-ref spill threshold lowered from 1024 (V3/V4)
+    to 256 chunks per inode (`V5_INLINE_CHUNK_THRESHOLD`). With
+    the also-raised metadata cap (16 MiB -> 64 MiB), vaults
+    holding thousands of files stay well within budget instead
+    of hitting `MetadataBudgetExhausted` -> ENOSPC mid-copy.
+  - Paired with the LUKSBOX2 header magic and the sidecar
+    mirrors (`<vault>.lbx.header-bak`, `<vault>.lbx.meta-bak`).
+    A crash mid-flush leaves a recoverable previous-good copy in
+    the mirror; the open path uses it transparently and forces
+    a flush to re-establish live.
+  Read path tolerates any inline count up to the postcard
+  decode limit so a future threshold tweak does not reject old
+  LBM5 vaults. Pre-LBM5 binaries refuse the magic, which is the
+  correct posture (they would silently miss the recovery
+  sidecars). v2/v3/v4 vaults auto-upgrade to LBM5 + LUKSBOX2
+  on the first `Vfs::flush` against a dirty tree; the upgrade
+  is one-way.
 
-Choice of v2 vs v3 is locked at vault creation time and stamped
-implicitly via the magic byte (which is itself inside the
-AEAD-encrypted region, so an attacker without MVK cannot flip it).
-Old binaries presented with an `LBM\x03` blob fail with a clean
-`MetadataDeserialize` error rather than silently mis-parsing.
+Users who need to keep new vaults openable by older binaries
+can opt back to LBM2 via `LUKSBOX_FORMAT_V2=1` at create time;
+they then lose chmod/link/symlink AND mirror-based crash recovery.
+
+Choice of v2 vs v3 vs v4 vs v5 is stamped implicitly via the
+magic byte (which is itself inside the AEAD-encrypted region, so
+an attacker without MVK cannot flip it). Old binaries presented
+with an `LBM\x03` / `LBM\x04` / `LBM\x05` blob they don't
+understand fail with a clean `MetadataDeserialize` error rather
+than silently mis-parsing.
+
+#### Metadata budget and capacity notification (v0.2.1+)
+
+The metadata region size is fixed at vault create time and held in
+the on-disk header (`metadata_size` field). Default 64 MiB for v5
+vaults; the upper cap (`MAX_METADATA_SIZE`) is also 64 MiB.
+
+What fills the region:
+
+- **Inodes**: each `InodeV4OnDisk` postcards to roughly 60-90 bytes
+  for a typical file (varint-encoded `id`, `parent`, `size`,
+  `mtime_ns`, `mode`, `link_count` plus the chunk-ref vec).
+- **Directory entries**: each `(name, FileId)` pair in a parent
+  inode adds roughly 30 bytes plus the name string length.
+- **Chunk-ref vec**: for files under the v5 spill threshold
+  (256 chunks ~ 1 MiB plaintext) the chunk refs are stored
+  inline, ~2-18 bytes per ChunkRef depending on id/generation
+  varint width. Files above the threshold spill their chunk list
+  to external chunk-list blocks in the data area and carry only
+  a small `(head_ref, count)` stub in the inode.
+
+In practice the metadata region holds order ~500k typical-shape
+files before approaching the 64 MiB cap. Pathological inputs
+(extremely long filenames, deeply nested directories with huge
+fan-out) reach the cap sooner.
+
+When the region is approaching its cap, LUKSbox emits a soft
+notification BEFORE the user hits the hard
+`MetadataBudgetExhausted` (ENOSPC) error:
+
+- **>=75% used**: a one-shot info message. CLI users see it on
+  stderr; GUI users see a non-blocking toast. The vault is
+  still healthy at this level but if many more files are
+  expected, plan a migration.
+- **>=90% used**: a one-shot stronger warning. The next few
+  writes are likely to start failing. Recommend archiving older
+  content or recreating the vault with a larger
+  `--metadata-size`.
+- Notifications fire at most once per level per session via the
+  in-process `last_warned_pct` latch (CLI side: on the `Vfs`
+  struct; GUI side: on the AppState). Re-opening the vault
+  resets the latch so the warning fires again if usage is still
+  in the threshold band.
+
+Users driving the vault via a FUSE / FUSE-T / WinFsp mount get
+the warning indirectly: the mount process is itself the CLI
+`luksbox mount` command (or a helper subprocess of the GUI),
+whose stderr surfaces the same `eprintln`. The GUI captures
+that stderr and routes it to its toast surface when running the
+mount as a subprocess. The hard `MetadataBudgetExhausted` -> FUSE
+`ENOSPC` mapping at `crates/luksbox-mount/src/fuse.rs` remains
+the backstop for any case where the soft notification was
+missed or dismissed.
+
+Mitigations once a warning fires:
+
+- `luksbox info <vault>` shows the current metadata size.
+- Recreate the vault with `--metadata-size 128M` (or higher,
+  up to the 64 MiB cap unless raised at format-bump time) and
+  copy content over. Future format work can move the chunk-table
+  to a separate growable region to remove the cap entirely.
+- Smaller files: avoid storing many tiny files (under 1 KiB);
+  combine them into archives where it makes sense.
+
+#### Tested-boundary advisory
+
+v0.2.1 has been validated end-to-end with real FUSE mounts up to
+roughly **30 GiB of stored content** with several thousand files.
+The format is engineered to handle much larger vaults, but
+LUKSbox surfaces a one-shot heads-up at create time AND when the
+vault file on disk crosses 30 GiB:
+
+- CLI: an eprintln after `Vfs::flush` notices the size crossing.
+- GUI: a non-blocking toast surfaced via the same
+  `flush_and_notify_capacity` helper that handles the metadata
+  budget warnings.
+
+The advisory asks users to:
+
+1. Periodically close and reopen the vault to verify it still
+   unlocks (the user-reported v0.2.0 data-loss case manifested as
+   "vault won't reopen", so a periodic close/reopen catches that
+   class early).
+2. Report any anomalies at
+   <https://github.com/PentHertz/LUKSbox/issues> so larger vault
+   classes can be added to the validated boundary in future
+   releases.
+
+The advisory is informational, not a hard limit: writes continue
+to succeed past 30 GiB. The boundary will be raised in subsequent
+releases as more usage data accumulates.
+
+Deniable vaults DO NOT emit the capacity notification through
+the sidecar-mirror mechanism, because deniable vaults
+deliberately opt out of every observable LUKSbox-shaped sidecar
+to preserve the deniability property (the on-disk artefact set
+must look like uniform random bytes, >=7.99 bits/byte entropy).
+For deniable vaults the `MetadataBudgetExhausted` error is the
+only signal; users sizing a deniable vault for many files should
+pick `--metadata-size 128M` or higher at create time.
 
 #### V3: chunk-list blocks
 
@@ -1843,7 +1979,7 @@ sequenceDiagram
 
 3. **Coerced user / rubber-hose decryption**. If the attacker has
    the device, the PIN, and a finger to apply, the vault opens.
-   Hidden-volume / duress-passphrase functionality is not in v1.
+   Hidden-volume / duress-passphrase functionality is not yet implemented.
 
 4. **Compromised host while vault is open**. If the host is
    already running attacker code, FIDO2 can't help - the MVK is in

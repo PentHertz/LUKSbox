@@ -20,7 +20,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use luksbox_fuse_t::{
-    DirEntry as FtDirEntry, Errno, FileAttr, Filesystem, MountOptions, S_IFDIR, S_IFREG, StatVfs,
+    DirEntry as FtDirEntry, Errno, FileAttr, Filesystem, MountOptions, S_IFDIR, S_IFLNK, S_IFREG,
+    StatVfs,
 };
 use luksbox_vfs::{Error as VfsError, FileId, InodeKind, Vfs};
 
@@ -86,6 +87,7 @@ impl LuksboxFuseTFs {
             VfsError::NotAFile => Errno::EISDIR,
             VfsError::NotEmpty => Errno::ENOTEMPTY,
             VfsError::InvalidPath(_) => Errno::EINVAL,
+            VfsError::RenameCycle => Errno::EINVAL,
             VfsError::MetadataBudgetExhausted => Errno::ENOSPC,
             VfsError::FileSizeExceedsCap => Errno::EFBIG,
             _ => Errno::EIO,
@@ -127,10 +129,17 @@ impl Filesystem for LuksboxFuseTFs {
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
         let id = self.lookup_id(&vfs, path)?;
         let stat = vfs.stat(id).map_err(|e| Self::vfs_errno(&e))?;
-        let (mode_bits, perm, nlink) = match stat.kind {
-            InodeKind::Directory => (S_IFDIR, 0o700u32, 2),
-            InodeKind::File => (S_IFREG, 0o600u32, 1),
+        // LBM4: use the persisted mode bits when available; mask
+        // to 0o7777 so file-type bits don't double-up with the
+        // explicit S_IF* added below. nlink for files comes from
+        // the persisted link_count (hardlinks); directories report
+        // the conventional 2; symlinks 1.
+        let (mode_bits, nlink) = match stat.kind {
+            InodeKind::Directory => (S_IFDIR, 2u32),
+            InodeKind::File => (S_IFREG, stat.link_count.max(1)),
+            InodeKind::Symlink => (S_IFLNK, 1u32),
         };
+        let perm = stat.mode & 0o7777;
         Ok(FileAttr {
             mode: mode_bits | perm,
             size: stat.size,
@@ -153,6 +162,7 @@ impl Filesystem for LuksboxFuseTFs {
                 mode: match e.kind {
                     InodeKind::Directory => S_IFDIR,
                     InodeKind::File => S_IFREG,
+                    InodeKind::Symlink => S_IFLNK,
                 },
             })
             .collect())
@@ -170,11 +180,18 @@ impl Filesystem for LuksboxFuseTFs {
         vfs.write(id, offset, data).map_err(|e| Self::vfs_errno(&e))
     }
 
-    fn create(&self, path: &Path, _mode: u32) -> Result<(), Errno> {
+    fn create(&self, path: &Path, mode: u32) -> Result<(), Errno> {
         let (parent, name) = Self::split_parent_name(path)?;
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
         let parent_id = self.lookup_id(&vfs, &parent)?;
-        vfs.create(parent_id, &name)
+        // Honor the caller-requested mode so the executable bit on
+        // scripts and binaries created via `open(O_CREAT, 0o755)`
+        // survives a `git clone` into a mounted vault. The FUSE-T
+        // trampoline at `crates/luksbox-fuse-t/src/ops.rs::op_create`
+        // does the same `mode & 0o7777` masking and umask handling
+        // before reaching this method, so we forward the value
+        // verbatim.
+        vfs.create_with_mode(parent_id, &name, mode & 0o7777)
             .map_err(|e| Self::vfs_errno(&e))?;
         let _ = vfs.flush();
         Ok(())
@@ -216,14 +233,17 @@ impl Filesystem for LuksboxFuseTFs {
     fn rename(&self, from: &Path, to: &Path) -> Result<(), Errno> {
         let (from_parent, from_name) = Self::split_parent_name(from)?;
         let (to_parent, to_name) = Self::split_parent_name(to)?;
-        if from_parent != to_parent {
-            // Cross-directory rename intentionally not in v1, matches
-            // the same restriction in fuse.rs.
-            return Err(Errno::from_raw(libc::ENOSYS));
-        }
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
-        let parent_id = self.lookup_id(&vfs, &from_parent)?;
-        vfs.rename(parent_id, &from_name, &to_name)
+        let from_parent_id = self.lookup_id(&vfs, &from_parent)?;
+        // Reuse the same id for same-parent renames so the VFS can
+        // detect the case and take its faster single-get_mut path.
+        // For cross-parent moves, the two lookups are distinct.
+        let to_parent_id = if from_parent == to_parent {
+            from_parent_id
+        } else {
+            self.lookup_id(&vfs, &to_parent)?
+        };
+        vfs.rename(from_parent_id, &from_name, to_parent_id, &to_name)
             .map_err(|e| Self::vfs_errno(&e))?;
         let _ = vfs.flush();
         Ok(())
@@ -235,6 +255,65 @@ impl Filesystem for LuksboxFuseTFs {
         vfs.truncate(id, size).map_err(|e| Self::vfs_errno(&e))?;
         let _ = vfs.flush();
         Ok(())
+    }
+
+    /// Persistent chmod (LBM4). The mode is `S_IFREG|S_IFDIR|...`
+    /// bits OR'd with permission bits; `Vfs::chmod` masks to
+    /// `0o7777` internally so file-type bits don't leak into the
+    /// stored mode.
+    fn chmod(&self, path: &Path, mode: u32) -> Result<(), Errno> {
+        let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
+        let id = self.lookup_id(&vfs, path)?;
+        vfs.chmod(id, mode).map_err(|e| Self::vfs_errno(&e))?;
+        let _ = vfs.flush();
+        Ok(())
+    }
+
+    /// Hardlink (LBM4). POSIX semantics: `from` must exist (and be
+    /// a regular file), `to` must not exist; both paths are vault-
+    /// internal. `Vfs::link` enforces these and refcount-protects
+    /// the chunks via `link_count`.
+    fn link(&self, from: &Path, to: &Path) -> Result<(), Errno> {
+        let (to_parent_path, to_name) = Self::split_parent_name(to)?;
+        let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
+        let target_id = self.lookup_id(&vfs, from)?;
+        let new_parent_id = self.lookup_id(&vfs, &to_parent_path)?;
+        vfs.link(target_id, new_parent_id, &to_name)
+            .map_err(|e| Self::vfs_errno(&e))?;
+        let _ = vfs.flush();
+        Ok(())
+    }
+
+    /// Create a symlink. `target` is the stored value (vault-
+    /// internal relative path); `linkpath` is where the symlink
+    /// lives. `Vfs::symlink` runs `is_safe_symlink_target` so any
+    /// attempt to store `/etc/shadow`, `../../outside`, or other
+    /// escape vectors is rejected at create time -- the supply-
+    /// chain `secret -> /etc/shadow` attack is blocked at the
+    /// VFS layer regardless of which mount backend invoked us.
+    fn symlink(&self, target: &Path, linkpath: &Path) -> Result<(), Errno> {
+        let target_str = target.to_str().ok_or(Errno::EINVAL)?;
+        let (link_parent, link_name) = Self::split_parent_name(linkpath)?;
+        let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
+        let parent_id = self.lookup_id(&vfs, &link_parent)?;
+        vfs.symlink(parent_id, &link_name, target_str)
+            .map_err(|e| Self::vfs_errno(&e))?;
+        let _ = vfs.flush();
+        Ok(())
+    }
+
+    /// Read a symlink's stored target into the libfuse-supplied
+    /// buffer. We copy at most `buf.len()` bytes; longer targets
+    /// are truncated (libfuse's contract -- it sized the buffer
+    /// at PATH_MAX = 4096 which matches our `MAX_SYMLINK_TARGET_LEN`,
+    /// so practical truncation is impossible).
+    fn readlink(&self, path: &Path, buf: &mut [u8]) -> Result<usize, Errno> {
+        let vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
+        let id = self.lookup_id(&vfs, path)?;
+        let target = vfs.readlink(id).map_err(|e| Self::vfs_errno(&e))?;
+        let n = target.len().min(buf.len());
+        buf[..n].copy_from_slice(&target.as_bytes()[..n]);
+        Ok(n)
     }
 
     fn flush(&self, _path: &Path) -> Result<(), Errno> {

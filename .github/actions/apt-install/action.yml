@@ -30,8 +30,21 @@ runs:
       run: |
         # Idempotent: re-running this action in the same job (or
         # across multiple `uses:` in one job) is safe.
+        #
+        # SUDO handling: hosted runners (ubuntu-22.04 / ubuntu-24.04 /
+        # ubuntu-*-arm) run steps as a regular user with passwordless
+        # sudo. Container-based steps (`container: debian:trixie`,
+        # used by the Trixie .deb matrix entry) run as root inside
+        # the container and typically don't have `sudo` installed at
+        # all. Detect once per invocation so both flows work without
+        # conditional copies of every command.
+        if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+            SUDO=""
+        else
+            SUDO="sudo"
+        fi
         echo 'Acquire::ForceIPv4 "true";' | \
-          sudo tee /etc/apt/apt.conf.d/99force-ipv4 > /dev/null
+          $SUDO tee /etc/apt/apt.conf.d/99force-ipv4 > /dev/null
     - name: apt-get install with retry
       shell: bash
       env:
@@ -40,12 +53,17 @@ runs:
         APT_RETRY_DELAY: ${{ inputs.retry-delay-seconds }}
       run: |
         set -u
+        if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+            SUDO=""
+        else
+            SUDO="sudo"
+        fi
         # Collapse whitespace + newlines so callers can pass the
         # package list on multiple lines for readability.
         pkgs=$(echo "$APT_PACKAGES" | tr '\n' ' ' | tr -s ' ')
         for attempt in $(seq 1 "$APT_ATTEMPTS"); do
-          if sudo apt-get update && \
-             sudo apt-get install -y --no-install-recommends $pkgs; then
+          if $SUDO apt-get update && \
+             $SUDO apt-get install -y --no-install-recommends $pkgs; then
             echo "apt install succeeded on attempt $attempt"
             exit 0
           fi

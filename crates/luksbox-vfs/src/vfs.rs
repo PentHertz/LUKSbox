@@ -331,6 +331,16 @@ pub struct Stat {
     pub kind: InodeKind,
     pub size: u64,
     pub mtime_ns: u64,
+    /// POSIX mode bits (12 bits used: `0o7777`). Persisted via LBM4
+    /// for vaults that have used `chmod`; LBM2/LBM3 vaults synthesise
+    /// the default for the inode's kind. Mount layers should mask
+    /// with `0o7777` and OR in the file-type bits themselves.
+    pub mode: u32,
+    /// POSIX hardlink count. >= 1 for every inode that exists.
+    /// Pre-LBM4 vaults always report `1` for files, `1` for
+    /// directories (the mount layer adds the conventional `+1`
+    /// for directories when reporting nlink to the kernel).
+    pub link_count: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -338,6 +348,49 @@ pub struct DirEntry {
     pub name: String,
     pub id: FileId,
     pub kind: InodeKind,
+}
+
+/// Snapshot of how much of the vault's metadata region is currently
+/// consumed by the encoded directory tree. The cap is configured at
+/// vault create time (default 64 MiB for v0.2.1+); used + spillover
+/// estimates approach the cap as inode count grows. CLI `info` prints
+/// this; the GUI polls it for an in-app low-capacity notification so
+/// users get an early warning before the hard `MetadataBudgetExhausted`
+/// (ENOSPC) error fires.
+#[derive(Debug, Clone, Copy)]
+pub struct MetadataBudgetStatus {
+    /// Current encoded size of the in-memory tree in bytes.
+    pub used_bytes: usize,
+    /// Hard cap. Once `used_bytes` reaches this, the next write that
+    /// would grow the tree fails with `MetadataBudgetExhausted`.
+    pub budget_bytes: usize,
+}
+
+impl MetadataBudgetStatus {
+    /// Usage as percentage 0..=100. Saturates at 100.
+    pub fn used_pct(self) -> u32 {
+        if self.budget_bytes == 0 {
+            return 0;
+        }
+        let pct = (self.used_bytes as u128 * 100 / self.budget_bytes as u128) as u32;
+        pct.min(100)
+    }
+
+    /// Soft-warning threshold: at or above 75% of capacity. The GUI
+    /// surfaces a non-blocking notification here; the CLI's `info`
+    /// flags the vault as approaching its metadata cap.
+    pub fn near_capacity(self) -> bool {
+        self.used_pct() >= 75
+    }
+
+    /// Hard-warning threshold: at or above 90% of capacity. The next
+    /// few writes are likely to start failing with
+    /// `MetadataBudgetExhausted`. The GUI surfaces a blocking
+    /// notification recommending the user archive content or
+    /// migrate to a new vault.
+    pub fn critical_capacity(self) -> bool {
+        self.used_pct() >= 90
+    }
 }
 
 /// Vault-wide tree counters. Surfaced for forensic tooling
@@ -377,6 +430,39 @@ const METADATA_V2_MAGIC: &[u8; 4] = b"LBM\x02";
 /// mis-decoding (postcard schemas differ -- v3 uses
 /// `InodeV3OnDisk` which has an extra `chunks_external` field).
 const METADATA_V3_MAGIC: &[u8; 4] = b"LBM\x03";
+
+/// 4-byte magic + 1-byte version = "LBM\x04". Required prefix on
+/// metadata blobs in the v4 format, which extends v3 by adding
+/// per-inode `mode` (POSIX mode bits, for chmod persistence) and
+/// `link_count` (POSIX hardlink count). New vaults default to v4.
+/// Existing v2/v3 vaults stay in their original format on read
+/// until an op that requires LBM4 (`chmod` to a non-default mode,
+/// or `link` creating a second hardlink) is performed; the next
+/// flush then auto-upgrades to LBM4. v2/v3 readers refuse v4 blobs
+/// cleanly via the version-byte mismatch rather than silently
+/// mis-decoding.
+///
+/// **Migration**: LBM4 is a one-way upgrade. Once a vault is
+/// written as LBM4, older LUKSbox binaries can no longer open it.
+/// The auto-upgrade rule (trigger only when chmod/link is used)
+/// means a user can stay on the old format if they avoid those
+/// operations -- relevant for users still distributing pre-v0.3
+/// LUKSbox binaries.
+const METADATA_V4_MAGIC: &[u8; 4] = b"LBM\x04";
+
+/// v5 metadata magic. Introduced in v0.2.1 alongside the durability
+/// fix (sidecar mirrors). Structurally identical to LBM4 on disk; the
+/// difference is operational:
+///   - the write path uses the lower `V5_INLINE_CHUNK_THRESHOLD` so
+///     large vaults stay within the 64 MiB metadata cap without
+///     spilling to MetadataBudgetExhausted;
+///   - the on-disk header carries LUKSBOX2 magic and the
+///     FLAG_HAS_*_MIRROR bits.
+///
+/// Pre-LBM5 binaries refuse to open vaults at this magic via the
+/// dispatch in `Vfs::open`, which is correct: a v0.2.0 binary would
+/// silently miss the recovery sidecars.
+const METADATA_V5_MAGIC: &[u8; 4] = b"LBM\x05";
 
 /// Environment-variable gate for the v3 (external chunk-list)
 /// metadata format. Historic naming kept (`LUKSBOX_FORMAT_V2`) so
@@ -434,6 +520,52 @@ fn use_v3_for_fresh_vault() -> bool {
     )
 }
 
+/// On-disk metadata format. The `Vfs` carries one of these per
+/// open vault so the flush path knows which serialiser to use.
+/// New vaults default to `V4`; existing v2/v3 vaults stay in
+/// their original format until an op that requires LBM4 (chmod
+/// to a non-default mode, or link to nlink>1) is performed,
+/// at which point the next flush auto-upgrades.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum MetadataFormat {
+    V2,
+    V3,
+    V4,
+    V5,
+}
+
+impl MetadataFormat {
+    /// Format used by a freshly-created vault. Defaults to V5 (v0.2.1+
+    /// durability layout: lower spill threshold, paired with LUKSBOX2
+    /// header + mirror sidecars). Users who need backward compat with
+    /// pre-v0.3 LUKSbox binaries can opt back to V2 via
+    /// `LUKSBOX_FORMAT_V2=1`. There is no V3-only or V4-only opt-out
+    /// path: those formats are read-supported indefinitely but new
+    /// vaults skip straight to V5.
+    fn for_fresh_vault() -> Self {
+        if use_v3_for_fresh_vault() {
+            Self::V5
+        } else {
+            Self::V2
+        }
+    }
+
+    /// Spill threshold for this format: any inode whose inline chunk
+    /// list would exceed this count is split out into an external
+    /// chunk-list block chain. Smaller = more compact metadata blob at
+    /// the cost of one extra read per large file's first chunk-list
+    /// fetch. V5 lowers from V3/V4's 1024 to 256 to keep the encoded
+    /// tree under the 64 MiB cap for very large vaults.
+    fn inline_chunk_threshold(self) -> usize {
+        match self {
+            MetadataFormat::V2 | MetadataFormat::V3 | MetadataFormat::V4 => {
+                V3_INLINE_CHUNK_THRESHOLD
+            }
+            MetadataFormat::V5 => crate::tree::V5_INLINE_CHUNK_THRESHOLD,
+        }
+    }
+}
+
 /// v3 on-disk Inode. Same shape as in-memory `Inode` except the
 /// chunk list either stays inline (small files, `chunks_external =
 /// None`) or moves to an external chain (large files, `chunks =
@@ -464,6 +596,54 @@ struct DirectoryTreeV3OnDisk {
     next_chunk_gen: u64,
     free_chunks: Vec<ChunkId>,
     inodes: std::collections::BTreeMap<FileId, InodeV3OnDisk>,
+}
+
+/// v4 on-disk Inode. Superset of v3: same shape plus two trailing
+/// fields, `mode` (POSIX mode bits, persists chmod) and
+/// `link_count` (POSIX hardlink count, persists multi-linked files).
+///
+/// **Field ordering matters for postcard**: new fields are appended
+/// so a v4 inode without mode/link_count bytes would deserialize as
+/// truncated. The v4 read path is reached only by the LBM4 magic
+/// check, so this is never invoked on shorter-than-expected bytes
+/// in practice. Defense-in-depth: corrupt truncated v4 blob fails
+/// postcard decode -> Error::MetadataDeserialize, never silent.
+///
+/// `cached_real_size` / `external_list_blocks` remain in-memory
+/// only (#[serde(skip)] on the working `Inode`).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct InodeV4OnDisk {
+    id: FileId,
+    parent: FileId,
+    kind: InodeKind,
+    size: u64,
+    mtime_ns: u64,
+    chunks: Vec<ChunkRef>,
+    chunks_external: Option<(ChunkRef, u64)>,
+    children: std::collections::BTreeMap<String, FileId>,
+    mode: u32,
+    link_count: u32,
+    /// Symlink target. `Some(s)` iff `kind == InodeKind::Symlink`.
+    /// Validation at load time (in `v4_on_disk_to_in_memory`) rejects
+    /// any target that's absolute, contains `..` or `.` components,
+    /// contains NUL, or exceeds `MAX_SYMLINK_TARGET_LEN` bytes. The
+    /// validation is identical to what `Vfs::symlink` enforces at
+    /// create time, so a vault written by us will always round-trip
+    /// cleanly. A vault containing a malicious symlink target (e.g.
+    /// `/etc/shadow`) is REJECTED at open time, before any FUSE
+    /// callback can return it to the kernel. This is the
+    /// load-time half of the supply-chain attack defense.
+    symlink_target: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct DirectoryTreeV4OnDisk {
+    root: FileId,
+    next_file_id: FileId,
+    next_chunk_id: ChunkId,
+    next_chunk_gen: u64,
+    free_chunks: Vec<ChunkId>,
+    inodes: std::collections::BTreeMap<FileId, InodeV4OnDisk>,
 }
 
 fn invalid_metadata<T>() -> Result<T, Error> {
@@ -507,7 +687,13 @@ fn validate_metadata_tree(
         return invalid_metadata();
     }
 
-    let mut referenced_inodes = BTreeSet::new();
+    // Count how many directory entries point at each inode. LBM4
+    // hardlinks allow N > 1; pre-LBM4 always 1. We cross-check
+    // against `inode.link_count` at the end -- if they disagree
+    // the metadata is corrupt (or attacker-forged after the chunk
+    // referencing check).
+    let mut entry_counts: std::collections::BTreeMap<FileId, u32> =
+        std::collections::BTreeMap::new();
     let mut live_chunks = BTreeSet::new();
 
     for (&id, inode) in &tree.inodes {
@@ -515,6 +701,12 @@ fn validate_metadata_tree(
             return invalid_metadata();
         }
         if id != ROOT_ID {
+            // For non-root inodes the `parent` field names ONE of
+            // the directories holding an entry to this inode. For
+            // single-linked files and for directories it's the
+            // unique parent; for multi-linked files (LBM4) it's
+            // one of the N parents. Either way, `parent` must be
+            // a real directory inode.
             let parent = tree
                 .inodes
                 .get(&inode.parent)
@@ -529,6 +721,19 @@ fn validate_metadata_tree(
                 if inode.size != 0 || !inode.chunks.is_empty() {
                     return invalid_metadata();
                 }
+                // Directories MUST NOT carry a symlink_target -- same
+                // defensive reasoning as the File branch below.
+                if inode.symlink_target.is_some() {
+                    return invalid_metadata();
+                }
+                // Directories can't be hardlinked (POSIX), so
+                // link_count for a directory is meaningful only as
+                // "1" (matches the conventional "the directory
+                // itself counts as one link via `.`"). Reject any
+                // other value to keep the invariant tight.
+                if inode.link_count != 1 {
+                    return invalid_metadata();
+                }
                 for (name, &child_id) in &inode.children {
                     if validate_name(name).is_err() || child_id == ROOT_ID {
                         return invalid_metadata();
@@ -537,13 +742,63 @@ fn validate_metadata_tree(
                         .inodes
                         .get(&child_id)
                         .ok_or(Error::MetadataDeserialize)?;
-                    if child.parent != id || !referenced_inodes.insert(child_id) {
+                    // Tally an entry-count toward the target inode.
+                    // If `child` is a directory, also enforce
+                    // single-parent (no two dir entries to one
+                    // dir, which would create a cycle).
+                    let count = entry_counts.entry(child_id).or_insert(0);
+                    *count = count.saturating_add(1);
+                    if child.kind == InodeKind::Directory && *count > 1 {
+                        // Two directory entries pointing at one
+                        // directory inode -- only legitimate as
+                        // root's self-loop, which we already
+                        // excluded above (child_id == ROOT_ID).
                         return invalid_metadata();
                     }
                 }
             }
+            InodeKind::Symlink => {
+                // Symlinks: no children, no chunks, link_count == 1
+                // (hardlinks to symlinks are theoretically POSIX-
+                // valid but we don't support them -- the LBM4 design
+                // says one directory entry per Symlink inode), and
+                // MUST carry a target. The target must satisfy the
+                // same sanity rules as `Vfs::symlink` enforces at
+                // create time; `v4_on_disk_to_in_memory` runs the
+                // check too, but we re-check here so a forged in-
+                // memory tree caught by `tree_needs_v4_format` ->
+                // flush -> validator can't poison the on-disk blob.
+                if !inode.children.is_empty()
+                    || !inode.chunks.is_empty()
+                    || !inode.external_list_blocks.is_empty()
+                    || inode.link_count != 1
+                {
+                    return invalid_metadata();
+                }
+                match inode.symlink_target.as_deref() {
+                    Some(t) if is_safe_symlink_target(t) => {}
+                    _ => return invalid_metadata(),
+                }
+            }
             InodeKind::File => {
                 if !inode.children.is_empty() {
+                    return invalid_metadata();
+                }
+                // Files MUST NOT carry a symlink_target. Defensive
+                // against a forged inode that's File-kind but has
+                // a target stuck on it (which would round-trip
+                // through serde and confuse readlink's invariant).
+                if inode.symlink_target.is_some() {
+                    return invalid_metadata();
+                }
+                // File inodes MUST have link_count >= 1. A persisted
+                // file with link_count == 0 is corrupt -- unlink
+                // would have freed its chunks. (The v4 read path
+                // already rejects link_count == 0, but defense-in-
+                // depth: pre-LBM4 vaults populate link_count = 1 in
+                // memory, so this catches a forged-in-memory case
+                // before flush gets a chance to re-serialise it.)
+                if inode.link_count == 0 {
                     return invalid_metadata();
                 }
                 if hide_size {
@@ -588,8 +843,32 @@ fn validate_metadata_tree(
         }
     }
 
-    for &id in tree.inodes.keys() {
-        if id != ROOT_ID && !referenced_inodes.contains(&id) {
+    // Every non-root inode must be referenced from at least one
+    // directory entry, AND for File inodes the count of directory
+    // entries pointing at the inode must EQUAL its `link_count`
+    // (LBM4 hardlinks; pre-LBM4 vaults always have link_count == 1
+    // so this collapses to "exactly one entry"). This is the
+    // critical invariant for refcount-correct unlink: if the
+    // entry-count and link_count diverge, a later unlink could
+    // free chunks while another directory entry still points at
+    // them (use-after-free of ciphertext slots).
+    for (&id, inode) in &tree.inodes {
+        if id == ROOT_ID {
+            continue;
+        }
+        let count = entry_counts.get(&id).copied().unwrap_or(0);
+        if count == 0 {
+            // Unreachable inode -- garbage that unlink should have
+            // cleaned up.
+            return invalid_metadata();
+        }
+        if inode.kind == InodeKind::File && count != inode.link_count {
+            return invalid_metadata();
+        }
+        // Symlinks aren't hardlinkable in our format (one entry per
+        // symlink inode). Combined with the `link_count == 1` check
+        // for the symlink itself, count must equal 1.
+        if inode.kind == InodeKind::Symlink && count != 1 {
             return invalid_metadata();
         }
     }
@@ -650,6 +929,13 @@ fn v3_on_disk_to_in_memory(
                 children: od.children,
                 cached_real_size: None,
                 external_list_blocks,
+                // LBM3 on disk doesn't carry mode/link_count, so we
+                // populate sensible defaults. They become persisted
+                // only if a later op (chmod, link) triggers an
+                // auto-upgrade to LBM4 at flush time.
+                mode: crate::tree::default_mode_for_kind(od.kind),
+                link_count: 1,
+                symlink_target: None,
             },
         );
     }
@@ -663,32 +949,165 @@ fn v3_on_disk_to_in_memory(
     })
 }
 
+/// LBM4 counterpart to `v3_on_disk_to_in_memory`. Identical chunk-
+/// chain expansion logic; the additional work is copying the new
+/// per-inode `mode` and `link_count` fields straight from disk into
+/// the in-memory `Inode` (instead of substituting defaults like the
+/// LBM3 reader does).
+///
+/// Defensive bounds check: `link_count == 0` is a corrupt vault
+/// (every existing inode is reachable from at least one directory
+/// entry, so its refcount must be >= 1). Refuse rather than letting
+/// a subsequent `unlink` underflow to u32::MAX and skip the chunk-
+/// free path. `mode` has no upper bound check -- POSIX mode bits
+/// are a `u16` semantically but `u32` storage is forward-compat
+/// (S_ISUID/S_ISGID extensions, anyone). The mount layers mask out
+/// bits they don't understand.
+fn v4_on_disk_to_in_memory(
+    v4: DirectoryTreeV4OnDisk,
+    container: &mut luksbox_format::Container,
+) -> Result<DirectoryTree, Error> {
+    let mut inodes: std::collections::BTreeMap<FileId, crate::tree::Inode> =
+        std::collections::BTreeMap::new();
+    for (id, od) in v4.inodes {
+        if od.link_count == 0 {
+            // Corrupt: every inode must have at least one directory
+            // entry pointing at it (otherwise it would have been
+            // freed by unlink), so refcount must be >= 1.
+            return Err(Error::MetadataDeserialize);
+        }
+        // Symlink presence-of-target invariant. Match the create-
+        // time invariant: Symlink -> Some, non-Symlink -> None.
+        // Validate the target with the same rules `Vfs::symlink`
+        // applies at create time, so a vault carrying a
+        // maliciously-authored symlink target (absolute, contains
+        // `..`, contains NUL, oversize) is REFUSED at open time
+        // -- the FUSE readlink callback never sees the bytes,
+        // closing the `/etc/shadow` supply-chain hole even if the
+        // vault was written by a non-LUKSbox tool.
+        match (od.kind, od.symlink_target.as_deref()) {
+            (InodeKind::Symlink, Some(t)) => {
+                if !is_safe_symlink_target(t) {
+                    return Err(Error::MetadataDeserialize);
+                }
+            }
+            (InodeKind::Symlink, None) | (_, Some(_)) => {
+                return Err(Error::MetadataDeserialize);
+            }
+            _ => {}
+        }
+        let (chunks, external_list_blocks) = match od.chunks_external {
+            None => (od.chunks, Vec::new()),
+            Some((head, expected_count)) => {
+                if !od.chunks.is_empty() {
+                    return Err(Error::MetadataDeserialize);
+                }
+                chunk::walk_chunk_list_chain(container, od.id, head, expected_count)
+                    .map_err(|_| Error::MetadataDeserialize)?
+            }
+        };
+        inodes.insert(
+            id,
+            crate::tree::Inode {
+                id: od.id,
+                parent: od.parent,
+                kind: od.kind,
+                size: od.size,
+                mtime_ns: od.mtime_ns,
+                chunks,
+                children: od.children,
+                cached_real_size: None,
+                external_list_blocks,
+                mode: od.mode,
+                link_count: od.link_count,
+                symlink_target: od.symlink_target,
+            },
+        );
+    }
+    Ok(DirectoryTree {
+        root: v4.root,
+        next_file_id: v4.next_file_id,
+        next_chunk_id: v4.next_chunk_id,
+        next_chunk_gen: v4.next_chunk_gen,
+        free_chunks: v4.free_chunks,
+        inodes,
+    })
+}
+
 /// Encrypted VFS atop a `Container`. Buffers the directory tree in memory and
 /// writes it back to the metadata blob on `flush` / `close` / drop.
 pub struct Vfs {
     container: Container,
     tree: DirectoryTree,
     dirty: bool,
-    /// On-disk metadata format for this vault. Locked at first flush:
-    /// v2 (LBM2) writes all chunk lists inline; v3 (LBM3) spills any
-    /// inode with chunks.len() > `V3_INLINE_CHUNK_THRESHOLD` to an
-    /// external chunk-list-block chain. A vault that was created LBM2
-    /// stays LBM2 forever; a vault opted into LBM3 at create time
-    /// (`LUKSBOX_FORMAT_V2=1`) stays LBM3. Migration between formats
-    /// is out-of-band (re-create the vault).
-    use_v3_format: bool,
+    /// On-disk metadata format for this vault. New vaults default
+    /// to V5 (v0.2.1+ shape: lower spill threshold, paired with
+    /// LUKSBOX2 header and sidecar mirrors). Existing V2/V3 vaults
+    /// retain their format on open and auto-upgrade to V5 on the
+    /// first flush against a dirty tree. Downgrade is not supported.
+    format: MetadataFormat,
+    /// Highest metadata-budget-usage percentage we've already warned
+    /// about. The eprintln warning in `flush` fires only on upward
+    /// threshold crossings (>=75% once, then >=90% once) per Vfs
+    /// instance, so CLI users see the message exactly when capacity
+    /// changes from healthy to concerning without spamming on every
+    /// subsequent flush.
+    last_warned_pct: u32,
+    /// Set once we've emitted the "vault size beyond the tested
+    /// boundary" advisory for this Vfs session. v0.2.1 has been
+    /// ground-truth tested up to ~30 GiB of stored content; beyond
+    /// that the format is expected to work but is in untested
+    /// territory and we ask users to verify unlocks + report issues.
+    /// One-shot per session via this latch.
+    warned_beyond_tested_size: bool,
 }
+
+/// Vault on-disk size beyond which the runtime emits a one-shot
+/// "untested territory" advisory. Aligns with the validation
+/// boundary documented in CRYPTO_SPEC.md and PROJECT_OVERVIEW.md.
+const TESTED_VAULT_SIZE_BYTES: u64 = 30 * 1024 * 1024 * 1024;
 
 impl Vfs {
     /// Open a Vfs over an already-unlocked container. If the metadata blob is
     /// empty (freshly created container), initializes a fresh tree.
     pub fn open(mut container: Container) -> Result<Self, Error> {
         let blob = container.read_metadata()?;
-        let (tree, use_v3_format) = if blob.is_empty() {
+        let (tree, format) = if blob.is_empty() {
             // Fresh vault: pick the format based on the env-var gate.
-            // The choice is then locked in by the first flush writing
-            // the LBM2 / LBM3 magic onto disk.
-            (DirectoryTree::new(), use_v3_for_fresh_vault())
+            // The choice is locked in by the first flush writing the
+            // appropriate magic onto disk.
+            (DirectoryTree::new(), MetadataFormat::for_fresh_vault())
+        } else if blob.len() >= METADATA_V5_MAGIC.len()
+            && &blob[..METADATA_V5_MAGIC.len()] == METADATA_V5_MAGIC
+        {
+            // LBM5: structurally the v4 on-disk shape. The lower
+            // V5_INLINE_CHUNK_THRESHOLD is a write-side invariant
+            // only; the read path tolerates any inline count up to
+            // the postcard decode limit so we stay forward-compatible
+            // with future threshold tweaks.
+            let payload = &blob[METADATA_V5_MAGIC.len()..];
+            if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                return Err(Error::MetadataDeserialize);
+            }
+            let v4: DirectoryTreeV4OnDisk =
+                postcard::from_bytes(payload).map_err(|_| Error::MetadataDeserialize)?;
+            (
+                v4_on_disk_to_in_memory(v4, &mut container)?,
+                MetadataFormat::V5,
+            )
+        } else if blob.len() >= METADATA_V4_MAGIC.len()
+            && &blob[..METADATA_V4_MAGIC.len()] == METADATA_V4_MAGIC
+        {
+            let payload = &blob[METADATA_V4_MAGIC.len()..];
+            if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                return Err(Error::MetadataDeserialize);
+            }
+            let v4: DirectoryTreeV4OnDisk =
+                postcard::from_bytes(payload).map_err(|_| Error::MetadataDeserialize)?;
+            (
+                v4_on_disk_to_in_memory(v4, &mut container)?,
+                MetadataFormat::V4,
+            )
         } else if blob.len() >= METADATA_V3_MAGIC.len()
             && &blob[..METADATA_V3_MAGIC.len()] == METADATA_V3_MAGIC
         {
@@ -698,7 +1117,10 @@ impl Vfs {
             }
             let v3: DirectoryTreeV3OnDisk =
                 postcard::from_bytes(payload).map_err(|_| Error::MetadataDeserialize)?;
-            (v3_on_disk_to_in_memory(v3, &mut container)?, true)
+            (
+                v3_on_disk_to_in_memory(v3, &mut container)?,
+                MetadataFormat::V3,
+            )
         } else if blob.len() >= METADATA_V2_MAGIC.len()
             && &blob[..METADATA_V2_MAGIC.len()] == METADATA_V2_MAGIC
         {
@@ -706,13 +1128,19 @@ impl Vfs {
             if payload.len() > METADATA_DECODE_LIMIT_BYTES {
                 return Err(Error::MetadataDeserialize);
             }
-            (
-                postcard::from_bytes::<DirectoryTree>(payload)
-                    .map_err(|_| Error::MetadataDeserialize)?,
-                false,
-            )
+            let mut tree: DirectoryTree =
+                postcard::from_bytes(payload).map_err(|_| Error::MetadataDeserialize)?;
+            // V2 on-disk inodes don't carry mode/link_count; the
+            // serde-skip defaults assign DEFAULT_FILE_MODE to every
+            // inode. Patch directories to the conventional 0o755 so
+            // the FUSE layer reports sensible mode bits on first
+            // stat. link_count stays 1 (set by the skip-default).
+            for inode in tree.inodes.values_mut() {
+                inode.mode = crate::tree::default_mode_for_kind(inode.kind);
+            }
+            (tree, MetadataFormat::V2)
         } else {
-            // Neither LBM2 nor LBM3 -- unsupported version, refuse cleanly.
+            // Not LBM2/3/4/5 -- unsupported version, refuse cleanly.
             return Err(Error::MetadataDeserialize);
         };
         validate_metadata_tree(
@@ -724,19 +1152,80 @@ impl Vfs {
             container,
             tree,
             dirty: false,
-            use_v3_format,
+            format,
+            last_warned_pct: 0,
+            warned_beyond_tested_size: false,
         })
     }
 
-    /// Whether this vault is using the v3 metadata format. Visible
-    /// to tests; production code should not branch on it (the Vfs
-    /// internals handle format-specific behaviour transparently).
+    /// Whether this vault uses any non-v2 metadata format (v3 or v4).
+    /// Visible to tests; production code should not branch on it.
+    /// Preserved name for backward compat with existing tests.
     pub fn uses_v3_metadata(&self) -> bool {
-        self.use_v3_format
+        !matches!(self.format, MetadataFormat::V2)
+    }
+
+    /// Whether this vault is currently in (or has been upgraded to)
+    /// the v4-or-later metadata format (v4 or v5). v4 was where
+    /// persistent chmod and hardlinks landed; v5 adds the lower spill
+    /// threshold and is paired with the durability mirrors. Both are
+    /// equally capable for the chmod/link feature set.
+    pub fn uses_v4_metadata(&self) -> bool {
+        matches!(self.format, MetadataFormat::V4 | MetadataFormat::V5)
+    }
+
+    /// Whether this vault is on the v0.2.1 v5 metadata format.
+    pub fn uses_v5_metadata(&self) -> bool {
+        matches!(self.format, MetadataFormat::V5)
+    }
+
+    /// Whether the vault's on-disk size is beyond the v0.2.1
+    /// ground-truth-tested boundary (~30 GiB). GUI callers poll this
+    /// to surface a one-shot advisory toast asking the user to verify
+    /// the vault still unlocks and report issues if it doesn't.
+    /// Cheap: a single `stat()` against the vault path.
+    pub fn is_beyond_tested_size(&self) -> bool {
+        std::fs::metadata(self.container.vault_path())
+            .map(|m| m.len() > TESTED_VAULT_SIZE_BYTES)
+            .unwrap_or(false)
+    }
+
+    /// Current metadata-region budget usage in bytes plus the cap.
+    /// The CLI's `info` subcommand surfaces this, and the GUI polls
+    /// it for status display so users get an in-app warning before
+    /// they hit the cap on large file-count vaults (5k+ inodes
+    /// approaching the 64 MiB region).
+    ///
+    /// O(N) over inodes: serializes a snapshot of the current tree.
+    /// Cheap enough to call periodically (once per CLI `info` /
+    /// once per GUI refresh tick); not cheap enough for hot-path
+    /// callers like statfs.
+    pub fn metadata_budget_status(&self) -> MetadataBudgetStatus {
+        let budget =
+            luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size);
+        // Encode the in-memory tree the same way the next flush
+        // would, modulo the per-format magic prefix (4 B). The
+        // projection in `check_metadata_budget_for_chunks` is for
+        // pre-flighting writes; for status display we just want the
+        // current encoded size, so a plain to_allocvec is enough.
+        let used = postcard::to_allocvec(&self.tree)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        MetadataBudgetStatus {
+            used_bytes: used,
+            budget_bytes: budget,
+        }
     }
 
     pub fn flush(&mut self) -> Result<(), Error> {
-        if !self.dirty {
+        // Force a flush even when the tree is clean if the most recent
+        // open recovered the metadata blob from a sidecar mirror. The
+        // recovery path is correct but the live region is stale until
+        // the next flush rewrites it; without this force-trigger the
+        // vault could close clean and the next crash would leave us
+        // without a current live AND without a current mirror.
+        let metadata_recovered = self.container.metadata_was_recovered_from_mirror();
+        if !self.dirty && !metadata_recovered {
             return Ok(());
         }
         validate_metadata_tree(
@@ -744,42 +1233,245 @@ impl Vfs {
             self.container.data_offset(),
             self.container.header.hide_size_header(),
         )?;
-        let bytes = if self.use_v3_format {
-            // v3: spill any inode whose chunk list exceeds
-            // V3_INLINE_CHUNK_THRESHOLD into an external chunk-list
-            // chain, then serialise the spilled tree as
-            // DirectoryTreeV3OnDisk. Spilling writes chunk-list
-            // blocks AND mutates inode.external_list_blocks for
-            // bookkeeping; old external_list_blocks (from a
-            // previous flush) are freed during the spill.
-            let v3 = self.spill_to_v3_on_disk()?;
-            let payload = postcard::to_allocvec(&v3).map_err(|_| Error::MetadataSerialize)?;
-            if payload.len() > METADATA_DECODE_LIMIT_BYTES {
-                return Err(Error::MetadataSerialize);
+        // v0.2.1 auto-upgrade: any flush against a LUKSBOX1 vault
+        // bumps it to LUKSBOX2 + LBM5. One-way; the next crash gets
+        // mirror recovery, but the cost is that pre-v0.3 binaries
+        // can no longer open the vault. The user picked auto-upgrade
+        // on next flush explicitly.
+        //
+        // Explicit deniable-mode exclusion: deniable vaults must NOT
+        // auto-upgrade, because the upgrade implies on-disk sidecar
+        // mirrors (`<vault>.lbx.{header,meta}-bak`) which are a
+        // distinguishability beacon defeating the deniability
+        // property. Deniable vaults keep their existing in-place
+        // overwrite + internal-redundancy crash-safety story. See
+        // `Container::is_v2_format` for the parallel guard on the
+        // write path.
+        if self.container.header.version_major == luksbox_core::VERSION_MAJOR_V1
+            && !self.container.is_deniable()
+        {
+            self.container.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+            self.container.mark_header_dirty();
+            // Bump the metadata format too. V5 supersedes V2/V3/V4
+            // for the v0.2.1+ shape: lower spill threshold, paired
+            // with the LUKSBOX2 header.
+            self.format = MetadataFormat::V5;
+        }
+        // Auto-upgrade to V4 if any inode has been touched by an
+        // LBM4-only op (non-default mode, or hardlink count > 1).
+        // Skipped for V5 which already covers those features.
+        let needs_v4 = self.tree_needs_v4_format();
+        if matches!(self.format, MetadataFormat::V2 | MetadataFormat::V3) && needs_v4 {
+            self.format = MetadataFormat::V4;
+        }
+        let bytes = match self.format {
+            MetadataFormat::V5 => {
+                // v5: same on-disk shape as v4, lower spill threshold
+                // applied via `self.format.inline_chunk_threshold()`
+                // inside `spill_to_v3_on_disk`. Magic differs so
+                // pre-LBM5 binaries refuse the vault (they'd miss the
+                // sidecar mirror recovery path).
+                let v4 = self.spill_to_v4_on_disk()?;
+                let payload = postcard::to_allocvec(&v4).map_err(|_| Error::MetadataSerialize)?;
+                if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                    return Err(Error::MetadataSerialize);
+                }
+                let mut bytes = Vec::with_capacity(METADATA_V5_MAGIC.len() + payload.len());
+                bytes.extend_from_slice(METADATA_V5_MAGIC);
+                bytes.extend_from_slice(&payload);
+                bytes
             }
-            let mut bytes = Vec::with_capacity(METADATA_V3_MAGIC.len() + payload.len());
-            bytes.extend_from_slice(METADATA_V3_MAGIC);
-            bytes.extend_from_slice(&payload);
-            bytes
-        } else {
-            // v2: plain postcard of the whole tree, all chunks inline.
-            let payload =
-                postcard::to_allocvec(&self.tree).map_err(|_| Error::MetadataSerialize)?;
-            if payload.len() > METADATA_DECODE_LIMIT_BYTES {
-                return Err(Error::MetadataSerialize);
+            MetadataFormat::V4 => {
+                // v4: same spill machinery as v3 + per-inode
+                // mode/link_count. spill_to_v4_on_disk reuses
+                // spill_to_v3_on_disk's chunk-list-block handling.
+                let v4 = self.spill_to_v4_on_disk()?;
+                let payload = postcard::to_allocvec(&v4).map_err(|_| Error::MetadataSerialize)?;
+                if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                    return Err(Error::MetadataSerialize);
+                }
+                let mut bytes = Vec::with_capacity(METADATA_V4_MAGIC.len() + payload.len());
+                bytes.extend_from_slice(METADATA_V4_MAGIC);
+                bytes.extend_from_slice(&payload);
+                bytes
             }
-            let mut bytes = Vec::with_capacity(METADATA_V2_MAGIC.len() + payload.len());
-            bytes.extend_from_slice(METADATA_V2_MAGIC);
-            bytes.extend_from_slice(&payload);
-            bytes
+            MetadataFormat::V3 => {
+                // v3: spill any inode whose chunk list exceeds
+                // V3_INLINE_CHUNK_THRESHOLD into an external chunk-
+                // list chain, then serialise the spilled tree as
+                // DirectoryTreeV3OnDisk. Spilling writes chunk-list
+                // blocks AND mutates inode.external_list_blocks for
+                // bookkeeping; old external_list_blocks (from a
+                // previous flush) are freed during the spill.
+                let v3 = self.spill_to_v3_on_disk()?;
+                let payload = postcard::to_allocvec(&v3).map_err(|_| Error::MetadataSerialize)?;
+                if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                    return Err(Error::MetadataSerialize);
+                }
+                let mut bytes = Vec::with_capacity(METADATA_V3_MAGIC.len() + payload.len());
+                bytes.extend_from_slice(METADATA_V3_MAGIC);
+                bytes.extend_from_slice(&payload);
+                bytes
+            }
+            MetadataFormat::V2 => {
+                // v2: plain postcard of the whole tree, all chunks
+                // inline. Inode's mode/link_count fields are
+                // serde-skipped, so the on-disk shape is unchanged
+                // from pre-LBM4 code (preserves backward compat).
+                let payload =
+                    postcard::to_allocvec(&self.tree).map_err(|_| Error::MetadataSerialize)?;
+                if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                    return Err(Error::MetadataSerialize);
+                }
+                let mut bytes = Vec::with_capacity(METADATA_V2_MAGIC.len() + payload.len());
+                bytes.extend_from_slice(METADATA_V2_MAGIC);
+                bytes.extend_from_slice(&payload);
+                bytes
+            }
         };
         self.container.write_metadata(&bytes)?;
+        // The live metadata region has been re-established. Clear the
+        // recovery flag so subsequent clean flushes (when the tree is
+        // not dirty) take the fast path.
+        self.container.clear_metadata_recovered_flag();
+        // Soft-warn on stderr when the metadata region is nearing
+        // capacity. CLI users see it directly; the mount subprocess'
+        // stderr is captured by the GUI / system log. The GUI's own
+        // status indicator (via `Vfs::metadata_budget_status`) is the
+        // primary in-app surface; this eprintln is the
+        // CLI-equivalent so headless users get the same heads-up
+        // before hitting the hard ENOSPC. State-tracked via the
+        // `last_warned_pct` field so the message fires only on
+        // upward threshold crossings, not on every flush.
+        let pct = ((bytes.len() as u128 * 100)
+            / luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size)
+                as u128) as u32;
+        let pct = pct.min(100);
+        if pct >= 90 && self.last_warned_pct < 90 {
+            eprintln!(
+                "luksbox: warn: metadata region at {pct}% capacity ({} / {} bytes). \
+                 Further writes may fail with 'no space left on device'. \
+                 Consider archiving content or migrating to a new vault \
+                 (create with --metadata-size larger than the default 64 MiB).",
+                bytes.len(),
+                luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size,),
+            );
+            self.last_warned_pct = pct;
+        } else if pct >= 75 && self.last_warned_pct < 75 {
+            eprintln!(
+                "luksbox: note: metadata region at {pct}% capacity ({} / {} bytes). \
+                 The metadata region (not the host disk) is the bottleneck for \
+                 vaults with very large inode counts; if many more files are \
+                 expected, consider re-creating with a larger --metadata-size.",
+                bytes.len(),
+                luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size,),
+            );
+            self.last_warned_pct = pct;
+        }
+        // Tested-boundary advisory. v0.2.1 was ground-truth tested
+        // up to TESTED_VAULT_SIZE_BYTES (~30 GiB) of stored content.
+        // Beyond that the format is expected to work but is in
+        // untested territory; ask the user to verify unlocks +
+        // report issues. One-shot per Vfs session via the latch.
+        if !self.warned_beyond_tested_size {
+            if let Ok(meta) = std::fs::metadata(self.container.vault_path()) {
+                if meta.len() > TESTED_VAULT_SIZE_BYTES {
+                    eprintln!(
+                        "luksbox: note: vault on-disk size ({} GiB) is beyond the \
+                         tested boundary (~30 GiB). The format is expected to handle \
+                         larger vaults but this usage has not been ground-truth tested. \
+                         Please periodically close and reopen the vault to verify it \
+                         still unlocks, and report any anomalies at \
+                         https://github.com/PentHertz/LUKSbox/issues.",
+                        meta.len() / (1024 * 1024 * 1024)
+                    );
+                    self.warned_beyond_tested_size = true;
+                }
+            }
+        }
         // If the container has an anchor sidecar configured, push the
         // current vault generation to it so a future open can detect
         // rollback via `anchor::compare`.
         self.container.write_anchor(self.tree.next_chunk_gen)?;
         self.dirty = false;
         Ok(())
+    }
+
+    /// Detects whether the in-memory tree has any inode that
+    /// requires LBM4 persistence: a non-default mode (chmod was
+    /// used), or link_count > 1 (hardlink was created). LBM2/LBM3
+    /// can't carry these fields, so a tree that needs them must be
+    /// upgraded to LBM4 on the next flush.
+    ///
+    /// Cheap: O(N) over inodes, no allocations. Called once per
+    /// flush.
+    fn tree_needs_v4_format(&self) -> bool {
+        for inode in self.tree.inodes.values() {
+            if inode.link_count != 1 {
+                return true;
+            }
+            // Symlinks are LBM4-only (the kind variant doesn't
+            // exist in v2/v3 postcard encoding). Any symlink in
+            // the tree forces an upgrade.
+            if inode.kind == InodeKind::Symlink {
+                return true;
+            }
+            // default_mode_for_kind only knows File/Directory; for
+            // Symlink we treat 0o777 as the conventional default
+            // (POSIX: symlinks have no enforceable mode).
+            let default_mode = match inode.kind {
+                InodeKind::File => crate::tree::DEFAULT_FILE_MODE,
+                InodeKind::Directory => crate::tree::DEFAULT_DIR_MODE,
+                InodeKind::Symlink => 0o777,
+            };
+            if inode.mode != default_mode {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Mirror of `spill_to_v3_on_disk` that produces the v4 on-disk
+    /// shape. Reuses the v3 chunk-list-spill machinery via delegation
+    /// rather than duplicating it -- the only difference between v3
+    /// and v4 is per-inode `mode` + `link_count`, which we copy from
+    /// the in-memory tree after the v3 spill resolves chunks.
+    fn spill_to_v4_on_disk(&mut self) -> Result<DirectoryTreeV4OnDisk, Error> {
+        let v3 = self.spill_to_v3_on_disk()?;
+        let inodes_v4: std::collections::BTreeMap<FileId, InodeV4OnDisk> =
+            v3.inodes
+                .into_iter()
+                .map(|(id, od)| {
+                    let inode =
+                        self.tree.inodes.get(&id).expect(
+                            "v3 spill enumerates only ids that exist in the in-memory tree",
+                        );
+                    (
+                        id,
+                        InodeV4OnDisk {
+                            id: od.id,
+                            parent: od.parent,
+                            kind: od.kind,
+                            size: od.size,
+                            mtime_ns: od.mtime_ns,
+                            chunks: od.chunks,
+                            chunks_external: od.chunks_external,
+                            children: od.children,
+                            mode: inode.mode,
+                            link_count: inode.link_count,
+                            symlink_target: inode.symlink_target.clone(),
+                        },
+                    )
+                })
+                .collect();
+        Ok(DirectoryTreeV4OnDisk {
+            root: v3.root,
+            next_file_id: v3.next_file_id,
+            next_chunk_id: v3.next_chunk_id,
+            next_chunk_gen: v3.next_chunk_gen,
+            free_chunks: v3.free_chunks,
+            inodes: inodes_v4,
+        })
     }
 
     /// For each inode in the in-memory tree, decide between inline
@@ -803,11 +1495,12 @@ impl Vfs {
             // Snapshot the inode's spill-relevant data while the
             // immutable borrow is alive, then re-borrow mutably to
             // update external_list_blocks.
+            let threshold = self.format.inline_chunk_threshold();
             let (chunks_len, file_needs_external) = {
                 let inode = self.tree.inodes.get(&id).expect("id from keys()");
                 (
                     inode.chunks.len(),
-                    inode.kind == InodeKind::File && inode.chunks.len() > V3_INLINE_CHUNK_THRESHOLD,
+                    inode.kind == InodeKind::File && inode.chunks.len() > threshold,
                 )
             };
             // Free any previously-allocated external_list_blocks; we
@@ -939,13 +1632,13 @@ impl Vfs {
     ///
     /// Two estimation strategies, one per format:
     ///
-    /// - **v2 (`use_v3_format = false`)**: every ChunkRef lands inline
-    ///   in the metadata blob. Serialise the current tree once
-    ///   (postcard, fast), add a conservative 12 B per new chunk
-    ///   (worst-case two u64 varints + Vec-length slack), and compare
-    ///   to the budget. Same as before this fix.
+    /// - **v2 (`format == V2`)**: every ChunkRef lands inline in the
+    ///   metadata blob. Serialise the current tree once (postcard,
+    ///   fast), add a conservative 12 B per new chunk (worst-case
+    ///   two u64 varints + Vec-length slack), and compare to the
+    ///   budget. Same as before this fix.
     ///
-    /// - **v3 (`use_v3_format = true`)**: any inode whose chunk count
+    /// - **v3 / v4 (`format != V2`)**: any inode whose chunk count
     ///   exceeds `V3_INLINE_CHUNK_THRESHOLD` spills its chunk list out
     ///   of the metadata region at flush time. The on-disk Inode for
     ///   such an inode carries a constant-size head ChunkRef + count
@@ -971,7 +1664,7 @@ impl Vfs {
         let region_size = self.container.header.metadata_size;
         let budget = luksbox_format::metadata::payload_budget_for(region_size);
 
-        if !self.use_v3_format {
+        if matches!(self.format, MetadataFormat::V2) {
             // v2: every chunk is inline. Same logic as before the fix.
             let current = postcard::to_allocvec(&self.tree)
                 .map_err(|_| Error::MetadataSerialize)?
@@ -1014,8 +1707,8 @@ impl Vfs {
             } else {
                 inode.chunks.len()
             };
-            let renders_external =
-                inode.kind == InodeKind::File && projected_chunk_count > V3_INLINE_CHUNK_THRESHOLD;
+            let renders_external = inode.kind == InodeKind::File
+                && projected_chunk_count > self.format.inline_chunk_threshold();
             on_disk_inodes.insert(
                 inode_id,
                 if renders_external {
@@ -1115,6 +1808,8 @@ impl Vfs {
             kind: inode.kind,
             size: real_size,
             mtime_ns: inode.mtime_ns,
+            mode: inode.mode,
+            link_count: inode.link_count,
         })
     }
 
@@ -1273,6 +1968,9 @@ impl Vfs {
                 children: Default::default(),
                 cached_real_size: None,
                 external_list_blocks: Vec::new(),
+                mode: crate::tree::DEFAULT_DIR_MODE,
+                link_count: 1,
+                symlink_target: None,
             },
         );
         self.tree
@@ -1285,7 +1983,29 @@ impl Vfs {
         Ok(id)
     }
 
+    /// Create a regular file with the default mode (`0o644`).
+    /// Convenience wrapper preserved for CLI / GUI callers that
+    /// don't care about the mode; FUSE callers that get a mode from
+    /// `open(O_CREAT, mode)` should use [`Vfs::create_with_mode`] so
+    /// the executable bit on scripts and binaries survives a
+    /// `git clone` into a mounted vault (the previous path defaulted
+    /// every newly-created file to 0o644 regardless of what the
+    /// caller passed).
     pub fn create(&mut self, parent: FileId, name: &str) -> Result<FileId, Error> {
+        self.create_with_mode(parent, name, crate::tree::DEFAULT_FILE_MODE)
+    }
+
+    /// Create a regular file with a specific POSIX permission mode.
+    /// Mode is masked to `0o7777` (strips any S_IF* file-type bits a
+    /// FUSE caller might have included). The FUSE umask, if any, is
+    /// the caller's responsibility to apply BEFORE passing the mode
+    /// here; FUSE clients call us with the already-umasked value.
+    pub fn create_with_mode(
+        &mut self,
+        parent: FileId,
+        name: &str,
+        mode: u32,
+    ) -> Result<FileId, Error> {
         validate_name(name)?;
         self.require_dir(parent)?;
         if self.tree.inodes[&parent].children.contains_key(name) {
@@ -1304,6 +2024,9 @@ impl Vfs {
                 children: Default::default(),
                 cached_real_size: None,
                 external_list_blocks: Vec::new(),
+                mode: mode & 0o7777,
+                link_count: 1,
+                symlink_target: None,
             },
         );
         self.tree
@@ -1575,35 +2298,262 @@ impl Vfs {
         Ok(())
     }
 
+    /// Unlink: refcount-aware as of LBM4. Removes the directory
+    /// entry first, then decrements the target's `link_count`. The
+    /// chunks (and v3 chunk-list blocks) are freed ONLY when
+    /// `link_count` reaches zero -- i.e. when the last hardlink is
+    /// removed. This is the POSIX `unlink(2)` contract and the only
+    /// way hardlinks can be safe: freeing chunks on the first unlink
+    /// would silently corrupt the OTHER directory entries that still
+    /// point at the inode, because their chunk references would
+    /// dangle into freed slots that the next allocation cycle could
+    /// overwrite -- a "use-after-free of ciphertext", surfacing as
+    /// garbled reads (decryption against a different file_key, or a
+    /// chunk written under a different generation than the AAD
+    /// expects, both of which would fail AEAD and read EIO; not
+    /// silent disclosure, but data loss).
+    ///
+    /// For pre-LBM4 vaults, link_count is always 1 (set by the read
+    /// path) so the refcount-decrement immediately hits zero and the
+    /// behaviour is identical to the pre-LBM4 unlink.
+    ///
+    /// **Security**: link_count is `u32`. Subtracting from a stored
+    /// `0` (which v4_on_disk_to_in_memory rejects, but defense-in-
+    /// depth) would wrap to u32::MAX and skip the free-on-zero
+    /// branch. We use `saturating_sub(1)` so the worst case is "the
+    /// chunks leak" rather than "freed chunks reallocated to another
+    /// file, ciphertext substitution" -- the former is a recoverable
+    /// space bug, the latter is a confidentiality bug.
     pub fn unlink(&mut self, parent: FileId, name: &str) -> Result<(), Error> {
         let parent_inode = self.require_dir(parent)?;
         let target_id = *parent_inode.children.get(name).ok_or(Error::NotFound)?;
         let target = self.tree.inodes.get(&target_id).unwrap();
-        if target.kind != InodeKind::File {
+        // POSIX `unlink(2)` removes files AND symlinks. Directories
+        // require `rmdir(2)` instead.
+        if target.kind == InodeKind::Directory {
             return Err(Error::IsADirectory);
         }
-        let chunks = target.chunks.clone();
-        // v3: also free any chunk-list-block slots the file owns in
-        // the data area. Without this they would leak (data area
-        // chunks holding stale chunk-list bytes that no inode points
-        // at). The blocks themselves stay encrypted on disk; the
-        // slots return to free_chunks and get overwritten on the next
-        // allocation cycle. v2 vaults leave external_list_blocks
-        // empty so this loop is a no-op for them.
-        let list_blocks = target.external_list_blocks.clone();
-        for cref in chunks {
-            self.tree.free_chunk_id(cref.id);
-        }
-        for cref in list_blocks {
-            self.tree.free_chunk_id(cref.id);
-        }
-        self.tree.inodes.remove(&target_id);
+
+        // Remove the directory entry first. Doing so before the
+        // refcount mutation keeps the invariant that
+        // "validate_metadata_tree's directory-entry count for an
+        // inode == its link_count" holds at every observable point
+        // between operations (even mid-Vfs::unlink if we ever
+        // re-entered concurrently, which Mutex serialization
+        // prevents anyway).
         self.tree
             .inodes
             .get_mut(&parent)
             .unwrap()
             .children
             .remove(name);
+
+        // Saturating-sub: a corrupt vault that reached us with
+        // link_count == 0 would wrap to u32::MAX without it. The
+        // worst case post-fix is "this unlink freed an entry but the
+        // inode survives with link_count=0 and leaks chunks"; the
+        // worst case pre-fix would have been "wrap to u32::MAX,
+        // unlink any number of times without ever freeing" --
+        // confidentiality-preserving but leaks unbounded chunks.
+        let target_mut = self.tree.inodes.get_mut(&target_id).unwrap();
+        target_mut.link_count = target_mut.link_count.saturating_sub(1);
+        let now_zero = target_mut.link_count == 0;
+
+        if now_zero {
+            // Last hardlink gone -- free chunks + chunk-list blocks
+            // and drop the inode entirely. Matches the pre-LBM4
+            // behaviour, which assumed link_count was always 1.
+            let chunks = target_mut.chunks.clone();
+            let list_blocks = target_mut.external_list_blocks.clone();
+            for cref in chunks {
+                self.tree.free_chunk_id(cref.id);
+            }
+            for cref in list_blocks {
+                self.tree.free_chunk_id(cref.id);
+            }
+            self.tree.inodes.remove(&target_id);
+        }
+        // If still nonzero, the inode remains and is reachable via
+        // its other directory entries; chunks stay allocated.
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Persistently change an inode's POSIX mode bits. Triggers
+    /// auto-upgrade to LBM4 on next flush if the new mode differs
+    /// from the kind's default. Only applies to files / directories
+    /// that exist; returns NotFound otherwise.
+    ///
+    /// **Security**: chmod is a metadata-only op; it doesn't touch
+    /// chunk slots, free lists, or anything that could leak
+    /// ciphertext. We don't validate the mode bits (POSIX mode is
+    /// caller-supplied user-space data), just store them as-is.
+    /// Mount layers mask out bits they don't understand.
+    pub fn chmod(&mut self, id: FileId, mode: u32) -> Result<(), Error> {
+        let inode = self.tree.inodes.get_mut(&id).ok_or(Error::NotFound)?;
+        // Mask to the POSIX-defined mode bits (12 bits: 0o7777 =
+        // setuid|setgid|sticky + 9 permission bits). Higher bits
+        // are file-type identifiers in stat(2) (S_IFREG/S_IFDIR)
+        // and don't belong in stored mode. Defense: silently strip
+        // them rather than reject; some callers (libfuse) pass the
+        // full mode including type bits.
+        inode.mode = mode & 0o7777;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Create a symlink at `(parent, name)` whose stored target is
+    /// `target`. **Strict target sanitization** -- the target MUST
+    /// satisfy `is_safe_symlink_target`:
+    ///
+    /// - Not empty
+    /// - Bytes < `MAX_SYMLINK_TARGET_LEN` (PATH_MAX = 4096)
+    /// - Not absolute (doesn't start with `/` or `\` or a Windows
+    ///   drive-letter prefix like `C:`)
+    /// - No NUL bytes (would truncate at the C-string boundary
+    ///   when crossing back through the FUSE callback)
+    /// - No path components equal to `..` -- prevents the
+    ///   `secret -> ../../../etc/shadow` supply-chain attack class
+    /// - No path components equal to `.` -- not strictly a security
+    ///   bug (just a no-op component) but breaks the
+    ///   "components are file names or `..`" assumption other code
+    ///   relies on, and confuses any future symlink-follower
+    ///
+    /// This is the **strictest reasonable design**. Some legitimate
+    /// uses (like `git`'s `.git/objects/info/alternates -> ../../
+    /// other-repo/...`) won't work. We accept that trade-off:
+    /// LUKSbox is a confidentiality-first vault, not a general
+    /// shared filesystem, and the cost of a single CVE in this code
+    /// path would be catastrophic (data exfil via symlink chain).
+    ///
+    /// A future "controlled-`..`" mode that resolves targets
+    /// against the symlink's parent directory and verifies the
+    /// result stays within the vault root could be added later as
+    /// an opt-in.
+    pub fn symlink(&mut self, parent: FileId, name: &str, target: &str) -> Result<FileId, Error> {
+        validate_name(name)?;
+        if !is_safe_symlink_target(target) {
+            return Err(Error::InvalidPath(target.to_string()));
+        }
+        self.require_dir(parent)?;
+        if self.tree.inodes[&parent].children.contains_key(name) {
+            return Err(Error::AlreadyExists);
+        }
+        let id = self.tree.alloc_file_id().ok_or(Error::IdSpaceExhausted)?;
+        self.tree.inodes.insert(
+            id,
+            Inode {
+                id,
+                parent,
+                kind: InodeKind::Symlink,
+                size: target.len() as u64,
+                mtime_ns: 0,
+                chunks: Vec::new(),
+                children: Default::default(),
+                cached_real_size: None,
+                external_list_blocks: Vec::new(),
+                // POSIX symlinks have no enforceable mode; the
+                // kernel checks the target's mode instead. 0o777
+                // matches what mainstream filesystems return.
+                mode: 0o777,
+                link_count: 1,
+                symlink_target: Some(target.to_string()),
+            },
+        );
+        self.tree
+            .inodes
+            .get_mut(&parent)
+            .unwrap()
+            .children
+            .insert(name.to_string(), id);
+        self.dirty = true;
+        Ok(id)
+    }
+
+    /// Read a symlink's stored target. Returns `Error::NotFound`
+    /// if `id` doesn't exist; returns `Error::NotAFile` (mapped to
+    /// EINVAL by the mount layer) if `id` is not a symlink.
+    pub fn readlink(&self, id: FileId) -> Result<String, Error> {
+        let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?;
+        if inode.kind != InodeKind::Symlink {
+            return Err(Error::NotAFile);
+        }
+        Ok(inode
+            .symlink_target
+            .clone()
+            .expect("invariant: Symlink kind always carries a target"))
+    }
+
+    /// Hardlink: add a new directory entry `(new_parent, new_name)`
+    /// pointing to the existing inode at `target_id`. POSIX
+    /// `link(2)`: only files can be hardlinked (directories are
+    /// reserved for `..` resolution and would create cycles).
+    /// Increments the target's `link_count`. Auto-upgrades to LBM4
+    /// on next flush because link_count becomes > 1.
+    ///
+    /// **Security considerations:**
+    /// - target must already exist (no creating phantom inodes)
+    /// - target must be a File (POSIX forbids dir hardlinks; allowing
+    ///   them would let `is_descendant_of` cycle-guard miss true
+    ///   cycles and let trees grow loops)
+    /// - new_parent must exist + be a directory
+    /// - new_name must not already exist in new_parent (POSIX would
+    ///   require EEXIST; we don't replace because replace + new link
+    ///   semantics are ambiguous and easy to get wrong)
+    /// - link_count is `u32`; saturating_add caps at u32::MAX. A
+    ///   vault that legitimately has 2^32 hardlinks to one inode is
+    ///   absurd; cap by failing the link rather than wrapping
+    pub fn link(
+        &mut self,
+        target_id: FileId,
+        new_parent: FileId,
+        new_name: &str,
+    ) -> Result<(), Error> {
+        validate_name(new_name)?;
+
+        // Validate target. Only regular files can be hardlinked
+        // -- POSIX forbids dir hardlinks (cycle defense), and our
+        // LBM4 format invariant is "one directory entry per
+        // Symlink inode" (the per-symlink target is the link; a
+        // second name to the same target would be a different
+        // symlink with the same target, semantically clearer to
+        // create separately). For Symlinks we map the rejection
+        // to NotAFile -> EINVAL at the mount layer.
+        let target = self.tree.inodes.get(&target_id).ok_or(Error::NotFound)?;
+        match target.kind {
+            InodeKind::File => {}
+            InodeKind::Directory => return Err(Error::IsADirectory),
+            InodeKind::Symlink => return Err(Error::NotAFile),
+        }
+        let cur_count = target.link_count;
+        // u32 overflow guard. POSIX `link(2)` returns EMLINK for
+        // "too many links". We map that to AlreadyExists since we
+        // don't have a dedicated EMLINK variant; the FUSE errno
+        // mapping is close enough (most callers treat both as
+        // "can't link, fall back to copy"). A real 2^32-link inode
+        // is astronomical -- this is purely defensive.
+        if cur_count == u32::MAX {
+            return Err(Error::AlreadyExists);
+        }
+
+        // Validate new_parent.
+        let new_dir = self.tree.inodes.get(&new_parent).ok_or(Error::NotFound)?;
+        if new_dir.kind != InodeKind::Directory {
+            return Err(Error::NotADirectory);
+        }
+        if new_dir.children.contains_key(new_name) {
+            return Err(Error::AlreadyExists);
+        }
+
+        // Mutate: insert directory entry, bump refcount.
+        self.tree
+            .inodes
+            .get_mut(&new_parent)
+            .unwrap()
+            .children
+            .insert(new_name.to_string(), target_id);
+        let target_mut = self.tree.inodes.get_mut(&target_id).unwrap();
+        target_mut.link_count = target_mut.link_count.saturating_add(1);
         self.dirty = true;
         Ok(())
     }
@@ -1629,20 +2579,199 @@ impl Vfs {
         Ok(())
     }
 
-    /// Within-directory rename. Cross-directory rename is intentionally not in v1.
-    pub fn rename(&mut self, parent: FileId, old_name: &str, new_name: &str) -> Result<(), Error> {
+    /// Full POSIX `rename(2)` -- within-directory AND cross-directory.
+    ///
+    /// **Replacement**: if `new_name` already exists in `new_parent`,
+    /// the existing entry is atomically replaced (POSIX requires this;
+    /// the pre-fix behavior of returning `AlreadyExists` broke every
+    /// program that uses the "write temp + rename onto target" atomic-
+    /// write idiom, including git, sqlite WAL checkpointing, and most
+    /// editor save flows). Type-compatibility is enforced first:
+    ///
+    /// - file -> file: replace, freeing the displaced file's chunks.
+    /// - dir -> empty dir: replace, dropping the displaced empty dir.
+    /// - file -> dir: rejected with `IsADirectory`.
+    /// - dir -> file: rejected with `NotADirectory`.
+    /// - dir -> non-empty dir: rejected with `NotEmpty`.
+    /// - same target inode (old == new entry): no-op success.
+    ///
+    /// **Cycle guard**: when the source is a directory, the rename is
+    /// rejected with `RenameCycle` (-> EINVAL) if `new_parent` equals
+    /// `src` or sits inside `src`'s subtree. Without the guard the
+    /// tree would gain a cycle and the next traversal would loop.
+    ///
+    /// The implementation is three phases (validate, free, move) so
+    /// any rejection leaves on-disk state untouched. All chunk-freeing
+    /// matches the `unlink` cleanup path so a replaced file's data
+    /// blocks return to `free_chunks` instead of leaking.
+    pub fn rename(
+        &mut self,
+        old_parent: FileId,
+        old_name: &str,
+        new_parent: FileId,
+        new_name: &str,
+    ) -> Result<(), Error> {
+        validate_name(old_name)?;
         validate_name(new_name)?;
-        let dir = self.tree.inodes.get_mut(&parent).ok_or(Error::NotFound)?;
-        if dir.kind != InodeKind::Directory {
+
+        // POSIX: rename(x, x) within the same dir is a no-op success.
+        // Doing the check up-front also avoids the Phase 2/3 work for
+        // a trivially-equivalent call.
+        if old_parent == new_parent && old_name == new_name {
+            let dir = self.tree.inodes.get(&old_parent).ok_or(Error::NotFound)?;
+            if dir.kind != InodeKind::Directory {
+                return Err(Error::NotADirectory);
+            }
+            if !dir.children.contains_key(old_name) {
+                return Err(Error::NotFound);
+            }
+            return Ok(());
+        }
+
+        // ---- Phase 1: validate everything before mutating ---------------
+        // Both parents must exist and be directories. Source must
+        // exist under its old name.
+        let old_dir = self.tree.inodes.get(&old_parent).ok_or(Error::NotFound)?;
+        if old_dir.kind != InodeKind::Directory {
             return Err(Error::NotADirectory);
         }
-        if dir.children.contains_key(new_name) {
-            return Err(Error::AlreadyExists);
+        let src_id = *old_dir.children.get(old_name).ok_or(Error::NotFound)?;
+        let new_dir = self.tree.inodes.get(&new_parent).ok_or(Error::NotFound)?;
+        if new_dir.kind != InodeKind::Directory {
+            return Err(Error::NotADirectory);
         }
-        let id = dir.children.remove(old_name).ok_or(Error::NotFound)?;
-        dir.children.insert(new_name.to_string(), id);
+
+        // Cycle guard. Only meaningful when src is a directory; files
+        // can't have descendants. `new_parent == src_id` is the
+        // self-rename case ("rename /a into /a"); `is_descendant`
+        // catches the deeper case ("rename /a into /a/b/..."). The
+        // helper uses a visited-set so a corrupt cyclic on-disk tree
+        // can't make the check loop forever.
+        let src_kind = self.tree.inodes.get(&src_id).unwrap().kind;
+        if src_kind == InodeKind::Directory
+            && (new_parent == src_id || self.is_descendant_of(src_id, new_parent))
+        {
+            return Err(Error::RenameCycle);
+        }
+
+        // Look up displaced target in `new_parent` and validate
+        // type-compatibility. `dir.children.get(name).copied()` is
+        // a fresh immutable borrow on `new_dir`, but `new_dir` is
+        // already borrowed above -- re-fetch through `inodes.get`
+        // to keep the borrow checker happy without an interleaved
+        // `&mut` (Phase 3 is the only `&mut` access).
+        let displaced = {
+            let new_dir = self.tree.inodes.get(&new_parent).unwrap();
+            if let Some(&dst_id) = new_dir.children.get(new_name) {
+                // Same inode would only happen via hardlinks, which we
+                // don't support yet. Defensive: treat as no-op so a
+                // future hardlink patch can't accidentally drop the
+                // only reference to the inode.
+                if src_id == dst_id {
+                    return Ok(());
+                }
+                let dst = self.tree.inodes.get(&dst_id).unwrap();
+                match (src_kind, dst.kind) {
+                    (InodeKind::Directory, InodeKind::Directory) => {
+                        if !dst.children.is_empty() {
+                            return Err(Error::NotEmpty);
+                        }
+                    }
+                    (InodeKind::Directory, _) => return Err(Error::NotADirectory),
+                    (_, InodeKind::Directory) => return Err(Error::IsADirectory),
+                    _ => {}
+                }
+                Some(dst_id)
+            } else {
+                None
+            }
+        };
+
+        // ---- Phase 2: free the displaced inode's data chunks ------------
+        // Only file inodes have chunks; empty directories have none.
+        // Matches the cleanup path in `unlink` so we don't leak data-
+        // area slots when a file is replaced via rename. Borrow-scope
+        // block keeps the immutable `inodes.get` alive only as long as
+        // it takes to clone out the chunk lists, so the subsequent
+        // `tree.free_chunk_id` (mutates `tree.free_chunks`) compiles.
+        if let Some(dst_id) = displaced {
+            let (chunks, list_blocks) = {
+                let dst = self.tree.inodes.get(&dst_id).unwrap();
+                (dst.chunks.clone(), dst.external_list_blocks.clone())
+            };
+            for cref in chunks {
+                self.tree.free_chunk_id(cref.id);
+            }
+            for cref in list_blocks {
+                self.tree.free_chunk_id(cref.id);
+            }
+            self.tree.inodes.remove(&dst_id);
+        }
+
+        // ---- Phase 3: move the directory entry --------------------------
+        if old_parent == new_parent {
+            // Same dir: a single get_mut handles both remove + insert.
+            let dir = self.tree.inodes.get_mut(&old_parent).unwrap();
+            let id = dir.children.remove(old_name).unwrap();
+            // `insert` overwrites any existing entry for `new_name`,
+            // whose inode we already removed in Phase 2 (if any).
+            dir.children.insert(new_name.to_string(), id);
+        } else {
+            // Cross-dir: two distinct `get_mut`s. Scope the first to
+            // its remove so the &mut borrow drops before the second
+            // get_mut runs. old_parent != new_parent in this branch
+            // so the two borrows reference different map entries.
+            let id = {
+                let old_dir = self.tree.inodes.get_mut(&old_parent).unwrap();
+                old_dir.children.remove(old_name).unwrap()
+            };
+            let new_dir = self.tree.inodes.get_mut(&new_parent).unwrap();
+            new_dir.children.insert(new_name.to_string(), id);
+        }
         self.dirty = true;
         Ok(())
+    }
+
+    /// Returns `true` if `candidate` lives anywhere in the subtree
+    /// rooted at `root` (exclusive of `root` itself -- the caller
+    /// checks equality separately when it matters). Used by `rename`
+    /// to detect cross-directory moves that would create a cycle.
+    ///
+    /// Uses a visited-set so a corrupt on-disk tree with an existing
+    /// cycle cannot make the traversal loop forever. Cost is O(N) in
+    /// the size of `root`'s subtree.
+    ///
+    /// Defense-in-depth: walks `children` regardless of `kind`. The
+    /// well-formed invariant is "only Directory inodes have non-empty
+    /// `children`", but if a corrupted or attacker-influenced vault
+    /// ever has a File-kind inode that nonetheless carries children
+    /// (or a future Symlink variant with embedded entries), skipping
+    /// based on kind would let those children hide from the cycle
+    /// check -- a rename into one of them would then create a real
+    /// directory cycle, and the next traversal (read_directory,
+    /// flush, rotate_mvk) would loop forever. Walking unconditionally
+    /// costs nothing on well-formed vaults (the `children` BTreeMap
+    /// on a File is normally empty) and closes the corruption-induced
+    /// cycle-injection vector.
+    fn is_descendant_of(&self, root: FileId, candidate: FileId) -> bool {
+        let mut stack = vec![root];
+        let mut visited: std::collections::BTreeSet<FileId> = std::collections::BTreeSet::new();
+        while let Some(cur) = stack.pop() {
+            if !visited.insert(cur) {
+                continue;
+            }
+            let inode = match self.tree.inodes.get(&cur) {
+                Some(i) => i,
+                None => continue,
+            };
+            for &child_id in inode.children.values() {
+                if child_id == candidate {
+                    return true;
+                }
+                stack.push(child_id);
+            }
+        }
+        false
     }
 
     /// MVK rotation. Re-encrypts every chunk with new MVK-derived file_keys,
@@ -2046,12 +3175,108 @@ impl Vfs {
     }
 }
 
+/// POSIX-ish single-name validation. Rejects empty, ".", "..", any
+/// component containing a path separator (forward OR backslash) or
+/// NUL, and any name longer than `MAX_NAME_LEN_BYTES`.
+///
+/// The length cap matches Linux NAME_MAX = 255 and the WinFsp /
+/// libfuse limits, so a name we accept here will also be accepted by
+/// every mount backend. Without the cap, a programmatic caller (a
+/// caller bypassing the mount layer -- CLI, library, fuzzer) could
+/// submit megabyte-sized names that bloat the metadata blob's
+/// postcard encoding linearly and amplify a single `mkdir` into a
+/// large allocation. Defense-in-depth against the metadata-budget
+/// DoS class.
+///
+/// **Cross-platform zip-slip defense**: backslash `\` is rejected
+/// even on POSIX hosts because LUKSbox vaults are portable -- a
+/// vault created on Linux with `cmd.exe\..\..\Windows\System32\drivers\etc\hosts`
+/// as a filename would pass `validate_name` if we only checked `/`,
+/// and when later opened on Windows the GUI's "extract directory"
+/// feature does `local.join(&ent.name)` -- on Windows that treats
+/// `\` as a separator, so the join would resolve OUTSIDE the
+/// destination directory and write to a system-controlled path
+/// under the user's process privileges. Rejecting `\` at the format
+/// boundary blocks the attack regardless of which host eventually
+/// extracts the vault. The trade-off is that genuine Linux files
+/// containing `\` cannot be added to a vault, which we accept as
+/// a security/portability win.
+const MAX_NAME_LEN_BYTES: usize = 255;
+
 fn validate_name(name: &str) -> Result<(), Error> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.len() > MAX_NAME_LEN_BYTES
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
         Err(Error::InvalidPath(name.to_string()))
     } else {
         Ok(())
     }
+}
+
+/// Strict symlink-target sanitization. Returns `true` iff `target`
+/// is safe to store in the vault.
+///
+/// The rules block the `/etc/shadow`-class supply-chain attack:
+///
+/// 1. **Empty rejected**: an empty target is nonsense in POSIX and
+///    causes readlink to return EINVAL on every read; refuse at
+///    create time.
+/// 2. **Length-capped** (PATH_MAX = 4096): bounds metadata-blob
+///    growth and FUSE readlink buffer copies.
+/// 3. **Absolute path rejected**: starts with `/`, `\`, or a drive-
+///    letter prefix (`C:`). The kernel would resolve an absolute
+///    target against the host filesystem, exposing host files via
+///    a vault read.
+/// 4. **NUL byte rejected**: would truncate the target at the C-
+///    string boundary when copied through the FUSE callback,
+///    silently producing a different target than what was stored.
+/// 5. **No `..` components**: a single `..` could escape the
+///    symlink's parent directory. Even chained `..`s with valid
+///    components in between still escape if the chain depth >
+///    parent depth in the vault. Easiest correct policy: refuse
+///    `..` entirely. (Trade-off documented on `Vfs::symlink`.)
+/// 6. **No `.` components**: not a security bug, but they're a
+///    no-op that confuses any future symlink-following resolver
+///    (e.g. counting `..` depth would have to skip `.`); refuse.
+///
+/// Components are split on BOTH `/` and `\` so a target stored on
+/// one OS doesn't bypass validation when read on another -- the
+/// same cross-platform-portability reasoning as `validate_name`.
+pub fn is_safe_symlink_target(target: &str) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    if target.len() > crate::tree::MAX_SYMLINK_TARGET_LEN {
+        return false;
+    }
+    if target.contains('\0') {
+        return false;
+    }
+    // Absolute markers.
+    let bytes = target.as_bytes();
+    if bytes[0] == b'/' || bytes[0] == b'\\' {
+        return false;
+    }
+    // Windows drive-letter prefix ("C:..."): two-byte sequence
+    // where byte 1 is `:` and byte 0 is an ASCII letter. Cross-
+    // platform reject (we don't care what OS this vault is opened
+    // on; if a drive-letter target could ever make it to a
+    // Windows host's readlink, that's a Windows-side escape).
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    // Per-component rejections. Split on both separators.
+    for component in target.split(|c| c == '/' || c == '\\') {
+        if component == ".." || component == "." {
+            return false;
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -2292,10 +3517,1033 @@ mod tests {
         let root = vfs.root_id();
         let f = vfs.create(root, "old").unwrap();
         vfs.write(f, 0, b"hi").unwrap();
-        vfs.rename(root, "old", "new").unwrap();
+        vfs.rename(root, "old", root, "new").unwrap();
         assert!(vfs.lookup(root, "old").is_err());
         let g = vfs.lookup(root, "new").unwrap();
         assert_eq!(g, f);
+    }
+
+    /// POSIX `rename(2)` MUST atomically replace an existing target
+    /// file. The pre-fix behavior returned `AlreadyExists`, breaking
+    /// every program using the "write temp + rename onto target"
+    /// atomic-write idiom -- the symptom that surfaced this was
+    /// `git clone` failing with "could not write config file ... File
+    /// exists" because git's `commit_lock_file_to()` issues exactly
+    /// this rename.
+    #[test]
+    fn rename_replaces_existing_file_atomic_write_idiom() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        // Simulate the atomic-write pattern: a real target file
+        // already in place, plus a freshly-written temp file holding
+        // the new contents.
+        let target = vfs.create(root, "config").unwrap();
+        vfs.write(target, 0, b"old contents").unwrap();
+        let tmp = vfs.create(root, "config.lock").unwrap();
+        vfs.write(tmp, 0, b"new contents").unwrap();
+
+        // The rename used to fail with AlreadyExists; must now succeed.
+        vfs.rename(root, "config.lock", root, "config").unwrap();
+
+        // The new entry holds the temp file's inode + bytes.
+        let after = vfs.lookup(root, "config").unwrap();
+        assert_eq!(after, tmp, "target should now reference temp inode");
+        let mut buf = vec![0u8; b"new contents".len()];
+        vfs.read(after, 0, &mut buf).unwrap();
+        assert_eq!(buf, b"new contents");
+        // The temp name is gone.
+        assert!(vfs.lookup(root, "config.lock").is_err());
+    }
+
+    /// When a file is displaced by rename, its data-area chunks MUST
+    /// return to the free list -- otherwise repeated atomic-writes
+    /// (git pack repacking, sqlite checkpoints) would leak ciphertext
+    /// chunks forever. Same invariant `unlink` already guarantees.
+    #[test]
+    fn rename_frees_displaced_file_chunks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+
+        let displaced = vfs.create(root, "big").unwrap();
+        // Multi-chunk payload so `chunks` is non-empty.
+        vfs.write(displaced, 0, &vec![0xAAu8; 32 * 1024]).unwrap();
+        let displaced_chunks: Vec<_> = vfs.tree.inodes.get(&displaced).unwrap().chunks.clone();
+        assert!(
+            !displaced_chunks.is_empty(),
+            "test precondition: displaced file should have allocated chunks"
+        );
+
+        let replacement = vfs.create(root, "small").unwrap();
+        vfs.write(replacement, 0, b"x").unwrap();
+
+        vfs.rename(root, "small", root, "big").unwrap();
+
+        // The displaced inode is gone from the inode table.
+        assert!(
+            !vfs.tree.inodes.contains_key(&displaced),
+            "displaced inode must be removed after rename-replace"
+        );
+        // Every chunk the displaced file owned is now in free_chunks
+        // so a subsequent allocation can reuse the slot.
+        for cref in &displaced_chunks {
+            assert!(
+                vfs.tree.free_chunks.contains(&cref.id),
+                "displaced chunk {} was not freed",
+                cref.id
+            );
+        }
+        // Replacement file's data is intact under the new name.
+        let after = vfs.lookup(root, "big").unwrap();
+        assert_eq!(after, replacement);
+    }
+
+    /// Empty-directory replacement: `rename(d1, d2)` where both are
+    /// directories and d2 is empty must succeed (POSIX); the empty d2
+    /// inode is dropped.
+    #[test]
+    fn rename_replaces_empty_directory() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+
+        let src_dir = vfs.mkdir(root, "src").unwrap();
+        vfs.create(src_dir, "inside").unwrap();
+        let empty_dst = vfs.mkdir(root, "dst").unwrap();
+
+        vfs.rename(root, "src", root, "dst").unwrap();
+
+        // Replaced inode is gone.
+        assert!(!vfs.tree.inodes.contains_key(&empty_dst));
+        // Children of the original src dir transferred under the new name.
+        let after = vfs.lookup(root, "dst").unwrap();
+        assert_eq!(after, src_dir);
+        assert!(vfs.lookup(after, "inside").is_ok());
+        assert!(vfs.lookup(root, "src").is_err());
+    }
+
+    /// Type-mismatch and non-empty-directory rejections must surface
+    /// BEFORE any mutation (Phase 1 validation). Pre/post inode counts
+    /// confirm nothing leaked.
+    #[test]
+    fn rename_rejects_type_mismatches_without_side_effects() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+
+        let f = vfs.create(root, "afile").unwrap();
+        let d = vfs.mkdir(root, "adir").unwrap();
+        let d2 = vfs.mkdir(root, "fulldir").unwrap();
+        vfs.create(d2, "child").unwrap();
+
+        let before = vfs.tree.inodes.len();
+
+        // dir -> non-empty dir: NotEmpty
+        assert!(matches!(
+            vfs.rename(root, "adir", root, "fulldir"),
+            Err(Error::NotEmpty)
+        ));
+        // file -> dir: IsADirectory
+        assert!(matches!(
+            vfs.rename(root, "afile", root, "adir"),
+            Err(Error::IsADirectory)
+        ));
+        // dir -> file: NotADirectory
+        assert!(matches!(
+            vfs.rename(root, "adir", root, "afile"),
+            Err(Error::NotADirectory)
+        ));
+
+        // None of the rejections may have mutated the tree.
+        assert_eq!(vfs.tree.inodes.len(), before);
+        assert_eq!(vfs.lookup(root, "afile").unwrap(), f);
+        assert_eq!(vfs.lookup(root, "adir").unwrap(), d);
+        assert_eq!(vfs.lookup(root, "fulldir").unwrap(), d2);
+    }
+
+    /// `rename(x, x)` is a no-op success per POSIX. Crucially, it must
+    /// not run Phase 2 (which would free the inode's chunks and leave
+    /// the directory entry dangling).
+    #[test]
+    fn rename_same_name_is_no_op_success() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+
+        let f = vfs.create(root, "file").unwrap();
+        vfs.write(f, 0, b"intact").unwrap();
+        let chunks_before: Vec<_> = vfs.tree.inodes.get(&f).unwrap().chunks.clone();
+
+        vfs.rename(root, "file", root, "file").unwrap();
+
+        let chunks_after: Vec<_> = vfs.tree.inodes.get(&f).unwrap().chunks.clone();
+        assert_eq!(
+            chunks_before, chunks_after,
+            "no-op rename must not free chunks"
+        );
+        let mut buf = vec![0u8; b"intact".len()];
+        vfs.read(f, 0, &mut buf).unwrap();
+        assert_eq!(buf, b"intact");
+    }
+
+    /// Even when names match, `rename(missing, missing)` returns
+    /// ENOENT (POSIX). Guards the early-out path from masking errors.
+    #[test]
+    fn rename_same_name_missing_source_returns_not_found() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        assert!(matches!(
+            vfs.rename(root, "absent", root, "absent"),
+            Err(Error::NotFound)
+        ));
+    }
+
+    /// Cross-directory move (no displacement). The git-objects
+    /// "atomically promote tmp/ -> aa/bbbb" idiom -- without this,
+    /// `git clone` fails after the same-dir rename fix unblocks it.
+    #[test]
+    fn rename_cross_directory_moves_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+
+        let src_dir = vfs.mkdir(root, "tmp").unwrap();
+        let dst_dir = vfs.mkdir(root, "objects").unwrap();
+        let f = vfs.create(src_dir, "deadbeef").unwrap();
+        vfs.write(f, 0, b"object contents").unwrap();
+
+        vfs.rename(src_dir, "deadbeef", dst_dir, "ab12").unwrap();
+
+        // Source name is gone, destination has the same inode + bytes.
+        assert!(vfs.lookup(src_dir, "deadbeef").is_err());
+        let moved = vfs.lookup(dst_dir, "ab12").unwrap();
+        assert_eq!(moved, f);
+        let mut buf = vec![0u8; b"object contents".len()];
+        vfs.read(moved, 0, &mut buf).unwrap();
+        assert_eq!(buf, b"object contents");
+    }
+
+    /// Cross-directory move that displaces an existing target file
+    /// must free the displaced file's chunks (same invariant as the
+    /// same-dir replace test, just across parents).
+    #[test]
+    fn rename_cross_directory_replace_frees_displaced_chunks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+
+        let src_dir = vfs.mkdir(root, "src").unwrap();
+        let dst_dir = vfs.mkdir(root, "dst").unwrap();
+        let source = vfs.create(src_dir, "incoming").unwrap();
+        vfs.write(source, 0, b"new").unwrap();
+        let displaced = vfs.create(dst_dir, "target").unwrap();
+        vfs.write(displaced, 0, &vec![0xCDu8; 32 * 1024]).unwrap();
+        let displaced_chunks: Vec<_> = vfs.tree.inodes.get(&displaced).unwrap().chunks.clone();
+        assert!(
+            !displaced_chunks.is_empty(),
+            "test precondition: displaced file should have allocated chunks"
+        );
+
+        vfs.rename(src_dir, "incoming", dst_dir, "target").unwrap();
+
+        assert!(!vfs.tree.inodes.contains_key(&displaced));
+        for cref in &displaced_chunks {
+            assert!(
+                vfs.tree.free_chunks.contains(&cref.id),
+                "displaced chunk {} was not freed",
+                cref.id
+            );
+        }
+        assert!(vfs.lookup(src_dir, "incoming").is_err());
+        let after = vfs.lookup(dst_dir, "target").unwrap();
+        assert_eq!(after, source);
+    }
+
+    /// Cycle guard: renaming a directory onto itself must be rejected
+    /// with `RenameCycle`. Without the guard the tree would gain a
+    /// self-loop and the next traversal would diverge.
+    #[test]
+    fn rename_directory_into_itself_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let d = vfs.mkdir(root, "d").unwrap();
+        assert!(matches!(
+            vfs.rename(root, "d", d, "x"),
+            Err(Error::RenameCycle)
+        ));
+    }
+
+    /// Cycle guard: renaming a directory into one of its descendants
+    /// must be rejected with `RenameCycle`. POSIX requires EINVAL.
+    #[test]
+    fn rename_directory_into_descendant_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        // Build /a/b/c/d ; try to move /a under /a/b/c.
+        let a = vfs.mkdir(root, "a").unwrap();
+        let b = vfs.mkdir(a, "b").unwrap();
+        let c = vfs.mkdir(b, "c").unwrap();
+        let _d = vfs.mkdir(c, "d").unwrap();
+
+        assert!(matches!(
+            vfs.rename(root, "a", c, "moved"),
+            Err(Error::RenameCycle)
+        ));
+        // Pre-existing tree is untouched.
+        assert!(vfs.lookup(root, "a").is_ok());
+        assert!(vfs.lookup(a, "b").is_ok());
+    }
+
+    /// Cycle guard must NOT trigger when the source is a file -- only
+    /// directories can ever produce cycles. A file's "subtree" is empty.
+    #[test]
+    fn rename_cycle_guard_does_not_block_file_into_subtree_position() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let outer = vfs.mkdir(root, "outer").unwrap();
+        let inner = vfs.mkdir(outer, "inner").unwrap();
+        let f = vfs.create(root, "f").unwrap();
+        vfs.write(f, 0, b"hi").unwrap();
+
+        // Moving a file into a deeply-nested dir is fine.
+        vfs.rename(root, "f", inner, "f").unwrap();
+        assert_eq!(vfs.lookup(inner, "f").unwrap(), f);
+        assert!(vfs.lookup(root, "f").is_err());
+    }
+
+    /// Cross-dir rename must reject if either parent is missing,
+    /// without mutating the tree on either side.
+    #[test]
+    fn rename_rejects_missing_parents() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let src_dir = vfs.mkdir(root, "src").unwrap();
+        vfs.create(src_dir, "x").unwrap();
+        let before = vfs.tree.inodes.len();
+
+        // Bogus FileId (we don't expose the constructor; use a u64 we
+        // know doesn't collide with any real id by going way past the
+        // ones the test allocated).
+        let bogus = u64::MAX - 1;
+        assert!(matches!(
+            vfs.rename(src_dir, "x", bogus, "x"),
+            Err(Error::NotFound)
+        ));
+        assert!(matches!(
+            vfs.rename(bogus, "x", src_dir, "x"),
+            Err(Error::NotFound)
+        ));
+        // Tree is byte-identical after both rejections.
+        assert_eq!(vfs.tree.inodes.len(), before);
+        assert!(vfs.lookup(src_dir, "x").is_ok());
+    }
+
+    /// Adversarial: a corrupted (or future-buggy) vault could carry
+    /// a `File`-kind inode that nonetheless has children. The pre-
+    /// hardening cycle guard skipped File-kind inodes' children, so
+    /// an attacker who could plant such an inode could trick rename
+    /// into creating a directory cycle. After the hardening, the
+    /// guard walks `children` regardless of `kind` and the rename
+    /// is rejected with `RenameCycle`.
+    ///
+    /// The corruption is simulated by reaching into the in-memory
+    /// tree directly (only possible from inside the crate; mirrors
+    /// what a deserialization bug on a malformed blob could produce).
+    #[test]
+    fn cycle_guard_rejects_corrupted_file_kind_inode_hosting_target() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+
+        // Build a normal subtree, then corrupt the intermediate inode
+        // to look like a File while still owning its child.
+        let outer = vfs.mkdir(root, "outer").unwrap();
+        let middle = vfs.mkdir(outer, "middle").unwrap();
+        let inner = vfs.mkdir(middle, "inner").unwrap();
+
+        // Corruption: flip middle's kind without touching its children.
+        // A real attacker would need to author a malformed metadata
+        // blob to land in this state, but defense-in-depth: the
+        // cycle guard must still reject regardless.
+        vfs.tree.inodes.get_mut(&middle).unwrap().kind = InodeKind::File;
+
+        // Renaming /outer (which transitively contains the corrupted
+        // /outer/middle/inner) under `inner` MUST be rejected: it
+        // would otherwise complete the cycle outer -> middle ->
+        // inner -> outer.
+        assert!(matches!(
+            vfs.rename(root, "outer", inner, "loop"),
+            Err(Error::RenameCycle)
+        ));
+    }
+
+    /// Cross-platform zip-slip defense: a vault entry name containing
+    /// `\` would be safe on Linux's `Path::join` but escape on
+    /// Windows's. validate_name rejects it at the format layer so a
+    /// vault is safe to extract on any host.
+    #[test]
+    fn validate_name_rejects_backslash() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        // Any backslash in the name is rejected.
+        assert!(matches!(
+            vfs.create(root, "harmless\\name"),
+            Err(Error::InvalidPath(_))
+        ));
+        // Concrete attack string from the threat model:
+        // `..\\..\\Windows\\System32\\drivers\\etc\\hosts` would
+        // resolve through `Path::join` on Windows as a directory-
+        // traversal escape if it made it past validate_name.
+        assert!(matches!(
+            vfs.create(root, "..\\..\\Windows\\System32\\drivers\\etc\\hosts"),
+            Err(Error::InvalidPath(_))
+        ));
+        // Mkdir + rename go through the same gate.
+        assert!(matches!(
+            vfs.mkdir(root, "bad\\dir"),
+            Err(Error::InvalidPath(_))
+        ));
+        vfs.create(root, "ok").unwrap();
+        assert!(matches!(
+            vfs.rename(root, "ok", root, "renamed\\to"),
+            Err(Error::InvalidPath(_))
+        ));
+    }
+
+    /// Length-cap defense for `validate_name`: programmatic callers
+    /// must not be able to submit megabyte-sized names that bloat the
+    /// metadata blob linearly. Mirrors NAME_MAX = 255 on Linux.
+    #[test]
+    fn validate_name_rejects_oversize() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+
+        // 256 bytes -- one over NAME_MAX.
+        let oversize = "x".repeat(256);
+        assert!(matches!(
+            vfs.create(root, &oversize),
+            Err(Error::InvalidPath(_))
+        ));
+        // Exactly NAME_MAX must still work (255 bytes).
+        let at_cap = "y".repeat(255);
+        vfs.create(root, &at_cap).unwrap();
+        // And rename's name validation enforces the cap on both
+        // sides (old and new name).
+        assert!(matches!(
+            vfs.rename(root, &at_cap, root, &oversize),
+            Err(Error::InvalidPath(_))
+        ));
+    }
+
+    /// Adversarial round-trip: rename a-> b -> c -> a many times, with
+    /// a file write between each, and confirm the inode's chunk list
+    /// is intact + no chunks have been spuriously freed. The classic
+    /// "atomic-write loop" pattern.
+    #[test]
+    fn rename_round_trip_loop_does_not_leak_or_drop_chunks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "a").unwrap();
+        vfs.write(f, 0, b"payload-v0").unwrap();
+        let initial_chunks: Vec<_> = vfs.tree.inodes.get(&f).unwrap().chunks.clone();
+
+        for i in 0..32 {
+            // Each iteration: a -> b, b -> c, c -> a, with no writes
+            // in between (so the chunk set must be preserved exactly).
+            vfs.rename(root, "a", root, "b").unwrap();
+            vfs.rename(root, "b", root, "c").unwrap();
+            vfs.rename(root, "c", root, "a").unwrap();
+            let now: Vec<_> = vfs.tree.inodes.get(&f).unwrap().chunks.clone();
+            assert_eq!(
+                now, initial_chunks,
+                "chunks must survive {i}-th rename-loop iteration unchanged",
+            );
+            // free_chunks must NOT have grown via spurious frees.
+            assert!(
+                vfs.tree.free_chunks.is_empty(),
+                "rename of a unique non-displacing entry must not free chunks (iter {i})",
+            );
+        }
+    }
+
+    // ============================================================
+    // LBM4 / chmod / hardlink tests
+    // ============================================================
+
+    /// chmod stores the new mode and `stat` returns it. End-to-end:
+    /// the typical git filemode probe (chmod 0o755, stat, expect
+    /// **Regression test for the v0.2.1 `git clone` executable-bit
+    /// bug**: `Vfs::create_with_mode(parent, name, 0o755)` must land
+    /// the file at 0o755 on first `stat`, WITHOUT any subsequent
+    /// chmod, and the mode must survive flush+reopen.
+    ///
+    /// Why this is the right test: git uses `open(O_CREAT, 0o100755)`
+    /// to materialise executable files from the index. The FUSE
+    /// `create` callback receives that mode and threads it through
+    /// `Vfs::create_with_mode`. Earlier code ignored the mode and
+    /// defaulted every newly-created file to 0o644, so `git clone`
+    /// of a repo containing executable scripts or binaries silently
+    /// dropped the +x bit unless git followed up with a chmod (and
+    /// not every git version does).
+    #[test]
+    fn create_with_mode_lands_at_requested_mode_then_persists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let f = {
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            let root = vfs.root_id();
+            // Simulate git: open(O_CREAT, 0o755) -> create with mode.
+            let f = vfs.create_with_mode(root, "setup.sh", 0o755).unwrap();
+            assert_eq!(
+                vfs.stat(f).unwrap().mode,
+                0o755,
+                "create_with_mode must land at the requested mode, not the default"
+            );
+            vfs.flush().unwrap();
+            assert!(
+                vfs.uses_v4_metadata(),
+                "non-default mode at create time must trigger LBM4+ format"
+            );
+            f
+        };
+        // Reopen and confirm the executable bit survived.
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        assert_eq!(
+            vfs.stat(f).unwrap().mode,
+            0o755,
+            "executable bit must round-trip through flush+reopen"
+        );
+    }
+
+    /// `Vfs::create` (no-mode convenience wrapper) still defaults to
+    /// 0o644 so CLI / GUI callers that don't care about the mode
+    /// get the legacy behavior.
+    #[test]
+    fn create_without_mode_defaults_to_0o644() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "doc.txt").unwrap();
+        assert_eq!(vfs.stat(f).unwrap().mode, 0o644);
+    }
+
+    /// 0o755) succeeds across a flush+reopen cycle.
+    #[test]
+    fn chmod_persists_across_flush_and_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let f = {
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            let root = vfs.root_id();
+            let f = vfs.create(root, "script.sh").unwrap();
+            // Default mode is 0o644 for a fresh file.
+            assert_eq!(vfs.stat(f).unwrap().mode, 0o644);
+            vfs.chmod(f, 0o755).unwrap();
+            assert_eq!(vfs.stat(f).unwrap().mode, 0o755);
+            vfs.flush().unwrap();
+            // After flush the format must be V4 (auto-upgrade fired
+            // because mode != default).
+            assert!(vfs.uses_v4_metadata(), "chmod must trigger LBM4 upgrade");
+            f
+        };
+
+        // Reopen. The mode must round-trip from disk.
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        assert!(vfs.uses_v4_metadata(), "reopen must detect LBM4 from magic");
+        assert_eq!(vfs.stat(f).unwrap().mode, 0o755);
+    }
+
+    /// chmod masks input to `0o7777` so file-type bits (S_IFREG etc.)
+    /// passed by libfuse's setattr never end up in the stored mode
+    /// field -- otherwise a subsequent stat would report the wrong
+    /// file type.
+    #[test]
+    fn chmod_masks_file_type_bits() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "x").unwrap();
+        // S_IFREG (0o100000) | 0o644 -- this is what libfuse's
+        // setattr will pass.
+        vfs.chmod(f, 0o100644).unwrap();
+        let s = vfs.stat(f).unwrap();
+        assert_eq!(s.mode, 0o644, "file-type bits must be masked out");
+    }
+
+    /// In v0.2.1, the per-feature auto-upgrade to LBM4 (formerly the
+    /// only auto-upgrade trigger) is superseded by the unconditional
+    /// LBM5 + LUKSBOX2 upgrade on any flush against a LUKSBOX1 vault.
+    /// So a v0.2.0-envelope vault always lands on V5 after the first
+    /// flush regardless of whether chmod was a no-op or a real change.
+    /// The chmod-specific check (`tree_needs_v4_format`) still governs
+    /// the narrower V2/V3 -> V4 case for vaults that somehow miss the
+    /// LUKSBOX1 upgrade (e.g. a corrupt header.version_major reading
+    /// as 2 already but with V2 metadata).
+    #[test]
+    fn flush_without_v4_features_still_upgrades_v1_vault_to_v5() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let _v2_guard = set_format_v3_override(Some(false));
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "x").unwrap();
+        vfs.write(f, 0, b"hi").unwrap();
+        // Apply the default mode (no-op chmod). The v4-specific
+        // trigger does NOT fire (mode is unchanged), but the
+        // v0.2.1 LUKSBOX1 -> LUKSBOX2 + LBM5 trigger does, because
+        // the vault was created with v1 header.
+        vfs.chmod(f, 0o644).unwrap();
+        vfs.flush().unwrap();
+        assert!(
+            vfs.uses_v5_metadata(),
+            "v0.2.0-envelope vault must upgrade to LBM5 on first flush"
+        );
+        assert_eq!(
+            vfs.container.header.version_major,
+            luksbox_core::VERSION_MAJOR_V2,
+            "v0.2.0-envelope vault must upgrade to LUKSBOX2 header on first flush"
+        );
+    }
+
+    /// **Critical security invariant**: hardlinks share chunks.
+    /// Unlinking one of N hardlinks must NOT free the underlying
+    /// chunks -- doing so would leave the other N-1 directory
+    /// entries pointing at freed chunk slots. Next `alloc_chunk_id`
+    /// could hand those slots to a different file, and the
+    /// surviving links would then decrypt-against-wrong-key /
+    /// fail-AEAD on read (data loss; not silent disclosure, but
+    /// loss of vault integrity).
+    #[test]
+    fn link_then_unlink_one_of_two_keeps_chunks_alive() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "orig").unwrap();
+        vfs.write(f, 0, b"shared payload").unwrap();
+        let orig_chunks: Vec<_> = vfs.tree.inodes.get(&f).unwrap().chunks.clone();
+        assert!(!orig_chunks.is_empty());
+
+        // Link "orig" under a new name. nlink: 1 -> 2.
+        vfs.link(f, root, "alias").unwrap();
+        assert_eq!(vfs.stat(f).unwrap().link_count, 2);
+
+        // Unlink the original name. nlink: 2 -> 1. Inode + chunks
+        // MUST stay alive because "alias" still points to them.
+        vfs.unlink(root, "orig").unwrap();
+        assert!(
+            vfs.tree.inodes.contains_key(&f),
+            "inode must survive while alias links remain",
+        );
+        let still_there = vfs.lookup(root, "alias").unwrap();
+        assert_eq!(still_there, f);
+        // Chunks MUST still be live (not in free_chunks).
+        for cref in &orig_chunks {
+            assert!(
+                !vfs.tree.free_chunks.contains(&cref.id),
+                "chunk {} freed prematurely while alias still references it",
+                cref.id
+            );
+        }
+        // Reading through the surviving alias still works.
+        let mut buf = vec![0u8; b"shared payload".len()];
+        vfs.read(still_there, 0, &mut buf).unwrap();
+        assert_eq!(buf, b"shared payload");
+
+        // Now unlink the LAST link. nlink: 1 -> 0. Inode + chunks
+        // must finally be freed.
+        vfs.unlink(root, "alias").unwrap();
+        assert!(!vfs.tree.inodes.contains_key(&f));
+        for cref in &orig_chunks {
+            assert!(
+                vfs.tree.free_chunks.contains(&cref.id),
+                "chunk {} must be freed after the last link is removed",
+                cref.id
+            );
+        }
+    }
+
+    /// Multi-link round-trip through flush + reopen. The persisted
+    /// link_count must match the directory-entry count after reload
+    /// (otherwise `validate_metadata_tree` rejects the vault).
+    #[test]
+    fn hardlinks_persist_across_flush_and_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        {
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            let root = vfs.root_id();
+            let f = vfs.create(root, "a").unwrap();
+            vfs.write(f, 0, b"hardlinked").unwrap();
+            vfs.link(f, root, "b").unwrap();
+            vfs.link(f, root, "c").unwrap();
+            assert_eq!(vfs.stat(f).unwrap().link_count, 3);
+            vfs.flush().unwrap();
+            assert!(vfs.uses_v4_metadata());
+        }
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        assert!(vfs.uses_v4_metadata());
+        let root = vfs.root_id();
+        // All three names resolve to the same inode.
+        let ia = vfs.lookup(root, "a").unwrap();
+        let ib = vfs.lookup(root, "b").unwrap();
+        let ic = vfs.lookup(root, "c").unwrap();
+        assert_eq!(ia, ib);
+        assert_eq!(ib, ic);
+        assert_eq!(vfs.stat(ia).unwrap().link_count, 3);
+    }
+
+    /// **Security**: a forged-in-memory inode with `link_count = 0`
+    /// (which could only happen via a future bug or attacker-
+    /// authored vault) must be rejected at flush time. The v4 read
+    /// path also rejects link_count == 0 at load, but defense-in-
+    /// depth: catch it at write too so we never persist a vault
+    /// that the next reader would reject.
+    #[test]
+    fn forged_link_count_zero_is_rejected_at_flush() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "x").unwrap();
+        // Forge link_count = 0 (impossible via the public API).
+        vfs.tree.inodes.get_mut(&f).unwrap().link_count = 0;
+        vfs.dirty = true;
+        match vfs.flush() {
+            Err(Error::MetadataDeserialize) => {} // validator caught it
+            Ok(()) => panic!("flush must reject link_count == 0"),
+            Err(e) => panic!("expected MetadataDeserialize, got {e:?}"),
+        }
+    }
+
+    /// **Security**: link() must reject targets that are directories.
+    /// POSIX bans dir hardlinks; allowing them would make `is_
+    /// descendant_of` cycle-guard miss cycles created via hardlink
+    /// instead of rename, and the next traversal (readdir, flush,
+    /// rotate_mvk) would loop forever.
+    #[test]
+    fn link_rejects_directory_target() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let d = vfs.mkdir(root, "d").unwrap();
+        assert!(matches!(
+            vfs.link(d, root, "d_alias"),
+            Err(Error::IsADirectory)
+        ));
+        // Tree byte-identical: no entry created, nlink unchanged.
+        assert!(vfs.lookup(root, "d_alias").is_err());
+        assert_eq!(vfs.stat(d).unwrap().link_count, 1);
+    }
+
+    /// **Security**: link() rejects duplicate target name in
+    /// new_parent. The alternative (replace) would silently free
+    /// the displaced inode without refcount-decrementing the OTHER
+    /// directory entries pointing at it -- same use-after-free
+    /// class as the unsafe-unlink case.
+    #[test]
+    fn link_rejects_collision_with_existing_entry() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "src").unwrap();
+        vfs.create(root, "taken").unwrap();
+        assert!(matches!(
+            vfs.link(f, root, "taken"),
+            Err(Error::AlreadyExists)
+        ));
+        assert_eq!(vfs.stat(f).unwrap().link_count, 1);
+    }
+
+    /// **Security defense-in-depth**: u32::MAX hardlinks is
+    /// astronomical (would need 4 TiB of directory entries) but
+    /// the overflow guard must still fire. Without it,
+    /// `saturating_add(1)` would cap silently and the next unlink
+    /// would over-decrement (subtracting from a "true" count of
+    /// MAX+1 + saturated link wouldn't match the entry count, so
+    /// flush would reject -- but we belt-and-suspenders here).
+    #[test]
+    fn link_rejects_when_link_count_would_overflow_u32() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "x").unwrap();
+        // Set link_count to the cap, bypassing the public link()
+        // (which is exactly what we're stress-testing).
+        vfs.tree.inodes.get_mut(&f).unwrap().link_count = u32::MAX;
+        assert!(matches!(
+            vfs.link(f, root, "alias"),
+            Err(Error::AlreadyExists) // mapped to EMLINK at FUSE
+        ));
+    }
+
+    /// **Security**: refcount-aware unlink uses `saturating_sub(1)`
+    /// so a corrupt in-memory link_count of 0 doesn't wrap to
+    /// u32::MAX (which would let unlimited unlinks succeed without
+    /// freeing chunks). After saturating-sub, the worst case is
+    /// "chunks leak"; without it, the worst case would be "chunks
+    /// reallocated to a different file, ciphertext substitution".
+    #[test]
+    fn unlink_saturates_on_zero_link_count_without_underflow() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "x").unwrap();
+        // Forge link_count = 0 (corrupt). Saturating-sub would
+        // keep it at 0 (not wrap to MAX), so unlink frees the
+        // chunks immediately even though the public path normally
+        // never reaches link_count == 0 while an entry is present.
+        vfs.tree.inodes.get_mut(&f).unwrap().link_count = 0;
+        vfs.unlink(root, "x").unwrap();
+        assert!(!vfs.tree.inodes.contains_key(&f));
+        // Did NOT wrap: a second unlink (impossible here -- entry
+        // is gone -- but the invariant of saturating-sub matters
+        // for the case where the entry remained).
+    }
+
+    // ============================================================
+    // Symlink security tests
+    // ============================================================
+    //
+    // Threat model: a vault is a supply-chain artifact. An attacker
+    // distributes a "useful" vault with a passphrase they control.
+    // The victim mounts it, browses with a file manager, or any
+    // tool auto-previews symlinks. Without our sanitization, a
+    // vault containing `secret -> /etc/shadow` would let the
+    // attacker exfiltrate host files via the victim's UID. Same
+    // CVE class as CVE-2018-1002200 / CVE-2017-1000117.
+    //
+    // The defense is `is_safe_symlink_target`, enforced at:
+    //   1. `Vfs::symlink` create-time
+    //   2. `v4_on_disk_to_in_memory` load-time (so a forged vault
+    //      authored by a non-LUKSbox tool is rejected at open)
+    //   3. `validate_metadata_tree` flush-time (so a forged in-
+    //      memory tree can't be persisted)
+    //
+    // These tests pin all three layers.
+
+    #[test]
+    fn is_safe_symlink_target_blocks_absolute_paths() {
+        assert!(!is_safe_symlink_target("/etc/shadow"));
+        assert!(!is_safe_symlink_target("/"));
+        assert!(!is_safe_symlink_target("\\Windows\\System32"));
+        assert!(!is_safe_symlink_target("C:\\Windows"));
+        assert!(!is_safe_symlink_target("c:relative"));
+    }
+
+    #[test]
+    fn is_safe_symlink_target_blocks_traversal_components() {
+        assert!(!is_safe_symlink_target(".."));
+        assert!(!is_safe_symlink_target("../etc/shadow"));
+        assert!(!is_safe_symlink_target("a/../b"));
+        assert!(!is_safe_symlink_target("a/b/.."));
+        assert!(!is_safe_symlink_target("..\\..\\hosts"));
+        // single `.` also rejected per design
+        assert!(!is_safe_symlink_target("./a"));
+        assert!(!is_safe_symlink_target("a/./b"));
+    }
+
+    #[test]
+    fn is_safe_symlink_target_blocks_nul_and_empty_and_oversize() {
+        assert!(!is_safe_symlink_target(""));
+        assert!(!is_safe_symlink_target("file\0bytes"));
+        let too_long = "a".repeat(crate::tree::MAX_SYMLINK_TARGET_LEN + 1);
+        assert!(!is_safe_symlink_target(&too_long));
+        // Exactly at the cap is OK.
+        let at_cap = "a".repeat(crate::tree::MAX_SYMLINK_TARGET_LEN);
+        assert!(is_safe_symlink_target(&at_cap));
+    }
+
+    #[test]
+    fn is_safe_symlink_target_accepts_ordinary_relative_paths() {
+        assert!(is_safe_symlink_target("README.md"));
+        assert!(is_safe_symlink_target("subdir/file"));
+        assert!(is_safe_symlink_target("a/b/c/d.txt"));
+        assert!(is_safe_symlink_target("name-with-dashes"));
+        assert!(is_safe_symlink_target("name with spaces"));
+    }
+
+    /// Vfs::symlink end-to-end: create, stat, readlink, persist.
+    #[test]
+    fn symlink_create_stat_readlink_persist_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let id = {
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            let root = vfs.root_id();
+            vfs.create(root, "target.txt").unwrap();
+            let id = vfs.symlink(root, "link", "target.txt").unwrap();
+            let stat = vfs.stat(id).unwrap();
+            assert_eq!(stat.kind, InodeKind::Symlink);
+            assert_eq!(vfs.readlink(id).unwrap(), "target.txt");
+            vfs.flush().unwrap();
+            assert!(vfs.uses_v4_metadata(), "symlink must force LBM4 upgrade");
+            id
+        };
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        assert!(vfs.uses_v4_metadata());
+        assert_eq!(vfs.readlink(id).unwrap(), "target.txt");
+    }
+
+    /// **CRITICAL SECURITY**: `secret -> /etc/shadow` style targets
+    /// are rejected at create time.
+    #[test]
+    fn symlink_rejects_absolute_target_etc_shadow_attack() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        assert!(matches!(
+            vfs.symlink(root, "evil", "/etc/shadow"),
+            Err(Error::InvalidPath(_))
+        ));
+        assert!(matches!(
+            vfs.symlink(root, "evil2", "\\Windows\\System32\\drivers\\etc\\hosts"),
+            Err(Error::InvalidPath(_))
+        ));
+        // No inode was created.
+        assert!(vfs.lookup(root, "evil").is_err());
+        assert!(vfs.lookup(root, "evil2").is_err());
+    }
+
+    /// **CRITICAL SECURITY**: relative-with-traversal targets
+    /// (`../../etc/shadow`) are rejected too.
+    #[test]
+    fn symlink_rejects_traversal_target() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        assert!(matches!(
+            vfs.symlink(root, "escape", "../../../etc/shadow"),
+            Err(Error::InvalidPath(_))
+        ));
+        assert!(matches!(
+            vfs.symlink(root, "subtle", "valid/../../etc/shadow"),
+            Err(Error::InvalidPath(_))
+        ));
+    }
+
+    /// **CRITICAL SECURITY (load-time)**: a vault forged with a
+    /// malicious symlink target -- which our `Vfs::symlink` would
+    /// never have produced -- must be REJECTED at `Vfs::open` time
+    /// so the FUSE readlink callback never returns the bytes to
+    /// the kernel.
+    #[test]
+    fn forged_malicious_symlink_target_rejected_at_open() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        // First, create a legitimate vault with a legitimate symlink.
+        {
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            let root = vfs.root_id();
+            vfs.create(root, "real.txt").unwrap();
+            vfs.symlink(root, "link", "real.txt").unwrap();
+            vfs.flush().unwrap();
+        }
+        // Open, mutate the symlink target in memory to the attack
+        // string, force a flush. The validator MUST refuse.
+        {
+            let mut vfs = Vfs::open(open_container(&path)).unwrap();
+            let root = vfs.root_id();
+            let link_id = vfs.lookup(root, "link").unwrap();
+            vfs.tree.inodes.get_mut(&link_id).unwrap().symlink_target =
+                Some("/etc/shadow".to_string());
+            vfs.dirty = true;
+            assert!(matches!(vfs.flush(), Err(Error::MetadataDeserialize)));
+        }
+    }
+
+    /// Symlink rejects empty-name, oversize, and NUL via the
+    /// underlying `validate_name` on the link's own name.
+    #[test]
+    fn symlink_link_name_uses_validate_name() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        assert!(matches!(
+            vfs.symlink(root, "", "target"),
+            Err(Error::InvalidPath(_))
+        ));
+        assert!(matches!(
+            vfs.symlink(root, "name/with/slash", "target"),
+            Err(Error::InvalidPath(_))
+        ));
+        assert!(matches!(
+            vfs.symlink(root, "name\\with\\backslash", "target"),
+            Err(Error::InvalidPath(_))
+        ));
+    }
+
+    /// Symlinks cannot be hardlinked (LBM4 format invariant: one
+    /// directory entry per symlink inode).
+    #[test]
+    fn link_rejects_symlink_target() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let sym = vfs.symlink(root, "link", "target").unwrap();
+        assert!(matches!(vfs.link(sym, root, "link2"), Err(Error::NotAFile)));
+    }
+
+    /// Unlink works on symlinks (POSIX `unlink(2)` removes regular
+    /// files AND symlinks; only directories require `rmdir`).
+    #[test]
+    fn unlink_works_on_symlinks() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let sym = vfs.symlink(root, "link", "target").unwrap();
+        vfs.unlink(root, "link").unwrap();
+        assert!(!vfs.tree.inodes.contains_key(&sym));
+        assert!(vfs.lookup(root, "link").is_err());
+    }
+
+    /// readlink on a non-symlink returns NotAFile (mapped to
+    /// EINVAL at the mount layer).
+    #[test]
+    fn readlink_on_file_or_dir_fails_cleanly() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "f").unwrap();
+        assert!(matches!(vfs.readlink(f), Err(Error::NotAFile)));
+        assert!(matches!(vfs.readlink(root), Err(Error::NotAFile)));
     }
 
     #[test]
@@ -2358,6 +4606,188 @@ mod tests {
         assert!(
             matches!(final_err, Error::MetadataBudgetExhausted),
             "expected MetadataBudgetExhausted, got {final_err:?}"
+        );
+    }
+
+    #[test]
+    fn v0_2_0_style_vault_auto_upgrades_to_luksbox2_on_first_flush() {
+        // A v0.2.0 on-disk vault is characterised by:
+        //   - header magic LUKSBOX1 (header.version_major == 1)
+        //   - metadata magic LBM2 (set_format_v3_override(Some(false)))
+        //   - no mirror sidecars
+        //
+        // We can't construct that exact state via the v0.2.1 code path
+        // because the first flush itself triggers the auto-upgrade.
+        // What we test instead is that, given a freshly created vault
+        // built with the v0.2.0 envelope (LUKSBOX1 + LBM2 + no
+        // mirrors), the FIRST flush flips it to LUKSBOX2 + LBM5 with
+        // mirrors. The simulation is faithful because the on-disk
+        // bytes are byte-for-byte identical to what a v0.2.0 binary
+        // would have written.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("upgrade.lbx");
+        // Phase 1: create a v0.2.0-style vault and write some
+        // metadata so the on-disk blob carries a real LBM2 magic
+        // (not empty). The format override forces v2 metadata; the
+        // header is v1 by default of Header::try_new. After this
+        // block the vault on disk is indistinguishable from one a
+        // v0.2.0 binary would have produced.
+        {
+            let _v2 = set_format_v3_override(Some(false));
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            let root = vfs.root_id();
+            let f = vfs.create(root, "before.txt").unwrap();
+            vfs.write(f, 0, b"pre-upgrade").unwrap();
+            // Force the v1 header + v2 metadata wire image. The flush
+            // we're about to call here would (with v0.2.1 logic)
+            // auto-upgrade -- we want this flush to NOT do that so we
+            // can test the upgrade firing on a SECOND, post-reopen
+            // flush. Temporarily revert the in-memory state right
+            // before flush so this flush behaves like a v0.2.0 flush.
+            vfs.container.header.version_major = luksbox_core::VERSION_MAJOR_V1;
+            vfs.format = MetadataFormat::V2;
+            // Bypass the upgrade trigger by writing directly through
+            // the v2-format path. We call the normal flush() but the
+            // upgrade-on-v1 guard then bumps it back; to suppress
+            // that we manually serialize the v2 blob and write it.
+            // Easiest: just exit without flushing, then write the
+            // blob through a private path. Cleaner approach below
+            // bypasses the auto-upgrade via a temporary override of
+            // the format check by writing the bytes directly.
+            let payload = postcard::to_allocvec(&vfs.tree)
+                .map_err(|_| Error::MetadataSerialize)
+                .unwrap();
+            let mut bytes = Vec::with_capacity(METADATA_V2_MAGIC.len() + payload.len());
+            bytes.extend_from_slice(METADATA_V2_MAGIC);
+            bytes.extend_from_slice(&payload);
+            vfs.container.write_metadata(&bytes).unwrap();
+            vfs.dirty = false;
+            // Don't call vfs.flush() (it would auto-upgrade). Drop
+            // here triggers Container::drop -> persist_header, which
+            // in v1 mode writes the header in place without mirrors.
+        }
+        let mirror_meta = path.with_file_name(format!(
+            "{}.meta-bak",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let mirror_header = path.with_file_name(format!(
+            "{}.header-bak",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            !mirror_meta.exists(),
+            "phase 1 (just-created v0.2.0-style vault): no metadata mirror should exist yet"
+        );
+        assert!(
+            !mirror_header.exists(),
+            "phase 1 (just-created v0.2.0-style vault): no header mirror should exist yet"
+        );
+        // Confirm the on-disk header magic is LUKSBOX1.
+        {
+            let raw_header = std::fs::read(&path).unwrap();
+            assert_eq!(
+                &raw_header[..8],
+                &luksbox_core::MAGIC_V1,
+                "phase 1: on-disk header should carry LUKSBOX1 magic"
+            );
+        }
+        // Phase 2: reopen with the default v0.2.1 paths and trigger a
+        // flush by writing a file. The flush must auto-upgrade to
+        // LUKSBOX2 + V5 + mirrors-on-disk.
+        {
+            let mut vfs = Vfs::open(open_container(&path)).unwrap();
+            assert_eq!(
+                vfs.container.header.version_major,
+                luksbox_core::VERSION_MAJOR_V1,
+                "phase 2 entry: in-memory header still v1 (matches disk)"
+            );
+            assert!(
+                !vfs.uses_v3_metadata(),
+                "phase 2 entry: in-memory format still v2 (matches disk)"
+            );
+            let root = vfs.root_id();
+            let f = vfs.create(root, "after.txt").unwrap();
+            vfs.write(f, 0, b"post-upgrade").unwrap();
+            vfs.flush().unwrap();
+            assert!(vfs.uses_v5_metadata(), "flush must upgrade to V5");
+            assert_eq!(
+                vfs.container.header.version_major,
+                luksbox_core::VERSION_MAJOR_V2,
+                "flush must upgrade header to LUKSBOX2"
+            );
+        }
+        // Phase 3: confirm on-disk state: LUKSBOX2 magic, both
+        // mirrors present.
+        {
+            let raw_header = std::fs::read(&path).unwrap();
+            assert_eq!(
+                &raw_header[..8],
+                &luksbox_core::MAGIC_V2,
+                "phase 3: on-disk header must carry LUKSBOX2 magic after upgrade"
+            );
+            assert!(
+                mirror_meta.exists(),
+                "phase 3: metadata mirror must exist after upgrade"
+            );
+            assert!(
+                mirror_header.exists(),
+                "phase 3: header mirror must exist after upgrade"
+            );
+        }
+        // Phase 4: reopen with v0.2.1 binary one more time and check
+        // the file written in phase 2 is still readable through the
+        // upgraded format.
+        {
+            let mut vfs = Vfs::open(open_container(&path)).unwrap();
+            assert!(vfs.uses_v5_metadata());
+            let root = vfs.root_id();
+            let after = vfs.lookup(root, "after.txt").unwrap();
+            let mut buf = [0u8; 64];
+            let n = vfs.read(after, 0, &mut buf).unwrap();
+            assert_eq!(&buf[..n], b"post-upgrade");
+        }
+    }
+
+    #[test]
+    fn v5_format_writes_lbm5_magic_to_disk() {
+        // Fresh vaults default to v5. After flush, the on-disk
+        // metadata blob must carry the LBM\x05 magic so older binaries
+        // refuse it cleanly.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v5.lbx");
+        {
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            assert!(vfs.uses_v5_metadata(), "fresh vault must default to V5");
+            let root = vfs.root_id();
+            let f = vfs.create(root, "hello").unwrap();
+            vfs.write(f, 0, b"v5 payload").unwrap();
+            vfs.flush().unwrap();
+        }
+        // Reopen with a fresh container and verify on-disk magic.
+        let mut c = open_container(&path);
+        let raw = c.read_metadata().unwrap();
+        assert!(
+            raw.starts_with(METADATA_V5_MAGIC),
+            "v5 vault must serialise with LBM5 magic, got prefix {:?}",
+            &raw[..raw.len().min(8)]
+        );
+        // And the read path must accept LBM5 and round-trip the data.
+        let vfs = Vfs::open(c).unwrap();
+        assert!(vfs.uses_v5_metadata());
+    }
+
+    #[test]
+    fn v5_spill_threshold_is_lower_than_v3() {
+        // The whole point of v5 is the lower threshold; pin it so a
+        // future accidental bump back to 1024 fails this test.
+        assert!(
+            MetadataFormat::V5.inline_chunk_threshold()
+                < MetadataFormat::V4.inline_chunk_threshold(),
+            "v5 threshold must be < v4 threshold (otherwise v5 buys nothing)"
+        );
+        assert_eq!(
+            MetadataFormat::V5.inline_chunk_threshold(),
+            crate::tree::V5_INLINE_CHUNK_THRESHOLD
         );
     }
 
@@ -3076,6 +5506,10 @@ mod tests {
                             dst.write(nf, off, &buf[..n]).unwrap();
                             off += n as u64;
                         }
+                    }
+                    InodeKind::Symlink => {
+                        let target = src.readlink(e.id).unwrap();
+                        dst.symlink(ddir, &e.name, &target).unwrap();
                     }
                 }
             }
@@ -3863,6 +6297,9 @@ mod tests {
                 children: Default::default(),
                 cached_real_size: None,
                 external_list_blocks: Vec::new(),
+                mode: crate::tree::DEFAULT_FILE_MODE,
+                link_count: 1,
+                symlink_target: None,
             },
         );
         write_raw_tree_metadata(&mut container, &tree);

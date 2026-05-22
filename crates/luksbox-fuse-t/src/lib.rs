@@ -182,6 +182,7 @@ pub struct FileAttr {
 // keeps the math consistent across platforms.
 pub const S_IFDIR: u32 = libc::S_IFDIR as u32;
 pub const S_IFREG: u32 = libc::S_IFREG as u32;
+pub const S_IFLNK: u32 = libc::S_IFLNK as u32;
 
 /// One entry as fed into the readdir callback's filler function.
 #[derive(Debug)]
@@ -249,6 +250,45 @@ pub trait Filesystem: Send + Sync {
     }
 
     fn truncate(&self, path: &Path, size: u64) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// POSIX `chmod(2)`. The full mode word (including file-type
+    /// bits like `S_IFREG`) is passed; adapters should mask to
+    /// `0o7777` before storing if they only persist permission bits.
+    /// Default ENOSYS keeps backward compat for adapters that
+    /// haven't opted in (libfuse maps ENOSYS to "operation not
+    /// supported" and most callers like git fall back gracefully).
+    fn chmod(&self, path: &Path, mode: u32) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// POSIX `link(2)`. Create a new directory entry at `to`
+    /// pointing at the inode currently named by `from`. Both paths
+    /// are vault-internal POSIX paths. Default ENOSYS so adapters
+    /// without hardlink support keep their pre-existing behavior;
+    /// callers that get ENOSYS typically fall back to copy.
+    fn link(&self, from: &Path, to: &Path) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// POSIX `symlink(2)`. Create a symlink at `linkpath` whose
+    /// stored target is `target`. **Adapters MUST sanitize `target`**
+    /// before storing -- an unvalidated absolute target (e.g.
+    /// `/etc/shadow`) or a relative target that escapes the vault
+    /// (e.g. `../../../etc/shadow`) creates a supply-chain CVE
+    /// (CVE-2018-1002200 class). LUKSbox's adapter resolves symlinks
+    /// inside the vault namespace only; see `crates/luksbox-vfs/
+    /// src/vfs.rs::Vfs::symlink` for the validation rules.
+    fn symlink(&self, target: &Path, linkpath: &Path) -> Result<(), Errno> {
+        Err(Errno::ENOSYS)
+    }
+
+    /// POSIX `readlink(2)`. Returns the bytes of the symlink target
+    /// stored at `path`. `buf` is the kernel-provided destination;
+    /// the impl must copy at most `buf.len()` bytes and return the
+    /// number copied (the kernel uses this as the symlink length).
+    fn readlink(&self, path: &Path, buf: &mut [u8]) -> Result<usize, Errno> {
         Err(Errno::ENOSYS)
     }
 

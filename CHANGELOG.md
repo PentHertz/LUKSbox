@@ -16,9 +16,204 @@ canonical record.
 
 ## [Unreleased]
 
-Slot-policy revisit for the multi-factor combos. Existing v0.1.1
-vaults open unchanged; the behavior change is entirely at create
-time.
+## [v0.2.1] - 2026-05-22
+
+Slot-policy revisit for the multi-factor combos plus the v0.2.1
+durability fix (LBM5 + LUKSBOX2 sidecar mirrors, raised metadata
+cap, capacity notification, tested-boundary advisory). Existing
+v0.1.1 vaults open unchanged; the behavior change is entirely at
+create time for the slot-policy work, and auto-upgrades on first
+flush for the durability envelope.
+
+### Durability fix: crash-safe header + metadata writes (LBM5 / LUKSBOX2)
+
+Fixes a real-user data-loss bug reported on v0.2.0: a vault that hit
+ENOSPC mid-copy at ~13 GB with ~5000 small files became permanently
+unopenable after force-quit (`blob deserialization failed` on unlock).
+The two underlying causes were:
+
+1. The metadata region cap was 16 MiB; serializing the directory
+   tree for a multi-thousand-file vault overflowed it and surfaced
+   as `MetadataBudgetExhausted` -> ENOSPC.
+2. Both the 8 KiB header (with all keyslots) and the metadata blob
+   were written in place with a plain seek+write. A crash mid-write
+   destroyed the only copy. A separate failure mode produced
+   "no keyslot accepted the provided unlock material" when the
+   header was the corrupt region rather than the metadata.
+
+The fix adds A/B durability for both critical regions plus a higher
+metadata cap, all cross-platform (Linux, macOS, Windows):
+
+- **`MAX_METADATA_SIZE` raised 16 MiB -> 64 MiB** with
+  `DEFAULT_METADATA_REGION_SIZE` to match. New vaults reach ~40+ GiB
+  of stored content before any metadata pressure.
+- **LBM5 metadata format** lowers the inline chunk-ref spill
+  threshold from 1024 to 256 chunks per inode, so encoded trees
+  stay compact even for very large vaults. On-disk shape is
+  byte-identical to LBM4; only the magic + write-side threshold
+  differ.
+- **LUKSBOX2 header magic** carries two new HMAC-authenticated
+  flag bits (`FLAG_HAS_HEADER_MIRROR`, `FLAG_HAS_METADATA_MIRROR`)
+  that signal the presence of sidecar mirrors. Pre-LBM5 binaries
+  refuse the new magic via the version-major check, which is the
+  correct posture (they would silently miss the recovery sidecars).
+- **`<vault>.lbx.header-bak`** holds the previous-good 8 KiB header,
+  rotated via temp+rename before every live header overwrite. On
+  open, mirror recovery is gated **strictly** on the live header
+  failing to PARSE (e.g. magic byte garbled, keyslot kind byte
+  invalid, version-major / magic mismatch). Mirror recovery does
+  NOT fire when the live header parses fine but unlock rejects
+  the credential, because the mirror still carries previously-good
+  keyslots that may have been revoked since. Without this gating,
+  a user who revoked a passphrase A and persisted would find A
+  still working via the mirror. The conservative gating means
+  the narrow "live header parses, but keyslot AEAD bytes are
+  corrupted" failure mode (a partial-write subclass) is recovered
+  manually via `luksbox header-restore <vault> <vault>.lbx.header-bak
+  --no-verify` rather than automatically. Manual is correct here:
+  it makes the implicit "accept whatever credentials the mirror
+  has" choice explicit and auditable. Detached-header vaults put
+  the mirror next to the detached sidecar.
+- **`<vault>.lbx.meta-bak`** holds the previous-good encrypted
+  metadata region with the same rotate-then-overwrite protocol.
+  `read_metadata` falls back to it on AEAD verification failure
+  and marks `metadata_recovered_from_mirror` so the next `Vfs::flush`
+  forces a rewrite.
+- **Auto-upgrade on first flush**. A v0.2.0 vault (LUKSBOX1 + LBMx)
+  is bumped to LUKSBOX2 + LBM5 the first time `Vfs::flush` runs
+  against a dirty tree. The user does not need to run a migration
+  command; the rollover is one-way (pre-v0.3 binaries can no
+  longer open the vault afterwards).
+- **Cross-platform crash safety.** All sidecar rotations go through
+  `atomic_secure_write` (temp file + fsync + rename + parent dir
+  fsync), which maps to POSIX `rename(2)` on Linux/macOS and
+  `MoveFileExW(REPLACE_EXISTING)` on Windows. Directory fsync is
+  strict on POSIX, best-effort on Windows (NTFS journals the
+  rename via `MoveFileExW`, so the rename is durable on return).
+- **Disk cost.** Each v0.2.1+ vault keeps one 8 KiB header-bak plus
+  one `metadata_size`-bytes meta-bak alongside the .lbx file
+  (16 MiB for upgraded v0.2.0 vaults, 64 MiB for new vaults). For
+  the typical encrypted-backup-on-USB use case this is rounding
+  error; for tiny demo vaults, `--metadata-size` shrinks the
+  region (and therefore the mirror).
+- **Security posture preserved.** Mirrors are AEAD/HMAC-bound to
+  the same MVK as live, so a forged or attacker-substituted mirror
+  fails verification and the open path surfaces the live error.
+  The anchor sidecar's rollback check still runs against the
+  recovered header. MVK rotation
+  (`begin/commit_atomic_rotation`) explicitly **deletes** both
+  sidecar mirrors at commit time so the post-rotation vault
+  cannot fall back to OLD-MVK-encrypted keyslots; fresh mirrors
+  are written on the next live overwrite. Mirror file reads are
+  stat-then-bounded so an attacker-planted symlink to `/dev/zero`
+  cannot OOM the recovery path.
+- **Recovery is not unbounded forgiveness.** Two-level corruption
+  (both live and mirror garbled) surfaces the live error as
+  before; recovery only saves the user when at most ONE of the
+  two regions was destroyed by the crash.
+
+Migration policy: deliberately additive. Old vaults remain
+read-supported indefinitely; the upgrade triggers only on first
+flush. No `metadata_size` relocation in this release (that would
+require moving the data region, which is the dangerous part of any
+durability migration).
+
+### Metadata-budget capacity notification
+
+Vaults holding very large inode counts (hundreds of thousands of
+files) can approach the 64 MiB metadata region cap before they
+exhaust host disk space. Without a notification, the first sign
+the user would see is a hard "no space left on device" error
+mid-copy (the exact failure that motivated the durability fix).
+
+v0.2.1 emits a soft notification BEFORE the hard ENOSPC, on two
+thresholds:
+
+- **>=75% used**: informational. CLI users see a one-line
+  message on stderr; GUI users see a non-blocking toast.
+- **>=90% used**: stronger warning recommending content
+  archival or migration to a new vault with a larger
+  `--metadata-size`.
+
+Notifications fire at most once per level per session. The
+metadata budget status is exposed as `Vfs::metadata_budget_status()`
+returning a `MetadataBudgetStatus { used_bytes, budget_bytes }`
+struct with `used_pct`, `near_capacity` (>=75%), and
+`critical_capacity` (>=90%) accessors so external tooling can
+build dashboards or pre-flight checks.
+
+Deniable vaults DO NOT participate in this notification through
+the sidecar-mirror mechanism: deniable vaults deliberately opt
+out of every observable LUKSbox-shaped sidecar. They still get
+the `MetadataBudgetExhausted` -> ENOSPC backstop and the
+`Vfs::metadata_budget_status` API for in-app status display.
+
+See `docs/CRYPTO_SPEC.md` -- "Metadata budget and capacity
+notification (v0.2.1+)" for the full design and mitigation
+options once a warning fires.
+
+### Tested-boundary advisory (v0.2.1)
+
+v0.2.1 has been ground-truth validated end-to-end (real FUSE
+mount, write, force-quit, reopen, verify) up to roughly **30 GiB
+of stored content** with several thousand files. The format is
+engineered for larger vaults but usage beyond that boundary has
+not yet been explicitly tested.
+
+LUKSbox surfaces a one-shot heads-up at two moments:
+
+- At create time: `luksbox create` prints an advisory noting the
+  tested boundary so users planning very large vaults know
+  upfront.
+- At runtime: when `Vfs::flush` notices the on-disk vault size
+  has crossed 30 GiB, a one-shot eprintln (CLI) or toast (GUI)
+  asks the user to verify the vault still unlocks (the v0.2.0
+  failure mode was specifically "can't reopen after force-quit",
+  so periodic close+reopen catches that class early) and to
+  report any anomalies.
+
+The advisory is informational, not a hard limit. The boundary
+will be raised in subsequent releases as validated usage data
+accumulates. See `docs/PROJECT_OVERVIEW.md` section 5.4 for the
+user-facing guidance.
+
+Deferred:
+
+- CLI `luksbox repair` / `luksbox health` subcommands (manual
+  recovery / mirror staleness warning). Automatic recovery covers
+  the load-bearing case; tooling is convenience.
+- LUKSBOX1 -> LUKSBOX2 in-place header relocation. Not needed
+  with the additive sidecar design.
+
+### macFUSE Apple-build fix
+
+Linux-only `renameat2(2)` flag constants (`RENAME_EXCHANGE`,
+`RENAME_WHITEOUT`, `RENAME_NOREPLACE`) are exposed by the `fuser`
+crate's `RenameFlags` only under `#[cfg(target_os = "linux")]`,
+so the macFUSE build broke when the shared `fuse.rs` file
+referenced them unconditionally. The Linux rename handler now
+cfg-gates the entire flag check: on macOS / Windows the
+`renameat2` flags don't exist in the FUSE protocol and the check
+is moot. Linux behavior unchanged.
+
+### Install note: Trixie deb + plain `su root`
+
+`dpkg -i luksbox_*.deb` aborts on Debian 13 with
+`dpkg: error: 2 expected programs not found in PATH or not
+executable` (ldconfig, start-stop-daemon) when run from a shell
+where root's `PATH` lacks `/sbin`. This happens when you switch
+to root via `su root` rather than `su -` (the latter loads
+root's login PATH which includes `/sbin`). Dpkg's pre-flight
+check fails BEFORE any maintainer script runs, so we cannot fix
+it inside the package. Workarounds:
+
+- `sudo dpkg -i luksbox_*.deb` (sudo honors `secure_path` in
+  `/etc/sudoers`, which contains `/sbin`)
+- `su -` then `dpkg -i ...` (login shell loads root's PATH)
+- `export PATH="$PATH:/sbin:/usr/sbin" && dpkg -i ...` before
+  running install
+
+The `dist/install.sh` driver uses `sudo` and is not affected.
 
 ### Security audit follow-up (filesystem-boundary hardening)
 
@@ -85,6 +280,129 @@ credited via `security@penthertz.com`.
 and `luksbox-cli::tests::functional` pin the regressions, including a
 real end-to-end `panic -y --wipe-data` against a symlinked path that
 verifies the sentinel file is byte-for-byte unchanged.
+
+### v4 metadata format (NEW DEFAULT) - persistent chmod, hardlinks, symlinks
+
+A new on-disk metadata format ("v4", magic `LBM\x04`) extends v3
+with two per-inode fields, `mode: u32` (POSIX mode bits) and
+`link_count: u32` (POSIX hardlink count), and a new
+`InodeKind::Symlink` variant carrying an in-vault target string.
+v4 is the default for newly-created vaults; existing v2/v3 vaults
+stay in their original format on flush UNLESS an LBM4-only feature
+is used (a chmod to a non-default mode, a link that produces
+nlink>1, or any symlink). The auto-upgrade is one-way: once a
+vault is written as LBM4, pre-v0.3 LUKSbox binaries can no longer
+open it. The env-var opt-out (`LUKSBOX_FORMAT_V2=1`) still works
+for users who need to keep new vaults openable by older binaries
+-- they just lose the new features.
+
+What the format change enables, end-user-visible:
+
+- **Persistent `chmod`**. `chmod 0o755 script.sh` survives unmount
+  and remount; mode bits are stored in the inode rather than
+  synthesised on every stat. `git`'s `core.filemode` probe sees
+  the change take effect, so executable bits on shell scripts /
+  cmd.com binaries / etc. survive a vault checkout.
+- **POSIX hardlinks**. `ln file linkname` creates a true hardlink
+  (shared inode, both names report `nlink=2`, writing through one
+  is visible through the other). The refcount-aware `unlink`
+  decrements `link_count` instead of freeing chunks on the first
+  removal -- a file with N hardlinks survives N-1 unlinks. Last
+  unlink frees chunks the same way pre-LBM4 vaults always did.
+- **Symlinks** (with strict target sanitization, see below).
+
+### Symlink supply-chain defense
+
+LUKSbox symlinks are validated by `is_safe_symlink_target` at three
+layers (create time, vault-open / load time, and flush time). The
+function rejects:
+
+- Absolute targets (start with `/`, `\`, or a Windows drive-letter
+  prefix like `C:foo`)
+- Targets containing `..` or `.` components (anywhere, not just
+  leading)
+- NUL bytes (would silently truncate at the C-string boundary
+  when crossing the FUSE callback)
+- Targets exceeding `MAX_SYMLINK_TARGET_LEN` (PATH_MAX = 4096)
+- Empty targets
+
+This closes the `secret -> /etc/shadow` supply-chain attack class:
+an attacker who distributes a vault with a passphrase they control
+cannot embed a symlink that would, when traversed by a victim's
+file manager or `cat`, exfiltrate host files under the victim's
+UID. The kernel surfaces `EINVAL` (LUKSbox `Error::InvalidPath`)
+to user-space, so `ln -s /etc/shadow evil` inside a mounted vault
+fails the same way as creating an invalid filename. The same
+defense fires at vault open time, so a vault forged outside
+LUKSbox (e.g. via a metadata-blob edit) is refused before any
+FUSE `readlink` callback can return the malicious bytes.
+
+Ground-truth verified: `git clone https://github.com/PentHertz/LUKSbox.git`
++ `chmod +x` + `ln target alias` + `ln -s real link` all work
+inside a mounted vault, survive unmount/remount, and the four
+attack-string symlink-creation attempts (`/etc/shadow`,
+`../../../etc/shadow`, `valid/../../etc/shadow`, `C:\Windows\...`)
+all return `EINVAL` immediately.
+
+### POSIX rename(2) semantics
+
+`Vfs::rename` was missing two cases POSIX requires; both are now
+fixed. Both affected git, sqlite WAL checkpointing, and every
+editor that uses the standard "write temp + rename onto target"
+atomic-write idiom -- the symptom that surfaced this was
+`git clone` failing with "could not write config file ... File
+exists".
+
+- **Replace-on-conflict**. Rename onto an existing target now
+  replaces (POSIX requirement). The displaced inode's data chunks
+  AND v3 chunk-list blocks return to `free_chunks` (same path as
+  `unlink`), so the replace never leaks ciphertext storage.
+  Pre-fix code returned `AlreadyExists` and broke every atomic-
+  write tool. Type compatibility is enforced first: file -> dir is
+  rejected with `IsADirectory`, dir -> file with `NotADirectory`,
+  dir -> non-empty dir with `NotEmpty`.
+- **Cross-directory rename**. `Vfs::rename` now takes
+  `(old_parent, old_name, new_parent, new_name)` and moves inodes
+  between parents in a single atomic operation. A new
+  `Vfs::is_descendant_of` cycle guard refuses moves that would
+  put a directory inside its own subtree (POSIX `EINVAL`), using
+  a visited-set so the traversal terminates even on a corrupt
+  vault with pre-existing cycles. FUSE / FUSE-T / WinFsp callers
+  all now honour cross-dir rename instead of returning
+  `ENOSYS` / `STATUS_ACCESS_DENIED`.
+- **`RENAME_NOREPLACE` flag honoured** on FUSE, **`MoveFileEx`
+  `MOVEFILE_REPLACE_EXISTING=false`** honoured on WinFsp:
+  applications that explicitly want EEXIST/COLLISION still get it.
+
+### Cross-platform zip-slip defense on vault entry names
+
+`validate_name` now rejects `\` (backslash) on every host, not just
+`/`. A vault entry name like `..\..\Windows\System32\drivers\etc\hosts`
+would pass the old `/`-only check on Linux but, when the GUI's
+"extract directory" feature ran `local.join(&ent.name)` on a
+Windows host, `Path::join` would treat `\` as a separator and
+escape the destination -- the classic CVE-2018-1002200 ("zip slip")
+class. The legitimate use-case cost is "Linux files containing
+`\` in their names can't be added to a vault", which we accept as
+a security/portability win. The GUI extract path also got a
+`name_escapes_directory` defense-in-depth check that re-rejects
+anything containing `/`, `\`, `..`, or `.` before joining.
+
+`validate_name` also gained a `MAX_NAME_LEN_BYTES = 255` cap (NAME_MAX)
+to prevent programmatic callers from bloating the metadata blob
+with megabyte-sized filenames.
+
+### Cycle-guard hardening against corrupted vaults
+
+The rename cycle guard (`is_descendant_of`) now walks `children`
+regardless of inode `kind`. The well-formed invariant says "only
+Directory inodes have non-empty `children`", but if a corrupted or
+attacker-influenced vault carries a File-kind inode with non-empty
+children (an LBM4 forgery, or a future bug), skipping by kind
+would let those children hide from the cycle check -- a rename
+into one of them would then create a real directory cycle, and the
+next readdir / flush / rotate_mvk traversal would loop forever.
+Walking unconditionally is free on well-formed vaults.
 
 ### v3 metadata format (NEW DEFAULT) + bigger v2 default
 

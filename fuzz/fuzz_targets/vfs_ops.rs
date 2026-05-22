@@ -16,6 +16,14 @@
 //! cleanly or rejected with a typed `Error`. Never panic, never
 //! corrupt the in-memory tree, never leak file IDs across renames.
 //!
+//! Cross-directory `rename` is fuzzed by picking two independent
+//! parent indices from `known_ids`. The cycle-guard path is exercised
+//! whenever the fuzzer happens to pick a `new_parent` that lives
+//! inside the source's subtree -- `is_descendant_of` must walk that
+//! subtree without panicking even when the on-disk tree has been
+//! repeatedly mutated, including replace-rename of directories onto
+//! other directories.
+//!
 //! Pipeline per iteration:
 //!   1. Split fuzzer input into a small program of operations
 //!      (op-byte + variable-length name bytes).
@@ -122,7 +130,7 @@ fn run_program(vfs: &mut Vfs, mut cursor: &[u8]) {
         let name_bytes = take(&mut cursor, name_len.min(64));
         let name = String::from_utf8_lossy(name_bytes).into_owned();
 
-        match op % 8 {
+        match op % 10 {
             0 => {
                 // mkdir
                 if let Ok(id) = vfs.mkdir(parent, &name) {
@@ -148,11 +156,20 @@ fn run_program(vfs: &mut Vfs, mut cursor: &[u8]) {
                 let _ = vfs.readdir(parent);
             }
             4 => {
-                // rename: needs a SECOND name
+                // rename: pick a DIFFERENT parent for the destination
+                // so cross-dir + cycle-guard paths get exercised. The
+                // second index byte picks new_parent from `known_ids`.
+                // The fuzzer hits the cycle guard most often when
+                // new_parent happens to live under `name`'s subtree --
+                // is_descendant_of must reject those without panic.
+                let new_parent_idx = take(&mut cursor, 1).first().copied().unwrap_or(0);
+                let new_parent = *known_ids
+                    .get((new_parent_idx as usize) % known_ids.len())
+                    .unwrap_or(&root);
                 let new_len = take(&mut cursor, 1).first().copied().unwrap_or(0) as usize;
                 let new_bytes = take(&mut cursor, new_len.min(64));
                 let new_name = String::from_utf8_lossy(new_bytes).into_owned();
-                let _ = vfs.rename(parent, &name, &new_name);
+                let _ = vfs.rename(parent, &name, new_parent, &new_name);
             }
             5 => {
                 // unlink
@@ -176,6 +193,35 @@ fn run_program(vfs: &mut Vfs, mut cursor: &[u8]) {
                 // flush — exercises the postcard-encode + AEAD-encrypt
                 // + anchor write path with the current tree state.
                 let _ = vfs.flush();
+            }
+            8 => {
+                // symlink: pick a fuzzer-derived target string with
+                // a fresh length byte so we exercise the
+                // is_safe_symlink_target validator against a wide
+                // range of attacker-controlled inputs (absolute
+                // paths, `..` chains, NULs, oversize, etc.). The
+                // VFS must never panic regardless of what the fuzzer
+                // crafts here.
+                let target_len = take(&mut cursor, 1).first().copied().unwrap_or(0) as usize;
+                let target_bytes = take(&mut cursor, target_len.min(96));
+                let target = String::from_utf8_lossy(target_bytes).into_owned();
+                if let Ok(id) = vfs.symlink(parent, &name, &target) {
+                    if known_ids.len() < 64 {
+                        known_ids.push(id);
+                    }
+                }
+            }
+            9 => {
+                // chmod: arbitrary fuzzer-derived mode bits. The VFS
+                // masks to 0o7777 internally, so any input value is
+                // acceptable; the test is that it doesn't panic on
+                // the masking or persistence path.
+                let mode_bytes = take(&mut cursor, 4);
+                let mut mode = 0u32;
+                for (i, b) in mode_bytes.iter().enumerate() {
+                    mode |= (*b as u32) << (8 * i);
+                }
+                let _ = vfs.chmod(parent, mode);
             }
             _ => unreachable!(),
         }

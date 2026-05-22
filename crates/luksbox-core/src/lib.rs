@@ -18,7 +18,8 @@ pub mod secret_mem;
 pub use crate::aead::CipherSuite;
 pub use crate::error::Error;
 pub use crate::header::{
-    FLAG_HIDE_SIZE_HEADER, FLAG_PAD_FILES_POW2, HEADER_SIZE, Header, MAX_KEYSLOTS,
+    FLAG_HAS_HEADER_MIRROR, FLAG_HAS_METADATA_MIRROR, FLAG_HIDE_SIZE_HEADER, FLAG_PAD_FILES_POW2,
+    HEADER_SIZE, Header, MAGIC_V1, MAGIC_V2, MAX_KEYSLOTS, VERSION_MAJOR_V1, VERSION_MAJOR_V2,
 };
 pub use crate::kdf::{Argon2idParams, KdfId};
 pub use crate::key::{KeyEncryptionKey, MasterVolumeKey, SubKey};

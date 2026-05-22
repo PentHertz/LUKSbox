@@ -293,11 +293,19 @@ struct CreateForm {
     /// path: anyone with it can open the vault without ANY of the
     /// hardware factors.
     enable_recovery_passphrase: bool,
-    /// On-disk metadata format. v2 (`false`) keeps inline chunk lists
-    /// and works with every LUKSbox binary; v3 (`true`) moves chunk
-    /// lists out-of-line into encrypted chunk-list blocks so a single
-    /// vault can hold arbitrarily-large files. Requires LUKSbox v0.2.0+
-    /// to open. Choice is permanent for the vault.
+    /// On-disk format choice for the new vault.
+    /// `false`: v2 (legacy LBM2 + LUKSBOX1, inline chunk lists, NO
+    /// sidecar mirrors). Readable by pre-v0.3 LUKSbox binaries but
+    /// NOT crash-safe; auto-upgrades to v0.2.1 on first flush unless
+    /// `LUKSBOX_FORMAT_V2=1` is set in the environment to suppress
+    /// the upgrade.
+    /// `true` (default): v0.2.1 format (LBM5 + LUKSBOX2 header +
+    /// `<vault>.lbx.{header,meta}-bak` mirrors for crash-safety).
+    /// Requires LUKSbox v0.2.1+ to open. Choice is permanent for the
+    /// vault.
+    /// The boolean name is preserved from v0.2.x for API stability;
+    /// the field actually toggles the broader v0.2.1 envelope, not
+    /// just LBM3.
     use_v3_format: bool,
 }
 
@@ -914,6 +922,20 @@ pub struct LuksboxApp {
     listing_err: Option<String>,
     pending: Option<Pending>,
     toasts: Vec<Toast>,
+    /// Highest metadata-budget-usage percentage we've already shown
+    /// a toast for in this vault-open session. Reset to 0 every time
+    /// a different vault is opened (or the current one is locked) so
+    /// the warning fires once per level (75%, 90%) per session.
+    /// Pairs with `Vfs::metadata_budget_status` to give GUI users
+    /// the same approaching-capacity heads-up that CLI users get
+    /// via the eprintln in `Vfs::flush`.
+    metadata_warned_pct: u32,
+    /// One-shot latch for the "vault size beyond the v0.2.1
+    /// ground-truth-tested boundary (~30 GiB)" advisory toast.
+    /// Reset every time a different vault is opened (in
+    /// `lock_and_drop_vault`) so a freshly-opened oversized vault
+    /// still surfaces the heads-up exactly once per session.
+    tested_size_advisory_shown: bool,
     passgen_dialog: Option<PassgenDialog>,
     add_passphrase_modal: Option<AddPassphraseForm>,
     /// PIN typed into the "add FIDO2 keyslot" modal. Wrapped in
@@ -1161,8 +1183,8 @@ enum PickerTarget {
 }
 
 /// In-flight rename. The user picked a row; we keep the original name
-/// (so we can call `vfs.rename(parent, old, new)`) and a buffer the
-/// modal binds to.
+/// (so we can call `vfs.rename(parent, old, parent, new)` -- same-dir
+/// rename only from this entry point) and a buffer the modal binds to.
 struct RenameTarget {
     old_name: String,
     buf: String,
@@ -1267,6 +1289,8 @@ impl LuksboxApp {
             listing_err: None,
             pending: None,
             toasts: Vec::new(),
+            metadata_warned_pct: 0,
+            tested_size_advisory_shown: false,
             passgen_dialog: None,
             add_passphrase_modal: None,
             add_fido2_pin_modal: None,
@@ -1308,6 +1332,62 @@ impl LuksboxApp {
     }
     fn toast_warn(&mut self, t: impl Into<String>) {
         self.push_toast(t.into(), ToastKind::Warn);
+    }
+
+    /// Flush the open vault's tree, then surface an in-app toast if
+    /// the metadata region is approaching its 64 MiB cap (default for
+    /// v0.2.1+ vaults). The warning thresholds match the eprintln in
+    /// `Vfs::flush` (75% / 90%) so CLI and GUI users see the same
+    /// signal; the toast is the user-visible channel for people
+    /// driving the vault entirely through the GUI browser instead of
+    /// the mount or the CLI.
+    ///
+    /// State-tracked via `metadata_warned_pct` on the AppState so a
+    /// single session shows each level at most once, avoiding toast
+    /// spam on bulk operations.
+    fn flush_and_notify_capacity(&mut self) {
+        // Collect everything off `v` first so the mutable borrow on
+        // self.vault is released before any toast_warn call (which
+        // also borrows &mut self).
+        let (pct, beyond_tested) = {
+            let Some(v) = self.vault.as_mut() else {
+                return;
+            };
+            let _ = v.vfs.flush();
+            let pct = v.vfs.metadata_budget_status().used_pct();
+            let beyond_tested = v.vfs.is_beyond_tested_size();
+            (pct, beyond_tested)
+        };
+        if pct >= 90 && self.metadata_warned_pct < 90 {
+            self.metadata_warned_pct = pct;
+            self.toast_warn(format!(
+                "Vault metadata region at {pct}% capacity. \
+                 Further writes may fail. Consider archiving content \
+                 or migrating to a new vault with a larger --metadata-size."
+            ));
+        } else if pct >= 75 && self.metadata_warned_pct < 75 {
+            self.metadata_warned_pct = pct;
+            self.toast_warn(format!(
+                "Vault metadata region at {pct}% capacity. \
+                 If many more files are expected, plan a migration to a \
+                 vault created with a larger --metadata-size."
+            ));
+        }
+        // Tested-boundary advisory. v0.2.1 was ground-truth tested up
+        // to ~30 GiB; beyond that the format is expected to work but
+        // we ask users to verify unlocks + report issues. One-shot
+        // per session via the latch; resets in `lock_and_drop_vault`.
+        if !self.tested_size_advisory_shown && beyond_tested {
+            self.tested_size_advisory_shown = true;
+            self.toast_warn(
+                "This vault is beyond the v0.2.1 ground-truth-tested boundary \
+                 (~30 GiB). The format is expected to handle larger vaults but \
+                 your usage has not been explicitly tested. Please close and \
+                 reopen the vault periodically to verify it still unlocks, and \
+                 report any anomalies at https://github.com/PentHertz/LUKSbox/issues."
+                    .to_string(),
+            );
+        }
     }
     fn push_toast(&mut self, text: String, kind: ToastKind) {
         self.toasts.push(Toast {
@@ -2406,6 +2486,14 @@ impl LuksboxApp {
         self.cwd = "/".into();
         self.listing.clear();
         self.listing_err = None;
+        // Reset the budget-warning latch so a freshly-opened vault
+        // starts with a clean slate. Without this, opening a small
+        // vault after a large one would suppress the first warning
+        // because `metadata_warned_pct` still held the old vault's
+        // high-water mark.
+        self.metadata_warned_pct = 0;
+        // Same one-shot reset for the tested-boundary advisory.
+        self.tested_size_advisory_shown = false;
     }
 
     /// Entry point for any UI action that would abandon the
@@ -3788,13 +3876,17 @@ impl LuksboxApp {
                         |ui| {
                             ui.checkbox(
                                 &mut self.create.use_v3_format,
-                                "Use v3 metadata format (default; out-of-line chunk lists; no per-vault size ceiling)",
+                                "Use v0.2.1 format (default; LBM5 + LUKSBOX2 header + crash-safety mirrors)",
                             );
                             if !self.create.use_v3_format {
                                 ui.label(
                                     RichText::new(
-                                        "v2 (compat): inline chunk lists, ~10 GiB practical per-vault ceiling. \
-                                         Readable by pre-v0.2.0 LUKSbox. Choice is permanent.",
+                                        "v2 (legacy): inline chunk lists, no sidecar mirrors, \
+                                         ~10 GiB practical per-vault ceiling. Readable by pre-v0.3 \
+                                         LUKSbox binaries. NOT crash-safe: a force-quit mid-write \
+                                         can leave the vault permanently unopenable. Choice is \
+                                         permanent; auto-upgrades to v0.2.1 on first flush unless \
+                                         LUKSBOX_FORMAT_V2=1 is set in the environment.",
                                     )
                                     .color(theme::DIM)
                                     .size(11.0),
@@ -3802,8 +3894,11 @@ impl LuksboxApp {
                             } else {
                                 ui.label(
                                     RichText::new(
-                                        "v3: no per-vault size ceiling. Requires LUKSbox v0.2.0+ to open. \
-                                         Choice is permanent.",
+                                        "v0.2.1 format: 64 MiB metadata cap, lower spill threshold, \
+                                         and sidecar mirrors at <vault>.lbx.{header,meta}-bak that \
+                                         enable crash-safety recovery (the v0.2.0 'vault won't reopen \
+                                         after force-quit' class is fixed). Requires LUKSbox v0.2.1+ \
+                                         to open. Choice is permanent.",
                                     )
                                     .color(theme::DIM)
                                     .size(11.0),
@@ -5244,6 +5339,13 @@ impl LuksboxApp {
                                             do_download = Some(ent.name.clone());
                                             ui.close();
                                         }
+                                    }
+                                    InodeKind::Symlink => {
+                                        // Symlinks: no extract action
+                                        // (the target is a vault-
+                                        // internal path, not file
+                                        // bytes). Rename + delete
+                                        // still appear below.
                                     }
                                 }
                                 if ui.button("Rename...").clicked() {
@@ -8273,7 +8375,7 @@ impl LuksboxApp {
                     match v.vfs.lookup_path(&cwd) {
                         Ok(parent) => match v.vfs.mkdir(parent, &trimmed) {
                             Ok(_) => {
-                                let _ = v.vfs.flush();
+                                self.flush_and_notify_capacity();
                                 self.toast_ok(format!("created /{trimmed}"));
                                 self.refresh_listing();
                             }
@@ -8348,7 +8450,7 @@ impl LuksboxApp {
                 } else if let Some(v) = self.vault.as_mut() {
                     let cwd = self.cwd.clone();
                     match v.vfs.lookup_path(&cwd) {
-                        Ok(parent) => match v.vfs.rename(parent, &rt.old_name, &new_name) {
+                        Ok(parent) => match v.vfs.rename(parent, &rt.old_name, parent, &new_name) {
                             Ok(()) => {
                                 let _ = v.vfs.flush();
                                 self.toast_ok(format!("renamed to {new_name}"));

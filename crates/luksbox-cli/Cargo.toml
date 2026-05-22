@@ -136,12 +136,29 @@ of decrypted vaults as regular directories.\
 """
 section = "utils"
 priority = "optional"
-# Runtime dependencies. libfido2-1 + libfuse3-3 are the names on
-# Debian 12 / Ubuntu 22.04+ ; older releases may name them
-# differently and need a different artifact. libssl3 is pulled in
-# transitively by libfido2 but listed explicitly so apt can satisfy
-# it before libfido2's postinst.
-depends = "$auto, libfido2-1, libfuse3-3"
+# Runtime dependencies. `$auto` is cargo-deb's ELF-scan: it walks
+# every binary in `assets` (luksbox + luksbox-gui), reads their
+# dynamic-section NEEDED entries, and resolves each to the Debian
+# package providing that SONAME on the BUILD HOST (via dpkg-shlibs
+# / dpkg-query). That means the produced Depends line is correct
+# per-distro automatically:
+#   - jammy build (libfuse 3.10, pre-t64) ->
+#       Depends: libfido2-1, libfuse3-3, libssl3, ...
+#   - noble build (libfuse 3.14, t64) ->
+#       Depends: libfido2-1t64, libfuse3-3, libssl3t64, ...
+#   - trixie build (libfuse 3.17, t64 + libfuse3.so.4 SONAME bump) ->
+#       Depends: libfido2-1t64, libfuse3-4, libssl3t64, ...
+# Users pick the .deb matching their distro on the release page
+# (`luksbox_<ver>_jammy_amd64.deb` / `_noble_` / `_trixie_`).
+#
+# We DO NOT list specific package names alongside `$auto` (no
+# `libfido2-1` or `libfuse3-3` here). cargo-deb concatenates the
+# manual list to $auto's output without per-name dedup, so a
+# manual `libfuse3-3` on a trixie build gets ANDed with $auto's
+# `libfuse3-4` and the strict `libfuse3-3` blocks the install.
+# That was the actual bug behind "luksbox: Depends: libfuse3-3 but
+# it is not installable" on Debian 13.
+depends = "$auto"
 # `tpm-udev` is the package that ships `/etc/udev/rules.d/60-tpm.rules`
 # and creates the `tss` system group on Debian / Ubuntu. Without it,
 # /dev/tpm0 and /dev/tpmrm0 are root-only and `luksbox enroll --tpm2`
