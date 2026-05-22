@@ -185,6 +185,36 @@ Deferred:
 - LUKSBOX1 -> LUKSBOX2 in-place header relocation. Not needed
   with the additive sidecar design.
 
+### macFUSE Apple-build fix
+
+Linux-only `renameat2(2)` flag constants (`RENAME_EXCHANGE`,
+`RENAME_WHITEOUT`, `RENAME_NOREPLACE`) are exposed by the `fuser`
+crate's `RenameFlags` only under `#[cfg(target_os = "linux")]`,
+so the macFUSE build broke when the shared `fuse.rs` file
+referenced them unconditionally. The Linux rename handler now
+cfg-gates the entire flag check: on macOS / Windows the
+`renameat2` flags don't exist in the FUSE protocol and the check
+is moot. Linux behavior unchanged.
+
+### Install note: Trixie deb + plain `su root`
+
+`dpkg -i luksbox_*.deb` aborts on Debian 13 with
+`dpkg: error: 2 expected programs not found in PATH or not
+executable` (ldconfig, start-stop-daemon) when run from a shell
+where root's `PATH` lacks `/sbin`. This happens when you switch
+to root via `su root` rather than `su -` (the latter loads
+root's login PATH which includes `/sbin`). Dpkg's pre-flight
+check fails BEFORE any maintainer script runs, so we cannot fix
+it inside the package. Workarounds:
+
+- `sudo dpkg -i luksbox_*.deb` (sudo honors `secure_path` in
+  `/etc/sudoers`, which contains `/sbin`)
+- `su -` then `dpkg -i ...` (login shell loads root's PATH)
+- `export PATH="$PATH:/sbin:/usr/sbin" && dpkg -i ...` before
+  running install
+
+The `dist/install.sh` driver uses `sudo` and is not affected.
+
 ### Security audit follow-up (filesystem-boundary hardening)
 
 Round of fixes for findings on the path-handling / TOCTOU surfaces.

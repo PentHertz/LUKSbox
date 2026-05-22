@@ -807,17 +807,36 @@ impl Filesystem for LuksboxFs {
         // `RENAME_EXCHANGE` (atomic swap) and `RENAME_WHITEOUT`
         // (overlayfs internal) aren't supported. Reject up front
         // so the VFS doesn't silently treat them as plain replace.
-        let unsupported_flags =
-            fuser::RenameFlags::RENAME_EXCHANGE | fuser::RenameFlags::RENAME_WHITEOUT;
-        if flags.intersects(unsupported_flags) {
-            reply.error(Errno::EINVAL);
-            return;
-        }
-        // `RENAME_NOREPLACE`: caller explicitly wants EEXIST if the
-        // target already exists. The VFS layer's POSIX behavior is
-        // replace-on-conflict, so enforce the no-replace contract
-        // here before delegating.
-        let no_replace = flags.contains(fuser::RenameFlags::RENAME_NOREPLACE);
+        // Also handle the Linux-only `RENAME_NOREPLACE` (caller
+        // explicitly wants EEXIST if the target already exists; the
+        // VFS layer's POSIX behavior is replace-on-conflict, so
+        // enforce the no-replace contract here before delegating).
+        //
+        // These flag constants come from Linux's `renameat2(2)` and
+        // are gated to `target_os = "linux"` inside the `fuser`
+        // crate; on macOS (macFUSE builds reach this file too via
+        // the `fuse` feature) the syscall doesn't exist and the
+        // FUSE protocol never carries the bits, so the whole check
+        // is moot. cfg-gate to Linux so the macOS build doesn't
+        // reference symbols that aren't compiled in.
+        #[cfg(target_os = "linux")]
+        let no_replace = {
+            let unsupported_flags =
+                fuser::RenameFlags::RENAME_EXCHANGE | fuser::RenameFlags::RENAME_WHITEOUT;
+            if flags.intersects(unsupported_flags) {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+            flags.contains(fuser::RenameFlags::RENAME_NOREPLACE)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let no_replace = {
+            // Suppress unused-variable on non-Linux. The kernel
+            // doesn't pass any renameat2 flags to FUSE on macOS, so
+            // there is nothing to inspect.
+            let _ = flags;
+            false
+        };
         let r = match self.vfs.lock() {
             Ok(mut v) => {
                 if no_replace && v.lookup(newparent.0, newname).is_ok() {
