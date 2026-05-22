@@ -8,8 +8,8 @@ use std::path::{Path, PathBuf};
 use fs2::FileExt;
 use luksbox_core::file_util::{atomic_secure_write, secure_create_new, sync_parent_dir};
 use luksbox_core::{
-    Argon2idParams, CipherSuite, HEADER_SIZE, Header, KdfId, Keyslot, MAX_KEYSLOTS,
-    MasterVolumeKey, SlotKind, SubKey,
+    Argon2idParams, CipherSuite, FLAG_HAS_HEADER_MIRROR, FLAG_HAS_METADATA_MIRROR, HEADER_SIZE,
+    Header, KdfId, Keyslot, MAX_KEYSLOTS, MasterVolumeKey, SlotKind, SubKey,
 };
 
 /// Capture the (device, inode) tuple of an open file. This is the
@@ -24,6 +24,19 @@ use luksbox_core::{
 /// (volume_serial_number, file_index) from
 /// GetFileInformationByHandle, which std exposes via
 /// MetadataExt on a File handle (both stable since Rust 1.63).
+/// Append `".{ext}"` to a path's filename without replacing the
+/// existing extension. `Path::with_extension` would replace, which
+/// turns `vault.lbx` into `vault.meta-bak`; we want
+/// `vault.lbx.meta-bak`. Uses `OsString::push` so it works on Linux
+/// (raw bytes), macOS (UTF-8), and Windows (WTF-16 code units)
+/// without lossy conversion.
+fn append_extension(path: &Path, ext: &str) -> PathBuf {
+    let mut s = path.as_os_str().to_owned();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
+}
+
 #[cfg(unix)]
 fn inode_of(f: &File) -> std::io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
@@ -372,6 +385,13 @@ pub struct Container {
     /// fields. `None` means standard mode and the existing
     /// `header.to_bytes(&mvk)` path applies.
     deniable: Option<DeniableState>,
+    /// Set to true when `read_metadata` falls back to the
+    /// `<vault>.lbx.meta-bak` sidecar after the live region failed
+    /// AEAD verification. `Vfs::flush` uses this to force a metadata
+    /// rewrite even when the in-memory tree is otherwise clean,
+    /// re-establishing the live region from the recovered bytes so
+    /// the next crash has a current live + previous mirror again.
+    metadata_recovered_from_mirror: bool,
     // Locks are held intrinsically by `file` (and by the `File`
     // inside `header_storage` when detached). When the Container is
     // dropped, those handles are dropped, which releases their
@@ -662,6 +682,7 @@ impl Container {
             anchor_path: None,
             rotation: None,
             deniable: None,
+            metadata_recovered_from_mirror: false,
         })
     }
 
@@ -1092,6 +1113,7 @@ impl Container {
                 inner,
                 unlocked_slot_idx: slot_idx,
             }),
+            metadata_recovered_from_mirror: false,
         })
     }
 
@@ -1204,6 +1226,7 @@ impl Container {
                 inner: result.inner,
                 unlocked_slot_idx: result.matched_slot_idx,
             }),
+            metadata_recovered_from_mirror: false,
         })
     }
 
@@ -1536,6 +1559,7 @@ impl Container {
             anchor_path: None,
             rotation: None,
             deniable: None,
+            metadata_recovered_from_mirror: false,
         })
     }
 
@@ -1548,20 +1572,27 @@ impl Container {
         header_path: Option<&Path>,
         mut material: UnlockMaterial<'_>,
     ) -> Result<Self, Error> {
-        let (file, header_storage, header_bytes, header) =
-            Self::load_locked_header(path, header_path)?;
-        let mvk = try_unlock(&header, &mut material)?;
-        header.verify_hmac(&header_bytes, &mvk)?;
+        let (file, header_storage, _header_bytes, header, mvk, recovered) =
+            Self::open_locked_with_header_recovery(path, header_path, |h, b| {
+                let mvk = try_unlock(h, &mut material)?;
+                h.verify_hmac(b, &mvk)?;
+                Ok(mvk)
+            })?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
             header_storage,
             header,
             mvk,
-            header_dirty: false,
+            // If the header was recovered from a sidecar mirror, force
+            // a header flush on next clean shutdown so the live region
+            // is re-established. Avoids the next crash leaving the
+            // vault with no live header AND no recovered mirror.
+            header_dirty: recovered,
             anchor_path: None,
             rotation: None,
             deniable: None,
+            metadata_recovered_from_mirror: false,
         })
     }
 
@@ -1592,21 +1623,30 @@ impl Container {
         header_path: Option<&Path>,
         mvk: MasterVolumeKey,
     ) -> Result<Self, Error> {
-        let (file, header_storage, header_bytes, header) =
-            Self::load_locked_header(path, header_path)?;
-        // Verify HMAC FIRST. If the supplied MVK is wrong, surface a
-        // clean error instead of going on to read garbled metadata.
-        header.verify_hmac(&header_bytes, &mvk)?;
+        // The unlock+verify closure here is HMAC-only because the
+        // caller already has the MVK; we don't need to walk keyslots.
+        // We return a clone of the input MVK on success so the helper
+        // signature stays uniform with the keyslot-bearing path.
+        let mvk_for_closure = mvk.clone();
+        let (file, header_storage, _header_bytes, header, recovered_mvk, recovered) =
+            Self::open_locked_with_header_recovery(path, header_path, move |h, b| {
+                h.verify_hmac(b, &mvk_for_closure)?;
+                Ok(mvk_for_closure.clone())
+            })?;
+        // Drop the unused clone returned by the helper; we already
+        // hold the caller-supplied MVK and prefer that exact instance.
+        let _ = recovered_mvk;
         Ok(Self {
             file,
             path: path.to_path_buf(),
             header_storage,
             header,
             mvk,
-            header_dirty: false,
+            header_dirty: recovered,
             anchor_path: None,
             rotation: None,
             deniable: None,
+            metadata_recovered_from_mirror: false,
         })
     }
 
@@ -1721,6 +1761,7 @@ impl Container {
                 inner,
                 unlocked_slot_idx,
             }),
+            metadata_recovered_from_mirror: false,
         })
     }
 
@@ -1825,6 +1866,96 @@ impl Container {
         Ok((file, header_storage, header_bytes, header))
     }
 
+    /// Open + lock the vault, then attempt the caller-supplied unlock
+    /// step against the live header. If the live header fails (parse,
+    /// unlock, or HMAC verify), look for `<storage_path>.header-bak`
+    /// and retry the same unlock step against it. On mirror success,
+    /// returns the mirror-recovered (bytes, header, mvk) tuple with
+    /// `recovered = true`. On mirror failure or absence, returns the
+    /// LIVE error so the user sees the actual cause.
+    ///
+    /// Threat model:
+    /// - Mirror is AEAD-authenticated under the same MVK as live, so
+    ///   a forged mirror does not verify and gets rejected here.
+    /// - A stale-but-valid mirror would lose at most the most recent
+    ///   header rewrite, which is the same posture as recovering an
+    ///   older anchor counter (also a "previous good" semantics).
+    /// - The anchor-counter check downstream still runs against the
+    ///   recovered header so a malicious rollback past the anchor
+    ///   high-water mark still gets rejected.
+    fn open_locked_with_header_recovery<F>(
+        path: &Path,
+        header_path: Option<&Path>,
+        mut try_unlock_and_verify: F,
+    ) -> Result<
+        (
+            File,
+            HeaderStorage,
+            [u8; HEADER_SIZE],
+            Header,
+            MasterVolumeKey,
+            bool,
+        ),
+        Error,
+    >
+    where
+        F: FnMut(&Header, &[u8; HEADER_SIZE]) -> Result<MasterVolumeKey, Error>,
+    {
+        // **CRITICAL SECURITY BOUNDARY**: mirror recovery is gated
+        // strictly on the live header failing to PARSE. We do NOT
+        // recover from the mirror when the live header parses fine
+        // but the unlock step rejects the credential. The mirror
+        // holds the PREVIOUS-good keyslot table, which still
+        // contains slots the user may have REVOKED in the current
+        // live header. Falling back on unlock-failure would let a
+        // revoked credential succeed against the previous-good
+        // mirror, silently undoing every revocation the user has
+        // performed. The reviewer flagged this as a one-line
+        // auth-bypass; this gating is the fix.
+        //
+        // User-visible trade-off: the v0.2.0 "no keyslot accepted"
+        // scenario where keyslot AEAD bytes get partially overwritten
+        // by a crashed write is auto-recovered only when the
+        // corruption surfaces as a structural parse failure
+        // (e.g. a slot whose kind byte is garbage gets rejected by
+        // Keyslot::from_bytes, which propagates as a Header parse
+        // failure). For the narrow case where keyslot bytes are
+        // corrupted but Header::from_bytes still passes, the user
+        // runs `luksbox header-restore <vault> <vault>.lbx.header-bak
+        // --no-verify` manually. Manual is correct: it makes the
+        // implicit "I accept whatever credentials the mirror has"
+        // choice explicit and auditable, instead of papering over
+        // a revocation silently.
+        match Self::load_locked_header(path, header_path) {
+            Ok((file, storage, live_bytes, live_header)) => {
+                // Live header parsed cleanly. Surface unlock outcome
+                // directly. NO mirror fallback here -- that would be
+                // the revoke-bypass.
+                let mvk = try_unlock_and_verify(&live_header, &live_bytes)?;
+                Ok((file, storage, live_bytes, live_header, mvk, false))
+            }
+            Err(live_parse_err) => {
+                // Live header is structurally broken (the crashed-
+                // write signature). Open + lock the vault file fresh
+                // so we can return a useful handle, then try the
+                // mirror.
+                let (file, storage) = open_lock_no_header(path, header_path)?;
+                let mirror_path = header_mirror_path_for(path, &storage);
+                match try_unlock_via_mirror(&mirror_path, &mut try_unlock_and_verify) {
+                    Some(Ok((m_bytes, m_header, mvk))) => {
+                        eprintln!(
+                            "luksbox: live header failed to parse; \
+                             recovered from sidecar mirror at {}",
+                            mirror_path.display()
+                        );
+                        Ok((file, storage, m_bytes, m_header, mvk, true))
+                    }
+                    _ => Err(live_parse_err),
+                }
+            }
+        }
+    }
+
     /// Read and decrypt the metadata blob. Returned plaintext is
     /// `Zeroizing`, wiped from memory when the caller drops it.
     pub fn read_metadata(&mut self) -> Result<zeroize::Zeroizing<Vec<u8>>, Error> {
@@ -1833,15 +1964,102 @@ impl Container {
         self.file
             .seek(SeekFrom::Start(self.header.metadata_offset))?;
         self.file.read_exact(&mut region)?;
-        metadata::read_metadata(
+        match metadata::read_metadata(
             self.header.cipher_suite,
             &self.mvk,
             &self.header.header_salt,
             &region,
-        )
+        ) {
+            Ok(pt) => Ok(pt),
+            Err(live_err) => {
+                // Live region failed to AEAD-verify or parse. Try the
+                // sidecar mirror at `<vault>.lbx.meta-bak`. The mirror
+                // is AEAD-bound to the same MVK and header_salt, so a
+                // forged or attacker-substituted mirror fails the same
+                // way live did and we surface the live error.
+                let mirror_path = self.metadata_mirror_path();
+                if !mirror_path.exists() {
+                    return Err(live_err);
+                }
+                // Stat-first bounded read: refuse anything that isn't
+                // exactly the expected region size. Defends against an
+                // attacker-planted symlink at the mirror path pointing
+                // at /dev/zero or a multi-GB file. We never allocate
+                // more than `region_size` bytes regardless of what's
+                // at the mirror path.
+                let mirror_stat = match std::fs::metadata(&mirror_path) {
+                    Ok(s) => s,
+                    Err(_) => return Err(live_err),
+                };
+                if mirror_stat.len() != region_size as u64 {
+                    return Err(live_err);
+                }
+                let mut mirror_bytes = vec![0u8; region_size];
+                match std::fs::File::open(&mirror_path)
+                    .and_then(|mut f| f.read_exact(&mut mirror_bytes))
+                {
+                    Ok(()) => {}
+                    Err(_) => return Err(live_err),
+                }
+                match metadata::read_metadata(
+                    self.header.cipher_suite,
+                    &self.mvk,
+                    &self.header.header_salt,
+                    &mirror_bytes,
+                ) {
+                    Ok(pt) => {
+                        eprintln!(
+                            "luksbox: live metadata failed to AEAD-verify; \
+                             recovered from sidecar mirror at {}",
+                            mirror_path.display()
+                        );
+                        // Mark for re-establishment on next flush so
+                        // we don't keep relying on the mirror.
+                        self.metadata_recovered_from_mirror = true;
+                        Ok(pt)
+                    }
+                    Err(_mirror_err) => Err(live_err),
+                }
+            }
+        }
+    }
+
+    /// Whether the most recent `read_metadata` fell back to the
+    /// sidecar mirror. `Vfs::flush` reads this to know whether to force
+    /// a metadata rewrite even when the tree is otherwise clean.
+    pub fn metadata_was_recovered_from_mirror(&self) -> bool {
+        self.metadata_recovered_from_mirror
+    }
+
+    /// Clear the metadata-recovered flag. Called by `Vfs::flush` after
+    /// it successfully re-establishes the live region so subsequent
+    /// clean flushes take the fast path.
+    pub fn clear_metadata_recovered_flag(&mut self) {
+        self.metadata_recovered_from_mirror = false;
+    }
+
+    /// Mark the header dirty so the next `persist_header` (e.g. via
+    /// `Drop` or an explicit call) writes the in-memory header back to
+    /// disk. Used by `Vfs::flush` to commit the v0.3.0 LUKSBOX1 ->
+    /// LUKSBOX2 auto-upgrade.
+    pub fn mark_header_dirty(&mut self) {
+        self.header_dirty = true;
     }
 
     /// Encrypt and write the metadata blob.
+    ///
+    /// v0.3.0 crash-safety protocol: before overwriting the live region,
+    /// rotate a previous-good copy into the `<vault>.lbx.meta-bak`
+    /// sidecar via temp+rename. On the first call for a v2 vault this
+    /// also sets `FLAG_HAS_METADATA_MIRROR` so the next `persist_header`
+    /// records the mirror's presence on disk. A crash mid-write to the
+    /// live region leaves the previously-good bytes intact in the
+    /// mirror, which `read_metadata`'s recovery path will use on next
+    /// open.
+    ///
+    /// Skipped for v1 vaults (LUKSBOX1 magic), which preserve the
+    /// v0.2.0 in-place rewrite behavior until the auto-upgrade trigger
+    /// in `Vfs::flush` bumps them to v2.
     pub fn write_metadata(&mut self, plaintext: &[u8]) -> Result<(), Error> {
         let region_size = self.header.metadata_size as usize;
         if plaintext.len() + METADATA_OVERHEAD > region_size {
@@ -1855,11 +2073,100 @@ impl Container {
             plaintext,
             &mut region,
         )?;
+        // v2 vaults: rotate previous-good before overwriting live.
+        // If the mirror rotate fails we MUST NOT proceed with the live
+        // overwrite; otherwise a crash mid-live-write would destroy
+        // both copies. Propagate the error and leave live untouched.
+        if self.is_v2_format() {
+            self.rotate_metadata_mirror()?;
+        }
         self.file
             .seek(SeekFrom::Start(self.header.metadata_offset))?;
         self.file.write_all(&region)?;
-        self.file.flush()?;
+        self.file.sync_all()?;
+        sync_parent_dir(&self.path)?;
         Ok(())
+    }
+
+    /// True iff the in-memory header is v0.3.0+ format (LUKSBOX2 magic)
+    /// AND the container is NOT a deniable vault. Deniable vaults
+    /// explicitly opt out of the sidecar-mirror protocol because:
+    ///
+    ///   - **Entropy invariant**: deniability targets the property
+    ///     that the on-disk artefact set has Shannon entropy
+    ///     indistinguishable from uniform random (each byte close to
+    ///     8 bits, in practice >= 7.99 bits per byte across the
+    ///     vault file). The deniable header (DENIABLE_HEADER_SIZE =
+    ///     36864 B) is constructed so its bytes pass this test
+    ///     (verified by `dieharder` / NIST STS in the test suite).
+    ///     A visible `<vault>.lbx.{header,meta}-bak` sidecar at a
+    ///     predictable name and length next to the vault drops
+    ///     observed entropy of the artefact set well below that
+    ///     threshold (predictable filename, predictable 8 KiB /
+    ///     metadata_size length, predictable existence pattern
+    ///     after every flush). An observer counting sidecar files
+    ///     in a directory immediately identifies the vault as a
+    ///     LUKSbox deniable container -- defeating the property
+    ///     the deniable header pays a 36 KiB cost to establish.
+    ///
+    ///   - The deniable header format already has internal
+    ///     redundancy. The 36 KiB header (DENIABLE_HEADER_SIZE) carries
+    ///     each AEAD-wrapped slot at a deterministic offset; a partial
+    ///     overwrite that destroys some slot bytes is detectable
+    ///     and rejectable, and the persist path writes the cached
+    ///     36 KiB buffer wholesale rather than field-by-field.
+    ///
+    ///   - The crash-safety class the mirror protocol defends against
+    ///     (in-place overwrite of a critical region) is less acute
+    ///     for deniable vaults because the inner-header offsets are
+    ///     fixed and the persist is a single contiguous write.
+    ///
+    /// v1 (LUKSBOX1) vaults preserve the v0.2.0 in-place rewrite
+    /// behavior to avoid touching disk in any new way until the
+    /// auto-upgrade trigger fires in `Vfs::flush`.
+    fn is_v2_format(&self) -> bool {
+        self.header.version_major == luksbox_core::VERSION_MAJOR_V2 && self.deniable.is_none()
+    }
+
+    /// Rotate the metadata mirror: read the current on-disk region
+    /// bytes, write them to `<vault>.lbx.meta-bak` via temp+rename,
+    /// fsync parent dir. On first call also marks the in-memory header
+    /// flag so the next `persist_header` records the mirror's presence
+    /// on disk (purely an optimization hint; recovery walks the
+    /// conventional path regardless).
+    ///
+    /// Caller must ensure the live region is still intact (the rotation
+    /// reads from it). This is true at the top of `write_metadata`
+    /// before any write happens.
+    fn rotate_metadata_mirror(&mut self) -> Result<(), Error> {
+        let region_size = self.header.metadata_size as usize;
+        let mut prev_live = zeroize::Zeroizing::new(vec![0u8; region_size]);
+        self.file
+            .seek(SeekFrom::Start(self.header.metadata_offset))?;
+        self.file.read_exact(&mut prev_live)?;
+        let mirror_path = self.metadata_mirror_path();
+        // atomic_secure_write: 0600 temp neighbour, fsync, rename,
+        // fsync parent. If a stale `.tmp.<hex>` is left from a prior
+        // crashed write it will be cleaned up by the helper.
+        atomic_secure_write(&mirror_path, &prev_live)?;
+        if !self.header.has_metadata_mirror() {
+            self.header.flags |= FLAG_HAS_METADATA_MIRROR;
+            self.header_dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Conventional path of the metadata mirror sidecar.
+    fn metadata_mirror_path(&self) -> PathBuf {
+        append_extension(&self.path, "meta-bak")
+    }
+
+    /// Conventional path of the header mirror sidecar. For inline-header
+    /// vaults this sits next to the .lbx file. For detached-header
+    /// vaults it sits next to the sidecar.
+    fn header_mirror_path(&self) -> PathBuf {
+        let base = self.header_storage_path().to_path_buf();
+        append_extension(&base, "header-bak")
     }
 
     pub fn enroll_passphrase(
@@ -2517,12 +2824,37 @@ impl Container {
             // buffer wholesale. Detached headers are not yet
             // supported in deniable mode (constructors reject
             // header_path), so we always write to offset 0 of
-            // `self.file`.
+            // `self.file`. Deniable mode opts out of the v2 sidecar
+            // mirror protocol entirely: a visible mirror file would
+            // defeat the deniability property that the vault contains
+            // no observable LUKSbox-shaped artifacts. The deniable
+            // header itself is duplicated at multiple offsets within
+            // the 36 KiB region for its own redundancy.
             self.file.seek(SeekFrom::Start(0))?;
             self.file.write_all(&deniable.bytes[..])?;
             self.file.sync_all()?;
             self.header_dirty = false;
             return Ok(());
+        }
+        // v2 vaults: rotate previous-good header bytes into the mirror
+        // BEFORE we overwrite the live region. Same crash-safety
+        // protocol as `write_metadata`: any mid-write failure on live
+        // leaves a recoverable copy at `<storage_path>.header-bak`.
+        // If the rotate itself fails we must NOT proceed with the live
+        // overwrite; aborting preserves the live region intact.
+        //
+        // On first persist after auto-upgrade the FLAG_HAS_HEADER_MIRROR
+        // bit was already toggled in-memory by the upgrade trigger, so
+        // the bytes we're about to serialize already advertise the
+        // mirror's presence on disk to future opens.
+        if self.is_v2_format() {
+            self.rotate_header_mirror()?;
+            // Mark the flag in-memory if this is the very first time.
+            // The serialized bytes (computed below) will then carry
+            // the bit through to disk.
+            if !self.header.has_header_mirror() {
+                self.header.flags |= FLAG_HAS_HEADER_MIRROR;
+            }
         }
         let bytes = self.header.to_bytes(&self.mvk);
         match &mut self.header_storage {
@@ -2530,6 +2862,7 @@ impl Container {
                 self.file.seek(SeekFrom::Start(0))?;
                 self.file.write_all(&bytes)?;
                 self.file.sync_all()?;
+                sync_parent_dir(&self.path)?;
             }
             HeaderStorage::Detached(_, hp) => {
                 // Replace the sidecar atomically. The existing
@@ -2551,6 +2884,32 @@ impl Container {
             }
         }
         self.header_dirty = false;
+        Ok(())
+    }
+
+    /// Rotate the header mirror: read the current live HEADER_SIZE
+    /// bytes (from inline offset 0 or from the detached sidecar),
+    /// write them to `<storage_path>.header-bak` via temp+rename.
+    /// Caller must ensure the live header is still intact (we read
+    /// from it). This is true at the top of `persist_header` before
+    /// any live overwrite.
+    fn rotate_header_mirror(&mut self) -> Result<(), Error> {
+        let mut prev_live = [0u8; HEADER_SIZE];
+        match &self.header_storage {
+            HeaderStorage::Inline => {
+                self.file.seek(SeekFrom::Start(0))?;
+                self.file.read_exact(&mut prev_live)?;
+            }
+            HeaderStorage::Detached(hf, _) => {
+                // Use the existing detached handle (it's the same fd
+                // we hold the flock on); read from its start.
+                let mut hf_dup = hf.try_clone()?;
+                hf_dup.seek(SeekFrom::Start(0))?;
+                hf_dup.read_exact(&mut prev_live)?;
+            }
+        }
+        let mirror_path = self.header_mirror_path();
+        atomic_secure_write(&mirror_path, &prev_live)?;
         Ok(())
     }
 
@@ -2876,6 +3235,40 @@ impl Container {
         std::fs::rename(&state.tmp_data_path, &state.committed_data_path)?;
         sync_parent_dir(&state.committed_data_path)?;
 
+        // **CRITICAL**: drop the OLD sidecar mirrors that were
+        // written under the PRE-rotation MVK + keyslot envelopes.
+        // If we left them, a later crash mid-write on the post-
+        // rotation live region would let mirror recovery present
+        // a header whose keyslots still unwrap the OLD MVK -- which
+        // is the rolled-away credential the user just removed.
+        // Mirror cleanup at the committed path; the v2 write path
+        // will write fresh mirrors on the next live overwrite.
+        // Best-effort: the rotation itself succeeded; failure to
+        // delete a stale mirror is logged but not propagated, since
+        // the in-place-renamed live region is still authoritative.
+        let stale_meta_mirror = append_extension(&state.committed_data_path, "meta-bak");
+        let stale_header_mirror = match &self.header_storage {
+            HeaderStorage::Inline => append_extension(&state.committed_data_path, "header-bak"),
+            HeaderStorage::Detached(_, hp) => append_extension(hp, "header-bak"),
+        };
+        for stale in [&stale_meta_mirror, &stale_header_mirror] {
+            if stale.exists() {
+                if let Err(e) = std::fs::remove_file(stale) {
+                    eprintln!(
+                        "luksbox: warn: failed to remove stale post-rotation mirror at {}: {}",
+                        stale.display(),
+                        e
+                    );
+                }
+            }
+        }
+        // Also clear the FLAG_HAS_*_MIRROR bits in the in-memory
+        // header so the next persist_header / write_metadata
+        // treat this as a "first-time mirror init" and re-establish
+        // mirrors with the NEW-MVK-encrypted bytes.
+        self.header.flags &= !(FLAG_HAS_HEADER_MIRROR | FLAG_HAS_METADATA_MIRROR);
+        self.header_dirty = true;
+
         // Our open handle now points at the renamed file (same inode as
         // the new vault on POSIX). Update path so future operations refer
         // to the canonical path.
@@ -2918,6 +3311,122 @@ impl Drop for Container {
     fn drop(&mut self) {
         let _ = self.persist_header();
     }
+}
+
+/// Conventional path of the header mirror sidecar for the given vault
+/// path + storage shape. Inline vaults put it next to the .lbx file;
+/// detached vaults put it next to the header sidecar (so the mirror
+/// rides along with whichever file is the source of truth for the
+/// header bytes).
+fn header_mirror_path_for(vault: &Path, storage: &HeaderStorage) -> PathBuf {
+    let base = match storage {
+        HeaderStorage::Inline => vault.to_path_buf(),
+        HeaderStorage::Detached(_, hp) => hp.clone(),
+    };
+    append_extension(&base, "header-bak")
+}
+
+/// Try to read the header mirror at `mirror_path` and run the caller's
+/// unlock+verify closure against it. Returns:
+///   - `None` if the mirror file doesn't exist (no recovery possible).
+///   - `Some(Err(_))` if the mirror exists but is invalid or fails the
+///     unlock/verify step (forged, stale-with-wrong-MVK, corrupted).
+///   - `Some(Ok((bytes, header, mvk)))` on successful recovery.
+///
+/// On any I/O error reading the mirror (permission, etc.), returns
+/// `Some(Err(_))` so the caller can decide whether to fall back to
+/// the live error.
+fn try_unlock_via_mirror<F>(
+    mirror_path: &Path,
+    try_unlock_and_verify: &mut F,
+) -> Option<Result<([u8; HEADER_SIZE], Header, MasterVolumeKey), Error>>
+where
+    F: FnMut(&Header, &[u8; HEADER_SIZE]) -> Result<MasterVolumeKey, Error>,
+{
+    if !mirror_path.exists() {
+        return None;
+    }
+    // Defense against attacker who can write to the vault directory:
+    // a symlink at `<vault>.lbx.header-bak` to `/dev/zero` (Linux)
+    // or a multi-GB attacker-staged file would OOM us on
+    // `fs::read`. Stat first and refuse anything that isn't exactly
+    // HEADER_SIZE so we never allocate more than 8 KiB regardless
+    // of what's at the path. `metadata()` follows symlinks; we want
+    // that here so a symlink to /dev/zero (which reports size 0)
+    // would also be rejected by the != HEADER_SIZE branch.
+    let stat = match std::fs::metadata(mirror_path) {
+        Ok(s) => s,
+        Err(e) => return Some(Err(Error::Io(e))),
+    };
+    if stat.len() != HEADER_SIZE as u64 {
+        return Some(Err(Error::Crypto(luksbox_core::Error::HeaderAuthFailed)));
+    }
+    // Bounded read: open the file and pull exactly HEADER_SIZE
+    // bytes. `read_exact` against an 8 KiB buffer caps the
+    // allocation. Use OpenOptions then read_exact rather than
+    // fs::read so we don't touch attacker-controlled length fields.
+    let mut buf = [0u8; HEADER_SIZE];
+    {
+        let mut f = match std::fs::File::open(mirror_path) {
+            Ok(f) => f,
+            Err(e) => return Some(Err(Error::Io(e))),
+        };
+        if let Err(e) = f.read_exact(&mut buf) {
+            return Some(Err(Error::Io(e)));
+        }
+    }
+    let header = match Header::from_bytes(&buf) {
+        Ok(h) => h,
+        Err(e) => return Some(Err(Error::Crypto(e))),
+    };
+    let mvk = match try_unlock_and_verify(&header, &buf) {
+        Ok(m) => m,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(Ok((buf, header, mvk)))
+}
+
+/// Open + lock the vault file and (optionally) the detached header
+/// sidecar, but do NOT read or parse the header. Used by the recovery
+/// path when the live header parse failed: we still need the file
+/// handle for the rotate-back step, but we can't trust the live header
+/// to even be there.
+///
+/// Errors propagate from the same `open_rw_checked` / `lock_handles`
+/// paths as `load_locked_header`; this is the prefix of that function
+/// up to (but not including) the live read.
+fn open_lock_no_header(
+    path: &Path,
+    header_path: Option<&Path>,
+) -> Result<(File, HeaderStorage), Error> {
+    let (file, file_inode, canonical_path) = open_rw_checked(path, None)?;
+    let (header_storage, header_inode, canonical_header) = match header_path {
+        None => (HeaderStorage::Inline, None, None),
+        Some(hp) => {
+            let (hf, hf_inode, canon_hp) = open_rw_checked(hp, None)?;
+            (
+                HeaderStorage::Detached(hf, hp.to_path_buf()),
+                Some(hf_inode),
+                Some(canon_hp),
+            )
+        }
+    };
+    match (&header_storage, header_path) {
+        (HeaderStorage::Inline, _) => {
+            lock_handles(&[(&file, path)])?;
+        }
+        (HeaderStorage::Detached(hf, _), Some(hp)) => {
+            lock_handles(&[(&file, path), (hf, hp)])?;
+        }
+        (HeaderStorage::Detached(_, _), None) => {
+            unreachable!("Detached header storage requires a header_path")
+        }
+    }
+    verify_path_inode(&canonical_path, file_inode)?;
+    if let (Some(canon_hp), Some(expected)) = (canonical_header.as_ref(), header_inode) {
+        verify_path_inode(canon_hp, expected)?;
+    }
+    Ok((file, header_storage))
 }
 
 fn try_unlock(
@@ -5082,5 +5591,531 @@ mod tests {
             pt.is_empty(),
             "empty vault should have empty metadata payload"
         );
+    }
+
+    #[test]
+    fn v2_vault_write_creates_header_and_metadata_mirrors() {
+        // When the in-memory header is marked v2, both `write_metadata`
+        // and `persist_header` must rotate previous-good copies into
+        // sidecar files before overwriting the live regions, and must
+        // set the corresponding FLAG_HAS_*_MIRROR bits so subsequent
+        // opens advertise the mirrors as present.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v2.lbx");
+        {
+            let mut c = Container::create_with_passphrase(
+                &path,
+                None,
+                CipherSuite::Aes256Gcm,
+                test_params(),
+                b"v2-roundtrip",
+            )
+            .unwrap();
+            // Promote the in-memory header to v2 so the next write
+            // exercises the mirror-rotate path. Auto-upgrade (commit 5)
+            // will do this automatically from `Vfs::flush`; here we
+            // simulate it directly to isolate the write-path test.
+            c.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+            c.header_dirty = true;
+            c.write_metadata(b"first payload").unwrap();
+            c.persist_header().unwrap();
+        }
+        let mirror_meta = path.with_file_name(format!(
+            "{}.meta-bak",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let mirror_header = path.with_file_name(format!(
+            "{}.header-bak",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            mirror_meta.exists(),
+            "metadata mirror should exist after a v2 write_metadata: {}",
+            mirror_meta.display()
+        );
+        assert!(
+            mirror_header.exists(),
+            "header mirror should exist after a v2 persist_header: {}",
+            mirror_header.display()
+        );
+        // Reopen and confirm the flag bits made it to disk and the
+        // recovered tree is readable from the live region.
+        let mut c =
+            Container::open(&path, None, UnlockMaterial::Passphrase(b"v2-roundtrip")).unwrap();
+        assert_eq!(c.header.version_major, luksbox_core::VERSION_MAJOR_V2);
+        assert!(c.header.has_header_mirror());
+        assert!(c.header.has_metadata_mirror());
+        let blob = c.read_metadata().unwrap();
+        assert_eq!(&**blob, b"first payload");
+    }
+
+    #[test]
+    fn v1_vault_writes_do_not_create_mirrors() {
+        // v0.2.0-format vaults preserve the in-place rewrite behavior
+        // until an explicit upgrade trigger fires. No mirror files
+        // should appear on disk.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v1.lbx");
+        let mut c = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"v1-only",
+        )
+        .unwrap();
+        // Default `try_new` builds a v1 header; explicitly assert
+        // before testing the negative.
+        assert_eq!(c.header.version_major, luksbox_core::VERSION_MAJOR_V1);
+        c.write_metadata(b"v1 payload").unwrap();
+        c.persist_header().unwrap();
+        for ext in ["meta-bak", "header-bak"] {
+            let sidecar = path.with_file_name(format!(
+                "{}.{ext}",
+                path.file_name().unwrap().to_string_lossy()
+            ));
+            assert!(
+                !sidecar.exists(),
+                "v1 vault must not create sidecar at {}",
+                sidecar.display()
+            );
+        }
+    }
+
+    #[test]
+    fn v2_recovers_metadata_after_corrupting_live_region() {
+        // Simulates the user's "blob deserialization failed" scenario:
+        // a crash corrupted the live metadata bytes; the mirror still
+        // holds previous-good. Open should fall back to the mirror,
+        // mark `metadata_recovered_from_mirror`, and surface the
+        // previous-good payload.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("recover.lbx");
+        // Phase 1: create v2 vault, write known payload, persist.
+        {
+            let mut c = Container::create_with_passphrase(
+                &path,
+                None,
+                CipherSuite::Aes256Gcm,
+                test_params(),
+                b"recover",
+            )
+            .unwrap();
+            c.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+            c.header_dirty = true;
+            c.write_metadata(b"alpha").unwrap();
+            c.persist_header().unwrap();
+            // Second write so the mirror holds "alpha" (previous-good)
+            // and the live region holds "beta". The crash injection
+            // below targets live; the recovery path should rebuild
+            // "beta" -> no, actually the mirror holds the bytes that
+            // were live before the SECOND write, which is "alpha".
+            c.write_metadata(b"beta").unwrap();
+            c.persist_header().unwrap();
+        }
+        // Phase 2: simulate a crash mid-write to the LIVE metadata
+        // region by truncating the encrypted blob's AEAD tag area.
+        // The live region now fails AEAD verification; the mirror
+        // still holds the encrypted "alpha" blob.
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            // Read the existing header to learn metadata_offset.
+            let header = {
+                let mut hb = [0u8; HEADER_SIZE];
+                f.seek(SeekFrom::Start(0)).unwrap();
+                f.read_exact(&mut hb).unwrap();
+                Header::from_bytes(&hb).unwrap()
+            };
+            // Overwrite the first 64 bytes of the metadata region
+            // with garbage; that's well past the AEAD nonce + len
+            // prefix and far enough into the ciphertext to make AEAD
+            // verification fail without question.
+            f.seek(SeekFrom::Start(header.metadata_offset)).unwrap();
+            f.write_all(&[0xAA; 64]).unwrap();
+            f.sync_all().unwrap();
+        }
+        // Phase 3: reopen and confirm recovery returns "alpha" (the
+        // previous-good payload from the mirror), not the live garbage.
+        let mut c = Container::open(&path, None, UnlockMaterial::Passphrase(b"recover")).unwrap();
+        let blob = c.read_metadata().unwrap();
+        assert_eq!(
+            &**blob, b"alpha",
+            "must recover from mirror, not garbled live"
+        );
+        assert!(c.metadata_was_recovered_from_mirror());
+    }
+
+    #[test]
+    fn v2_recovers_header_after_corrupting_live_header() {
+        // Simulates the user's "no keyslot accepted the provided unlock
+        // material" scenario: a crash partially overwrote the live
+        // 8 KiB header, breaking keyslot AEAD or header HMAC. The
+        // header-bak sidecar still holds the previous-good header.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hdr.lbx");
+        // Phase 1: create v2 vault, two persist_headers so the mirror
+        // is established.
+        {
+            let mut c = Container::create_with_passphrase(
+                &path,
+                None,
+                CipherSuite::Aes256Gcm,
+                test_params(),
+                b"hdr-recover",
+            )
+            .unwrap();
+            c.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+            c.header_dirty = true;
+            c.persist_header().unwrap();
+            // Touch the header (re-enroll same passphrase or just
+            // re-set dirty) to trigger a second persist that rotates
+            // the previous-good copy into the mirror.
+            c.header_dirty = true;
+            c.persist_header().unwrap();
+            // Write a small metadata payload so we have something to
+            // verify reads still work after recovery.
+            c.write_metadata(b"header-recovery-payload").unwrap();
+        }
+        // Phase 2: simulate a crash mid-write to the LIVE header by
+        // scribbling over the first 4 KiB. This destroys the magic,
+        // version, AND the first 4 keyslots; unlock fails completely.
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0xCC; 4096]).unwrap();
+            f.sync_all().unwrap();
+        }
+        // Phase 3: reopen should succeed via the header mirror.
+        let mut c = Container::open(&path, None, UnlockMaterial::Passphrase(b"hdr-recover"))
+            .expect("must recover header from sidecar mirror");
+        let blob = c.read_metadata().unwrap();
+        assert_eq!(&**blob, b"header-recovery-payload");
+    }
+
+    /// **CRITICAL REGRESSION TEST**: a revoked credential must NOT
+    /// succeed against the `<vault>.lbx.header-bak` mirror that was
+    /// written before the revoke. Mirror recovery is gated strictly
+    /// on Header::from_bytes parse failure; unlock-failure on an
+    /// otherwise-parseable header must NOT fall back to the mirror,
+    /// because the mirror still carries the revoked slot.
+    ///
+    /// First reviewer-found auth-bypass in the v0.3.0 durability
+    /// fix. This test pins the gating so a future regression is
+    /// caught immediately.
+    /// **Deniability invariant**: a deniable vault must NEVER create
+    /// sidecar mirror files, even if its in-memory header gets
+    /// forced into the v2 magic by a stray code path or test setup.
+    /// Mirror sidecars at predictable names + lengths drop the
+    /// observed entropy of the on-disk artefact set below the
+    /// >=7.99 bits/byte target the deniable header pays 36 KiB to
+    /// establish, defeating the property entirely.
+    #[test]
+    fn deniable_vault_never_creates_sidecar_mirrors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("denvault.lbx");
+        let mut c = Container::create_with_passphrase_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            cheap_argon2(),
+            0,
+            b"deniable-test",
+        )
+        .unwrap();
+        // Force the in-memory header to claim v2; this is what a
+        // confused code path might do. The is_v2_format guard must
+        // still refuse the mirror write because is_deniable() is
+        // true.
+        c.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+        c.mark_header_dirty();
+        // Persist + write some metadata. Neither should produce a
+        // mirror file.
+        c.persist_header().unwrap();
+        c.write_metadata(b"deniable payload should not leak mirror")
+            .unwrap();
+        let mirror_header = path.with_file_name(format!(
+            "{}.header-bak",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let mirror_meta = path.with_file_name(format!(
+            "{}.meta-bak",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            !mirror_header.exists(),
+            "deniable vault must NEVER create a header sidecar mirror at {}: \
+             would drop entropy of on-disk artefact set below ~7.99 bits/byte \
+             and defeat deniability",
+            mirror_header.display()
+        );
+        assert!(
+            !mirror_meta.exists(),
+            "deniable vault must NEVER create a metadata sidecar mirror at {}: \
+             would drop entropy of on-disk artefact set below ~7.99 bits/byte \
+             and defeat deniability",
+            mirror_meta.display()
+        );
+    }
+
+    #[test]
+    fn v2_revoked_credential_does_not_unlock_via_mirror() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("revoke.lbx");
+        // Phase 1: create v2 vault with passphrase A in slot 0,
+        // enroll passphrase B in slot 1, persist (rotates mirror).
+        // Then revoke slot 0 and persist again (rotates again).
+        // After this, live header has B only; mirror has A and B.
+        {
+            let mut c = Container::create_with_passphrase(
+                &path,
+                None,
+                CipherSuite::Aes256Gcm,
+                test_params(),
+                b"pass-A",
+            )
+            .unwrap();
+            c.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+            c.header_dirty = true;
+            c.enroll_passphrase(b"pass-B", test_params()).unwrap();
+            c.persist_header().unwrap();
+            // Sanity: both passphrases work right now.
+            drop(c);
+            let _ = Container::open(&path, None, UnlockMaterial::Passphrase(b"pass-A")).unwrap();
+            let _ = Container::open(&path, None, UnlockMaterial::Passphrase(b"pass-B")).unwrap();
+
+            let mut c =
+                Container::open(&path, None, UnlockMaterial::Passphrase(b"pass-A")).unwrap();
+            // Slot 0 is pass-A, slot 1 is pass-B. Revoke slot 0.
+            c.header.revoke_slot(0).unwrap();
+            c.header_dirty = true;
+            c.persist_header().unwrap();
+        }
+        // Phase 2: a header-bak mirror exists and (because of the
+        // rotate-before-overwrite protocol) holds the state from
+        // the previous persist, which still had pass-A in slot 0.
+        // The mirror MUST NOT allow pass-A to unlock.
+        let mirror = path.with_file_name(format!(
+            "{}.header-bak",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(mirror.exists(), "phase 2: header mirror should exist");
+        let result = Container::open(&path, None, UnlockMaterial::Passphrase(b"pass-A"));
+        match result {
+            Ok(_) => panic!("pass-A was revoked; mirror-recovery auth-bypass regressed"),
+            Err(Error::UnlockFailed) => {}
+            Err(other) => panic!("expected UnlockFailed for revoked credential, got {other:?}"),
+        }
+        // pass-B still works against live (sanity).
+        let _ = Container::open(&path, None, UnlockMaterial::Passphrase(b"pass-B")).unwrap();
+    }
+
+    /// **CRITICAL REGRESSION TEST**: an attacker who plants a
+    /// symlink at `<vault>.lbx.header-bak` pointing at `/dev/zero`
+    /// (or any oversize file) must not OOM us via the recovery
+    /// path. We stat-then-bounded-read so the allocation is capped
+    /// at HEADER_SIZE regardless of what's at the path.
+    #[test]
+    #[cfg(unix)]
+    fn v2_recovery_refuses_oversize_mirror_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("oversize.lbx");
+        {
+            let mut c = Container::create_with_passphrase(
+                &path,
+                None,
+                CipherSuite::Aes256Gcm,
+                test_params(),
+                b"oversize",
+            )
+            .unwrap();
+            c.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+            c.header_dirty = true;
+            c.persist_header().unwrap();
+            c.header_dirty = true;
+            c.persist_header().unwrap();
+        }
+        // Corrupt live (force the recovery path to look at the
+        // mirror) and replace the mirror with a 1 MB file (way
+        // larger than HEADER_SIZE = 8 KiB).
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0u8; 4096]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let mirror = path.with_file_name(format!(
+            "{}.header-bak",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&mirror, vec![0u8; 1024 * 1024]).unwrap();
+        // Open must fail (the oversize mirror is rejected without
+        // OOM-allocating a 1 MB buffer for it).
+        assert!(
+            Container::open(&path, None, UnlockMaterial::Passphrase(b"oversize")).is_err(),
+            "oversize mirror must be rejected"
+        );
+    }
+
+    #[test]
+    fn v2_detached_header_vault_mirror_sits_next_to_sidecar() {
+        // Detached-header vaults keep the 8 KiB header in a separate
+        // sidecar file (referenced via `header_path`). The mirror
+        // protocol must rotate `<header_sidecar>.header-bak`, not
+        // `<vault>.lbx.header-bak`. Verify the path placement and
+        // that recovery works from there.
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("d.lbx");
+        let header_sidecar = dir.path().join("d.hdr");
+        {
+            let mut c = Container::create_with_passphrase(
+                &vault,
+                Some(&header_sidecar),
+                CipherSuite::Aes256Gcm,
+                test_params(),
+                b"detached",
+            )
+            .unwrap();
+            c.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+            c.header_dirty = true;
+            c.persist_header().unwrap();
+            // Second persist so the mirror has previous-good.
+            c.header_dirty = true;
+            c.persist_header().unwrap();
+        }
+        // Mirror lives next to the detached header, not the vault.
+        let mirror_next_to_sidecar = header_sidecar.with_file_name(format!(
+            "{}.header-bak",
+            header_sidecar.file_name().unwrap().to_string_lossy()
+        ));
+        let mirror_next_to_vault = vault.with_file_name(format!(
+            "{}.header-bak",
+            vault.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            mirror_next_to_sidecar.exists(),
+            "header mirror should sit next to the detached sidecar at {}",
+            mirror_next_to_sidecar.display()
+        );
+        assert!(
+            !mirror_next_to_vault.exists(),
+            "header mirror should NOT sit next to the .lbx for detached vaults"
+        );
+        // Corrupt the live sidecar and confirm recovery works.
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&header_sidecar)
+                .unwrap();
+            f.write_all(&[0xCC; 4096]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let _c = Container::open(
+            &vault,
+            Some(&header_sidecar),
+            UnlockMaterial::Passphrase(b"detached"),
+        )
+        .expect("must recover detached header from sidecar mirror");
+    }
+
+    #[test]
+    fn v2_recovery_refuses_truncated_mirror() {
+        // A mirror file shorter than HEADER_SIZE is corrupt; the
+        // recovery path must refuse it and surface the live error
+        // rather than silently zero-padding.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("trunc.lbx");
+        {
+            let mut c = Container::create_with_passphrase(
+                &path,
+                None,
+                CipherSuite::Aes256Gcm,
+                test_params(),
+                b"trunc",
+            )
+            .unwrap();
+            c.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+            c.header_dirty = true;
+            c.persist_header().unwrap();
+            c.header_dirty = true;
+            c.persist_header().unwrap();
+        }
+        // Corrupt live AND truncate mirror.
+        {
+            let mut f = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0u8; 4096]).unwrap();
+            f.sync_all().unwrap();
+        }
+        let mirror = path.with_file_name(format!(
+            "{}.header-bak",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&mirror, b"short").unwrap();
+        assert!(
+            Container::open(&path, None, UnlockMaterial::Passphrase(b"trunc")).is_err(),
+            "truncated mirror must not be accepted"
+        );
+    }
+
+    #[test]
+    fn v2_repeated_writes_rotate_mirror_to_previous_good() {
+        // After two successful write_metadata calls on a v2 vault, the
+        // mirror should hold the PREVIOUS payload (rotated just before
+        // the most recent overwrite), and the live region should hold
+        // the LATEST payload. This is the load-bearing crash-safety
+        // invariant: at any moment, the mirror reflects what the live
+        // region looked like before the in-progress overwrite started.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v2-rotate.lbx");
+        let mut c = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"rotate",
+        )
+        .unwrap();
+        c.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+        c.header_dirty = true;
+        c.write_metadata(b"first").unwrap();
+        c.persist_header().unwrap();
+        // Second write: live now holds "second", mirror should now
+        // hold "first" (the previous-good).
+        c.write_metadata(b"second").unwrap();
+        // Read the mirror by hand and verify the AEAD-decrypts to
+        // "first".
+        let mirror_path = path.with_file_name(format!(
+            "{}.meta-bak",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let mirror_bytes = std::fs::read(&mirror_path).unwrap();
+        let pt = metadata::read_metadata(
+            c.header.cipher_suite,
+            &c.mvk,
+            &c.header.header_salt,
+            &mirror_bytes,
+        )
+        .expect("mirror must AEAD-decrypt under the live MVK");
+        assert_eq!(&**pt, b"first");
+        // Live still has "second".
+        let live = c.read_metadata().unwrap();
+        assert_eq!(&**live, b"second");
     }
 }

@@ -207,6 +207,21 @@ test = false
 doc = false
 bench = false
 
+# v0.3.0 mirror-recovery security boundary fuzzer. Builds a v2 vault
+# with two passphrases A and B, revokes A, applies fuzzer-chosen
+# corruption to the live header or sidecar mirror, then tries to open
+# with both. Invariant: a revoked passphrase must NEVER unlock,
+# regardless of corruption pattern. Catches regressions of the
+# reviewer-found auth-bypass where mirror recovery fired on
+# unlock-failure (not just parse-failure) and let the mirror's
+# previous-good keyslot table authenticate the revoked credential.
+[[bin]]
+name = "v2_mirror_recovery"
+path = "fuzz_targets/v2_mirror_recovery.rs"
+test = false
+doc = false
+bench = false
+
 # Fuzz binaries should not be part of the workspace; cargo-fuzz expects to
 # build them with sanitizers and -C codegen-units=1. Excluding from the
 # workspace lets us keep workspace-wide `cargo build` fast and unsanitized.

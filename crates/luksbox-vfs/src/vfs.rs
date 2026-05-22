@@ -350,6 +350,49 @@ pub struct DirEntry {
     pub kind: InodeKind,
 }
 
+/// Snapshot of how much of the vault's metadata region is currently
+/// consumed by the encoded directory tree. The cap is configured at
+/// vault create time (default 64 MiB for v0.3.0+); used + spillover
+/// estimates approach the cap as inode count grows. CLI `info` prints
+/// this; the GUI polls it for an in-app low-capacity notification so
+/// users get an early warning before the hard `MetadataBudgetExhausted`
+/// (ENOSPC) error fires.
+#[derive(Debug, Clone, Copy)]
+pub struct MetadataBudgetStatus {
+    /// Current encoded size of the in-memory tree in bytes.
+    pub used_bytes: usize,
+    /// Hard cap. Once `used_bytes` reaches this, the next write that
+    /// would grow the tree fails with `MetadataBudgetExhausted`.
+    pub budget_bytes: usize,
+}
+
+impl MetadataBudgetStatus {
+    /// Usage as percentage 0..=100. Saturates at 100.
+    pub fn used_pct(self) -> u32 {
+        if self.budget_bytes == 0 {
+            return 0;
+        }
+        let pct = (self.used_bytes as u128 * 100 / self.budget_bytes as u128) as u32;
+        pct.min(100)
+    }
+
+    /// Soft-warning threshold: at or above 75% of capacity. The GUI
+    /// surfaces a non-blocking notification here; the CLI's `info`
+    /// flags the vault as approaching its metadata cap.
+    pub fn near_capacity(self) -> bool {
+        self.used_pct() >= 75
+    }
+
+    /// Hard-warning threshold: at or above 90% of capacity. The next
+    /// few writes are likely to start failing with
+    /// `MetadataBudgetExhausted`. The GUI surfaces a blocking
+    /// notification recommending the user archive content or
+    /// migrate to a new vault.
+    pub fn critical_capacity(self) -> bool {
+        self.used_pct() >= 90
+    }
+}
+
 /// Vault-wide tree counters. Surfaced for forensic tooling
 /// (`header dump` JSON output).
 #[derive(Debug, Clone, Copy)]
@@ -406,6 +449,20 @@ const METADATA_V3_MAGIC: &[u8; 4] = b"LBM\x03";
 /// operations -- relevant for users still distributing pre-v0.3
 /// LUKSbox binaries.
 const METADATA_V4_MAGIC: &[u8; 4] = b"LBM\x04";
+
+/// v5 metadata magic. Introduced in v0.3.0 alongside the durability
+/// fix (sidecar mirrors). Structurally identical to LBM4 on disk; the
+/// difference is operational:
+///   - the write path uses the lower `V5_INLINE_CHUNK_THRESHOLD` so
+///     large vaults stay within the 64 MiB metadata cap without
+///     spilling to MetadataBudgetExhausted;
+///   - the on-disk header carries LUKSBOX2 magic and the
+///     FLAG_HAS_*_MIRROR bits.
+///
+/// Pre-LBM5 binaries refuse to open vaults at this magic via the
+/// dispatch in `Vfs::open`, which is correct: a v0.2.0 binary would
+/// silently miss the recovery sidecars.
+const METADATA_V5_MAGIC: &[u8; 4] = b"LBM\x05";
 
 /// Environment-variable gate for the v3 (external chunk-list)
 /// metadata format. Historic naming kept (`LUKSBOX_FORMAT_V2`) so
@@ -474,18 +531,37 @@ enum MetadataFormat {
     V2,
     V3,
     V4,
+    V5,
 }
 
 impl MetadataFormat {
-    /// Format used by a freshly-created vault. Defaults to V4 so
-    /// chmod / hardlinks Just Work on new vaults. Users who need
-    /// backward compat with pre-v0.3 LUKSbox binaries can opt back
-    /// to V3 (or V2) via `LUKSBOX_FORMAT_V2=1`.
+    /// Format used by a freshly-created vault. Defaults to V5 (v0.3.0+
+    /// durability layout: lower spill threshold, paired with LUKSBOX2
+    /// header + mirror sidecars). Users who need backward compat with
+    /// pre-v0.3 LUKSbox binaries can opt back to V2 via
+    /// `LUKSBOX_FORMAT_V2=1`. There is no V3-only or V4-only opt-out
+    /// path: those formats are read-supported indefinitely but new
+    /// vaults skip straight to V5.
     fn for_fresh_vault() -> Self {
         if use_v3_for_fresh_vault() {
-            Self::V4
+            Self::V5
         } else {
             Self::V2
+        }
+    }
+
+    /// Spill threshold for this format: any inode whose inline chunk
+    /// list would exceed this count is split out into an external
+    /// chunk-list block chain. Smaller = more compact metadata blob at
+    /// the cost of one extra read per large file's first chunk-list
+    /// fetch. V5 lowers from V3/V4's 1024 to 256 to keep the encoded
+    /// tree under the 64 MiB cap for very large vaults.
+    fn inline_chunk_threshold(self) -> usize {
+        match self {
+            MetadataFormat::V2 | MetadataFormat::V3 | MetadataFormat::V4 => {
+                V3_INLINE_CHUNK_THRESHOLD
+            }
+            MetadataFormat::V5 => crate::tree::V5_INLINE_CHUNK_THRESHOLD,
         }
     }
 }
@@ -965,14 +1041,31 @@ pub struct Vfs {
     tree: DirectoryTree,
     dirty: bool,
     /// On-disk metadata format for this vault. New vaults default
-    /// to V4 (supports persistent chmod + hardlinks). Existing
-    /// V2/V3 vaults retain their format on flush UNLESS an LBM4-
-    /// only feature is used (chmod to non-default mode, link
-    /// producing nlink>1); the flush path then auto-upgrades to
-    /// V4. Downgrade is not supported -- once V4 is written, the
-    /// vault stays V4.
+    /// to V5 (v0.3.0+ shape: lower spill threshold, paired with
+    /// LUKSBOX2 header and sidecar mirrors). Existing V2/V3 vaults
+    /// retain their format on open and auto-upgrade to V5 on the
+    /// first flush against a dirty tree. Downgrade is not supported.
     format: MetadataFormat,
+    /// Highest metadata-budget-usage percentage we've already warned
+    /// about. The eprintln warning in `flush` fires only on upward
+    /// threshold crossings (>=75% once, then >=90% once) per Vfs
+    /// instance, so CLI users see the message exactly when capacity
+    /// changes from healthy to concerning without spamming on every
+    /// subsequent flush.
+    last_warned_pct: u32,
+    /// Set once we've emitted the "vault size beyond the tested
+    /// boundary" advisory for this Vfs session. v0.3.0 has been
+    /// ground-truth tested up to ~30 GiB of stored content; beyond
+    /// that the format is expected to work but is in untested
+    /// territory and we ask users to verify unlocks + report issues.
+    /// One-shot per session via this latch.
+    warned_beyond_tested_size: bool,
 }
+
+/// Vault on-disk size beyond which the runtime emits a one-shot
+/// "untested territory" advisory. Aligns with the validation
+/// boundary documented in CRYPTO_SPEC.md and PROJECT_OVERVIEW.md.
+const TESTED_VAULT_SIZE_BYTES: u64 = 30 * 1024 * 1024 * 1024;
 
 impl Vfs {
     /// Open a Vfs over an already-unlocked container. If the metadata blob is
@@ -984,6 +1077,24 @@ impl Vfs {
             // The choice is locked in by the first flush writing the
             // appropriate magic onto disk.
             (DirectoryTree::new(), MetadataFormat::for_fresh_vault())
+        } else if blob.len() >= METADATA_V5_MAGIC.len()
+            && &blob[..METADATA_V5_MAGIC.len()] == METADATA_V5_MAGIC
+        {
+            // LBM5: structurally the v4 on-disk shape. The lower
+            // V5_INLINE_CHUNK_THRESHOLD is a write-side invariant
+            // only; the read path tolerates any inline count up to
+            // the postcard decode limit so we stay forward-compatible
+            // with future threshold tweaks.
+            let payload = &blob[METADATA_V5_MAGIC.len()..];
+            if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                return Err(Error::MetadataDeserialize);
+            }
+            let v4: DirectoryTreeV4OnDisk =
+                postcard::from_bytes(payload).map_err(|_| Error::MetadataDeserialize)?;
+            (
+                v4_on_disk_to_in_memory(v4, &mut container)?,
+                MetadataFormat::V5,
+            )
         } else if blob.len() >= METADATA_V4_MAGIC.len()
             && &blob[..METADATA_V4_MAGIC.len()] == METADATA_V4_MAGIC
         {
@@ -1029,8 +1140,7 @@ impl Vfs {
             }
             (tree, MetadataFormat::V2)
         } else {
-            // Neither LBM2, LBM3, nor LBM4 -- unsupported version,
-            // refuse cleanly.
+            // Not LBM2/3/4/5 -- unsupported version, refuse cleanly.
             return Err(Error::MetadataDeserialize);
         };
         validate_metadata_tree(
@@ -1043,6 +1153,8 @@ impl Vfs {
             tree,
             dirty: false,
             format,
+            last_warned_pct: 0,
+            warned_beyond_tested_size: false,
         })
     }
 
@@ -1054,16 +1166,66 @@ impl Vfs {
     }
 
     /// Whether this vault is currently in (or has been upgraded to)
-    /// the v4 metadata format. v4 is what enables persistent chmod
-    /// and hardlinks. New vaults default to v4; existing v2/v3
-    /// vaults stay in their original format until an lbm4-only op
-    /// is used.
+    /// the v4-or-later metadata format (v4 or v5). v4 was where
+    /// persistent chmod and hardlinks landed; v5 adds the lower spill
+    /// threshold and is paired with the durability mirrors. Both are
+    /// equally capable for the chmod/link feature set.
     pub fn uses_v4_metadata(&self) -> bool {
-        matches!(self.format, MetadataFormat::V4)
+        matches!(self.format, MetadataFormat::V4 | MetadataFormat::V5)
+    }
+
+    /// Whether this vault is on the v0.3.0 v5 metadata format.
+    pub fn uses_v5_metadata(&self) -> bool {
+        matches!(self.format, MetadataFormat::V5)
+    }
+
+    /// Whether the vault's on-disk size is beyond the v0.3.0
+    /// ground-truth-tested boundary (~30 GiB). GUI callers poll this
+    /// to surface a one-shot advisory toast asking the user to verify
+    /// the vault still unlocks and report issues if it doesn't.
+    /// Cheap: a single `stat()` against the vault path.
+    pub fn is_beyond_tested_size(&self) -> bool {
+        std::fs::metadata(self.container.vault_path())
+            .map(|m| m.len() > TESTED_VAULT_SIZE_BYTES)
+            .unwrap_or(false)
+    }
+
+    /// Current metadata-region budget usage in bytes plus the cap.
+    /// The CLI's `info` subcommand surfaces this, and the GUI polls
+    /// it for status display so users get an in-app warning before
+    /// they hit the cap on large file-count vaults (5k+ inodes
+    /// approaching the 64 MiB region).
+    ///
+    /// O(N) over inodes: serializes a snapshot of the current tree.
+    /// Cheap enough to call periodically (once per CLI `info` /
+    /// once per GUI refresh tick); not cheap enough for hot-path
+    /// callers like statfs.
+    pub fn metadata_budget_status(&self) -> MetadataBudgetStatus {
+        let budget =
+            luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size);
+        // Encode the in-memory tree the same way the next flush
+        // would, modulo the per-format magic prefix (4 B). The
+        // projection in `check_metadata_budget_for_chunks` is for
+        // pre-flighting writes; for status display we just want the
+        // current encoded size, so a plain to_allocvec is enough.
+        let used = postcard::to_allocvec(&self.tree)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        MetadataBudgetStatus {
+            used_bytes: used,
+            budget_bytes: budget,
+        }
     }
 
     pub fn flush(&mut self) -> Result<(), Error> {
-        if !self.dirty {
+        // Force a flush even when the tree is clean if the most recent
+        // open recovered the metadata blob from a sidecar mirror. The
+        // recovery path is correct but the live region is stale until
+        // the next flush rewrites it; without this force-trigger the
+        // vault could close clean and the next crash would leave us
+        // without a current live AND without a current mirror.
+        let metadata_recovered = self.container.metadata_was_recovered_from_mirror();
+        if !self.dirty && !metadata_recovered {
             return Ok(());
         }
         validate_metadata_tree(
@@ -1071,15 +1233,54 @@ impl Vfs {
             self.container.data_offset(),
             self.container.header.hide_size_header(),
         )?;
+        // v0.3.0 auto-upgrade: any flush against a LUKSBOX1 vault
+        // bumps it to LUKSBOX2 + LBM5. One-way; the next crash gets
+        // mirror recovery, but the cost is that pre-v0.3 binaries
+        // can no longer open the vault. The user picked auto-upgrade
+        // on next flush explicitly.
+        //
+        // Explicit deniable-mode exclusion: deniable vaults must NOT
+        // auto-upgrade, because the upgrade implies on-disk sidecar
+        // mirrors (`<vault>.lbx.{header,meta}-bak`) which are a
+        // distinguishability beacon defeating the deniability
+        // property. Deniable vaults keep their existing in-place
+        // overwrite + internal-redundancy crash-safety story. See
+        // `Container::is_v2_format` for the parallel guard on the
+        // write path.
+        if self.container.header.version_major == luksbox_core::VERSION_MAJOR_V1
+            && !self.container.is_deniable()
+        {
+            self.container.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+            self.container.mark_header_dirty();
+            // Bump the metadata format too. V5 supersedes V2/V3/V4
+            // for the v0.3.0+ shape: lower spill threshold, paired
+            // with the LUKSBOX2 header.
+            self.format = MetadataFormat::V5;
+        }
         // Auto-upgrade to V4 if any inode has been touched by an
         // LBM4-only op (non-default mode, or hardlink count > 1).
-        // This is one-way: once V4 has been written, the vault stays
-        // V4. Pre-LBM4 binaries can no longer open the vault after
-        // this point.
-        if self.format != MetadataFormat::V4 && self.tree_needs_v4_format() {
+        // Skipped for V5 which already covers those features.
+        let needs_v4 = self.tree_needs_v4_format();
+        if matches!(self.format, MetadataFormat::V2 | MetadataFormat::V3) && needs_v4 {
             self.format = MetadataFormat::V4;
         }
         let bytes = match self.format {
+            MetadataFormat::V5 => {
+                // v5: same on-disk shape as v4, lower spill threshold
+                // applied via `self.format.inline_chunk_threshold()`
+                // inside `spill_to_v3_on_disk`. Magic differs so
+                // pre-LBM5 binaries refuse the vault (they'd miss the
+                // sidecar mirror recovery path).
+                let v4 = self.spill_to_v4_on_disk()?;
+                let payload = postcard::to_allocvec(&v4).map_err(|_| Error::MetadataSerialize)?;
+                if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                    return Err(Error::MetadataSerialize);
+                }
+                let mut bytes = Vec::with_capacity(METADATA_V5_MAGIC.len() + payload.len());
+                bytes.extend_from_slice(METADATA_V5_MAGIC);
+                bytes.extend_from_slice(&payload);
+                bytes
+            }
             MetadataFormat::V4 => {
                 // v4: same spill machinery as v3 + per-inode
                 // mode/link_count. spill_to_v4_on_disk reuses
@@ -1129,6 +1330,65 @@ impl Vfs {
             }
         };
         self.container.write_metadata(&bytes)?;
+        // The live metadata region has been re-established. Clear the
+        // recovery flag so subsequent clean flushes (when the tree is
+        // not dirty) take the fast path.
+        self.container.clear_metadata_recovered_flag();
+        // Soft-warn on stderr when the metadata region is nearing
+        // capacity. CLI users see it directly; the mount subprocess'
+        // stderr is captured by the GUI / system log. The GUI's own
+        // status indicator (via `Vfs::metadata_budget_status`) is the
+        // primary in-app surface; this eprintln is the
+        // CLI-equivalent so headless users get the same heads-up
+        // before hitting the hard ENOSPC. State-tracked via the
+        // `last_warned_pct` field so the message fires only on
+        // upward threshold crossings, not on every flush.
+        let pct = ((bytes.len() as u128 * 100)
+            / luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size)
+                as u128) as u32;
+        let pct = pct.min(100);
+        if pct >= 90 && self.last_warned_pct < 90 {
+            eprintln!(
+                "luksbox: warn: metadata region at {pct}% capacity ({} / {} bytes). \
+                 Further writes may fail with 'no space left on device'. \
+                 Consider archiving content or migrating to a new vault \
+                 (create with --metadata-size larger than the default 64 MiB).",
+                bytes.len(),
+                luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size,),
+            );
+            self.last_warned_pct = pct;
+        } else if pct >= 75 && self.last_warned_pct < 75 {
+            eprintln!(
+                "luksbox: note: metadata region at {pct}% capacity ({} / {} bytes). \
+                 The metadata region (not the host disk) is the bottleneck for \
+                 vaults with very large inode counts; if many more files are \
+                 expected, consider re-creating with a larger --metadata-size.",
+                bytes.len(),
+                luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size,),
+            );
+            self.last_warned_pct = pct;
+        }
+        // Tested-boundary advisory. v0.3.0 was ground-truth tested
+        // up to TESTED_VAULT_SIZE_BYTES (~30 GiB) of stored content.
+        // Beyond that the format is expected to work but is in
+        // untested territory; ask the user to verify unlocks +
+        // report issues. One-shot per Vfs session via the latch.
+        if !self.warned_beyond_tested_size {
+            if let Ok(meta) = std::fs::metadata(self.container.vault_path()) {
+                if meta.len() > TESTED_VAULT_SIZE_BYTES {
+                    eprintln!(
+                        "luksbox: note: vault on-disk size ({} GiB) is beyond the \
+                         tested boundary (~30 GiB). The format is expected to handle \
+                         larger vaults but this usage has not been ground-truth tested. \
+                         Please periodically close and reopen the vault to verify it \
+                         still unlocks, and report any anomalies at \
+                         https://github.com/PentHertz/LUKSbox/issues.",
+                        meta.len() / (1024 * 1024 * 1024)
+                    );
+                    self.warned_beyond_tested_size = true;
+                }
+            }
+        }
         // If the container has an anchor sidecar configured, push the
         // current vault generation to it so a future open can detect
         // rollback via `anchor::compare`.
@@ -1235,11 +1495,12 @@ impl Vfs {
             // Snapshot the inode's spill-relevant data while the
             // immutable borrow is alive, then re-borrow mutably to
             // update external_list_blocks.
+            let threshold = self.format.inline_chunk_threshold();
             let (chunks_len, file_needs_external) = {
                 let inode = self.tree.inodes.get(&id).expect("id from keys()");
                 (
                     inode.chunks.len(),
-                    inode.kind == InodeKind::File && inode.chunks.len() > V3_INLINE_CHUNK_THRESHOLD,
+                    inode.kind == InodeKind::File && inode.chunks.len() > threshold,
                 )
             };
             // Free any previously-allocated external_list_blocks; we
@@ -1446,8 +1707,8 @@ impl Vfs {
             } else {
                 inode.chunks.len()
             };
-            let renders_external =
-                inode.kind == InodeKind::File && projected_chunk_count > V3_INLINE_CHUNK_THRESHOLD;
+            let renders_external = inode.kind == InodeKind::File
+                && projected_chunk_count > self.format.inline_chunk_threshold();
             on_disk_inodes.insert(
                 inode_id,
                 if renders_external {
@@ -3758,15 +4019,17 @@ mod tests {
         assert_eq!(s.mode, 0o644, "file-type bits must be masked out");
     }
 
-    /// LBM3 vault auto-upgrades to LBM4 only when chmod sets a
-    /// non-default mode. A chmod that re-applies the default leaves
-    /// the format untouched, preserving backward compat for vaults
-    /// the user wants to keep readable by pre-LBM4 binaries.
-    ///
-    /// (We trigger the auto-upgrade check on flush, so we have to
-    /// call flush twice and observe the format hasn't changed.)
+    /// In v0.3.0, the per-feature auto-upgrade to LBM4 (formerly the
+    /// only auto-upgrade trigger) is superseded by the unconditional
+    /// LBM5 + LUKSBOX2 upgrade on any flush against a LUKSBOX1 vault.
+    /// So a v0.2.0-envelope vault always lands on V5 after the first
+    /// flush regardless of whether chmod was a no-op or a real change.
+    /// The chmod-specific check (`tree_needs_v4_format`) still governs
+    /// the narrower V2/V3 -> V4 case for vaults that somehow miss the
+    /// LUKSBOX1 upgrade (e.g. a corrupt header.version_major reading
+    /// as 2 already but with V2 metadata).
     #[test]
-    fn flush_without_v4_features_keeps_original_format() {
+    fn flush_without_v4_features_still_upgrades_v1_vault_to_v5() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("a.lbx");
         let _v2_guard = set_format_v3_override(Some(false));
@@ -3774,13 +4037,20 @@ mod tests {
         let root = vfs.root_id();
         let f = vfs.create(root, "x").unwrap();
         vfs.write(f, 0, b"hi").unwrap();
-        // Apply the default mode (no-op chmod). Must NOT trigger
-        // upgrade.
+        // Apply the default mode (no-op chmod). The v4-specific
+        // trigger does NOT fire (mode is unchanged), but the
+        // v0.3.0 LUKSBOX1 -> LUKSBOX2 + LBM5 trigger does, because
+        // the vault was created with v1 header.
         vfs.chmod(f, 0o644).unwrap();
         vfs.flush().unwrap();
         assert!(
-            !vfs.uses_v4_metadata(),
-            "default-mode chmod must NOT auto-upgrade to LBM4 (kept LBM2 for backward compat)",
+            vfs.uses_v5_metadata(),
+            "v0.2.0-envelope vault must upgrade to LBM5 on first flush"
+        );
+        assert_eq!(
+            vfs.container.header.version_major,
+            luksbox_core::VERSION_MAJOR_V2,
+            "v0.2.0-envelope vault must upgrade to LUKSBOX2 header on first flush"
         );
     }
 
@@ -4258,6 +4528,188 @@ mod tests {
         assert!(
             matches!(final_err, Error::MetadataBudgetExhausted),
             "expected MetadataBudgetExhausted, got {final_err:?}"
+        );
+    }
+
+    #[test]
+    fn v0_2_0_style_vault_auto_upgrades_to_luksbox2_on_first_flush() {
+        // A v0.2.0 on-disk vault is characterised by:
+        //   - header magic LUKSBOX1 (header.version_major == 1)
+        //   - metadata magic LBM2 (set_format_v3_override(Some(false)))
+        //   - no mirror sidecars
+        //
+        // We can't construct that exact state via the v0.3.0 code path
+        // because the first flush itself triggers the auto-upgrade.
+        // What we test instead is that, given a freshly created vault
+        // built with the v0.2.0 envelope (LUKSBOX1 + LBM2 + no
+        // mirrors), the FIRST flush flips it to LUKSBOX2 + LBM5 with
+        // mirrors. The simulation is faithful because the on-disk
+        // bytes are byte-for-byte identical to what a v0.2.0 binary
+        // would have written.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("upgrade.lbx");
+        // Phase 1: create a v0.2.0-style vault and write some
+        // metadata so the on-disk blob carries a real LBM2 magic
+        // (not empty). The format override forces v2 metadata; the
+        // header is v1 by default of Header::try_new. After this
+        // block the vault on disk is indistinguishable from one a
+        // v0.2.0 binary would have produced.
+        {
+            let _v2 = set_format_v3_override(Some(false));
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            let root = vfs.root_id();
+            let f = vfs.create(root, "before.txt").unwrap();
+            vfs.write(f, 0, b"pre-upgrade").unwrap();
+            // Force the v1 header + v2 metadata wire image. The flush
+            // we're about to call here would (with v0.3.0 logic)
+            // auto-upgrade -- we want this flush to NOT do that so we
+            // can test the upgrade firing on a SECOND, post-reopen
+            // flush. Temporarily revert the in-memory state right
+            // before flush so this flush behaves like a v0.2.0 flush.
+            vfs.container.header.version_major = luksbox_core::VERSION_MAJOR_V1;
+            vfs.format = MetadataFormat::V2;
+            // Bypass the upgrade trigger by writing directly through
+            // the v2-format path. We call the normal flush() but the
+            // upgrade-on-v1 guard then bumps it back; to suppress
+            // that we manually serialize the v2 blob and write it.
+            // Easiest: just exit without flushing, then write the
+            // blob through a private path. Cleaner approach below
+            // bypasses the auto-upgrade via a temporary override of
+            // the format check by writing the bytes directly.
+            let payload = postcard::to_allocvec(&vfs.tree)
+                .map_err(|_| Error::MetadataSerialize)
+                .unwrap();
+            let mut bytes = Vec::with_capacity(METADATA_V2_MAGIC.len() + payload.len());
+            bytes.extend_from_slice(METADATA_V2_MAGIC);
+            bytes.extend_from_slice(&payload);
+            vfs.container.write_metadata(&bytes).unwrap();
+            vfs.dirty = false;
+            // Don't call vfs.flush() (it would auto-upgrade). Drop
+            // here triggers Container::drop -> persist_header, which
+            // in v1 mode writes the header in place without mirrors.
+        }
+        let mirror_meta = path.with_file_name(format!(
+            "{}.meta-bak",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        let mirror_header = path.with_file_name(format!(
+            "{}.header-bak",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+        assert!(
+            !mirror_meta.exists(),
+            "phase 1 (just-created v0.2.0-style vault): no metadata mirror should exist yet"
+        );
+        assert!(
+            !mirror_header.exists(),
+            "phase 1 (just-created v0.2.0-style vault): no header mirror should exist yet"
+        );
+        // Confirm the on-disk header magic is LUKSBOX1.
+        {
+            let raw_header = std::fs::read(&path).unwrap();
+            assert_eq!(
+                &raw_header[..8],
+                &luksbox_core::MAGIC_V1,
+                "phase 1: on-disk header should carry LUKSBOX1 magic"
+            );
+        }
+        // Phase 2: reopen with the default v0.3.0 paths and trigger a
+        // flush by writing a file. The flush must auto-upgrade to
+        // LUKSBOX2 + V5 + mirrors-on-disk.
+        {
+            let mut vfs = Vfs::open(open_container(&path)).unwrap();
+            assert_eq!(
+                vfs.container.header.version_major,
+                luksbox_core::VERSION_MAJOR_V1,
+                "phase 2 entry: in-memory header still v1 (matches disk)"
+            );
+            assert!(
+                !vfs.uses_v3_metadata(),
+                "phase 2 entry: in-memory format still v2 (matches disk)"
+            );
+            let root = vfs.root_id();
+            let f = vfs.create(root, "after.txt").unwrap();
+            vfs.write(f, 0, b"post-upgrade").unwrap();
+            vfs.flush().unwrap();
+            assert!(vfs.uses_v5_metadata(), "flush must upgrade to V5");
+            assert_eq!(
+                vfs.container.header.version_major,
+                luksbox_core::VERSION_MAJOR_V2,
+                "flush must upgrade header to LUKSBOX2"
+            );
+        }
+        // Phase 3: confirm on-disk state: LUKSBOX2 magic, both
+        // mirrors present.
+        {
+            let raw_header = std::fs::read(&path).unwrap();
+            assert_eq!(
+                &raw_header[..8],
+                &luksbox_core::MAGIC_V2,
+                "phase 3: on-disk header must carry LUKSBOX2 magic after upgrade"
+            );
+            assert!(
+                mirror_meta.exists(),
+                "phase 3: metadata mirror must exist after upgrade"
+            );
+            assert!(
+                mirror_header.exists(),
+                "phase 3: header mirror must exist after upgrade"
+            );
+        }
+        // Phase 4: reopen with v0.3.0 binary one more time and check
+        // the file written in phase 2 is still readable through the
+        // upgraded format.
+        {
+            let mut vfs = Vfs::open(open_container(&path)).unwrap();
+            assert!(vfs.uses_v5_metadata());
+            let root = vfs.root_id();
+            let after = vfs.lookup(root, "after.txt").unwrap();
+            let mut buf = [0u8; 64];
+            let n = vfs.read(after, 0, &mut buf).unwrap();
+            assert_eq!(&buf[..n], b"post-upgrade");
+        }
+    }
+
+    #[test]
+    fn v5_format_writes_lbm5_magic_to_disk() {
+        // Fresh vaults default to v5. After flush, the on-disk
+        // metadata blob must carry the LBM\x05 magic so older binaries
+        // refuse it cleanly.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v5.lbx");
+        {
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            assert!(vfs.uses_v5_metadata(), "fresh vault must default to V5");
+            let root = vfs.root_id();
+            let f = vfs.create(root, "hello").unwrap();
+            vfs.write(f, 0, b"v5 payload").unwrap();
+            vfs.flush().unwrap();
+        }
+        // Reopen with a fresh container and verify on-disk magic.
+        let mut c = open_container(&path);
+        let raw = c.read_metadata().unwrap();
+        assert!(
+            raw.starts_with(METADATA_V5_MAGIC),
+            "v5 vault must serialise with LBM5 magic, got prefix {:?}",
+            &raw[..raw.len().min(8)]
+        );
+        // And the read path must accept LBM5 and round-trip the data.
+        let vfs = Vfs::open(c).unwrap();
+        assert!(vfs.uses_v5_metadata());
+    }
+
+    #[test]
+    fn v5_spill_threshold_is_lower_than_v3() {
+        // The whole point of v5 is the lower threshold; pin it so a
+        // future accidental bump back to 1024 fails this test.
+        assert!(
+            MetadataFormat::V5.inline_chunk_threshold()
+                < MetadataFormat::V4.inline_chunk_threshold(),
+            "v5 threshold must be < v4 threshold (otherwise v5 buys nothing)"
+        );
+        assert_eq!(
+            MetadataFormat::V5.inline_chunk_threshold(),
+            crate::tree::V5_INLINE_CHUNK_THRESHOLD
         );
     }
 

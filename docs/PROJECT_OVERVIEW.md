@@ -400,13 +400,73 @@ stderr when running on non-accelerated CPUs, recommending
 | | Size |
 |---|---|
 | Header (constant) | 8 KiB |
-| Metadata region (default; configurable) | 1 MiB |
+| Metadata region (v0.3.0+ default; configurable via `--metadata-size`) | 64 MiB |
 | Per-chunk overhead (12 B nonce + 16 B AEAD tag) | **28 B per 4096 B plaintext** = 0.7 % |
 | `.kyber` seed file (ML-KEM-768) | 122 B |
 | `.kyber` seed file (ML-KEM-1024) | 123 B |
 | `.hybrid` sidecar entry (ML-KEM-768) | 2.3 KB |
 | `.hybrid` sidecar entry (ML-KEM-1024) | 3.1 KB |
 | `.anchor` sidecar | 48 B |
+| `.lbx.header-bak` sidecar (v0.3.0+, NOT in deniable vaults) | 8 KiB |
+| `.lbx.meta-bak` sidecar (v0.3.0+, NOT in deniable vaults) | = metadata region size |
+
+The two `*-bak` sidecars hold previous-good copies of the
+critical regions for crash-safety recovery. They are absent on
+deniable vaults to preserve the >=7.99 bits/byte entropy property
+of the on-disk artefact set. For new v0.3.0+ vaults the total
+crash-safety overhead is roughly **64 MiB + 8 KiB** alongside
+the .lbx file; for upgraded v0.2.0 vaults the mirror tracks the
+existing region size (typically 16 MiB).
+
+#### Capacity guidance
+
+The metadata region holds the encoded directory tree. With v5 the
+inline chunk-ref spill threshold drops to 256 chunks per inode
+(~1 MiB plaintext per file), so large files spill their chunk
+lists to the data area and consume only a small inode stub in the
+metadata blob. Practical encoded-size estimate: ~60-90 bytes per
+inode plus ~30 bytes per directory entry. A 64 MiB region holds
+roughly **500k typical-shape files** before approaching capacity.
+
+LUKSbox emits a soft notification when the metadata region passes
+75% (informational) or 90% (warning) usage: CLI users see the
+message on stderr, GUI users get a one-shot toast. Once a
+warning fires, options are:
+
+1. `luksbox info <vault>` to inspect the current size.
+2. Recreate the vault with a larger `--metadata-size` (up to the
+   64 MiB cap) and `luksbox cp` content over.
+3. Avoid storing very many tiny files; combine into archives
+   where it makes sense.
+
+Hard `MetadataBudgetExhausted` at 100% surfaces as ENOSPC at the
+FUSE / WinFsp / FUSE-T layer so the OS file manager surfaces a
+"no space left on device" error the user already understands.
+
+#### Tested boundary (v0.3.0)
+
+LUKSbox v0.3.0 has been ground-truth validated up to roughly
+**30 GiB of stored content** with several thousand files via the
+real FUSE mount path (create, write, mount, copy, unmount,
+reopen, verify). The format is engineered for larger vaults but
+that usage has not yet been explicitly tested.
+
+A one-shot advisory fires when a vault file on disk crosses
+30 GiB:
+
+- CLI: a single eprintln from `Vfs::flush` ("vault on-disk size
+  is beyond the tested boundary; please verify unlocks and
+  report issues").
+- GUI: a non-blocking toast surfaced via the same notification
+  helper.
+
+The advice is to close and reopen the vault periodically (the
+v0.2.0 failure mode that motivated the durability fix was "vault
+won't reopen after force-quit"; periodic reopens catch that
+class early) and to report anomalies at
+<https://github.com/PentHertz/LUKSbox/issues>. The boundary will
+be raised in subsequent releases as more validated usage
+accumulates.
 
 ---
 

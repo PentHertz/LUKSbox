@@ -182,14 +182,17 @@ impl KdfStrengthArg {
 /// and a perf baseline showing sub-2s open at 100 GiB.
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq, Default)]
 pub(crate) enum VaultFormatArg {
-    /// Inline chunk lists in the metadata region. Practical ~10 GiB
-    /// per-vault ceiling. Readable by every LUKSbox binary
-    /// (including pre-v0.2.0 readers). Pick this if you need to
-    /// share the vault with someone on an older LUKSbox.
+    /// Inline chunk lists in the metadata region (LBM2 magic, no
+    /// sidecar mirrors). Practical ~10 GiB per-vault ceiling.
+    /// Readable by every LUKSbox binary (including pre-v0.2.0
+    /// readers). Pick this only if you need to share the vault
+    /// with someone on a pre-v0.3 LUKSbox AND can suppress the
+    /// auto-upgrade trigger via `LUKSBOX_FORMAT_V2=1`.
     V2,
-    /// External chunk-list blocks in the data area (default). No
-    /// practical per-vault ceiling. Requires LUKSbox v0.2.0 or
-    /// newer to open.
+    /// LBM5 + LUKSBOX2 (v0.3.0 default). External chunk-list blocks
+    /// in the data area, 64 MiB metadata cap, sidecar mirrors at
+    /// `<vault>.lbx.{header,meta}-bak` for crash-safety. Requires
+    /// LUKSbox v0.3.0+ to open.
     #[default]
     V3,
 }
@@ -374,27 +377,27 @@ enum Command {
         /// existing vault.
         #[arg(long, value_name = "BYTES")]
         metadata_size: Option<String>,
-        /// Opt the new vault into the **v3 metadata format**, which
-        /// stores per-file chunk lists out-of-line in encrypted
-        /// chunk-list blocks in the data area rather than inline in
-        /// the metadata region. Removes the practical ~10 GiB
-        /// per-vault ceiling of the v2 format (which capped at the
-        /// 16 MiB metadata region size) and lets a vault hold
-        /// arbitrarily-large files.
+        /// Metadata format for the new vault.
         ///
-        /// Trade-offs:
-        /// - On open, every spilled file's chunk-list chain is
-        ///   walked from disk, so opens of huge vaults are slower
-        ///   than v2 (a 100 GiB single-file vault touches ~100k
-        ///   chunk-list blocks at open).
-        /// - Old LUKSbox binaries (pre-v0.2.0) cannot read v3
-        ///   vaults -- they refuse the `LBM\x03` metadata magic.
+        /// - `v3` (NEW DEFAULT in v0.3.0): LBM5 on disk, paired with
+        ///   the LUKSBOX2 header + sidecar mirrors at
+        ///   `<vault>.lbx.header-bak` and `<vault>.lbx.meta-bak`.
+        ///   External chunk-list blocks for large files; lower
+        ///   inline-spill threshold; 64 MiB metadata region. Crash
+        ///   mid-write to either critical region is recovered
+        ///   automatically on next open. Requires LUKSbox v0.3.0+
+        ///   to open.
+        /// - `v2`: inline chunk lists, LBM2 magic, no mirrors. Kept
+        ///   for backward compatibility when sharing vaults with
+        ///   pre-v0.3 LUKSbox binaries. Practical ~10 GiB per-vault
+        ///   ceiling; no crash-safety guarantees on header/metadata
+        ///   writes. Even when chosen at create time, any operation
+        ///   that triggers a flush will auto-upgrade the vault to
+        ///   the v0.3.0 format unless `LUKSBOX_FORMAT_V2=1` is set
+        ///   in the environment to suppress the upgrade trigger.
         ///
-        /// Default v2 stays the default; v3 is opt-in until
-        /// deniable + fuzz coverage land in a later release. Once
-        /// chosen at create, the format is permanent for that
-        /// vault (re-create to switch).
-        #[arg(long, default_value = "v2")]
+        /// Once the auto-upgrade fires, the format is permanent.
+        #[arg(long, default_value = "v3")]
         format: VaultFormatArg,
     },
     /// Show container header / keyslot summary (no unlock required).
@@ -3304,6 +3307,22 @@ fn cmd_create(
             luksbox_format::hybrid_sidecar::sidecar_path(path).display()
         );
     }
+    // One-time tested-boundary advisory. v0.3.0 has been validated
+    // end-to-end up to ~30 GiB of stored content with thousands of
+    // files; beyond that boundary the format is expected to work but
+    // has not been ground-truth tested. Surface this at create time
+    // so users know to verify unlocks and report issues if they push
+    // past the boundary.
+    eprintln!();
+    eprintln!(
+        "  note: v0.3.0 has been validated end-to-end up to ~30 GiB of stored\n  \
+              content with several thousand files. If you plan to store more,\n  \
+              please periodically verify the vault still unlocks (close and\n  \
+              reopen) and report any anomalies at\n  \
+              https://github.com/PentHertz/LUKSbox/issues. The format is\n  \
+              expected to handle larger vaults; this advisory just flags that\n  \
+              your usage is beyond what has been ground-truth tested."
+    );
     Ok(())
 }
 

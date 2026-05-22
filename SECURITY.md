@@ -391,6 +391,43 @@ get in touch.
 
 ### Operational gaps
 
+- **v0.3.0 durability fix (LUKSBOX2 / LBM5) excludes deniable
+  vaults.** The sidecar-mirror crash-safety protocol
+  (`<vault>.lbx.header-bak` and `<vault>.lbx.meta-bak`) is
+  deliberately disabled for deniable containers. Sidecar files at
+  predictable names and lengths next to the vault would defeat the
+  deniability property the deniable header pays 36 KiB to
+  establish: a uniformly random byte distribution (>=7.99 bits per
+  byte) across the on-disk artefact set. An attacker listing files
+  in the directory would instantly identify the vault as a LUKSbox
+  deniable container. Crash safety for deniable vaults stays on
+  the existing path: the deniable header has internal slot-layout
+  redundancy and is rewritten wholesale on every persist, so a
+  crash mid-write is detectable and rejectable but does not
+  benefit from the additive A/B mirror semantics. Enforced in
+  `Container::is_v2_format()` (write-side guard) and in
+  `Vfs::flush` (auto-upgrade trigger guard). Regression-tested by
+  `deniable_vault_never_creates_sidecar_mirrors`.
+- **v0.3.0 mirror recovery is gated on parse failure, not unlock
+  failure.** Without this gating a previously-revoked credential
+  would unlock against the previous-good keyslot still in the
+  mirror, silently undoing every revoke. The trade-off: the rare
+  "live header parses but keyslot AEAD bytes are partially
+  corrupted" failure mode is recovered manually via
+  `luksbox header-restore <vault> <vault>.lbx.header-bak
+  --no-verify`. Test `v2_revoked_credential_does_not_unlock_via_mirror`
+  pins this gating; the `v2_mirror_recovery` libFuzzer target
+  fuzzes the property under arbitrary corruption + mirror
+  substitution patterns.
+- **Metadata-budget capacity notification is in-process only.**
+  The 75% / 90% warnings are emitted on the `Vfs` instance's
+  stderr (CLI) or via a one-shot toast on the AppState (GUI).
+  There is no system-wide notification channel: a user driving a
+  mounted vault via Finder / Nemo / Explorer who never opens the
+  GUI browser will only see the hard ENOSPC at 100% capacity.
+  Mitigation: the mount subprocess itself is the `luksbox mount`
+  CLI command whose stderr is captured by the GUI (when running
+  as a subprocess) or the system log (when run standalone).
 - **No reproducible builds.** Bit-for-bit reproducibility is not yet in
   place; build artifacts are not deterministic across machines.
 - **Per-platform signing posture (v0.1.1):**

@@ -20,6 +20,166 @@ Slot-policy revisit for the multi-factor combos. Existing v0.1.1
 vaults open unchanged; the behavior change is entirely at create
 time.
 
+### Durability fix: crash-safe header + metadata writes (LBM5 / LUKSBOX2)
+
+Fixes a real-user data-loss bug reported on v0.2.0: a vault that hit
+ENOSPC mid-copy at ~13 GB with ~5000 small files became permanently
+unopenable after force-quit (`blob deserialization failed` on unlock).
+The two underlying causes were:
+
+1. The metadata region cap was 16 MiB; serializing the directory
+   tree for a multi-thousand-file vault overflowed it and surfaced
+   as `MetadataBudgetExhausted` -> ENOSPC.
+2. Both the 8 KiB header (with all keyslots) and the metadata blob
+   were written in place with a plain seek+write. A crash mid-write
+   destroyed the only copy. A separate failure mode produced
+   "no keyslot accepted the provided unlock material" when the
+   header was the corrupt region rather than the metadata.
+
+The fix adds A/B durability for both critical regions plus a higher
+metadata cap, all cross-platform (Linux, macOS, Windows):
+
+- **`MAX_METADATA_SIZE` raised 16 MiB -> 64 MiB** with
+  `DEFAULT_METADATA_REGION_SIZE` to match. New vaults reach ~40+ GiB
+  of stored content before any metadata pressure.
+- **LBM5 metadata format** lowers the inline chunk-ref spill
+  threshold from 1024 to 256 chunks per inode, so encoded trees
+  stay compact even for very large vaults. On-disk shape is
+  byte-identical to LBM4; only the magic + write-side threshold
+  differ.
+- **LUKSBOX2 header magic** carries two new HMAC-authenticated
+  flag bits (`FLAG_HAS_HEADER_MIRROR`, `FLAG_HAS_METADATA_MIRROR`)
+  that signal the presence of sidecar mirrors. Pre-LBM5 binaries
+  refuse the new magic via the version-major check, which is the
+  correct posture (they would silently miss the recovery sidecars).
+- **`<vault>.lbx.header-bak`** holds the previous-good 8 KiB header,
+  rotated via temp+rename before every live header overwrite. On
+  open, mirror recovery is gated **strictly** on the live header
+  failing to PARSE (e.g. magic byte garbled, keyslot kind byte
+  invalid, version-major / magic mismatch). Mirror recovery does
+  NOT fire when the live header parses fine but unlock rejects
+  the credential, because the mirror still carries previously-good
+  keyslots that may have been revoked since. Without this gating,
+  a user who revoked a passphrase A and persisted would find A
+  still working via the mirror. The conservative gating means
+  the narrow "live header parses, but keyslot AEAD bytes are
+  corrupted" failure mode (a partial-write subclass) is recovered
+  manually via `luksbox header-restore <vault> <vault>.lbx.header-bak
+  --no-verify` rather than automatically. Manual is correct here:
+  it makes the implicit "accept whatever credentials the mirror
+  has" choice explicit and auditable. Detached-header vaults put
+  the mirror next to the detached sidecar.
+- **`<vault>.lbx.meta-bak`** holds the previous-good encrypted
+  metadata region with the same rotate-then-overwrite protocol.
+  `read_metadata` falls back to it on AEAD verification failure
+  and marks `metadata_recovered_from_mirror` so the next `Vfs::flush`
+  forces a rewrite.
+- **Auto-upgrade on first flush**. A v0.2.0 vault (LUKSBOX1 + LBMx)
+  is bumped to LUKSBOX2 + LBM5 the first time `Vfs::flush` runs
+  against a dirty tree. The user does not need to run a migration
+  command; the rollover is one-way (pre-v0.3 binaries can no
+  longer open the vault afterwards).
+- **Cross-platform crash safety.** All sidecar rotations go through
+  `atomic_secure_write` (temp file + fsync + rename + parent dir
+  fsync), which maps to POSIX `rename(2)` on Linux/macOS and
+  `MoveFileExW(REPLACE_EXISTING)` on Windows. Directory fsync is
+  strict on POSIX, best-effort on Windows (NTFS journals the
+  rename via `MoveFileExW`, so the rename is durable on return).
+- **Disk cost.** Each v0.3.0+ vault keeps one 8 KiB header-bak plus
+  one `metadata_size`-bytes meta-bak alongside the .lbx file
+  (16 MiB for upgraded v0.2.0 vaults, 64 MiB for new vaults). For
+  the typical encrypted-backup-on-USB use case this is rounding
+  error; for tiny demo vaults, `--metadata-size` shrinks the
+  region (and therefore the mirror).
+- **Security posture preserved.** Mirrors are AEAD/HMAC-bound to
+  the same MVK as live, so a forged or attacker-substituted mirror
+  fails verification and the open path surfaces the live error.
+  The anchor sidecar's rollback check still runs against the
+  recovered header. MVK rotation
+  (`begin/commit_atomic_rotation`) explicitly **deletes** both
+  sidecar mirrors at commit time so the post-rotation vault
+  cannot fall back to OLD-MVK-encrypted keyslots; fresh mirrors
+  are written on the next live overwrite. Mirror file reads are
+  stat-then-bounded so an attacker-planted symlink to `/dev/zero`
+  cannot OOM the recovery path.
+- **Recovery is not unbounded forgiveness.** Two-level corruption
+  (both live and mirror garbled) surfaces the live error as
+  before; recovery only saves the user when at most ONE of the
+  two regions was destroyed by the crash.
+
+Migration policy: deliberately additive. Old vaults remain
+read-supported indefinitely; the upgrade triggers only on first
+flush. No `metadata_size` relocation in this release (that would
+require moving the data region, which is the dangerous part of any
+durability migration).
+
+### Metadata-budget capacity notification
+
+Vaults holding very large inode counts (hundreds of thousands of
+files) can approach the 64 MiB metadata region cap before they
+exhaust host disk space. Without a notification, the first sign
+the user would see is a hard "no space left on device" error
+mid-copy (the exact failure that motivated the durability fix).
+
+v0.3.0 emits a soft notification BEFORE the hard ENOSPC, on two
+thresholds:
+
+- **>=75% used**: informational. CLI users see a one-line
+  message on stderr; GUI users see a non-blocking toast.
+- **>=90% used**: stronger warning recommending content
+  archival or migration to a new vault with a larger
+  `--metadata-size`.
+
+Notifications fire at most once per level per session. The
+metadata budget status is exposed as `Vfs::metadata_budget_status()`
+returning a `MetadataBudgetStatus { used_bytes, budget_bytes }`
+struct with `used_pct`, `near_capacity` (>=75%), and
+`critical_capacity` (>=90%) accessors so external tooling can
+build dashboards or pre-flight checks.
+
+Deniable vaults DO NOT participate in this notification through
+the sidecar-mirror mechanism: deniable vaults deliberately opt
+out of every observable LUKSbox-shaped sidecar. They still get
+the `MetadataBudgetExhausted` -> ENOSPC backstop and the
+`Vfs::metadata_budget_status` API for in-app status display.
+
+See `docs/CRYPTO_SPEC.md` -- "Metadata budget and capacity
+notification (v0.3.0+)" for the full design and mitigation
+options once a warning fires.
+
+### Tested-boundary advisory (v0.3.0)
+
+v0.3.0 has been ground-truth validated end-to-end (real FUSE
+mount, write, force-quit, reopen, verify) up to roughly **30 GiB
+of stored content** with several thousand files. The format is
+engineered for larger vaults but usage beyond that boundary has
+not yet been explicitly tested.
+
+LUKSbox surfaces a one-shot heads-up at two moments:
+
+- At create time: `luksbox create` prints an advisory noting the
+  tested boundary so users planning very large vaults know
+  upfront.
+- At runtime: when `Vfs::flush` notices the on-disk vault size
+  has crossed 30 GiB, a one-shot eprintln (CLI) or toast (GUI)
+  asks the user to verify the vault still unlocks (the v0.2.0
+  failure mode was specifically "can't reopen after force-quit",
+  so periodic close+reopen catches that class early) and to
+  report any anomalies.
+
+The advisory is informational, not a hard limit. The boundary
+will be raised in subsequent releases as validated usage data
+accumulates. See `docs/PROJECT_OVERVIEW.md` section 5.4 for the
+user-facing guidance.
+
+Deferred:
+
+- CLI `luksbox repair` / `luksbox health` subcommands (manual
+  recovery / mirror staleness warning). Automatic recovery covers
+  the load-bearing case; tooling is convenience.
+- LUKSBOX1 -> LUKSBOX2 in-place header relocation. Not needed
+  with the additive sidecar design.
+
 ### Security audit follow-up (filesystem-boundary hardening)
 
 Round of fixes for findings on the path-handling / TOCTOU surfaces.

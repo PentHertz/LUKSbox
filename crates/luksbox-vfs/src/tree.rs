@@ -33,6 +33,16 @@ pub const CHUNK_LIST_FILE_ID_BIT: FileId = 1 << 63;
 /// extra-read penalty per access.
 pub const V3_INLINE_CHUNK_THRESHOLD: usize = 1024;
 
+/// Inline chunk-list threshold used when writing LBM5 metadata
+/// (v0.3.0+ default). Lower than the V3/V4 value (1024) so the
+/// encoded directory tree stays compact for very large vaults with
+/// thousands of files: 256 chunks at 4 KiB plaintext ~ 1 MiB per
+/// inode before spilling to an external chunk-list chain. The read
+/// path tolerates LBM5 blobs that carry larger inline counts
+/// (forward-compat with a future threshold change) and only enforces
+/// the structural validation common to all formats.
+pub const V5_INLINE_CHUNK_THRESHOLD: usize = 256;
+
 /// Reference to a chunk slot on disk, with a monotonic per-vault generation
 /// counter for replay protection. The generation is included in the
 /// per-chunk AAD; an attacker who has an old encrypted chunk and tries to

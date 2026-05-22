@@ -27,17 +27,26 @@ pub const MIN_CHUNK_SIZE: u32 = 512;
 /// allows future growth while refusing pathological values that could
 /// trigger huge per-chunk allocations.
 pub const MAX_CHUNK_SIZE: u32 = 1 << 20;
-/// Largest accepted `metadata_size` field. Real vaults have about 1 MiB of
-/// metadata (`DEFAULT_METADATA_REGION_SIZE` in luksbox-format); 16 MiB
-/// is 16x headroom and well below any realistic OOM threshold. Without
-/// this cap, `read_metadata` would happily attempt
-/// `vec![0u8; u64::MAX as usize]` on a vault crafted by a collaborator
-/// who has the MVK - not a stolen-vault attack, but a real DoS in any
-/// "shared vault from untrusted collaborator" workflow.
-pub const MAX_METADATA_SIZE: u64 = 16 << 20;
+/// Largest accepted `metadata_size` field. Raised in v0.3.0 from 16 MiB
+/// to 64 MiB so the encoded directory tree for vaults with thousands of
+/// inodes plus their inline chunk-ref tables fits without spilling to
+/// `MetadataBudgetExhausted` (the underlying cause of v0.2.0's surface
+/// "no space left on device" failure at vault scales around 13 GB with
+/// 5k+ small files). The cap still bounds the worst-case
+/// `vec![0u8; metadata_size as usize]` allocation in `read_metadata`
+/// against a vault crafted by a hostile MVK holder.
+pub const MAX_METADATA_SIZE: u64 = 64 << 20;
 
-const MAGIC: [u8; 8] = *b"LUKSBOX1";
-const VERSION_MAJOR: u16 = 1;
+/// On-disk magic byte sequence used by LUKSbox v0.2.0 and earlier.
+pub const MAGIC_V1: [u8; 8] = *b"LUKSBOX1";
+/// On-disk magic byte sequence introduced in v0.3.0 alongside the
+/// sidecar-mirror durability fix. Old binaries reject this magic via
+/// the version-major check in `Header::from_bytes`, which is the
+/// correct behavior (they'd silently miss the recovery sidecars).
+pub const MAGIC_V2: [u8; 8] = *b"LUKSBOX2";
+
+pub const VERSION_MAJOR_V1: u16 = 1;
+pub const VERSION_MAJOR_V2: u16 = 2;
 const VERSION_MINOR: u16 = 0;
 
 const OFF_MAGIC: usize = 0;
@@ -84,6 +93,24 @@ pub const FLAG_PAD_FILES_POW2: u32 = 1 << 0;
 /// against a fully-capable MVK-holder.
 pub const FLAG_HIDE_SIZE_HEADER: u32 = 1 << 1;
 
+/// Bit 2 of `Header::flags`. When set, the container keeps a
+/// previous-good copy of the 8 KiB header at `<storage_path>.header-bak`
+/// rotated via temp+rename before every overwrite of the live header
+/// region. On open, if the live header fails to parse or HMAC-verify,
+/// the recovery path reads and verifies the mirror, and on a successful
+/// fallback marks `header_dirty` so the next clean shutdown re-establishes
+/// the live region.
+///
+/// HMAC-authenticated by `verify_hmac`, so an attacker who flips this
+/// bit to make the recovery path ignore the mirror will fail HMAC.
+pub const FLAG_HAS_HEADER_MIRROR: u32 = 1 << 2;
+
+/// Bit 3 of `Header::flags`. Same guarantee as `FLAG_HAS_HEADER_MIRROR`
+/// but for the AEAD-encrypted metadata region at `<vault>.lbx.meta-bak`.
+/// The mirror is sized to match `metadata_size` so a `read_metadata`
+/// against the mirror behaves identically to one against the live region.
+pub const FLAG_HAS_METADATA_MIRROR: u32 = 1 << 3;
+
 const _: () = assert!(OFF_KEYSLOTS + MAX_KEYSLOTS * SLOT_SIZE <= OFF_HMAC);
 
 #[derive(Clone)]
@@ -97,6 +124,12 @@ pub struct Header {
     pub metadata_size: u64,
     pub data_offset: u64,
     pub keyslots: [Keyslot; MAX_KEYSLOTS],
+    /// On-disk format major version. `1` = LUKSBOX1 (v0.2.0 and earlier,
+    /// no sidecar mirrors). `2` = LUKSBOX2 (v0.3.0+, supports the
+    /// header/metadata mirror sidecars guarded by FLAG_HAS_*_MIRROR).
+    /// Default `try_new` builds a v1 header for back-compat; container
+    /// code that wants new vaults on v2 sets this explicitly.
+    pub version_major: u16,
 }
 
 impl Header {
@@ -124,6 +157,7 @@ impl Header {
             metadata_size: 0,
             data_offset,
             keyslots: core::array::from_fn(|_| Keyslot::empty()),
+            version_major: VERSION_MAJOR_V1,
         })
     }
 
@@ -144,6 +178,20 @@ impl Header {
     /// the real file length.
     pub fn hide_size_header(&self) -> bool {
         (self.flags & FLAG_HIDE_SIZE_HEADER) != 0
+    }
+
+    /// Whether a previous-good header copy is persisted at the sidecar
+    /// `<storage_path>.header-bak`. v0.3.0+ vaults set this on first
+    /// flush after open.
+    pub fn has_header_mirror(&self) -> bool {
+        (self.flags & FLAG_HAS_HEADER_MIRROR) != 0
+    }
+
+    /// Whether a previous-good metadata copy is persisted at the
+    /// sidecar `<vault>.lbx.meta-bak`. v0.3.0+ vaults set this on first
+    /// flush after open.
+    pub fn has_metadata_mirror(&self) -> bool {
+        (self.flags & FLAG_HAS_METADATA_MIRROR) != 0
     }
 
     /// Find the lowest-index empty slot.
@@ -182,12 +230,21 @@ impl Header {
     /// Parse without verifying the HMAC. Caller must verify by recomputing once
     /// an MVK candidate has been recovered from a keyslot.
     pub fn from_bytes(buf: &[u8; HEADER_SIZE]) -> Result<Self, Error> {
-        if buf[OFF_MAGIC..OFF_MAGIC + 8] != MAGIC {
+        let magic_bytes: &[u8] = &buf[OFF_MAGIC..OFF_MAGIC + 8];
+        let version_major = if magic_bytes == MAGIC_V1 {
+            VERSION_MAJOR_V1
+        } else if magic_bytes == MAGIC_V2 {
+            VERSION_MAJOR_V2
+        } else {
             return Err(Error::InvalidMagic);
-        }
+        };
         let major = u16::from_le_bytes(buf[OFF_VER_MAJOR..OFF_VER_MAJOR + 2].try_into().unwrap());
         let minor = u16::from_le_bytes(buf[OFF_VER_MINOR..OFF_VER_MINOR + 2].try_into().unwrap());
-        if major != VERSION_MAJOR {
+        // The magic byte sequence and the version_major field are two
+        // independent encodings of the same fact; refuse a header where
+        // they disagree (would indicate format confusion or an attempt
+        // to feed v2 fields into the v1 parsing path).
+        if major != version_major {
             return Err(Error::UnsupportedVersion { major, minor });
         }
         let header_size = u32::from_le_bytes(
@@ -302,6 +359,7 @@ impl Header {
             metadata_size,
             data_offset,
             keyslots,
+            version_major,
         })
     }
 
@@ -335,8 +393,15 @@ impl Header {
             .try_fill_bytes(&mut buf[reserved_start..reserved_end])
             .expect("OS RNG failure during header padding fill");
 
-        buf[OFF_MAGIC..OFF_MAGIC + 8].copy_from_slice(&MAGIC);
-        buf[OFF_VER_MAJOR..OFF_VER_MAJOR + 2].copy_from_slice(&VERSION_MAJOR.to_le_bytes());
+        let magic = match self.version_major {
+            VERSION_MAJOR_V2 => MAGIC_V2,
+            // Default to v1 magic for any other value, including 0 from
+            // a freshly-built `Header` that hasn't been initialized via
+            // try_new (defensive; try_new always sets v1).
+            _ => MAGIC_V1,
+        };
+        buf[OFF_MAGIC..OFF_MAGIC + 8].copy_from_slice(&magic);
+        buf[OFF_VER_MAJOR..OFF_VER_MAJOR + 2].copy_from_slice(&self.version_major.to_le_bytes());
         buf[OFF_VER_MINOR..OFF_VER_MINOR + 2].copy_from_slice(&VERSION_MINOR.to_le_bytes());
         buf[OFF_HEADER_SIZE..OFF_HEADER_SIZE + 4]
             .copy_from_slice(&(HEADER_SIZE as u32).to_le_bytes());
@@ -540,5 +605,104 @@ mod tests {
             Header::from_bytes(&bytes),
             Err(Error::InvalidField)
         ));
+    }
+
+    #[test]
+    fn header_default_try_new_is_v1() {
+        let h = Header::new(
+            CipherSuite::Aes256Gcm,
+            KdfId::Argon2id,
+            4096,
+            HEADER_SIZE as u64,
+        );
+        assert_eq!(h.version_major, VERSION_MAJOR_V1);
+        assert!(!h.has_header_mirror());
+        assert!(!h.has_metadata_mirror());
+    }
+
+    #[test]
+    fn header_v2_roundtrip() {
+        let suite = CipherSuite::Aes256Gcm;
+        let mvk = MasterVolumeKey::from_bytes([0x77; 32]);
+        let mut header = Header::new(suite, KdfId::Argon2id, 4096, HEADER_SIZE as u64);
+        header.version_major = VERSION_MAJOR_V2;
+        header.flags |= FLAG_HAS_HEADER_MIRROR | FLAG_HAS_METADATA_MIRROR;
+        let slot = Keyslot::new_passphrase(
+            suite,
+            &mvk,
+            b"v2 vault",
+            Argon2idParams::TEST_ONLY,
+            &header.header_salt,
+        )
+        .unwrap();
+        header.install_slot(0, slot).unwrap();
+
+        let bytes = header.to_bytes(&mvk);
+        assert_eq!(&bytes[OFF_MAGIC..OFF_MAGIC + 8], &MAGIC_V2);
+
+        let parsed = Header::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.version_major, VERSION_MAJOR_V2);
+        assert!(parsed.has_header_mirror());
+        assert!(parsed.has_metadata_mirror());
+
+        let recovered = parsed.keyslots[0]
+            .unlock_passphrase(suite, b"v2 vault", &parsed.header_salt)
+            .unwrap();
+        parsed.verify_hmac(&bytes, &recovered).unwrap();
+    }
+
+    #[test]
+    fn header_v1_magic_with_v2_version_field_rejected() {
+        // A vault built with LUKSBOX1 magic but a version_major of 2
+        // in the structured field is an inconsistent on-disk state.
+        // Reject it so neither half of the encoding can be used to
+        // smuggle the other through.
+        let mut bytes = well_formed_header_bytes();
+        bytes[OFF_VER_MAJOR..OFF_VER_MAJOR + 2].copy_from_slice(&VERSION_MAJOR_V2.to_le_bytes());
+        assert!(matches!(
+            Header::from_bytes(&bytes),
+            Err(Error::UnsupportedVersion { .. })
+        ));
+    }
+
+    #[test]
+    fn header_unknown_magic_still_rejected() {
+        let mut bytes = [0u8; HEADER_SIZE];
+        bytes[..8].copy_from_slice(b"LUKSBOX3");
+        assert!(matches!(
+            Header::from_bytes(&bytes),
+            Err(Error::InvalidMagic)
+        ));
+    }
+
+    #[test]
+    fn header_mirror_flag_bits_disjoint() {
+        // Guard against an accidental collision with the existing
+        // privacy-padding flag bits.
+        assert_ne!(
+            FLAG_HAS_HEADER_MIRROR & FLAG_PAD_FILES_POW2,
+            FLAG_HAS_HEADER_MIRROR
+        );
+        assert_ne!(
+            FLAG_HAS_HEADER_MIRROR & FLAG_HIDE_SIZE_HEADER,
+            FLAG_HAS_HEADER_MIRROR
+        );
+        assert_ne!(
+            FLAG_HAS_METADATA_MIRROR & FLAG_PAD_FILES_POW2,
+            FLAG_HAS_METADATA_MIRROR
+        );
+        assert_ne!(
+            FLAG_HAS_METADATA_MIRROR & FLAG_HIDE_SIZE_HEADER,
+            FLAG_HAS_METADATA_MIRROR
+        );
+        assert_ne!(FLAG_HAS_HEADER_MIRROR, FLAG_HAS_METADATA_MIRROR);
+    }
+
+    #[test]
+    fn header_max_metadata_size_is_64_mib() {
+        // Pin the cap so any future change is intentional. The plan
+        // raises it from 16 MiB (v0.2.0) to 64 MiB to fit large-vault
+        // chunk-ref tables without spilling to ENOSPC.
+        assert_eq!(MAX_METADATA_SIZE, 64 << 20);
     }
 }
