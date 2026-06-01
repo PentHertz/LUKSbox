@@ -7082,7 +7082,7 @@ impl LuksboxApp {
 // ---- pending overlay + modals + toasts -----------------------------------
 
 impl LuksboxApp {
-    fn draw_pending_overlay(&self, ctx: &egui::Context) {
+    fn draw_pending_overlay(&mut self, ctx: &egui::Context) {
         let Some(p) = &self.pending else { return };
         // Fido2Probe is a silent background poke at libfido2 to
         // refresh the sidebar device picker, never block the UI for
@@ -7093,9 +7093,32 @@ impl LuksboxApp {
         }
         let needs_touch = p.needs_touch();
         let label = p.label();
+        let headline = p.headline();
         // Drive a continuous repaint while the overlay is up so the
         // pulse animation and pending channels both stay live.
         ctx.request_repaint_after(Duration::from_millis(40));
+
+        // Cancel signal flag: set by either the Cancel button or
+        // the Esc key. Applied after the overlay closure returns to
+        // avoid borrowing self mutably from inside the show()
+        // closure. Without a cancel path the user gets STUCK on the
+        // "touch your authenticator" overlay if libfido2 / the USB
+        // HID stack drops a button press (real-world Fedora report
+        // where 5+ retries + GUI restarts were needed to get a
+        // touch through). Cancel ALWAYS works and detaches the UI
+        // from the in-flight FIDO2 op; the background thread runs
+        // to completion on its own time but the user is free.
+        let mut cancel_requested = false;
+        // Esc cancels too. Checked outside the overlay so the input
+        // probe runs even if the Area is hot-blocking other input.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel_requested = true;
+        }
+
+        // Need a height bump on the touch panel to fit the Cancel
+        // button row underneath the prompt without crowding the
+        // pulsing dot.
+        let panel_h = if needs_touch { 230.0 } else { 130.0 };
 
         egui::Area::new(egui::Id::new("pending-overlay"))
             .fixed_pos(egui::pos2(0.0, 0.0))
@@ -7106,7 +7129,7 @@ impl LuksboxApp {
                 ui.painter()
                     .rect_filled(rect, 0.0, Color32::from_black_alpha(190));
                 let center = rect.center();
-                let panel_size = Vec2::new(420.0, if needs_touch { 180.0 } else { 130.0 });
+                let panel_size = Vec2::new(420.0, panel_h);
                 let panel_rect = egui::Rect::from_center_size(center, panel_size);
                 ui.painter()
                     .rect_filled(panel_rect, CornerRadius::same(12), theme::PANEL);
@@ -7143,13 +7166,37 @@ impl LuksboxApp {
                                     .circle_filled(dot_rect.center(), 10.0, theme::ACCENT);
                                 ui.add_space(8.0);
                                 ui.label(
-                                    RichText::new(p.headline())
+                                    RichText::new(headline)
                                         .strong()
                                         .color(theme::ACCENT)
                                         .size(15.0),
                                 );
                                 ui.add_space(4.0);
                                 ui.label(RichText::new(label).color(theme::DIM).size(12.0));
+                                // Cancel button + Esc hint. Only
+                                // shown for touch-blocking ops since
+                                // non-touch pending ops (file copy,
+                                // probe, etc.) typically finish in
+                                // milliseconds and a cancel button
+                                // would just confuse the spinner UX.
+                                ui.add_space(12.0);
+                                if ui
+                                    .add_sized([160.0, 28.0], egui::Button::new("Cancel"))
+                                    .on_hover_text(
+                                        "Stop waiting for the authenticator. The unlock attempt \
+                                         is detached; the background FIDO2 call finishes on its \
+                                         own (you can ignore any late device blink).",
+                                    )
+                                    .clicked()
+                                {
+                                    cancel_requested = true;
+                                }
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new("(Esc also cancels)")
+                                        .color(theme::FAINT)
+                                        .size(11.0),
+                                );
                             } else {
                                 ui.add(egui::Spinner::new().color(theme::ACCENT).size(28.0));
                                 ui.add_space(8.0);
@@ -7159,6 +7206,16 @@ impl LuksboxApp {
                     },
                 );
             });
+
+        if cancel_requested {
+            // Drop the receiver: the background thread's send to
+            // this channel will fail silently, the thread frees its
+            // FIDO2 / TPM resources on its own exit. We just stop
+            // listening. UI returns to whatever view we were on
+            // before (Unlock form / Browser).
+            self.pending = None;
+            self.toast_warn("cancelled, returning to previous view");
+        }
     }
 
     fn draw_modals(&mut self, ctx: &egui::Context) {
