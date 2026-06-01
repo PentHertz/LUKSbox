@@ -529,6 +529,20 @@ enum Command {
         /// rejected if combined with an explicit mountpoint.
         #[arg(long)]
         private_mount: bool,
+        /// Restore pre-v0.2.2 eager-flush durability semantics: every
+        /// metadata-changing FUSE op (create / mkdir / unlink / rmdir
+        /// / rename / setattr / symlink / link / close) drives an
+        /// immediate `Vfs::flush`, guaranteeing the change is durable
+        /// on disk before the syscall returns. Defaults to off in
+        /// v0.2.2+, which defers flushes to a background timer and
+        /// to explicit `fsync(2)` calls (matches ext4 / btrfs /
+        /// xfs commit-interval semantics). Pass `--sync` if you need
+        /// every operation to be crash-durable on return; the cost
+        /// is roughly proportional to vault file count (a vault
+        /// with thousands of files can take minutes per op in sync
+        /// mode, hence the v0.2.2 default change).
+        #[arg(long)]
+        sync: bool,
     },
     /// Subprocess-isolated FUSE-T mount helper. Reads a 32-byte
     /// MasterVolumeKey from stdin and uses it to open the vault
@@ -643,6 +657,11 @@ enum Command {
         #[arg(long)]
         anchor: Option<PathBuf>,
         mountpoint: PathBuf,
+        /// See `luksbox mount --sync`. Restores pre-v0.2.2
+        /// eager-flush semantics; defaults to deferred. Same
+        /// trade-off as the standard mount.
+        #[arg(long)]
+        sync: bool,
     },
     /// Open a deniable-header file and print the inner-header
     /// fields. Use to verify the header is openable with the supplied
@@ -1157,12 +1176,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             foreground,
             mountpoint,
             private_mount,
+            sync,
         } => cmd_mount(
             &path,
             &unlock,
             foreground,
             mountpoint.as_deref(),
             private_mount,
+            sync,
         ),
         Command::MountFuseTHelper {
             vault,
@@ -1202,6 +1223,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             foreground,
             anchor,
             mountpoint,
+            sync,
         } => cmd_deniable_mount(
             &path,
             &cipher,
@@ -1213,6 +1235,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             foreground,
             anchor.as_deref(),
             &mountpoint,
+            sync,
         ),
         Command::DeniableInfo {
             path,
@@ -4701,6 +4724,7 @@ fn cmd_mount(
     foreground: bool,
     mountpoint: Option<&Path>,
     private_mount: bool,
+    sync_mode: bool,
 ) -> Result<()> {
     // Resolve mountpoint:
     //   --private-mount + no explicit path -> derive ~/Library/LUKSbox/Mounts/<vault-name>
@@ -4887,7 +4911,7 @@ fn cmd_mount(
             mp_abs.display(),
         );
     }
-    luksbox_mount::mount(vfs, &mp_abs, !foreground)?;
+    luksbox_mount::mount(vfs, &mp_abs, !foreground, sync_mode)?;
     Ok(())
 }
 
@@ -5138,7 +5162,9 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
     // Run the FUSE event loop in foreground (no daemonize). The
     // parent process polls our exit status; daemonizing here would
     // leave the parent unable to detect mount-end.
-    luksbox_mount::mount(vfs, &mp_abs, false)
+    // sync_mode = false: FUSE-T helper inherits the GUI's default;
+    // FUSE-T's mount() ignores the flag for v0.2.2 anyway.
+    luksbox_mount::mount(vfs, &mp_abs, false, false)
         .map_err(|e| format!("mount {}: {e}", mp_abs.display()))?;
     eprintln!("luksbox-mount-helper: mount returned cleanly, exiting");
     Ok(())
@@ -5377,6 +5403,7 @@ fn cmd_deniable_mount(
     foreground: bool,
     anchor: Option<&Path>,
     mountpoint: &Path,
+    sync_mode: bool,
 ) -> Result<()> {
     use luksbox_format::anchor as anchor_mod;
     use luksbox_vfs::Vfs;
@@ -5450,7 +5477,7 @@ fn cmd_deniable_mount(
             }
         }
     }
-    luksbox_mount::mount(vfs, &mp_abs, !foreground)?;
+    luksbox_mount::mount(vfs, &mp_abs, !foreground, sync_mode)?;
     Ok(())
 }
 

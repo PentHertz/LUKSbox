@@ -1026,8 +1026,20 @@ fn mount_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
             }
         }
     }
+    // Eager-flush opt-in. Default OFF (v0.2.2 fast deferred-flush).
+    // The default makes vaults with thousands of files usable; ticking
+    // this restores the per-op crash-durable semantics of pre-v0.2.2
+    // (slow on big vaults, every metadata op fsync's). Matches the
+    // `--sync` CLI flag and the GUI's "Eager flush (--sync)" checkbox.
+    let sync_mode = Confirm::with_theme(theme)
+        .with_prompt(
+            "Eager flush? (every metadata op crash-durable on return; SLOW on \
+             vaults with thousands of files -- default is no)",
+        )
+        .default(false)
+        .interact()?;
     println!("OK mounting at {}", mp_abs.display());
-    luksbox_mount::mount(vfs, &mp_abs, false)?;
+    luksbox_mount::mount(vfs, &mp_abs, false, sync_mode)?;
     Ok(())
 }
 
@@ -3565,7 +3577,16 @@ fn mount_action(theme: &ColorfulTheme, vfs: Vfs, vault: &Path) -> Result<()> {
             mp_abs.display(),
         );
     }
-    luksbox_mount::mount(vfs, &mp_abs, daemonize)?;
+    // Eager-flush opt-in. Same prompt + default as the open-and-mount
+    // path above; see the comment there for the trade-off rationale.
+    let sync_mode = Confirm::with_theme(theme)
+        .with_prompt(
+            "Eager flush? (every metadata op crash-durable on return; SLOW on \
+             vaults with thousands of files -- default is no)",
+        )
+        .default(false)
+        .interact()?;
+    luksbox_mount::mount(vfs, &mp_abs, daemonize, sync_mode)?;
     Ok(())
 }
 

@@ -962,6 +962,14 @@ pub struct LuksboxApp {
     /// Triggers the confirm-forget modal. The path is the recent
     /// entry to remove; cleared on Cancel or after Forget runs.
     pending_forget_recent: Option<PathBuf>,
+    /// When true, the next `start_mount_picker` invocation passes
+    /// `sync_mode = true` to `luksbox_mount::mount`, restoring the
+    /// pre-v0.2.2 eager-flush semantics for this mount session.
+    /// Surfaced as a checkbox in the Browser view next to the Mount
+    /// button. Off by default (matches v0.2.2's fast deferred-flush
+    /// behavior). Per-vault-session, not persisted across opens --
+    /// the user explicitly re-ticks each time they want eager flush.
+    mount_sync_mode: bool,
     passgen_dialog: Option<PassgenDialog>,
     add_passphrase_modal: Option<AddPassphraseForm>,
     /// PIN typed into the "add FIDO2 keyslot" modal. Wrapped in
@@ -1319,6 +1327,7 @@ impl LuksboxApp {
             tested_size_advisory_shown: false,
             recovery_report: None,
             pending_forget_recent: None,
+            mount_sync_mode: false,
             passgen_dialog: None,
             add_passphrase_modal: None,
             add_fido2_pin_modal: None,
@@ -5371,6 +5380,23 @@ impl LuksboxApp {
                 {
                     self.start_mount_picker(false);
                 }
+                // Eager-flush toggle: matches the CLI `--sync` flag.
+                // Default OFF (v0.2.2 fast deferred-flush behavior).
+                // Tick before clicking Mount as volume to restore
+                // pre-v0.2.2 per-op crash durability for the next
+                // mount session.
+                ui.checkbox(&mut self.mount_sync_mode, "Eager flush (--sync)")
+                    .on_hover_text(
+                        "Restore pre-v0.2.2 durability: every metadata-changing op \
+                     (create / unlink / rmdir / rename / chmod / close) drives \
+                     an immediate flush, guaranteeing the change is on disk \
+                     before the syscall returns. Default is OFF (deferred \
+                     flush via a 30-second timer, matches ext4 / btrfs \
+                     commit-interval semantics). Eager flush makes vaults \
+                     with thousands of files unusably slow -- tick this only \
+                     for small vaults or workflows where you need every op \
+                     to be crash-durable on return.",
+                    );
                 // Private mount button: macOS-only because that's the
                 // platform where the FUSE-T NFS-loopback model exposes
                 // the mountpoint name (under /Volumes) to every local
@@ -5819,9 +5845,14 @@ impl LuksboxApp {
         } else {
             let mp_clone = mountpoint.clone();
             let (tx, rx) = std::sync::mpsc::channel();
+            // Snapshot the user's sync-mode preference at the moment
+            // they clicked Mount. Resetting it post-mount means the
+            // checkbox state doesn't bleed into the next mount.
+            let sync_mode = self.mount_sync_mode;
+            self.mount_sync_mode = false;
             std::thread::spawn(move || {
-                let r =
-                    luksbox_mount::mount(opened.vfs, &mp_clone, false).map_err(|e| e.to_string());
+                let r = luksbox_mount::mount(opened.vfs, &mp_clone, false, sync_mode)
+                    .map_err(|e| e.to_string());
                 let _ = tx.send(r);
             });
             MountBackend::InProcess { rx }

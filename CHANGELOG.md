@@ -30,6 +30,60 @@ sidecar mirror envelope. Vaults that already lost chunk-list
 blocks to this bug are NOT recovered by upgrading; this release
 only prevents future occurrences.
 
+### Performance
+
+- **Deferred metadata flush ("Layer 1") on Linux libfuse3 mounts.**
+  Pre-v0.2.2, every metadata-changing FUSE op (create, mkdir,
+  unlink, rmdir, rename, setattr, symlink, link, FUSE flush/release)
+  drove an immediate synchronous `Vfs::flush`, which on v0.2.1+
+  vaults rewrote the entire 64 MiB metadata mirror and live region
+  plus re-spilled every inode's chunk-list chain. On a 10k-file
+  vault this could make a single `rm` of one small file take
+  **3+ minutes** (real-user report on Linux Mint). v0.2.2 changes
+  the default: those ops mark the in-memory tree dirty and return
+  immediately, and a background `luksbox-flush-timer` thread (one
+  per mount) drives a `Vfs::flush` every 30 seconds when dirty.
+  Explicit `fsync(2)` / `fsyncdir(2)` syscalls remain eagerly
+  synchronous (POSIX-required). Final flush on unmount via the
+  FUSE `destroy()` callback also stays eager. The net effect on
+  the user's bug-report scenario: `rm` returns in milliseconds,
+  `cp -r 10k_files` completes in seconds instead of hours.
+
+  Durability model matches ext4 / btrfs / xfs commit intervals: a
+  crash without an explicit `fsync` can lose up to 30 seconds of
+  metadata changes. The on-disk encrypted bytes that ARE flushed
+  retain the v0.2.2 mirror-protocol durability fence (chunk-list
+  blocks are durable before the mirror commits), so the
+  post-flush state is still crash-consistent. Anti-rollback /
+  anchor sidecar semantics are unchanged: the anchor lags behind
+  the in-memory generation counter by up to the timer interval,
+  but catches up on every flush. Keyslot revocation is unaffected
+  (`revoke()` calls `persist_header` independently of `vfs.flush`).
+
+  **`luksbox mount --sync`** (also accepted on `deniable-mount`)
+  restores the pre-v0.2.2 eager-flush semantics for users whose
+  threat model requires every operation to be durable on return.
+  Workload cost is proportional to total file count; recommended
+  only for small vaults or specific durability-critical workflows.
+
+  **Wizard (TUI):** the open-and-mount and post-create mount flows
+  now prompt `"Eager flush? (every metadata op crash-durable on
+  return; SLOW on vaults with thousands of files -- default is
+  no)"`. Default is no (matches the CLI default).
+
+  **GUI:** the Browser view shows an `Eager flush (--sync)`
+  checkbox next to the `Mount as volume...` button, with a hover
+  tooltip explaining the trade-off. Default off; per-mount, not
+  persisted across vault sessions (the checkbox resets to off
+  after each mount).
+
+  Scope: this change affects Linux libfuse3 mounts only for v0.2.2.
+  macOS FUSE-T (`fuse_t.rs`) and Windows WinFsp (`winfsp.rs`) retain
+  their pre-v0.2.2 flush behavior; their `mount()` entry points
+  accept the new `sync_mode` parameter for forward compat but
+  ignore it. macFUSE on macOS shares `fuse.rs` with Linux libfuse3
+  and gets the deferred-flush behavior automatically.
+
 ### Fixed
 
 - **Durability hole in the v0.2.1 mirror protocol** (CVE-class

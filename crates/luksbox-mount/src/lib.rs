@@ -290,7 +290,13 @@ pub fn mount<P: AsRef<Path>>(
     vfs: luksbox_vfs::Vfs,
     mountpoint: P,
     daemonize: bool,
+    sync_mode: bool,
 ) -> Result<(), MountError> {
+    // FUSE-T's mount() does not yet plumb sync_mode through the C
+    // trampoline; v0.2.2 deferred-flush optimisation lives in the
+    // libfuse3 (Linux) handler. macOS users opt in by mounting via
+    // macFUSE instead (which goes through the cfg branch below).
+    let _ = sync_mode;
     fuse_t::mount(vfs, mountpoint.as_ref(), daemonize)?;
     Ok(())
 }
@@ -304,8 +310,9 @@ pub fn mount<P: AsRef<Path>>(
     vfs: luksbox_vfs::Vfs,
     mountpoint: P,
     daemonize: bool,
+    sync_mode: bool,
 ) -> Result<(), MountError> {
-    fuse::mount(vfs, mountpoint.as_ref(), daemonize)?;
+    fuse::mount(vfs, mountpoint.as_ref(), daemonize, sync_mode)?;
     Ok(())
 }
 
@@ -314,7 +321,12 @@ pub fn mount<P: AsRef<Path>>(
     vfs: luksbox_vfs::Vfs,
     mountpoint: P,
     _daemonize: bool,
+    sync_mode: bool,
 ) -> Result<(), MountError> {
+    // WinFsp's session API doesn't yet take the sync_mode hint; the
+    // deferred-flush change is libfuse3-only for v0.2.2. The flag is
+    // accepted at the API surface for forward compat.
+    let _ = sync_mode;
     winfsp::mount(vfs, mountpoint.as_ref())
 }
 
@@ -328,6 +340,7 @@ pub fn mount<P: AsRef<Path>>(
     _vfs: luksbox_vfs::Vfs,
     _mountpoint: P,
     _daemonize: bool,
+    _sync_mode: bool,
 ) -> Result<(), MountError> {
     Err(MountError::Unsupported)
 }
