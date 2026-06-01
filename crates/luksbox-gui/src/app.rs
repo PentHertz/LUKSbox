@@ -371,6 +371,13 @@ struct UnlockForm {
     use_deniable: bool,
     deniable_cipher: CipherChoice,
     deniable_kdf: KdfStrength,
+    /// Recovery mode (read-only): when set, `Vfs::open` will install
+    /// inodes whose chunk-list chain fails AEAD as zero-byte
+    /// placeholders and continue, instead of refusing the whole
+    /// vault. Used to copy out healthy files when the metadata is
+    /// partially corrupt (e.g. the v0.2.1 durability-hole symptom).
+    /// Vault is flagged read-only; writes / flush refuse.
+    recovery_mode: bool,
 }
 
 impl Default for UnlockForm {
@@ -390,6 +397,7 @@ impl Default for UnlockForm {
             use_deniable: false,
             deniable_cipher: CipherChoice::AesSiv,
             deniable_kdf: KdfStrength::Interactive,
+            recovery_mode: false,
         }
     }
 }
@@ -936,6 +944,12 @@ pub struct LuksboxApp {
     /// `lock_and_drop_vault`) so a freshly-opened oversized vault
     /// still surfaces the heads-up exactly once per session.
     tested_size_advisory_shown: bool,
+    /// Set after a successful recovery-mode open when at least one
+    /// inode was tolerated. The browser view renders a modal listing
+    /// the broken files (inode id, original size, path, AEAD-failure
+    /// reason). Cleared when the user dismisses the modal or locks
+    /// the vault.
+    recovery_report: Option<Vec<luksbox_vfs::ToleratedInode>>,
     passgen_dialog: Option<PassgenDialog>,
     add_passphrase_modal: Option<AddPassphraseForm>,
     /// PIN typed into the "add FIDO2 keyslot" modal. Wrapped in
@@ -1291,6 +1305,7 @@ impl LuksboxApp {
             toasts: Vec::new(),
             metadata_warned_pct: 0,
             tested_size_advisory_shown: false,
+            recovery_report: None,
             passgen_dialog: None,
             add_passphrase_modal: None,
             add_fido2_pin_modal: None,
@@ -1749,11 +1764,21 @@ impl LuksboxApp {
                     let has_fido2 = opened.has_fido2;
                     let has_hybrid_pq = opened.has_hybrid_pq;
                     let has_tpm = opened.has_tpm;
+                    // Capture the tolerated-inode list BEFORE moving
+                    // `opened` into `self.vault`. If non-empty, the
+                    // user opened in recovery mode AND the vault had
+                    // chunk-list-block AEAD failures we skipped: show
+                    // them the list in a modal so they know which
+                    // files were lost.
+                    let tolerated = opened.tolerated_inodes.clone();
                     self.vault = Some(opened);
                     self.cwd = "/".into();
                     self.refresh_listing();
                     self.view = View::Browser;
                     self.unlock = UnlockForm::default();
+                    if !tolerated.is_empty() {
+                        self.recovery_report = Some(tolerated);
+                    }
                     recent::upsert(RecentVault {
                         path,
                         header_path,
@@ -2471,6 +2496,7 @@ impl LuksboxApp {
             use_deniable: false,
             deniable_cipher,
             deniable_kdf: KdfStrength::Interactive,
+            recovery_mode: false,
         };
         self.view = View::Unlock;
     }
@@ -2494,6 +2520,10 @@ impl LuksboxApp {
         self.metadata_warned_pct = 0;
         // Same one-shot reset for the tested-boundary advisory.
         self.tested_size_advisory_shown = false;
+        // Dismiss any leftover recovery-mode report so the next
+        // vault doesn't inherit the previous vault's broken-file
+        // list.
+        self.recovery_report = None;
     }
 
     /// Entry point for any UI action that would abandon the
@@ -4459,6 +4489,29 @@ impl LuksboxApp {
                     }
                 });
             }
+            // Recovery-mode toggle. When set, Vfs::open will install
+            // any inode whose chunk-list chain fails AEAD as a
+            // 0-byte placeholder instead of refusing the whole
+            // vault, so the user can copy out healthy files when
+            // metadata is partially corrupt. Vault is flagged
+            // read-only; writes/flush refuse. Use only when a
+            // normal open just failed with the v0.2.1 "metadata
+            // blob deserialization failed" symptom -- see
+            // CHANGELOG v0.2.2.
+            ui.add_space(6.0);
+            ui.checkbox(
+                &mut self.unlock.recovery_mode,
+                "Recovery mode (read-only, skips broken files)",
+            )
+            .on_hover_text(
+                "Use ONLY when a normal open failed with 'metadata blob \
+                 deserialization failed'. The vault is opened read-only \
+                 with broken files replaced by 0-byte placeholders, so \
+                 you can copy out everything that's still readable. \
+                 Writes / flush are refused. After open, you'll see a \
+                 list of the files that were lost.",
+            );
+
             // Deniable-mode unlock toggle. When set, the cipher +
             // KDF dropdowns below are required (the user must have
             // recorded them at create time). Mutually exclusive
@@ -5130,6 +5183,7 @@ impl LuksboxApp {
                 CipherChoice::Chacha => luksbox_core::CipherSuite::ChaCha20Poly1305,
             },
             deniable_kdf: self.unlock.deniable_kdf,
+            recovery_mode: self.unlock.recovery_mode,
         };
         let needs_touch = matches!(
             opts.method,
@@ -7002,6 +7056,7 @@ impl LuksboxApp {
         self.draw_empty_passphrase_confirm_modal(ctx);
         self.draw_deniable_modal(ctx);
         self.draw_deniable_recovery_modal(ctx);
+        self.draw_recovery_report_modal(ctx);
 
         // Add-passphrase modal
         let mut close_pp = false;
@@ -8985,6 +9040,99 @@ impl LuksboxApp {
             }
         } else if cancelled {
             self.pending_clipboard_warning = None;
+        }
+    }
+
+    fn draw_recovery_report_modal(&mut self, ctx: &egui::Context) {
+        let Some(report) = self.recovery_report.as_ref() else {
+            return;
+        };
+        let report = report.clone();
+        let mut dismiss = false;
+        let modal = egui::Modal::new(egui::Id::new("recovery-report-modal"))
+            .frame(
+                Frame::default()
+                    .fill(theme::PANEL)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(20),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(capped_width(ui, 640.0));
+                ui.label(
+                    RichText::new("Opened in recovery mode")
+                        .size(15.0)
+                        .strong()
+                        .color(theme::WARN),
+                );
+                ui.add_space(10.0);
+                ui.label(format!(
+                    "{} file(s) had unreadable chunk-list metadata and were \
+                     installed as 0-byte placeholders so the vault could be \
+                     mounted. These files are NOT recoverable from the live \
+                     data area. Everything else in the vault is intact.",
+                    report.len()
+                ));
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "The vault is mounted READ-ONLY: any write or flush \
+                         will be refused so the patched (lossy) tree never \
+                         overwrites the on-disk metadata. Copy what you \
+                         need out, then lock the vault.",
+                    )
+                    .color(theme::DIM)
+                    .small(),
+                );
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        for ti in &report {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}  ({} bytes lost)",
+                                    if ti.path.is_empty() {
+                                        "<unreachable>"
+                                    } else {
+                                        ti.path.as_str()
+                                    },
+                                    ti.original_size
+                                ))
+                                .monospace()
+                                .size(12.0),
+                            );
+                            if !ti.reason.is_empty() {
+                                ui.label(
+                                    RichText::new(format!("    {}", ti.reason))
+                                        .color(theme::DIM)
+                                        .small()
+                                        .monospace(),
+                                );
+                            }
+                            ui.add_space(2.0);
+                        }
+                    });
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+                if ui
+                    .add_sized(
+                        [capped_width(ui, 420.0), CONTROL_H],
+                        egui::Button::new("Got it"),
+                    )
+                    .clicked()
+                {
+                    dismiss = true;
+                }
+            });
+        if modal.backdrop_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            dismiss = true;
+        }
+        if dismiss {
+            self.recovery_report = None;
         }
     }
 

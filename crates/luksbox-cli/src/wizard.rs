@@ -3161,44 +3161,119 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
             .interact()?
     };
 
-    let mut cont = match options[pick] {
-        "Passphrase" => {
-            let pw = Password::with_theme(theme)
-                .with_prompt("Passphrase")
-                .interact()?;
-            Container::open(
-                &vault,
-                header_path.as_deref(),
-                UnlockMaterial::Passphrase(pw.as_bytes()),
-            )?
-        }
-        "FIDO2 authenticator" => unlock_via_fido2(theme, &vault, header_path.as_deref(), &header)?,
-        "Hybrid passphrase + ML-KEM (post-quantum)" => {
-            unlock_via_hybrid_pq(theme, &vault, header_path.as_deref())?
-        }
-        "Hybrid FIDO2 + ML-KEM (post-quantum)" => {
-            unlock_via_hybrid_pq_fido2(theme, &vault, header_path.as_deref(), &header)?
-        }
-        "TPM 2.0 (this machine)" => {
-            unlock_via_tpm2(theme, &vault, header_path.as_deref(), &header)?
-        }
-        "Fused TPM 2.0 + FIDO2" => {
-            unlock_via_tpm2_fido2(theme, &vault, header_path.as_deref(), &header)?
-        }
-        "Hybrid TPM 2.0 + ML-KEM (2-factor)" => {
-            unlock_via_hybrid_pq_tpm2(theme, &vault, header_path.as_deref(), &header)?
-        }
-        "Hybrid TPM 2.0 + FIDO2 + ML-KEM (3-factor)" => {
-            unlock_via_hybrid_pq_tpm2_fido2(theme, &vault, header_path.as_deref(), &header)?
-        }
-        _ => unreachable!(),
+    let pick_label = options[pick];
+    // Inline closure that runs the unlock-by-pick-label dispatch.
+    // Used once at first open; re-invoked if Vfs::open trips the
+    // metadata-deserialize path and the user opts into recovery mode
+    // (re-authentication is required because the first Container was
+    // consumed by the failed Vfs::open).
+    let do_unlock = || -> Result<Container> {
+        Ok(match pick_label {
+            "Passphrase" => {
+                let pw = Password::with_theme(theme)
+                    .with_prompt("Passphrase")
+                    .interact()?;
+                Container::open(
+                    &vault,
+                    header_path.as_deref(),
+                    UnlockMaterial::Passphrase(pw.as_bytes()),
+                )?
+            }
+            "FIDO2 authenticator" => {
+                unlock_via_fido2(theme, &vault, header_path.as_deref(), &header)?
+            }
+            "Hybrid passphrase + ML-KEM (post-quantum)" => {
+                unlock_via_hybrid_pq(theme, &vault, header_path.as_deref())?
+            }
+            "Hybrid FIDO2 + ML-KEM (post-quantum)" => {
+                unlock_via_hybrid_pq_fido2(theme, &vault, header_path.as_deref(), &header)?
+            }
+            "TPM 2.0 (this machine)" => {
+                unlock_via_tpm2(theme, &vault, header_path.as_deref(), &header)?
+            }
+            "Fused TPM 2.0 + FIDO2" => {
+                unlock_via_tpm2_fido2(theme, &vault, header_path.as_deref(), &header)?
+            }
+            "Hybrid TPM 2.0 + ML-KEM (2-factor)" => {
+                unlock_via_hybrid_pq_tpm2(theme, &vault, header_path.as_deref(), &header)?
+            }
+            "Hybrid TPM 2.0 + FIDO2 + ML-KEM (3-factor)" => {
+                unlock_via_hybrid_pq_tpm2_fido2(theme, &vault, header_path.as_deref(), &header)?
+            }
+            _ => unreachable!(),
+        })
     };
+    let mut cont = do_unlock()?;
     let trusted_anchor_gen = if let Some(ap) = anchor_path.as_deref() {
         cont.set_anchor(Some(ap.to_path_buf()))?
     } else {
         None
     };
-    let vfs = Vfs::open(cont)?;
+    // Try the normal open. If the metadata-blob parse fails (the
+    // v0.2.1 durability-hole symptom; see CHANGELOG v0.2.2), offer
+    // the user a tolerant-recovery retry: re-authenticate, set the
+    // thread-local toleration flag, install broken inodes as
+    // 0-byte placeholders, mount the vault read-only, and print
+    // the list of files that were lost.
+    let mut tolerated_recovery_used = false;
+    let vfs = match Vfs::open(cont) {
+        Ok(v) => v,
+        Err(luksbox_vfs::Error::MetadataDeserialize) => {
+            eprintln!();
+            eprintln!(
+                "  WARN vault metadata parse failed -- the directory tree appears \
+                 corrupt or partially overwritten."
+            );
+            eprintln!(
+                "       This matches the v0.2.1 durability-hole symptom \
+                 (fixed in v0.2.2; see CHANGELOG)."
+            );
+            eprintln!();
+            let try_recovery = Confirm::with_theme(theme)
+                .with_prompt(
+                    "Try opening in recovery mode? (read-only, skips broken \
+                     files, you can copy out what's readable; you'll need to \
+                     re-authenticate)",
+                )
+                .default(true)
+                .interact()?;
+            if !try_recovery {
+                return Err("metadata blob deserialization failed".into());
+            }
+            // Re-unlock since the previous Container was consumed.
+            let mut cont2 = do_unlock()?;
+            if let Some(ap) = anchor_path.as_deref() {
+                cont2.set_anchor(Some(ap.to_path_buf()))?;
+            }
+            let _tolerate_guard = luksbox_vfs::set_tolerate_bad_chunk_lists(true);
+            let v = Vfs::open(cont2)?;
+            tolerated_recovery_used = true;
+            v
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if tolerated_recovery_used {
+        let toll = vfs.tolerated_inodes();
+        eprintln!();
+        eprintln!(
+            "  OK opened in recovery mode. {} broken file(s) installed as 0-byte placeholders:",
+            toll.len()
+        );
+        for ti in toll {
+            eprintln!(
+                "    inode={} kind={:?} original_size={} path={}",
+                ti.id, ti.kind, ti.original_size, ti.path
+            );
+            if !ti.reason.is_empty() {
+                eprintln!("        reason: {}", ti.reason);
+            }
+        }
+        eprintln!();
+        eprintln!(
+            "  Vault is mounted READ-ONLY. Use `luksbox get` or mount to copy out \
+             the surviving files. Writes / flush are refused while in recovery mode."
+        );
+    }
     if let Some(anchor_gen) = trusted_anchor_gen {
         match anchor::compare(anchor_gen, vfs.vault_generation()) {
             anchor::VerificationOutcome::Ok => {

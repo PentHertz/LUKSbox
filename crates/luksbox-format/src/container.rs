@@ -99,6 +99,100 @@ fn is_symlink(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Operation kinds recorded in the per-thread flush op log. Used by
+/// the v0.2.2 regression test to verify that `Container::sync_data_area`
+/// runs BEFORE `Container::write_metadata` during `Vfs::flush`, which
+/// is the load-bearing ordering for the mirror-protocol durability
+/// fence. Recording is unconditional but the overhead is negligible
+/// (one `Vec::push` per Container op).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum FlushOp {
+    SyncDataArea,
+    WriteMetadata,
+}
+
+/// Abstraction over the backing storage for the `.lbx` file. Real
+/// production code uses `std::fs::File`; the crash-impact test suite
+/// uses `SimFile` which models page-cache writes vs durable bytes and
+/// supports a `crash()` operation that reverts un-fsync'd writes.
+///
+/// Composes `std::io::{Read, Write, Seek}` and adds `sync_all` which is
+/// the durability primitive Container relies on (and which is NOT on
+/// the std I/O traits -- it's an inherent on `std::fs::File`).
+pub trait LbxFile: std::io::Read + std::io::Write + std::io::Seek + Send {
+    fn sync_all(&mut self) -> std::io::Result<()>;
+}
+
+impl LbxFile for std::fs::File {
+    fn sync_all(&mut self) -> std::io::Result<()> {
+        std::fs::File::sync_all(self)
+    }
+}
+
+std::thread_local! {
+    static FLUSH_OP_LOG: std::cell::RefCell<Vec<FlushOp>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn record_flush_op(op: FlushOp) {
+    FLUSH_OP_LOG.with(|log| log.borrow_mut().push(op));
+}
+
+/// Clear the per-thread flush op log. Tests call this immediately
+/// before the operation under test so prior unrelated flushes don't
+/// pollute the assertion.
+pub fn reset_flush_op_log() {
+    FLUSH_OP_LOG.with(|log| log.borrow_mut().clear());
+}
+
+/// Snapshot the per-thread flush op log. Tests inspect the returned
+/// vec to assert ordering of `sync_data_area` vs `write_metadata`.
+pub fn flush_op_log_snapshot() -> Vec<FlushOp> {
+    FLUSH_OP_LOG.with(|log| log.borrow().clone())
+}
+
+std::thread_local! {
+    /// Thread-local crash-injection point used by the SimFile-backed
+    /// durability impact test. When set, `Container::write_metadata`
+    /// returns an `Error::Io` AFTER the sidecar mirror has been
+    /// committed via `write_metadata_mirror` but BEFORE the live
+    /// metadata region is overwritten and `self.file.sync_all()`
+    /// is called. This models a real-world crash in the precise
+    /// fault window the v0.2.2 durability fence closes: mirror is
+    /// durably committed to the NEW state, but un-fsync'd writes
+    /// to the `.lbx` file (chunk-list blocks from the spill stage,
+    /// plus the live region overwrite still to come) are about to
+    /// be lost.
+    static CRASH_AFTER_MIRROR_TLS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard for the crash-after-mirror injection. Restores the
+/// previous value on drop. Test-only.
+pub struct CrashAfterMirrorGuard {
+    previous: bool,
+}
+
+impl Drop for CrashAfterMirrorGuard {
+    fn drop(&mut self) {
+        CRASH_AFTER_MIRROR_TLS.with(|c| c.set(self.previous));
+    }
+}
+
+/// Test-only: enable / disable the crash-after-mirror-commit
+/// injection on the current thread. Returns a guard that restores
+/// the previous value on drop. Set by the durability-impact test
+/// to verify the v0.2.2 fence saves chunk-list-block writes; never
+/// touched in production.
+pub fn set_crash_after_mirror_for_test(v: bool) -> CrashAfterMirrorGuard {
+    let previous = CRASH_AFTER_MIRROR_TLS.with(|c| c.replace(v));
+    CrashAfterMirrorGuard { previous }
+}
+
+fn crash_after_mirror_for_test() -> bool {
+    CRASH_AFTER_MIRROR_TLS.with(|c| c.get())
+}
+
 /// Open a path read+write while also enforcing optional TOCTOU-detection:
 /// if `expected_inode` is `Some`, verify the freshly-opened fd resolves
 /// to the same (device, inode) that a previous open captured. New open
@@ -362,7 +456,7 @@ pub enum UnlockMaterial<'a> {
 /// chunks.  Closing the container persists the header back to disk if it has
 /// been mutated (keyslot enroll/revoke).
 pub struct Container {
-    file: File,
+    file: Box<dyn LbxFile>,
     path: PathBuf,
     header_storage: HeaderStorage,
     pub header: Header,
@@ -673,7 +767,7 @@ impl Container {
         }
 
         Ok(Self {
-            file,
+            file: Box::new(file),
             path: path.to_path_buf(),
             header_storage,
             header,
@@ -1099,7 +1193,7 @@ impl Container {
         header_bytes_arr.copy_from_slice(&header_bytes);
 
         Ok(Self {
-            file,
+            file: Box::new(file),
             path: path.to_path_buf(),
             header_storage: HeaderStorage::Inline,
             header: synth_header,
@@ -1212,7 +1306,7 @@ impl Container {
         header_bytes_arr.copy_from_slice(&header_buf);
 
         Ok(Self {
-            file,
+            file: Box::new(file),
             path,
             header_storage: HeaderStorage::Inline,
             header: synth_header,
@@ -1550,7 +1644,7 @@ impl Container {
         }
 
         Ok(Self {
-            file,
+            file: Box::new(file),
             path: path.to_path_buf(),
             header_storage,
             header,
@@ -1579,7 +1673,7 @@ impl Container {
                 Ok(mvk)
             })?;
         Ok(Self {
-            file,
+            file: Box::new(file),
             path: path.to_path_buf(),
             header_storage,
             header,
@@ -1637,7 +1731,7 @@ impl Container {
         // hold the caller-supplied MVK and prefer that exact instance.
         let _ = recovered_mvk;
         Ok(Self {
-            file,
+            file: Box::new(file),
             path: path.to_path_buf(),
             header_storage,
             header,
@@ -1747,7 +1841,7 @@ impl Container {
         synth_header.header_salt = per_vault_salt;
 
         Ok(Self {
-            file,
+            file: Box::new(file),
             path: path.to_path_buf(),
             header_storage: HeaderStorage::Inline,
             header: synth_header,
@@ -2061,6 +2155,7 @@ impl Container {
     /// v0.2.0 in-place rewrite behavior until the auto-upgrade trigger
     /// in `Vfs::flush` bumps them to v2.
     pub fn write_metadata(&mut self, plaintext: &[u8]) -> Result<(), Error> {
+        record_flush_op(FlushOp::WriteMetadata);
         let region_size = self.header.metadata_size as usize;
         if plaintext.len() + METADATA_OVERHEAD > region_size {
             return Err(Error::MetadataTooLarge);
@@ -2104,6 +2199,19 @@ impl Container {
         // `v2_corrupted_live_after_revoke_does_not_unlock_via_mirror`.
         if self.is_v2_format() {
             self.write_metadata_mirror(&region)?;
+        }
+        // Test-only crash injection at the exact fault window the
+        // v0.2.2 durability fence closes: mirror is durably committed
+        // (above) but the live region overwrite + `sync_all()` below
+        // haven't run yet. SimFile-backed tests use this to simulate
+        // power loss here and verify the fence saved chunk-list-block
+        // writes by fsync'ing the `.lbx` file before this call (in
+        // `Vfs::flush::container.sync_data_area()`).
+        if crash_after_mirror_for_test() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "crash_after_mirror_for_test: simulated crash after mirror commit",
+            )));
         }
         self.file
             .seek(SeekFrom::Start(self.header.metadata_offset))?;
@@ -3009,6 +3117,39 @@ impl Container {
         self.file.flush().map_err(Into::into)
     }
 
+    /// Test-only: replace the backing `.lbx` file handle with a
+    /// different `LbxFile` implementation (typically a `SimFile` for
+    /// crash-impact tests). The replacement file MUST hold byte-
+    /// identical content to the file being replaced at every offset
+    /// the Container will read from -- the easiest way is to read
+    /// the original file into a Vec before swapping, then pass
+    /// `Box::new(SimFile::from_bytes(bytes))`. Returns the original
+    /// file so the caller can drop it (or stash it for a later
+    /// re-swap).
+    ///
+    /// Production code never calls this; it exists so the durability
+    /// fence regression test can intercept all subsequent I/O without
+    /// reaching the underlying disk.
+    pub fn swap_lbx_file_for_test(&mut self, new_file: Box<dyn LbxFile>) -> Box<dyn LbxFile> {
+        std::mem::replace(&mut self.file, new_file)
+    }
+
+    /// Fsync the .lbx file so any writes queued via `write_at`
+    /// (chunk data, chunk-list blocks) are durable on disk. Used as
+    /// a fence by the VFS flush path: chunk-list block writes MUST
+    /// be durable BEFORE the sidecar mirror (`.lbx.meta-bak`) commits
+    /// new chunks_external pointers. Without that fence a crash
+    /// between mirror-commit and the live-region fsync can leave
+    /// the mirror durable while chunk-list-block writes are still
+    /// in the page cache, producing a vault whose mirror says
+    /// "chunk-list block at slot X under generation G" while slot X
+    /// on disk still holds the pre-flush bytes. The reader's AEAD
+    /// then fails on every such block. Affects v0.2.1 vaults.
+    pub fn sync_data_area(&mut self) -> Result<(), Error> {
+        record_flush_op(FlushOp::SyncDataArea);
+        self.file.sync_all().map_err(Into::into)
+    }
+
     /// Set or clear the anchor sidecar path. With `Some`, reads and
     /// verifies the anchor file's HMAC under the MVK-derived anchor key,
     /// returning the trusted generation counter for the caller to compare
@@ -3212,7 +3353,7 @@ impl Container {
         }
         #[cfg(not(unix))]
         let tmp_file = OpenOptions::new().read(true).write(true).open(&tmp)?;
-        self.file = tmp_file;
+        self.file = Box::new(tmp_file);
         self.path = tmp.clone();
         self.rotation = Some(RotationState {
             tmp_data_path: tmp,
@@ -3300,7 +3441,7 @@ impl Container {
             .read(true)
             .write(true)
             .open(&state.committed_data_path)?;
-        self.file = original_file;
+        self.file = Box::new(original_file);
         self.path = state.committed_data_path;
 
         // Best-effort cleanup of the temp file.

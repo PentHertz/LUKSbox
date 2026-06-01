@@ -325,6 +325,15 @@ pub struct UnlockOpts {
     /// Argon2id strength preset the deniable vault was created with.
     /// Same wrong-value behaviour as `deniable_cipher`.
     pub deniable_kdf: KdfStrength,
+    /// Open in tolerant recovery mode (read-only). When set,
+    /// `Vfs::open` installs inodes whose chunk-list chain fails AEAD
+    /// as zero-byte placeholders and continues, instead of refusing
+    /// the whole vault. The resulting Vfs refuses flushes
+    /// (`Error::ReadOnlyMount`) so the patched tree never overwrites
+    /// the on-disk metadata. UI surfaces the broken-inode list via
+    /// `OpenedVault::tolerated_inodes`. Use only when a normal open
+    /// failed with `metadata blob deserialization failed`.
+    pub recovery_mode: bool,
 }
 
 // `Tpm2*` and `HybridPqTpm2*` variants are constructed only from
@@ -383,6 +392,13 @@ pub struct OpenedVault {
     /// MUST remember this path (or move the file elsewhere and
     /// remember where) to unlock later.
     pub deniable_tpm_blob_path: Option<PathBuf>,
+    /// Tolerant-recovery report: which inodes had their chunk-list
+    /// chain skipped during open. Empty for normal opens. Populated
+    /// when `UnlockOpts::recovery_mode == true` and the vault had
+    /// at least one chunk-list-block AEAD failure. The GUI surfaces
+    /// this as a modal listing the broken file paths + original
+    /// sizes after the open completes.
+    pub tolerated_inodes: Vec<luksbox_vfs::ToleratedInode>,
 }
 
 #[derive(Debug, Clone)]
@@ -611,6 +627,7 @@ pub fn create_vault_tpm2_only(
         has_tpm,
         deniable_fido2_recovery: None,
         deniable_tpm_blob_path,
+        tolerated_inodes: Vec::new(),
     })
 }
 
@@ -908,6 +925,7 @@ pub fn create_vault_with_tpm_factors_deniable(
         has_tpm: true,
         deniable_fido2_recovery,
         deniable_tpm_blob_path,
+        tolerated_inodes: Vec::new(),
     })
 }
 
@@ -1194,6 +1212,7 @@ pub fn create_vault_with_tpm_factors_only(
         has_tpm,
         deniable_fido2_recovery: None,
         deniable_tpm_blob_path: None,
+        tolerated_inodes: Vec::new(),
     })
 }
 
@@ -1830,6 +1849,7 @@ pub fn create_vault(opts: CreateOpts) -> Result<OpenedVault, String> {
         has_tpm,
         deniable_fido2_recovery: captured_fido2_recovery,
         deniable_tpm_blob_path: None,
+        tolerated_inodes: Vec::new(),
     })
 }
 
@@ -2398,7 +2418,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
         } else {
             None
         };
-        let vfs = luksbox_vfs::Vfs::open(cont).map_err(estr)?;
+        let vfs = open_vfs_with_optional_recovery(cont, opts.recovery_mode)?;
         if let Some(anchor_gen) = trusted_gen {
             match anchor::compare(anchor_gen, vfs.vault_generation()) {
                 anchor::VerificationOutcome::Ok
@@ -2415,6 +2435,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
                 }
             }
         }
+        let tolerated_inodes = vfs.tolerated_inodes().to_vec();
         return Ok(OpenedVault {
             vfs,
             vault_path: opts.path.clone(),
@@ -2426,6 +2447,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
             has_tpm: false,
             deniable_fido2_recovery: None,
             deniable_tpm_blob_path: None,
+            tolerated_inodes,
         });
     }
     let mut cont = match opts.method {
@@ -2529,7 +2551,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
     let has_hybrid_pq = header_has_hybrid_pq(&cont.header);
     let has_tpm = header_has_tpm(&cont.header);
     let cipher = cipher_label(cont.header.cipher_suite).to_string();
-    let vfs = Vfs::open(cont).map_err(estr)?;
+    let vfs = open_vfs_with_optional_recovery(cont, opts.recovery_mode)?;
     if let Some(anchor_gen) = trusted_gen {
         match anchor::compare(anchor_gen, vfs.vault_generation()) {
             anchor::VerificationOutcome::Ok | anchor::VerificationOutcome::AnchorStale { .. } => {}
@@ -2544,6 +2566,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
             }
         }
     }
+    let tolerated_inodes = vfs.tolerated_inodes().to_vec();
     Ok(OpenedVault {
         vfs,
         vault_path: opts.path,
@@ -2555,7 +2578,22 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
         has_tpm,
         deniable_fido2_recovery: None,
         deniable_tpm_blob_path: None,
+        tolerated_inodes,
     })
+}
+
+/// Helper used by both deniable and standard open paths: runs
+/// `Vfs::open(cont)` with the tolerate-bad-chunk-lists thread-local
+/// set if and only if `recovery_mode == true`. Returns the resulting
+/// Vfs; the `tolerated_inodes()` accessor on the Vfs carries the
+/// recovery report (empty for normal opens).
+fn open_vfs_with_optional_recovery(cont: Container, recovery_mode: bool) -> Result<Vfs, String> {
+    if recovery_mode {
+        let _g = luksbox_vfs::set_tolerate_bad_chunk_lists(true);
+        Vfs::open(cont).map_err(estr)
+    } else {
+        Vfs::open(cont).map_err(estr)
+    }
 }
 
 // ============================================================

@@ -2367,7 +2367,64 @@ fn open_container(path: &Path, unlock: &UnlockArgs) -> Result<Container> {
     } else if unlock.fido2 {
         open_container_fido2(path, unlock.header.as_deref())
     } else {
+        // Default route: passphrase. But if the vault has zero
+        // passphrase keyslots, prompting for a passphrase is a
+        // dead-end -- surface the right flag to use instead, with
+        // the actual keyslot kinds present so the user knows what
+        // to pass. Same UX pattern as the wizard, which auto-routes
+        // by inspecting the header.
+        let header_src = unlock.header.as_deref().unwrap_or(path);
+        if let Ok(mut f) = luksbox_core::file_util::open_existing_read_no_follow_policy(header_src)
+        {
+            let mut buf = [0u8; HEADER_SIZE];
+            if f.read_exact(&mut buf).is_ok() {
+                drop(f);
+                if let Ok(header) = Header::from_bytes(&buf) {
+                    let has_pp = header
+                        .keyslots
+                        .iter()
+                        .any(|s| s.kind == SlotKind::Passphrase);
+                    if !has_pp {
+                        let suggestion = pick_unlock_suggestion(&header.keyslots);
+                        return Err(format!(
+                            "vault has no passphrase keyslot; rerun with {suggestion}"
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
         open_container_passphrase(path, unlock.header.as_deref())
+    }
+}
+
+/// Inspect a vault's keyslots and return the flag string the user
+/// should rerun with (e.g. `--fido2`, `--tpm2`, `--tpm2-fido2`).
+fn pick_unlock_suggestion(keyslots: &[luksbox_core::Keyslot]) -> &'static str {
+    let any_fido2 = keyslots.iter().any(|s| {
+        matches!(
+            s.kind,
+            SlotKind::Fido2HmacSecret | SlotKind::Fido2DerivedMvk
+        )
+    });
+    let any_tpm2 = keyslots.iter().any(|s| s.kind == SlotKind::Tpm2Sealed);
+    let any_tpm2_fido = keyslots.iter().any(|s| s.kind == SlotKind::Tpm2Fido2);
+    let any_hybrid = keyslots.iter().any(|s| {
+        s.kind.is_hybrid_pq_passphrase()
+            || s.kind.is_hybrid_pq_fido2()
+            || s.kind == SlotKind::HybridPqKemTpm2
+            || s.kind == SlotKind::HybridPqKemTpm2Fido2
+    });
+    if any_tpm2_fido {
+        "--tpm2-fido2"
+    } else if any_tpm2 {
+        "--tpm2"
+    } else if any_fido2 {
+        "--fido2"
+    } else if any_hybrid {
+        "--pq-hybrid <PATH-TO-.kyber>"
+    } else {
+        "an appropriate unlock flag (see `luksbox info <vault>` for the keyslot kinds)"
     }
 }
 
@@ -2590,7 +2647,16 @@ fn open_container_fido2(path: &Path, header_path: Option<&Path>) -> Result<Conta
     let mut last_err: Option<Box<dyn StdError>> = None;
     let mut tried = 0usize;
     for slot in &header.keyslots {
-        if slot.kind != SlotKind::Fido2HmacSecret {
+        // Accept BOTH FIDO2 keyslot kinds:
+        //   - Fido2HmacSecret: hmac-secret output unwraps the wrapped MVK
+        //   - Fido2DerivedMvk: hmac-secret output IS the MVK (direct)
+        // The format layer dispatches by `kind` inside
+        // `UnlockMaterial::Fido2` (container.rs:3482-3494) so we can
+        // hand it the same `Fido2` payload for either kind.
+        if !matches!(
+            slot.kind,
+            SlotKind::Fido2HmacSecret | SlotKind::Fido2DerivedMvk
+        ) {
             continue;
         }
         tried += 1;
