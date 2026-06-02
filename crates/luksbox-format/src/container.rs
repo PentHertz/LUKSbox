@@ -103,8 +103,9 @@ fn is_symlink(path: &Path) -> bool {
 /// the v0.2.2 regression test to verify that `Container::sync_data_area`
 /// runs BEFORE `Container::write_metadata` during `Vfs::flush`, which
 /// is the load-bearing ordering for the mirror-protocol durability
-/// fence. Recording is unconditional but the overhead is negligible
-/// (one `Vec::push` per Container op).
+/// fence. Only present (and only recorded) when the `test-injection`
+/// feature is on; production / release builds compile this out.
+#[cfg(feature = "test-injection")]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum FlushOp {
     SyncDataArea,
@@ -129,11 +130,13 @@ impl LbxFile for std::fs::File {
     }
 }
 
+#[cfg(feature = "test-injection")]
 std::thread_local! {
     static FLUSH_OP_LOG: std::cell::RefCell<Vec<FlushOp>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+#[cfg(feature = "test-injection")]
 fn record_flush_op(op: FlushOp) {
     FLUSH_OP_LOG.with(|log| log.borrow_mut().push(op));
 }
@@ -141,16 +144,19 @@ fn record_flush_op(op: FlushOp) {
 /// Clear the per-thread flush op log. Tests call this immediately
 /// before the operation under test so prior unrelated flushes don't
 /// pollute the assertion.
+#[cfg(feature = "test-injection")]
 pub fn reset_flush_op_log() {
     FLUSH_OP_LOG.with(|log| log.borrow_mut().clear());
 }
 
 /// Snapshot the per-thread flush op log. Tests inspect the returned
 /// vec to assert ordering of `sync_data_area` vs `write_metadata`.
+#[cfg(feature = "test-injection")]
 pub fn flush_op_log_snapshot() -> Vec<FlushOp> {
     FLUSH_OP_LOG.with(|log| log.borrow().clone())
 }
 
+#[cfg(feature = "test-injection")]
 std::thread_local! {
     /// Thread-local crash-injection point used by the SimFile-backed
     /// durability impact test. When set, `Container::write_metadata`
@@ -169,10 +175,12 @@ std::thread_local! {
 
 /// RAII guard for the crash-after-mirror injection. Restores the
 /// previous value on drop. Test-only.
+#[cfg(feature = "test-injection")]
 pub struct CrashAfterMirrorGuard {
     previous: bool,
 }
 
+#[cfg(feature = "test-injection")]
 impl Drop for CrashAfterMirrorGuard {
     fn drop(&mut self) {
         CRASH_AFTER_MIRROR_TLS.with(|c| c.set(self.previous));
@@ -184,13 +192,21 @@ impl Drop for CrashAfterMirrorGuard {
 /// the previous value on drop. Set by the durability-impact test
 /// to verify the v0.2.2 fence saves chunk-list-block writes; never
 /// touched in production.
+#[cfg(feature = "test-injection")]
 pub fn set_crash_after_mirror_for_test(v: bool) -> CrashAfterMirrorGuard {
     let previous = CRASH_AFTER_MIRROR_TLS.with(|c| c.replace(v));
     CrashAfterMirrorGuard { previous }
 }
 
+#[cfg(feature = "test-injection")]
 fn crash_after_mirror_for_test() -> bool {
     CRASH_AFTER_MIRROR_TLS.with(|c| c.get())
+}
+
+#[cfg(not(feature = "test-injection"))]
+#[inline(always)]
+fn crash_after_mirror_for_test() -> bool {
+    false
 }
 
 /// Open a path read+write while also enforcing optional TOCTOU-detection:
@@ -2155,6 +2171,7 @@ impl Container {
     /// v0.2.0 in-place rewrite behavior until the auto-upgrade trigger
     /// in `Vfs::flush` bumps them to v2.
     pub fn write_metadata(&mut self, plaintext: &[u8]) -> Result<(), Error> {
+        #[cfg(feature = "test-injection")]
         record_flush_op(FlushOp::WriteMetadata);
         let region_size = self.header.metadata_size as usize;
         if plaintext.len() + METADATA_OVERHEAD > region_size {
@@ -3126,9 +3143,10 @@ impl Container {
     /// file so the caller can drop it (or stash it for a later
     /// re-swap).
     ///
-    /// Production code never calls this; it exists so the durability
-    /// fence regression test can intercept all subsequent I/O without
-    /// reaching the underlying disk.
+    /// Gated behind the `test-injection` cargo feature; release builds
+    /// of downstream crates do NOT compile this method in, so the
+    /// surface is unreachable from a production binary.
+    #[cfg(feature = "test-injection")]
     pub fn swap_lbx_file_for_test(&mut self, new_file: Box<dyn LbxFile>) -> Box<dyn LbxFile> {
         std::mem::replace(&mut self.file, new_file)
     }
@@ -3145,6 +3163,7 @@ impl Container {
     /// on disk still holds the pre-flush bytes. The reader's AEAD
     /// then fails on every such block. Affects v0.2.1 vaults.
     pub fn sync_data_area(&mut self) -> Result<(), Error> {
+        #[cfg(feature = "test-injection")]
         record_flush_op(FlushOp::SyncDataArea);
         self.file.sync_all().map_err(Into::into)
     }

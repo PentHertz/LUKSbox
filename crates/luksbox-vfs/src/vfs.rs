@@ -504,6 +504,7 @@ pub fn set_format_v3_override(v: Option<bool>) -> FormatV3OverrideGuard {
     FormatV3OverrideGuard { previous }
 }
 
+#[cfg(test)]
 thread_local! {
     /// Thread-local escape hatch for the v0.2.2 durability fence in
     /// `Vfs::flush`. When `true`, `flush` skips the
@@ -511,21 +512,31 @@ thread_local! {
     /// v0.2.1 mirror-protocol durability hole. Toggled ONLY by the
     /// `skip_fence_thread_local_reproduces_v0_2_1_ordering` test to
     /// demonstrate the fence is load-bearing. Production code never
-    /// touches this.
+    /// touches this and the symbol does not exist in release builds.
     static SKIP_FENCE_FOR_TEST_TLS: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 }
 
+#[cfg(test)]
 fn skip_fence_for_test() -> bool {
     SKIP_FENCE_FOR_TEST_TLS.with(|c| c.get())
 }
 
+#[cfg(not(test))]
+#[inline(always)]
+fn skip_fence_for_test() -> bool {
+    false
+}
+
 /// RAII guard for the thread-local skip-fence override. Restores
-/// `false` on drop. Test-only.
+/// `false` on drop. Test-only; cfg(test)-gated so production builds
+/// never see the symbol.
+#[cfg(test)]
 pub struct SkipFenceGuard {
     previous: bool,
 }
 
+#[cfg(test)]
 impl Drop for SkipFenceGuard {
     fn drop(&mut self) {
         SKIP_FENCE_FOR_TEST_TLS.with(|c| c.set(self.previous));
@@ -534,6 +545,7 @@ impl Drop for SkipFenceGuard {
 
 /// Test-only: enable / disable the durability fence on the current
 /// thread. Returns a guard that restores the previous value on drop.
+#[cfg(test)]
 pub fn set_skip_fence_for_test(v: bool) -> SkipFenceGuard {
     let previous = SKIP_FENCE_FOR_TEST_TLS.with(|c| c.replace(v));
     SkipFenceGuard { previous }
