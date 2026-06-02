@@ -2293,93 +2293,85 @@ impl LuksboxApp {
         let mut want_forget = false;
         let mut want_open = false;
 
-        // Layout invariant for the row: the click-to-open area
-        // (title + path + pills) is a set of `Sense::click()`
-        // Labels, NOT a `Frame::show().response.interact(...)`.
-        // The previous version had a clickable parent Frame whose
-        // `interact()` was registered AFTER the inner X button,
-        // which put it on top in egui's z-order and silently ate
-        // every click meant for the X. That made "Forget" appear
-        // dead. Now: the Frame is purely visual (no click sense),
-        // the Labels carry their own click sense, and the X Button
-        // is its own widget. Each widget owns a disjoint area; the
-        // hit test routes to whichever rect actually contains the
-        // click.
-        let resp = Frame::new()
+        // Layout for the row, plus the dual click handling:
+        //
+        // Inside the Frame, we first reserve a 28 px column on the
+        // right via `ui.set_max_width(inner - 28)`. Title / path /
+        // pills then render naturally inside the LEFT content area
+        // and cannot overflow into the reserved X-button strip.
+        // The labels carry NO Sense::click; they are visual.
+        //
+        // After the Frame closes, `frame_resp.interact(Sense::click())`
+        // registers a single "open the vault" click sense over the
+        // WHOLE frame rect (left content + right reserved strip +
+        // any empty padding). Clicking anywhere in the row triggers
+        // the unlock flow EXCEPT where the X button takes over.
+        //
+        // The X (forget) button is drawn via `egui::Area` on the
+        // Middle layer (above the parent ui's Background layer).
+        // Two important properties of Area:
+        //   1. It is on a higher layer, so input is consumed there
+        //      first. A click on the X-button rect routes to the
+        //      Area's button and the bg sense (on the lower layer)
+        //      does NOT see it. No "X eaten" regression.
+        //   2. It does NOT advance the parent ui's cursor. The
+        //      previous attempt used `ui.put`, which DID advance
+        //      the cursor (backwards into the frame's interior),
+        //      pulling the next row's top above the previous row's
+        //      bottom -- this was the "history rows crossing each
+        //      other" bug. Area sidesteps the cursor entirely.
+        let frame_resp = Frame::new()
             .fill(theme::PANEL)
             .stroke(Stroke::new(1.0, Color32::TRANSPARENT))
             .corner_radius(CornerRadius::same(6))
             .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
+                // Force the frame to fill the sidebar's available
+                // width (instead of shrinking to fit the longest
+                // label). Without this, a short vault name produces
+                // a narrow row while a long name produces a wider
+                // one, so the recent list looks ragged.
+                // `set_min_width(available)` makes the inner ui's
+                // used rect at least that wide; the Frame's outer
+                // rect then expands to (inner + 2 * inner_margin) =
+                // the parent's full content width.
+                let inner_width = ui.available_width();
+                ui.set_min_width(inner_width);
+
+                // Reserve 28 px (22 px button + 6 px gap) on the
+                // right so the title / path / pills cannot render
+                // under where the X button will be drawn.
+                let content_width = (inner_width - 28.0).max(0.0);
+                ui.set_max_width(content_width);
+
                 let name = r
                     .path
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| r.path.display().to_string());
-                ui.horizontal(|ui| {
-                    let title_color = if missing { theme::DIM } else { theme::TEXT };
-                    // Title is itself a clickable label (Sense::click).
-                    // Click on the title text opens the unlock flow.
-                    // Truncation keeps long vault names from pushing
-                    // the X off the right edge on narrow sidebars; the
-                    // full name is still in the hover tooltip.
-                    let title_resp = ui.add(
-                        egui::Label::new(
-                            RichText::new(&name).strong().color(title_color).size(13.0),
-                        )
+                let title_color = if missing { theme::DIM } else { theme::TEXT };
+                // Title: visual only. Truncate + hover tooltip
+                // preserve the long-name UX without a competing
+                // click rect.
+                ui.add(
+                    egui::Label::new(RichText::new(&name).strong().color(title_color).size(13.0))
                         .truncate()
-                        .selectable(false)
-                        .sense(egui::Sense::click()),
-                    );
-                    if title_resp.on_hover_text(&name).clicked() {
-                        want_open = true;
-                    }
-                    // Push the x button to the right edge with explicit
-                    // spacing rather than a nested right_to_left layout,
-                    // which was clipping the button's hit-rect on narrow
-                    // sidebars and silently swallowing clicks. The
-                    // 22x22 frameless `x` style is intentional --
-                    // it stays out of the way visually while the row
-                    // is parsed for content first; the hover tooltip
-                    // and the confirm-forget modal make the action
-                    // discoverable without a permanent border around
-                    // every row.
-                    let avail = ui.available_width();
-                    if avail > 28.0 {
-                        ui.add_space(avail - 26.0);
-                    }
-                    let btn = ui.add_sized(
-                        [22.0, 22.0],
-                        egui::Button::new(RichText::new("x").color(theme::FAINT).size(14.0))
-                            .frame(false),
-                    );
-                    if btn
-                        .on_hover_text("forget this vault (doesn't delete the file)")
-                        .clicked()
-                    {
-                        want_forget = true;
-                    }
-                });
-                // Path label: also click-to-open. Truncates with
-                // ellipsis; full path stays in the hover tooltip.
-                let path_resp = ui.add(
+                        .selectable(false),
+                )
+                .on_hover_text(&name);
+                // Path label: also visual; bg click sense covers it.
+                ui.add(
                     egui::Label::new(
                         RichText::new(r.path.display().to_string())
                             .small()
                             .color(theme::FAINT),
                     )
                     .truncate()
-                    .selectable(false)
-                    .sense(egui::Sense::click()),
-                );
-                if path_resp
-                    .on_hover_text(r.path.display().to_string())
-                    .clicked()
-                {
-                    want_open = true;
-                }
-                // Pills wrap to multiple rows, 5 pills don't fit on a
-                // about 248 px sidebar in one line.
+                    .selectable(false),
+                )
+                .on_hover_text(r.path.display().to_string());
+                // Pills wrap to multiple rows, 5 pills don't fit on
+                // a about 248 px sidebar in one line.
                 ui.horizontal_wrapped(|ui| {
                     if missing {
                         theme::pill(
@@ -2424,21 +2416,49 @@ impl LuksboxApp {
             })
             .response;
 
-        // Right-click anywhere on the row's frame opens the forget
-        // modal (no Sense::click() on the frame itself; the context
-        // menu attaches to hover-only responses too). Replaces the
-        // previous "Forget AND delete the .lbx" unconfirmed
-        // destructive shortcut -- the modal asks before unlinking.
-        resp.context_menu(|ui| {
+        // Background click sense over the WHOLE frame rect.
+        let bg_resp = frame_resp.interact(egui::Sense::click());
+
+        // X button via egui::Area. Top-right corner of the frame
+        // rect, accounting for the Frame's 10 px horizontal inner
+        // margin. Area is on a higher layer so its button consumes
+        // X-area clicks before the bg sense sees them, AND it does
+        // not advance the parent ui's cursor (avoiding the
+        // crossing-rows bug from the prior `ui.put` attempt).
+        let btn_top_left = egui::pos2(
+            frame_resp.rect.right() - 10.0 - 22.0,
+            frame_resp.rect.top() + 8.0,
+        );
+        let area_id = ui.id().with(("forget-btn", r.path.display().to_string()));
+        let btn_resp = egui::Area::new(area_id)
+            .fixed_pos(btn_top_left)
+            .order(egui::Order::Middle)
+            .show(ui.ctx(), |ui| {
+                ui.add_sized(
+                    [22.0, 22.0],
+                    egui::Button::new(RichText::new("x").color(theme::FAINT).size(14.0))
+                        .frame(false),
+                )
+                .on_hover_text("forget this vault (doesn't delete the file)")
+            })
+            .inner;
+        if btn_resp.clicked() {
+            want_forget = true;
+        } else if bg_resp.clicked() {
+            want_open = true;
+        }
+
+        // Right-click anywhere on the row opens the forget modal.
+        bg_resp.context_menu(|ui| {
             if ui.button("Forget this vault from history...").clicked() {
                 want_forget = true;
                 ui.close();
             }
         });
 
-        if resp.hovered() {
+        if bg_resp.hovered() {
             ui.painter().rect_stroke(
-                resp.rect,
+                frame_resp.rect,
                 CornerRadius::same(6),
                 Stroke::new(1.0, theme::BORDER),
                 egui::StrokeKind::Inside,
