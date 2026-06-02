@@ -967,7 +967,7 @@ fn tpm2_fido2_subformat_short_buffer_returns_none() {
 fn tpm2_fido2_subformat_blob_len_overruns_buffer_returns_none() {
     // Length prefix claims 100 bytes but only 50 follow.
     let mut buf = (100u16).to_le_bytes().to_vec();
-    buf.extend(std::iter::repeat(0xaau8).take(50));
+    buf.extend(std::iter::repeat_n(0xaau8, 50));
     let slot = build_tpm2_fido2_with_cred_id(buf);
     assert!(slot.tpm2_fido2_sealed_blob().is_none());
 }
@@ -976,7 +976,7 @@ fn tpm2_fido2_subformat_blob_len_overruns_buffer_returns_none() {
 fn tpm2_fido2_subformat_zero_length_blob_returns_empty_slice() {
     // tpm_blob_len = 0 with a 50-byte cred_id following.
     let mut buf = (0u16).to_le_bytes().to_vec();
-    buf.extend(std::iter::repeat(0xbbu8).take(50));
+    buf.extend(std::iter::repeat_n(0xbbu8, 50));
     let slot = build_tpm2_fido2_with_cred_id(buf);
     let blob = slot
         .tpm2_fido2_sealed_blob()
@@ -1006,7 +1006,7 @@ fn tpm2_fido2_subformat_blob_len_max_u16_with_short_buffer_returns_none() {
     // tpm_blob_len = 0xffff, but the buffer is only 16 bytes total.
     // Parser must NOT attempt the slice (would panic) and return None.
     let mut buf = (0xffffu16).to_le_bytes().to_vec();
-    buf.extend(std::iter::repeat(0u8).take(14));
+    buf.extend(std::iter::repeat_n(0u8, 14));
     let slot = build_tpm2_fido2_with_cred_id(buf);
     assert!(slot.tpm2_fido2_sealed_blob().is_none());
 }

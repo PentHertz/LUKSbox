@@ -76,7 +76,7 @@ fn hmac_verify_bench(runner: &mut CtRunner, rng: &mut BenchRng) {
         inputs.push(buf);
     }
 
-    for (input, class) in inputs.into_iter().zip(classes.into_iter()) {
+    for (input, class) in inputs.into_iter().zip(classes) {
         // Re-parse the (mutated) header. Parsing is the same for both
         // classes - it doesn't touch the HMAC tag bytes for layout
         // decisions (HMAC is at offset HEADER_SIZE-32, after the slot

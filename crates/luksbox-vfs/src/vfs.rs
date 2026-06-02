@@ -94,7 +94,7 @@ fn build_borrowed_deniable_credential(
             DC::Fido2Passphrase {
                 passphrase: pp,
                 argon2: arg,
-                hmac_secret_output: &**hs,
+                hmac_secret_output: hs,
             }
         }
         K::TpmPassphrase => {
@@ -105,7 +105,7 @@ fn build_borrowed_deniable_credential(
             DC::TpmPassphrase {
                 passphrase: pp,
                 argon2: arg,
-                unsealed: &**u,
+                unsealed: u,
             }
         }
         K::TpmFido2Passphrase => {
@@ -117,8 +117,8 @@ fn build_borrowed_deniable_credential(
             DC::TpmFido2Passphrase {
                 passphrase: pp,
                 argon2: arg,
-                unsealed: &**u,
-                hmac_secret_output: &**hs,
+                unsealed: u,
+                hmac_secret_output: hs,
             }
         }
         K::HybridPqPassphrase => {
@@ -129,7 +129,7 @@ fn build_borrowed_deniable_credential(
             DC::HybridPqPassphrase {
                 passphrase: pp,
                 argon2: arg,
-                mlkem_shared: &**m,
+                mlkem_shared: m,
             }
         }
         K::HybridPqFido2Passphrase => {
@@ -141,8 +141,8 @@ fn build_borrowed_deniable_credential(
             DC::HybridPqFido2Passphrase {
                 passphrase: pp,
                 argon2: arg,
-                mlkem_shared: &**m,
-                hmac_secret_output: &**hs,
+                mlkem_shared: m,
+                hmac_secret_output: hs,
             }
         }
         K::HybridPqTpmPassphrase => {
@@ -154,8 +154,8 @@ fn build_borrowed_deniable_credential(
             DC::HybridPqTpmPassphrase {
                 passphrase: pp,
                 argon2: arg,
-                mlkem_shared: &**m,
-                unsealed: &**u,
+                mlkem_shared: m,
+                unsealed: u,
             }
         }
         K::HybridPqTpmFido2Passphrase => {
@@ -165,9 +165,9 @@ fn build_borrowed_deniable_credential(
             DC::HybridPqTpmFido2Passphrase {
                 passphrase: pp,
                 argon2: arg,
-                mlkem_shared: &**m,
-                unsealed: &**u,
-                hmac_secret_output: &**hs,
+                mlkem_shared: m,
+                unsealed: u,
+                hmac_secret_output: hs,
             }
         }
     };
@@ -1098,7 +1098,6 @@ fn v4_on_disk_to_in_memory(
     let mut inodes: std::collections::BTreeMap<FileId, crate::tree::Inode> =
         std::collections::BTreeMap::new();
     for (id, od) in v4.inodes {
-        let mut od = od;
         let mut chunks_lost = false;
         if od.link_count == 0 {
             // Corrupt: every inode must have at least one directory
@@ -1298,7 +1297,7 @@ pub struct Vfs {
     ///   - MVK rotation (every chunk gets re-encrypted under the
     ///     new MVK, so every chunk-list block too)
     /// Paths that DON'T mark (chunks vec unchanged):
-    ///   - `chmod`, `rename`, `link`, `mkdir`, `symlink` — those
+    ///   - `chmod`, `rename`, `link`, `mkdir`, `symlink` -- those
     ///     touch the in-memory tree but the chunk-list chain is
     ///     byte-identical on disk and the inline-or-external decision
     ///     doesn't change.
@@ -1487,16 +1486,16 @@ impl Vfs {
             let mut stack: Vec<(FileId, String)> = vec![(ROOT_ID, "/".to_string())];
             while let Some((id, path)) = stack.pop() {
                 id_to_path.insert(id, path.clone());
-                if let Some(inode) = tree.inodes.get(&id) {
-                    if inode.kind == InodeKind::Directory {
-                        for (name, &child_id) in &inode.children {
-                            let child_path = if path == "/" {
-                                format!("/{name}")
-                            } else {
-                                format!("{path}/{name}")
-                            };
-                            stack.push((child_id, child_path));
-                        }
+                if let Some(inode) = tree.inodes.get(&id)
+                    && inode.kind == InodeKind::Directory
+                {
+                    for (name, &child_id) in &inode.children {
+                        let child_path = if path == "/" {
+                            format!("/{name}")
+                        } else {
+                            format!("{path}/{name}")
+                        };
+                        stack.push((child_id, child_path));
                     }
                 }
             }
@@ -1804,21 +1803,20 @@ impl Vfs {
         // Beyond that the format is expected to work but is in
         // untested territory; ask the user to verify unlocks +
         // report issues. One-shot per Vfs session via the latch.
-        if !self.warned_beyond_tested_size {
-            if let Ok(meta) = std::fs::metadata(self.container.vault_path()) {
-                if meta.len() > TESTED_VAULT_SIZE_BYTES {
-                    eprintln!(
-                        "luksbox: note: vault on-disk size ({} GiB) is beyond the \
+        if !self.warned_beyond_tested_size
+            && let Ok(meta) = std::fs::metadata(self.container.vault_path())
+            && meta.len() > TESTED_VAULT_SIZE_BYTES
+        {
+            eprintln!(
+                "luksbox: note: vault on-disk size ({} GiB) is beyond the \
                          tested boundary (~30 GiB). The format is expected to handle \
                          larger vaults but this usage has not been ground-truth tested. \
                          Please periodically close and reopen the vault to verify it \
                          still unlocks, and report any anomalies at \
                          https://github.com/PentHertz/LUKSbox/issues.",
-                        meta.len() / (1024 * 1024 * 1024)
-                    );
-                    self.warned_beyond_tested_size = true;
-                }
-            }
+                meta.len() / (1024 * 1024 * 1024)
+            );
+            self.warned_beyond_tested_size = true;
         }
         // If the container has an anchor sidecar configured, push the
         // current vault generation to it so a future open can detect
@@ -3346,7 +3344,7 @@ impl Vfs {
                 } => slot.unlock_fido2(
                     suite,
                     passphrase.as_ref().map(|p| p.as_bytes()),
-                    &*hmac_secret_for_verify,
+                    hmac_secret_for_verify,
                     &header_salt,
                 ),
             }
@@ -3397,7 +3395,7 @@ impl Vfs {
                     aad[8..12].copy_from_slice(&(chunk_idx as u32).to_le_bytes());
                     aad[12..].copy_from_slice(&chunk_ref.generation.to_le_bytes());
                     self.container
-                        .rekey_chunk_at(chunk_ref.id, &*old_fk, &*new_fk, &aad)?;
+                        .rekey_chunk_at(chunk_ref.id, &old_fk, &new_fk, &aad)?;
                 }
                 // v3: also re-encrypt every chunk-list block this
                 // file owns. They live in the same data area but
@@ -3421,7 +3419,7 @@ impl Vfs {
                     aad[8..12].copy_from_slice(&(block_idx as u32).to_le_bytes());
                     aad[12..].copy_from_slice(&block_ref.generation.to_le_bytes());
                     self.container
-                        .rekey_chunk_at(block_ref.id, &*old_lfk, &*new_lfk, &aad)?;
+                        .rekey_chunk_at(block_ref.id, &old_lfk, &new_lfk, &aad)?;
                 }
             }
 
@@ -3461,7 +3459,7 @@ impl Vfs {
                             suite,
                             &new_mvk,
                             passphrase.as_ref().map(|p| p.as_bytes()),
-                            &*hmac_secret_for_new_wrap,
+                            hmac_secret_for_new_wrap,
                             cred_id,
                             *new_hmac_salt,
                             kdf_params,
@@ -3637,7 +3635,7 @@ impl Vfs {
                     aad[8..12].copy_from_slice(&(chunk_idx as u32).to_le_bytes());
                     aad[12..].copy_from_slice(&chunk_ref.generation.to_le_bytes());
                     this.container
-                        .rekey_chunk_at(chunk_ref.id, &*old_fk, &*new_fk, &aad)?;
+                        .rekey_chunk_at(chunk_ref.id, &old_fk, &new_fk, &aad)?;
                 }
                 // v3: chunk-list blocks under the synthetic-file_id
                 // list key. Same derivation pattern but via
@@ -3655,7 +3653,7 @@ impl Vfs {
                     aad[8..12].copy_from_slice(&(block_idx as u32).to_le_bytes());
                     aad[12..].copy_from_slice(&block_ref.generation.to_le_bytes());
                     this.container
-                        .rekey_chunk_at(block_ref.id, &*old_lfk, &*new_lfk, &aad)?;
+                        .rekey_chunk_at(block_ref.id, &old_lfk, &new_lfk, &aad)?;
                 }
             }
 
@@ -3799,7 +3797,7 @@ pub fn is_safe_symlink_target(target: &str) -> bool {
         return false;
     }
     // Per-component rejections. Split on both separators.
-    for component in target.split(|c| c == '/' || c == '\\') {
+    for component in target.split(['/', '\\']) {
         if component == ".." || component == "." {
             return false;
         }
@@ -4939,7 +4937,7 @@ mod tests {
             assert!(vfs.uses_v4_metadata(), "symlink must force LBM4 upgrade");
             id
         };
-        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        let vfs = Vfs::open(open_container(&path)).unwrap();
         assert!(vfs.uses_v4_metadata());
         assert_eq!(vfs.readlink(id).unwrap(), "target.txt");
     }
@@ -6801,8 +6799,7 @@ mod tests {
         // InvalidField BEFORE any IO.
         let too_big = limit + 1;
         let err = walk_chunk_list_chain(&mut vfs.container, f, head, too_big)
-            .err()
-            .expect("walk must refuse expected_count beyond MAX_FILE_SIZE/CHUNK_SIZE");
+            .expect_err("walk must refuse expected_count beyond MAX_FILE_SIZE/CHUNK_SIZE");
         // Type-check the error: Crypto(InvalidField).
         match err {
             Error::Crypto(luksbox_core::Error::InvalidField) => {}
@@ -6812,8 +6809,7 @@ mod tests {
         // And u64::MAX too -- the saturating math in max_blocks
         // wouldn't have helped without the upfront cap.
         let err = walk_chunk_list_chain(&mut vfs.container, f, head, u64::MAX)
-            .err()
-            .expect("walk must refuse u64::MAX expected_count");
+            .expect_err("walk must refuse u64::MAX expected_count");
         assert!(matches!(
             err,
             Error::Crypto(luksbox_core::Error::InvalidField)
@@ -6867,8 +6863,7 @@ mod tests {
         let list_key = list_file_key(&vfs.container, file_id);
         let synth_id = file_id | CHUNK_LIST_FILE_ID_BIT;
         let err = read_chunk(&mut vfs.container, &list_key, synth_id, 0, data_chunk_ref)
-            .err()
-            .expect("data chunk must NOT decrypt under list key");
+            .expect_err("data chunk must NOT decrypt under list key");
         // Crypto error of some kind -- we don't care which variant,
         // just that the AEAD refused.
         assert!(
@@ -6880,8 +6875,7 @@ mod tests {
         //    the DATA AAD shape (real file_id, chunk_idx=0) must
         //    also FAIL -- symmetric guarantee.
         let err = read_chunk(&mut vfs.container, &data_key, file_id, 0, list_block_ref)
-            .err()
-            .expect("list block must NOT decrypt under data key");
+            .expect_err("list block must NOT decrypt under data key");
         assert!(
             matches!(err, Error::Crypto(_)),
             "expected AEAD failure, got {err:?}"

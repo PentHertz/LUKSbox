@@ -14,7 +14,7 @@ canonical record.
 
 ---
 
-## [Unreleased] -- targeting v0.2.2
+## [v0.2.2] - 2026-06-02
 
 Critical durability fix on top of v0.2.1. **Closes a real-user
 data-loss class** where v0.2.1's mirror protocol could commit

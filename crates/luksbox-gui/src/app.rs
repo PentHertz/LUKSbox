@@ -4226,11 +4226,9 @@ impl LuksboxApp {
         // Catches missing-device upfront so the user doesn't waste
         // time on PIN entry / Argon2id only to bounce off a libfido2
         // NoDevices error from inside the worker.
-        if needs_touch {
-            if let Err(e) = ops::pre_check_fido2() {
-                self.toast_err(e);
-                return;
-            }
+        if needs_touch && let Err(e) = ops::pre_check_fido2() {
+            self.toast_err(e);
+            return;
         }
 
         // TPM-bootstrap path: pre-flight the chip so the common
@@ -5683,13 +5681,12 @@ impl LuksboxApp {
         // associated app even though the bytes are intact. Skip
         // when the chosen path already has an extension (the user
         // explicitly chose to rename to a different type).
-        if local.extension().is_none() {
-            if let Some(ext) = std::path::Path::new(name)
+        if local.extension().is_none()
+            && let Some(ext) = std::path::Path::new(name)
                 .extension()
                 .and_then(|s| s.to_str())
-            {
-                local.set_extension(ext);
-            }
+        {
+            local.set_extension(ext);
         }
         let v = match self.vault.take() {
             Some(v) => v,
@@ -8940,7 +8937,7 @@ impl LuksboxApp {
         // immediately.
         if let Some(payload) = copy_requested {
             if self.prefs.clipboard_warning_acknowledged {
-                self.commit_clipboard_copy(&ctx, payload);
+                self.commit_clipboard_copy(ctx, payload);
             } else {
                 self.pending_clipboard_warning = Some(zeroize::Zeroizing::new(payload));
             }
@@ -9858,9 +9855,7 @@ fn start_mount_subprocess(
     // dedicated error message so the user immediately knows to
     // hunt for the other process. Detached header (if any) is
     // probed too; child's `lock_handles` locks both.
-    if let Err(e) = preflight_vault_unlocked(&vault_path, header_path.as_deref()) {
-        return Err(e);
-    }
+    preflight_vault_unlocked(&vault_path, header_path.as_deref())?;
 
     // 3. Spawn the child. Optionally wrap with macOS sandbox-exec
     // for defense-in-depth (opt-in via LUKSBOX_SANDBOX_HELPER=1
@@ -10213,14 +10208,15 @@ fn build_helper_command(
         // The whole point of the opt-in is that the user told us they
         // want sandboxing; honor that or refuse, never silently
         // weaken. The error surfaces in the GUI toast.
-        return Err(format!(
+        return Err(
             "LUKSBOX_SANDBOX_HELPER=1 is set but the sandbox profile was \
              not found in the .app bundle's Resources directory \
              (expected: <bundle>/Contents/Resources/fuse-t-helper.sb). \
              Refusing to spawn the helper unsandboxed. Either unset \
              LUKSBOX_SANDBOX_HELPER (and accept no sandboxing), or \
              reinstall LUKSbox so the bundle ships the profile."
-        ));
+                .to_string(),
+        );
     }
 
     // Default path: direct invocation of the helper, no sandbox wrap.
@@ -10483,13 +10479,12 @@ impl LuksboxApp {
         // that the egui::Window closure takes. If the job completed
         // since the last frame, lift the result into the form's
         // `result` field and clear `pending`.
-        if let Some(form) = self.deniable_modal.as_mut() {
-            if let Some(rx) = form.pending.as_ref() {
-                if let Ok(res) = rx.try_recv() {
-                    form.result = Some(res);
-                    form.pending = None;
-                }
-            }
+        if let Some(form) = self.deniable_modal.as_mut()
+            && let Some(rx) = form.pending.as_ref()
+            && let Ok(res) = rx.try_recv()
+        {
+            form.result = Some(res);
+            form.pending = None;
         }
 
         let Some(form) = self.deniable_modal.as_mut() else {

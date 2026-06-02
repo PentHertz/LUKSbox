@@ -584,7 +584,7 @@ pub fn try_open_envelope_v2(
     // is the same regardless of which slot index won the constant-
     // time pick.
     let payload =
-        SlotPayload::decode(&*all_pt[matched_slot_idx]).map_err(|_| Error::OpaqueUnlockFailed)?;
+        SlotPayload::decode(&all_pt[matched_slot_idx]).map_err(|_| Error::OpaqueUnlockFailed)?;
 
     // Carve inner header region for phase 2.
     let inner_region = header[DENIABLE_INNER_OFFSET..].to_vec();

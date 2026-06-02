@@ -481,7 +481,7 @@ impl LuksboxFs {
         // created on LBM4 vaults).
         let nlink = match stat.kind {
             InodeKind::Directory => 2,
-            InodeKind::File => stat.link_count.max(1) as u32,
+            InodeKind::File => stat.link_count.max(1),
             InodeKind::Symlink => 1,
         };
         Some(FileAttr {
@@ -590,11 +590,11 @@ impl Filesystem for LuksboxFs {
                 return;
             }
         };
-        if let Some(new_size) = size {
-            if let Err(e) = vfs.truncate(ino, new_size) {
-                reply.error(errno(&e));
-                return;
-            }
+        if let Some(new_size) = size
+            && let Err(e) = vfs.truncate(ino, new_size)
+        {
+            reply.error(errno(&e));
+            return;
         }
         if let Some(new_mode) = mode {
             // Persistent chmod, LBM4-only. On a pre-LBM4 vault this
@@ -1033,10 +1033,10 @@ impl Filesystem for LuksboxFs {
         // unmount, not after up to LAZY_FLUSH_INTERVAL_SECS more
         // sleeping. Same Mutex<Option<_>>::take() pattern as
         // pending modal teardown elsewhere.
-        if let Ok(mut tx) = self.timer_stop_tx.lock() {
-            if let Some(tx) = tx.take() {
-                drop(tx);
-            }
+        if let Ok(mut tx) = self.timer_stop_tx.lock()
+            && let Some(tx) = tx.take()
+        {
+            drop(tx);
         }
         // Final flush before the FS handle dies. Catches any
         // deferred metadata changes since the last timer tick AND

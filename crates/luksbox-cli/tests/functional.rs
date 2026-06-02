@@ -1262,7 +1262,7 @@ fn header_restore_refuses_truncated_input() {
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
     assert_ok(&run(dir, &["create", "v.lbx"]), "create");
-    std::fs::write(dir.join("short.bin"), &[0u8; 500]).unwrap();
+    std::fs::write(dir.join("short.bin"), [0u8; 500]).unwrap();
     let out = run(
         dir,
         &["header-restore", "v.lbx", "short.bin", "--no-verify"],

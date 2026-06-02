@@ -366,7 +366,7 @@ pub fn secure_create_or_truncate(path: &Path) -> io::Result<File> {
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
-        return Ok(f);
+        Ok(f)
     }
 
     // Non-Unix path: preserve the prior Windows-only flow.
@@ -552,7 +552,7 @@ fn write_secure_tmp_for(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     use rand_core::{OsRng, RngCore};
     OsRng
         .try_fill_bytes(&mut rand_bytes)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("rng: {e}")))?;
+        .map_err(|e| io::Error::other(format!("rng: {e}")))?;
     let suffix: String = rand_bytes.iter().map(|b| format!("{b:02x}")).collect();
 
     let mut tmp_path = path.to_path_buf();

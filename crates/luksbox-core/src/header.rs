@@ -222,7 +222,7 @@ impl Header {
     pub fn to_bytes(&self, mvk: &MasterVolumeKey) -> [u8; HEADER_SIZE] {
         let mut buf = self.serialize_unauth();
         let mac_key = mvk.derive_subkey(&self.header_salt, HEADER_MAC_INFO);
-        let tag = compute_hmac(&*mac_key, &buf[..OFF_HMAC]);
+        let tag = compute_hmac(&mac_key, &buf[..OFF_HMAC]);
         buf[OFF_HMAC..].copy_from_slice(&tag);
         buf
     }
@@ -366,7 +366,7 @@ impl Header {
     /// Verify the HMAC. Call after a candidate MVK has been recovered.
     pub fn verify_hmac(&self, raw: &[u8; HEADER_SIZE], mvk: &MasterVolumeKey) -> Result<(), Error> {
         let mac_key = mvk.derive_subkey(&self.header_salt, HEADER_MAC_INFO);
-        let expected = compute_hmac(&*mac_key, &raw[..OFF_HMAC]);
+        let expected = compute_hmac(&mac_key, &raw[..OFF_HMAC]);
         if expected.ct_eq(&raw[OFF_HMAC..]).into() {
             Ok(())
         } else {

@@ -46,7 +46,7 @@ fn aead_open_bench_for_suite(runner: &mut CtRunner, rng: &mut BenchRng, suite: C
         inputs.push(bad);
     }
 
-    for (input, class) in inputs.into_iter().zip(classes.into_iter()) {
+    for (input, class) in inputs.into_iter().zip(classes) {
         runner.run_one(class, || {
             let r = std::hint::black_box(aead::open(
                 suite,

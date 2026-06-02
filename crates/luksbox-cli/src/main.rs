@@ -917,7 +917,7 @@ fn aes_hardware_available() -> bool {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        return std::arch::is_x86_feature_detected!("aes");
+        std::arch::is_x86_feature_detected!("aes")
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -3229,10 +3229,10 @@ fn cmd_create(
     // matching LBM2 / LBM3 magic on first flush.
     let _format_guard =
         luksbox_vfs::set_format_v3_override(Some(matches!(format, VaultFormatArg::V3)));
-    if let Some(hp) = header_path {
-        if hp.exists() {
-            return Err(format!("header file {} already exists", hp.display()).into());
-        }
+    if let Some(hp) = header_path
+        && hp.exists()
+    {
+        return Err(format!("header file {} already exists", hp.display()).into());
     }
     let want_pad = pad_files || hide_sizes;
     if (want_pad || hide_sizes) && kind == SlotKindArg::Fido2Direct {
@@ -3240,10 +3240,10 @@ fn cmd_create(
             "--pad-files / --hide-sizes are not yet supported with --kind fido2-direct".into(),
         );
     }
-    if let Some(ap) = &anchor_path {
-        if ap.exists() {
-            return Err(format!("anchor file {} already exists", ap.display()).into());
-        }
+    if let Some(ap) = &anchor_path
+        && ap.exists()
+    {
+        return Err(format!("anchor file {} already exists", ap.display()).into());
     }
     let needs_pq_hybrid = matches!(
         kind,
@@ -3270,10 +3270,10 @@ fn cmd_create(
             "--pq-hybrid is only meaningful with one of the --kind hybrid-pq* variants".into(),
         );
     }
-    if let Some(kp) = &pq_hybrid_path {
-        if kp.exists() {
-            return Err(format!("kyber secret file {} already exists", kp.display()).into());
-        }
+    if let Some(kp) = &pq_hybrid_path
+        && kp.exists()
+    {
+        return Err(format!("kyber secret file {} already exists", kp.display()).into());
     }
     let mut flags: u32 = 0;
     if want_pad {
@@ -5031,18 +5031,17 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
             )
             .into());
         }
-        if let Some(hp) = header {
-            if no_follow
-                && std::fs::symlink_metadata(hp)
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false)
-            {
-                return Err(format!(
-                    "header {} is a symlink and LUKSBOX_NO_FOLLOW_SYMLINKS=1 is set",
-                    hp.display()
-                )
-                .into());
-            }
+        if let Some(hp) = header
+            && no_follow
+            && std::fs::symlink_metadata(hp)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+        {
+            return Err(format!(
+                "header {} is a symlink and LUKSBOX_NO_FOLLOW_SYMLINKS=1 is set",
+                hp.display()
+            )
+            .into());
         }
     }
     let vault_abs = vault
@@ -5275,13 +5274,13 @@ fn cmd_deniable_init(
             path.display()
         ));
     }
-    if let Some(ap) = anchor {
-        if ap.exists() {
-            return Err(cli_err!(
-                "refusing to overwrite existing anchor file: {}",
-                ap.display()
-            ));
-        }
+    if let Some(ap) = anchor
+        && ap.exists()
+    {
+        return Err(cli_err!(
+            "refusing to overwrite existing anchor file: {}",
+            ap.display()
+        ));
     }
 
     let mut cont: luksbox_format::Container = match cred {
@@ -6017,7 +6016,7 @@ fn cli_create_tpm_deniable_v2(
     let cred = luksbox_core::deniable::DeniableCredential::TpmPassphrase {
         passphrase: pass.as_bytes(),
         argon2,
-        unsealed: &*secret,
+        unsealed: &secret,
     };
     let material = DeniableMaterial {
         cred_id: Vec::new(),
@@ -6054,7 +6053,7 @@ fn cli_create_tpm_fido2_deniable_v2(
     let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
         passphrase: pass.as_bytes(),
         argon2,
-        unsealed: &*secret,
+        unsealed: &secret,
         hmac_secret_output: &hmac_secret,
     };
     let material = DeniableMaterial {
@@ -6101,7 +6100,7 @@ fn cli_create_pq_tpm_deniable_v2(
         passphrase: pass.as_bytes(),
         argon2,
         mlkem_shared: &shared,
-        unsealed: &*secret,
+        unsealed: &secret,
     };
     let material = DeniableMaterial {
         cred_id: Vec::new(),
@@ -6174,7 +6173,7 @@ fn cli_create_pq_tpm_fido2_deniable_v2(
         passphrase: pass.as_bytes(),
         argon2,
         mlkem_shared: &shared,
-        unsealed: &*secret,
+        unsealed: &secret,
         hmac_secret_output: &hmac_secret,
     };
     let material = DeniableMaterial {

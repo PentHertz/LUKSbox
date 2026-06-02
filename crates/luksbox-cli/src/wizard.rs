@@ -395,7 +395,7 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
         None
     };
 
-    let mut recovery = DeniableRecoveryInfo::default();
+    let mut recovery = DeniableRecoveryInfo;
     println!();
     println!("Running operations (Argon2 / device touch may take a few seconds)...");
 
@@ -722,7 +722,7 @@ fn create_den_tpm(
     let cred = luksbox_core::deniable::DeniableCredential::TpmPassphrase {
         passphrase: pass.as_bytes(),
         argon2,
-        unsealed: &*secret,
+        unsealed: &secret,
     };
     let material = DeniableMaterial {
         cred_id: Vec::new(),
@@ -765,7 +765,7 @@ fn create_den_tpm_fido2(
     let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
         passphrase: pass.as_bytes(),
         argon2,
-        unsealed: &*secret,
+        unsealed: &secret,
         hmac_secret_output: &hmac_secret,
     };
     let material = DeniableMaterial {
@@ -806,7 +806,7 @@ fn create_den_pq_tpm(
         passphrase: envelope_pw.as_bytes(),
         argon2,
         mlkem_shared: &shared,
-        unsealed: &*tpm_secret,
+        unsealed: &tpm_secret,
     };
     let material = DeniableMaterial {
         cred_id: Vec::new(),
@@ -879,7 +879,7 @@ fn create_den_pq_tpm_fido2(
         passphrase: envelope_pw.as_bytes(),
         argon2,
         mlkem_shared: &shared,
-        unsealed: &*tpm_secret,
+        unsealed: &tpm_secret,
         hmac_secret_output: &hmac_secret,
     };
     let material = DeniableMaterial {
@@ -1970,7 +1970,7 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
     // FIDO2-direct + all four hybrid kinds + all TPM kinds skip
     // pad/hide-sizes prompts (they have their own follow-on prompts
     // and the size-hardening flags don't apply to keyslot wrapping).
-    let opts = ask_create_options(theme, matches!(kind_choice, 2 | 3 | 4 | 5 | 6 | 7..=13))?;
+    let opts = ask_create_options(theme, matches!(kind_choice, 2..=13))?;
 
     match kind_choice {
         0 => create_passphrase(theme, &pb, header_path.as_deref(), cipher, &opts)?,
@@ -2250,19 +2250,19 @@ fn create_with_tpm_bootstrap(
         TpmBootstrap::HybridPq(_) | TpmBootstrap::HybridPqFido2(_)
     ) {
         let sidecar = luksbox_format::hybrid_sidecar::sidecar_path(vault);
-        if sidecar.exists() {
-            if let Ok(mut entries) = luksbox_format::hybrid_sidecar::read(&sidecar) {
-                for e in &mut entries {
-                    if e.slot_idx == 1 {
-                        e.slot_idx = 0;
-                    }
+        if sidecar.exists()
+            && let Ok(mut entries) = luksbox_format::hybrid_sidecar::read(&sidecar)
+        {
+            for e in &mut entries {
+                if e.slot_idx == 1 {
+                    e.slot_idx = 0;
                 }
-                let _ = luksbox_format::hybrid_sidecar::write_with_binding(
-                    &sidecar,
-                    &entries,
-                    cont.header_salt(),
-                );
             }
+            let _ = luksbox_format::hybrid_sidecar::write_with_binding(
+                &sidecar,
+                &entries,
+                cont.header_salt(),
+            );
         }
     }
     cont.persist_header()?;
@@ -2431,7 +2431,7 @@ fn create_single_slot_tpm_vault(
                     &blob.to_bytes(),
                 )
             };
-            if let Ok(_) = res {
+            if res.is_ok() {
                 let sidecar = hybrid_sidecar::sidecar_path(vault);
                 if let Err(e) = hybrid_sidecar::write(
                     &sidecar,
@@ -2523,7 +2523,7 @@ fn create_single_slot_tpm_vault(
                     hmac_salt,
                 )
             };
-            if let Ok(_) = res {
+            if res.is_ok() {
                 let sidecar = hybrid_sidecar::sidecar_path(vault);
                 if let Err(e) = hybrid_sidecar::write(
                     &sidecar,
@@ -2615,11 +2615,10 @@ fn create_passphrase(
         .with_prompt("Enroll a FIDO2 keyslot now? (recommended)")
         .default(true)
         .interact()?
+        && let Err(e) = enroll_fido2_into(theme, &mut cont)
     {
-        if let Err(e) = enroll_fido2_into(theme, &mut cont) {
-            eprintln!("FAIL FIDO2 enroll failed: {e}");
-            eprintln!("  (vault still usable via passphrase; you can try again later)");
-        }
+        eprintln!("FAIL FIDO2 enroll failed: {e}");
+        eprintln!("  (vault still usable via passphrase; you can try again later)");
     }
 
     maybe_mount_now(theme, cont, vault)
@@ -3147,10 +3146,11 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
             .position(|o| *o == "Hybrid FIDO2 + ML-KEM (post-quantum)")
         {
             i
-        } else if let Some(i) = options.iter().position(|o| *o == "FIDO2 authenticator") {
-            i
         } else {
-            0
+            options
+                .iter()
+                .position(|o| *o == "FIDO2 authenticator")
+                .unwrap_or_default()
         }
     } else {
         0
@@ -3966,7 +3966,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
         #[cfg(target_os = "linux")]
         let action = match choice {
             0..=12 => choice,
-            13 | 14 | 15 => choice,
+            13..=15 => choice,
             _ => unreachable!(),
         };
         #[cfg(not(target_os = "linux"))]
@@ -4465,7 +4465,7 @@ fn enroll_tpm2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Result
     let cred = luksbox_core::deniable::DeniableCredential::TpmPassphrase {
         passphrase: pass.as_bytes(),
         argon2,
-        unsealed: &*secret,
+        unsealed: &secret,
     };
     let material = DeniableMaterial {
         cred_id: Vec::new(),
@@ -4509,7 +4509,7 @@ fn enroll_tpm2_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> 
     let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
         passphrase: pass.as_bytes(),
         argon2,
-        unsealed: &*tpm_secret,
+        unsealed: &tpm_secret,
         hmac_secret_output: &hmac_secret,
     };
     let material = DeniableMaterial {
@@ -4557,7 +4557,7 @@ fn enroll_hybrid_pq_tpm2_deniable_into(
         passphrase: envelope_pw.as_bytes(),
         argon2,
         mlkem_shared: &shared,
-        unsealed: &*tpm_secret,
+        unsealed: &tpm_secret,
     };
     let material = DeniableMaterial {
         cred_id: Vec::new(),
@@ -4660,7 +4660,7 @@ fn enroll_hybrid_pq_tpm2_fido2_deniable_into(
         passphrase: envelope_pw.as_bytes(),
         argon2,
         mlkem_shared: &shared,
-        unsealed: &*tpm_secret,
+        unsealed: &tpm_secret,
         hmac_secret_output: &hmac_secret,
     };
     let material = DeniableMaterial {

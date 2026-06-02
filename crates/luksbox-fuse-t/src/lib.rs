@@ -180,9 +180,9 @@ pub struct FileAttr {
 // composes `S_IFDIR | 0o700u32` would get a type-mismatch on macOS
 // only. Re-exposing as u32 (the type used by `FileAttr::mode`)
 // keeps the math consistent across platforms.
-pub const S_IFDIR: u32 = libc::S_IFDIR as u32;
-pub const S_IFREG: u32 = libc::S_IFREG as u32;
-pub const S_IFLNK: u32 = libc::S_IFLNK as u32;
+pub const S_IFDIR: u32 = libc::S_IFDIR;
+pub const S_IFREG: u32 = libc::S_IFREG;
+pub const S_IFLNK: u32 = libc::S_IFLNK;
 
 /// One entry as fed into the readdir callback's filler function.
 #[derive(Debug)]

@@ -191,7 +191,7 @@ fn mount_empty_vault_root_is_readable() {
     let vfs = reopen_vfs(&vault);
 
     let mp_thr = mp.clone();
-    let mount_join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false));
+    let mount_join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false, false));
 
     // Give the kernel mount time to land. 2 seconds is well over what
     // we observe in practice (sub-second) but tolerant of slow CI.
@@ -227,7 +227,7 @@ fn write_via_mount_persists_across_remount() {
     let vfs = reopen_vfs(&vault);
 
     let mp_thr = mp.clone();
-    let mount_join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false));
+    let mount_join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false, false));
     thread::sleep(Duration::from_secs(2));
 
     // Write a file via the kernel mount path.
@@ -244,7 +244,7 @@ fn write_via_mount_persists_across_remount() {
     std::thread::sleep(std::time::Duration::from_millis(20));
     let vfs2 = reopen_vfs(&vault);
     let mp_thr2 = mp.clone();
-    let mount_join2 = thread::spawn(move || luksbox_mount::mount(vfs2, &mp_thr2, false));
+    let mount_join2 = thread::spawn(move || luksbox_mount::mount(vfs2, &mp_thr2, false, false));
     thread::sleep(Duration::from_secs(2));
 
     let read_back = std::fs::read(&test_file);
@@ -275,7 +275,7 @@ fn unmount_from_other_thread_wakes_mount_thread() {
     let mp_thr = mp.clone();
     let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
     thread::spawn(move || {
-        let r = luksbox_mount::mount(vfs, &mp_thr, false).map_err(|e| e.to_string());
+        let r = luksbox_mount::mount(vfs, &mp_thr, false, false).map_err(|e| e.to_string());
         let _ = done_tx.send(r);
     });
 
@@ -305,7 +305,7 @@ fn three_mount_unmount_cycles_in_one_process() {
         let vfs = reopen_vfs(&vault);
 
         let mp_thr = mp.clone();
-        let mount_join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false));
+        let mount_join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false, false));
         thread::sleep(Duration::from_secs(1));
 
         // Touch the mountpoint to verify it's actually mounted.

@@ -219,12 +219,12 @@ fn open_rw_checked(
         .open(path)
         .map_err(|e| map_io_err_to_vault_locked(e, path))?;
     let actual = inode_of(&f).map_err(|e| map_io_err_to_vault_locked(e, path))?;
-    if let Some(expected) = expected_inode {
-        if actual != expected {
-            return Err(Error::PathSubstituted {
-                path: path.display().to_string(),
-            });
-        }
+    if let Some(expected) = expected_inode
+        && actual != expected
+    {
+        return Err(Error::PathSubstituted {
+            path: path.display().to_string(),
+        });
     }
     // Round 12 fix R12-11: capture the canonical (symlink-resolved)
     // path right after the successful open so the later
@@ -2208,8 +2208,7 @@ impl Container {
         // writes by fsync'ing the `.lbx` file before this call (in
         // `Vfs::flush::container.sync_data_area()`).
         if crash_after_mirror_for_test() {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(Error::Io(std::io::Error::other(
                 "crash_after_mirror_for_test: simulated crash after mirror commit",
             )));
         }
@@ -3401,14 +3400,14 @@ impl Container {
             HeaderStorage::Detached(_, hp) => append_extension(hp, "header-bak"),
         };
         for stale in [&stale_meta_mirror, &stale_header_mirror] {
-            if stale.exists() {
-                if let Err(e) = std::fs::remove_file(stale) {
-                    eprintln!(
-                        "luksbox: warn: failed to remove stale post-rotation mirror at {}: {}",
-                        stale.display(),
-                        e
-                    );
-                }
+            if stale.exists()
+                && let Err(e) = std::fs::remove_file(stale)
+            {
+                eprintln!(
+                    "luksbox: warn: failed to remove stale post-rotation mirror at {}: {}",
+                    stale.display(),
+                    e
+                );
             }
         }
         // Also clear the FLAG_HAS_*_MIRROR bits in the in-memory
@@ -3601,13 +3600,13 @@ fn try_unlock(
                 if slot.kind != SlotKind::Passphrase {
                     continue;
                 }
-                if let Ok(mvk) = slot.unlock_passphrase(suite, pw, &header.header_salt) {
-                    if found.is_none() {
-                        found = Some(mvk);
-                    }
-                    // Don't break, keep iterating to maintain
-                    // constant time across the whole keyslot table.
+                if let Ok(mvk) = slot.unlock_passphrase(suite, pw, &header.header_salt)
+                    && found.is_none()
+                {
+                    found = Some(mvk);
                 }
+                // Don't break, keep iterating to maintain
+                // constant time across the whole keyslot table.
             }
             found.ok_or(Error::UnlockFailed)
         }
@@ -3651,10 +3650,9 @@ fn try_unlock(
                     passphrase,
                     pq_shared,
                     &header.header_salt,
-                ) {
-                    if found.is_none() {
-                        found = Some(mvk);
-                    }
+                ) && found.is_none()
+                {
+                    found = Some(mvk);
                 }
             }
             found.ok_or(Error::UnlockFailed)
@@ -5963,7 +5961,7 @@ mod tests {
     /// Mirror sidecars at predictable names + lengths drop the
     /// observed entropy of the on-disk artefact set below the
     /// >=7.99 bits/byte target the deniable header pays 36 KiB to
-    /// establish, defeating the property entirely.
+    /// > establish, defeating the property entirely.
     #[test]
     fn deniable_vault_never_creates_sidecar_mirrors() {
         let tmp = tempfile::tempdir().unwrap();
@@ -6073,13 +6071,12 @@ mod tests {
         // directly. Both are "user is locked out" outcomes; what
         // matters for the security property is `Ok(_)` MUST NOT
         // fire.
-        match result {
-            Ok(_) => panic!(
+        if result.is_ok() {
+            panic!(
                 "AUTH BYPASS: revoked pass-A unlocked via mirror after live corruption. \
                  Intended-state mirror protocol regressed; mirror is holding pre-revoke \
                  keyslots instead of the current post-revoke state."
-            ),
-            Err(_) => {}
+            )
         }
         // Phase 5: pass-B must still work via mirror recovery
         // (sanity: recovery path itself is functional).

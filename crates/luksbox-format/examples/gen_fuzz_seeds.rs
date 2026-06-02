@@ -46,8 +46,8 @@ fn main() {
     .unwrap();
     h_aes.install_slot(0, slot_pp.clone()).unwrap();
     let h_aes_bytes = h_aes.to_bytes(&mvk);
-    fs::write(format!("{base}/header_parse/seed_aes"), &h_aes_bytes).unwrap();
-    fs::write(format!("{base}/header_roundtrip/seed_aes"), &h_aes_bytes).unwrap();
+    fs::write(format!("{base}/header_parse/seed_aes"), h_aes_bytes).unwrap();
+    fs::write(format!("{base}/header_roundtrip/seed_aes"), h_aes_bytes).unwrap();
 
     // ChaCha header with the same keyslot.
     let mut h_cc = Header::new(
@@ -58,8 +58,8 @@ fn main() {
     );
     h_cc.install_slot(0, slot_pp.clone()).unwrap();
     let h_cc_bytes = h_cc.to_bytes(&mvk);
-    fs::write(format!("{base}/header_parse/seed_chacha"), &h_cc_bytes).unwrap();
-    fs::write(format!("{base}/header_roundtrip/seed_chacha"), &h_cc_bytes).unwrap();
+    fs::write(format!("{base}/header_parse/seed_chacha"), h_cc_bytes).unwrap();
+    fs::write(format!("{base}/header_roundtrip/seed_chacha"), h_cc_bytes).unwrap();
 
     // FIDO2 keyslot variant for the round-trip target.
     let mut h_fido = Header::new(
@@ -82,8 +82,8 @@ fn main() {
     h_fido.install_slot(0, slot_pp.clone()).unwrap();
     h_fido.install_slot(1, slot_fido.clone()).unwrap();
     let h_fido_bytes = h_fido.to_bytes(&mvk);
-    fs::write(format!("{base}/header_parse/seed_fido"), &h_fido_bytes).unwrap();
-    fs::write(format!("{base}/header_roundtrip/seed_fido"), &h_fido_bytes).unwrap();
+    fs::write(format!("{base}/header_parse/seed_fido"), h_fido_bytes).unwrap();
+    fs::write(format!("{base}/header_roundtrip/seed_fido"), h_fido_bytes).unwrap();
 
     // Keyslot seeds: empty, passphrase, fido2.
     fs::write(format!("{base}/keyslot_parse/seed_empty"), [0u8; SLOT_SIZE]).unwrap();
@@ -157,12 +157,8 @@ fn main() {
     h_v3.install_slot(1, slot_v3_yk.clone()).unwrap();
     h_v3.install_slot(2, slot_v3_titan.clone()).unwrap();
     let h_v3_bytes = h_v3.to_bytes(&mvk);
-    fs::write(format!("{base}/header_parse/seed_v3_multi"), &h_v3_bytes).unwrap();
-    fs::write(
-        format!("{base}/header_roundtrip/seed_v3_multi"),
-        &h_v3_bytes,
-    )
-    .unwrap();
+    fs::write(format!("{base}/header_parse/seed_v3_multi"), h_v3_bytes).unwrap();
+    fs::write(format!("{base}/header_roundtrip/seed_v3_multi"), h_v3_bytes).unwrap();
 
     // Valid encrypted metadata region.
     let mut region = vec![0u8; 1024 * 1024];
@@ -267,12 +263,12 @@ fn main() {
         let encoded = payload.encode().unwrap();
         fs::write(
             format!("{base}/slot_payload_decode/seed_fido2_payload"),
-            &encoded,
+            encoded,
         )
         .unwrap();
         fs::write(
             format!("{afl_base}/slot_payload_decode/seed_fido2_payload"),
-            &encoded,
+            encoded,
         )
         .unwrap();
         // Pure-zero buffer: decoder must reject (kind=0 is not a
