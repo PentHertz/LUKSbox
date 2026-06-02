@@ -77,6 +77,44 @@ only prevents future occurrences.
   persisted across vault sessions (the checkbox resets to off
   after each mount).
 
+- **Per-inode dirty tracking in the spill code ("Layer 2").** Pre-
+  v0.2.2, `Vfs::flush` (whether eager or timer-driven) re-spilled
+  every inode that exceeded the inline-chunk threshold: free old
+  external_list_blocks, allocate fresh ChunkIDs + generations,
+  re-encrypt every chunk-list block, re-write the chain. For a
+  vault with N spilled files this was O(N) chunk-list-block
+  AEAD-writes per flush, regardless of how many inodes actually
+  changed. With Layer 1 batching the flushes, Layer 2 makes each
+  flush itself fast: a `chunks_dirty: BTreeSet<FileId>` is
+  populated by `write`, `truncate`, and `create_with_mode`, and
+  `spill_to_v3_on_disk` reuses the existing in-memory
+  `external_list_blocks` (and therefore the on-disk chunk-list
+  blocks) for any inode NOT in that set. Result: per-flush cost
+  is now O(K) where K = inodes touched since last flush, not
+  O(N) where N = total spilled files.
+
+  Cleared at the end of every successful `Vfs::flush`, alongside
+  the existing `dirty = false` flag. Re-populated with every
+  inode (`tree.inodes.keys().copied()`) on:
+   - format upgrades (V1->V5 and V2/V3->V4 triggered by the
+     `tree_needs_v4_format` check)
+   - MVK rotation (both standard and deniable variants)
+  -- these paths rewrite the chain regardless and want the full
+  spill semantics.
+
+  `chmod`, `rename`, `link`, `mkdir`, `symlink` do NOT mark
+  chunks_dirty: those touch the in-memory tree but leave the
+  chunk-list chain byte-identical on disk and don't change the
+  inline-vs-external decision.
+
+  Regression test: `v3_clean_inode_reuses_chunk_list_blocks_across_flush`
+  creates two spilled files, modifies only one, flushes, and
+  asserts the untouched file's `external_list_blocks` (chunk_ids
+  AND generations) are byte-identical to the pre-flush snapshot
+  while the touched file's blocks got fresh IDs / gens. Plus a
+  reopen sanity check that decrypts the first byte of each file
+  through both reused and freshly-spilled chains.
+
   Scope: this change affects Linux libfuse3 mounts only for v0.2.2.
   macOS FUSE-T (`fuse_t.rs`) and Windows WinFsp (`winfsp.rs`) retain
   their pre-v0.2.2 flush behavior; their `mount()` entry points

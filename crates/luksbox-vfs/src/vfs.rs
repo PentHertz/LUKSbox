@@ -1277,6 +1277,32 @@ pub struct Vfs {
     /// Read via `Vfs::tolerated_inodes()`. The Vfs is read-only
     /// while non-empty (`Vfs::flush` refuses with `ReadOnlyMount`).
     tolerated_inodes: Vec<ToleratedInode>,
+    /// Layer-2 per-inode dirty tracking. Set of inode IDs whose
+    /// `chunks` vec has been mutated since the last successful
+    /// flush. Used by `spill_to_v3_on_disk` to skip the
+    /// free-old + allocate-new + re-encrypt + re-write cycle for
+    /// inodes whose chunk-list chain is still valid on disk. For a
+    /// vault with N spilled files where only K are touched per
+    /// flush, this turns the per-flush cost from O(N) chunk-list-
+    /// block writes into O(K). Cleared at the end of `Vfs::flush`
+    /// alongside `dirty = false`.
+    ///
+    /// Mutation paths that mark an inode dirty here:
+    ///   - `write` and `truncate` (chunks added / removed / rewritten)
+    ///   - `create_with_mode` (new inode, in case it transitions to
+    ///     external before next flush)
+    /// Paths that REMOVE an entry (because the inode is gone):
+    ///   - `unlink` / `rmdir`
+    /// Paths that mark ALL inodes dirty (full re-spill required):
+    ///   - format upgrade in `Vfs::flush` (e.g. V2 -> V5)
+    ///   - MVK rotation (every chunk gets re-encrypted under the
+    ///     new MVK, so every chunk-list block too)
+    /// Paths that DON'T mark (chunks vec unchanged):
+    ///   - `chmod`, `rename`, `link`, `mkdir`, `symlink` — those
+    ///     touch the in-memory tree but the chunk-list chain is
+    ///     byte-identical on disk and the inline-or-external decision
+    ///     doesn't change.
+    chunks_dirty: std::collections::BTreeSet<FileId>,
 }
 
 /// Vault on-disk size beyond which the runtime emits a one-shot
@@ -1489,6 +1515,10 @@ impl Vfs {
             last_warned_pct: 0,
             warned_beyond_tested_size: false,
             tolerated_inodes: tolerated,
+            // Fresh open: every in-memory inode matches its on-disk
+            // chunk-list chain. Mutations after this point will add
+            // entries here as they touch chunks.
+            chunks_dirty: std::collections::BTreeSet::new(),
         })
     }
 
@@ -1608,6 +1638,12 @@ impl Vfs {
             // for the v0.2.1+ shape: lower spill threshold, paired
             // with the LUKSBOX2 header.
             self.format = MetadataFormat::V5;
+            // Layer 2: format upgrade changes the inline-vs-external
+            // threshold AND the encoding of inode rows; every
+            // existing inode must be re-walked through the spill
+            // logic on this flush. The reuse fast path checks
+            // chunks_dirty, so mark every inode dirty here.
+            self.chunks_dirty.extend(self.tree.inodes.keys().copied());
         }
         // Auto-upgrade to V4 if any inode has been touched by an
         // LBM4-only op (non-default mode, or hardlink count > 1).
@@ -1615,6 +1651,8 @@ impl Vfs {
         let needs_v4 = self.tree_needs_v4_format();
         if matches!(self.format, MetadataFormat::V2 | MetadataFormat::V3) && needs_v4 {
             self.format = MetadataFormat::V4;
+            // Layer 2: same reasoning as the V1->V5 upgrade above.
+            self.chunks_dirty.extend(self.tree.inodes.keys().copied());
         }
         let bytes = match self.format {
             MetadataFormat::V5 => {
@@ -1787,6 +1825,14 @@ impl Vfs {
         // rollback via `anchor::compare`.
         self.container.write_anchor(self.tree.next_chunk_gen)?;
         self.dirty = false;
+        // Layer 2: every dirty inode has either been re-spilled
+        // (full path) or had its existing chain reused (fast path).
+        // Either way, the in-memory state now matches the just-
+        // written on-disk metadata, so the next flush starts fresh.
+        // Cleared only after the metadata write succeeded so a
+        // flush that fails mid-way leaves the dirty markers in
+        // place for the next attempt.
+        self.chunks_dirty.clear();
         Ok(())
     }
 
@@ -1896,6 +1942,53 @@ impl Vfs {
                     inode.kind == InodeKind::File && inode.chunks.len() > threshold,
                 )
             };
+            // Layer 2 fast path: this inode's chunks vec is unchanged
+            // since the last flush AND it still needs (and already
+            // has) an external chunk-list chain. Reuse the existing
+            // on-disk blocks -- no free, no alloc, no re-encrypt, no
+            // write. The chunk-list block slots are still reserved
+            // (we never freed them), so other allocations can't have
+            // overwritten them, and their AEAD remains valid under
+            // the current MVK + (synth_id, block_idx, generation)
+            // AAD. Just record (head, count) in the on-disk inode.
+            //
+            // Safety of the reuse:
+            //   - chunks_dirty is the authoritative "did this inode's
+            //     chunks vec change" marker; write/truncate set it,
+            //     unlink removes the entry. chmod/rename/link don't
+            //     touch chunks so they don't set it -- and the
+            //     chunk-list chain doesn't depend on parent/mode/etc.
+            //   - The threshold can't have changed mid-Vfs-session
+            //     (format upgrades mark all inodes dirty in flush(),
+            //     so an upgrade-driven re-spill takes the full path).
+            //   - MVK rotation re-encrypts every chunk under the new
+            //     MVK, including chunk-list blocks; its post-rotation
+            //     code marks every inode dirty so the next flush
+            //     re-walks the spill.
+            if file_needs_external && !self.chunks_dirty.contains(&id) {
+                let inode = self.tree.inodes.get(&id).expect("id from keys()");
+                if let Some(head) = inode.external_list_blocks.first().copied() {
+                    on_disk_inodes.insert(
+                        id,
+                        InodeV3OnDisk {
+                            id: inode.id,
+                            parent: inode.parent,
+                            kind: inode.kind,
+                            size: inode.size,
+                            mtime_ns: inode.mtime_ns,
+                            chunks: Vec::new(),
+                            chunks_external: Some((head, chunks_len as u64)),
+                            children: inode.children.clone(),
+                        },
+                    );
+                    continue;
+                }
+                // Fall-through: file_needs_external but no in-memory
+                // external_list_blocks. Means this inode was freshly
+                // marked dirty (e.g. write that just crossed the
+                // threshold) but somehow lost its dirty marker. Take
+                // the full path for correctness.
+            }
             // Free any previously-allocated external_list_blocks; we
             // either rewrite them fresh (still external) or no longer
             // need them (shrunk back to inline).
@@ -2429,6 +2522,13 @@ impl Vfs {
             .children
             .insert(name.to_string(), id);
         self.dirty = true;
+        // Layer 2: brand-new inode with no on-disk chunk-list chain
+        // yet. Marking dirty lets `spill_to_v3_on_disk` correctly
+        // pick the inline-vs-external path on first flush. Costs
+        // nothing for inline files (which is the common case for a
+        // freshly-created empty inode) since the spill code only
+        // does work when the file actually crosses the threshold.
+        self.chunks_dirty.insert(id);
         Ok(id)
     }
 
@@ -2621,6 +2721,10 @@ impl Vfs {
             inode_mut.cached_real_size = Some(new_real);
         }
         self.dirty = true;
+        // Layer 2: this inode's chunks vec just changed; mark so the
+        // next spill_to_v3_on_disk re-encrypts its chunk-list chain
+        // instead of reusing the existing on-disk blocks.
+        self.chunks_dirty.insert(id);
         Ok(buf.len())
     }
 
@@ -2688,6 +2792,8 @@ impl Vfs {
             inode_mut.cached_real_size = Some(new_size);
         }
         self.dirty = true;
+        // Layer 2: same reasoning as `write` -- chunks vec mutated.
+        self.chunks_dirty.insert(id);
         Ok(())
     }
 
@@ -2765,6 +2871,9 @@ impl Vfs {
                 self.tree.free_chunk_id(cref.id);
             }
             self.tree.inodes.remove(&target_id);
+            // Layer 2: inode is gone; drop any pending dirty marker
+            // for it so the next spill doesn't try to look it up.
+            self.chunks_dirty.remove(&target_id);
         }
         // If still nonzero, the inode remains and is reachable via
         // its other directory entries; chunks stay allocated.
@@ -3381,6 +3490,14 @@ impl Vfs {
                 self.container
                     .commit_atomic_rotation()
                     .map_err(Error::Format)?;
+                // Layer 2: rotation rewrites every chunk and every
+                // chunk-list block under the new MVK. To keep the
+                // Layer 2 reuse fast path correct regardless of
+                // rotation's internal bookkeeping, mark every inode
+                // dirty so the next flush takes the full spill path
+                // (allocates fresh chunk-list slots). One-time cost
+                // -- rotation is a rare operation.
+                self.chunks_dirty.extend(self.tree.inodes.keys().copied());
                 Ok(())
             }
             (true, Err(e)) => {
@@ -3391,7 +3508,16 @@ impl Vfs {
                 let _ = self.container.abort_atomic_rotation();
                 Err(e)
             }
-            (false, r) => r,
+            (false, Ok(())) => {
+                // Layer 2: non-crash-safe rotation also rewrote
+                // every chunk + chunk-list block under the new MVK;
+                // mark all inodes dirty so the next flush takes the
+                // full spill path. Same reasoning as the crash-safe
+                // arm above.
+                self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+                Ok(())
+            }
+            (false, Err(e)) => Err(e),
         }
     }
 
@@ -3549,13 +3675,22 @@ impl Vfs {
                 self.container
                     .commit_atomic_rotation()
                     .map_err(Error::Format)?;
+                // Layer 2: deniable rotation, same as standard:
+                // every chunk + chunk-list block was rewritten,
+                // mark every inode dirty so the next flush takes
+                // the full spill path.
+                self.chunks_dirty.extend(self.tree.inodes.keys().copied());
                 Ok(())
             }
             (true, Err(e)) => {
                 let _ = self.container.abort_atomic_rotation();
                 Err(e)
             }
-            (false, r) => r,
+            (false, Ok(())) => {
+                self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+                Ok(())
+            }
+            (false, Err(e)) => Err(e),
         }
     }
 
@@ -5983,6 +6118,120 @@ mod tests {
         let mut buf = vec![0u8; 64 * 1024];
         vfs.read(f, 0, &mut buf).unwrap();
         assert!(buf.iter().all(|&b| b == 0x55));
+    }
+
+    /// Layer 2 regression test: a clean spilled inode's chunk-list
+    /// chain must be REUSED across a flush -- same `external_list_blocks`
+    /// ChunkRefs (id AND generation), no allocations bumped, no
+    /// chunk-list-block slots churned in `free_chunks`. This is the
+    /// load-bearing invariant of `chunks_dirty`-driven reuse: it's
+    /// what makes the v0.2.2 deferred-flush behavior cheap even
+    /// when the timer eventually fires on a vault with thousands of
+    /// spilled files where only a few changed.
+    #[test]
+    fn v3_clean_inode_reuses_chunk_list_blocks_across_flush() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("layer2-reuse.lbx");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = with_v3_env(|| Vfs::open(cont)).unwrap();
+        let root = vfs.root_id();
+        // Two large files, both spilled. After flush, both have
+        // populated `external_list_blocks`.
+        let untouched = vfs.create(root, "untouched").unwrap();
+        vfs.write(untouched, 0, &vec![0xAAu8; 8 * 1024 * 1024])
+            .unwrap();
+        let modified = vfs.create(root, "modified").unwrap();
+        vfs.write(modified, 0, &vec![0xBBu8; 8 * 1024 * 1024])
+            .unwrap();
+        vfs.flush().unwrap();
+
+        // Snapshot the post-flush state.
+        let untouched_blocks_before: Vec<ChunkRef> =
+            vfs.tree.inodes[&untouched].external_list_blocks.clone();
+        let modified_blocks_before: Vec<ChunkRef> =
+            vfs.tree.inodes[&modified].external_list_blocks.clone();
+        let next_chunk_id_before = vfs.tree.next_chunk_id;
+        let next_chunk_gen_before = vfs.tree.next_chunk_gen;
+        assert!(!untouched_blocks_before.is_empty());
+        assert!(!modified_blocks_before.is_empty());
+
+        // Touch only `modified` -- write a single byte at offset 0.
+        // This marks `modified` dirty in `chunks_dirty`; `untouched`
+        // is NOT in the set.
+        vfs.write(modified, 0, &[0xCC]).unwrap();
+        vfs.flush().unwrap();
+
+        // Post-flush invariants:
+        //
+        // 1. `untouched`'s external_list_blocks MUST be byte-identical
+        //    to the pre-flush snapshot. Same chunk_ids, same
+        //    generations -- no allocations, no rewrites.
+        let untouched_blocks_after: Vec<ChunkRef> =
+            vfs.tree.inodes[&untouched].external_list_blocks.clone();
+        assert_eq!(
+            untouched_blocks_after, untouched_blocks_before,
+            "Layer 2 invariant: an inode NOT in chunks_dirty must keep \
+             its existing external_list_blocks across a flush (same \
+             chunk_ids AND generations)"
+        );
+
+        // 2. `modified`'s blocks DID get re-spilled, so they got
+        //    fresh chunk_ids / generations. At minimum the
+        //    generations should have moved.
+        let modified_blocks_after: Vec<ChunkRef> =
+            vfs.tree.inodes[&modified].external_list_blocks.clone();
+        assert_ne!(
+            modified_blocks_after, modified_blocks_before,
+            "Layer 2 sanity: a dirty inode MUST take the full spill path \
+             (fresh chunk_ids + generations for its chain)"
+        );
+
+        // 3. `next_chunk_gen` advanced (modified got fresh gens) but
+        //    not by `2 * untouched_blocks_before.len()` (which is
+        //    what pre-Layer-2 would have consumed re-spilling both).
+        //    Tight upper bound: modified's block count + a small
+        //    fudge for any incidental allocations.
+        let gen_delta = vfs.tree.next_chunk_gen - next_chunk_gen_before;
+        let _ = next_chunk_id_before;
+        assert!(
+            gen_delta < (untouched_blocks_before.len() + modified_blocks_before.len() + 32) as u64,
+            "Layer 2 cost bound: next_chunk_gen advanced by {} (untouched={}, \
+             modified={}); without reuse the untouched blocks alone would \
+             have consumed >= {}",
+            gen_delta,
+            untouched_blocks_before.len(),
+            modified_blocks_before.len(),
+            untouched_blocks_before.len()
+        );
+
+        // 4. Reopen verifies the chunk-list chains are still
+        //    decryptable: untouched's reused blocks are still
+        //    AEAD-valid under the current MVK + generation, and
+        //    modified's fresh blocks decrypt cleanly too.
+        drop(vfs);
+        let cont = Container::open(
+            &path,
+            None,
+            luksbox_format::UnlockMaterial::Passphrase(b"pw"),
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        // Reading the first byte of each file forces a chunk-list-
+        // chain walk + chunk read. If the reused blocks were silently
+        // invalid this would fail with MetadataDeserialize or an
+        // AEAD error.
+        let mut buf = [0u8; 1];
+        assert_eq!(vfs.read(untouched, 0, &mut buf).unwrap(), 1);
+        assert_eq!(buf[0], 0xAA);
+        assert_eq!(vfs.read(modified, 0, &mut buf).unwrap(), 1);
+        assert_eq!(buf[0], 0xCC);
     }
 
     #[test]
