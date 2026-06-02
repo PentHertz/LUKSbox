@@ -2338,10 +2338,15 @@ impl LuksboxApp {
                 let inner_width = ui.available_width();
                 ui.set_min_width(inner_width);
 
-                // Reserve 28 px (22 px button + 6 px gap) on the
-                // right so the title / path / pills cannot render
-                // under where the X button will be drawn.
-                let content_width = (inner_width - 28.0).max(0.0);
+                // Reserve room on the right so the title / path /
+                // pills can't render under the X button. The X is
+                // anchored 4 px from the frame's right edge and 4 px
+                // from the top (tight to the top-right corner), so
+                // its left edge sits at frame.right - 26. Reserve
+                // 22 px from the inner ui's right edge: that gives a
+                // 4 px gap between the rightmost content character
+                // and the X button.
+                let content_width = (inner_width - 22.0).max(0.0);
                 ui.set_max_width(content_width);
 
                 let name = r
@@ -2419,15 +2424,16 @@ impl LuksboxApp {
         // Background click sense over the WHOLE frame rect.
         let bg_resp = frame_resp.interact(egui::Sense::click());
 
-        // X button via egui::Area. Top-right corner of the frame
-        // rect, accounting for the Frame's 10 px horizontal inner
-        // margin. Area is on a higher layer so its button consumes
-        // X-area clicks before the bg sense sees them, AND it does
-        // not advance the parent ui's cursor (avoiding the
-        // crossing-rows bug from the prior `ui.put` attempt).
+        // X button via egui::Area. Pinned 4 px inside the frame's
+        // top-right corner (Frame's corner_radius is 6 so 4 px puts
+        // the button just inside the rounded curve). Area is on a
+        // higher layer so its button consumes X-area clicks before
+        // the bg sense sees them, AND it does not advance the
+        // parent ui's cursor (avoiding the crossing-rows bug from
+        // the prior `ui.put` attempt).
         let btn_top_left = egui::pos2(
-            frame_resp.rect.right() - 10.0 - 22.0,
-            frame_resp.rect.top() + 8.0,
+            frame_resp.rect.right() - 4.0 - 22.0,
+            frame_resp.rect.top() + 4.0,
         );
         let area_id = ui.id().with(("forget-btn", r.path.display().to_string()));
         let btn_resp = egui::Area::new(area_id)
