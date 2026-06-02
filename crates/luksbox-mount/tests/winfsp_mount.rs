@@ -179,7 +179,7 @@ fn mount_makes_drive_visible_to_win32() {
     let (vfs, _vault) = fresh_vfs(dir.path(), "visible");
 
     let mp_thr = mp.clone();
-    let mount_join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false));
+    let mount_join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false, false));
 
     // Give the kernel mount + drive-letter registration time to land.
     // 3 seconds is well over what we observe in practice (sub-second)
@@ -245,7 +245,7 @@ fn unmount_from_other_thread_wakes_mount_thread() {
     let mp_thr = mp.clone();
     let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
     thread::spawn(move || {
-        let r = luksbox_mount::mount(vfs, &mp_thr, false).map_err(|e| e.to_string());
+        let r = luksbox_mount::mount(vfs, &mp_thr, false, false).map_err(|e| e.to_string());
         let _ = done_tx.send(r);
     });
 
@@ -280,7 +280,7 @@ fn three_mount_unmount_cycles_in_one_process() {
     for round in 1..=3 {
         let vfs = reopen_vfs(&vault);
         let mp_thr = mp.clone();
-        let join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false));
+        let join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false, false));
         thread::sleep(Duration::from_secs(2));
 
         luksbox_mount::unmount(&mp).unwrap_or_else(|e| panic!("round {round}: unmount: {e}"));
@@ -331,7 +331,7 @@ fn file_written_via_win32_survives_unmount() {
     let (vfs, vault) = fresh_vfs(dir.path(), "persist");
 
     let mp_thr = mp.clone();
-    let mount_join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false));
+    let mount_join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false, false));
 
     // Wait for the kernel mount to be visible to Win32.
     thread::sleep(Duration::from_secs(3));
