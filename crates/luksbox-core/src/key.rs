@@ -43,14 +43,32 @@ impl MasterVolumeKey {
         Self(SecretBox::from_bytes(bytes))
     }
 
-    /// Round 12 fix R12-17: construct an MVK from a `Zeroizing`-wrapped
-    /// byte array without exposing the bytes as a `Copy` parameter on
-    /// the caller's stack. Production callers that hold MVK material
-    /// in `Zeroizing<[u8;KEY_LEN]>` should prefer this over `from_bytes`
-    /// to avoid the by-value-Copy stack-residence pattern the audit
-    /// catalogued under R12-17.
+    /// Construct an MVK from a `Zeroizing`-wrapped byte array without
+    /// materialising a `[u8; KEY_LEN]` temporary on the caller's stack.
+    /// The bytes are copied directly from the caller's `Zeroizing` storage
+    /// into a freshly-allocated `SecretBox` backing buffer (memfd_secret
+    /// pages on Linux >= 5.14, heap with mlockall/VirtualLock otherwise).
+    ///
+    /// The earlier implementation went through `SecretBox::from_bytes(**bytes)`,
+    /// which double-copies: first `**bytes` produces a Copy `[u8; KEY_LEN]`
+    /// temporary on the function's stack, then `from_bytes` takes that
+    /// temporary by value and copies it into the backing buffer. The
+    /// temporary's bytes survive on the stack until frame reuse, defeating
+    /// the `Zeroizing` guarantee the audit (R12-17) was meant to provide.
     pub fn from_zeroizing(bytes: &Zeroizing<[u8; KEY_LEN]>) -> Self {
-        Self(SecretBox::from_bytes(**bytes))
+        let mut sb = SecretBox::zeroed();
+        sb.as_mut_array().copy_from_slice(&**bytes);
+        Self(sb)
+    }
+
+    /// Same as `from_zeroizing` but for borrowed array refs that the caller
+    /// already holds without `Zeroizing`. Use when the source bytes live in
+    /// caller-owned storage that the caller is responsible for wiping
+    /// (e.g., a `&[u8; KEY_LEN]` parameter passed through several layers).
+    pub fn from_array_ref(bytes: &[u8; KEY_LEN]) -> Self {
+        let mut sb = SecretBox::zeroed();
+        sb.as_mut_array().copy_from_slice(bytes);
+        Self(sb)
     }
 
     pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
@@ -97,10 +115,30 @@ impl KeyEncryptionKey {
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
         Self(bytes)
     }
-    /// Round 12 fix R12-17: same rationale as
-    /// `MasterVolumeKey::from_zeroizing`.
+    /// Same rationale as `MasterVolumeKey::from_zeroizing`: the previous
+    /// `Self(**bytes)` form spawned a `[u8; KEY_LEN]` Copy temporary on the
+    /// stack before the field assignment, leaving 32 bytes of KEK material
+    /// readable in the stack frame after the move. This form constructs
+    /// the destination first and writes the bytes into it through a
+    /// borrowed pointer, so no anonymous Copy temporary exists.
+    ///
+    /// NOTE: `KeyEncryptionKey`'s inline `[u8; KEY_LEN]` storage means
+    /// the returned value still carries 32 bytes by value through the
+    /// return slot; truly heap-only KEK storage would require switching
+    /// the field to `Box<[u8; KEY_LEN]>` or `SecretBox`. This fix
+    /// closes the *additional* stack copy that `**bytes` introduced.
     pub fn from_zeroizing(bytes: &Zeroizing<[u8; KEY_LEN]>) -> Self {
-        Self(**bytes)
+        let mut k = Self([0u8; KEY_LEN]);
+        k.0.copy_from_slice(&**bytes);
+        k
+    }
+
+    /// Same as `from_zeroizing` but for a borrowed `&[u8; KEY_LEN]` whose
+    /// storage is already managed by the caller.
+    pub fn from_array_ref(bytes: &[u8; KEY_LEN]) -> Self {
+        let mut k = Self([0u8; KEY_LEN]);
+        k.0.copy_from_slice(bytes);
+        k
     }
     pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
         &self.0

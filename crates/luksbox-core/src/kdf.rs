@@ -183,7 +183,7 @@ pub fn derive_hybrid_fido2_kek(
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
     hkdf.expand(b"lbx:hybrid-fido-kek/v1", out.as_mut_slice())
         .map_err(|_| Error::Kdf)?;
-    Ok(KeyEncryptionKey::from_bytes(*out))
+    Ok(KeyEncryptionKey::from_zeroizing(&out))
 }
 
 /// Hybrid KEK = HKDF-SHA256 over (Argon2id-stretched passphrase ||
@@ -218,7 +218,7 @@ pub fn derive_hybrid_kek(
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
     hkdf.expand(b"lbx:hybrid-kek/v1", out.as_mut_slice())
         .map_err(|_| Error::Kdf)?;
-    Ok(KeyEncryptionKey::from_bytes(*out))
+    Ok(KeyEncryptionKey::from_zeroizing(&out))
 }
 
 #[cfg(test)]

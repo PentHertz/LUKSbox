@@ -5489,15 +5489,21 @@ fn cmd_deniable_mount(
 // (.kyber / .tpm-blob) come via --flag.
 
 fn prompt_pass_twice(p1: &str, p2: &str) -> Result<zeroize::Zeroizing<String>> {
-    let a = rpassword::prompt_password(p1)?;
-    let b = rpassword::prompt_password(p2)?;
-    if a != b {
+    // Wrap both reads in `Zeroizing` immediately so the heap allocation
+    // returned by `rpassword` is scrubbed on every drop path -- panic,
+    // early-return on mismatch, the empty-string error, etc. The earlier
+    // form left the confirmation `b` as a plain `String` from prompt to
+    // end-of-scope, so a panic between the two prompts would have leaked
+    // the confirmation copy to ordinary heap memory.
+    let a = zeroize::Zeroizing::new(rpassword::prompt_password(p1)?);
+    let b = zeroize::Zeroizing::new(rpassword::prompt_password(p2)?);
+    if *a != *b {
         return Err(cli_err!("passphrases do not match"));
     }
     if a.is_empty() {
         return Err(cli_err!("empty passphrase not accepted for deniable mode"));
     }
-    Ok(zeroize::Zeroizing::new(a))
+    Ok(a)
 }
 
 /// v2 deniable open. Always passphrase-driven (envelope discovery
@@ -5532,9 +5538,10 @@ fn cli_open_deniable_v2(
     };
 
     // Phase 1: passphrase-only credential for envelope discovery,
-    // hinted with the user's intended slot kind.
-    let pass = rpassword::prompt_password("Passphrase: ")?;
-    let pass_zeroizing = zeroize::Zeroizing::new(pass);
+    // hinted with the user's intended slot kind. Wrap immediately so
+    // the `rpassword`-returned `String` heap allocation is scrubbed
+    // even if the envelope-open step below panics.
+    let pass_zeroizing = zeroize::Zeroizing::new(rpassword::prompt_password("Passphrase: ")?);
     let env_cred = DeniableCredential::Passphrase {
         passphrase: pass_zeroizing.as_bytes(),
         argon2,
@@ -5708,9 +5715,9 @@ fn cli_fido2_hmac_from_payload(
     if cred_id.is_empty() {
         return Err(cli_err!("envelope cred_id is empty for FIDO2 variant"));
     }
-    let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
     let mut auth = make_fido2_authenticator();
-    Ok(auth.hmac_secret(RP_ID, cred_id, salt, Some(&pin))?)
+    Ok(auth.hmac_secret(RP_ID, cred_id, salt, Some(pin.as_str()))?)
 }
 
 /// Drive the TPM to unseal a blob taken from the envelope payload.
@@ -5766,7 +5773,7 @@ fn cli_pq_decap_with_fallback(
     } else {
         "Seed-file passphrase: "
     };
-    let typed_seed_pw = rpassword::prompt_password(prompt_text)?;
+    let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(prompt_text)?);
     let seed_pw_bytes: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
         match envelope_pw {
             Some(env) => zeroize::Zeroizing::new(env.to_vec()),
@@ -5777,7 +5784,7 @@ fn cli_pq_decap_with_fallback(
             }
         }
     } else {
-        zeroize::Zeroizing::new(typed_seed_pw.into_bytes())
+        zeroize::Zeroizing::new(typed_seed_pw.as_bytes().to_vec())
     };
 
     let seed = seed_file::read(kyber_path, &seed_pw_bytes[..])?;
@@ -5831,16 +5838,16 @@ fn cli_create_fido2_deniable_v2(
     use luksbox_format::deniable_header::DeniableMaterial;
     use rand_core::RngCore;
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
-    let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     rand_core::OsRng
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| cli_err!("OS RNG: {e}"))?;
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin.as_str()))?;
     let cred = luksbox_core::deniable::DeniableCredential::Fido2Passphrase {
         passphrase: pass.as_bytes(),
         argon2,
@@ -5926,25 +5933,25 @@ fn cli_create_pq_fido2_deniable_v2(
         PqParams::Ml768
     };
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
-    // Round 12 fix R12-02: align with GUI/wizard. Blank = reuse envelope.
-    let typed_seed_pw = rpassword::prompt_password(
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    // Blank = reuse envelope passphrase (aligns with GUI/wizard).
+    let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(
         "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
-    )?;
+    )?);
     let seed_pw: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
         zeroize::Zeroizing::new(pass.as_bytes().to_vec())
     } else {
-        zeroize::Zeroizing::new(typed_seed_pw.into_bytes())
+        zeroize::Zeroizing::new(typed_seed_pw.as_bytes().to_vec())
     };
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
-    let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     rand_core::OsRng
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| cli_err!("OS RNG: {e}"))?;
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin.as_str()))?;
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
     let cred = luksbox_core::deniable::DeniableCredential::HybridPqFido2Passphrase {
@@ -6006,7 +6013,7 @@ fn cli_create_tpm_deniable_v2(
     // Optional TPM userAuth. Empty input means "no PIN" -- the
     // unlock side must then use `unseal` (no PIN) or the TPM
     // rejects with TPM_RC_AUTH_FAIL and bumps the DA counter.
-    let pin_in = rpassword::prompt_password("TPM PIN (empty for none): ")?;
+    let pin_in = zeroize::Zeroizing::new(rpassword::prompt_password("TPM PIN (empty for none): ")?);
     let pin_bytes: Option<&[u8]> = if pin_in.is_empty() {
         None
     } else {
@@ -6039,17 +6046,17 @@ fn cli_create_tpm_fido2_deniable_v2(
     use luksbox_format::deniable_header::DeniableMaterial;
     use rand_core::RngCore;
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
     let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
-    let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     rand_core::OsRng
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| cli_err!("OS RNG: {e}"))?;
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin.as_str()))?;
     let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
         passphrase: pass.as_bytes(),
         argon2,
@@ -6085,14 +6092,14 @@ fn cli_create_pq_tpm_deniable_v2(
     };
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
     let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
-    // Round 12 fix R12-02: align with GUI/wizard. Blank = reuse envelope.
-    let typed_seed_pw = rpassword::prompt_password(
+    // Blank = reuse envelope passphrase (aligns with GUI/wizard).
+    let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(
         "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
-    )?;
+    )?);
     let seed_pw: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
         zeroize::Zeroizing::new(pass.as_bytes().to_vec())
     } else {
-        zeroize::Zeroizing::new(typed_seed_pw.into_bytes())
+        zeroize::Zeroizing::new(typed_seed_pw.as_bytes().to_vec())
     };
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
@@ -6147,26 +6154,26 @@ fn cli_create_pq_tpm_fido2_deniable_v2(
         PqParams::Ml768
     };
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
-    // Round 12 fix R12-02: align with GUI/wizard. Blank = reuse envelope.
-    let typed_seed_pw = rpassword::prompt_password(
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    // Blank = reuse envelope passphrase (aligns with GUI/wizard).
+    let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(
         "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
-    )?;
+    )?);
     let seed_pw: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
         zeroize::Zeroizing::new(pass.as_bytes().to_vec())
     } else {
-        zeroize::Zeroizing::new(typed_seed_pw.into_bytes())
+        zeroize::Zeroizing::new(typed_seed_pw.as_bytes().to_vec())
     };
     let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
-    let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     rand_core::OsRng
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| cli_err!("OS RNG: {e}"))?;
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin.as_str()))?;
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
     let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpmFido2Passphrase {

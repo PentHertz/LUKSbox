@@ -325,7 +325,7 @@ pub fn trial_decrypt_with_idx(
     if bool::from(found) {
         Some((
             found_idx_u8 as usize,
-            MasterVolumeKey::from_bytes(*mvk_bytes),
+            MasterVolumeKey::from_zeroizing(&mvk_bytes),
         ))
     } else {
         None
@@ -657,7 +657,7 @@ fn hkdf_kek(
     let hk = Hkdf::<Sha256>::new(Some(per_vault_salt), ikm);
     hk.expand(info, out.as_mut_slice())
         .expect("32 <= 255*HashLen");
-    KeyEncryptionKey::from_bytes(*out)
+    KeyEncryptionKey::from_zeroizing(&out)
 }
 
 /// Internal: HKDF-SHA256 KEK from a CONCATENATED IKM (multiple
@@ -687,7 +687,7 @@ pub fn inner_header_key(
     let hk = Hkdf::<Sha256>::new(Some(per_vault_salt), mvk.as_bytes());
     hk.expand(hkdf_info::INNER_HEADER, out.as_mut_slice())
         .expect("32 <= 255*HashLen");
-    KeyEncryptionKey::from_bytes(*out)
+    KeyEncryptionKey::from_zeroizing(&out)
 }
 
 // ============================================================
