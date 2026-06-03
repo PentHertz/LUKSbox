@@ -18,6 +18,8 @@ use crate::unix_statvfs::host_fs_statvfs;
 
 const TTL: Duration = Duration::from_secs(1);
 
+use crate::LAZY_FLUSH_INTERVAL_SECS;
+
 /// Layer 1 deferred-flush policy:
 ///
 /// FUSE filesystem ops that mutate metadata (create, mkdir, unlink,
@@ -36,12 +38,10 @@ const TTL: Duration = Duration::from_secs(1);
 /// mirror + live region on every `rm`, so a single `rm` could take
 /// minutes on a 10k-file vault).
 ///
-/// Crash-loss window: up to LAZY_FLUSH_INTERVAL_SECS of metadata
-/// changes if the host loses power between activity and the next
-/// timer tick. Same crash-loss profile as ext4's `commit=30` default.
-/// Users who want the pre-Layer-1 eager-flush semantics back can
-/// pass `--sync` to `luksbox mount`.
-const LAZY_FLUSH_INTERVAL_SECS: u64 = 30;
+/// Users who want pre-Layer-1 eager-flush semantics back pass `--sync`
+/// to `luksbox mount`. The interval constant lives in the crate root
+/// (`crate::LAZY_FLUSH_INTERVAL_SECS`) and is shared with the FUSE-T
+/// and WinFsp adapters which implement the same pattern.
 
 pub fn mount(vfs: Vfs, mountpoint: &Path, daemonize: bool, sync_mode: bool) -> std::io::Result<()> {
     // AutoUnmount intentionally NOT used: on Linux it implies allow_other,

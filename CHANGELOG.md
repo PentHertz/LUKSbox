@@ -32,7 +32,7 @@ only prevents future occurrences.
 
 ### Performance
 
-- **Deferred metadata flush ("Layer 1") on Linux libfuse3 mounts.**
+- **Deferred metadata flush ("Layer 1") on all mount backends.**
   Pre-v0.2.2, every metadata-changing FUSE op (create, mkdir,
   unlink, rmdir, rename, setattr, symlink, link, FUSE flush/release)
   drove an immediate synchronous `Vfs::flush`, which on v0.2.1+
@@ -45,9 +45,18 @@ only prevents future occurrences.
   per mount) drives a `Vfs::flush` every 30 seconds when dirty.
   Explicit `fsync(2)` / `fsyncdir(2)` syscalls remain eagerly
   synchronous (POSIX-required). Final flush on unmount via the
-  FUSE `destroy()` callback also stays eager. The net effect on
-  the user's bug-report scenario: `rm` returns in milliseconds,
-  `cp -r 10k_files` completes in seconds instead of hours.
+  FUSE `destroy()` callback (and WinFsp's `Drop`) also stays eager.
+  The net effect on the user's bug-report scenario: `rm` returns
+  in milliseconds, `cp -r 10k_files` completes in seconds instead
+  of hours.
+
+  **Platform coverage:** Linux libfuse3, macOS macFUSE, macOS
+  FUSE-T, and Windows WinFsp all share the same lazy-flush
+  pattern. Earlier v0.2.2 drafts shipped Layer 1 for libfuse3 only;
+  the FUSE-T and WinFsp adapters now host their own
+  `luksbox-flush-timer` thread with identical 30 s cadence,
+  identical `--sync` opt-out, and identical final-flush guarantee.
+  The shared interval lives in `luksbox_mount::LAZY_FLUSH_INTERVAL_SECS`.
 
   Durability model matches ext4 / btrfs / xfs commit intervals: a
   crash without an explicit `fsync` can lose up to 30 seconds of

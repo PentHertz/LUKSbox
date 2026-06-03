@@ -36,6 +36,27 @@ mod unix_statvfs;
 #[cfg(all(target_os = "windows", feature = "winfsp"))]
 mod winfsp;
 
+/// Layer 1 deferred-flush interval, shared by every mount backend that
+/// implements the lazy-flush pattern (libfuse3, FUSE-T, WinFsp).
+/// Background `luksbox-flush-timer` threads in each adapter wake every
+/// `LAZY_FLUSH_INTERVAL_SECS` seconds, briefly acquire the Vfs lock and
+/// call `Vfs::flush()` (a no-op when the tree is clean). Mutating ops
+/// return as soon as the in-memory tree is updated rather than driving
+/// a synchronous flush per call. Users who want pre-Layer-1 semantics
+/// (durable on every metadata op return) pass `--sync` to
+/// `luksbox mount`, which disables the timer and re-enables eager
+/// flushing in every adapter.
+///
+/// Crash-loss window: up to `LAZY_FLUSH_INTERVAL_SECS` of metadata
+/// changes if the host loses power between activity and the next
+/// timer tick. Matches ext4's `commit=30` default.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "fuse"),
+    all(target_os = "macos", feature = "fuse-t"),
+    all(target_os = "windows", feature = "winfsp"),
+))]
+pub(crate) const LAZY_FLUSH_INTERVAL_SECS: u64 = 30;
+
 /// Re-export of `winfsp::winfsp_preflight` so the GUI can fail the
 /// "Mount" button early with an actionable WinFsp-missing message
 /// instead of waiting for the dispatcher set-up to surface the
@@ -292,12 +313,7 @@ pub fn mount<P: AsRef<Path>>(
     daemonize: bool,
     sync_mode: bool,
 ) -> Result<(), MountError> {
-    // FUSE-T's mount() does not yet plumb sync_mode through the C
-    // trampoline; v0.2.2 deferred-flush optimisation lives in the
-    // libfuse3 (Linux) handler. macOS users opt in by mounting via
-    // macFUSE instead (which goes through the cfg branch below).
-    let _ = sync_mode;
-    fuse_t::mount(vfs, mountpoint.as_ref(), daemonize)?;
+    fuse_t::mount(vfs, mountpoint.as_ref(), daemonize, sync_mode)?;
     Ok(())
 }
 
@@ -323,11 +339,7 @@ pub fn mount<P: AsRef<Path>>(
     _daemonize: bool,
     sync_mode: bool,
 ) -> Result<(), MountError> {
-    // WinFsp's session API doesn't yet take the sync_mode hint; the
-    // deferred-flush change is libfuse3-only for v0.2.2. The flag is
-    // accepted at the API surface for forward compat.
-    let _ = sync_mode;
-    winfsp::mount(vfs, mountpoint.as_ref())
+    winfsp::mount(vfs, mountpoint.as_ref(), sync_mode)
 }
 
 #[cfg(any(

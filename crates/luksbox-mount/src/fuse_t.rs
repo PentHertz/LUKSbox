@@ -17,7 +17,8 @@
 //! tree generation counter.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use luksbox_fuse_t::{
     DirEntry as FtDirEntry, Errno, FileAttr, Filesystem, MountOptions, S_IFDIR, S_IFLNK, S_IFREG,
@@ -25,15 +26,21 @@ use luksbox_fuse_t::{
 };
 use luksbox_vfs::{Error as VfsError, FileId, InodeKind, Vfs};
 
+use crate::LAZY_FLUSH_INTERVAL_SECS;
 use crate::unix_statvfs::host_fs_statvfs;
 
-pub fn mount(vfs: Vfs, mountpoint: &Path, _daemonize: bool) -> Result<(), super::MountError> {
+pub fn mount(
+    vfs: Vfs,
+    mountpoint: &Path,
+    _daemonize: bool,
+    sync_mode: bool,
+) -> Result<(), super::MountError> {
     // FUSE-T's high-level API blocks the calling thread until unmount,
     // and installs its own SIGINT handler so Ctrl-C unmounts cleanly.
     // We don't fork/daemonize here, the CLI binary does that one
     // level up if needed (mirroring the structure in fuse.rs but
     // moving the fork to the caller, which is cleaner anyway).
-    let fs = LuksboxFuseTFs::new(vfs);
+    let fs = LuksboxFuseTFs::new(vfs, sync_mode);
     let mut options = MountOptions::default();
     // Show a friendlier name in Finder than the default "luksbox".
     options.volname = Some("LUKSbox".to_string());
@@ -47,7 +54,11 @@ pub fn unmount(mountpoint: &Path) -> Result<(), super::MountError> {
 }
 
 struct LuksboxFuseTFs {
-    vfs: Mutex<Vfs>,
+    /// Wrapped in `Arc` so the deferred-flush timer thread (spawned in
+    /// `new` when `sync_mode == false`) can hold an independent strong
+    /// reference and call `vfs.flush()` periodically without keeping
+    /// `&self` borrowed for the timer's lifetime.
+    vfs: Arc<Mutex<Vfs>>,
     uid: u32,
     gid: u32,
     /// Directory containing the .lbx vault file, cached at construction
@@ -58,10 +69,21 @@ struct LuksboxFuseTFs {
     /// which is what the default trait impl returns. Mirrors the same
     /// pattern in fuse.rs for libfuse/macFUSE.
     vault_parent: Option<PathBuf>,
+    /// When true, every metadata-mutating op drives an immediate
+    /// `vfs.flush()` (pre-Layer-1 behavior). Set via `luksbox mount
+    /// --sync` for users who want every operation durable before it
+    /// returns. Default is `false` -- ops mark the Vfs dirty and
+    /// return; the timer thread below catches up.
+    sync_mode: bool,
+    /// Wakes / shuts down the deferred-flush timer thread. Dropping
+    /// the sender (or sending on it) causes the timer's `recv_timeout`
+    /// to return `Disconnected` immediately and the thread exits.
+    /// `None` when `sync_mode == true` (no timer was spawned).
+    timer_stop_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl LuksboxFuseTFs {
-    fn new(vfs: Vfs) -> Self {
+    fn new(vfs: Vfs, sync_mode: bool) -> Self {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
         let vault_parent = vfs
@@ -69,11 +91,56 @@ impl LuksboxFuseTFs {
             .vault_path()
             .parent()
             .map(|p| p.to_path_buf());
+        let vfs = Arc::new(Mutex::new(vfs));
+        let timer_stop_tx = if sync_mode {
+            None
+        } else {
+            // Background flush timer: wakes every
+            // LAZY_FLUSH_INTERVAL_SECS, briefly takes the Vfs lock and
+            // calls `vfs.flush()`. `recv_timeout` returns `Disconnected`
+            // either when the FS is dropped (Sender dropped) OR when
+            // `destroy()` sends a stop signal; either way the thread
+            // exits within microseconds rather than after another
+            // sleep. Mirrors the fuse.rs (libfuse3) implementation.
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let timer_vfs = Arc::clone(&vfs);
+            let _ = std::thread::Builder::new()
+                .name("luksbox-flush-timer".to_string())
+                .spawn(move || {
+                    loop {
+                        match rx.recv_timeout(Duration::from_secs(LAZY_FLUSH_INTERVAL_SECS)) {
+                            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                break;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if let Ok(mut v) = timer_vfs.lock() {
+                                    let _ = v.flush();
+                                }
+                            }
+                        }
+                    }
+                });
+            Some(tx)
+        };
         Self {
-            vfs: Mutex::new(vfs),
+            vfs,
             uid,
             gid,
             vault_parent,
+            sync_mode,
+            timer_stop_tx: Mutex::new(timer_stop_tx),
+        }
+    }
+
+    /// Called from every metadata-mutating FUSE-T handler in lieu of
+    /// the pre-Layer-1 unconditional `vfs.flush()`. With the default
+    /// `sync_mode == false`, this is a no-op -- the in-memory tree
+    /// stays dirty and the timer thread above catches up within
+    /// `LAZY_FLUSH_INTERVAL_SECS`. With `--sync`, every mutation
+    /// drives an immediate flush, restoring pre-Layer-1 semantics.
+    fn maybe_flush_now(&self, vfs: &mut Vfs) {
+        if self.sync_mode {
+            let _ = vfs.flush();
         }
     }
 
@@ -193,7 +260,7 @@ impl Filesystem for LuksboxFuseTFs {
         // verbatim.
         vfs.create_with_mode(parent_id, &name, mode & 0o7777)
             .map_err(|e| Self::vfs_errno(&e))?;
-        let _ = vfs.flush();
+        self.maybe_flush_now(&mut vfs);
         Ok(())
     }
 
@@ -206,7 +273,7 @@ impl Filesystem for LuksboxFuseTFs {
         // Empty dirs create no chunks; flush now or the metadata
         // change won't survive a subsequent unmount. Same reasoning
         // as fuse.rs:mkdir.
-        let _ = vfs.flush();
+        self.maybe_flush_now(&mut vfs);
         Ok(())
     }
 
@@ -216,7 +283,7 @@ impl Filesystem for LuksboxFuseTFs {
         let parent_id = self.lookup_id(&vfs, &parent)?;
         vfs.unlink(parent_id, &name)
             .map_err(|e| Self::vfs_errno(&e))?;
-        let _ = vfs.flush();
+        self.maybe_flush_now(&mut vfs);
         Ok(())
     }
 
@@ -226,7 +293,7 @@ impl Filesystem for LuksboxFuseTFs {
         let parent_id = self.lookup_id(&vfs, &parent)?;
         vfs.rmdir(parent_id, &name)
             .map_err(|e| Self::vfs_errno(&e))?;
-        let _ = vfs.flush();
+        self.maybe_flush_now(&mut vfs);
         Ok(())
     }
 
@@ -245,7 +312,7 @@ impl Filesystem for LuksboxFuseTFs {
         };
         vfs.rename(from_parent_id, &from_name, to_parent_id, &to_name)
             .map_err(|e| Self::vfs_errno(&e))?;
-        let _ = vfs.flush();
+        self.maybe_flush_now(&mut vfs);
         Ok(())
     }
 
@@ -253,7 +320,7 @@ impl Filesystem for LuksboxFuseTFs {
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
         let id = self.lookup_id(&vfs, path)?;
         vfs.truncate(id, size).map_err(|e| Self::vfs_errno(&e))?;
-        let _ = vfs.flush();
+        self.maybe_flush_now(&mut vfs);
         Ok(())
     }
 
@@ -265,7 +332,7 @@ impl Filesystem for LuksboxFuseTFs {
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
         let id = self.lookup_id(&vfs, path)?;
         vfs.chmod(id, mode).map_err(|e| Self::vfs_errno(&e))?;
-        let _ = vfs.flush();
+        self.maybe_flush_now(&mut vfs);
         Ok(())
     }
 
@@ -280,7 +347,7 @@ impl Filesystem for LuksboxFuseTFs {
         let new_parent_id = self.lookup_id(&vfs, &to_parent_path)?;
         vfs.link(target_id, new_parent_id, &to_name)
             .map_err(|e| Self::vfs_errno(&e))?;
-        let _ = vfs.flush();
+        self.maybe_flush_now(&mut vfs);
         Ok(())
     }
 
@@ -298,7 +365,7 @@ impl Filesystem for LuksboxFuseTFs {
         let parent_id = self.lookup_id(&vfs, &link_parent)?;
         vfs.symlink(parent_id, &link_name, target_str)
             .map_err(|e| Self::vfs_errno(&e))?;
-        let _ = vfs.flush();
+        self.maybe_flush_now(&mut vfs);
         Ok(())
     }
 
@@ -334,14 +401,25 @@ impl Filesystem for LuksboxFuseTFs {
         // time, and that's when our chunk index needs to land on
         // disk.
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
-        let _ = vfs.flush();
+        self.maybe_flush_now(&mut vfs);
         Ok(())
     }
 
     fn destroy(&self) {
-        // Final teardown after kernel unmount. Belt-and-suspenders
-        // flush so anything held back by release()'s soft-flush gets
-        // out.
+        // Signal the deferred-flush timer thread to exit. Dropping
+        // the Sender causes the timer's `recv_timeout` to return
+        // `Disconnected` immediately rather than waiting out the
+        // remaining sleep period. Same Mutex<Option<_>>::take()
+        // pattern as the libfuse3 adapter.
+        if let Ok(mut tx) = self.timer_stop_tx.lock()
+            && let Some(tx) = tx.take()
+        {
+            drop(tx);
+        }
+        // Final teardown after kernel unmount. Unconditional flush so
+        // anything deferred since the last timer tick (or held back
+        // by release()'s soft-flush) lands on disk before the
+        // Container is dropped.
         if let Ok(mut vfs) = self.vfs.lock() {
             let _ = vfs.flush();
         }
