@@ -381,8 +381,37 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
         rp_id: &str,
         cred_id: &[u8],
         salt: &[u8; 32],
+        prehash_salt: bool,
         _pin: Option<&str>,
     ) -> Result<HmacSecret, Error> {
+        // V1/V2/V3 keyslots (the "raw salt" wire convention) cannot
+        // unlock on Windows. webauthn.dll, when fed via
+        // `pHmacSecretSaltValues`, always SHA-256s the salt before
+        // forwarding to the authenticator (W3C WebAuthn Level 3 PRF
+        // behaviour); the API offers no way to opt out. Producing a
+        // wrong HMAC and letting the AEAD fail downstream would
+        // surface as the generic "keyslot authentication failed"
+        // error, which a v0.2.2 user spent a long debugging session
+        // tracing to this exact root cause. We short-circuit with a
+        // clear pointer at the v0.3.0 migration tool instead.
+        if !prehash_salt {
+            return Err(Error::Other(
+                "this FIDO2 keyslot was enrolled on Linux/macOS under \
+                 the pre-v0.3.0 wire convention and cannot unlock on \
+                 Windows. The Linux backend (libfido2) passes the \
+                 hmac-secret salt raw to the authenticator, while the \
+                 Windows backend (webauthn.dll) prehashes it with \
+                 SHA-256 per the W3C WebAuthn Level 3 PRF spec; the \
+                 two paths produce different HMAC outputs from the \
+                 same authenticator. Migrate the slot to the \
+                 cross-platform v0.3.0 convention by running \
+                 `luksbox migrate-fido2-slot --slot N` on Linux or \
+                 macOS, or enroll a backup passphrase keyslot for \
+                 cross-platform access."
+                    .into(),
+            ));
+        }
+
         // Defence-in-depth on caller-supplied bytes. cred_id comes
         // from the .lbx vault keyslot; a corrupted or tampered keyslot
         // could in principle produce a multi-MB cred_id that we'd

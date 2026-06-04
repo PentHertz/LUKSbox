@@ -6271,6 +6271,35 @@ impl LuksboxApp {
                                     .color(theme::FAINT),
                                 );
                             }
+                            // V0.3.0 cross-platform tag: V4 FIDO2 slots
+                            // (the new default) open on Linux, macOS, and
+                            // Windows; older V1/V2/V3 FIDO2 slots are
+                            // Linux/macOS-only because libfido2 and
+                            // webauthn.dll prehash the hmac-secret salt
+                            // differently. Surface this in the slot table
+                            // so users can find the slots they need to
+                            // migrate before crossing platforms.
+                            if slot.touches_fido2() {
+                                if slot.fido2_salt_prehashed() {
+                                    ui.label(
+                                        RichText::new("V4: cross-platform (Linux/macOS/Windows)")
+                                            .small()
+                                            .color(theme::FAINT),
+                                    );
+                                } else {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "V{}: Linux/macOS-only \
+                                             (pre-v0.3.0; run `luksbox \
+                                             migrate-fido2-slot --slot {i}` \
+                                             for cross-platform)",
+                                            slot.aad_version
+                                        ))
+                                        .small()
+                                        .color(theme::WARN),
+                                    );
+                                }
+                            }
                         });
                     ui.add_space(8.0);
                 }

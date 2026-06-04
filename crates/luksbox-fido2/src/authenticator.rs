@@ -105,11 +105,29 @@ pub trait Fido2Authenticator {
     ) -> Result<EnrollResult, Error>;
 
     /// Compute hmac-secret(salt) for an existing credential.
+    ///
+    /// `prehash_salt`: governs the on-wire convention. When true, the
+    /// authenticator must be driven so it computes
+    /// `HMAC-SHA256(device_secret, SHA-256(salt))` (v0.3.0 cross-
+    /// platform "V4" slot convention). When false, it must compute
+    /// `HMAC-SHA256(device_secret, salt)` (pre-v0.3.0 V1/V2/V3
+    /// convention, Linux/macOS only).
+    ///
+    /// Backend behaviour:
+    /// - libfido2 (Linux/macOS): SHA-256s the salt locally when
+    ///   `prehash_salt=true`; passes it raw when false.
+    /// - webauthn.dll (Windows): always prehashes internally per
+    ///   W3C WebAuthn Level 3 PRF behaviour, so the param can only
+    ///   honour `true`. On `false` (V1/V2/V3 slot) it returns a
+    ///   `Fido2SlotPlatformLocked` error pointing at the migration
+    ///   command rather than producing wrong bytes.
+    /// - mock: mirrors libfido2 semantics for tests.
     fn hmac_secret(
         &mut self,
         rp_id: &str,
         cred_id: &[u8],
         salt: &[u8; 32],
+        prehash_salt: bool,
         pin: Option<&str>,
     ) -> Result<HmacSecret, Error>;
 }

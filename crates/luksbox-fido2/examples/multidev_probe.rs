@@ -55,7 +55,7 @@ fn enroll_and_wrap(
 
     println!("TOUCH {} ({})  assert (derive KEK)", touch_n + 1, label);
     let secret = auth
-        .hmac_secret(RP, &er.credential.id, &salt, pin)
+        .hmac_secret(RP, &er.credential.id, &salt, true, pin)
         .unwrap_or_else(|e| panic!("{label} assert failed: {e:?}"));
 
     let slot = Keyslot::new_fido2(
@@ -101,7 +101,13 @@ fn unlock_via(
     let mut auth = auth_for(path);
     println!("TOUCH {} ({})  assert (unlock)", touch_n, label);
     let secret = auth
-        .hmac_secret(RP, &parsed.fido2_cred_id, &parsed.fido2_hmac_salt, pin)
+        .hmac_secret(
+            RP,
+            &parsed.fido2_cred_id,
+            &parsed.fido2_hmac_salt,
+            parsed.fido2_salt_prehashed(),
+            pin,
+        )
         .unwrap_or_else(|e| panic!("{label} unlock-assert failed: {e:?}"));
 
     parsed

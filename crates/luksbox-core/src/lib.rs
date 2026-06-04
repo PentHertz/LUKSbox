@@ -24,6 +24,6 @@ pub use crate::header::{
 pub use crate::kdf::{Argon2idParams, KdfId};
 pub use crate::key::{KeyEncryptionKey, MasterVolumeKey, SubKey};
 pub use crate::keyslot::{
-    AAD_VERSION_V1, AAD_VERSION_V2, AAD_VERSION_V3, FIDO2_CRED_ID_MAX, FIDO2_CRED_ID_MAX_V1V2,
-    Keyslot, SLOT_SIZE, SlotKind,
+    AAD_VERSION_V1, AAD_VERSION_V2, AAD_VERSION_V3, AAD_VERSION_V4, FIDO2_CRED_ID_MAX,
+    FIDO2_CRED_ID_MAX_V1V2, Keyslot, SLOT_SIZE, SlotKind,
 };

@@ -720,7 +720,7 @@ pub fn create_vault_with_tpm_factors_deniable(
                 .try_fill_bytes(&mut hmac_salt)
                 .map_err(|e| format!("OS RNG failure: {e}"))?;
             let hmac_secret = auth
-                .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))
+                .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))
                 .map_err(estr)?;
 
             let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
@@ -811,7 +811,7 @@ pub fn create_vault_with_tpm_factors_deniable(
                 .try_fill_bytes(&mut hmac_salt)
                 .map_err(|e| format!("OS RNG failure: {e}"))?;
             let hmac_secret = auth
-                .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))
+                .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))
                 .map_err(estr)?;
 
             let (pk, seed) = keygen_with(params);
@@ -1002,7 +1002,7 @@ pub fn create_vault_with_tpm_factors_only(
                 .try_fill_bytes(&mut hmac_salt)
                 .map_err(|e| format!("OS RNG: {e}"))?;
             let hmac_secret = auth
-                .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))
+                .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))
                 .map_err(estr)?;
 
             Container::create_with_tpm2_fido2(
@@ -1097,7 +1097,7 @@ pub fn create_vault_with_tpm_factors_only(
                 .try_fill_bytes(&mut hmac_salt)
                 .map_err(|e| format!("OS RNG: {e}"))?;
             let hmac_secret = auth
-                .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))
+                .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))
                 .map_err(estr)?;
 
             let (pk, seed) = keygen_with(params);
@@ -1627,7 +1627,7 @@ pub fn create_vault(opts: CreateOpts) -> Result<OpenedVault, String> {
                 .try_fill_bytes(&mut hmac_salt)
                 .map_err(|e| format!("OS RNG failure: {e}"))?;
             let hmac_secret = auth
-                .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin))
+                .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin))
                 .map_err(estr)?;
             let cred = luksbox_core::deniable::DeniableCredential::Fido2Passphrase {
                 passphrase: pw.as_bytes(),
@@ -1871,7 +1871,7 @@ fn create_fido2_wrap(
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG failure generating FIDO2 hmac salt: {e}"))?;
     let hmac_secret = auth
-        .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin))
+        .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin))
         .map_err(estr)?;
     Container::create_with_fido2_flags(
         path,
@@ -1916,7 +1916,7 @@ fn create_fido2_direct(
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG failure generating FIDO2 hmac salt: {e}"))?;
     let hmac_secret = auth
-        .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin))
+        .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin))
         .map_err(estr)?;
     Container::create_with_fido2_derived_mvk(
         path,
@@ -2031,7 +2031,7 @@ fn create_hybrid_pq_fido2(
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG failure generating FIDO2 hmac salt: {e}"))?;
     let hmac_secret = auth
-        .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin))
+        .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin))
         .map_err(estr)?;
 
     let (pk, kyber_seed) = keygen_with(params);
@@ -2691,7 +2691,7 @@ fn create_hybrid_pq_fido2_deniable(
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG failure: {e}"))?;
     let hmac_secret = auth
-        .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin))
+        .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin))
         .map_err(estr)?;
 
     let (pk, seed) = keygen_with(params);
@@ -2824,7 +2824,13 @@ fn deniable_fido2_hmac_from_payload(
         return Err("envelope cred_id is empty for FIDO2 variant".into());
     }
     let mut auth = make_fido2_authenticator();
-    auth.hmac_secret(RP_ID, cred_id, salt, Some(pin))
+    // Deniable v2 envelopes embedded the cred_id + salt at create
+    // time. v0.3.0 always uses the V4 prehashed-salt convention for
+    // new envelopes; older envelopes would need an envelope-version
+    // probe here. The deniable-header v2 format is still in flux
+    // (docs/DENIABLE_HEADER.md), so we hard-code `true` and revisit
+    // when the envelope gains an explicit convention version.
+    auth.hmac_secret(RP_ID, cred_id, salt, true, Some(pin))
         .map_err(estr)
 }
 
@@ -2871,14 +2877,19 @@ fn unlock_with_fido2(
         ) {
             continue;
         }
-        let hmac_secret =
-            match auth.hmac_secret(RP_ID, &slot.fido2_cred_id, &slot.fido2_hmac_salt, Some(pin)) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2: {e}"));
-                    continue;
-                }
-            };
+        let hmac_secret = match auth.hmac_secret(
+            RP_ID,
+            &slot.fido2_cred_id,
+            &slot.fido2_hmac_salt,
+            slot.fido2_salt_prehashed(),
+            Some(pin),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(format!("FIDO2: {e}"));
+                continue;
+            }
+        };
         match Container::open(
             path,
             header_path,
@@ -3005,14 +3016,19 @@ fn unlock_with_tpm2_fido2(
             Some(c) => c.to_vec(),
             None => continue,
         };
-        let hmac_secret =
-            match auth.hmac_secret(RP_ID, &stored_cred, &slot.fido2_hmac_salt, Some(pin)) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2 hmac-secret: {e}"));
-                    continue;
-                }
-            };
+        let hmac_secret = match auth.hmac_secret(
+            RP_ID,
+            &stored_cred,
+            &slot.fido2_hmac_salt,
+            slot.fido2_salt_prehashed(),
+            Some(pin),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(format!("FIDO2 hmac-secret: {e}"));
+                continue;
+            }
+        };
         let mut unseal = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
             let parsed = SealedBlob::from_bytes(blob)
                 .map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
@@ -3220,14 +3236,19 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
                 continue;
             }
         };
-        let hmac_secret =
-            match auth.hmac_secret(RP_ID, &stored_cred, &slot.fido2_hmac_salt, Some(pin)) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2: {e}"));
-                    continue;
-                }
-            };
+        let hmac_secret = match auth.hmac_secret(
+            RP_ID,
+            &stored_cred,
+            &slot.fido2_hmac_salt,
+            slot.fido2_salt_prehashed(),
+            Some(pin),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(format!("FIDO2: {e}"));
+                continue;
+            }
+        };
         let pq_shared = match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
             Ok(s) => s,
             Err(e) => {
@@ -3378,14 +3399,19 @@ fn unlock_with_hybrid_pq_fido2(
                 continue;
             }
         };
-        let hmac_secret =
-            match auth.hmac_secret(RP_ID, &slot.fido2_cred_id, &slot.fido2_hmac_salt, Some(pin)) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2: {e}"));
-                    continue;
-                }
-            };
+        let hmac_secret = match auth.hmac_secret(
+            RP_ID,
+            &slot.fido2_cred_id,
+            &slot.fido2_hmac_salt,
+            slot.fido2_salt_prehashed(),
+            Some(pin),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(format!("FIDO2: {e}"));
+                continue;
+            }
+        };
         let pq_shared = match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
             Ok(s) => s,
             Err(e) => {
@@ -3835,7 +3861,7 @@ pub fn enroll_fido2(vfs: &mut Vfs, pin: &str) -> Result<usize, String> {
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG failure generating FIDO2 hmac salt: {e}"))?;
     let hmac_secret = auth
-        .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin))
+        .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin))
         .map_err(estr)?;
     let cont = vfs.container_mut();
     let idx = cont
@@ -3886,7 +3912,7 @@ pub fn enroll_fido2_deniable(
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG failure: {e}"))?;
     let hmac_secret = auth
-        .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin))
+        .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin))
         .map_err(estr)?;
 
     let cont = vfs.container_mut();
@@ -4040,7 +4066,7 @@ pub fn enroll_tpm2_fido2_deniable(
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG failure: {e}"))?;
     let hmac_secret = auth
-        .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(fido2_pin))
+        .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(fido2_pin))
         .map_err(estr)?;
 
     let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
@@ -4175,7 +4201,7 @@ pub fn enroll_hybrid_pq_tpm2_fido2_deniable(
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG failure: {e}"))?;
     let hmac_secret = auth
-        .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(fido2_pin))
+        .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(fido2_pin))
         .map_err(estr)?;
 
     let (pk, seed) = keygen_with(params);
@@ -4291,7 +4317,7 @@ pub fn enroll_tpm2_fido2(vfs: &mut Vfs, pin: &str) -> Result<usize, String> {
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG failure generating FIDO2 hmac salt: {e}"))?;
     let hmac_secret = auth
-        .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin))
+        .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin))
         .map_err(estr)?;
 
     let cont = vfs.container_mut();
@@ -4528,7 +4554,7 @@ pub fn enroll_hybrid_pq_tpm2_fido2(
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG failure generating FIDO2 hmac salt: {e}"))?;
     let hmac_secret = auth
-        .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(fido2_pin))
+        .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(fido2_pin))
         .map_err(estr)?;
 
     let (pk, seed) = keygen_with(params);
@@ -5018,7 +5044,7 @@ pub fn enroll_hybrid_pq_fido2(
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG failure generating FIDO2 hmac salt: {e}"))?;
     let hmac_secret = auth
-        .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin))
+        .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin))
         .map_err(estr)?;
 
     let (pk, seed) = keygen_with(params);
@@ -5288,7 +5314,7 @@ pub fn enroll_hybrid_pq_fido2_deniable(
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG failure generating FIDO2 hmac salt: {e}"))?;
     let hmac_secret = auth
-        .hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin))
+        .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin))
         .map_err(estr)?;
 
     let (pk, seed) = keygen_with(params);

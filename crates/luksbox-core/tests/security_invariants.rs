@@ -299,8 +299,8 @@ fn v3_slot_aead_aad_covers_fido2_cred_id_region() {
         let parsed = Keyslot::from_bytes(&bytes).unwrap();
         assert_eq!(
             parsed.aad_version,
-            luksbox_core::AAD_VERSION_V3,
-            "new FIDO2 slot must default to V3 AAD shape"
+            luksbox_core::AAD_VERSION_V4,
+            "new FIDO2 slot must default to V4 (cross-platform salt convention)"
         );
         let recovered = parsed
             .unlock_fido2(CipherSuite::Aes256Gcm, None, &hmac_secret, &HEADER_SALT)
@@ -348,7 +348,7 @@ fn v3_slot_accepts_288_byte_cred_id() {
     let (bytes, mvk) = build_fido2_slot(&cred_id, salt, &hmac_secret);
 
     let parsed = Keyslot::from_bytes(&bytes).unwrap();
-    assert_eq!(parsed.aad_version, luksbox_core::AAD_VERSION_V3);
+    assert_eq!(parsed.aad_version, luksbox_core::AAD_VERSION_V4);
     assert_eq!(parsed.fido2_cred_id.len(), 288);
     assert_eq!(parsed.fido2_cred_id, cred_id);
 
@@ -368,12 +368,12 @@ fn flipping_aad_version_byte_breaks_unlock() {
         .expect("clean unlock");
 
     // Flip byte 1 (the AAD-version + layout selector). New slots are
-    // V3; flip to V1. Reader will build a V1 AAD instead of V3, AND
+    // V4; flip to V1. Reader will build a V1 AAD instead of V4, AND
     // V1 has a different layout (hmac_salt at 256 vs 480) for FIDO2
     // slots, AND the version byte itself sits inside the AAD region
     // so its value is part of the tag input. Any of these breaks the
     // tag check.
-    assert_eq!(bytes[1], luksbox_core::AAD_VERSION_V3);
+    assert_eq!(bytes[1], luksbox_core::AAD_VERSION_V4);
     bytes[1] = luksbox_core::AAD_VERSION_V1;
     let parsed = Keyslot::from_bytes(&bytes).unwrap();
     assert_eq!(parsed.aad_version, luksbox_core::AAD_VERSION_V1);

@@ -39,7 +39,7 @@ fn assert_for(
 ) -> [u8; 32] {
     let mut a = auth_for(path);
     let h = a
-        .hmac_secret(RP, cred, salt, pin)
+        .hmac_secret(RP, cred, salt, true, pin)
         .unwrap_or_else(|e| panic!("{label} assert failed: {e:?}"));
     *h
 }
@@ -151,7 +151,7 @@ fn main() {
     println!("\n--- Phase A: negative cross-device test ---");
     println!("(no touch expected: YubiKey rejects Titan cred_id immediately)");
     let mut yk = auth_for(&yubikey);
-    let yk_attempt = yk.hmac_secret(RP, &cred_id, &salt, pin.as_deref());
+    let yk_attempt = yk.hmac_secret(RP, &cred_id, &salt, true, pin.as_deref());
     let test_a = match yk_attempt {
         Err(e) => {
             println!("  OK  YubiKey rejected: {e:?}");
@@ -375,7 +375,7 @@ fn open_with_fresh_assert(
     pin: Option<&str>,
 ) -> Result<(), String> {
     let mut auth = auth_for(titan_path);
-    let secret = match auth.hmac_secret(RP, cred_id, salt, pin) {
+    let secret = match auth.hmac_secret(RP, cred_id, salt, true, pin) {
         Ok(s) => s,
         Err(e) => return Err(format!("device assert failed: {e:?}")),
     };

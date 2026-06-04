@@ -118,7 +118,7 @@ fn rogue_device_with_chosen_hmac_secret_cannot_unlock_legit_wrap_slot() {
     let er = legit.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0xCC; 32];
     let real_secret = legit
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
     let mvk = fresh_mvk();
     let slot = Keyslot::new_fido2(
@@ -139,7 +139,7 @@ fn rogue_device_with_chosen_hmac_secret_cannot_unlock_legit_wrap_slot() {
     let mut rogue = MockAuthenticator::new();
     rogue.force_hmac_secret([0xDE; 32]);
     let rogue_secret = rogue
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
     assert_eq!(
         *rogue_secret, [0xDE; 32],
@@ -166,7 +166,7 @@ fn rogue_device_cannot_derive_legit_mvk_in_direct_mode() {
     let er = legit.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0xEE; 32];
     let real_secret = legit
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
     let slot = Keyslot::new_fido2_derived_mvk(&er.credential.id, salt).unwrap();
     let real_mvk = slot.unlock_fido2_derived_mvk(&real_secret).unwrap();
@@ -174,7 +174,7 @@ fn rogue_device_cannot_derive_legit_mvk_in_direct_mode() {
     let mut rogue = MockAuthenticator::new();
     rogue.force_hmac_secret([0x11; 32]);
     let rogue_secret = rogue
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
     let rogue_mvk = slot.unlock_fido2_derived_mvk(&rogue_secret).unwrap();
 
@@ -191,7 +191,7 @@ fn rogue_device_returning_all_zeros_does_not_unlock_wrap_slot() {
     let er = legit.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0xFF; 32];
     let real_secret = legit
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
     let slot = Keyslot::new_fido2(
         SUITE,
@@ -217,7 +217,7 @@ fn rogue_device_returning_all_ones_does_not_unlock_wrap_slot() {
     let er = legit.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0xAB; 32];
     let real_secret = legit
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
     let slot = Keyslot::new_fido2(
         SUITE,
@@ -250,7 +250,7 @@ fn slot_bytes_with_swapped_cred_id_fail_unlock_attempt() {
     let er = legit.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0x77; 32];
     let real_secret = legit
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
     let slot = Keyslot::new_fido2(
         SUITE,
@@ -268,7 +268,7 @@ fn slot_bytes_with_swapped_cred_id_fail_unlock_attempt() {
     // cred_id (or different salt), returns a different value.
     let other = legit.enroll("luksbox.local", b"u", None).unwrap();
     let wrong_secret = legit
-        .hmac_secret("luksbox.local", &other.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &other.credential.id, &salt, true, None)
         .unwrap();
     assert_ne!(real_secret, wrong_secret);
     assert!(
@@ -289,7 +289,7 @@ fn legit_device_after_passphrase_brute_force_still_blocks() {
     let er = legit.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0xDE; 32];
     let real_secret = legit
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
     // Built WITH a passphrase second factor.
     let slot = Keyslot::new_fido2(
@@ -335,7 +335,7 @@ fn direct_mode_with_swapped_device_yields_different_mvk() {
     let er_a = device_a.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0xBB; 32];
     let secret_a = device_a
-        .hmac_secret("luksbox.local", &er_a.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er_a.credential.id, &salt, true, None)
         .unwrap();
     let slot = Keyslot::new_fido2_derived_mvk(&er_a.credential.id, salt).unwrap();
     let mvk_a = slot.unlock_fido2_derived_mvk(&secret_a).unwrap();
@@ -348,13 +348,13 @@ fn direct_mode_with_swapped_device_yields_different_mvk() {
     // device_b being given the legit cred_id from elsewhere and
     // asked to compute hmac_secret. A rogue device cooperates and
     // returns SOMETHING; legit device_b returns Err (unknown cred).
-    let r = device_b.hmac_secret("luksbox.local", &er_a.credential.id, &salt, None);
+    let r = device_b.hmac_secret("luksbox.local", &er_a.credential.id, &salt, true, None);
     assert!(r.is_err(), "legit device rejects unknown cred_id");
 
     // Force-reply rogue mode: device_b returns an attacker-chosen value.
     device_b.force_hmac_secret([0xDD; 32]);
     let secret_b = device_b
-        .hmac_secret("luksbox.local", &er_a.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er_a.credential.id, &salt, true, None)
         .unwrap();
     let mvk_b = slot.unlock_fido2_derived_mvk(&secret_b).unwrap();
     assert_ne!(
@@ -376,7 +376,7 @@ fn rogue_device_returning_all_zeros_yields_distinct_mvk_in_direct_mode() {
     let er = legit.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0xAB; 32];
     let real_secret = legit
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
 
     let slot = Keyslot::new_fido2_derived_mvk(&er.credential.id, salt).unwrap();
@@ -395,7 +395,7 @@ fn rogue_device_returning_all_ones_yields_distinct_mvk_in_direct_mode() {
     let er = legit.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0xCD; 32];
     let real_secret = legit
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
 
     let slot = Keyslot::new_fido2_derived_mvk(&er.credential.id, salt).unwrap();
@@ -416,7 +416,7 @@ fn rogue_device_with_all_zeros_does_not_unlock_hybrid_pq_fido2() {
     let er = legit.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0xEE; 32];
     let real_secret = legit
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
     let pq_shared = [0xAA; 32]; // simulate a fixed Kyber-decap shared secret
 
@@ -447,7 +447,7 @@ fn rogue_device_with_all_ones_does_not_unlock_hybrid_pq_fido2() {
     let er = legit.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0x55; 32];
     let real_secret = legit
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
     let pq_shared = [0xBB; 32];
 
@@ -483,7 +483,7 @@ fn rogue_device_with_legit_hmac_but_wrong_kyber_does_not_unlock_hybrid() {
     let er = legit.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0x77; 32];
     let real_secret = legit
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
     let real_pq = [0xC0; 32];
     let wrong_pq = [0xC1; 32]; // off by one bit in one byte
@@ -547,7 +547,7 @@ fn slot_kind_distinguishes_wrap_vs_direct_at_unlock() {
     let er = auth.enroll("luksbox.local", b"u", None).unwrap();
     let salt = [0x33; 32];
     let secret = auth
-        .hmac_secret("luksbox.local", &er.credential.id, &salt, None)
+        .hmac_secret("luksbox.local", &er.credential.id, &salt, true, None)
         .unwrap();
     let mvk = fresh_mvk();
 

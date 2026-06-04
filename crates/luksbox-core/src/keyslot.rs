@@ -140,18 +140,37 @@ const OFF_KIND: usize = 0;
 ///   format and reason vary per vendor and aren't always publicly
 ///   documented). Any byte not part of a structured field is random
 ///   padding for entropy obfuscation.
+/// - `AAD_VERSION_V4 = 3`: byte layout identical to V3 (same AAD
+///   shape, same cred_id/hmac_salt offsets). The only difference is
+///   the WIRE-side interpretation of `fido2_hmac_salt` for FIDO2-
+///   touching slot kinds: V4 slots require the salt to be SHA-256
+///   prehashed before reaching the authenticator. On the libfido2
+///   (Linux + macOS) side we apply the prehash explicitly; on the
+///   webauthn.dll (Windows) side webauthn.dll already prehashes
+///   internally per W3C WebAuthn Level 3 PRF behaviour, so we send
+///   the raw salt and let the API do its thing. Both backends
+///   converge on the authenticator computing
+///   `HMAC-SHA256(device_secret, SHA-256(salt))`, fixing the
+///   v0.2.2 cross-platform incompatibility where libfido2 sent the
+///   salt raw and webauthn.dll prehashed it for the same on-disk
+///   slot. V4 slots are cross-platform; V1/V2/V3 FIDO2 slots stay
+///   Linux/macOS-only.
 ///
 /// Stored INSIDE the AAD region (offset 1, within the 0..76 range), so
 /// a tamper that flips the version byte at unwrap time changes the
 /// AAD shape AND tags a different byte sequence, breaking the AEAD.
 ///
-/// Existing V1/V2 vaults on disk continue to read under their original
-/// layout. New slots created by any `Keyslot::new_*` constructor are
-/// V3 to support every authenticator out of the box.
+/// Existing V1/V2/V3 vaults on disk continue to read under their
+/// original layout/wire format. New slots created by any
+/// `Keyslot::new_*` constructor are V4: passphrase / TPM slots gain
+/// nothing from V4 (no FIDO2 salt to prehash) but the version bump
+/// is uniform so `aad_version >= V4` is a single test for "this
+/// vault was created post-FIDO2-cross-platform-fix".
 const OFF_AAD_VERSION: usize = 1;
 pub const AAD_VERSION_V1: u8 = 0;
 pub const AAD_VERSION_V2: u8 = 1;
 pub const AAD_VERSION_V3: u8 = 2;
+pub const AAD_VERSION_V4: u8 = 3;
 const OFF_UUID: usize = 4;
 const OFF_M_COST: usize = 20;
 const OFF_T_COST: usize = 24;
@@ -478,6 +497,40 @@ impl Keyslot {
         matches!(self.kind, SlotKind::Empty)
     }
 
+    /// Does this slot's wire format require the FIDO2 hmac-secret
+    /// salt to be SHA-256 prehashed before reaching the authenticator?
+    ///
+    /// V1/V2/V3 FIDO2 slots: no — libfido2 sends the raw salt. These
+    /// slots are Linux/macOS-only because webauthn.dll on Windows
+    /// always prehashes, producing a different HMAC output.
+    /// V4+ FIDO2 slots: yes — libfido2 callers prehash explicitly
+    /// (this function returns true), and webauthn.dll prehashes on
+    /// its own. Both converge cross-platform.
+    ///
+    /// Non-FIDO2 slot kinds return false (the result is unused for
+    /// them; `fido2_hmac_salt` is all zeros and never sent to a
+    /// device).
+    pub fn fido2_salt_prehashed(&self) -> bool {
+        self.aad_version >= AAD_VERSION_V4
+    }
+
+    /// True for any slot kind whose unlock path drives the FIDO2
+    /// hmac-secret extension. Useful for the Windows "v1/v2/v3
+    /// FIDO2 slot is Linux-only, run `luksbox migrate-fido2-slot`"
+    /// guard at unlock time and for the `luksbox info` slot table.
+    pub fn touches_fido2(&self) -> bool {
+        matches!(
+            self.kind,
+            SlotKind::Fido2HmacSecret
+                | SlotKind::Fido2DerivedMvk
+                | SlotKind::HybridPqKemFido2
+                | SlotKind::HybridPqKem1024Fido2
+                | SlotKind::Tpm2Fido2
+                | SlotKind::HybridPqKemTpm2Fido2
+                | SlotKind::HybridPqKem1024Tpm2Fido2
+        )
+    }
+
     /// Create a passphrase keyslot wrapping `mvk`.
     pub fn new_passphrase(
         suite: CipherSuite,
@@ -501,7 +554,7 @@ impl Keyslot {
 
         let mut slot = Self {
             kind: SlotKind::Passphrase,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params,
             kdf_salt,
@@ -547,7 +600,7 @@ impl Keyslot {
 
         let mut slot = Self {
             kind: SlotKind::Fido2HmacSecret,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params,
             kdf_salt,
@@ -604,7 +657,7 @@ impl Keyslot {
 
         let mut slot = Self {
             kind: SlotKind::Tpm2Sealed,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             // No Argon2id is run for TPM-sealed slots - the KEK
             // comes from the TPM unseal directly. Zero params
@@ -738,7 +791,7 @@ impl Keyslot {
 
         let mut slot = Self {
             kind: SlotKind::Tpm2Fido2,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             // No Argon2id for the fused kind, both inputs are
             // already 32-byte high-entropy values, HKDF mixing is
@@ -863,7 +916,7 @@ impl Keyslot {
             .map_err(|e| Error::OsRng(e.to_string()))?;
         let mut slot = Self {
             kind: SlotKind::Tpm2SealedPin,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params: Argon2idParams {
                 m_cost_kib: 0,
@@ -915,7 +968,7 @@ impl Keyslot {
             .map_err(|e| Error::OsRng(e.to_string()))?;
         let mut slot = Self {
             kind: SlotKind::HybridPqKemTpm2,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params: Argon2idParams {
                 m_cost_kib: 0,
@@ -1003,7 +1056,7 @@ impl Keyslot {
             .map_err(|e| Error::OsRng(e.to_string()))?;
         let mut slot = Self {
             kind: SlotKind::HybridPqKemTpm2Fido2,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params: Argon2idParams {
                 m_cost_kib: 0,
@@ -1191,7 +1244,7 @@ impl Keyslot {
 
         let mut slot = Self {
             kind,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params,
             kdf_salt,
@@ -1337,7 +1390,7 @@ impl Keyslot {
 
         let mut slot = Self {
             kind,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params,
             kdf_salt,
@@ -1427,7 +1480,7 @@ impl Keyslot {
             .map_err(|e| Error::OsRng(e.to_string()))?;
         Ok(Self {
             kind: SlotKind::Fido2DerivedMvk,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             // KDF/AEAD params here are unused for derived-MVK slots, but
             // we fill them with non-zero junk so the slot is byte-shape
@@ -1688,7 +1741,7 @@ impl Keyslot {
         // currently rejected to avoid silently treating unknown shapes
         // as one we know.
         let aad_version = buf[OFF_AAD_VERSION];
-        if aad_version > AAD_VERSION_V3 {
+        if aad_version > AAD_VERSION_V4 {
             return Err(Error::InvalidField);
         }
         let mut uuid = [0u8; 16];
@@ -2004,7 +2057,7 @@ mod tests {
 
         let slot = Keyslot::new_tpm2(suite, &mvk, &kek, &fake_blob, &header_salt).unwrap();
         assert_eq!(slot.kind, SlotKind::Tpm2Sealed);
-        assert_eq!(slot.aad_version, AAD_VERSION_V3);
+        assert_eq!(slot.aad_version, AAD_VERSION_V4);
         assert_eq!(slot.tpm2_sealed_blob().unwrap(), fake_blob.as_slice());
 
         // Round-trip through the on-disk byte layout.

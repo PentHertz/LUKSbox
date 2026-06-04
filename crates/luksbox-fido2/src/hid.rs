@@ -12,6 +12,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
 
 use rand_core::{OsRng, RngCore};
+use zeroize::Zeroizing;
 
 use crate::authenticator::{Credential, EnrollResult, Fido2Authenticator, HmacSecret};
 use crate::error::Error;
@@ -343,12 +344,30 @@ impl Fido2Authenticator for HidAuthenticator {
         rp_id: &str,
         cred_id: &[u8],
         salt: &[u8; 32],
+        prehash_salt: bool,
         pin: Option<&str>,
     ) -> Result<HmacSecret, Error> {
         let dev = open_device(self.device_path.as_deref())?;
         let assert = AssertHandle::new()?;
 
         let rp = cstring(rp_id)?;
+
+        // V4 slots (`prehash_salt=true`) want the authenticator to see
+        // SHA-256(salt) so the wire HMAC matches what webauthn.dll
+        // produces on Windows (which prehashes automatically). libfido2
+        // is a CTAP2-level library and passes whatever bytes we hand
+        // it to the device verbatim, so we have to do the prehash
+        // ourselves here. The Zeroizing wrapper scrubs the 32 B
+        // digest after this method returns regardless of unwind path.
+        let salt_to_send: Zeroizing<[u8; 32]> = if prehash_salt {
+            use sha2::{Digest, Sha256};
+            let mut out = Zeroizing::new([0u8; 32]);
+            let digest = Sha256::digest(salt);
+            out.copy_from_slice(&digest);
+            out
+        } else {
+            Zeroizing::new(*salt)
+        };
 
         unsafe {
             checked_at(
@@ -373,7 +392,7 @@ impl Fido2Authenticator for HidAuthenticator {
             )?;
             checked_at(
                 "fido_assert_set_hmac_salt",
-                fido_assert_set_hmac_salt(assert.ptr, salt.as_ptr(), salt.len()),
+                fido_assert_set_hmac_salt(assert.ptr, salt_to_send.as_ptr(), salt_to_send.len()),
             )?;
             checked_at(
                 "fido_assert_set_up",

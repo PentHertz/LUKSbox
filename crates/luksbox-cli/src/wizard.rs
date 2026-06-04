@@ -529,7 +529,7 @@ fn create_den_fido2(
             .map_err(|e| format!("OS RNG failure: {e}"))?;
     }
     println!("{}", crate::auth_prompt("derive the unlock key"));
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
     let cred = luksbox_core::deniable::DeniableCredential::Fido2Passphrase {
         passphrase: pass.as_bytes(),
         argon2,
@@ -649,7 +649,7 @@ fn create_den_pq_fido2(
             .try_fill_bytes(&mut hmac_salt)
             .map_err(|e| format!("OS RNG failure: {e}"))?;
     }
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
@@ -769,7 +769,7 @@ fn create_den_tpm_fido2(
             .try_fill_bytes(&mut hmac_salt)
             .map_err(|e| format!("OS RNG failure: {e}"))?;
     }
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
     let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
         passphrase: pass.as_bytes(),
         argon2,
@@ -881,7 +881,7 @@ fn create_den_pq_tpm_fido2(
             .try_fill_bytes(&mut hmac_salt)
             .map_err(|e| format!("OS RNG failure: {e}"))?;
     }
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
@@ -1277,7 +1277,13 @@ fn wizard_fido2_hmac_from_payload(
             .interact()?,
     );
     let mut auth = crate::make_fido2_authenticator();
-    Ok(auth.hmac_secret(RP_ID, cred_id, salt, Some(&pin))?)
+    // Deniable v2 envelopes embedded the cred_id + salt at create
+    // time. v0.3.0 always uses the V4 prehashed-salt convention for
+    // new envelopes; older envelopes would need an envelope-version
+    // probe here. The deniable-header v2 format is still in flux
+    // (docs/DENIABLE_HEADER.md), so we hard-code `true` and revisit
+    // when the envelope gains an explicit convention version.
+    Ok(auth.hmac_secret(RP_ID, cred_id, salt, true, Some(&pin))?)
 }
 
 /// v2 wizard helper: unseal the TPM blob recovered from the slot
@@ -1902,6 +1908,21 @@ fn print_slots(header: &Header, with_kdf: bool) {
     println!("keyslots:");
     for (i, s) in header.keyslots.iter().enumerate() {
         println!("{}", format_slot(i, s, with_kdf));
+        // Same V4 cross-platform indicator as `luksbox info`. V4
+        // FIDO2 slots open on Linux, macOS, and Windows; V1/V2/V3
+        // slots open only on Linux/macOS and need `luksbox
+        // migrate-fido2-slot --slot N` to become cross-platform.
+        if s.touches_fido2() {
+            if s.fido2_salt_prehashed() {
+                println!("       compat: V4 cross-platform (Linux/macOS/Windows)");
+            } else {
+                println!(
+                    "       compat: V{ver} Linux/macOS-only -- migrate with \
+                     `luksbox migrate-fido2-slot --slot {i}` for cross-platform",
+                    ver = s.aad_version,
+                );
+            }
+        }
     }
 }
 
@@ -2399,7 +2420,7 @@ fn create_single_slot_tpm_vault(
             let mut hmac_salt = [0u8; 32];
             OsRng.fill_bytes(&mut hmac_salt);
             eprintln!("{}", crate::auth_prompt("again to derive the FIDO2 half"));
-            let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+            let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
             Container::create_with_tpm2_fido2(
                 vault,
@@ -2519,7 +2540,7 @@ fn create_single_slot_tpm_vault(
             let mut hmac_salt = [0u8; 32];
             OsRng.fill_bytes(&mut hmac_salt);
             eprintln!("{}", crate::auth_prompt("again to derive the FIDO2 half"));
-            let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+            let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
             let (pk, seed) = keygen_with(params);
             let (ct, shared) = encapsulate_with(params, &pk)?;
@@ -2690,7 +2711,7 @@ fn create_fido2_wrap(
             "{}",
             crate::auth_prompt("again to derive the keyslot secret")
         );
-        let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+        let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
         let mut cont = Container::create_with_fido2_flags(
             vault,
@@ -2763,7 +2784,7 @@ fn create_fido2_direct(
         let mut hmac_salt = [0u8; 32];
         OsRng.fill_bytes(&mut hmac_salt);
         eprintln!("{}", crate::auth_prompt("again to derive the MVK"));
-        let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+        let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
         let mut cont = Container::create_with_fido2_derived_mvk(
             vault,
@@ -2956,7 +2977,7 @@ fn create_hybrid_pq_fido2(
         "{}",
         crate::auth_prompt("again to derive the keyslot secret")
     );
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     eprintln!("Generating {level_label} keypair...");
     let (pk, kyber_seed) = keygen_with(params);
@@ -3352,6 +3373,47 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
         }
     }
     println!("OK opened {}", vault.display());
+
+    // Surface any pre-v0.3.0 FIDO2 keyslots and point at the
+    // in-place migration command. This is the first place a user
+    // running the wizard interactively encounters their vault's
+    // keyslots after unlock, so it's the right moment to nudge
+    // them toward fixing cross-platform compatibility before they
+    // try to open the vault on Windows and hit a confusing
+    // "keyslot authentication failed".
+    let stale_fido2_slots: Vec<usize> = vfs
+        .container()
+        .header
+        .keyslots
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.touches_fido2() && !s.fido2_salt_prehashed())
+        .map(|(i, _)| i)
+        .collect();
+    if !stale_fido2_slots.is_empty() {
+        eprintln!();
+        eprintln!(
+            "  Notice: {} FIDO2 keyslot(s) in this vault use the pre-v0.3.0 \
+             wire convention (V1/V2/V3) and unlock only on Linux/macOS.",
+            stale_fido2_slots.len()
+        );
+        eprintln!(
+            "  To make them cross-platform (Linux + macOS + Windows), run on \
+             Linux or macOS:"
+        );
+        for s in &stale_fido2_slots {
+            eprintln!(
+                "    luksbox migrate-fido2-slot {} --slot {s}",
+                vault.display()
+            );
+        }
+        eprintln!(
+            "  This re-enrolls a fresh V4 credential under the same authenticator \
+             and revokes the old slot in place."
+        );
+        eprintln!();
+    }
+
     open_loop(theme, vfs, &vault)
 }
 
@@ -3841,7 +3903,16 @@ fn collect_fido2_credential_for_rotate(
     let mut auth = crate::make_fido2_authenticator();
 
     eprintln!("{}", crate::auth_prompt(&format!("verify slot {slot_idx}")));
-    let old = auth.hmac_secret(RP_ID, &cred_id, &slot.fido2_hmac_salt, Some(&pin))?;
+    // Verifying the OLD slot uses the slot's own convention; the new
+    // wrap derivation that follows is treated as a fresh enrollment
+    // and writes the V4 convention.
+    let old = auth.hmac_secret(
+        RP_ID,
+        &cred_id,
+        &slot.fido2_hmac_salt,
+        slot.fido2_salt_prehashed(),
+        Some(&pin),
+    )?;
 
     let mut new_hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut new_hmac_salt);
@@ -3849,7 +3920,7 @@ fn collect_fido2_credential_for_rotate(
         "{}",
         crate::auth_prompt("again to derive the new wrap secret")
     );
-    let new = auth.hmac_secret(RP_ID, &cred_id, &new_hmac_salt, Some(&pin))?;
+    let new = auth.hmac_secret(RP_ID, &cred_id, &new_hmac_salt, true, Some(&pin))?;
 
     Ok(SlotCredential::Fido2Wrap {
         slot_idx,
@@ -4358,7 +4429,7 @@ fn update_fido2_in(theme: &ColorfulTheme, c: &mut Container, slot_idx: usize) ->
         "{}",
         crate::auth_prompt("again to derive the keyslot secret")
     );
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     c.update_fido2_at(
         slot_idx,
@@ -4402,7 +4473,7 @@ fn enroll_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
         "{}",
         crate::auth_prompt("again to derive the keyslot secret")
     );
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let idx = c.enroll_fido2(None, &hmac_secret, &cred_id, hmac_salt, kdf_params())?;
     c.persist_header()?;
@@ -4462,7 +4533,7 @@ fn enroll_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Resul
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
     eprintln!("{}", crate::auth_prompt("derive the new slot's secret"));
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let cred = luksbox_core::deniable::DeniableCredential::Fido2Passphrase {
         passphrase: pass.as_bytes(),
@@ -4556,7 +4627,7 @@ fn enroll_tpm2_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> 
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
         passphrase: pass.as_bytes(),
@@ -4705,7 +4776,7 @@ fn enroll_hybrid_pq_tpm2_fido2_deniable_into(
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
@@ -4809,6 +4880,7 @@ fn unlock_via_fido2(
             RP_ID,
             &slot.fido2_cred_id,
             &slot.fido2_hmac_salt,
+            slot.fido2_salt_prehashed(),
             Some(&pin),
         ) {
             Ok(s) => s,
@@ -4960,6 +5032,7 @@ fn unlock_via_hybrid_pq_fido2(
             RP_ID,
             &slot.fido2_cred_id,
             &slot.fido2_hmac_salt,
+            slot.fido2_salt_prehashed(),
             Some(&pin),
         ) {
             Ok(s) => s,
@@ -5149,7 +5222,7 @@ fn enroll_tpm2_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
     eprintln!("{}", crate::auth_prompt("again to derive the FIDO2 half"));
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let blob_bytes = blob.to_bytes();
     let idx = c.enroll_tpm2_fido2(
@@ -5327,7 +5400,7 @@ fn enroll_hybrid_pq_tpm2_fido2_into(
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
     eprintln!("{}", crate::auth_prompt("again to derive the FIDO2 half"));
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     eprintln!("generating {level_label} keypair...");
     let (pk, seed) = keygen_with(params);
@@ -5612,7 +5685,7 @@ fn enroll_hybrid_pq_fido2_into(
     OsRng
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG: {e}"))?;
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     eprintln!("generating {level_label} keypair...");
     let (pk, seed) = keygen_with(params);
@@ -5726,7 +5799,7 @@ fn enroll_hybrid_pq_fido2_deniable_into(
     OsRng
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG: {e}"))?;
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     eprintln!("generating {level_label} keypair...");
     let (pk, seed) = keygen_with(params);
@@ -5891,14 +5964,19 @@ fn unlock_via_tpm2_fido2(
                 stored_cred.len()
             ))
         );
-        let hmac_secret =
-            match auth.hmac_secret(RP_ID, &stored_cred, &slot.fido2_hmac_salt, Some(&pin)) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2: {e}"));
-                    continue;
-                }
-            };
+        let hmac_secret = match auth.hmac_secret(
+            RP_ID,
+            &stored_cred,
+            &slot.fido2_hmac_salt,
+            slot.fido2_salt_prehashed(),
+            Some(&pin),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(format!("FIDO2: {e}"));
+                continue;
+            }
+        };
         let mut unseal = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
             let parsed = SealedBlob::from_bytes(blob)
                 .map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
@@ -6083,14 +6161,19 @@ fn unlock_via_hybrid_pq_tpm2_fido2(
             "{}",
             crate::auth_prompt(&format!("3-factor unlock (slot {slot_idx})"))
         );
-        let hmac_secret =
-            match auth.hmac_secret(RP_ID, &stored_cred, &slot.fido2_hmac_salt, Some(&pin)) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2: {e}"));
-                    continue;
-                }
-            };
+        let hmac_secret = match auth.hmac_secret(
+            RP_ID,
+            &stored_cred,
+            &slot.fido2_hmac_salt,
+            slot.fido2_salt_prehashed(),
+            Some(&pin),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(format!("FIDO2: {e}"));
+                continue;
+            }
+        };
         let pq_shared = match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
             Ok(s) => s,
             Err(e) => {
