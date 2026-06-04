@@ -180,6 +180,12 @@ pub struct FileAttr {
 // composes `S_IFDIR | 0o700u32` would get a type-mismatch on macOS
 // only. Re-exposing as u32 (the type used by `FileAttr::mode`)
 // keeps the math consistent across platforms.
+// `as u32` cast is mandatory: `libc::S_IFDIR` etc. are typed as
+// `mode_t`, which is `u16` on macOS / FUSE-T (a `as u32` widening
+// cast) and `u32` on Linux (a no-op cast). Without the cast the
+// macOS build fails with E0308 mismatched types; without `u32` on
+// the lhs the Linux build's caller-side arithmetic (e.g.
+// `S_IFDIR | 0o700u32`) would force callers to platform-cast.
 pub const S_IFDIR: u32 = libc::S_IFDIR as u32;
 pub const S_IFREG: u32 = libc::S_IFREG as u32;
 pub const S_IFLNK: u32 = libc::S_IFLNK as u32;

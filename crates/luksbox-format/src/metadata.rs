@@ -169,7 +169,7 @@ pub fn write_metadata(
     aad[..32].copy_from_slice(header_salt);
     aad[32..].copy_from_slice(&ct_len.to_le_bytes());
 
-    let ct = aead::seal(suite, &*key, &nonce, &aad, plaintext)?;
+    let ct = aead::seal(suite, &key, &nonce, &aad, plaintext)?;
     debug_assert_eq!(ct.len(), ct_len as usize);
 
     // Fill the entire region with random bytes BEFORE writing the real
@@ -226,7 +226,7 @@ pub fn read_metadata(
     aad[..32].copy_from_slice(header_salt);
     aad[32..].copy_from_slice(&(ct_len as u64).to_le_bytes());
 
-    let pt = aead::open(suite, &*key, &nonce, &aad, ct)?;
+    let pt = aead::open(suite, &key, &nonce, &aad, ct)?;
     Ok(Zeroizing::new(pt))
 }
 

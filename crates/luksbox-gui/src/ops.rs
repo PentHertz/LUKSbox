@@ -325,6 +325,15 @@ pub struct UnlockOpts {
     /// Argon2id strength preset the deniable vault was created with.
     /// Same wrong-value behaviour as `deniable_cipher`.
     pub deniable_kdf: KdfStrength,
+    /// Open in tolerant recovery mode (read-only). When set,
+    /// `Vfs::open` installs inodes whose chunk-list chain fails AEAD
+    /// as zero-byte placeholders and continues, instead of refusing
+    /// the whole vault. The resulting Vfs refuses flushes
+    /// (`Error::ReadOnlyMount`) so the patched tree never overwrites
+    /// the on-disk metadata. UI surfaces the broken-inode list via
+    /// `OpenedVault::tolerated_inodes`. Use only when a normal open
+    /// failed with `metadata blob deserialization failed`.
+    pub recovery_mode: bool,
 }
 
 // `Tpm2*` and `HybridPqTpm2*` variants are constructed only from
@@ -383,6 +392,13 @@ pub struct OpenedVault {
     /// MUST remember this path (or move the file elsewhere and
     /// remember where) to unlock later.
     pub deniable_tpm_blob_path: Option<PathBuf>,
+    /// Tolerant-recovery report: which inodes had their chunk-list
+    /// chain skipped during open. Empty for normal opens. Populated
+    /// when `UnlockOpts::recovery_mode == true` and the vault had
+    /// at least one chunk-list-block AEAD failure. The GUI surfaces
+    /// this as a modal listing the broken file paths + original
+    /// sizes after the open completes.
+    pub tolerated_inodes: Vec<luksbox_vfs::ToleratedInode>,
 }
 
 #[derive(Debug, Clone)]
@@ -584,16 +600,16 @@ pub fn create_vault_tpm2_only(
     };
 
     let mut cont = cont;
-    if let Some(ap) = anchor_path.as_ref() {
-        if let Err(e) = cont.init_anchor(ap.clone(), 1).map_err(estr) {
-            drop(cont);
-            let _ = std::fs::remove_file(&vault_path);
-            let _ = std::fs::remove_file(ap);
-            if let Some(sc) = &deniable_tpm_blob_path {
-                let _ = std::fs::remove_file(sc);
-            }
-            return Err(format!("anchor init failed: {e}"));
+    if let Some(ap) = anchor_path.as_ref()
+        && let Err(e) = cont.init_anchor(ap.clone(), 1).map_err(estr)
+    {
+        drop(cont);
+        let _ = std::fs::remove_file(&vault_path);
+        let _ = std::fs::remove_file(ap);
+        if let Some(sc) = &deniable_tpm_blob_path {
+            let _ = std::fs::remove_file(sc);
         }
+        return Err(format!("anchor init failed: {e}"));
     }
     let has_fido2 = header_has_fido2(&cont.header);
     let has_hybrid_pq = header_has_hybrid_pq(&cont.header);
@@ -611,6 +627,7 @@ pub fn create_vault_tpm2_only(
         has_tpm,
         deniable_fido2_recovery: None,
         deniable_tpm_blob_path,
+        tolerated_inodes: Vec::new(),
     })
 }
 
@@ -681,7 +698,7 @@ pub fn create_vault_with_tpm_factors_deniable(
         .clone();
     let kdf_params = opts.kdf.params();
 
-    let (cont_res, post) = match kind {
+    let (cont_res, _post) = match kind {
         TpmBootstrapKind::Tpm2 | TpmBootstrapKind::Tpm2Pin { .. } => {
             // Single-factor TPM is handled by create_vault_tpm2_only.
             // This function only sees the 3-factor combos.
@@ -709,7 +726,7 @@ pub fn create_vault_with_tpm_factors_deniable(
             let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
                 passphrase: envelope_pw.as_bytes(),
                 argon2: kdf_params,
-                unsealed: &*tpm_secret,
+                unsealed: &tpm_secret,
                 hmac_secret_output: &hmac_secret,
             };
             let material = DeniableMaterial {
@@ -751,7 +768,7 @@ pub fn create_vault_with_tpm_factors_deniable(
                 passphrase: envelope_pw.as_bytes(),
                 argon2: kdf_params,
                 mlkem_shared: &shared,
-                unsealed: &*tpm_secret,
+                unsealed: &tpm_secret,
             };
             let material = DeniableMaterial {
                 cred_id: Vec::new(),
@@ -806,7 +823,7 @@ pub fn create_vault_with_tpm_factors_deniable(
                 passphrase: envelope_pw.as_bytes(),
                 argon2: kdf_params,
                 mlkem_shared: &shared,
-                unsealed: &*tpm_secret,
+                unsealed: &tpm_secret,
                 hmac_secret_output: &hmac_secret,
             };
             let material = DeniableMaterial {
@@ -826,7 +843,6 @@ pub fn create_vault_with_tpm_factors_deniable(
             (res, ())
         }
     };
-    let _ = post;
     let cont = match cont_res {
         Ok(c) => c,
         Err(e) => {
@@ -879,16 +895,16 @@ pub fn create_vault_with_tpm_factors_deniable(
     }
 
     let mut cont = cont;
-    if let Some(ap) = anchor_path.as_ref() {
-        if let Err(e) = cont.init_anchor(ap.clone(), 1).map_err(estr) {
-            drop(cont);
-            let _ = std::fs::remove_file(&vault_path);
-            for sc in &sidecars_on_disk {
-                let _ = std::fs::remove_file(sc);
-            }
-            let _ = std::fs::remove_file(ap);
-            return Err(format!("anchor init failed: {e}"));
+    if let Some(ap) = anchor_path.as_ref()
+        && let Err(e) = cont.init_anchor(ap.clone(), 1).map_err(estr)
+    {
+        drop(cont);
+        let _ = std::fs::remove_file(&vault_path);
+        for sc in &sidecars_on_disk {
+            let _ = std::fs::remove_file(sc);
         }
+        let _ = std::fs::remove_file(ap);
+        return Err(format!("anchor init failed: {e}"));
     }
     let cipher_lbl = cipher_label(cont.header.cipher_suite).to_string();
     let has_fido2 = deniable_fido2_recovery.is_some();
@@ -908,6 +924,7 @@ pub fn create_vault_with_tpm_factors_deniable(
         has_tpm: true,
         deniable_fido2_recovery,
         deniable_tpm_blob_path,
+        tolerated_inodes: Vec::new(),
     })
 }
 
@@ -1166,16 +1183,16 @@ pub fn create_vault_with_tpm_factors_only(
     }
 
     let mut cont = cont;
-    if let Some(ap) = anchor_path.as_ref() {
-        if let Err(e) = cont.init_anchor(ap.clone(), 1).map_err(estr) {
-            drop(cont);
-            let _ = std::fs::remove_file(&vault_path);
-            for sc in &sidecars_on_disk {
-                let _ = std::fs::remove_file(sc);
-            }
-            let _ = std::fs::remove_file(ap);
-            return Err(format!("anchor init failed: {e}"));
+    if let Some(ap) = anchor_path.as_ref()
+        && let Err(e) = cont.init_anchor(ap.clone(), 1).map_err(estr)
+    {
+        drop(cont);
+        let _ = std::fs::remove_file(&vault_path);
+        for sc in &sidecars_on_disk {
+            let _ = std::fs::remove_file(sc);
         }
+        let _ = std::fs::remove_file(ap);
+        return Err(format!("anchor init failed: {e}"));
     }
 
     let cipher_lbl = cipher_label(cont.header.cipher_suite).to_string();
@@ -1194,6 +1211,7 @@ pub fn create_vault_with_tpm_factors_only(
         has_tpm,
         deniable_fido2_recovery: None,
         deniable_tpm_blob_path: None,
+        tolerated_inodes: Vec::new(),
     })
 }
 
@@ -1295,19 +1313,19 @@ pub fn create_vault_with_tpm_bootstrap(
             // Slot 1: the admin's deniable passphrase is at slot 0,
             // TPM lands at slot 1 (matches the standard TPM
             // bootstrap convention).
-            enroll_tpm2_deniable(&mut opened.vfs, 1, &bootstrap_pw, bootstrap_argon2, None)
+            enroll_tpm2_deniable(&mut opened.vfs, 1, bootstrap_pw, bootstrap_argon2, None)
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         (TpmBootstrapKind::Tpm2Pin { pin }, true) => enroll_tpm2_deniable(
             &mut opened.vfs,
             1,
-            &bootstrap_pw,
+            bootstrap_pw,
             bootstrap_argon2,
             Some(pin.as_bytes()),
         ),
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         (TpmBootstrapKind::Tpm2Fido2 { pin }, true) => {
-            enroll_tpm2_fido2_deniable(&mut opened.vfs, 1, &pin, &bootstrap_pw, bootstrap_argon2)
+            enroll_tpm2_fido2_deniable(&mut opened.vfs, 1, &pin, bootstrap_pw, bootstrap_argon2)
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         (
@@ -1329,7 +1347,7 @@ pub fn create_vault_with_tpm_bootstrap(
                 &vault_path,
                 &kyber_path,
                 &seed_pw,
-                &bootstrap_pw,
+                bootstrap_pw,
                 bootstrap_argon2,
                 params,
             )
@@ -1356,7 +1374,7 @@ pub fn create_vault_with_tpm_bootstrap(
                 &kyber_path,
                 &seed_pw,
                 &pin,
-                &bootstrap_pw,
+                bootstrap_pw,
                 bootstrap_argon2,
                 params,
             )
@@ -1453,25 +1471,25 @@ pub fn create_vault_with_tpm_bootstrap(
             // path is derived from the vault path independently.
             let _ = kp; // suppress unused-warning if cfg drops the helper
             let sidecar = luksbox_format::hybrid_sidecar::sidecar_path(&vault_path);
-            if sidecar.exists() {
-                if let Ok(mut entries) = luksbox_format::hybrid_sidecar::read(&sidecar) {
-                    for e in &mut entries {
-                        if e.slot_idx as usize == tpm_idx {
-                            e.slot_idx = 0;
-                        } else if e.slot_idx == 0 {
-                            // Defensive: the swap target was 0, but
-                            // bootstrap creates slot 0 as a non-hybrid
-                            // passphrase, so there shouldn't be a slot_idx=0
-                            // entry to relocate. Leave as-is; the parser
-                            // would have rejected duplicates anyway.
-                        }
+            if sidecar.exists()
+                && let Ok(mut entries) = luksbox_format::hybrid_sidecar::read(&sidecar)
+            {
+                for e in &mut entries {
+                    if e.slot_idx as usize == tpm_idx {
+                        e.slot_idx = 0;
+                    } else if e.slot_idx == 0 {
+                        // Defensive: the swap target was 0, but
+                        // bootstrap creates slot 0 as a non-hybrid
+                        // passphrase, so there shouldn't be a slot_idx=0
+                        // entry to relocate. Leave as-is; the parser
+                        // would have rejected duplicates anyway.
                     }
-                    let _ = luksbox_format::hybrid_sidecar::write_with_binding(
-                        &sidecar,
-                        &entries,
-                        cont.header_salt(),
-                    );
                 }
+                let _ = luksbox_format::hybrid_sidecar::write_with_binding(
+                    &sidecar,
+                    &entries,
+                    cont.header_salt(),
+                );
             }
         }
         if let Err(e) = cont.persist_header() {
@@ -1830,6 +1848,7 @@ pub fn create_vault(opts: CreateOpts) -> Result<OpenedVault, String> {
         has_tpm,
         deniable_fido2_recovery: captured_fido2_recovery,
         deniable_tpm_blob_path: None,
+        tolerated_inodes: Vec::new(),
     })
 }
 
@@ -2398,7 +2417,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
         } else {
             None
         };
-        let vfs = luksbox_vfs::Vfs::open(cont).map_err(estr)?;
+        let vfs = open_vfs_with_optional_recovery(cont, opts.recovery_mode)?;
         if let Some(anchor_gen) = trusted_gen {
             match anchor::compare(anchor_gen, vfs.vault_generation()) {
                 anchor::VerificationOutcome::Ok
@@ -2415,6 +2434,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
                 }
             }
         }
+        let tolerated_inodes = vfs.tolerated_inodes().to_vec();
         return Ok(OpenedVault {
             vfs,
             vault_path: opts.path.clone(),
@@ -2426,6 +2446,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
             has_tpm: false,
             deniable_fido2_recovery: None,
             deniable_tpm_blob_path: None,
+            tolerated_inodes,
         });
     }
     let mut cont = match opts.method {
@@ -2529,7 +2550,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
     let has_hybrid_pq = header_has_hybrid_pq(&cont.header);
     let has_tpm = header_has_tpm(&cont.header);
     let cipher = cipher_label(cont.header.cipher_suite).to_string();
-    let vfs = Vfs::open(cont).map_err(estr)?;
+    let vfs = open_vfs_with_optional_recovery(cont, opts.recovery_mode)?;
     if let Some(anchor_gen) = trusted_gen {
         match anchor::compare(anchor_gen, vfs.vault_generation()) {
             anchor::VerificationOutcome::Ok | anchor::VerificationOutcome::AnchorStale { .. } => {}
@@ -2544,6 +2565,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
             }
         }
     }
+    let tolerated_inodes = vfs.tolerated_inodes().to_vec();
     Ok(OpenedVault {
         vfs,
         vault_path: opts.path,
@@ -2555,7 +2577,22 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
         has_tpm,
         deniable_fido2_recovery: None,
         deniable_tpm_blob_path: None,
+        tolerated_inodes,
     })
+}
+
+/// Helper used by both deniable and standard open paths: runs
+/// `Vfs::open(cont)` with the tolerate-bad-chunk-lists thread-local
+/// set if and only if `recovery_mode == true`. Returns the resulting
+/// Vfs; the `tolerated_inodes()` accessor on the Vfs carries the
+/// recovery report (empty for normal opens).
+fn open_vfs_with_optional_recovery(cont: Container, recovery_mode: bool) -> Result<Vfs, String> {
+    if recovery_mode {
+        let _g = luksbox_vfs::set_tolerate_bad_chunk_lists(true);
+        Vfs::open(cont).map_err(estr)
+    } else {
+        Vfs::open(cont).map_err(estr)
+    }
 }
 
 // ============================================================
@@ -3958,7 +3995,7 @@ pub fn enroll_tpm2_deniable(
     let cred = luksbox_core::deniable::DeniableCredential::TpmPassphrase {
         passphrase: passphrase.as_bytes(),
         argon2,
-        unsealed: &*secret,
+        unsealed: &secret,
     };
     let material = DeniableMaterial {
         cred_id: Vec::new(),
@@ -4009,7 +4046,7 @@ pub fn enroll_tpm2_fido2_deniable(
     let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
         passphrase: passphrase.as_bytes(),
         argon2,
-        unsealed: &*tpm_secret,
+        unsealed: &tpm_secret,
         hmac_secret_output: &hmac_secret,
     };
     let material = DeniableMaterial {
@@ -4054,7 +4091,7 @@ pub fn enroll_hybrid_pq_tpm2_deniable(
         passphrase: passphrase.as_bytes(),
         argon2,
         mlkem_shared: &shared,
-        unsealed: &*tpm_secret,
+        unsealed: &tpm_secret,
     };
     let material = DeniableMaterial {
         cred_id: Vec::new(),
@@ -4148,7 +4185,7 @@ pub fn enroll_hybrid_pq_tpm2_fido2_deniable(
         passphrase: passphrase.as_bytes(),
         argon2,
         mlkem_shared: &shared,
-        unsealed: &*tpm_secret,
+        unsealed: &tpm_secret,
         hmac_secret_output: &hmac_secret,
     };
     let material = DeniableMaterial {
@@ -5150,8 +5187,8 @@ pub fn enroll_hybrid_pq_passphrase_deniable(
     // doesn't expose populated/empty state; `install_slot_v2` just
     // overwrites the slot bytes). The sidecar entry that was paired
     // with the old credential is now garbage for the new credential
-    // (different ML-KEM keypair → wrong decap → wrong shared secret
-    // → AEAD reject). Without filtering, `hybrid_sidecar::write`
+    // (different ML-KEM keypair -> wrong decap -> wrong shared secret
+    // -> AEAD reject). Without filtering, `hybrid_sidecar::write`
     // sees two entries with the same `slot_idx` and refuses with
     // "duplicate entry for slot N (rejected to eliminate
     // find()-returns-first ambiguity; rebuild the sidecar from the

@@ -179,10 +179,20 @@ impl Tpm2Sealer {
         // object's auth slot so the next Esys_Unseal carries the
         // correct password session value.
         if let Some(pin_bytes) = pin {
-            // `Auth::try_from(&[u8])` copies into the type's internal
-            // storage (a `BoxedBytes`-like buffer); avoid an additional
-            // unzeroized `Vec<u8>` on our side. The Auth-internal copy
-            // is upstream-owned and not zeroized in tss-esapi 7.x.
+            // `Auth::try_from(&[u8])` copies the PIN into the Rust-side
+            // `Auth` value. In tss-esapi 7.7.0 that storage is
+            // `Zeroizing<Vec<u8>>` (see `structures::buffers`), so the
+            // Rust copy is wiped on the implicit `Drop` of `auth` below.
+            //
+            // What is NOT cleaned up: once `tr_set_auth` succeeds, ESAPI
+            // marshals the bytes into the C-side ESYS context's internal
+            // `TPM2B_AUTH` slot for the loaded object. That C-side copy
+            // is upstream-owned and tss-esapi 7.x does not zeroize it
+            // when the Context drops -- only when the same auth slot is
+            // overwritten or the object is flushed. We immediately flush
+            // the loaded object below (`flush_context(loaded.into())`),
+            // which is the best ESAPI-side mitigation available without
+            // bumping past tss-esapi 7.x.
             let auth = Auth::try_from(pin_bytes)
                 .map_err(|e| Error::TpmError(format!("PIN too long: {e}")))?;
             self.ctx
@@ -335,7 +345,13 @@ impl Tpm2Sealer {
         // loaded object handle. Pass None to omit (no PIN required).
         let user_auth = match pin {
             // Same reasoning as in `unseal_with_pin`: pass the slice
-            // straight in and skip the local unzeroized Vec round-trip.
+            // straight in and skip a local unzeroized `Vec` round-trip.
+            // The Rust `Auth` value's storage is `Zeroizing<Vec<u8>>`
+            // in tss-esapi 7.7.0, so the Rust copy is wiped on Drop
+            // after `self.ctx.create` consumes it. ESAPI's C-side
+            // TPMS_SENSITIVE_CREATE buffer carrying the userAuth into
+            // the kernel is upstream-owned and not zeroized in 7.x;
+            // mitigated only by the Context Drop's resource cleanup.
             Some(pin_bytes) => Some(
                 Auth::try_from(pin_bytes)
                     .map_err(|e| Error::TpmError(format!("PIN too long for TPM Auth: {e}")))?,

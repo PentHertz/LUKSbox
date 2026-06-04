@@ -2485,7 +2485,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "luksbox-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "clap",
  "dialoguer",
@@ -2509,7 +2509,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes-gcm",
  "aes-gcm-siv",
@@ -2530,14 +2530,14 @@ dependencies = [
 
 [[package]]
 name = "luksbox-ct-bench"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "rand",
 ]
 
 [[package]]
 name = "luksbox-fido2"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes",
  "bindgen 0.72.1",
@@ -2559,7 +2559,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-format"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "fs2",
  "hmac",
@@ -2577,7 +2577,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-fuse-t"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "bindgen 0.71.1",
  "libc",
@@ -2587,7 +2587,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-gui"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "arboard",
  "dirs",
@@ -2618,7 +2618,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-mount"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "ctrlc",
  "fuser",
@@ -2636,7 +2636,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-pq"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2658,7 +2658,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-tpm"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "luksbox-core",
  "luksbox-format",
@@ -2671,7 +2671,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-vfs"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "luksbox-core",
  "luksbox-format",

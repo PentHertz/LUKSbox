@@ -70,7 +70,7 @@ fn slot_unlock_bench(runner: &mut CtRunner, rng: &mut BenchRng) {
         inputs.push(buf);
     }
 
-    for (input, class) in inputs.into_iter().zip(classes.into_iter()) {
+    for (input, class) in inputs.into_iter().zip(classes) {
         let parsed = Keyslot::from_bytes(&input).expect("parse mutated slot");
         runner.run_one(class, || {
             let r = std::hint::black_box(parsed.unlock_passphrase(

@@ -91,6 +91,14 @@ enum View {
 enum NavigateAction {
     OpenRecent(RecentVault),
     OpenPicker,
+    /// Go straight to the Unlock view with the path field empty,
+    /// no `rfd::FileDialog` involved. Escape hatch for users whose
+    /// system file picker doesn't open (e.g. Fedora installs
+    /// missing `xdg-desktop-portal-gtk`, sandboxed or headless
+    /// sessions, broken portal services). The Unlock view's path
+    /// field is editable so the user can type a path and Browse if
+    /// rfd happens to work.
+    OpenManualEntry,
     GoCreate,
     GoPanic,
     GoWelcome,
@@ -371,6 +379,13 @@ struct UnlockForm {
     use_deniable: bool,
     deniable_cipher: CipherChoice,
     deniable_kdf: KdfStrength,
+    /// Recovery mode (read-only): when set, `Vfs::open` will install
+    /// inodes whose chunk-list chain fails AEAD as zero-byte
+    /// placeholders and continue, instead of refusing the whole
+    /// vault. Used to copy out healthy files when the metadata is
+    /// partially corrupt (e.g. the v0.2.1 durability-hole symptom).
+    /// Vault is flagged read-only; writes / flush refuse.
+    recovery_mode: bool,
 }
 
 impl Default for UnlockForm {
@@ -390,6 +405,7 @@ impl Default for UnlockForm {
             use_deniable: false,
             deniable_cipher: CipherChoice::AesSiv,
             deniable_kdf: KdfStrength::Interactive,
+            recovery_mode: false,
         }
     }
 }
@@ -936,6 +952,24 @@ pub struct LuksboxApp {
     /// `lock_and_drop_vault`) so a freshly-opened oversized vault
     /// still surfaces the heads-up exactly once per session.
     tested_size_advisory_shown: bool,
+    /// Set after a successful recovery-mode open when at least one
+    /// inode was tolerated. The browser view renders a modal listing
+    /// the broken files (inode id, original size, path, AEAD-failure
+    /// reason). Cleared when the user dismisses the modal or locks
+    /// the vault.
+    recovery_report: Option<Vec<luksbox_vfs::ToleratedInode>>,
+    /// Set when the user clicked the x button on a recent-vault row.
+    /// Triggers the confirm-forget modal. The path is the recent
+    /// entry to remove; cleared on Cancel or after Forget runs.
+    pending_forget_recent: Option<PathBuf>,
+    /// When true, the next `start_mount_picker` invocation passes
+    /// `sync_mode = true` to `luksbox_mount::mount`, restoring the
+    /// pre-v0.2.2 eager-flush semantics for this mount session.
+    /// Surfaced as a checkbox in the Browser view next to the Mount
+    /// button. Off by default (matches v0.2.2's fast deferred-flush
+    /// behavior). Per-vault-session, not persisted across opens --
+    /// the user explicitly re-ticks each time they want eager flush.
+    mount_sync_mode: bool,
     passgen_dialog: Option<PassgenDialog>,
     add_passphrase_modal: Option<AddPassphraseForm>,
     /// PIN typed into the "add FIDO2 keyslot" modal. Wrapped in
@@ -1291,6 +1325,9 @@ impl LuksboxApp {
             toasts: Vec::new(),
             metadata_warned_pct: 0,
             tested_size_advisory_shown: false,
+            recovery_report: None,
+            pending_forget_recent: None,
+            mount_sync_mode: false,
             passgen_dialog: None,
             add_passphrase_modal: None,
             add_fido2_pin_modal: None,
@@ -1749,11 +1786,21 @@ impl LuksboxApp {
                     let has_fido2 = opened.has_fido2;
                     let has_hybrid_pq = opened.has_hybrid_pq;
                     let has_tpm = opened.has_tpm;
+                    // Capture the tolerated-inode list BEFORE moving
+                    // `opened` into `self.vault`. If non-empty, the
+                    // user opened in recovery mode AND the vault had
+                    // chunk-list-block AEAD failures we skipped: show
+                    // them the list in a modal so they know which
+                    // files were lost.
+                    let tolerated = opened.tolerated_inodes.clone();
                     self.vault = Some(opened);
                     self.cwd = "/".into();
                     self.refresh_listing();
                     self.view = View::Browser;
                     self.unlock = UnlockForm::default();
+                    if !tolerated.is_empty() {
+                        self.recovery_report = Some(tolerated);
+                    }
                     recent::upsert(RecentVault {
                         path,
                         header_path,
@@ -2028,9 +2075,27 @@ impl LuksboxApp {
                 }
                 if ui
                     .add_sized([sidebar_w, 32.0], ghost_button("Open existing..."))
+                    .on_hover_text(
+                        "Pick a vault via the system file browser. \
+                         On Fedora / Wayland this requires xdg-desktop-portal-gtk; \
+                         if the browser doesn't appear, use 'Type path manually'.",
+                    )
                     .clicked()
                 {
                     self.request_navigate(NavigateAction::OpenPicker);
+                }
+                if ui
+                    .add_sized([sidebar_w, 28.0], ghost_button("Type path manually..."))
+                    .on_hover_text(
+                        "Open the unlock form with an empty path field so you \
+                         can type or paste a vault path directly. Use this when \
+                         the system file picker doesn't work (Fedora installs \
+                         missing xdg-desktop-portal-gtk, sandboxed builds, \
+                         remote / headless sessions).",
+                    )
+                    .clicked()
+                {
+                    self.request_navigate(NavigateAction::OpenManualEntry);
                 }
 
                 ui.add_space(20.0);
@@ -2226,52 +2291,80 @@ impl LuksboxApp {
         // recent entry per repaint, only about 20 entries max, so OK.
         let missing = !r.path.is_file();
         let mut want_forget = false;
+        let mut want_open = false;
 
-        let resp = Frame::new()
+        // Layout for the row, plus the dual click handling:
+        //
+        // Inside the Frame, we first reserve a 28 px column on the
+        // right via `ui.set_max_width(inner - 28)`. Title / path /
+        // pills then render naturally inside the LEFT content area
+        // and cannot overflow into the reserved X-button strip.
+        // The labels carry NO Sense::click; they are visual.
+        //
+        // After the Frame closes, `frame_resp.interact(Sense::click())`
+        // registers a single "open the vault" click sense over the
+        // WHOLE frame rect (left content + right reserved strip +
+        // any empty padding). Clicking anywhere in the row triggers
+        // the unlock flow EXCEPT where the X button takes over.
+        //
+        // The X (forget) button is drawn via `egui::Area` on the
+        // Middle layer (above the parent ui's Background layer).
+        // Two important properties of Area:
+        //   1. It is on a higher layer, so input is consumed there
+        //      first. A click on the X-button rect routes to the
+        //      Area's button and the bg sense (on the lower layer)
+        //      does NOT see it. No "X eaten" regression.
+        //   2. It does NOT advance the parent ui's cursor. The
+        //      previous attempt used `ui.put`, which DID advance
+        //      the cursor (backwards into the frame's interior),
+        //      pulling the next row's top above the previous row's
+        //      bottom -- this was the "history rows crossing each
+        //      other" bug. Area sidesteps the cursor entirely.
+        let frame_resp = Frame::new()
             .fill(theme::PANEL)
             .stroke(Stroke::new(1.0, Color32::TRANSPARENT))
             .corner_radius(CornerRadius::same(6))
             .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
+                // Force the frame to fill the sidebar's available
+                // width (instead of shrinking to fit the longest
+                // label). Without this, a short vault name produces
+                // a narrow row while a long name produces a wider
+                // one, so the recent list looks ragged.
+                // `set_min_width(available)` makes the inner ui's
+                // used rect at least that wide; the Frame's outer
+                // rect then expands to (inner + 2 * inner_margin) =
+                // the parent's full content width.
+                let inner_width = ui.available_width();
+                ui.set_min_width(inner_width);
+
+                // Reserve room on the right so the title / path /
+                // pills can't render under the X button. The X is
+                // anchored 4 px from the frame's right edge and 4 px
+                // from the top (tight to the top-right corner), so
+                // its left edge sits at frame.right - 26. Reserve
+                // 22 px from the inner ui's right edge: that gives a
+                // 4 px gap between the rightmost content character
+                // and the X button.
+                let content_width = (inner_width - 22.0).max(0.0);
+                ui.set_max_width(content_width);
+
                 let name = r
                     .path
                     .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_else(|| r.path.display().to_string());
-                ui.horizontal(|ui| {
-                    let title_color = if missing { theme::DIM } else { theme::TEXT };
-                    // Truncate long vault names with ellipsis so they
-                    // can't push the x button off-screen on narrow
-                    // sidebars; full name still available on hover.
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(&name).strong().color(title_color).size(13.0),
-                        )
+                let title_color = if missing { theme::DIM } else { theme::TEXT };
+                // Title: visual only. Truncate + hover tooltip
+                // preserve the long-name UX without a competing
+                // click rect.
+                ui.add(
+                    egui::Label::new(RichText::new(&name).strong().color(title_color).size(13.0))
                         .truncate()
                         .selectable(false),
-                    )
-                    .on_hover_text(&name);
-                    // Push the x button to the right edge with explicit
-                    // spacing rather than a nested right_to_left layout,
-                    // which was clipping the button's hit-rect on narrow
-                    // sidebars and silently swallowing clicks.
-                    let avail = ui.available_width();
-                    if avail > 28.0 {
-                        ui.add_space(avail - 26.0);
-                    }
-                    let btn = ui.add_sized(
-                        [22.0, 22.0],
-                        egui::Button::new(RichText::new("x").color(theme::FAINT).size(14.0))
-                            .frame(false),
-                    );
-                    if btn
-                        .on_hover_text("forget this vault (doesn't delete the file)")
-                        .clicked()
-                    {
-                        want_forget = true;
-                    }
-                });
-                // Path also truncates with ellipsis; full path on hover.
+                )
+                .on_hover_text(&name);
+                // Path label: also visual; bg click sense covers it.
                 ui.add(
                     egui::Label::new(
                         RichText::new(r.path.display().to_string())
@@ -2282,8 +2375,8 @@ impl LuksboxApp {
                     .selectable(false),
                 )
                 .on_hover_text(r.path.display().to_string());
-                // Pills wrap to multiple rows, 5 pills don't fit on a
-                // about 248 px sidebar in one line.
+                // Pills wrap to multiple rows, 5 pills don't fit on
+                // a about 248 px sidebar in one line.
                 ui.horizontal_wrapped(|ui| {
                     if missing {
                         theme::pill(
@@ -2326,41 +2419,63 @@ impl LuksboxApp {
                     );
                 }
             })
-            .response
-            .interact(egui::Sense::click());
+            .response;
 
-        // Right-click also exposes Forget, same action via two paths.
-        resp.context_menu(|ui| {
-            if ui.button("Forget this vault").clicked() {
+        // Background click sense over the WHOLE frame rect.
+        let bg_resp = frame_resp.interact(egui::Sense::click());
+
+        // X button via egui::Area. Pinned 4 px inside the frame's
+        // top-right corner (Frame's corner_radius is 6 so 4 px puts
+        // the button just inside the rounded curve). Area is on a
+        // higher layer so its button consumes X-area clicks before
+        // the bg sense sees them, AND it does not advance the
+        // parent ui's cursor (avoiding the crossing-rows bug from
+        // the prior `ui.put` attempt).
+        let btn_top_left = egui::pos2(
+            frame_resp.rect.right() - 4.0 - 22.0,
+            frame_resp.rect.top() + 4.0,
+        );
+        let area_id = ui.id().with(("forget-btn", r.path.display().to_string()));
+        let btn_resp = egui::Area::new(area_id)
+            .fixed_pos(btn_top_left)
+            .order(egui::Order::Middle)
+            .show(ui.ctx(), |ui| {
+                ui.add_sized(
+                    [22.0, 22.0],
+                    egui::Button::new(RichText::new("x").color(theme::FAINT).size(14.0))
+                        .frame(false),
+                )
+                .on_hover_text("forget this vault (doesn't delete the file)")
+            })
+            .inner;
+        if btn_resp.clicked() {
+            want_forget = true;
+        } else if bg_resp.clicked() {
+            want_open = true;
+        }
+
+        // Right-click anywhere on the row opens the forget modal.
+        bg_resp.context_menu(|ui| {
+            if ui.button("Forget this vault from history...").clicked() {
                 want_forget = true;
-                ui.close();
-            }
-            if ui
-                .button(RichText::new("Forget AND delete the .lbx file").color(theme::DANGER))
-                .on_hover_text("Removes from recent list and unlinks the .lbx, IRREVERSIBLE.")
-                .clicked()
-            {
-                // Defer the actual delete to `forget_recent_path` so we
-                // don't borrow self twice.
-                want_forget = true;
-                let _ = std::fs::remove_file(&r.path);
                 ui.close();
             }
         });
 
-        if resp.hovered() {
+        if bg_resp.hovered() {
             ui.painter().rect_stroke(
-                resp.rect,
+                frame_resp.rect,
                 CornerRadius::same(6),
                 Stroke::new(1.0, theme::BORDER),
                 egui::StrokeKind::Inside,
             );
         }
-        // Plain click opens the unlock flow, but only if the file
-        // still exists. Clicking a missing entry surfaces a toast
-        // explaining the situation rather than a cryptic Container::open
-        // failure later.
-        if resp.clicked() && !want_forget {
+        // Click on the title or the path text opens the unlock flow.
+        // Clicking the X gives `want_forget` instead and is checked
+        // first below so the open path doesn't double-fire. Clicking
+        // a missing entry surfaces a toast explaining the situation
+        // rather than a cryptic Container::open failure later.
+        if want_open && !want_forget {
             if missing {
                 self.toast_warn(format!(
                     "{} no longer exists, click x to forget it.",
@@ -2371,7 +2486,12 @@ impl LuksboxApp {
             }
         }
         if want_forget {
-            self.forget_recent_path(&r.path);
+            // Route through the confirm-forget modal instead of
+            // forgetting immediately. The modal both confirms the
+            // click (so users get visual feedback that the button
+            // worked) and lets them back out before any list change
+            // or file unlink.
+            self.pending_forget_recent = Some(r.path.clone());
         }
         ui.add_space(4.0);
     }
@@ -2388,10 +2508,26 @@ impl LuksboxApp {
     }
 
     fn open_existing_picker(&mut self) {
+        // No `add_filter()` calls. rfd's filter semantics differ by
+        // backend in ways that all break this use case:
+        //   - `&["lbx"]`             hides extensionless vaults.
+        //   - `&["*"]`               works on Windows/macOS; on Linux
+        //                            xdg-desktop-portal it's emitted
+        //                            as a `*.*` glob that requires
+        //                            at least one dot in the name,
+        //                            so extensionless vaults stay
+        //                            hidden (user-reported on Fedora).
+        //   - `&[] as &[&str]`       works as "match anything" on
+        //                            some portals, "match nothing"
+        //                            on others; users report it still
+        //                            filters their .lbx files out.
+        // The only cross-platform way to actually show every file in
+        // the chosen directory is to install zero filters and let
+        // the picker render its directory listing verbatim. Users
+        // can still type a path manually via "Type path manually..."
+        // on Welcome if even this doesn't help.
         if let Some(path) = rfd::FileDialog::new()
-            .set_title("Open LUKSbox vault (.lbx)")
-            .add_filter("LUKSbox vault", &["lbx"])
-            .add_filter("any file", &["*"])
+            .set_title("Open LUKSbox vault")
             .pick_file()
         {
             let mut entry = RecentVault {
@@ -2471,6 +2607,7 @@ impl LuksboxApp {
             use_deniable: false,
             deniable_cipher,
             deniable_kdf: KdfStrength::Interactive,
+            recovery_mode: false,
         };
         self.view = View::Unlock;
     }
@@ -2494,6 +2631,14 @@ impl LuksboxApp {
         self.metadata_warned_pct = 0;
         // Same one-shot reset for the tested-boundary advisory.
         self.tested_size_advisory_shown = false;
+        // Dismiss any leftover recovery-mode report so the next
+        // vault doesn't inherit the previous vault's broken-file
+        // list.
+        self.recovery_report = None;
+        // Dismiss any open forget-recent confirm so the user starts
+        // the next session without a stale modal anchored to a
+        // previously-pending path.
+        self.pending_forget_recent = None;
     }
 
     /// Entry point for any UI action that would abandon the
@@ -2515,6 +2660,10 @@ impl LuksboxApp {
         match action {
             NavigateAction::OpenRecent(r) => self.start_unlock(r),
             NavigateAction::OpenPicker => self.open_existing_picker(),
+            NavigateAction::OpenManualEntry => {
+                self.unlock = UnlockForm::default();
+                self.view = View::Unlock;
+            }
             NavigateAction::GoCreate => self.view = View::Create,
             NavigateAction::GoPanic => self.view = View::Panic,
             NavigateAction::GoWelcome => self.view = View::Welcome,
@@ -4103,11 +4252,9 @@ impl LuksboxApp {
         // Catches missing-device upfront so the user doesn't waste
         // time on PIN entry / Argon2id only to bounce off a libfido2
         // NoDevices error from inside the worker.
-        if needs_touch {
-            if let Err(e) = ops::pre_check_fido2() {
-                self.toast_err(e);
-                return;
-            }
+        if needs_touch && let Err(e) = ops::pre_check_fido2() {
+            self.toast_err(e);
+            return;
         }
 
         // TPM-bootstrap path: pre-flight the chip so the common
@@ -4270,12 +4417,37 @@ impl LuksboxApp {
                 }
             });
         });
-        ui.label(
-            RichText::new(&self.unlock.path)
-                .color(theme::DIM)
-                .size(12.0)
-                .monospace(),
-        );
+        // Vault-path row: editable text input + Browse button. Used
+        // to be a read-only label, which left users whose `rfd` file
+        // dialog never opens (Fedora installs missing
+        // `xdg-desktop-portal-gtk`, sandboxed builds without a
+        // portal, headless X forwards) with no way to correct or
+        // enter the path. Editable + Browse here means: pick via
+        // rfd if it works; type the path if it doesn't.
+        ui.horizontal(|ui| {
+            let (field_w, browse_w) = trailing_button_row_widths(ui, FORM_FIELD_MAX_W, 90.0);
+            ui.add_sized(
+                [field_w, CONTROL_H],
+                egui::TextEdit::singleline(&mut self.unlock.path)
+                    .hint_text("path to .lbx (or any vault file)")
+                    .font(egui::TextStyle::Monospace),
+            );
+            if ui
+                .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
+                .clicked()
+                // No add_filter() calls: rfd's filter semantics
+                // hide extensionless vaults on every backend that
+                // matters (see `open_existing_picker` for the full
+                // analysis). Showing the unfiltered directory
+                // listing is the only behavior that matches user
+                // expectation across Windows, macOS, and Linux.
+                && let Some(p) = rfd::FileDialog::new()
+                    .set_title("Open LUKSbox vault")
+                    .pick_file()
+            {
+                self.unlock.path = p.display().to_string();
+            }
+        });
         ui.separator();
         ui.add_space(10.0);
         if go_back {
@@ -4459,6 +4631,29 @@ impl LuksboxApp {
                     }
                 });
             }
+            // Recovery-mode toggle. When set, Vfs::open will install
+            // any inode whose chunk-list chain fails AEAD as a
+            // 0-byte placeholder instead of refusing the whole
+            // vault, so the user can copy out healthy files when
+            // metadata is partially corrupt. Vault is flagged
+            // read-only; writes/flush refuse. Use only when a
+            // normal open just failed with the v0.2.1 "metadata
+            // blob deserialization failed" symptom -- see
+            // CHANGELOG v0.2.2.
+            ui.add_space(6.0);
+            ui.checkbox(
+                &mut self.unlock.recovery_mode,
+                "Recovery mode (read-only, skips broken files)",
+            )
+            .on_hover_text(
+                "Use ONLY when a normal open failed with 'metadata blob \
+                 deserialization failed'. The vault is opened read-only \
+                 with broken files replaced by 0-byte placeholders, so \
+                 you can copy out everything that's still readable. \
+                 Writes / flush are refused. After open, you'll see a \
+                 list of the files that were lost.",
+            );
+
             // Deniable-mode unlock toggle. When set, the cipher +
             // KDF dropdowns below are required (the user must have
             // recorded them at create time). Mutually exclusive
@@ -5130,6 +5325,7 @@ impl LuksboxApp {
                 CipherChoice::Chacha => luksbox_core::CipherSuite::ChaCha20Poly1305,
             },
             deniable_kdf: self.unlock.deniable_kdf,
+            recovery_mode: self.unlock.recovery_mode,
         };
         let needs_touch = matches!(
             opts.method,
@@ -5208,6 +5404,23 @@ impl LuksboxApp {
                 {
                     self.start_mount_picker(false);
                 }
+                // Eager-flush toggle: matches the CLI `--sync` flag.
+                // Default OFF (v0.2.2 fast deferred-flush behavior).
+                // Tick before clicking Mount as volume to restore
+                // pre-v0.2.2 per-op crash durability for the next
+                // mount session.
+                ui.checkbox(&mut self.mount_sync_mode, "Eager flush (--sync)")
+                    .on_hover_text(
+                        "Restore pre-v0.2.2 durability: every metadata-changing op \
+                     (create / unlink / rmdir / rename / chmod / close) drives \
+                     an immediate flush, guaranteeing the change is on disk \
+                     before the syscall returns. Default is OFF (deferred \
+                     flush via a 30-second timer, matches ext4 / btrfs \
+                     commit-interval semantics). Eager flush makes vaults \
+                     with thousands of files unusably slow -- tick this only \
+                     for small vaults or workflows where you need every op \
+                     to be crash-durable on return.",
+                    );
                 // Private mount button: macOS-only because that's the
                 // platform where the FUSE-T NFS-loopback model exposes
                 // the mountpoint name (under /Volumes) to every local
@@ -5478,7 +5691,11 @@ impl LuksboxApp {
             let filter_label = format!(".{ext} file");
             dialog = dialog.add_filter(&filter_label, &[ext]);
         }
-        dialog = dialog.add_filter("All files", &["*"]);
+        // Empty extension list = "match anything" on most rfd
+        // backends, including extensionless files. Literal `["*"]`
+        // is treated as a `*.*` glob on GTK portals and silently
+        // hides extensionless files (Fedora user report).
+        dialog = dialog.add_filter("All files", &[] as &[&str]);
         let Some(mut local) = dialog.save_file() else {
             return;
         };
@@ -5490,13 +5707,12 @@ impl LuksboxApp {
         // associated app even though the bytes are intact. Skip
         // when the chosen path already has an extension (the user
         // explicitly chose to rename to a different type).
-        if local.extension().is_none() {
-            if let Some(ext) = std::path::Path::new(name)
+        if local.extension().is_none()
+            && let Some(ext) = std::path::Path::new(name)
                 .extension()
                 .and_then(|s| s.to_str())
-            {
-                local.set_extension(ext);
-            }
+        {
+            local.set_extension(ext);
         }
         let v = match self.vault.take() {
             Some(v) => v,
@@ -5652,9 +5868,14 @@ impl LuksboxApp {
         } else {
             let mp_clone = mountpoint.clone();
             let (tx, rx) = std::sync::mpsc::channel();
+            // Snapshot the user's sync-mode preference at the moment
+            // they clicked Mount. Resetting it post-mount means the
+            // checkbox state doesn't bleed into the next mount.
+            let sync_mode = self.mount_sync_mode;
+            self.mount_sync_mode = false;
             std::thread::spawn(move || {
-                let r =
-                    luksbox_mount::mount(opened.vfs, &mp_clone, false).map_err(|e| e.to_string());
+                let r = luksbox_mount::mount(opened.vfs, &mp_clone, false, sync_mode)
+                    .map_err(|e| e.to_string());
                 let _ = tx.send(r);
             });
             MountBackend::InProcess { rx }
@@ -6711,6 +6932,7 @@ impl LuksboxApp {
         let next_label = match self.confirm_lock.as_ref().expect("checked above") {
             NavigateAction::OpenRecent(r) => format!("open {}", r.path.display()),
             NavigateAction::OpenPicker => "open another vault".into(),
+            NavigateAction::OpenManualEntry => "open another vault (manual path entry)".into(),
             NavigateAction::GoCreate => "create a new vault".into(),
             NavigateAction::GoPanic => "go to the PANIC screen".into(),
             NavigateAction::GoWelcome => "return to the welcome screen".into(),
@@ -6914,7 +7136,7 @@ impl LuksboxApp {
 // ---- pending overlay + modals + toasts -----------------------------------
 
 impl LuksboxApp {
-    fn draw_pending_overlay(&self, ctx: &egui::Context) {
+    fn draw_pending_overlay(&mut self, ctx: &egui::Context) {
         let Some(p) = &self.pending else { return };
         // Fido2Probe is a silent background poke at libfido2 to
         // refresh the sidebar device picker, never block the UI for
@@ -6925,9 +7147,32 @@ impl LuksboxApp {
         }
         let needs_touch = p.needs_touch();
         let label = p.label();
+        let headline = p.headline();
         // Drive a continuous repaint while the overlay is up so the
         // pulse animation and pending channels both stay live.
         ctx.request_repaint_after(Duration::from_millis(40));
+
+        // Cancel signal flag: set by either the Cancel button or
+        // the Esc key. Applied after the overlay closure returns to
+        // avoid borrowing self mutably from inside the show()
+        // closure. Without a cancel path the user gets STUCK on the
+        // "touch your authenticator" overlay if libfido2 / the USB
+        // HID stack drops a button press (real-world Fedora report
+        // where 5+ retries + GUI restarts were needed to get a
+        // touch through). Cancel ALWAYS works and detaches the UI
+        // from the in-flight FIDO2 op; the background thread runs
+        // to completion on its own time but the user is free.
+        let mut cancel_requested = false;
+        // Esc cancels too. Checked outside the overlay so the input
+        // probe runs even if the Area is hot-blocking other input.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel_requested = true;
+        }
+
+        // Need a height bump on the touch panel to fit the Cancel
+        // button row underneath the prompt without crowding the
+        // pulsing dot.
+        let panel_h = if needs_touch { 230.0 } else { 130.0 };
 
         egui::Area::new(egui::Id::new("pending-overlay"))
             .fixed_pos(egui::pos2(0.0, 0.0))
@@ -6938,7 +7183,7 @@ impl LuksboxApp {
                 ui.painter()
                     .rect_filled(rect, 0.0, Color32::from_black_alpha(190));
                 let center = rect.center();
-                let panel_size = Vec2::new(420.0, if needs_touch { 180.0 } else { 130.0 });
+                let panel_size = Vec2::new(420.0, panel_h);
                 let panel_rect = egui::Rect::from_center_size(center, panel_size);
                 ui.painter()
                     .rect_filled(panel_rect, CornerRadius::same(12), theme::PANEL);
@@ -6975,13 +7220,37 @@ impl LuksboxApp {
                                     .circle_filled(dot_rect.center(), 10.0, theme::ACCENT);
                                 ui.add_space(8.0);
                                 ui.label(
-                                    RichText::new(p.headline())
+                                    RichText::new(headline)
                                         .strong()
                                         .color(theme::ACCENT)
                                         .size(15.0),
                                 );
                                 ui.add_space(4.0);
                                 ui.label(RichText::new(label).color(theme::DIM).size(12.0));
+                                // Cancel button + Esc hint. Only
+                                // shown for touch-blocking ops since
+                                // non-touch pending ops (file copy,
+                                // probe, etc.) typically finish in
+                                // milliseconds and a cancel button
+                                // would just confuse the spinner UX.
+                                ui.add_space(12.0);
+                                if ui
+                                    .add_sized([160.0, 28.0], egui::Button::new("Cancel"))
+                                    .on_hover_text(
+                                        "Stop waiting for the authenticator. The unlock attempt \
+                                         is detached; the background FIDO2 call finishes on its \
+                                         own (you can ignore any late device blink).",
+                                    )
+                                    .clicked()
+                                {
+                                    cancel_requested = true;
+                                }
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new("(Esc also cancels)")
+                                        .color(theme::FAINT)
+                                        .size(11.0),
+                                );
                             } else {
                                 ui.add(egui::Spinner::new().color(theme::ACCENT).size(28.0));
                                 ui.add_space(8.0);
@@ -6991,6 +7260,16 @@ impl LuksboxApp {
                     },
                 );
             });
+
+        if cancel_requested {
+            // Drop the receiver: the background thread's send to
+            // this channel will fail silently, the thread frees its
+            // FIDO2 / TPM resources on its own exit. We just stop
+            // listening. UI returns to whatever view we were on
+            // before (Unlock form / Browser).
+            self.pending = None;
+            self.toast_warn("cancelled, returning to previous view");
+        }
     }
 
     fn draw_modals(&mut self, ctx: &egui::Context) {
@@ -7002,6 +7281,8 @@ impl LuksboxApp {
         self.draw_empty_passphrase_confirm_modal(ctx);
         self.draw_deniable_modal(ctx);
         self.draw_deniable_recovery_modal(ctx);
+        self.draw_recovery_report_modal(ctx);
+        self.draw_forget_recent_modal(ctx);
 
         // Add-passphrase modal
         let mut close_pp = false;
@@ -8682,7 +8963,7 @@ impl LuksboxApp {
         // immediately.
         if let Some(payload) = copy_requested {
             if self.prefs.clipboard_warning_acknowledged {
-                self.commit_clipboard_copy(&ctx, payload);
+                self.commit_clipboard_copy(ctx, payload);
             } else {
                 self.pending_clipboard_warning = Some(zeroize::Zeroizing::new(payload));
             }
@@ -8985,6 +9266,218 @@ impl LuksboxApp {
             }
         } else if cancelled {
             self.pending_clipboard_warning = None;
+        }
+    }
+
+    fn draw_forget_recent_modal(&mut self, ctx: &egui::Context) {
+        let Some(path) = self.pending_forget_recent.clone() else {
+            return;
+        };
+        let display_name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        let display_path = path.display().to_string();
+        let file_exists = path.is_file();
+        let mut do_forget = false;
+        let mut do_forget_and_delete = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("forget-recent-modal"))
+            .frame(
+                Frame::default()
+                    .fill(theme::PANEL)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(20),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(capped_width(ui, 460.0));
+                ui.label(
+                    RichText::new("Forget this vault from history?")
+                        .size(15.0)
+                        .strong(),
+                );
+                ui.add_space(10.0);
+                ui.label(RichText::new(&display_name).strong().monospace().size(13.0));
+                ui.label(
+                    RichText::new(&display_path)
+                        .small()
+                        .monospace()
+                        .color(theme::DIM),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    "Forgetting only removes the vault from the recent list. \
+                     The .lbx file on disk stays where it is. You can re-add \
+                     it later via Open existing... and pick the same path.",
+                );
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+                // Buttons are centered horizontally in their rows.
+                // Default vertical layout left-aligns add_sized widgets
+                // against the inner margin, which looked off in a
+                // centered modal; vertical_centered keeps each button
+                // on the modal's centerline regardless of available
+                // width.
+                let btn_w = capped_width(ui, 420.0);
+                ui.vertical_centered(|ui| {
+                    if ui
+                        .add_sized([btn_w, CONTROL_H], egui::Button::new("Forget from history"))
+                        .clicked()
+                    {
+                        do_forget = true;
+                    }
+                });
+                ui.add_space(4.0);
+                // Destructive option: only show when the .lbx still
+                // exists on disk. Otherwise the unlink would just fail
+                // and there's nothing to delete.
+                if file_exists {
+                    ui.vertical_centered(|ui| {
+                        if ui
+                            .add_sized(
+                                [btn_w, CONTROL_H],
+                                egui::Button::new(
+                                    RichText::new("Forget AND delete the .lbx file (IRREVERSIBLE)")
+                                        .color(theme::DANGER),
+                                ),
+                            )
+                            .on_hover_text(
+                                "Removes from the recent list AND unlinks the .lbx file. \
+                                 There is no undo; do this only if you are sure the vault \
+                                 contents are no longer needed.",
+                            )
+                            .clicked()
+                        {
+                            do_forget_and_delete = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+                ui.vertical_centered(|ui| {
+                    if ui
+                        .add_sized([btn_w, CONTROL_H], egui::Button::new("Cancel"))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+        if modal.backdrop_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if do_forget {
+            self.forget_recent_path(&path);
+            self.pending_forget_recent = None;
+        } else if do_forget_and_delete {
+            // Unlink first, THEN forget. If unlink fails we still
+            // forget the entry from the recent list (the file is gone
+            // from the user's perspective; the entry would be marked
+            // "missing" on the next render anyway) but surface the
+            // unlink error as a toast so the user knows the file may
+            // still be on disk.
+            match std::fs::remove_file(&path) {
+                Ok(()) => self.toast_warn(format!("deleted {}", path.display())),
+                Err(e) => self.toast_err(format!("could not delete {}: {e}", path.display())),
+            }
+            self.forget_recent_path(&path);
+            self.pending_forget_recent = None;
+        } else if cancel {
+            self.pending_forget_recent = None;
+        }
+    }
+
+    fn draw_recovery_report_modal(&mut self, ctx: &egui::Context) {
+        let Some(report) = self.recovery_report.as_ref() else {
+            return;
+        };
+        let report = report.clone();
+        let mut dismiss = false;
+        let modal = egui::Modal::new(egui::Id::new("recovery-report-modal"))
+            .frame(
+                Frame::default()
+                    .fill(theme::PANEL)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(20),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(capped_width(ui, 640.0));
+                ui.label(
+                    RichText::new("Opened in recovery mode")
+                        .size(15.0)
+                        .strong()
+                        .color(theme::WARN),
+                );
+                ui.add_space(10.0);
+                ui.label(format!(
+                    "{} file(s) had unreadable chunk-list metadata and were \
+                     installed as 0-byte placeholders so the vault could be \
+                     mounted. These files are NOT recoverable from the live \
+                     data area. Everything else in the vault is intact.",
+                    report.len()
+                ));
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(
+                        "The vault is mounted READ-ONLY: any write or flush \
+                         will be refused so the patched (lossy) tree never \
+                         overwrites the on-disk metadata. Copy what you \
+                         need out, then lock the vault.",
+                    )
+                    .color(theme::DIM)
+                    .small(),
+                );
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+                egui::ScrollArea::vertical()
+                    .max_height(280.0)
+                    .show(ui, |ui| {
+                        for ti in &report {
+                            ui.label(
+                                RichText::new(format!(
+                                    "{}  ({} bytes lost)",
+                                    if ti.path.is_empty() {
+                                        "<unreachable>"
+                                    } else {
+                                        ti.path.as_str()
+                                    },
+                                    ti.original_size
+                                ))
+                                .monospace()
+                                .size(12.0),
+                            );
+                            if !ti.reason.is_empty() {
+                                ui.label(
+                                    RichText::new(format!("    {}", ti.reason))
+                                        .color(theme::DIM)
+                                        .small()
+                                        .monospace(),
+                                );
+                            }
+                            ui.add_space(2.0);
+                        }
+                    });
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+                if ui
+                    .add_sized(
+                        [capped_width(ui, 420.0), CONTROL_H],
+                        egui::Button::new("Got it"),
+                    )
+                    .clicked()
+                {
+                    dismiss = true;
+                }
+            });
+        if modal.backdrop_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            dismiss = true;
+        }
+        if dismiss {
+            self.recovery_report = None;
         }
     }
 
@@ -9388,9 +9881,7 @@ fn start_mount_subprocess(
     // dedicated error message so the user immediately knows to
     // hunt for the other process. Detached header (if any) is
     // probed too; child's `lock_handles` locks both.
-    if let Err(e) = preflight_vault_unlocked(&vault_path, header_path.as_deref()) {
-        return Err(e);
-    }
+    preflight_vault_unlocked(&vault_path, header_path.as_deref())?;
 
     // 3. Spawn the child. Optionally wrap with macOS sandbox-exec
     // for defense-in-depth (opt-in via LUKSBOX_SANDBOX_HELPER=1
@@ -9743,14 +10234,15 @@ fn build_helper_command(
         // The whole point of the opt-in is that the user told us they
         // want sandboxing; honor that or refuse, never silently
         // weaken. The error surfaces in the GUI toast.
-        return Err(format!(
+        return Err(
             "LUKSBOX_SANDBOX_HELPER=1 is set but the sandbox profile was \
              not found in the .app bundle's Resources directory \
              (expected: <bundle>/Contents/Resources/fuse-t-helper.sb). \
              Refusing to spawn the helper unsandboxed. Either unset \
              LUKSBOX_SANDBOX_HELPER (and accept no sandboxing), or \
              reinstall LUKSbox so the bundle ships the profile."
-        ));
+                .to_string(),
+        );
     }
 
     // Default path: direct invocation of the helper, no sandbox wrap.
@@ -10013,13 +10505,12 @@ impl LuksboxApp {
         // that the egui::Window closure takes. If the job completed
         // since the last frame, lift the result into the form's
         // `result` field and clear `pending`.
-        if let Some(form) = self.deniable_modal.as_mut() {
-            if let Some(rx) = form.pending.as_ref() {
-                if let Ok(res) = rx.try_recv() {
-                    form.result = Some(res);
-                    form.pending = None;
-                }
-            }
+        if let Some(form) = self.deniable_modal.as_mut()
+            && let Some(rx) = form.pending.as_ref()
+            && let Ok(res) = rx.try_recv()
+        {
+            form.result = Some(res);
+            form.pending = None;
         }
 
         let Some(form) = self.deniable_modal.as_mut() else {

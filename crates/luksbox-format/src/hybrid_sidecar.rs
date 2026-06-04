@@ -552,7 +552,7 @@ fn read_v2_body(bytes: &[u8], count: usize, start_off: usize) -> Result<Vec<Hybr
 }
 
 /// Find the entry for a given slot index.
-pub fn find<'a>(entries: &'a [HybridEntry], slot_idx: u8) -> Option<&'a HybridEntry> {
+pub fn find(entries: &[HybridEntry], slot_idx: u8) -> Option<&HybridEntry> {
     entries.iter().find(|e| e.slot_idx == slot_idx)
 }
 
@@ -638,8 +638,8 @@ mod tests {
         buf.extend_from_slice(&[0u8; 6]);
         for (idx, pk_seed, ct_seed) in [(0u8, 0x11u8, 0x22u8), (5u8, 0x55u8, 0x66u8)] {
             buf.push(idx);
-            buf.extend(std::iter::repeat(pk_seed).take(PUBKEY_LEN_768));
-            buf.extend(std::iter::repeat(ct_seed).take(CIPHERTEXT_LEN_768));
+            buf.extend(std::iter::repeat_n(pk_seed, PUBKEY_LEN_768));
+            buf.extend(std::iter::repeat_n(ct_seed, CIPHERTEXT_LEN_768));
         }
         fs::write(&path, &buf).unwrap();
         let entries = read(&path).unwrap();
@@ -695,7 +695,7 @@ mod tests {
         buf.push(0); // slot_idx
         buf.push(99); // unknown level byte
         // Can't tell how much to write past this, just write garbage
-        buf.extend(std::iter::repeat(0u8).take(100));
+        buf.extend(std::iter::repeat_n(0u8, 100));
         fs::write(&path, &buf).unwrap();
         let r = read(&path);
         assert!(r.is_err());

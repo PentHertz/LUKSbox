@@ -100,6 +100,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+use crate::LAZY_FLUSH_INTERVAL_SECS;
 
 use winfsp_wrs::U16Str;
 use winfsp_wrs::{
@@ -300,7 +303,11 @@ pub struct OpenContext {
 }
 
 pub struct LuksboxFs {
-    inner: Mutex<Vfs>,
+    /// Wrapped in `Arc` so the deferred-flush timer thread (spawned in
+    /// `new` when `sync_mode == false`) can hold a strong reference and
+    /// flush the Vfs periodically without tying its lifetime to
+    /// `&self` on the WinFsp dispatch thread.
+    inner: Arc<Mutex<Vfs>>,
     /// Default security descriptor returned for every inode in the
     /// volume. With `PersistentAcls=false` (we don't store ACLs in
     /// the vault), every `get_security_by_name` call MUST return a
@@ -333,10 +340,22 @@ pub struct LuksboxFs {
     /// Mirrors the same pattern used on Linux/macOS in `fuse.rs` so all
     /// three platforms surface honest space numbers to file managers.
     vault_parent: Option<PathBuf>,
+    /// When true, the per-handle `cleanup` callback drives an
+    /// immediate `Vfs::flush()` (pre-Layer-1 behavior). Set via
+    /// `luksbox mount --sync`. When false, `cleanup` only marks the
+    /// Vfs dirty and returns; the timer thread below catches up
+    /// within `LAZY_FLUSH_INTERVAL_SECS`. `Drop` always flushes
+    /// unconditionally as a final safety net.
+    sync_mode: bool,
+    /// Wakes / shuts down the deferred-flush timer thread. Dropping
+    /// the sender (or sending on it) causes the timer's
+    /// `recv_timeout` to return `Disconnected` immediately. `None`
+    /// when `sync_mode == true` (no timer was spawned).
+    timer_stop_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl LuksboxFs {
-    pub fn new(vfs: Vfs) -> Self {
+    pub fn new(vfs: Vfs, sync_mode: bool) -> Self {
         // Build the default SD from SDDL. Owner/Group/extra-DACL-entry
         // = the current process's user SID, resolved at runtime via
         // `current_user_sid` so volume-internal ACLs match the user
@@ -356,10 +375,56 @@ impl LuksboxFs {
             .vault_path()
             .parent()
             .map(|p| p.to_path_buf());
+        let inner = Arc::new(Mutex::new(vfs));
+        let timer_stop_tx = if sync_mode {
+            None
+        } else {
+            // Background flush timer: wakes every
+            // LAZY_FLUSH_INTERVAL_SECS, briefly takes the Vfs lock
+            // and calls `vfs.flush()`. Same lifecycle as fuse.rs /
+            // fuse_t.rs: `recv_timeout` returns `Disconnected` when
+            // the Sender is dropped (Drop signals this), so the
+            // thread exits within microseconds of unmount rather than
+            // after the remaining sleep period.
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let timer_vfs = Arc::clone(&inner);
+            let _ = std::thread::Builder::new()
+                .name("luksbox-flush-timer".to_string())
+                .spawn(move || {
+                    loop {
+                        match rx.recv_timeout(Duration::from_secs(LAZY_FLUSH_INTERVAL_SECS)) {
+                            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                break;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if let Ok(mut v) = timer_vfs.lock() {
+                                    let _ = v.flush();
+                                }
+                            }
+                        }
+                    }
+                });
+            Some(tx)
+        };
         Self {
-            inner: Mutex::new(vfs),
+            inner,
             default_security: Box::new(sd),
             vault_parent,
+            sync_mode,
+            timer_stop_tx: Mutex::new(timer_stop_tx),
+        }
+    }
+
+    /// Called from the WinFsp `cleanup` callback (the analogue of FUSE
+    /// `release`) in lieu of the pre-Layer-1 unconditional
+    /// `Vfs::flush()`. With the default `sync_mode == false` this is a
+    /// no-op -- the in-memory tree stays dirty and the timer thread
+    /// catches up within `LAZY_FLUSH_INTERVAL_SECS`. With `--sync`
+    /// every cleanup persists immediately, restoring pre-Layer-1
+    /// data-loss-on-forced-kill semantics.
+    fn maybe_flush_now(&self, vfs: &mut Vfs) {
+        if self.sync_mode {
+            let _ = vfs.flush();
         }
     }
 
@@ -380,6 +445,14 @@ impl Drop for LuksboxFs {
     /// underlying `Container` is dropped. `Vfs::flush()` is a no-op
     /// when nothing is dirty, so this is free in the happy path.
     fn drop(&mut self) {
+        // Signal the deferred-flush timer thread to exit first so it
+        // doesn't race with the final flush below. Same
+        // Mutex<Option<_>>::take() pattern as fuse.rs / fuse_t.rs.
+        if let Ok(mut tx) = self.timer_stop_tx.lock()
+            && let Some(tx) = tx.take()
+        {
+            drop(tx);
+        }
         if let Ok(mut vfs) = self.inner.lock() {
             let _ = vfs.flush();
         }
@@ -543,10 +616,13 @@ impl FileSystemInterface for LuksboxFs {
         // file into the mounted volume in Explorer, unmounted, and on
         // remount the file is gone."
         //
-        // Flush is unconditional within cleanup because the gating
-        // (modified-or-delete) is done by WinFsp itself before we get
-        // here. It's also cheap for non-mutating cases: Vfs::flush() is
-        // a no-op when `dirty == false`.
+        // Layer 1: cleanup applies the in-memory rmdir/unlink (delete
+        // case) or just leaves the dirty Vfs alone (non-delete case),
+        // then calls maybe_flush_now. With the default `sync_mode ==
+        // false`, the flush is deferred to the timer thread (every
+        // `LAZY_FLUSH_INTERVAL_SECS`). With `--sync` every cleanup
+        // persists immediately. `Drop::drop` provides the unconditional
+        // final safety net for the forced-kill / abandonment case.
         if flags.is(CleanupFlags::DELETE) {
             // Triggered after can_delete + actual delete decision.
             let Some(name) = file_name else { return };
@@ -565,14 +641,13 @@ impl FileSystemInterface for LuksboxFs {
             } else {
                 vfs.unlink(parent_id, leaf)
             };
-            let _ = vfs.flush();
-        } else {
-            // Non-delete cleanup: a write/truncate/set-size happened on
-            // this handle; persist it now so an unmount or process exit
-            // immediately afterwards doesn't lose the data.
-            if let Ok(mut vfs) = self.inner.lock() {
-                let _ = vfs.flush();
-            }
+            self.maybe_flush_now(&mut vfs);
+        } else if let Ok(mut vfs) = self.inner.lock() {
+            // Non-delete cleanup: a write/truncate/set-size happened
+            // on this handle. With `--sync`, persist now so unmount
+            // or process exit immediately afterwards is durable;
+            // without it, the timer / Drop final flush handles it.
+            self.maybe_flush_now(&mut vfs);
         }
     }
 
@@ -747,7 +822,7 @@ impl FileSystemInterface for LuksboxFs {
         }
         vfs.rename(from_parent, ol, to_parent, nl)
             .map_err(|e| vfs_err_to_nt(&e))?;
-        let _ = vfs.flush();
+        self.maybe_flush_now(&mut vfs);
         Ok(())
     }
 
@@ -832,7 +907,7 @@ impl FileSystemInterface for LuksboxFs {
 /// out-of-band unmount API; the only ways to release the kernel
 /// mount are the in-process `stop()` (handled here) or letting the
 /// process exit, which the kernel driver detects and unwinds.
-pub fn mount(vfs: Vfs, mountpoint: &Path) -> Result<(), MountError> {
+pub fn mount(vfs: Vfs, mountpoint: &Path, sync_mode: bool) -> Result<(), MountError> {
     winfsp_wrs::init().map_err(map_init_error)?;
 
     // Default OperationGuardStrategy (Coarse) matches our `Mutex<Vfs>`:
@@ -923,7 +998,7 @@ pub fn mount(vfs: Vfs, mountpoint: &Path) -> Result<(), MountError> {
             0xC0FFEE_u32
         );
     }
-    let fs = LuksboxFs::new(vfs);
+    let fs = LuksboxFs::new(vfs, sync_mode);
     let running = FileSystem::start(params, Some(&mp), fs).map_err(|e| {
         if winfsp_debug() {
             eprintln!("[winfsp] FileSystem::start FAILED NTSTATUS=0x{:08X}", e);

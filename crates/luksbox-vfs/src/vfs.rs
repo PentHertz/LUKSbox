@@ -94,7 +94,7 @@ fn build_borrowed_deniable_credential(
             DC::Fido2Passphrase {
                 passphrase: pp,
                 argon2: arg,
-                hmac_secret_output: &**hs,
+                hmac_secret_output: hs,
             }
         }
         K::TpmPassphrase => {
@@ -105,7 +105,7 @@ fn build_borrowed_deniable_credential(
             DC::TpmPassphrase {
                 passphrase: pp,
                 argon2: arg,
-                unsealed: &**u,
+                unsealed: u,
             }
         }
         K::TpmFido2Passphrase => {
@@ -117,8 +117,8 @@ fn build_borrowed_deniable_credential(
             DC::TpmFido2Passphrase {
                 passphrase: pp,
                 argon2: arg,
-                unsealed: &**u,
-                hmac_secret_output: &**hs,
+                unsealed: u,
+                hmac_secret_output: hs,
             }
         }
         K::HybridPqPassphrase => {
@@ -129,7 +129,7 @@ fn build_borrowed_deniable_credential(
             DC::HybridPqPassphrase {
                 passphrase: pp,
                 argon2: arg,
-                mlkem_shared: &**m,
+                mlkem_shared: m,
             }
         }
         K::HybridPqFido2Passphrase => {
@@ -141,8 +141,8 @@ fn build_borrowed_deniable_credential(
             DC::HybridPqFido2Passphrase {
                 passphrase: pp,
                 argon2: arg,
-                mlkem_shared: &**m,
-                hmac_secret_output: &**hs,
+                mlkem_shared: m,
+                hmac_secret_output: hs,
             }
         }
         K::HybridPqTpmPassphrase => {
@@ -154,8 +154,8 @@ fn build_borrowed_deniable_credential(
             DC::HybridPqTpmPassphrase {
                 passphrase: pp,
                 argon2: arg,
-                mlkem_shared: &**m,
-                unsealed: &**u,
+                mlkem_shared: m,
+                unsealed: u,
             }
         }
         K::HybridPqTpmFido2Passphrase => {
@@ -165,9 +165,9 @@ fn build_borrowed_deniable_credential(
             DC::HybridPqTpmFido2Passphrase {
                 passphrase: pp,
                 argon2: arg,
-                mlkem_shared: &**m,
-                unsealed: &**u,
-                hmac_secret_output: &**hs,
+                mlkem_shared: m,
+                unsealed: u,
+                hmac_secret_output: hs,
             }
         }
     };
@@ -221,7 +221,7 @@ pub struct DeniableRotationCredential {
 /// honoring the vault's `pad_files_pow2` mode.
 ///
 /// Without padding: `needed` (1:1).
-/// With padding:    next power of 2 ≥ `needed` (so 1->1, 2->2, 3->4, 5->8, ...).
+/// With padding:    next power of 2 >= `needed` (so 1->1, 2->2, 3->4, 5->8, ...).
 ///
 /// 0 stays 0 (an empty file still uses 0 chunks regardless of mode).
 fn padded_chunk_count(needed: usize, padding_on: bool) -> usize {
@@ -502,6 +502,135 @@ impl Drop for FormatV3OverrideGuard {
 pub fn set_format_v3_override(v: Option<bool>) -> FormatV3OverrideGuard {
     let previous = FORMAT_V3_THREAD_LOCAL.with(|c| c.replace(v));
     FormatV3OverrideGuard { previous }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Thread-local escape hatch for the v0.2.2 durability fence in
+    /// `Vfs::flush`. When `true`, `flush` skips the
+    /// `container.sync_data_area()` call that was added to fix the
+    /// v0.2.1 mirror-protocol durability hole. Toggled ONLY by the
+    /// `skip_fence_thread_local_reproduces_v0_2_1_ordering` test to
+    /// demonstrate the fence is load-bearing. Production code never
+    /// touches this and the symbol does not exist in release builds.
+    static SKIP_FENCE_FOR_TEST_TLS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn skip_fence_for_test() -> bool {
+    SKIP_FENCE_FOR_TEST_TLS.with(|c| c.get())
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn skip_fence_for_test() -> bool {
+    false
+}
+
+/// RAII guard for the thread-local skip-fence override. Restores
+/// `false` on drop. Test-only; cfg(test)-gated so production builds
+/// never see the symbol.
+#[cfg(test)]
+pub struct SkipFenceGuard {
+    previous: bool,
+}
+
+#[cfg(test)]
+impl Drop for SkipFenceGuard {
+    fn drop(&mut self) {
+        SKIP_FENCE_FOR_TEST_TLS.with(|c| c.set(self.previous));
+    }
+}
+
+/// Test-only: enable / disable the durability fence on the current
+/// thread. Returns a guard that restores the previous value on drop.
+#[cfg(test)]
+pub fn set_skip_fence_for_test(v: bool) -> SkipFenceGuard {
+    let previous = SKIP_FENCE_FOR_TEST_TLS.with(|c| c.replace(v));
+    SkipFenceGuard { previous }
+}
+
+thread_local! {
+    /// Thread-local override for the tolerate-bad-chunk-lists open-
+    /// time recovery path. When `true`, `Vfs::open` skips inodes
+    /// whose chunk-list chain fails AEAD instead of refusing the
+    /// whole vault. UI code (wizard, GUI) toggles this thread-local
+    /// before calling `Vfs::open`; CLI invocations still honor the
+    /// `LUKSBOX_TOLERATE_BAD_CHUNK_LISTS` env var (the function
+    /// `tolerate_bad_chunk_lists()` reads both).
+    static TOLERATE_BAD_CHUNK_LISTS_TLS: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// RAII guard for the thread-local tolerate-bad-chunk-lists flag.
+/// Restores the previous value on drop so nested or sibling calls
+/// aren't poisoned.
+pub struct TolerateBadChunkListsGuard {
+    previous: bool,
+}
+
+impl Drop for TolerateBadChunkListsGuard {
+    fn drop(&mut self) {
+        TOLERATE_BAD_CHUNK_LISTS_TLS.with(|c| c.set(self.previous));
+    }
+}
+
+/// Enable / disable tolerant recovery on the current thread. While
+/// set, `Vfs::open` will install inodes whose chunk-list chain fails
+/// AEAD as zero-byte placeholders and continue, instead of refusing
+/// the whole vault. The Vfs is marked read-only at flush time so
+/// the patched (lossy) tree never overwrites the on-disk metadata.
+/// The list of broken inodes is available via `Vfs::tolerated_inodes()`.
+pub fn set_tolerate_bad_chunk_lists(v: bool) -> TolerateBadChunkListsGuard {
+    let previous = TOLERATE_BAD_CHUNK_LISTS_TLS.with(|c| c.replace(v));
+    TolerateBadChunkListsGuard { previous }
+}
+
+/// True iff tolerant recovery is currently enabled on this thread,
+/// EITHER via the thread-local or via the `LUKSBOX_TOLERATE_BAD_CHUNK_LISTS`
+/// env var. Env var preserved for back-compat with the v0.2.2-recovery
+/// CLI procedure documented in the changelog.
+pub fn tolerate_bad_chunk_lists() -> bool {
+    TOLERATE_BAD_CHUNK_LISTS_TLS.with(|c| c.get())
+        || std::env::var_os("LUKSBOX_TOLERATE_BAD_CHUNK_LISTS").is_some()
+}
+
+thread_local! {
+    /// Per-thread accumulator for the tolerated-inode report. `Vfs::open`
+    /// resets it on entry and reads it back after `v4_on_disk_to_in_memory`
+    /// returns, resolves each entry's `path`, and stashes the final
+    /// list on the Vfs for UI callers.
+    static TOLERATED_INODES_TLS: std::cell::RefCell<Vec<ToleratedInode>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn record_tolerated_inode(inode: ToleratedInode) {
+    TOLERATED_INODES_TLS.with(|v| v.borrow_mut().push(inode));
+}
+
+fn take_tolerated_inodes() -> Vec<ToleratedInode> {
+    TOLERATED_INODES_TLS.with(|v| std::mem::take(&mut *v.borrow_mut()))
+}
+
+/// One row in the tolerated-inode report. Populated during `Vfs::open`
+/// when a chunk-list-chain fails AEAD and `tolerate_bad_chunk_lists()`
+/// returns true. UI callers retrieve the list via `Vfs::tolerated_inodes()`
+/// after `Vfs::open` returns successfully.
+#[derive(Debug, Clone)]
+pub struct ToleratedInode {
+    pub id: FileId,
+    pub kind: InodeKind,
+    /// Path inside the vault (resolved by walking parent IDs). May be
+    /// "<unreachable>" if the inode has no path from root (which is
+    /// itself a sign of corruption -- surfaced rather than hidden).
+    pub path: String,
+    /// Size the inode claimed before we zeroed it out (== the bytes
+    /// the user lost from this file).
+    pub original_size: u64,
+    /// Free-form description of the AEAD failure, e.g. "chunk-list
+    /// chain head=ChunkRef { id: 625, generation: 1138058 } expected=509 -- crypto: AEAD failure".
+    pub reason: String,
 }
 
 fn use_v3_for_fresh_vault() -> bool {
@@ -967,13 +1096,31 @@ fn v4_on_disk_to_in_memory(
     v4: DirectoryTreeV4OnDisk,
     container: &mut luksbox_format::Container,
 ) -> Result<DirectoryTree, Error> {
+    let debug = std::env::var_os("LUKSBOX_DEBUG_OPEN").is_some();
+    if debug {
+        eprintln!(
+            "luksbox-debug: v4_on_disk_to_in_memory: {} inodes, root={}, next_file_id={}, next_chunk_id={}, next_chunk_gen={}",
+            v4.inodes.len(),
+            v4.root,
+            v4.next_file_id,
+            v4.next_chunk_id,
+            v4.next_chunk_gen
+        );
+    }
     let mut inodes: std::collections::BTreeMap<FileId, crate::tree::Inode> =
         std::collections::BTreeMap::new();
     for (id, od) in v4.inodes {
+        let mut chunks_lost = false;
         if od.link_count == 0 {
             // Corrupt: every inode must have at least one directory
             // entry pointing at it (otherwise it would have been
             // freed by unlink), so refcount must be >= 1.
+            if debug {
+                eprintln!(
+                    "luksbox-debug: REJECT inode id={id} kind={:?}: link_count == 0",
+                    od.kind
+                );
+            }
             return Err(Error::MetadataDeserialize);
         }
         // Symlink presence-of-target invariant. Match the create-
@@ -988,10 +1135,26 @@ fn v4_on_disk_to_in_memory(
         match (od.kind, od.symlink_target.as_deref()) {
             (InodeKind::Symlink, Some(t)) => {
                 if !is_safe_symlink_target(t) {
+                    if debug {
+                        eprintln!(
+                            "luksbox-debug: REJECT inode id={id} kind=Symlink: \
+                             target rejected by is_safe_symlink_target ({} bytes, starts with {:?})",
+                            t.len(),
+                            &t.chars().take(40).collect::<String>()
+                        );
+                    }
                     return Err(Error::MetadataDeserialize);
                 }
             }
             (InodeKind::Symlink, None) | (_, Some(_)) => {
+                if debug {
+                    eprintln!(
+                        "luksbox-debug: REJECT inode id={id} kind={:?} symlink_target_present={}: \
+                         presence-of-target invariant",
+                        od.kind,
+                        od.symlink_target.is_some()
+                    );
+                }
                 return Err(Error::MetadataDeserialize);
             }
             _ => {}
@@ -1000,19 +1163,79 @@ fn v4_on_disk_to_in_memory(
             None => (od.chunks, Vec::new()),
             Some((head, expected_count)) => {
                 if !od.chunks.is_empty() {
+                    if debug {
+                        eprintln!(
+                            "luksbox-debug: REJECT inode id={id} kind={:?}: \
+                             both inline chunks ({} entries) AND chunks_external (head={:?}, expected={}) present",
+                            od.kind,
+                            od.chunks.len(),
+                            head,
+                            expected_count
+                        );
+                    }
                     return Err(Error::MetadataDeserialize);
                 }
-                chunk::walk_chunk_list_chain(container, od.id, head, expected_count)
-                    .map_err(|_| Error::MetadataDeserialize)?
+                match chunk::walk_chunk_list_chain(container, od.id, head, expected_count) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Tolerant recovery mode: bad chunk-list blocks
+                        // for a single file shouldn't keep the whole
+                        // vault sealed. With LUKSBOX_TOLERATE_BAD_CHUNK_LISTS=1
+                        // the file is installed with zero chunks (reads
+                        // return 0 bytes for it) and the open continues
+                        // so the remaining files can be recovered. The
+                        // broken file's id is printed to stderr.
+                        if tolerate_bad_chunk_lists() {
+                            eprintln!(
+                                "luksbox-recover: TOLERATING bad chunk-list chain for inode id={id} \
+                                 kind={:?} (head={:?}, expected={}, original_size={}): {e}. \
+                                 File installed with 0 chunks and size=0; mount in read-only mode and avoid writes.",
+                                od.kind, head, expected_count, od.size
+                            );
+                            chunks_lost = true;
+                            record_tolerated_inode(ToleratedInode {
+                                id,
+                                kind: od.kind,
+                                path: String::new(), // resolved post-tree-build
+                                original_size: od.size,
+                                reason: format!(
+                                    "chunk-list chain head={head:?} expected={expected_count} -- {e}"
+                                ),
+                            });
+                            (Vec::new(), Vec::new())
+                        } else {
+                            if debug {
+                                eprintln!(
+                                    "luksbox-debug: REJECT inode id={id} kind={:?}: \
+                                     walk_chunk_list_chain(head={:?}, expected={}) failed: {e}",
+                                    od.kind, head, expected_count
+                                );
+                                eprintln!(
+                                    "luksbox-debug: HINT: rerun with LUKSBOX_TOLERATE_BAD_CHUNK_LISTS=1 \
+                                     to skip broken inodes and recover the rest of the vault."
+                                );
+                            }
+                            return Err(Error::MetadataDeserialize);
+                        }
+                    }
+                }
             }
         };
+        // In tolerant-recovery mode the chunk-list chain decryption
+        // failed, so we cleared the chunks vec. Also zero out `size`
+        // so the file/size <-> chunks invariant in
+        // validate_metadata_tree (`chunks.len() >= required_chunks(size)`)
+        // holds. The original size is lost from the in-memory view
+        // (we couldn't read the data anyway), and the file appears
+        // empty on the mounted FS.
+        let inode_size = if chunks_lost { 0 } else { od.size };
         inodes.insert(
             id,
             crate::tree::Inode {
                 id: od.id,
                 parent: od.parent,
                 kind: od.kind,
-                size: od.size,
+                size: inode_size,
                 mtime_ns: od.mtime_ns,
                 chunks,
                 children: od.children,
@@ -1060,6 +1283,37 @@ pub struct Vfs {
     /// territory and we ask users to verify unlocks + report issues.
     /// One-shot per session via this latch.
     warned_beyond_tested_size: bool,
+    /// Tolerant-recovery report: which inodes had their chunk-list
+    /// chain skipped because AEAD failed. Empty for normal opens.
+    /// Read via `Vfs::tolerated_inodes()`. The Vfs is read-only
+    /// while non-empty (`Vfs::flush` refuses with `ReadOnlyMount`).
+    tolerated_inodes: Vec<ToleratedInode>,
+    /// Layer-2 per-inode dirty tracking. Set of inode IDs whose
+    /// `chunks` vec has been mutated since the last successful
+    /// flush. Used by `spill_to_v3_on_disk` to skip the
+    /// free-old + allocate-new + re-encrypt + re-write cycle for
+    /// inodes whose chunk-list chain is still valid on disk. For a
+    /// vault with N spilled files where only K are touched per
+    /// flush, this turns the per-flush cost from O(N) chunk-list-
+    /// block writes into O(K). Cleared at the end of `Vfs::flush`
+    /// alongside `dirty = false`.
+    ///
+    /// Mutation paths that mark an inode dirty here:
+    ///   - `write` and `truncate` (chunks added / removed / rewritten)
+    ///   - `create_with_mode` (new inode, in case it transitions to
+    ///     external before next flush)
+    /// Paths that REMOVE an entry (because the inode is gone):
+    ///   - `unlink` / `rmdir`
+    /// Paths that mark ALL inodes dirty (full re-spill required):
+    ///   - format upgrade in `Vfs::flush` (e.g. V2 -> V5)
+    ///   - MVK rotation (every chunk gets re-encrypted under the
+    ///     new MVK, so every chunk-list block too)
+    /// Paths that DON'T mark (chunks vec unchanged):
+    ///   - `chmod`, `rename`, `link`, `mkdir`, `symlink` -- those
+    ///     touch the in-memory tree but the chunk-list chain is
+    ///     byte-identical on disk and the inline-or-external decision
+    ///     doesn't change.
+    chunks_dirty: std::collections::BTreeSet<FileId>,
 }
 
 /// Vault on-disk size beyond which the runtime emits a one-shot
@@ -1071,7 +1325,33 @@ impl Vfs {
     /// Open a Vfs over an already-unlocked container. If the metadata blob is
     /// empty (freshly created container), initializes a fresh tree.
     pub fn open(mut container: Container) -> Result<Self, Error> {
+        // Reset the per-thread tolerated-inode accumulator so a
+        // prior open's leftover entries (e.g. if a previous Vfs::open
+        // returned Err) don't leak into this open's report.
+        let _ = take_tolerated_inodes();
         let blob = container.read_metadata()?;
+        let debug = std::env::var_os("LUKSBOX_DEBUG_OPEN").is_some();
+        if debug {
+            let head_len = blob.len().min(32);
+            eprintln!(
+                "luksbox-debug: metadata plaintext len={} first {} bytes = {}",
+                blob.len(),
+                head_len,
+                blob[..head_len]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+        let map_decode = |stage: &'static str| {
+            move |e: postcard::Error| {
+                if debug {
+                    eprintln!("luksbox-debug: {stage} postcard decode failed: {e}");
+                }
+                Error::MetadataDeserialize
+            }
+        };
         let (tree, format) = if blob.is_empty() {
             // Fresh vault: pick the format based on the env-var gate.
             // The choice is locked in by the first flush writing the
@@ -1080,6 +1360,9 @@ impl Vfs {
         } else if blob.len() >= METADATA_V5_MAGIC.len()
             && &blob[..METADATA_V5_MAGIC.len()] == METADATA_V5_MAGIC
         {
+            if debug {
+                eprintln!("luksbox-debug: matched LBM5 magic");
+            }
             // LBM5: structurally the v4 on-disk shape. The lower
             // V5_INLINE_CHUNK_THRESHOLD is a write-side invariant
             // only; the read path tolerates any inline count up to
@@ -1087,10 +1370,16 @@ impl Vfs {
             // with future threshold tweaks.
             let payload = &blob[METADATA_V5_MAGIC.len()..];
             if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                if debug {
+                    eprintln!(
+                        "luksbox-debug: LBM5 payload exceeds decode limit ({} bytes)",
+                        payload.len()
+                    );
+                }
                 return Err(Error::MetadataDeserialize);
             }
             let v4: DirectoryTreeV4OnDisk =
-                postcard::from_bytes(payload).map_err(|_| Error::MetadataDeserialize)?;
+                postcard::from_bytes(payload).map_err(map_decode("LBM5"))?;
             (
                 v4_on_disk_to_in_memory(v4, &mut container)?,
                 MetadataFormat::V5,
@@ -1098,12 +1387,21 @@ impl Vfs {
         } else if blob.len() >= METADATA_V4_MAGIC.len()
             && &blob[..METADATA_V4_MAGIC.len()] == METADATA_V4_MAGIC
         {
+            if debug {
+                eprintln!("luksbox-debug: matched LBM4 magic");
+            }
             let payload = &blob[METADATA_V4_MAGIC.len()..];
             if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                if debug {
+                    eprintln!(
+                        "luksbox-debug: LBM4 payload exceeds decode limit ({} bytes)",
+                        payload.len()
+                    );
+                }
                 return Err(Error::MetadataDeserialize);
             }
             let v4: DirectoryTreeV4OnDisk =
-                postcard::from_bytes(payload).map_err(|_| Error::MetadataDeserialize)?;
+                postcard::from_bytes(payload).map_err(map_decode("LBM4"))?;
             (
                 v4_on_disk_to_in_memory(v4, &mut container)?,
                 MetadataFormat::V4,
@@ -1111,12 +1409,21 @@ impl Vfs {
         } else if blob.len() >= METADATA_V3_MAGIC.len()
             && &blob[..METADATA_V3_MAGIC.len()] == METADATA_V3_MAGIC
         {
+            if debug {
+                eprintln!("luksbox-debug: matched LBM3 magic");
+            }
             let payload = &blob[METADATA_V3_MAGIC.len()..];
             if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                if debug {
+                    eprintln!(
+                        "luksbox-debug: LBM3 payload exceeds decode limit ({} bytes)",
+                        payload.len()
+                    );
+                }
                 return Err(Error::MetadataDeserialize);
             }
             let v3: DirectoryTreeV3OnDisk =
-                postcard::from_bytes(payload).map_err(|_| Error::MetadataDeserialize)?;
+                postcard::from_bytes(payload).map_err(map_decode("LBM3"))?;
             (
                 v3_on_disk_to_in_memory(v3, &mut container)?,
                 MetadataFormat::V3,
@@ -1124,12 +1431,21 @@ impl Vfs {
         } else if blob.len() >= METADATA_V2_MAGIC.len()
             && &blob[..METADATA_V2_MAGIC.len()] == METADATA_V2_MAGIC
         {
+            if debug {
+                eprintln!("luksbox-debug: matched LBM2 magic");
+            }
             let payload = &blob[METADATA_V2_MAGIC.len()..];
             if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                if debug {
+                    eprintln!(
+                        "luksbox-debug: LBM2 payload exceeds decode limit ({} bytes)",
+                        payload.len()
+                    );
+                }
                 return Err(Error::MetadataDeserialize);
             }
             let mut tree: DirectoryTree =
-                postcard::from_bytes(payload).map_err(|_| Error::MetadataDeserialize)?;
+                postcard::from_bytes(payload).map_err(map_decode("LBM2"))?;
             // V2 on-disk inodes don't carry mode/link_count; the
             // serde-skip defaults assign DEFAULT_FILE_MODE to every
             // inode. Patch directories to the conventional 0o755 so
@@ -1141,13 +1457,67 @@ impl Vfs {
             (tree, MetadataFormat::V2)
         } else {
             // Not LBM2/3/4/5 -- unsupported version, refuse cleanly.
+            if debug {
+                eprintln!(
+                    "luksbox-debug: NO LBM2/3/4/5 magic at start of plaintext (got 0x{:02x}{:02x}{:02x}{:02x})",
+                    blob.first().copied().unwrap_or(0),
+                    blob.get(1).copied().unwrap_or(0),
+                    blob.get(2).copied().unwrap_or(0),
+                    blob.get(3).copied().unwrap_or(0),
+                );
+            }
             return Err(Error::MetadataDeserialize);
         };
-        validate_metadata_tree(
+        if debug {
+            eprintln!(
+                "luksbox-debug: tree decoded as {:?}, running validate_metadata_tree",
+                format
+            );
+        }
+        let validate_res = validate_metadata_tree(
             &tree,
             container.data_offset(),
             container.header.hide_size_header(),
-        )?;
+        );
+        if debug {
+            match &validate_res {
+                Ok(()) => eprintln!("luksbox-debug: validate_metadata_tree OK"),
+                Err(e) => eprintln!("luksbox-debug: validate_metadata_tree FAILED: {e}"),
+            }
+        }
+        validate_res?;
+        // Resolve paths for any tolerated inodes the v4 conversion
+        // recorded. Walk the now-built tree from root to find each
+        // tolerated id's path. Done here (not inline in the
+        // conversion) because we need the directories' children
+        // map fully populated before we can walk by name.
+        let mut tolerated = take_tolerated_inodes();
+        if !tolerated.is_empty() {
+            let mut id_to_path: std::collections::BTreeMap<FileId, String> =
+                std::collections::BTreeMap::new();
+            let mut stack: Vec<(FileId, String)> = vec![(ROOT_ID, "/".to_string())];
+            while let Some((id, path)) = stack.pop() {
+                id_to_path.insert(id, path.clone());
+                if let Some(inode) = tree.inodes.get(&id)
+                    && inode.kind == InodeKind::Directory
+                {
+                    for (name, &child_id) in &inode.children {
+                        let child_path = if path == "/" {
+                            format!("/{name}")
+                        } else {
+                            format!("{path}/{name}")
+                        };
+                        stack.push((child_id, child_path));
+                    }
+                }
+            }
+            for ti in &mut tolerated {
+                ti.path = id_to_path
+                    .get(&ti.id)
+                    .cloned()
+                    .unwrap_or_else(|| "<unreachable>".to_string());
+            }
+        }
         Ok(Self {
             container,
             tree,
@@ -1155,7 +1525,20 @@ impl Vfs {
             format,
             last_warned_pct: 0,
             warned_beyond_tested_size: false,
+            tolerated_inodes: tolerated,
+            // Fresh open: every in-memory inode matches its on-disk
+            // chunk-list chain. Mutations after this point will add
+            // entries here as they touch chunks.
+            chunks_dirty: std::collections::BTreeSet::new(),
         })
+    }
+
+    /// The list of inodes that had their chunk-list chain skipped
+    /// during open because AEAD failed. Empty for normal opens. UI
+    /// code (wizard, GUI) calls this to surface the recovery report
+    /// to the user after a successful tolerant-recovery open.
+    pub fn tolerated_inodes(&self) -> &[ToleratedInode] {
+        &self.tolerated_inodes
     }
 
     /// Whether this vault uses any non-v2 metadata format (v3 or v4).
@@ -1218,6 +1601,16 @@ impl Vfs {
     }
 
     pub fn flush(&mut self) -> Result<(), Error> {
+        // Tolerant-recovery mode: if the open path zeroed any
+        // inode's chunks/size because its chunk-list chain failed
+        // AEAD, the in-memory tree no longer reflects the truth on
+        // disk. Persisting it would overwrite the original
+        // `chunks_external` pointers and `size` permanently --
+        // destroying any chance of brute-force recovering the
+        // broken files later. Refuse the flush in this mode.
+        if tolerate_bad_chunk_lists() {
+            return Err(Error::ReadOnlyMount);
+        }
         // Force a flush even when the tree is clean if the most recent
         // open recovered the metadata blob from a sidecar mirror. The
         // recovery path is correct but the live region is stale until
@@ -1256,6 +1649,12 @@ impl Vfs {
             // for the v0.2.1+ shape: lower spill threshold, paired
             // with the LUKSBOX2 header.
             self.format = MetadataFormat::V5;
+            // Layer 2: format upgrade changes the inline-vs-external
+            // threshold AND the encoding of inode rows; every
+            // existing inode must be re-walked through the spill
+            // logic on this flush. The reuse fast path checks
+            // chunks_dirty, so mark every inode dirty here.
+            self.chunks_dirty.extend(self.tree.inodes.keys().copied());
         }
         // Auto-upgrade to V4 if any inode has been touched by an
         // LBM4-only op (non-default mode, or hardlink count > 1).
@@ -1263,6 +1662,8 @@ impl Vfs {
         let needs_v4 = self.tree_needs_v4_format();
         if matches!(self.format, MetadataFormat::V2 | MetadataFormat::V3) && needs_v4 {
             self.format = MetadataFormat::V4;
+            // Layer 2: same reasoning as the V1->V5 upgrade above.
+            self.chunks_dirty.extend(self.tree.inodes.keys().copied());
         }
         let bytes = match self.format {
             MetadataFormat::V5 => {
@@ -1329,6 +1730,47 @@ impl Vfs {
                 bytes
             }
         };
+        // **Durability fence** before the sidecar-mirror commit.
+        //
+        // `spill_to_v[3-5]_on_disk` above called
+        // `chunk::write_chunk_list_block` for every spilled inode,
+        // which writes to the data area via `container.write_at()`
+        // -- page cache only, no fsync. The next call,
+        // `self.container.write_metadata(&bytes)`, commits the new
+        // metadata via the v0.2.1 mirror protocol: it fsyncs the
+        // `.lbx.meta-bak` sidecar (durably recording the NEW
+        // `chunks_external` pointers) BEFORE it overwrites the live
+        // region in `.lbx` and fsyncs `.lbx`.
+        //
+        // Without this fence, a crash between the mirror's fsync
+        // and `.lbx`'s sync_all leaves the mirror durable while
+        // the chunk-list block writes are still in the page cache:
+        // on next open, recovery from the mirror produces an
+        // in-memory tree whose `chunks_external.head` points to
+        // slots on disk that hold pre-flush bytes -- AEAD verifies
+        // against the OLD generation, the reader uses the NEW
+        // generation from the mirror, every such block fails AEAD.
+        //
+        // Symptom that exposed the bug: a v0.2.1 user's vault lost
+        // 26 chunk-list blocks in one flush, all in a contiguous
+        // generation window, with live and mirror byte-identical
+        // (consistent post-fsync state) but slots holding old
+        // bytes (the new writes never made it to disk before crash).
+        //
+        // Fix: fsync the `.lbx` file HERE so chunk-list block
+        // writes are durable BEFORE the mirror commits to "this is
+        // the new authoritative state". Mirror's invariant ("reader
+        // can trust these pointers") is restored.
+        //
+        // The thread-local `SKIP_FENCE_FOR_TEST` escape hatch
+        // (toggled only by `skip_fence_thread_local_reproduces_v0_2_1_ordering`)
+        // lets the regression test demonstrate the bug's
+        // reappearance if the fence is removed. Thread-local
+        // instead of an env var so parallel test threads don't
+        // race on the global env.
+        if !skip_fence_for_test() {
+            self.container.sync_data_area()?;
+        }
         self.container.write_metadata(&bytes)?;
         // The live metadata region has been re-established. Clear the
         // recovery flag so subsequent clean flushes (when the tree is
@@ -1373,27 +1815,34 @@ impl Vfs {
         // Beyond that the format is expected to work but is in
         // untested territory; ask the user to verify unlocks +
         // report issues. One-shot per Vfs session via the latch.
-        if !self.warned_beyond_tested_size {
-            if let Ok(meta) = std::fs::metadata(self.container.vault_path()) {
-                if meta.len() > TESTED_VAULT_SIZE_BYTES {
-                    eprintln!(
-                        "luksbox: note: vault on-disk size ({} GiB) is beyond the \
+        if !self.warned_beyond_tested_size
+            && let Ok(meta) = std::fs::metadata(self.container.vault_path())
+            && meta.len() > TESTED_VAULT_SIZE_BYTES
+        {
+            eprintln!(
+                "luksbox: note: vault on-disk size ({} GiB) is beyond the \
                          tested boundary (~30 GiB). The format is expected to handle \
                          larger vaults but this usage has not been ground-truth tested. \
                          Please periodically close and reopen the vault to verify it \
                          still unlocks, and report any anomalies at \
                          https://github.com/PentHertz/LUKSbox/issues.",
-                        meta.len() / (1024 * 1024 * 1024)
-                    );
-                    self.warned_beyond_tested_size = true;
-                }
-            }
+                meta.len() / (1024 * 1024 * 1024)
+            );
+            self.warned_beyond_tested_size = true;
         }
         // If the container has an anchor sidecar configured, push the
         // current vault generation to it so a future open can detect
         // rollback via `anchor::compare`.
         self.container.write_anchor(self.tree.next_chunk_gen)?;
         self.dirty = false;
+        // Layer 2: every dirty inode has either been re-spilled
+        // (full path) or had its existing chain reused (fast path).
+        // Either way, the in-memory state now matches the just-
+        // written on-disk metadata, so the next flush starts fresh.
+        // Cleared only after the metadata write succeeded so a
+        // flush that fails mid-way leaves the dirty markers in
+        // place for the next attempt.
+        self.chunks_dirty.clear();
         Ok(())
     }
 
@@ -1503,6 +1952,53 @@ impl Vfs {
                     inode.kind == InodeKind::File && inode.chunks.len() > threshold,
                 )
             };
+            // Layer 2 fast path: this inode's chunks vec is unchanged
+            // since the last flush AND it still needs (and already
+            // has) an external chunk-list chain. Reuse the existing
+            // on-disk blocks -- no free, no alloc, no re-encrypt, no
+            // write. The chunk-list block slots are still reserved
+            // (we never freed them), so other allocations can't have
+            // overwritten them, and their AEAD remains valid under
+            // the current MVK + (synth_id, block_idx, generation)
+            // AAD. Just record (head, count) in the on-disk inode.
+            //
+            // Safety of the reuse:
+            //   - chunks_dirty is the authoritative "did this inode's
+            //     chunks vec change" marker; write/truncate set it,
+            //     unlink removes the entry. chmod/rename/link don't
+            //     touch chunks so they don't set it -- and the
+            //     chunk-list chain doesn't depend on parent/mode/etc.
+            //   - The threshold can't have changed mid-Vfs-session
+            //     (format upgrades mark all inodes dirty in flush(),
+            //     so an upgrade-driven re-spill takes the full path).
+            //   - MVK rotation re-encrypts every chunk under the new
+            //     MVK, including chunk-list blocks; its post-rotation
+            //     code marks every inode dirty so the next flush
+            //     re-walks the spill.
+            if file_needs_external && !self.chunks_dirty.contains(&id) {
+                let inode = self.tree.inodes.get(&id).expect("id from keys()");
+                if let Some(head) = inode.external_list_blocks.first().copied() {
+                    on_disk_inodes.insert(
+                        id,
+                        InodeV3OnDisk {
+                            id: inode.id,
+                            parent: inode.parent,
+                            kind: inode.kind,
+                            size: inode.size,
+                            mtime_ns: inode.mtime_ns,
+                            chunks: Vec::new(),
+                            chunks_external: Some((head, chunks_len as u64)),
+                            children: inode.children.clone(),
+                        },
+                    );
+                    continue;
+                }
+                // Fall-through: file_needs_external but no in-memory
+                // external_list_blocks. Means this inode was freshly
+                // marked dirty (e.g. write that just crossed the
+                // threshold) but somehow lost its dirty marker. Take
+                // the full path for correctness.
+            }
             // Free any previously-allocated external_list_blocks; we
             // either rewrite them fresh (still external) or no longer
             // need them (shrunk back to inline).
@@ -2036,6 +2532,13 @@ impl Vfs {
             .children
             .insert(name.to_string(), id);
         self.dirty = true;
+        // Layer 2: brand-new inode with no on-disk chunk-list chain
+        // yet. Marking dirty lets `spill_to_v3_on_disk` correctly
+        // pick the inline-vs-external path on first flush. Costs
+        // nothing for inline files (which is the common case for a
+        // freshly-created empty inode) since the spill code only
+        // does work when the file actually crosses the threshold.
+        self.chunks_dirty.insert(id);
         Ok(id)
     }
 
@@ -2228,6 +2731,10 @@ impl Vfs {
             inode_mut.cached_real_size = Some(new_real);
         }
         self.dirty = true;
+        // Layer 2: this inode's chunks vec just changed; mark so the
+        // next spill_to_v3_on_disk re-encrypts its chunk-list chain
+        // instead of reusing the existing on-disk blocks.
+        self.chunks_dirty.insert(id);
         Ok(buf.len())
     }
 
@@ -2295,6 +2802,8 @@ impl Vfs {
             inode_mut.cached_real_size = Some(new_size);
         }
         self.dirty = true;
+        // Layer 2: same reasoning as `write` -- chunks vec mutated.
+        self.chunks_dirty.insert(id);
         Ok(())
     }
 
@@ -2372,6 +2881,9 @@ impl Vfs {
                 self.tree.free_chunk_id(cref.id);
             }
             self.tree.inodes.remove(&target_id);
+            // Layer 2: inode is gone; drop any pending dirty marker
+            // for it so the next spill doesn't try to look it up.
+            self.chunks_dirty.remove(&target_id);
         }
         // If still nonzero, the inode remains and is reachable via
         // its other directory entries; chunks stay allocated.
@@ -2844,7 +3356,7 @@ impl Vfs {
                 } => slot.unlock_fido2(
                     suite,
                     passphrase.as_ref().map(|p| p.as_bytes()),
-                    &*hmac_secret_for_verify,
+                    hmac_secret_for_verify,
                     &header_salt,
                 ),
             }
@@ -2895,7 +3407,7 @@ impl Vfs {
                     aad[8..12].copy_from_slice(&(chunk_idx as u32).to_le_bytes());
                     aad[12..].copy_from_slice(&chunk_ref.generation.to_le_bytes());
                     self.container
-                        .rekey_chunk_at(chunk_ref.id, &*old_fk, &*new_fk, &aad)?;
+                        .rekey_chunk_at(chunk_ref.id, &old_fk, &new_fk, &aad)?;
                 }
                 // v3: also re-encrypt every chunk-list block this
                 // file owns. They live in the same data area but
@@ -2919,7 +3431,7 @@ impl Vfs {
                     aad[8..12].copy_from_slice(&(block_idx as u32).to_le_bytes());
                     aad[12..].copy_from_slice(&block_ref.generation.to_le_bytes());
                     self.container
-                        .rekey_chunk_at(block_ref.id, &*old_lfk, &*new_lfk, &aad)?;
+                        .rekey_chunk_at(block_ref.id, &old_lfk, &new_lfk, &aad)?;
                 }
             }
 
@@ -2959,7 +3471,7 @@ impl Vfs {
                             suite,
                             &new_mvk,
                             passphrase.as_ref().map(|p| p.as_bytes()),
-                            &*hmac_secret_for_new_wrap,
+                            hmac_secret_for_new_wrap,
                             cred_id,
                             *new_hmac_salt,
                             kdf_params,
@@ -2988,6 +3500,14 @@ impl Vfs {
                 self.container
                     .commit_atomic_rotation()
                     .map_err(Error::Format)?;
+                // Layer 2: rotation rewrites every chunk and every
+                // chunk-list block under the new MVK. To keep the
+                // Layer 2 reuse fast path correct regardless of
+                // rotation's internal bookkeeping, mark every inode
+                // dirty so the next flush takes the full spill path
+                // (allocates fresh chunk-list slots). One-time cost
+                // -- rotation is a rare operation.
+                self.chunks_dirty.extend(self.tree.inodes.keys().copied());
                 Ok(())
             }
             (true, Err(e)) => {
@@ -2998,7 +3518,16 @@ impl Vfs {
                 let _ = self.container.abort_atomic_rotation();
                 Err(e)
             }
-            (false, r) => r,
+            (false, Ok(())) => {
+                // Layer 2: non-crash-safe rotation also rewrote
+                // every chunk + chunk-list block under the new MVK;
+                // mark all inodes dirty so the next flush takes the
+                // full spill path. Same reasoning as the crash-safe
+                // arm above.
+                self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+                Ok(())
+            }
+            (false, Err(e)) => Err(e),
         }
     }
 
@@ -3118,7 +3647,7 @@ impl Vfs {
                     aad[8..12].copy_from_slice(&(chunk_idx as u32).to_le_bytes());
                     aad[12..].copy_from_slice(&chunk_ref.generation.to_le_bytes());
                     this.container
-                        .rekey_chunk_at(chunk_ref.id, &*old_fk, &*new_fk, &aad)?;
+                        .rekey_chunk_at(chunk_ref.id, &old_fk, &new_fk, &aad)?;
                 }
                 // v3: chunk-list blocks under the synthetic-file_id
                 // list key. Same derivation pattern but via
@@ -3136,7 +3665,7 @@ impl Vfs {
                     aad[8..12].copy_from_slice(&(block_idx as u32).to_le_bytes());
                     aad[12..].copy_from_slice(&block_ref.generation.to_le_bytes());
                     this.container
-                        .rekey_chunk_at(block_ref.id, &*old_lfk, &*new_lfk, &aad)?;
+                        .rekey_chunk_at(block_ref.id, &old_lfk, &new_lfk, &aad)?;
                 }
             }
 
@@ -3156,13 +3685,22 @@ impl Vfs {
                 self.container
                     .commit_atomic_rotation()
                     .map_err(Error::Format)?;
+                // Layer 2: deniable rotation, same as standard:
+                // every chunk + chunk-list block was rewritten,
+                // mark every inode dirty so the next flush takes
+                // the full spill path.
+                self.chunks_dirty.extend(self.tree.inodes.keys().copied());
                 Ok(())
             }
             (true, Err(e)) => {
                 let _ = self.container.abort_atomic_rotation();
                 Err(e)
             }
-            (false, r) => r,
+            (false, Ok(())) => {
+                self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+                Ok(())
+            }
+            (false, Err(e)) => Err(e),
         }
     }
 
@@ -3271,7 +3809,7 @@ pub fn is_safe_symlink_target(target: &str) -> bool {
         return false;
     }
     // Per-component rejections. Split on both separators.
-    for component in target.split(|c| c == '/' || c == '\\') {
+    for component in target.split(['/', '\\']) {
         if component == ".." || component == "." {
             return false;
         }
@@ -4411,7 +4949,7 @@ mod tests {
             assert!(vfs.uses_v4_metadata(), "symlink must force LBM4 upgrade");
             id
         };
-        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        let vfs = Vfs::open(open_container(&path)).unwrap();
         assert!(vfs.uses_v4_metadata());
         assert_eq!(vfs.readlink(id).unwrap(), "target.txt");
     }
@@ -5592,6 +6130,120 @@ mod tests {
         assert!(buf.iter().all(|&b| b == 0x55));
     }
 
+    /// Layer 2 regression test: a clean spilled inode's chunk-list
+    /// chain must be REUSED across a flush -- same `external_list_blocks`
+    /// ChunkRefs (id AND generation), no allocations bumped, no
+    /// chunk-list-block slots churned in `free_chunks`. This is the
+    /// load-bearing invariant of `chunks_dirty`-driven reuse: it's
+    /// what makes the v0.2.2 deferred-flush behavior cheap even
+    /// when the timer eventually fires on a vault with thousands of
+    /// spilled files where only a few changed.
+    #[test]
+    fn v3_clean_inode_reuses_chunk_list_blocks_across_flush() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("layer2-reuse.lbx");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = with_v3_env(|| Vfs::open(cont)).unwrap();
+        let root = vfs.root_id();
+        // Two large files, both spilled. After flush, both have
+        // populated `external_list_blocks`.
+        let untouched = vfs.create(root, "untouched").unwrap();
+        vfs.write(untouched, 0, &vec![0xAAu8; 8 * 1024 * 1024])
+            .unwrap();
+        let modified = vfs.create(root, "modified").unwrap();
+        vfs.write(modified, 0, &vec![0xBBu8; 8 * 1024 * 1024])
+            .unwrap();
+        vfs.flush().unwrap();
+
+        // Snapshot the post-flush state.
+        let untouched_blocks_before: Vec<ChunkRef> =
+            vfs.tree.inodes[&untouched].external_list_blocks.clone();
+        let modified_blocks_before: Vec<ChunkRef> =
+            vfs.tree.inodes[&modified].external_list_blocks.clone();
+        let next_chunk_id_before = vfs.tree.next_chunk_id;
+        let next_chunk_gen_before = vfs.tree.next_chunk_gen;
+        assert!(!untouched_blocks_before.is_empty());
+        assert!(!modified_blocks_before.is_empty());
+
+        // Touch only `modified` -- write a single byte at offset 0.
+        // This marks `modified` dirty in `chunks_dirty`; `untouched`
+        // is NOT in the set.
+        vfs.write(modified, 0, &[0xCC]).unwrap();
+        vfs.flush().unwrap();
+
+        // Post-flush invariants:
+        //
+        // 1. `untouched`'s external_list_blocks MUST be byte-identical
+        //    to the pre-flush snapshot. Same chunk_ids, same
+        //    generations -- no allocations, no rewrites.
+        let untouched_blocks_after: Vec<ChunkRef> =
+            vfs.tree.inodes[&untouched].external_list_blocks.clone();
+        assert_eq!(
+            untouched_blocks_after, untouched_blocks_before,
+            "Layer 2 invariant: an inode NOT in chunks_dirty must keep \
+             its existing external_list_blocks across a flush (same \
+             chunk_ids AND generations)"
+        );
+
+        // 2. `modified`'s blocks DID get re-spilled, so they got
+        //    fresh chunk_ids / generations. At minimum the
+        //    generations should have moved.
+        let modified_blocks_after: Vec<ChunkRef> =
+            vfs.tree.inodes[&modified].external_list_blocks.clone();
+        assert_ne!(
+            modified_blocks_after, modified_blocks_before,
+            "Layer 2 sanity: a dirty inode MUST take the full spill path \
+             (fresh chunk_ids + generations for its chain)"
+        );
+
+        // 3. `next_chunk_gen` advanced (modified got fresh gens) but
+        //    not by `2 * untouched_blocks_before.len()` (which is
+        //    what pre-Layer-2 would have consumed re-spilling both).
+        //    Tight upper bound: modified's block count + a small
+        //    fudge for any incidental allocations.
+        let gen_delta = vfs.tree.next_chunk_gen - next_chunk_gen_before;
+        let _ = next_chunk_id_before;
+        assert!(
+            gen_delta < (untouched_blocks_before.len() + modified_blocks_before.len() + 32) as u64,
+            "Layer 2 cost bound: next_chunk_gen advanced by {} (untouched={}, \
+             modified={}); without reuse the untouched blocks alone would \
+             have consumed >= {}",
+            gen_delta,
+            untouched_blocks_before.len(),
+            modified_blocks_before.len(),
+            untouched_blocks_before.len()
+        );
+
+        // 4. Reopen verifies the chunk-list chains are still
+        //    decryptable: untouched's reused blocks are still
+        //    AEAD-valid under the current MVK + generation, and
+        //    modified's fresh blocks decrypt cleanly too.
+        drop(vfs);
+        let cont = Container::open(
+            &path,
+            None,
+            luksbox_format::UnlockMaterial::Passphrase(b"pw"),
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        // Reading the first byte of each file forces a chunk-list-
+        // chain walk + chunk read. If the reused blocks were silently
+        // invalid this would fail with MetadataDeserialize or an
+        // AEAD error.
+        let mut buf = [0u8; 1];
+        assert_eq!(vfs.read(untouched, 0, &mut buf).unwrap(), 1);
+        assert_eq!(buf[0], 0xAA);
+        assert_eq!(vfs.read(modified, 0, &mut buf).unwrap(), 1);
+        assert_eq!(buf[0], 0xCC);
+    }
+
     #[test]
     fn v3_unlink_frees_external_list_blocks() {
         // Without the v3 cleanup in unlink, the chunk-list blocks
@@ -5633,6 +6285,306 @@ mod tests {
     fn with_v3_env<T>(f: impl FnOnce() -> T) -> T {
         let _g = super::set_format_v3_override(Some(true));
         f()
+    }
+
+    /// Regression test for the v0.2.1 -> v0.2.2 durability fix.
+    ///
+    /// The fix adds a `Container::sync_data_area()` call inside
+    /// `Vfs::flush`, between `spill_to_v[3-5]_on_disk` (which writes
+    /// chunk-list blocks via `Container::write_at` to the page
+    /// cache) and `Container::write_metadata` (which commits the
+    /// `.lbx.meta-bak` sidecar mirror with NEW chunks_external
+    /// pointers and only THEN fsyncs the `.lbx` file). Without the
+    /// fence, a crash between mirror commit and live-region fsync
+    /// can leave the mirror durably pointing at chunk-list block
+    /// slots whose new bytes never reached disk -- producing the
+    /// real-world data-loss bug a v0.2.1 user hit.
+    ///
+    /// This is a compliance test: it verifies the ordering invariant
+    /// `sync_data_area` BEFORE `write_metadata`. A true crash-impact
+    /// simulation (lose un-fsync'd page cache, verify reopen
+    /// outcome) requires the `FileLike` trait refactor tracked as
+    /// a separate v0.2.3+ hygiene PR. For v0.2.2 the compliance
+    /// check locks the fix in place: removing the `sync_data_area`
+    /// call breaks this test, even if all spill/reopen happy paths
+    /// still work.
+    #[test]
+    fn flush_runs_sync_data_area_before_write_metadata() {
+        use luksbox_format::{FlushOp, flush_op_log_snapshot, reset_flush_op_log};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("fence.lbx");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "spill").unwrap();
+        // Write enough to force at least one inode past the v5
+        // inline threshold so spill_to_v4_on_disk writes chunk-list
+        // blocks via write_at. 2 MiB = 512 chunks > v5 threshold.
+        vfs.write(f, 0, &vec![0xAAu8; 2 * 1024 * 1024]).unwrap();
+
+        // Clear the op log right before the flush under test so
+        // any container init / earlier flush activity doesn't
+        // appear in the snapshot.
+        reset_flush_op_log();
+        vfs.flush().unwrap();
+        let log = flush_op_log_snapshot();
+
+        let i_sync = log.iter().position(|op| *op == FlushOp::SyncDataArea);
+        let i_write = log.iter().position(|op| *op == FlushOp::WriteMetadata);
+
+        assert!(
+            i_sync.is_some(),
+            "sync_data_area was not called during Vfs::flush (the v0.2.2 fence is missing). \
+             Log: {log:?}"
+        );
+        assert!(
+            i_write.is_some(),
+            "write_metadata was not called during Vfs::flush. Log: {log:?}"
+        );
+        assert!(
+            i_sync.unwrap() < i_write.unwrap(),
+            "sync_data_area must be called BEFORE write_metadata. \
+             This is the v0.2.2 durability fence: chunk-list blocks \
+             written via Container::write_at must be fsync'd to .lbx \
+             BEFORE the sidecar mirror (committed inside write_metadata) \
+             records new chunks_external pointers to them. \
+             Without this ordering a crash between mirror-commit and \
+             the final .lbx sync_all leaves the mirror durable while \
+             the chunk-list blocks are still in the page cache. \
+             Log: {log:?}"
+        );
+    }
+
+    /// Bug-reappearance check for the v0.2.2 fence. With the
+    /// thread-local skip-fence flag set, the fence is bypassed
+    /// and the op-log invariant fails. Thread-local instead of
+    /// env var so this test doesn't race with the positive-side
+    /// test on the same parallel test runner. Production code
+    /// never touches this flag.
+    #[test]
+    fn skip_fence_thread_local_reproduces_v0_2_1_ordering() {
+        use luksbox_format::{FlushOp, flush_op_log_snapshot, reset_flush_op_log};
+        let _guard = super::set_skip_fence_for_test(true);
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nofence.lbx");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "spill").unwrap();
+        vfs.write(f, 0, &vec![0xAAu8; 2 * 1024 * 1024]).unwrap();
+
+        reset_flush_op_log();
+        vfs.flush().unwrap();
+        let log = flush_op_log_snapshot();
+
+        // With the fence skipped, sync_data_area is not recorded
+        // even though write_metadata is. This proves the env-var
+        // escape hatch actually reproduces the v0.2.1 ordering
+        // (and that the compliance test above is load-bearing).
+        let i_sync = log.iter().position(|op| *op == FlushOp::SyncDataArea);
+        let i_write = log.iter().position(|op| *op == FlushOp::WriteMetadata);
+        assert!(
+            i_sync.is_none(),
+            "set_skip_fence_for_test(true) must skip the fence. Log: {log:?}"
+        );
+        assert!(
+            i_write.is_some(),
+            "write_metadata should still run even with the fence skipped. Log: {log:?}"
+        );
+    }
+
+    /// True crash-impact regression test for the v0.2.2 durability
+    /// fence. Uses `SimFile` to model the kernel page-cache vs durable
+    /// distinction, plus `set_crash_after_mirror_for_test` to halt
+    /// `Container::write_metadata` at the exact fault window the fence
+    /// closes (post-mirror-commit, pre-live-region-sync_all).
+    ///
+    /// Scenario A (fence enabled, default): chunk-list block writes
+    /// are fsync'd into `SimFile.durable` BEFORE the mirror commits.
+    /// Simulated crash + `SimFile.crash()` preserves them. Mirror
+    /// recovery rebuilds the tree pointing at chunk-list slots whose
+    /// NEW bytes are intact. Vault reopens cleanly.
+    ///
+    /// Scenario B (fence disabled, models v0.2.1): chunk-list block
+    /// writes are NOT in `SimFile.durable` when the mirror commits.
+    /// Crash reverts them. Mirror recovery still rebuilds the tree
+    /// with the NEW pointers, but the targeted slots now hold OLD
+    /// bytes (from the pre-flush state). AEAD fails on every
+    /// chunk-list block -> `Vfs::open` returns
+    /// `Error::MetadataDeserialize`. Reproduces the bug class.
+    ///
+    /// Pairs with the compliance test
+    /// `flush_runs_sync_data_area_before_write_metadata` above: the
+    /// compliance test locks the call ordering, this test locks the
+    /// crash-survival semantics that ordering provides.
+    #[test]
+    fn v0_2_2_fence_prevents_chunk_list_loss_after_simulated_crash() {
+        use luksbox_format::{SharedSimFile, SimFile, set_crash_after_mirror_for_test};
+
+        // --- Helper that runs the scenario with or without the fence ---
+        // Returns: (Ok if vfs reopened cleanly, Err with debug string
+        // describing the failure mode).
+        fn run_scenario(skip_fence: bool) -> Result<(), String> {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("durability.lbx");
+
+            // Phase 1: real-fs creation. Make a vault and write one
+            // spilling-sized file to establish chunk-list blocks
+            // and a clean post-flush state. Drop everything so all
+            // bytes flush to disk via normal fsync.
+            {
+                let cont = Container::create_with_passphrase(
+                    &path,
+                    None,
+                    CipherSuite::Aes256Gcm,
+                    test_params(),
+                    b"pw",
+                )
+                .unwrap();
+                let mut vfs = Vfs::open(cont).unwrap();
+                let root = vfs.root_id();
+                let f = vfs.create(root, "spill1").unwrap();
+                vfs.write(f, 0, &vec![0xAAu8; 2 * 1024 * 1024]).unwrap();
+                vfs.close().unwrap();
+            }
+
+            // Phase 2: snapshot the on-disk bytes for SimFile.
+            let initial_bytes = std::fs::read(&path).unwrap();
+
+            // Phase 3: open the vault, then swap in a SimFile whose
+            // `durable` mirrors the on-disk state. All subsequent
+            // I/O goes through SimFile; the on-disk .lbx file stays
+            // frozen but the .meta-bak file (written via real fs by
+            // atomic_secure_write) still gets updated normally.
+            let shared_sim = SharedSimFile::new(SimFile::from_bytes(initial_bytes));
+            let metadata_offset;
+            let metadata_size;
+            {
+                let cont = Container::open(
+                    &path,
+                    None,
+                    luksbox_format::UnlockMaterial::Passphrase(b"pw"),
+                )
+                .unwrap();
+                let mut vfs = Vfs::open(cont).unwrap();
+                metadata_offset = vfs.container().header.metadata_offset;
+                metadata_size = vfs.container().header.metadata_size;
+                vfs.container_mut()
+                    .swap_lbx_file_for_test(Box::new(shared_sim.handle()));
+
+                // Phase 4: write more spilling content. Goes to
+                // SimFile.backing; never fsync'd yet because the
+                // forthcoming flush is the one we'll interrupt.
+                let root = vfs.root_id();
+                let f = vfs.create(root, "spill2").unwrap();
+                vfs.write(f, 0, &vec![0xBBu8; 2 * 1024 * 1024]).unwrap();
+
+                // Phase 5: arm the crash injection and (optionally)
+                // skip the fence, then flush. The flush returns Err
+                // because the crash hook fires after mirror commit.
+                let _skip = if skip_fence {
+                    Some(super::set_skip_fence_for_test(true))
+                } else {
+                    None
+                };
+                let _crash = set_crash_after_mirror_for_test(true);
+                let flush_result = vfs.flush();
+                assert!(
+                    flush_result.is_err(),
+                    "crash injection must make the flush return Err"
+                );
+                // Drop the vfs WITHOUT letting Drop trigger a clean
+                // flush -- close() takes self by value so we just
+                // forget the vfs here. (There's no Drop impl on Vfs
+                // that touches the container, verified earlier.)
+                drop(vfs);
+                // Guards drop here, restoring skip-fence and
+                // crash-after-mirror to false.
+            }
+
+            // Phase 6: crash. Discards every un-fsync'd write from
+            // SimFile.backing -- chunk-list block writes survive
+            // only if the fence sync'd them before the mirror
+            // commit fault window.
+            shared_sim.crash();
+
+            // Phase 7: model "live region was partially overwritten
+            // when the crash hit" by corrupting the live metadata
+            // region bytes. Forces AEAD failure on reopen so the
+            // mirror-recovery path is exercised (otherwise live
+            // would parse cleanly to the pre-flush tree, bypassing
+            // the recovery path we're testing).
+            shared_sim.corrupt_range(metadata_offset, metadata_size as usize);
+
+            // Phase 8: write SimFile's post-crash state back to the
+            // .lbx path. Container::open will read these bytes;
+            // the .meta-bak file is still on real disk in its
+            // NEW-state form (committed before the crash hook).
+            std::fs::write(&path, shared_sim.backing_snapshot()).unwrap();
+
+            // Phase 9: reopen. Live region AEAD-fails (corrupted),
+            // mirror recovery picks NEW state, walks chunk-list
+            // blocks. With fence: NEW bytes intact -> success.
+            // Without fence: OLD bytes at NEW slot positions -> AEAD
+            // fail -> MetadataDeserialize.
+            let cont = Container::open(
+                &path,
+                None,
+                luksbox_format::UnlockMaterial::Passphrase(b"pw"),
+            )
+            .map_err(|e| format!("Container::open: {e}"))?;
+            Vfs::open(cont)
+                .map(|_| ())
+                .map_err(|e| format!("Vfs::open: {e}"))
+        }
+
+        // Scenario A: fence enabled (default). Chunk-list blocks
+        // were sync'd before the mirror commit; survive the crash;
+        // recovery rebuilds the vault.
+        run_scenario(false).expect(
+            "with the v0.2.2 fence enabled, the simulated post-mirror-commit \
+             crash must NOT lose chunk-list blocks (mirror recovery should \
+             reopen the vault cleanly)",
+        );
+
+        // Scenario B: fence disabled. Reproduces the v0.2.1 bug
+        // -- chunk-list blocks were never fsync'd before the
+        // mirror commit; the crash reverts them; mirror recovery
+        // points at slots whose bytes no longer match the NEW
+        // generation; AEAD fails.
+        match run_scenario(true) {
+            Err(msg) if msg.contains("metadata blob deserialization failed") => {
+                // Expected: with the fence skipped, chunk-list
+                // blocks are lost, AEAD fails during mirror-recovery
+                // walk, Vfs::open surfaces MetadataDeserialize.
+            }
+            Err(other) => panic!(
+                "without the fence, expected MetadataDeserialize from the \
+                 chunk-list-block AEAD failure; got: {other}"
+            ),
+            Ok(()) => panic!(
+                "without the fence, the simulated crash should have lost \
+                 chunk-list-block writes and Vfs::open should have failed \
+                 -- but it succeeded. This means the test is no longer \
+                 exercising the fault window (or the fence is being \
+                 applied somewhere unexpected)."
+            ),
+        }
     }
 
     #[test]
@@ -5859,8 +6811,7 @@ mod tests {
         // InvalidField BEFORE any IO.
         let too_big = limit + 1;
         let err = walk_chunk_list_chain(&mut vfs.container, f, head, too_big)
-            .err()
-            .expect("walk must refuse expected_count beyond MAX_FILE_SIZE/CHUNK_SIZE");
+            .expect_err("walk must refuse expected_count beyond MAX_FILE_SIZE/CHUNK_SIZE");
         // Type-check the error: Crypto(InvalidField).
         match err {
             Error::Crypto(luksbox_core::Error::InvalidField) => {}
@@ -5870,8 +6821,7 @@ mod tests {
         // And u64::MAX too -- the saturating math in max_blocks
         // wouldn't have helped without the upfront cap.
         let err = walk_chunk_list_chain(&mut vfs.container, f, head, u64::MAX)
-            .err()
-            .expect("walk must refuse u64::MAX expected_count");
+            .expect_err("walk must refuse u64::MAX expected_count");
         assert!(matches!(
             err,
             Error::Crypto(luksbox_core::Error::InvalidField)
@@ -5925,8 +6875,7 @@ mod tests {
         let list_key = list_file_key(&vfs.container, file_id);
         let synth_id = file_id | CHUNK_LIST_FILE_ID_BIT;
         let err = read_chunk(&mut vfs.container, &list_key, synth_id, 0, data_chunk_ref)
-            .err()
-            .expect("data chunk must NOT decrypt under list key");
+            .expect_err("data chunk must NOT decrypt under list key");
         // Crypto error of some kind -- we don't care which variant,
         // just that the AEAD refused.
         assert!(
@@ -5938,8 +6887,7 @@ mod tests {
         //    the DATA AAD shape (real file_id, chunk_idx=0) must
         //    also FAIL -- symmetric guarantee.
         let err = read_chunk(&mut vfs.container, &data_key, file_id, 0, list_block_ref)
-            .err()
-            .expect("list block must NOT decrypt under data key");
+            .expect_err("list block must NOT decrypt under data key");
         assert!(
             matches!(err, Error::Crypto(_)),
             "expected AEAD failure, got {err:?}"

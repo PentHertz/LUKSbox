@@ -18,7 +18,32 @@ use crate::unix_statvfs::host_fs_statvfs;
 
 const TTL: Duration = Duration::from_secs(1);
 
-pub fn mount(vfs: Vfs, mountpoint: &Path, daemonize: bool) -> std::io::Result<()> {
+use crate::LAZY_FLUSH_INTERVAL_SECS;
+
+/// Layer 1 deferred-flush policy:
+///
+/// FUSE filesystem ops that mutate metadata (create, mkdir, unlink,
+/// rmdir, rename, setattr, symlink, link, and the FUSE flush/release
+/// callbacks) no longer drive a synchronous `Vfs::flush` per call.
+/// Each op returns as soon as the in-memory tree is updated; a
+/// background `luksbox-flush-timer` thread runs `Vfs::flush()` every
+/// `LAZY_FLUSH_INTERVAL_SECS` seconds (no-op when the tree is clean).
+/// Explicit `fsync(2)` / `fsyncdir(2)` syscalls still flush eagerly
+/// (POSIX-required); unmount drives a final flush in `destroy()`.
+///
+/// This matches the durability model of native Linux filesystems
+/// (ext4, btrfs, xfs all defer with their own commit intervals) and
+/// is a precondition for usable performance on vaults with thousands
+/// of files (the pre-Layer-1 eager flush rewrote the 64 MiB metadata
+/// mirror + live region on every `rm`, so a single `rm` could take
+/// minutes on a 10k-file vault).
+///
+/// Users who want pre-Layer-1 eager-flush semantics back pass `--sync`
+/// to `luksbox mount`. The interval constant lives in the crate root
+/// (`crate::LAZY_FLUSH_INTERVAL_SECS`) and is shared with the FUSE-T
+/// and WinFsp adapters which implement the same pattern.
+
+pub fn mount(vfs: Vfs, mountpoint: &Path, daemonize: bool, sync_mode: bool) -> std::io::Result<()> {
     // AutoUnmount intentionally NOT used: on Linux it implies allow_other,
     // which kernel rejects for non-root unless /etc/fuse.conf has
     // user_allow_other. Users unmount via `luksbox umount` /
@@ -46,7 +71,7 @@ pub fn mount(vfs: Vfs, mountpoint: &Path, daemonize: bool) -> std::io::Result<()
         ));
     }
 
-    let fs = LuksboxFs::new(vfs);
+    let fs = LuksboxFs::new(vfs, sync_mode);
 
     if daemonize {
         run_daemonized(fs, mountpoint, config)
@@ -343,9 +368,10 @@ pub fn unmount(mountpoint: &Path) -> std::io::Result<()> {
 /// in 0.16). Wrap the Vfs in a Mutex for interior mutability, fuser
 /// runs the session loop on a single thread by default
 /// (`Config::n_threads = None` -> 1), so contention on the mutex is
-/// trivial.
+/// trivial. Wrapped in `Arc` so the deferred-flush timer thread can
+/// hold its own handle.
 struct LuksboxFs {
-    vfs: Mutex<Vfs>,
+    vfs: std::sync::Arc<Mutex<Vfs>>,
     uid: u32,
     gid: u32,
     /// Directory containing the .lbx vault file, cached at construction
@@ -354,10 +380,21 @@ struct LuksboxFs {
     /// if the vault path has no parent (root-level path, never the case
     /// in practice). Used exclusively by `statfs`.
     vault_parent: Option<PathBuf>,
+    /// When true, every metadata-changing op drives an immediate
+    /// `vfs.flush()` (pre-Layer-1 behavior). Set via `luksbox mount
+    /// --sync` for paranoid users who want every operation durable
+    /// before it returns. Default is `false` -- ops mark the Vfs
+    /// dirty and return; the timer thread below catches up.
+    sync_mode: bool,
+    /// Wakes / shuts down the deferred-flush timer thread. Dropping
+    /// the sender (or sending on it) signals the timer to exit; the
+    /// timer also exits when its `recv_timeout` returns Disconnected.
+    /// `None` when `sync_mode == true` (timer not spawned).
+    timer_stop_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
 impl LuksboxFs {
-    fn new(vfs: Vfs) -> Self {
+    fn new(vfs: Vfs, sync_mode: bool) -> Self {
         // SAFETY: getuid/getgid are signal-safe and always succeed.
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
@@ -366,11 +403,56 @@ impl LuksboxFs {
             .vault_path()
             .parent()
             .map(|p| p.to_path_buf());
+        let vfs = std::sync::Arc::new(Mutex::new(vfs));
+        let timer_stop_tx = if sync_mode {
+            None
+        } else {
+            // Background flush timer. Wakes every
+            // LAZY_FLUSH_INTERVAL_SECS, briefly takes the Vfs lock,
+            // calls `vfs.flush()` (a no-op when the tree is clean).
+            // recv_timeout returns Disconnected once the FS is
+            // dropped (Sender goes out of scope) OR when destroy()
+            // sends a stop signal -- either way the thread exits.
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let timer_vfs = std::sync::Arc::clone(&vfs);
+            let _ = std::thread::Builder::new()
+                .name("luksbox-flush-timer".to_string())
+                .spawn(move || {
+                    loop {
+                        match rx.recv_timeout(Duration::from_secs(LAZY_FLUSH_INTERVAL_SECS)) {
+                            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                                break;
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if let Ok(mut v) = timer_vfs.lock() {
+                                    let _ = v.flush();
+                                }
+                            }
+                        }
+                    }
+                });
+            Some(tx)
+        };
         Self {
-            vfs: Mutex::new(vfs),
+            vfs,
             uid,
             gid,
             vault_parent,
+            sync_mode,
+            timer_stop_tx: Mutex::new(timer_stop_tx),
+        }
+    }
+
+    /// Called from every metadata-mutating FUSE handler in lieu of
+    /// the pre-Layer-1 unconditional `vfs.flush()`. With the default
+    /// `sync_mode == false`, this is a no-op -- the in-memory tree
+    /// stays dirty and the timer thread above catches up within
+    /// `LAZY_FLUSH_INTERVAL_SECS`. With `--sync` mount option (set
+    /// via `luksbox mount --sync`), every mutation drives an
+    /// immediate flush, restoring pre-Layer-1 durability semantics.
+    fn maybe_flush_now(&self, vfs: &mut Vfs) {
+        if self.sync_mode {
+            let _ = vfs.flush();
         }
     }
 
@@ -399,7 +481,7 @@ impl LuksboxFs {
         // created on LBM4 vaults).
         let nlink = match stat.kind {
             InodeKind::Directory => 2,
-            InodeKind::File => stat.link_count.max(1) as u32,
+            InodeKind::File => stat.link_count.max(1),
             InodeKind::Symlink => 1,
         };
         Some(FileAttr {
@@ -508,11 +590,11 @@ impl Filesystem for LuksboxFs {
                 return;
             }
         };
-        if let Some(new_size) = size {
-            if let Err(e) = vfs.truncate(ino, new_size) {
-                reply.error(errno(&e));
-                return;
-            }
+        if let Some(new_size) = size
+            && let Err(e) = vfs.truncate(ino, new_size)
+        {
+            reply.error(errno(&e));
+            return;
         }
         if let Some(new_mode) = mode {
             // Persistent chmod, LBM4-only. On a pre-LBM4 vault this
@@ -524,7 +606,7 @@ impl Filesystem for LuksboxFs {
             }
         }
         if size.is_some() || mode.is_some() {
-            let _ = vfs.flush();
+            self.maybe_flush_now(&mut vfs);
         }
         // attr() takes its own lock so drop ours first.
         drop(vfs);
@@ -684,7 +766,7 @@ impl Filesystem for LuksboxFs {
             };
             match vfs.create_with_mode(parent.0, name, effective_mode) {
                 Ok(id) => {
-                    let _ = vfs.flush();
+                    self.maybe_flush_now(&mut vfs);
                     id
                 }
                 Err(e) => {
@@ -728,10 +810,14 @@ impl Filesystem for LuksboxFs {
             };
             match vfs.mkdir(parent.0, name) {
                 Ok(id) => {
-                    // Flush immediately: empty dirs create no file, so
-                    // no later release() callback would persist this
-                    // metadata change.
-                    let _ = vfs.flush();
+                    // Pre-Layer-1 forced an immediate flush here
+                    // because mkdir creates no file, so no later
+                    // release() callback would persist the change.
+                    // With Layer 1, the deferred-flush timer handles
+                    // that case within LAZY_FLUSH_INTERVAL_SECS, and
+                    // the final unmount flush in destroy() catches
+                    // anything still in flight.
+                    self.maybe_flush_now(&mut vfs);
                     id
                 }
                 Err(e) => {
@@ -753,7 +839,7 @@ impl Filesystem for LuksboxFs {
         };
         let r = match self.vfs.lock() {
             Ok(mut v) => v.unlink(parent.0, name).map(|_| {
-                let _ = v.flush();
+                self.maybe_flush_now(&mut v);
             }),
             Err(_) => {
                 reply.error(Errno::EIO);
@@ -773,7 +859,7 @@ impl Filesystem for LuksboxFs {
         };
         let r = match self.vfs.lock() {
             Ok(mut v) => v.rmdir(parent.0, name).map(|_| {
-                let _ = v.flush();
+                self.maybe_flush_now(&mut v);
             }),
             Err(_) => {
                 reply.error(Errno::EIO);
@@ -844,7 +930,7 @@ impl Filesystem for LuksboxFs {
                     return;
                 }
                 v.rename(parent.0, name, newparent.0, newname).map(|_| {
-                    let _ = v.flush();
+                    self.maybe_flush_now(&mut v);
                 })
             }
             Err(_) => {
@@ -866,9 +952,14 @@ impl Filesystem for LuksboxFs {
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        match self.vfs.lock().ok().and_then(|mut v| v.flush().ok()) {
-            Some(()) => reply.ok(),
-            None => reply.error(Errno::EIO),
+        // FUSE flush() is called on every close(2). POSIX does NOT
+        // require close() to be durable -- that's fsync()'s job.
+        // Deferred under Layer 1; eager only in --sync mode.
+        if let Ok(mut v) = self.vfs.lock() {
+            self.maybe_flush_now(&mut v);
+            reply.ok();
+        } else {
+            reply.error(Errno::EIO);
         }
     }
 
@@ -880,6 +971,8 @@ impl Filesystem for LuksboxFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        // fsync(2): user explicitly asked for durability. ALWAYS
+        // flushes regardless of Layer 1 / --sync setting.
         match self.vfs.lock().ok().and_then(|mut v| v.flush().ok()) {
             Some(()) => reply.ok(),
             None => reply.error(Errno::EIO),
@@ -894,6 +987,8 @@ impl Filesystem for LuksboxFs {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
+        // fsync(2) on a directory: same eager-flush semantics as
+        // fsync above.
         match self.vfs.lock().ok().and_then(|mut v| v.flush().ok()) {
             Some(()) => reply.ok(),
             None => reply.error(Errno::EIO),
@@ -910,8 +1005,11 @@ impl Filesystem for LuksboxFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        // Final close of an fd. Same POSIX rule as flush() above:
+        // close() is not required to be durable. Deferred under
+        // Layer 1.
         if let Ok(mut v) = self.vfs.lock() {
-            let _ = v.flush();
+            self.maybe_flush_now(&mut v);
         }
         reply.ok();
     }
@@ -928,6 +1026,21 @@ impl Filesystem for LuksboxFs {
     }
 
     fn destroy(&mut self) {
+        // Signal the deferred-flush timer thread to exit. Dropping
+        // the Sender is enough -- the timer's recv_timeout returns
+        // Disconnected on the next iteration. Doing it explicitly
+        // here means the thread exits within milliseconds of
+        // unmount, not after up to LAZY_FLUSH_INTERVAL_SECS more
+        // sleeping. Same Mutex<Option<_>>::take() pattern as
+        // pending modal teardown elsewhere.
+        if let Ok(mut tx) = self.timer_stop_tx.lock()
+            && let Some(tx) = tx.take()
+        {
+            drop(tx);
+        }
+        // Final flush before the FS handle dies. Catches any
+        // deferred metadata changes since the last timer tick AND
+        // (in --sync mode) is a defensive no-op.
         if let Ok(mut v) = self.vfs.lock() {
             let _ = v.flush();
         }
@@ -1004,7 +1117,7 @@ impl Filesystem for LuksboxFs {
         let id = match self.vfs.lock() {
             Ok(mut v) => match v.symlink(parent.0, link_name, target_str) {
                 Ok(id) => {
-                    let _ = v.flush();
+                    self.maybe_flush_now(&mut v);
                     id
                 }
                 Err(e) => {
@@ -1073,7 +1186,7 @@ impl Filesystem for LuksboxFs {
         };
         let r = match self.vfs.lock() {
             Ok(mut v) => v.link(ino.0, newparent.0, newname).map(|_| {
-                let _ = v.flush();
+                self.maybe_flush_now(&mut v);
             }),
             Err(_) => {
                 reply.error(Errno::EIO);

@@ -6,6 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 description = "On-disk container format I/O for luksbox (.lbx files)"
 
+[features]
+# Internal: exposes the test-injection surface (FlushOp log,
+# `Container::swap_lbx_file_for_test`, `set_crash_after_mirror_for_test`,
+# SimFile / SharedSimFile). OFF by default so production / release
+# builds compile these out entirely. Enabled in this workspace by
+# luksbox-vfs's [dev-dependencies] line so the durability-fence
+# regression tests can drive them. Do not enable in any production
+# build profile.
+test-injection = []
+
 [dependencies]
 luksbox-core = { path = "../luksbox-core" }
 luksbox-pq = { path = "../luksbox-pq" }

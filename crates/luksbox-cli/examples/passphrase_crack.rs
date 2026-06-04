@@ -168,7 +168,7 @@ fn main() {
                     stop.store(true, Ordering::Relaxed);
                     return;
                 }
-                if n % report_every == 0 {
+                if n.is_multiple_of(report_every) {
                     let secs = started.elapsed().as_secs_f64();
                     let rate = n as f64 / secs;
                     eprintln!("[+] tried {n} ({rate:.2} g/s, elapsed {secs:.0}s)");

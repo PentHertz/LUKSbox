@@ -14,7 +14,280 @@ canonical record.
 
 ---
 
-## [Unreleased]
+## [v0.2.2] - 2026-06-02
+
+Critical durability fix on top of v0.2.1. **Closes a real-user
+data-loss class** where v0.2.1's mirror protocol could commit
+"intended new state" pointers to disk before the chunk-list blocks
+those pointers reference were durable, so a crash in a narrow
+post-mirror-fsync, pre-live-fsync window left a vault whose
+recovery target pointed at slots that still held pre-flush bytes.
+The reader's AEAD verification then failed on every such block.
+
+Existing v0.2.1 vaults open unchanged; the fix is entirely on the
+write path. **No on-disk format change** -- same LBM5 + LUKSBOX2 +
+sidecar mirror envelope. Vaults that already lost chunk-list
+blocks to this bug are NOT recovered by upgrading; this release
+only prevents future occurrences.
+
+### Performance
+
+- **Deferred metadata flush ("Layer 1") on all mount backends.**
+  Pre-v0.2.2, every metadata-changing FUSE op (create, mkdir,
+  unlink, rmdir, rename, setattr, symlink, link, FUSE flush/release)
+  drove an immediate synchronous `Vfs::flush`, which on v0.2.1+
+  vaults rewrote the entire 64 MiB metadata mirror and live region
+  plus re-spilled every inode's chunk-list chain. On a 10k-file
+  vault this could make a single `rm` of one small file take
+  **3+ minutes** (real-user report on Linux Mint). v0.2.2 changes
+  the default: those ops mark the in-memory tree dirty and return
+  immediately, and a background `luksbox-flush-timer` thread (one
+  per mount) drives a `Vfs::flush` every 30 seconds when dirty.
+  Explicit `fsync(2)` / `fsyncdir(2)` syscalls remain eagerly
+  synchronous (POSIX-required). Final flush on unmount via the
+  FUSE `destroy()` callback (and WinFsp's `Drop`) also stays eager.
+  The net effect on the user's bug-report scenario: `rm` returns
+  in milliseconds, `cp -r 10k_files` completes in seconds instead
+  of hours.
+
+  **Platform coverage:** Linux libfuse3, macOS macFUSE, macOS
+  FUSE-T, and Windows WinFsp all share the same lazy-flush
+  pattern. Earlier v0.2.2 drafts shipped Layer 1 for libfuse3 only;
+  the FUSE-T and WinFsp adapters now host their own
+  `luksbox-flush-timer` thread with identical 30 s cadence,
+  identical `--sync` opt-out, and identical final-flush guarantee.
+  The shared interval lives in `luksbox_mount::LAZY_FLUSH_INTERVAL_SECS`.
+
+  Durability model matches ext4 / btrfs / xfs commit intervals: a
+  crash without an explicit `fsync` can lose up to 30 seconds of
+  metadata changes. The on-disk encrypted bytes that ARE flushed
+  retain the v0.2.2 mirror-protocol durability fence (chunk-list
+  blocks are durable before the mirror commits), so the
+  post-flush state is still crash-consistent. Anti-rollback /
+  anchor sidecar semantics are unchanged: the anchor lags behind
+  the in-memory generation counter by up to the timer interval,
+  but catches up on every flush. Keyslot revocation is unaffected
+  (`revoke()` calls `persist_header` independently of `vfs.flush`).
+
+  **`luksbox mount --sync`** (also accepted on `deniable-mount`)
+  restores the pre-v0.2.2 eager-flush semantics for users whose
+  threat model requires every operation to be durable on return.
+  Workload cost is proportional to total file count; recommended
+  only for small vaults or specific durability-critical workflows.
+
+  **Wizard (TUI):** the open-and-mount and post-create mount flows
+  now prompt `"Eager flush? (every metadata op crash-durable on
+  return; SLOW on vaults with thousands of files -- default is
+  no)"`. Default is no (matches the CLI default).
+
+  **GUI:** the Browser view shows an `Eager flush (--sync)`
+  checkbox next to the `Mount as volume...` button, with a hover
+  tooltip explaining the trade-off. Default off; per-mount, not
+  persisted across vault sessions (the checkbox resets to off
+  after each mount).
+
+- **Per-inode dirty tracking in the spill code ("Layer 2").** Pre-
+  v0.2.2, `Vfs::flush` (whether eager or timer-driven) re-spilled
+  every inode that exceeded the inline-chunk threshold: free old
+  external_list_blocks, allocate fresh ChunkIDs + generations,
+  re-encrypt every chunk-list block, re-write the chain. For a
+  vault with N spilled files this was O(N) chunk-list-block
+  AEAD-writes per flush, regardless of how many inodes actually
+  changed. With Layer 1 batching the flushes, Layer 2 makes each
+  flush itself fast: a `chunks_dirty: BTreeSet<FileId>` is
+  populated by `write`, `truncate`, and `create_with_mode`, and
+  `spill_to_v3_on_disk` reuses the existing in-memory
+  `external_list_blocks` (and therefore the on-disk chunk-list
+  blocks) for any inode NOT in that set. Result: per-flush cost
+  is now O(K) where K = inodes touched since last flush, not
+  O(N) where N = total spilled files.
+
+  Cleared at the end of every successful `Vfs::flush`, alongside
+  the existing `dirty = false` flag. Re-populated with every
+  inode (`tree.inodes.keys().copied()`) on:
+   - format upgrades (V1->V5 and V2/V3->V4 triggered by the
+     `tree_needs_v4_format` check)
+   - MVK rotation (both standard and deniable variants)
+  -- these paths rewrite the chain regardless and want the full
+  spill semantics.
+
+  `chmod`, `rename`, `link`, `mkdir`, `symlink` do NOT mark
+  chunks_dirty: those touch the in-memory tree but leave the
+  chunk-list chain byte-identical on disk and don't change the
+  inline-vs-external decision.
+
+  Regression test: `v3_clean_inode_reuses_chunk_list_blocks_across_flush`
+  creates two spilled files, modifies only one, flushes, and
+  asserts the untouched file's `external_list_blocks` (chunk_ids
+  AND generations) are byte-identical to the pre-flush snapshot
+  while the touched file's blocks got fresh IDs / gens. Plus a
+  reopen sanity check that decrypts the first byte of each file
+  through both reused and freshly-spilled chains.
+
+  Scope: this change affects Linux libfuse3 mounts only for v0.2.2.
+  macOS FUSE-T (`fuse_t.rs`) and Windows WinFsp (`winfsp.rs`) retain
+  their pre-v0.2.2 flush behavior; their `mount()` entry points
+  accept the new `sync_mode` parameter for forward compat but
+  ignore it. macFUSE on macOS shares `fuse.rs` with Linux libfuse3
+  and gets the deferred-flush behavior automatically.
+
+### Fixed
+
+- **Durability hole in the v0.2.1 mirror protocol** (CVE-class
+  data-loss bug). `Vfs::flush`'s spill stage writes external
+  chunk-list blocks via `Container::write_at` (page cache only,
+  no fsync). It then called `Container::write_metadata`, which
+  fsyncs `.lbx.meta-bak` BEFORE overwriting the live metadata
+  region and fsyncing the `.lbx` file. A crash between the
+  mirror's fsync and the `.lbx` sync_all (power loss, OOM kill,
+  kernel panic, host hypervisor death) could leave:
+  - `.lbx.meta-bak`: durably committed to the NEW state with
+    fresh `chunks_external` head/generation tuples pointing at
+    chunk-list-block slots in the data area.
+  - `.lbx` chunk-list-block slots: still holding bytes from a
+    previous flush (the new writes had not yet reached disk).
+  On reopen, mirror recovery picks the NEW `chunks_external`
+  pointers as authoritative. The reader's AEAD then verifies
+  every targeted chunk-list block under the NEW generation in
+  AAD, but the bytes on disk were written under the OLD
+  generation. Result: `crypto: AEAD failure` for every
+  chunk-list block that hadn't been fsync'd before the crash,
+  cascading to `metadata blob deserialization failed` from the
+  VFS layer at open time. Symptom in the wild: a v0.2.1 user
+  lost 26 contiguous-in-generation chunk-list blocks in a single
+  flush after a crash, while data chunks and the metadata blob
+  itself were intact.
+
+  Fix: new `Container::sync_data_area()` method (one
+  `self.file.sync_all()`), called from `Vfs::flush` between the
+  spill stage and `write_metadata`. The mirror's "reader can
+  trust these pointers" invariant is now backed by durable bytes.
+  Deniable vaults are unaffected (they explicitly opt out of the
+  sidecar-mirror protocol). v0.2.0 and earlier vaults are
+  unaffected (no mirror protocol there at all).
+
+- **`luksbox check --fido2` rejected `fido2-direct` vaults** with
+  `no FIDO2 keyslots in this container`. The flag-driven unlock
+  path (`open_container_fido2` in `crates/luksbox-cli/src/main.rs`)
+  iterated only `SlotKind::Fido2HmacSecret` slots and skipped
+  `SlotKind::Fido2DerivedMvk`, even though the format layer's
+  `UnlockMaterial::Fido2` arm has handled both kinds since v0.2.0.
+  Fixed to accept both kinds.
+
+- **CLI subcommands defaulted to a passphrase prompt on
+  FIDO2-only vaults** with no helpful diagnostic. When `--fido2`
+  / `--tpm2` / `--tpm2-fido2` / `--pq-hybrid` aren't passed and
+  the vault carries zero passphrase keyslots, the subcommand
+  now errors with `vault has no passphrase keyslot; rerun with
+  --fido2` (or `--tpm2`, `--tpm2-fido2`, `--pq-hybrid` as the
+  header dictates) instead of silently prompting for a passphrase
+  that no slot will ever accept.
+
+### Added
+
+- **Recovery primitives for vaults already broken by the v0.2.1
+  durability hole** (and other corruption classes that leave
+  chunk-list-block AEAD failing). Both are opt-in via env var so
+  no default behavior changes:
+  - `LUKSBOX_DEBUG_OPEN=1` -- instruments `Vfs::open` to print to
+    stderr the metadata plaintext head bytes, which LBM2/3/4/5
+    magic matched, postcard error details, the per-inode result
+    of `v4_on_disk_to_in_memory`, and the `validate_metadata_tree`
+    outcome. Lets a user with a refusing vault pinpoint the
+    exact parse step that trips without source modification.
+  - `LUKSBOX_TOLERATE_BAD_CHUNK_LISTS=1` -- when a chunk-list
+    chain fails AEAD during open, install the affected inode
+    with empty `chunks` and `size = 0` instead of refusing the
+    whole vault. The inode appears as a 0-byte file in the
+    mount, so the user can mount read-only and copy out every
+    healthy file. A new `Error::ReadOnlyMount` causes any
+    subsequent `Vfs::flush` to refuse so the patched (lossy)
+    tree is never persisted over the original on-disk metadata.
+
+- **Recovery mode in wizard and GUI** (no more env-var-only UX).
+  - **Wizard**: when the user opens a vault and `Vfs::open` fails
+    with `MetadataDeserialize`, the wizard now prompts "Try opening
+    in recovery mode?" (default yes). On confirm it re-authenticates,
+    sets the thread-local toleration flag, retries, and prints the
+    list of broken inode IDs / sizes / paths to stderr. Read-only
+    mount; flushes refuse.
+  - **GUI**: new "Recovery mode (read-only, skips broken files)"
+    checkbox in the Open form. On a successful recovery-mode open
+    with tolerated inodes, a modal lists every broken file's path
+    + original size + AEAD-failure reason so the user knows what
+    to re-source. Modal dismisses on click / backdrop / Esc; flush
+    is refused while the recovery report is active.
+  - The env-var path (`LUKSBOX_TOLERATE_BAD_CHUNK_LISTS=1`) still
+    works for CLI/headless use and continues to wrap the same code
+    path. The two are unified via the new `luksbox_vfs::set_tolerate_bad_chunk_lists`
+    thread-local guard + `tolerate_bad_chunk_lists()` predicate
+    (env var OR TLS). A new `Vfs::tolerated_inodes()` accessor
+    returns the broken-inode report; UI / scripts can read it
+    after a successful recovery-mode open.
+
+- **Regression test infrastructure for the durability fence.** Three
+  new tests in `crates/luksbox-vfs/src/vfs.rs`:
+  - `flush_runs_sync_data_area_before_write_metadata` -- compliance
+    test that snapshots a per-thread flush-op log and asserts
+    `Container::sync_data_area` runs strictly before
+    `Container::write_metadata` during `Vfs::flush`. Removing the
+    fence call breaks this test even when all happy-path tests
+    still pass. The log is exposed via three new `pub` helpers in
+    `luksbox-format::container`: `FlushOp`, `reset_flush_op_log`,
+    `flush_op_log_snapshot`.
+  - `skip_fence_thread_local_reproduces_v0_2_1_ordering` --
+    bug-reappearance check that uses the new thread-local
+    `set_skip_fence_for_test(true)` escape hatch to bypass the
+    fence on the calling thread, then verifies the op log shows
+    only `WriteMetadata` (matching the v0.2.1 ordering). Thread-
+    local instead of an env var so concurrent test threads don't
+    race. Production code never touches `set_skip_fence_for_test`.
+  - `v0_2_2_fence_prevents_chunk_list_loss_after_simulated_crash`
+    -- true crash-impact test using a new `SimFile` backing for
+    `Container` (models a kernel page cache vs durable bytes with
+    a `crash()` method that reverts un-fsync'd writes), plus a new
+    thread-local `set_crash_after_mirror_for_test` injection point
+    inside `Container::write_metadata`. The test runs the spill +
+    flush cycle twice -- once with the fence enabled (chunk-list
+    blocks survive the simulated crash; vault reopens cleanly via
+    mirror recovery) and once with the fence disabled via the
+    thread-local skip hatch (chunk-list blocks are lost; mirror
+    recovery points at slots holding pre-flush bytes; AEAD fails;
+    `Vfs::open` surfaces `MetadataDeserialize` matching the
+    real-world bug signature). Together with the compliance test
+    above this gives both ordering verification and durability-
+    semantics verification of the fence.
+
+- **SimFile (`luksbox_format::SimFile` + `SharedSimFile`)** -- public
+  test-injection helpers for any future flush-ordering invariant
+  that wants a deterministic crash-impact regression. Tracks
+  `backing` (page-cache view) vs `durable` (post-fsync view); a
+  `crash()` method reverts `backing` to `durable`. Paired with the
+  new `Container::swap_lbx_file_for_test` setter (file field now
+  `Box<dyn LbxFile>` where `LbxFile: Read + Write + Seek + sync_all`,
+  blanket-impl'd for `std::fs::File`) so tests can intercept all
+  Container I/O without touching the disk.
+
+### Security
+
+- **`luksbox-vfs::Error::ReadOnlyMount`** -- added so a
+  tolerant-recovery-opened vault refuses flushes / writes. Without
+  this, mounting a tolerant-recovery vault and letting any FUSE
+  write through (atime updates, accidental `touch`, anything that
+  marks the tree dirty) would persist the size-zeroed broken
+  inodes back to disk via the next flush, foreclosing any future
+  brute-force recovery attempt against the original
+  `chunks_external` pointers.
+
+### Notes
+
+- Anyone who hit this bug on v0.2.1: the lost chunk-list blocks
+  are not recoverable from the live data area (the bytes never
+  made it to disk). Deep recovery via an older `.meta-bak.tmp.*`
+  snapshot is theoretically possible if such a file exists AND
+  its older `chunks_external` pointers reference slots whose
+  data chunks haven't since been reused. Not automated in this
+  release.
 
 ## [v0.2.1] - 2026-05-22
 

@@ -48,7 +48,7 @@ fn derive_tpm2_fido2_kek(
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
     hk.expand(TPM2_FIDO2_KEK_INFO, out.as_mut_slice())
         .expect("32 <= 255 * HashLen");
-    KeyEncryptionKey::from_bytes(*out)
+    KeyEncryptionKey::from_zeroizing(&out)
 }
 
 /// Derive the KEK for a hybrid TPM + ML-KEM keyslot. Mixes the TPM
@@ -66,7 +66,7 @@ fn derive_hybrid_tpm2_kek(
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
     hk.expand(HYBRID_TPM2_KEK_INFO, out.as_mut_slice())
         .expect("32 <= 255 * HashLen");
-    KeyEncryptionKey::from_bytes(*out)
+    KeyEncryptionKey::from_zeroizing(&out)
 }
 
 /// Derive the KEK for the maximum-paranoia hybrid TPM + FIDO2 + ML-KEM
@@ -85,7 +85,7 @@ fn derive_hybrid_tpm2_fido2_kek(
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
     hk.expand(HYBRID_TPM2_FIDO2_KEK_INFO, out.as_mut_slice())
         .expect("32 <= 255 * HashLen");
-    KeyEncryptionKey::from_bytes(*out)
+    KeyEncryptionKey::from_zeroizing(&out)
 }
 
 /// Derive the MVK directly from a YubiKey's hmac-secret response.
@@ -96,7 +96,7 @@ pub fn derive_mvk_from_fido2(salt: &[u8; 32], hmac_secret: &[u8; 32]) -> MasterV
     let mut out = Zeroizing::new([0u8; KEY_LEN]);
     hk.expand(MVK_FROM_FIDO2_INFO, out.as_mut_slice())
         .expect("32 <= 255 * HashLen");
-    MasterVolumeKey::from_bytes(*out)
+    MasterVolumeKey::from_zeroizing(&out)
 }
 
 pub const SLOT_SIZE: usize = 512;
@@ -637,7 +637,7 @@ impl Keyslot {
             fido2_cred_id: sealed_blob.to_vec(),
             fido2_hmac_salt: [0; 32],
         };
-        let kek = KeyEncryptionKey::from_bytes(*kek_from_tpm);
+        let kek = KeyEncryptionKey::from_array_ref(kek_from_tpm);
         slot.wrap_mvk(suite, &kek, mvk, header_salt)?;
         Ok(slot)
     }
@@ -660,7 +660,7 @@ impl Keyslot {
         if !matches!(self.kind, SlotKind::Tpm2Sealed | SlotKind::Tpm2SealedPin) {
             return Err(Error::InvalidField);
         }
-        let kek = KeyEncryptionKey::from_bytes(*kek_from_tpm);
+        let kek = KeyEncryptionKey::from_array_ref(kek_from_tpm);
         self.unwrap_mvk(suite, &kek, header_salt)
     }
 
@@ -883,7 +883,7 @@ impl Keyslot {
             fido2_cred_id: sealed_blob.to_vec(),
             fido2_hmac_salt: [0; 32],
         };
-        let kek = KeyEncryptionKey::from_bytes(*kek_from_tpm);
+        let kek = KeyEncryptionKey::from_array_ref(kek_from_tpm);
         slot.wrap_mvk(suite, &kek, mvk, header_salt)?;
         Ok(slot)
     }
@@ -1506,7 +1506,7 @@ impl Keyslot {
         }
         let mut mvk = Zeroizing::new([0u8; KEY_LEN]);
         mvk.copy_from_slice(&pt);
-        let key = MasterVolumeKey::from_bytes(*mvk);
+        let key = MasterVolumeKey::from_zeroizing(&mvk);
         ct.zeroize();
         aad.zeroize();
         Ok(key)

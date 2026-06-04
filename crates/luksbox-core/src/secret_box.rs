@@ -155,10 +155,10 @@ enum Inner {
     Heap(Box<[u8; KEY_LEN]>),
 }
 
-/// Windows extern declarations for `VirtualLock` / `VirtualUnlock`.
-/// Same direct `extern "system"` pattern as `secret_mem::SetErrorMode`,
-/// no extra crate dependency. Both functions take a `LPVOID` + `SIZE_T`
-/// and return `BOOL` (nonzero on success).
+// Windows extern declarations for `VirtualLock` / `VirtualUnlock`.
+// Same direct `extern "system"` pattern as `secret_mem::SetErrorMode`,
+// no extra crate dependency. Both functions take a `LPVOID` + `SIZE_T`
+// and return `BOOL` (nonzero on success).
 #[cfg(target_os = "windows")]
 unsafe extern "system" {
     fn VirtualLock(addr: *mut core::ffi::c_void, size: usize) -> i32;

@@ -16,7 +16,7 @@
 //!      metadata-recorded generation no longer matches the on-disk
 //!      AAD.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use luksbox_core::{Argon2idParams, CipherSuite};
 use luksbox_format::{Container, UnlockMaterial};
@@ -44,7 +44,7 @@ fn make_vault(dir: &TempDir) -> PathBuf {
     path
 }
 
-fn open_vfs(path: &PathBuf) -> Vfs {
+fn open_vfs(path: &Path) -> Vfs {
     let cont = Container::open(path, None, UnlockMaterial::Passphrase(PASS)).unwrap();
     Vfs::open(cont).unwrap()
 }

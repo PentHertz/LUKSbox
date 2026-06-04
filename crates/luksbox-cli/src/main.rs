@@ -529,6 +529,20 @@ enum Command {
         /// rejected if combined with an explicit mountpoint.
         #[arg(long)]
         private_mount: bool,
+        /// Restore pre-v0.2.2 eager-flush durability semantics: every
+        /// metadata-changing FUSE op (create / mkdir / unlink / rmdir
+        /// / rename / setattr / symlink / link / close) drives an
+        /// immediate `Vfs::flush`, guaranteeing the change is durable
+        /// on disk before the syscall returns. Defaults to off in
+        /// v0.2.2+, which defers flushes to a background timer and
+        /// to explicit `fsync(2)` calls (matches ext4 / btrfs /
+        /// xfs commit-interval semantics). Pass `--sync` if you need
+        /// every operation to be crash-durable on return; the cost
+        /// is roughly proportional to vault file count (a vault
+        /// with thousands of files can take minutes per op in sync
+        /// mode, hence the v0.2.2 default change).
+        #[arg(long)]
+        sync: bool,
     },
     /// Subprocess-isolated FUSE-T mount helper. Reads a 32-byte
     /// MasterVolumeKey from stdin and uses it to open the vault
@@ -643,6 +657,11 @@ enum Command {
         #[arg(long)]
         anchor: Option<PathBuf>,
         mountpoint: PathBuf,
+        /// See `luksbox mount --sync`. Restores pre-v0.2.2
+        /// eager-flush semantics; defaults to deferred. Same
+        /// trade-off as the standard mount.
+        #[arg(long)]
+        sync: bool,
     },
     /// Open a deniable-header file and print the inner-header
     /// fields. Use to verify the header is openable with the supplied
@@ -898,7 +917,7 @@ fn aes_hardware_available() -> bool {
     }
     #[cfg(target_arch = "x86_64")]
     {
-        return std::arch::is_x86_feature_detected!("aes");
+        std::arch::is_x86_feature_detected!("aes")
     }
     #[cfg(target_arch = "aarch64")]
     {
@@ -1157,12 +1176,14 @@ fn dispatch(cli: Cli) -> Result<()> {
             foreground,
             mountpoint,
             private_mount,
+            sync,
         } => cmd_mount(
             &path,
             &unlock,
             foreground,
             mountpoint.as_deref(),
             private_mount,
+            sync,
         ),
         Command::MountFuseTHelper {
             vault,
@@ -1202,6 +1223,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             foreground,
             anchor,
             mountpoint,
+            sync,
         } => cmd_deniable_mount(
             &path,
             &cipher,
@@ -1213,6 +1235,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             foreground,
             anchor.as_deref(),
             &mountpoint,
+            sync,
         ),
         Command::DeniableInfo {
             path,
@@ -2367,7 +2390,64 @@ fn open_container(path: &Path, unlock: &UnlockArgs) -> Result<Container> {
     } else if unlock.fido2 {
         open_container_fido2(path, unlock.header.as_deref())
     } else {
+        // Default route: passphrase. But if the vault has zero
+        // passphrase keyslots, prompting for a passphrase is a
+        // dead-end -- surface the right flag to use instead, with
+        // the actual keyslot kinds present so the user knows what
+        // to pass. Same UX pattern as the wizard, which auto-routes
+        // by inspecting the header.
+        let header_src = unlock.header.as_deref().unwrap_or(path);
+        if let Ok(mut f) = luksbox_core::file_util::open_existing_read_no_follow_policy(header_src)
+        {
+            let mut buf = [0u8; HEADER_SIZE];
+            if f.read_exact(&mut buf).is_ok() {
+                drop(f);
+                if let Ok(header) = Header::from_bytes(&buf) {
+                    let has_pp = header
+                        .keyslots
+                        .iter()
+                        .any(|s| s.kind == SlotKind::Passphrase);
+                    if !has_pp {
+                        let suggestion = pick_unlock_suggestion(&header.keyslots);
+                        return Err(format!(
+                            "vault has no passphrase keyslot; rerun with {suggestion}"
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
         open_container_passphrase(path, unlock.header.as_deref())
+    }
+}
+
+/// Inspect a vault's keyslots and return the flag string the user
+/// should rerun with (e.g. `--fido2`, `--tpm2`, `--tpm2-fido2`).
+fn pick_unlock_suggestion(keyslots: &[luksbox_core::Keyslot]) -> &'static str {
+    let any_fido2 = keyslots.iter().any(|s| {
+        matches!(
+            s.kind,
+            SlotKind::Fido2HmacSecret | SlotKind::Fido2DerivedMvk
+        )
+    });
+    let any_tpm2 = keyslots.iter().any(|s| s.kind == SlotKind::Tpm2Sealed);
+    let any_tpm2_fido = keyslots.iter().any(|s| s.kind == SlotKind::Tpm2Fido2);
+    let any_hybrid = keyslots.iter().any(|s| {
+        s.kind.is_hybrid_pq_passphrase()
+            || s.kind.is_hybrid_pq_fido2()
+            || s.kind == SlotKind::HybridPqKemTpm2
+            || s.kind == SlotKind::HybridPqKemTpm2Fido2
+    });
+    if any_tpm2_fido {
+        "--tpm2-fido2"
+    } else if any_tpm2 {
+        "--tpm2"
+    } else if any_fido2 {
+        "--fido2"
+    } else if any_hybrid {
+        "--pq-hybrid <PATH-TO-.kyber>"
+    } else {
+        "an appropriate unlock flag (see `luksbox info <vault>` for the keyslot kinds)"
     }
 }
 
@@ -2590,7 +2670,16 @@ fn open_container_fido2(path: &Path, header_path: Option<&Path>) -> Result<Conta
     let mut last_err: Option<Box<dyn StdError>> = None;
     let mut tried = 0usize;
     for slot in &header.keyslots {
-        if slot.kind != SlotKind::Fido2HmacSecret {
+        // Accept BOTH FIDO2 keyslot kinds:
+        //   - Fido2HmacSecret: hmac-secret output unwraps the wrapped MVK
+        //   - Fido2DerivedMvk: hmac-secret output IS the MVK (direct)
+        // The format layer dispatches by `kind` inside
+        // `UnlockMaterial::Fido2` (container.rs:3482-3494) so we can
+        // hand it the same `Fido2` payload for either kind.
+        if !matches!(
+            slot.kind,
+            SlotKind::Fido2HmacSecret | SlotKind::Fido2DerivedMvk
+        ) {
             continue;
         }
         tried += 1;
@@ -3140,10 +3229,10 @@ fn cmd_create(
     // matching LBM2 / LBM3 magic on first flush.
     let _format_guard =
         luksbox_vfs::set_format_v3_override(Some(matches!(format, VaultFormatArg::V3)));
-    if let Some(hp) = header_path {
-        if hp.exists() {
-            return Err(format!("header file {} already exists", hp.display()).into());
-        }
+    if let Some(hp) = header_path
+        && hp.exists()
+    {
+        return Err(format!("header file {} already exists", hp.display()).into());
     }
     let want_pad = pad_files || hide_sizes;
     if (want_pad || hide_sizes) && kind == SlotKindArg::Fido2Direct {
@@ -3151,10 +3240,10 @@ fn cmd_create(
             "--pad-files / --hide-sizes are not yet supported with --kind fido2-direct".into(),
         );
     }
-    if let Some(ap) = &anchor_path {
-        if ap.exists() {
-            return Err(format!("anchor file {} already exists", ap.display()).into());
-        }
+    if let Some(ap) = &anchor_path
+        && ap.exists()
+    {
+        return Err(format!("anchor file {} already exists", ap.display()).into());
     }
     let needs_pq_hybrid = matches!(
         kind,
@@ -3181,10 +3270,10 @@ fn cmd_create(
             "--pq-hybrid is only meaningful with one of the --kind hybrid-pq* variants".into(),
         );
     }
-    if let Some(kp) = &pq_hybrid_path {
-        if kp.exists() {
-            return Err(format!("kyber secret file {} already exists", kp.display()).into());
-        }
+    if let Some(kp) = &pq_hybrid_path
+        && kp.exists()
+    {
+        return Err(format!("kyber secret file {} already exists", kp.display()).into());
     }
     let mut flags: u32 = 0;
     if want_pad {
@@ -4635,6 +4724,7 @@ fn cmd_mount(
     foreground: bool,
     mountpoint: Option<&Path>,
     private_mount: bool,
+    sync_mode: bool,
 ) -> Result<()> {
     // Resolve mountpoint:
     //   --private-mount + no explicit path -> derive ~/Library/LUKSbox/Mounts/<vault-name>
@@ -4821,7 +4911,7 @@ fn cmd_mount(
             mp_abs.display(),
         );
     }
-    luksbox_mount::mount(vfs, &mp_abs, !foreground)?;
+    luksbox_mount::mount(vfs, &mp_abs, !foreground, sync_mode)?;
     Ok(())
 }
 
@@ -4941,18 +5031,17 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
             )
             .into());
         }
-        if let Some(hp) = header {
-            if no_follow
-                && std::fs::symlink_metadata(hp)
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(false)
-            {
-                return Err(format!(
-                    "header {} is a symlink and LUKSBOX_NO_FOLLOW_SYMLINKS=1 is set",
-                    hp.display()
-                )
-                .into());
-            }
+        if let Some(hp) = header
+            && no_follow
+            && std::fs::symlink_metadata(hp)
+                .map(|m| m.file_type().is_symlink())
+                .unwrap_or(false)
+        {
+            return Err(format!(
+                "header {} is a symlink and LUKSBOX_NO_FOLLOW_SYMLINKS=1 is set",
+                hp.display()
+            )
+            .into());
         }
     }
     let vault_abs = vault
@@ -5072,7 +5161,9 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
     // Run the FUSE event loop in foreground (no daemonize). The
     // parent process polls our exit status; daemonizing here would
     // leave the parent unable to detect mount-end.
-    luksbox_mount::mount(vfs, &mp_abs, false)
+    // sync_mode = false: FUSE-T helper inherits the GUI's default;
+    // FUSE-T's mount() ignores the flag for v0.2.2 anyway.
+    luksbox_mount::mount(vfs, &mp_abs, false, false)
         .map_err(|e| format!("mount {}: {e}", mp_abs.display()))?;
     eprintln!("luksbox-mount-helper: mount returned cleanly, exiting");
     Ok(())
@@ -5183,13 +5274,13 @@ fn cmd_deniable_init(
             path.display()
         ));
     }
-    if let Some(ap) = anchor {
-        if ap.exists() {
-            return Err(cli_err!(
-                "refusing to overwrite existing anchor file: {}",
-                ap.display()
-            ));
-        }
+    if let Some(ap) = anchor
+        && ap.exists()
+    {
+        return Err(cli_err!(
+            "refusing to overwrite existing anchor file: {}",
+            ap.display()
+        ));
     }
 
     let mut cont: luksbox_format::Container = match cred {
@@ -5311,6 +5402,7 @@ fn cmd_deniable_mount(
     foreground: bool,
     anchor: Option<&Path>,
     mountpoint: &Path,
+    sync_mode: bool,
 ) -> Result<()> {
     use luksbox_format::anchor as anchor_mod;
     use luksbox_vfs::Vfs;
@@ -5384,7 +5476,7 @@ fn cmd_deniable_mount(
             }
         }
     }
-    luksbox_mount::mount(vfs, &mp_abs, !foreground)?;
+    luksbox_mount::mount(vfs, &mp_abs, !foreground, sync_mode)?;
     Ok(())
 }
 
@@ -5397,15 +5489,21 @@ fn cmd_deniable_mount(
 // (.kyber / .tpm-blob) come via --flag.
 
 fn prompt_pass_twice(p1: &str, p2: &str) -> Result<zeroize::Zeroizing<String>> {
-    let a = rpassword::prompt_password(p1)?;
-    let b = rpassword::prompt_password(p2)?;
-    if a != b {
+    // Wrap both reads in `Zeroizing` immediately so the heap allocation
+    // returned by `rpassword` is scrubbed on every drop path -- panic,
+    // early-return on mismatch, the empty-string error, etc. The earlier
+    // form left the confirmation `b` as a plain `String` from prompt to
+    // end-of-scope, so a panic between the two prompts would have leaked
+    // the confirmation copy to ordinary heap memory.
+    let a = zeroize::Zeroizing::new(rpassword::prompt_password(p1)?);
+    let b = zeroize::Zeroizing::new(rpassword::prompt_password(p2)?);
+    if *a != *b {
         return Err(cli_err!("passphrases do not match"));
     }
     if a.is_empty() {
         return Err(cli_err!("empty passphrase not accepted for deniable mode"));
     }
-    Ok(zeroize::Zeroizing::new(a))
+    Ok(a)
 }
 
 /// v2 deniable open. Always passphrase-driven (envelope discovery
@@ -5440,9 +5538,10 @@ fn cli_open_deniable_v2(
     };
 
     // Phase 1: passphrase-only credential for envelope discovery,
-    // hinted with the user's intended slot kind.
-    let pass = rpassword::prompt_password("Passphrase: ")?;
-    let pass_zeroizing = zeroize::Zeroizing::new(pass);
+    // hinted with the user's intended slot kind. Wrap immediately so
+    // the `rpassword`-returned `String` heap allocation is scrubbed
+    // even if the envelope-open step below panics.
+    let pass_zeroizing = zeroize::Zeroizing::new(rpassword::prompt_password("Passphrase: ")?);
     let env_cred = DeniableCredential::Passphrase {
         passphrase: pass_zeroizing.as_bytes(),
         argon2,
@@ -5616,9 +5715,9 @@ fn cli_fido2_hmac_from_payload(
     if cred_id.is_empty() {
         return Err(cli_err!("envelope cred_id is empty for FIDO2 variant"));
     }
-    let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
     let mut auth = make_fido2_authenticator();
-    Ok(auth.hmac_secret(RP_ID, cred_id, salt, Some(&pin))?)
+    Ok(auth.hmac_secret(RP_ID, cred_id, salt, Some(pin.as_str()))?)
 }
 
 /// Drive the TPM to unseal a blob taken from the envelope payload.
@@ -5674,7 +5773,7 @@ fn cli_pq_decap_with_fallback(
     } else {
         "Seed-file passphrase: "
     };
-    let typed_seed_pw = rpassword::prompt_password(prompt_text)?;
+    let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(prompt_text)?);
     let seed_pw_bytes: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
         match envelope_pw {
             Some(env) => zeroize::Zeroizing::new(env.to_vec()),
@@ -5685,7 +5784,7 @@ fn cli_pq_decap_with_fallback(
             }
         }
     } else {
-        zeroize::Zeroizing::new(typed_seed_pw.into_bytes())
+        zeroize::Zeroizing::new(typed_seed_pw.as_bytes().to_vec())
     };
 
     let seed = seed_file::read(kyber_path, &seed_pw_bytes[..])?;
@@ -5739,16 +5838,16 @@ fn cli_create_fido2_deniable_v2(
     use luksbox_format::deniable_header::DeniableMaterial;
     use rand_core::RngCore;
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
-    let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     rand_core::OsRng
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| cli_err!("OS RNG: {e}"))?;
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin.as_str()))?;
     let cred = luksbox_core::deniable::DeniableCredential::Fido2Passphrase {
         passphrase: pass.as_bytes(),
         argon2,
@@ -5834,25 +5933,25 @@ fn cli_create_pq_fido2_deniable_v2(
         PqParams::Ml768
     };
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
-    // Round 12 fix R12-02: align with GUI/wizard. Blank = reuse envelope.
-    let typed_seed_pw = rpassword::prompt_password(
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    // Blank = reuse envelope passphrase (aligns with GUI/wizard).
+    let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(
         "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
-    )?;
+    )?);
     let seed_pw: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
         zeroize::Zeroizing::new(pass.as_bytes().to_vec())
     } else {
-        zeroize::Zeroizing::new(typed_seed_pw.into_bytes())
+        zeroize::Zeroizing::new(typed_seed_pw.as_bytes().to_vec())
     };
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
-    let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     rand_core::OsRng
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| cli_err!("OS RNG: {e}"))?;
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin.as_str()))?;
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
     let cred = luksbox_core::deniable::DeniableCredential::HybridPqFido2Passphrase {
@@ -5914,7 +6013,7 @@ fn cli_create_tpm_deniable_v2(
     // Optional TPM userAuth. Empty input means "no PIN" -- the
     // unlock side must then use `unseal` (no PIN) or the TPM
     // rejects with TPM_RC_AUTH_FAIL and bumps the DA counter.
-    let pin_in = rpassword::prompt_password("TPM PIN (empty for none): ")?;
+    let pin_in = zeroize::Zeroizing::new(rpassword::prompt_password("TPM PIN (empty for none): ")?);
     let pin_bytes: Option<&[u8]> = if pin_in.is_empty() {
         None
     } else {
@@ -5924,7 +6023,7 @@ fn cli_create_tpm_deniable_v2(
     let cred = luksbox_core::deniable::DeniableCredential::TpmPassphrase {
         passphrase: pass.as_bytes(),
         argon2,
-        unsealed: &*secret,
+        unsealed: &secret,
     };
     let material = DeniableMaterial {
         cred_id: Vec::new(),
@@ -5947,21 +6046,21 @@ fn cli_create_tpm_fido2_deniable_v2(
     use luksbox_format::deniable_header::DeniableMaterial;
     use rand_core::RngCore;
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
     let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
-    let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     rand_core::OsRng
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| cli_err!("OS RNG: {e}"))?;
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin.as_str()))?;
     let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
         passphrase: pass.as_bytes(),
         argon2,
-        unsealed: &*secret,
+        unsealed: &secret,
         hmac_secret_output: &hmac_secret,
     };
     let material = DeniableMaterial {
@@ -5993,14 +6092,14 @@ fn cli_create_pq_tpm_deniable_v2(
     };
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
     let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
-    // Round 12 fix R12-02: align with GUI/wizard. Blank = reuse envelope.
-    let typed_seed_pw = rpassword::prompt_password(
+    // Blank = reuse envelope passphrase (aligns with GUI/wizard).
+    let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(
         "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
-    )?;
+    )?);
     let seed_pw: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
         zeroize::Zeroizing::new(pass.as_bytes().to_vec())
     } else {
-        zeroize::Zeroizing::new(typed_seed_pw.into_bytes())
+        zeroize::Zeroizing::new(typed_seed_pw.as_bytes().to_vec())
     };
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
@@ -6008,7 +6107,7 @@ fn cli_create_pq_tpm_deniable_v2(
         passphrase: pass.as_bytes(),
         argon2,
         mlkem_shared: &shared,
-        unsealed: &*secret,
+        unsealed: &secret,
     };
     let material = DeniableMaterial {
         cred_id: Vec::new(),
@@ -6055,33 +6154,33 @@ fn cli_create_pq_tpm_fido2_deniable_v2(
         PqParams::Ml768
     };
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let pin = rpassword::prompt_password("FIDO2 PIN: ")?;
-    // Round 12 fix R12-02: align with GUI/wizard. Blank = reuse envelope.
-    let typed_seed_pw = rpassword::prompt_password(
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    // Blank = reuse envelope passphrase (aligns with GUI/wizard).
+    let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(
         "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
-    )?;
+    )?);
     let seed_pw: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
         zeroize::Zeroizing::new(pass.as_bytes().to_vec())
     } else {
-        zeroize::Zeroizing::new(typed_seed_pw.into_bytes())
+        zeroize::Zeroizing::new(typed_seed_pw.as_bytes().to_vec())
     };
     let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
-    let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     rand_core::OsRng
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| cli_err!("OS RNG: {e}"))?;
-    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(&pin))?;
+    let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, Some(pin.as_str()))?;
     let (pk, seed) = keygen_with(params);
     let (ct, shared) = encapsulate_with(params, &pk)?;
     let cred = luksbox_core::deniable::DeniableCredential::HybridPqTpmFido2Passphrase {
         passphrase: pass.as_bytes(),
         argon2,
         mlkem_shared: &shared,
-        unsealed: &*secret,
+        unsealed: &secret,
         hmac_secret_output: &hmac_secret,
     };
     let material = DeniableMaterial {

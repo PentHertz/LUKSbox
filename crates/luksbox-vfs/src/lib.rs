@@ -26,5 +26,6 @@ pub use crate::error::Error;
 pub use crate::tree::{ChunkRef, DirectoryTree, FileId, InodeKind};
 pub use crate::vfs::{
     DeniableRotationCredential, DirEntry, FormatV3OverrideGuard, MAX_FILE_SIZE, SlotCredential,
-    Stat, TreeCounters, Vfs, set_format_v3_override,
+    Stat, TolerateBadChunkListsGuard, ToleratedInode, TreeCounters, Vfs, set_format_v3_override,
+    set_tolerate_bad_chunk_lists, tolerate_bad_chunk_lists,
 };

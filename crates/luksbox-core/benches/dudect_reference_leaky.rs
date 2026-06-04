@@ -48,7 +48,7 @@ fn naive_compare_bench(runner: &mut CtRunner, rng: &mut BenchRng) {
         }
     }
 
-    for (input, class) in inputs.into_iter().zip(classes.into_iter()) {
+    for (input, class) in inputs.into_iter().zip(classes) {
         runner.run_one(class, || {
             // Force the compiler to not optimize the call away.
             std::hint::black_box(naive_compare(

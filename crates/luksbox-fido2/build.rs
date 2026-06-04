@@ -168,12 +168,11 @@ fn main() {
         if let Ok(out) = std::process::Command::new(cmd)
             .arg("-print-file-name=include")
             .output()
+            && out.status.success()
         {
-            if out.status.success() {
-                let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if !dir.is_empty() && std::path::Path::new(&dir).exists() {
-                    builder = builder.clang_arg(format!("-isystem{dir}"));
-                }
+            let dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !dir.is_empty() && std::path::Path::new(&dir).exists() {
+                builder = builder.clang_arg(format!("-isystem{dir}"));
             }
         }
     }

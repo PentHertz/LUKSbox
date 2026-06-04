@@ -65,7 +65,7 @@ pub fn read_chunk(
     let ct = &buf[CHUNK_NONCE_LEN..];
 
     let aad = chunk_aad(file_id, chunk_idx, chunk.generation);
-    let pt = aead::open(suite, &**file_key, &nonce, &aad, ct)?;
+    let pt = aead::open(suite, file_key, &nonce, &aad, ct)?;
     Ok(Zeroizing::new(pt))
 }
 
@@ -91,7 +91,7 @@ pub fn write_chunk(
         .map_err(|e| Error::Crypto(luksbox_core::Error::OsRng(e.to_string())))?;
 
     let aad = chunk_aad(file_id, chunk_idx, chunk.generation);
-    let ct = aead::seal(suite, &**file_key, &nonce, &aad, plaintext)?;
+    let ct = aead::seal(suite, file_key, &nonce, &aad, plaintext)?;
     debug_assert_eq!(ct.len(), CHUNK_PLAINTEXT_SIZE + CHUNK_TAG_LEN);
 
     let mut on_disk = Vec::with_capacity(CHUNK_NONCE_LEN + ct.len());
@@ -99,27 +99,6 @@ pub fn write_chunk(
     on_disk.extend_from_slice(&ct);
     container.write_at(off, &on_disk)?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn slot_offset_rejects_multiply_overflow() {
-        assert!(matches!(
-            slot_offset(0, u64::MAX),
-            Err(Error::OffsetOverflow)
-        ));
-    }
-
-    #[test]
-    fn slot_offset_rejects_add_overflow() {
-        assert!(matches!(
-            slot_offset(u64::MAX - 10, 1),
-            Err(Error::OffsetOverflow)
-        ));
-    }
 }
 
 pub fn file_key(container: &Container, file_id: u64) -> SubKey {
@@ -405,4 +384,25 @@ pub fn list_file_key_for_mvk(
     file_id: u64,
 ) -> SubKey {
     file_key_for_mvk(mvk, header_salt, list_file_id(file_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slot_offset_rejects_multiply_overflow() {
+        assert!(matches!(
+            slot_offset(0, u64::MAX),
+            Err(Error::OffsetOverflow)
+        ));
+    }
+
+    #[test]
+    fn slot_offset_rejects_add_overflow() {
+        assert!(matches!(
+            slot_offset(u64::MAX - 10, 1),
+            Err(Error::OffsetOverflow)
+        ));
+    }
 }

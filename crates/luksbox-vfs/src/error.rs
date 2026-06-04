@@ -80,4 +80,13 @@ pub enum Error {
     /// vault. Larger vaults need a format-version bump.
     #[error("metadata region exhausted (vault holds too many chunks for its metadata budget)")]
     MetadataBudgetExhausted,
+
+    /// Refused a flush because the vault was opened in tolerant
+    /// recovery mode (`LUKSBOX_TOLERATE_BAD_CHUNK_LISTS=1`). Some
+    /// inode rows had their chunks vec and `size` zeroed so the
+    /// open could complete; persisting that tree would overwrite
+    /// the original on-disk metadata permanently. Mount read-only
+    /// and copy data out; never write to a tolerant-recovered vault.
+    #[error("vault opened in tolerant recovery mode; writes/flush refused (mount read-only)")]
+    ReadOnlyMount,
 }
