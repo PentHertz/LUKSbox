@@ -3025,9 +3025,12 @@ impl LuksboxApp {
                         submit_via_enter = true;
                     }
                     if ui.add_sized([browse_w, CONTROL_H], ghost_button("Browse")).clicked()
+                        // No `add_filter()` call: `&["lbx"]` hides
+                        // extensionless vaults (the old default name was
+                        // `secret`). See `open_existing_picker` for why no
+                        // filter variant works cross-platform (#12).
                         && let Some(p) = rfd::FileDialog::new()
                             .set_title("New vault file")
-                            .add_filter("LUKSbox vault", &["lbx"])
                             .save_file()
                         {
                             self.create.path = p.display().to_string();
