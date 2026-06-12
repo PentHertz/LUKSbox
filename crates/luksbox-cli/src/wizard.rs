@@ -3402,10 +3402,7 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
              Linux or macOS:"
         );
         for s in &stale_fido2_slots {
-            eprintln!(
-                "    luksbox migrate-fido2-slot {} --slot {s}",
-                vault.display()
-            );
+            eprintln!("    luksbox migrate-fido2-slot {} --slot {s}", vault.display());
         }
         eprintln!(
             "  This re-enrolls a fresh V4 credential under the same authenticator \
@@ -5964,19 +5961,14 @@ fn unlock_via_tpm2_fido2(
                 stored_cred.len()
             ))
         );
-        let hmac_secret = match auth.hmac_secret(
-            RP_ID,
-            &stored_cred,
-            &slot.fido2_hmac_salt,
-            slot.fido2_salt_prehashed(),
-            Some(&pin),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(format!("FIDO2: {e}"));
-                continue;
-            }
-        };
+        let hmac_secret =
+            match auth.hmac_secret(RP_ID, &stored_cred, &slot.fido2_hmac_salt, slot.fido2_salt_prehashed(), Some(&pin)) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(format!("FIDO2: {e}"));
+                    continue;
+                }
+            };
         let mut unseal = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
             let parsed = SealedBlob::from_bytes(blob)
                 .map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
@@ -6161,19 +6153,14 @@ fn unlock_via_hybrid_pq_tpm2_fido2(
             "{}",
             crate::auth_prompt(&format!("3-factor unlock (slot {slot_idx})"))
         );
-        let hmac_secret = match auth.hmac_secret(
-            RP_ID,
-            &stored_cred,
-            &slot.fido2_hmac_salt,
-            slot.fido2_salt_prehashed(),
-            Some(&pin),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(format!("FIDO2: {e}"));
-                continue;
-            }
-        };
+        let hmac_secret =
+            match auth.hmac_secret(RP_ID, &stored_cred, &slot.fido2_hmac_salt, slot.fido2_salt_prehashed(), Some(&pin)) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(format!("FIDO2: {e}"));
+                    continue;
+                }
+            };
         let pq_shared = match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
             Ok(s) => s,
             Err(e) => {

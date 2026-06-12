@@ -71,13 +71,16 @@ pub fn mount(vfs: Vfs, mountpoint: &Path, daemonize: bool, sync_mode: bool) -> s
         ));
     }
 
-    let fs = LuksboxFs::new(vfs, sync_mode);
-
     if daemonize {
-        run_daemonized(fs, mountpoint, config)
+        // LuksboxFs::new spawns the deferred-flush timer thread (when
+        // sync_mode is off), so it MUST run after the fork or the
+        // single-threaded-for-fork() check below trips on our own
+        // timer. The parent never builds a LuksboxFs.
+        run_daemonized(vfs, mountpoint, config, sync_mode)
     } else {
         install_signal_handler(mountpoint);
         spawn_suspend_listener(mountpoint);
+        let fs = LuksboxFs::new(vfs, sync_mode);
         // `mount2` does Session::new + run() in one call. Blocks until
         // the FS is unmounted (kernel signals EOF on /dev/fuse fd).
         fuser::mount2(fs, mountpoint, &config)
@@ -98,13 +101,34 @@ pub fn mount(vfs: Vfs, mountpoint: &Path, daemonize: bool, sync_mode: bool) -> s
 ///   documented rather than load-bearing.
 #[cfg(target_os = "linux")]
 fn assert_single_threaded_for_fork() -> std::io::Result<()> {
-    let mut count = 0usize;
+    // Enumerate threads and read each `/proc/self/task/<tid>/comm` so
+    // the error names the offenders. Past regressions in this file
+    // (e.g. constructing LuksboxFs before fork, spawning the flush
+    // timer in the parent) were silent counts; naming the threads
+    // makes the next regression obvious.
+    let mut threads: Vec<(libc::pid_t, String)> = Vec::new();
     for entry in std::fs::read_dir("/proc/self/task")? {
-        let _ = entry?;
-        count += 1;
-        if count > 1 {
-            return Err(std::io::Error::other(MULTITHREADED_FORK_MESSAGE));
-        }
+        let entry = entry?;
+        let tid = entry
+            .file_name()
+            .to_string_lossy()
+            .parse::<libc::pid_t>()
+            .unwrap_or(0);
+        let comm = std::fs::read_to_string(entry.path().join("comm"))
+            .unwrap_or_else(|_| "<?>".to_string())
+            .trim()
+            .to_string();
+        threads.push((tid, comm));
+    }
+    if threads.len() > 1 {
+        let listing = threads
+            .iter()
+            .map(|(tid, name)| format!("{tid}={name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(std::io::Error::other(format!(
+            "{MULTITHREADED_FORK_MESSAGE} Live threads at fork point: [{listing}]"
+        )));
     }
     Ok(())
 }
@@ -167,7 +191,12 @@ const MULTITHREADED_FORK_MESSAGE: &str = "luksbox-mount: refusing to daemonize f
 /// happens in the CHILD after fork. Trade-off: kernel-mount errors in
 /// the daemonized path land in /dev/null after `detach_from_terminal`
 ///, users hitting those should re-run with `--foreground`.
-fn run_daemonized(fs: LuksboxFs, mountpoint: &Path, config: Config) -> std::io::Result<()> {
+fn run_daemonized(
+    vfs: Vfs,
+    mountpoint: &Path,
+    config: Config,
+    sync_mode: bool,
+) -> std::io::Result<()> {
     assert_single_threaded_for_fork()?;
 
     // SAFETY: thread count was verified above. fork() in a single-threaded
@@ -180,9 +209,13 @@ fn run_daemonized(fs: LuksboxFs, mountpoint: &Path, config: Config) -> std::io::
             // Child: detach from controlling terminal, redirect stdio to
             // /dev/null, install the signal handler so SIGTERM (e.g. from
             // logout) triggers a clean unmount, then run the session.
+            // LuksboxFs::new spawns the deferred-flush timer here, in
+            // the child, so the parent's single-threaded check stays
+            // honest.
             unsafe { detach_from_terminal()? };
             install_signal_handler(mountpoint);
             spawn_suspend_listener(mountpoint);
+            let fs = LuksboxFs::new(vfs, sync_mode);
             let res = fuser::mount2(fs, mountpoint, &config);
             std::process::exit(if res.is_ok() { 0 } else { 1 });
         }

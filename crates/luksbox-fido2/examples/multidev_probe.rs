@@ -101,13 +101,7 @@ fn unlock_via(
     let mut auth = auth_for(path);
     println!("TOUCH {} ({})  assert (unlock)", touch_n, label);
     let secret = auth
-        .hmac_secret(
-            RP,
-            &parsed.fido2_cred_id,
-            &parsed.fido2_hmac_salt,
-            parsed.fido2_salt_prehashed(),
-            pin,
-        )
+        .hmac_secret(RP, &parsed.fido2_cred_id, &parsed.fido2_hmac_salt, parsed.fido2_salt_prehashed(), pin)
         .unwrap_or_else(|e| panic!("{label} unlock-assert failed: {e:?}"));
 
     parsed

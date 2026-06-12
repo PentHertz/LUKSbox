@@ -392,7 +392,11 @@ impl Fido2Authenticator for HidAuthenticator {
             )?;
             checked_at(
                 "fido_assert_set_hmac_salt",
-                fido_assert_set_hmac_salt(assert.ptr, salt_to_send.as_ptr(), salt_to_send.len()),
+                fido_assert_set_hmac_salt(
+                    assert.ptr,
+                    salt_to_send.as_ptr(),
+                    salt_to_send.len(),
+                ),
             )?;
             checked_at(
                 "fido_assert_set_up",

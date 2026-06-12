@@ -2359,9 +2359,11 @@ impl LuksboxApp {
                 // preserve the long-name UX without a competing
                 // click rect.
                 ui.add(
-                    egui::Label::new(RichText::new(&name).strong().color(title_color).size(13.0))
-                        .truncate()
-                        .selectable(false),
+                    egui::Label::new(
+                        RichText::new(&name).strong().color(title_color).size(13.0),
+                    )
+                    .truncate()
+                    .selectable(false),
                 )
                 .on_hover_text(&name);
                 // Path label: also visual; bg click sense covers it.

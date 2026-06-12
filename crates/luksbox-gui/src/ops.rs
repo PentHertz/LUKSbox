@@ -2877,19 +2877,14 @@ fn unlock_with_fido2(
         ) {
             continue;
         }
-        let hmac_secret = match auth.hmac_secret(
-            RP_ID,
-            &slot.fido2_cred_id,
-            &slot.fido2_hmac_salt,
-            slot.fido2_salt_prehashed(),
-            Some(pin),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(format!("FIDO2: {e}"));
-                continue;
-            }
-        };
+        let hmac_secret =
+            match auth.hmac_secret(RP_ID, &slot.fido2_cred_id, &slot.fido2_hmac_salt, slot.fido2_salt_prehashed(), Some(pin)) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(format!("FIDO2: {e}"));
+                    continue;
+                }
+            };
         match Container::open(
             path,
             header_path,
@@ -3016,19 +3011,14 @@ fn unlock_with_tpm2_fido2(
             Some(c) => c.to_vec(),
             None => continue,
         };
-        let hmac_secret = match auth.hmac_secret(
-            RP_ID,
-            &stored_cred,
-            &slot.fido2_hmac_salt,
-            slot.fido2_salt_prehashed(),
-            Some(pin),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(format!("FIDO2 hmac-secret: {e}"));
-                continue;
-            }
-        };
+        let hmac_secret =
+            match auth.hmac_secret(RP_ID, &stored_cred, &slot.fido2_hmac_salt, slot.fido2_salt_prehashed(), Some(pin)) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(format!("FIDO2 hmac-secret: {e}"));
+                    continue;
+                }
+            };
         let mut unseal = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
             let parsed = SealedBlob::from_bytes(blob)
                 .map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
@@ -3236,19 +3226,14 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
                 continue;
             }
         };
-        let hmac_secret = match auth.hmac_secret(
-            RP_ID,
-            &stored_cred,
-            &slot.fido2_hmac_salt,
-            slot.fido2_salt_prehashed(),
-            Some(pin),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(format!("FIDO2: {e}"));
-                continue;
-            }
-        };
+        let hmac_secret =
+            match auth.hmac_secret(RP_ID, &stored_cred, &slot.fido2_hmac_salt, slot.fido2_salt_prehashed(), Some(pin)) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(format!("FIDO2: {e}"));
+                    continue;
+                }
+            };
         let pq_shared = match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
             Ok(s) => s,
             Err(e) => {
@@ -3399,19 +3384,14 @@ fn unlock_with_hybrid_pq_fido2(
                 continue;
             }
         };
-        let hmac_secret = match auth.hmac_secret(
-            RP_ID,
-            &slot.fido2_cred_id,
-            &slot.fido2_hmac_salt,
-            slot.fido2_salt_prehashed(),
-            Some(pin),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(format!("FIDO2: {e}"));
-                continue;
-            }
-        };
+        let hmac_secret =
+            match auth.hmac_secret(RP_ID, &slot.fido2_cred_id, &slot.fido2_hmac_salt, slot.fido2_salt_prehashed(), Some(pin)) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(format!("FIDO2: {e}"));
+                    continue;
+                }
+            };
         let pq_shared = match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
             Ok(s) => s,
             Err(e) => {

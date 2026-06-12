@@ -2520,6 +2520,7 @@ dependencies = [
  "hmac",
  "libc",
  "luksbox-ct-bench",
+ "luksbox-fido2",
  "rand_core 0.6.4",
  "sha2",
  "subtle",
