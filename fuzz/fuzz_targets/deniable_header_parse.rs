@@ -101,7 +101,7 @@ fuzz_target!(|data: &[u8]| {
     // and not a bug). Run phase 2 too to exercise the inner-header
     // decryption + parse path. complete_open_v2 must also collapse
     // every failure into OpaqueUnlockFailed.
-    match complete_open_v2(envelope, &cred, cipher) {
+    match complete_open_v2(&envelope, &cred, cipher) {
         Ok(_) => {
             // Fuzzer hit a valid full open by chance.
         }
