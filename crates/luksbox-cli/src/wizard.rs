@@ -1151,15 +1151,31 @@ fn open_deniable_by_kind(
             {
                 let salt = salt_opt
                     .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
-                let hmac_secret = wizard_fido2_hmac_from_payload(theme, &cred_id, &salt)?;
+                let pin = wizard_prompt_fido2_pin(theme)?;
+                let hmac_secret = wizard_fido2_hmac_from_payload(&cred_id, &salt, true, &pin)?;
                 let cred = DeniableCredential::Fido2Passphrase {
                     passphrase: pass.as_bytes(),
                     argon2,
                     hmac_secret_output: &hmac_secret,
                 };
-                Ok(luksbox_format::Container::complete_open_v2_deniable(
-                    envelope, &cred,
-                )?)
+                match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred)
+                {
+                    Ok(c) => Ok(c),
+                    Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                        wizard_deniable_raw_salt_retry_notice();
+                        let hmac_secret =
+                            wizard_fido2_hmac_from_payload(&cred_id, &salt, false, &pin)?;
+                        let cred = DeniableCredential::Fido2Passphrase {
+                            passphrase: pass.as_bytes(),
+                            argon2,
+                            hmac_secret_output: &hmac_secret,
+                        };
+                        Ok(luksbox_format::Container::complete_open_v2_deniable(
+                            envelope, &cred,
+                        )?)
+                    }
+                    Err((_, e)) => Err(e.into()),
+                }
             }
             #[cfg(not(feature = "hardware"))]
             Err("FIDO2 hardware support not compiled in".into())
@@ -1181,16 +1197,33 @@ fn open_deniable_by_kind(
                 let shared = ask_pq_decap_for_deniable(theme, vault, &pass, matched_slot_idx)?;
                 let salt = salt_opt
                     .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
-                let hmac_secret = wizard_fido2_hmac_from_payload(theme, &cred_id, &salt)?;
+                let pin = wizard_prompt_fido2_pin(theme)?;
+                let hmac_secret = wizard_fido2_hmac_from_payload(&cred_id, &salt, true, &pin)?;
                 let cred = DeniableCredential::HybridPqFido2Passphrase {
                     passphrase: pass.as_bytes(),
                     argon2,
                     mlkem_shared: &shared,
                     hmac_secret_output: &hmac_secret,
                 };
-                Ok(luksbox_format::Container::complete_open_v2_deniable(
-                    envelope, &cred,
-                )?)
+                match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred)
+                {
+                    Ok(c) => Ok(c),
+                    Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                        wizard_deniable_raw_salt_retry_notice();
+                        let hmac_secret =
+                            wizard_fido2_hmac_from_payload(&cred_id, &salt, false, &pin)?;
+                        let cred = DeniableCredential::HybridPqFido2Passphrase {
+                            passphrase: pass.as_bytes(),
+                            argon2,
+                            mlkem_shared: &shared,
+                            hmac_secret_output: &hmac_secret,
+                        };
+                        Ok(luksbox_format::Container::complete_open_v2_deniable(
+                            envelope, &cred,
+                        )?)
+                    }
+                    Err((_, e)) => Err(e.into()),
+                }
             }
             #[cfg(not(feature = "hardware"))]
             Err("FIDO2 hardware support not compiled in".into())
@@ -1212,16 +1245,31 @@ fn open_deniable_by_kind(
             let unsealed = wizard_tpm_unseal_from_bytes(&tpm_blob, None)?;
             let salt = salt_opt
                 .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
-            let hmac_secret = wizard_fido2_hmac_from_payload(theme, &cred_id, &salt)?;
+            let pin = wizard_prompt_fido2_pin(theme)?;
+            let hmac_secret = wizard_fido2_hmac_from_payload(&cred_id, &salt, true, &pin)?;
             let cred = DeniableCredential::TpmFido2Passphrase {
                 passphrase: pass.as_bytes(),
                 argon2,
                 unsealed: &unsealed,
                 hmac_secret_output: &hmac_secret,
             };
-            Ok(luksbox_format::Container::complete_open_v2_deniable(
-                envelope, &cred,
-            )?)
+            match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred) {
+                Ok(c) => Ok(c),
+                Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                    wizard_deniable_raw_salt_retry_notice();
+                    let hmac_secret = wizard_fido2_hmac_from_payload(&cred_id, &salt, false, &pin)?;
+                    let cred = DeniableCredential::TpmFido2Passphrase {
+                        passphrase: pass.as_bytes(),
+                        argon2,
+                        unsealed: &unsealed,
+                        hmac_secret_output: &hmac_secret,
+                    };
+                    Ok(luksbox_format::Container::complete_open_v2_deniable(
+                        envelope, &cred,
+                    )?)
+                }
+                Err((_, e)) => Err(e.into()),
+            }
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         DenCredKind::HybridPqTpm2 => {
@@ -1243,7 +1291,8 @@ fn open_deniable_by_kind(
             let unsealed = wizard_tpm_unseal_from_bytes(&tpm_blob, None)?;
             let salt = salt_opt
                 .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
-            let hmac_secret = wizard_fido2_hmac_from_payload(theme, &cred_id, &salt)?;
+            let pin = wizard_prompt_fido2_pin(theme)?;
+            let hmac_secret = wizard_fido2_hmac_from_payload(&cred_id, &salt, true, &pin)?;
             let cred = DeniableCredential::HybridPqTpmFido2Passphrase {
                 passphrase: pass.as_bytes(),
                 argon2,
@@ -1251,9 +1300,24 @@ fn open_deniable_by_kind(
                 unsealed: &unsealed,
                 hmac_secret_output: &hmac_secret,
             };
-            Ok(luksbox_format::Container::complete_open_v2_deniable(
-                envelope, &cred,
-            )?)
+            match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred) {
+                Ok(c) => Ok(c),
+                Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                    wizard_deniable_raw_salt_retry_notice();
+                    let hmac_secret = wizard_fido2_hmac_from_payload(&cred_id, &salt, false, &pin)?;
+                    let cred = DeniableCredential::HybridPqTpmFido2Passphrase {
+                        passphrase: pass.as_bytes(),
+                        argon2,
+                        mlkem_shared: &shared,
+                        unsealed: &unsealed,
+                        hmac_secret_output: &hmac_secret,
+                    };
+                    Ok(luksbox_format::Container::complete_open_v2_deniable(
+                        envelope, &cred,
+                    )?)
+                }
+                Err((_, e)) => Err(e.into()),
+            }
         }
     }
 }
@@ -1261,29 +1325,50 @@ fn open_deniable_by_kind(
 /// v2 wizard helper: drive the FIDO2 device with cred_id + hmac_salt
 /// recovered from the slot envelope (no longer prompts the user for
 /// hex strings).
+///
+/// Deniable v2 envelopes embed the cred_id + salt at create time
+/// but, unlike keyslots, record NO salt-convention marker. v0.3.0
+/// creates envelopes under the V4 prehashed convention;
+/// v0.2.1/v0.2.2 envelopes recorded raw-salt HMACs on Linux/macOS.
+/// Callers probe: `prehash_salt = true` first, then on an
+/// inner-AEAD failure retry with `false` via
+/// `Container::complete_open_v2_deniable_reusable`. The PIN is
+/// prompted once by the caller so the fallback costs only a second
+/// touch.
 #[cfg(feature = "hardware")]
 fn wizard_fido2_hmac_from_payload(
-    theme: &ColorfulTheme,
     cred_id: &[u8],
     salt: &[u8; 32],
+    prehash_salt: bool,
+    pin: &str,
 ) -> Result<luksbox_fido2::HmacSecret> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID};
     if cred_id.is_empty() {
         return Err("envelope cred_id is empty for FIDO2 variant".into());
     }
-    let pin = zeroize::Zeroizing::new(
+    let mut auth = crate::make_fido2_authenticator();
+    Ok(auth.hmac_secret(RP_ID, cred_id, salt, prehash_salt, Some(pin))?)
+}
+
+/// Prompt the FIDO2 PIN once for a deniable unlock (shared between
+/// the first probe attempt and the raw-salt fallback).
+#[cfg(feature = "hardware")]
+fn wizard_prompt_fido2_pin(theme: &ColorfulTheme) -> Result<zeroize::Zeroizing<String>> {
+    Ok(zeroize::Zeroizing::new(
         Password::with_theme(theme)
             .with_prompt("FIDO2 PIN")
             .interact()?,
+    ))
+}
+
+/// User-facing notice for the second probe attempt.
+#[cfg(feature = "hardware")]
+fn wizard_deniable_raw_salt_retry_notice() {
+    eprintln!(
+        "Unlock failed under the v0.3.0 salt convention; retrying \
+         with the pre-v0.3.0 raw-salt convention. Touch the \
+         authenticator again."
     );
-    let mut auth = crate::make_fido2_authenticator();
-    // Deniable v2 envelopes embedded the cred_id + salt at create
-    // time. v0.3.0 always uses the V4 prehashed-salt convention for
-    // new envelopes; older envelopes would need an envelope-version
-    // probe here. The deniable-header v2 format is still in flux
-    // (docs/DENIABLE_HEADER.md), so we hard-code `true` and revisit
-    // when the envelope gains an explicit convention version.
-    Ok(auth.hmac_secret(RP_ID, cred_id, salt, true, Some(&pin))?)
 }
 
 /// v2 wizard helper: unseal the TPM blob recovered from the slot
@@ -1910,16 +1995,26 @@ fn print_slots(header: &Header, with_kdf: bool) {
         println!("{}", format_slot(i, s, with_kdf));
         // Same V4 cross-platform indicator as `luksbox info`. V4
         // FIDO2 slots open on Linux, macOS, and Windows; V1/V2/V3
-        // slots open only on Linux/macOS and need `luksbox
-        // migrate-fido2-slot --slot N` to become cross-platform.
+        // slots open only on Linux/macOS. Wrap-style slots can be
+        // migrated with `luksbox migrate-fido2-slot <vault> --slot N`;
+        // other FIDO2-touching kinds have no migration path yet.
         if s.touches_fido2() {
             if s.fido2_salt_prehashed() {
                 println!("       compat: V4 cross-platform (Linux/macOS/Windows)");
-            } else {
+            } else if s.kind == luksbox_core::SlotKind::Fido2HmacSecret {
+                // aad_version is 0-based on disk; labels are 1-based.
                 println!(
                     "       compat: V{ver} Linux/macOS-only -- migrate with \
-                     `luksbox migrate-fido2-slot --slot {i}` for cross-platform",
-                    ver = s.aad_version,
+                     `luksbox migrate-fido2-slot <vault> --slot {i}` for \
+                     cross-platform",
+                    ver = s.aad_version + 1,
+                );
+            } else {
+                println!(
+                    "       compat: V{ver} Linux/macOS-only -- migration \
+                     for this slot kind is not available yet; re-enroll \
+                     the credential on v0.3.0 for cross-platform",
+                    ver = s.aad_version + 1,
                 );
             }
         }
@@ -3402,7 +3497,10 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
              Linux or macOS:"
         );
         for s in &stale_fido2_slots {
-            eprintln!("    luksbox migrate-fido2-slot {} --slot {s}", vault.display());
+            eprintln!(
+                "    luksbox migrate-fido2-slot {} --slot {s}",
+                vault.display()
+            );
         }
         eprintln!(
             "  This re-enrolls a fresh V4 credential under the same authenticator \
@@ -5961,14 +6059,19 @@ fn unlock_via_tpm2_fido2(
                 stored_cred.len()
             ))
         );
-        let hmac_secret =
-            match auth.hmac_secret(RP_ID, &stored_cred, &slot.fido2_hmac_salt, slot.fido2_salt_prehashed(), Some(&pin)) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2: {e}"));
-                    continue;
-                }
-            };
+        let hmac_secret = match auth.hmac_secret(
+            RP_ID,
+            &stored_cred,
+            &slot.fido2_hmac_salt,
+            slot.fido2_salt_prehashed(),
+            Some(&pin),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(format!("FIDO2: {e}"));
+                continue;
+            }
+        };
         let mut unseal = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
             let parsed = SealedBlob::from_bytes(blob)
                 .map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
@@ -6153,14 +6256,19 @@ fn unlock_via_hybrid_pq_tpm2_fido2(
             "{}",
             crate::auth_prompt(&format!("3-factor unlock (slot {slot_idx})"))
         );
-        let hmac_secret =
-            match auth.hmac_secret(RP_ID, &stored_cred, &slot.fido2_hmac_salt, slot.fido2_salt_prehashed(), Some(&pin)) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2: {e}"));
-                    continue;
-                }
-            };
+        let hmac_secret = match auth.hmac_secret(
+            RP_ID,
+            &stored_cred,
+            &slot.fido2_hmac_salt,
+            slot.fido2_salt_prehashed(),
+            Some(&pin),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(format!("FIDO2: {e}"));
+                continue;
+            }
+        };
         let pq_shared = match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
             Ok(s) => s,
             Err(e) => {

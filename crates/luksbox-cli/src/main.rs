@@ -178,7 +178,7 @@ impl KdfStrengthArg {
 /// Each vault picks its format once at create time; format is
 /// fixed for the lifetime of the vault. Default flipped to v3 in
 /// the v0.2.0 release after end-to-end validation across standard
-/// + deniable, MVK rotation across all deniable credential kinds,
+/// and deniable, MVK rotation across all deniable credential kinds,
 /// and a perf baseline showing sub-2s open at 100 GiB.
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq, Default)]
 pub(crate) enum VaultFormatArg {
@@ -513,12 +513,12 @@ enum Command {
     ///
     /// Mountpoint conventions:
     ///  - Linux / macOS (FUSE3 / FUSE-T / macFUSE): mountpoint is an
-    ///     EXISTING empty directory. `mkdir -p ~/vault && luksbox mount
-    ///     v.lbx ~/vault` is the typical pattern.
+    ///    EXISTING empty directory. `mkdir -p ~/vault && luksbox mount
+    ///    v.lbx ~/vault` is the typical pattern.
     ///  - Windows (WinFsp): mountpoint is either a drive letter
-    ///     (e.g. `Z:`) OR a non-existent path the driver materializes
-    ///     as a reparse point. Passing an existing directory yields
-    ///     STATUS_OBJECT_NAME_COLLISION (0xC0000035) at mount start.
+    ///    (e.g. `Z:`) OR a non-existent path the driver materializes
+    ///    as a reparse point. Passing an existing directory yields
+    ///    STATUS_OBJECT_NAME_COLLISION (0xC0000035) at mount start.
     ///
     /// By default the mount daemonizes on Linux/macOS (you get your
     /// shell back; unmount with `luksbox umount`). Windows always runs
@@ -2197,7 +2197,7 @@ fn read_passphrase_from_stdin_pipe() -> io::Result<Zeroizing<String>> {
 ///      another process or redirected from a file). The passphrase
 ///      bytes never appear in argv or env; the writing process
 ///      controls visibility. Use:
-///        cat ~/.config/my-pp | luksbox open my.lbx
+///      `cat ~/.config/my-pp | luksbox open my.lbx`
 ///   2. `LUKSBOX_PASSPHRASE` env var, if set. (Convenient for shell
 ///      scripts; visible to same-UID processes via
 ///      `/proc/<pid>/environ` so prefer the pipe when both are
@@ -2919,14 +2919,19 @@ fn open_container_tpm2_fido2(path: &Path, header_path: Option<&Path>) -> Result<
                 stored_cred.len()
             ))
         );
-        let hmac_secret =
-            match auth.hmac_secret(RP_ID, &stored_cred, &slot.fido2_hmac_salt, slot.fido2_salt_prehashed(), Some(&pin)) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2: {e}").into());
-                    continue;
-                }
-            };
+        let hmac_secret = match auth.hmac_secret(
+            RP_ID,
+            &stored_cred,
+            &slot.fido2_hmac_salt,
+            slot.fido2_salt_prehashed(),
+            Some(&pin),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(format!("FIDO2: {e}").into());
+                continue;
+            }
+        };
 
         // The closure captures `sealer` mutably to call unseal()
         // for whichever slot blob format::try_unlock hands it.
@@ -2974,7 +2979,7 @@ fn open_container_tpm2_fido2(_path: &Path, _header_path: Option<&Path>) -> Resul
 }
 
 /// Hybrid TPM 2.0 + ML-KEM-768 unlock. Reads the .hybrid sidecar
-/// + the .kyber seed file (decrypts under user-supplied passphrase),
+/// and the .kyber seed file (decrypts under user-supplied passphrase),
 /// then for each HybridPqKemTpm2 slot decapsulates the Kyber
 /// ciphertext to obtain `pq_shared` and asks the TPM to unseal the
 /// stored blob; both halves go into UnlockMaterial::HybridPqTpm2.
@@ -3116,14 +3121,19 @@ fn open_container_hybrid_pq_tpm2_fido2(
             "{}",
             auth_prompt(&format!("3-factor unlock (slot {slot_idx})"))
         );
-        let hmac_secret =
-            match auth.hmac_secret(RP_ID, &stored_cred, &slot.fido2_hmac_salt, slot.fido2_salt_prehashed(), Some(&pin)) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2: {e}"));
-                    continue;
-                }
-            };
+        let hmac_secret = match auth.hmac_secret(
+            RP_ID,
+            &stored_cred,
+            &slot.fido2_hmac_salt,
+            slot.fido2_salt_prehashed(),
+            Some(&pin),
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(format!("FIDO2: {e}"));
+                continue;
+            }
+        };
         let pq_shared = match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
             Ok(s) => s,
             Err(e) => {
@@ -3913,13 +3923,25 @@ fn cmd_info(path: &Path) -> Result<()> {
         if s.touches_fido2() {
             if s.fido2_salt_prehashed() {
                 println!("       compat: V4 cross-platform (Linux/macOS/Windows)");
-            } else {
+            } else if s.kind == luksbox_core::SlotKind::Fido2HmacSecret {
+                // aad_version is 0-based on disk (AAD_VERSION_V1 = 0);
+                // the user-facing label is 1-based.
                 println!(
                     "       compat: V{ver} Linux/macOS-only -- migrate with \
                      `luksbox migrate-fido2-slot {path} --slot {i}` for \
                      cross-platform unlock",
-                    ver = s.aad_version,
+                    ver = s.aad_version + 1,
                     path = path.display(),
+                );
+            } else {
+                // migrate-fido2-slot only handles wrap-style FIDO2
+                // slots; don't point the user at a command that will
+                // refuse this kind.
+                println!(
+                    "       compat: V{ver} Linux/macOS-only -- migration \
+                     for this slot kind is not available yet; re-enroll \
+                     the credential on v0.3.0 for cross-platform unlock",
+                    ver = s.aad_version + 1,
                 );
             }
         }
@@ -4030,8 +4052,8 @@ fn cmd_migrate_fido2_slot(path: &Path, unlock: &UnlockArgs, slot: usize) -> Resu
 
     let new_idx = c.enroll_fido2(None, &hmac_secret, &cred_id, hmac_salt, kdf_params())?;
     if new_idx == slot {
-        // Shouldn't happen — `enroll_fido2` picks the first empty
-        // slot and `slot` is currently occupied — but defensively
+        // Shouldn't happen -- `enroll_fido2` picks the first empty
+        // slot and `slot` is currently occupied -- but defensively
         // refuse to revoke the new slot if it did.
         c.persist_header()?;
         return Err(cli_err!(
@@ -5715,15 +5737,31 @@ fn cli_open_deniable_v2(
             {
                 let salt = payload_hmac_salt
                     .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
-                let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt)?;
+                let pin = read_fido2_pin()?;
+                let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, true, &pin)?;
                 let cred = DeniableCredential::Fido2Passphrase {
                     passphrase: pass_zeroizing.as_bytes(),
                     argon2,
                     hmac_secret_output: &hmac,
                 };
-                Ok(luksbox_format::Container::complete_open_v2_deniable(
-                    envelope, &cred,
-                )?)
+                match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred)
+                {
+                    Ok(c) => Ok(c),
+                    Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                        cli_deniable_raw_salt_retry_notice();
+                        let hmac =
+                            cli_fido2_hmac_from_payload(&payload_cred_id, &salt, false, &pin)?;
+                        let cred = DeniableCredential::Fido2Passphrase {
+                            passphrase: pass_zeroizing.as_bytes(),
+                            argon2,
+                            hmac_secret_output: &hmac,
+                        };
+                        Ok(luksbox_format::Container::complete_open_v2_deniable(
+                            envelope, &cred,
+                        )?)
+                    }
+                    Err((_, e)) => Err(e.into()),
+                }
             }
             #[cfg(not(feature = "hardware"))]
             Err(cli_err!("FIDO2 hardware support not compiled in"))
@@ -5747,16 +5785,33 @@ fn cli_open_deniable_v2(
                 let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
                 let salt = payload_hmac_salt
                     .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
-                let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt)?;
+                let pin = read_fido2_pin()?;
+                let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, true, &pin)?;
                 let cred = DeniableCredential::HybridPqFido2Passphrase {
                     passphrase: pass_zeroizing.as_bytes(),
                     argon2,
                     mlkem_shared: &shared,
                     hmac_secret_output: &hmac,
                 };
-                Ok(luksbox_format::Container::complete_open_v2_deniable(
-                    envelope, &cred,
-                )?)
+                match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred)
+                {
+                    Ok(c) => Ok(c),
+                    Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                        cli_deniable_raw_salt_retry_notice();
+                        let hmac =
+                            cli_fido2_hmac_from_payload(&payload_cred_id, &salt, false, &pin)?;
+                        let cred = DeniableCredential::HybridPqFido2Passphrase {
+                            passphrase: pass_zeroizing.as_bytes(),
+                            argon2,
+                            mlkem_shared: &shared,
+                            hmac_secret_output: &hmac,
+                        };
+                        Ok(luksbox_format::Container::complete_open_v2_deniable(
+                            envelope, &cred,
+                        )?)
+                    }
+                    Err((_, e)) => Err(e.into()),
+                }
             }
             #[cfg(not(feature = "hardware"))]
             Err(cli_err!("FIDO2 hardware support not compiled in"))
@@ -5778,16 +5833,31 @@ fn cli_open_deniable_v2(
             let unsealed = cli_tpm_unseal_from_bytes(&payload_tpm_blob, None)?;
             let salt = payload_hmac_salt
                 .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
-            let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt)?;
+            let pin = read_fido2_pin()?;
+            let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, true, &pin)?;
             let cred = DeniableCredential::TpmFido2Passphrase {
                 passphrase: pass_zeroizing.as_bytes(),
                 argon2,
                 unsealed: &unsealed,
                 hmac_secret_output: &hmac,
             };
-            Ok(luksbox_format::Container::complete_open_v2_deniable(
-                envelope, &cred,
-            )?)
+            match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred) {
+                Ok(c) => Ok(c),
+                Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                    cli_deniable_raw_salt_retry_notice();
+                    let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, false, &pin)?;
+                    let cred = DeniableCredential::TpmFido2Passphrase {
+                        passphrase: pass_zeroizing.as_bytes(),
+                        argon2,
+                        unsealed: &unsealed,
+                        hmac_secret_output: &hmac,
+                    };
+                    Ok(luksbox_format::Container::complete_open_v2_deniable(
+                        envelope, &cred,
+                    )?)
+                }
+                Err((_, e)) => Err(e.into()),
+            }
         }
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         CliDenCred::PqTpm => {
@@ -5811,7 +5881,8 @@ fn cli_open_deniable_v2(
             let unsealed = cli_tpm_unseal_from_bytes(&payload_tpm_blob, None)?;
             let salt = payload_hmac_salt
                 .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
-            let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt)?;
+            let pin = read_fido2_pin()?;
+            let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, true, &pin)?;
             let cred = DeniableCredential::HybridPqTpmFido2Passphrase {
                 passphrase: pass_zeroizing.as_bytes(),
                 argon2,
@@ -5819,9 +5890,24 @@ fn cli_open_deniable_v2(
                 unsealed: &unsealed,
                 hmac_secret_output: &hmac,
             };
-            Ok(luksbox_format::Container::complete_open_v2_deniable(
-                envelope, &cred,
-            )?)
+            match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred) {
+                Ok(c) => Ok(c),
+                Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                    cli_deniable_raw_salt_retry_notice();
+                    let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, false, &pin)?;
+                    let cred = DeniableCredential::HybridPqTpmFido2Passphrase {
+                        passphrase: pass_zeroizing.as_bytes(),
+                        argon2,
+                        mlkem_shared: &shared,
+                        unsealed: &unsealed,
+                        hmac_secret_output: &hmac,
+                    };
+                    Ok(luksbox_format::Container::complete_open_v2_deniable(
+                        envelope, &cred,
+                    )?)
+                }
+                Err((_, e)) => Err(e.into()),
+            }
         }
         #[cfg(not(all(feature = "hardware", target_os = "linux")))]
         CliDenCred::Tpm | CliDenCred::TpmFido2 | CliDenCred::PqTpm | CliDenCred::PqTpmFido2 => Err(
@@ -5837,22 +5923,38 @@ fn cli_open_deniable_v2(
 fn cli_fido2_hmac_from_payload(
     cred_id: &[u8],
     salt: &[u8; 32],
+    prehash_salt: bool,
+    pin: &str,
 ) -> Result<luksbox_fido2::HmacSecret> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID};
     if cred_id.is_empty() {
         return Err(cli_err!("envelope cred_id is empty for FIDO2 variant"));
     }
-    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
     let mut auth = make_fido2_authenticator();
-    // Deniable v2 envelopes embedded the cred_id + salt at create
-    // time, so the convention they recorded is whatever the
-    // creating-side LUKSbox stamped. v0.3.0 onwards always uses the
-    // V4 prehashed-salt convention for new envelopes; older v2
-    // envelopes would need an envelope-version probe here. The
-    // deniable-header v2 format is still in flux (see
-    // docs/DENIABLE_HEADER.md), so we hard-code `true` and revisit
-    // when the envelope gains an explicit convention version.
-    Ok(auth.hmac_secret(RP_ID, cred_id, salt, true, Some(pin.as_str()))?)
+    // Deniable v2 envelopes embed the cred_id + salt at create time
+    // but, unlike keyslots (which carry `aad_version`), record NO
+    // salt-convention marker. v0.3.0 onwards creates envelopes with
+    // the V4 prehashed convention; v0.2.1/v0.2.2 envelopes recorded
+    // raw-salt HMACs on Linux/macOS. Callers therefore probe: try
+    // `prehash_salt = true` first, and on an inner-AEAD failure
+    // retry with `false` via
+    // `Container::complete_open_v2_deniable_reusable`. The PIN is
+    // prompted once by the caller so the fallback costs only a
+    // second touch.
+    Ok(auth.hmac_secret(RP_ID, cred_id, salt, prehash_salt, Some(pin))?)
+}
+
+/// User-facing notice for the second probe attempt (see
+/// `cli_fido2_hmac_from_payload`).
+#[cfg(feature = "hardware")]
+fn cli_deniable_raw_salt_retry_notice() {
+    eprintln!(
+        "{}",
+        auth_prompt(
+            "unlock failed under the v0.3.0 salt convention; \
+             retrying with the pre-v0.3.0 raw-salt convention"
+        )
+    );
 }
 
 /// Drive the TPM to unseal a blob taken from the envelope payload.

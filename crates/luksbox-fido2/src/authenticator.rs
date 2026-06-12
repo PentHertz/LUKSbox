@@ -118,8 +118,8 @@ pub trait Fido2Authenticator {
     ///   `prehash_salt=true`; passes it raw when false.
     /// - webauthn.dll (Windows): always prehashes internally per
     ///   W3C WebAuthn Level 3 PRF behaviour, so the param can only
-    ///   honour `true`. On `false` (V1/V2/V3 slot) it returns a
-    ///   `Fido2SlotPlatformLocked` error pointing at the migration
+    ///   honour `true`. On `false` (V1/V2/V3 slot) it returns an
+    ///   `Error::Other` whose message points at the migration
     ///   command rather than producing wrong bytes.
     /// - mock: mirrors libfido2 semantics for tests.
     fn hmac_secret(

@@ -405,9 +405,9 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
                  two paths produce different HMAC outputs from the \
                  same authenticator. Migrate the slot to the \
                  cross-platform v0.3.0 convention by running \
-                 `luksbox migrate-fido2-slot --slot N` on Linux or \
-                 macOS, or enroll a backup passphrase keyslot for \
-                 cross-platform access."
+                 `luksbox migrate-fido2-slot <vault> --slot N` on \
+                 Linux or macOS, or enroll a backup passphrase \
+                 keyslot for cross-platform access."
                     .into(),
             ));
         }

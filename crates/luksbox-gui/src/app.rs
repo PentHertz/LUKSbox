@@ -2359,11 +2359,9 @@ impl LuksboxApp {
                 // preserve the long-name UX without a competing
                 // click rect.
                 ui.add(
-                    egui::Label::new(
-                        RichText::new(&name).strong().color(title_color).size(13.0),
-                    )
-                    .truncate()
-                    .selectable(false),
+                    egui::Label::new(RichText::new(&name).strong().color(title_color).size(13.0))
+                        .truncate()
+                        .selectable(false),
                 )
                 .on_hover_text(&name);
                 // Path label: also visual; bg click sense covers it.
@@ -6028,8 +6026,9 @@ impl LuksboxApp {
     ///
     /// The two backends report completion differently:
     ///  - InProcess: receiver fires with the worker thread's
-    ///     `Result<(), String>`.
+    ///    `Result<(), String>`.
     ///  - Subprocess: child.try_wait() returns Some(ExitStatus).
+    ///
     /// Both translate into the same view transition.
     fn poll_mount(&mut self) {
         let Some(ms) = self.mount_status.as_mut() else {
@@ -6288,14 +6287,34 @@ impl LuksboxApp {
                                             .small()
                                             .color(theme::FAINT),
                                     );
-                                } else {
+                                } else if slot.kind
+                                    == luksbox_core::SlotKind::Fido2HmacSecret
+                                {
+                                    // aad_version is 0-based on disk
+                                    // (AAD_VERSION_V1 = 0); show the
+                                    // 1-based label users see in docs.
                                     ui.label(
                                         RichText::new(format!(
                                             "V{}: Linux/macOS-only \
                                              (pre-v0.3.0; run `luksbox \
-                                             migrate-fido2-slot --slot {i}` \
-                                             for cross-platform)",
-                                            slot.aad_version
+                                             migrate-fido2-slot <vault> \
+                                             --slot {i}` for cross-platform)",
+                                            slot.aad_version + 1
+                                        ))
+                                        .small()
+                                        .color(theme::WARN),
+                                    );
+                                } else {
+                                    // migrate-fido2-slot refuses
+                                    // non-wrap-style kinds; don't send
+                                    // the user to a dead end.
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "V{}: Linux/macOS-only \
+                                             (pre-v0.3.0; no migration for \
+                                             this slot kind yet -- re-enroll \
+                                             on v0.3.0 for cross-platform)",
+                                            slot.aad_version + 1
                                         ))
                                         .small()
                                         .color(theme::WARN),

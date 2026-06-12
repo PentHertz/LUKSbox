@@ -746,6 +746,7 @@ pub struct OrphanTempfile {
 ///     * `<vault_filename>.anchor.tmp.<16hex>`
 ///     * `<vault_filename>.hybrid.tmp.<16hex>`
 ///     * `<vault_filename>.kyber.tmp.<16hex>`
+///
 ///   We don't enforce the sidecar substring strictly; the
 ///   `<vault_filename>` prefix + `.tmp.<16hex>` suffix is sufficient.
 pub fn find_orphan_tempfiles(vault_path: &Path) -> io::Result<Vec<OrphanTempfile>> {

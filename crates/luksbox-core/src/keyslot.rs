@@ -440,7 +440,7 @@ impl SlotKind {
 pub struct Keyslot {
     pub kind: SlotKind,
     /// AEAD AAD shape, see `OFF_AAD_VERSION` doc. Set by every
-    /// `Keyslot::new_*` constructor to `AAD_VERSION_V2`. Read by
+    /// `Keyslot::new_*` constructor to `AAD_VERSION_V4`. Read by
     /// `from_bytes` from the on-disk byte. Empty slots leave it 0.
     pub aad_version: u8,
     pub uuid: [u8; 16],
@@ -500,10 +500,10 @@ impl Keyslot {
     /// Does this slot's wire format require the FIDO2 hmac-secret
     /// salt to be SHA-256 prehashed before reaching the authenticator?
     ///
-    /// V1/V2/V3 FIDO2 slots: no — libfido2 sends the raw salt. These
+    /// V1/V2/V3 FIDO2 slots: no -- libfido2 sends the raw salt. These
     /// slots are Linux/macOS-only because webauthn.dll on Windows
     /// always prehashes, producing a different HMAC output.
-    /// V4+ FIDO2 slots: yes — libfido2 callers prehash explicitly
+    /// V4+ FIDO2 slots: yes -- libfido2 callers prehash explicitly
     /// (this function returns true), and webauthn.dll prehashes on
     /// its own. Both converge cross-platform.
     ///

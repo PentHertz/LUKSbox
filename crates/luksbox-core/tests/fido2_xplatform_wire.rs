@@ -156,7 +156,7 @@ fn v4_keyslot_roundtrips_through_both_backend_simulations() {
         .expect("V4 slot must unlock on the simulated Linux path");
     assert_eq!(recovered_linux.as_bytes(), mvk.as_bytes());
 
-    // Unlock via the "Windows V4 path" — caller passes raw salt to
+    // Unlock via the "Windows V4 path" -- caller passes raw salt to
     // webauthn.dll, which prehashes; modelled by manual prehash then
     // mock with `prehash_salt=false`.
     let prehashed_salt: [u8; 32] = Sha256::digest(parsed.fido2_hmac_salt).into();

@@ -41,8 +41,12 @@ use crate::LAZY_FLUSH_INTERVAL_SECS;
 /// Users who want pre-Layer-1 eager-flush semantics back pass `--sync`
 /// to `luksbox mount`. The interval constant lives in the crate root
 /// (`crate::LAZY_FLUSH_INTERVAL_SECS`) and is shared with the FUSE-T
-/// and WinFsp adapters which implement the same pattern.
-
+/// and WinFsp adapters, which run the same timer thread. One known
+/// divergence: the FUSE-T adapter's `flush()` callback (close(2))
+/// stays eager regardless of `--sync` -- FUSE-T bridges the macOS
+/// NFS client, whose COMMIT expects data to be stable when it
+/// returns -- so write+close workloads on FUSE-T see only part of
+/// the Layer-1 win.
 pub fn mount(vfs: Vfs, mountpoint: &Path, daemonize: bool, sync_mode: bool) -> std::io::Result<()> {
     // AutoUnmount intentionally NOT used: on Linux it implies allow_other,
     // which kernel rejects for non-root unless /etc/fuse.conf has
@@ -457,8 +461,16 @@ impl LuksboxFs {
                                 break;
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                if let Ok(mut v) = timer_vfs.lock() {
-                                    let _ = v.flush();
+                                if let Ok(mut v) = timer_vfs.lock()
+                                    && let Err(e) = v.flush()
+                                {
+                                    // No syscall to report to from a
+                                    // timer tick; log so a failing
+                                    // vault file (ENOSPC, EIO) is at
+                                    // least visible. The next tick
+                                    // retries; fsync(2)/unmount also
+                                    // surface the error.
+                                    eprintln!("luksbox-mount: deferred flush failed: {e}");
                                 }
                             }
                         }
@@ -483,10 +495,14 @@ impl LuksboxFs {
     /// `LAZY_FLUSH_INTERVAL_SECS`. With `--sync` mount option (set
     /// via `luksbox mount --sync`), every mutation drives an
     /// immediate flush, restoring pre-Layer-1 durability semantics.
-    fn maybe_flush_now(&self, vfs: &mut Vfs) {
-        if self.sync_mode {
-            let _ = vfs.flush();
-        }
+    ///
+    /// Returns the flush error so --sync callers can report
+    /// EIO/ENOSPC to the syscall instead of claiming success while
+    /// the vault file rejected the write (the pre-Layer-1 handlers
+    /// propagated flush failures the same way). Always Ok in
+    /// deferred mode.
+    fn maybe_flush_now(&self, vfs: &mut Vfs) -> Result<(), VfsError> {
+        if self.sync_mode { vfs.flush() } else { Ok(()) }
     }
 
     fn attr(&self, id: FileId) -> Option<FileAttr> {
@@ -557,6 +573,10 @@ fn errno(e: &VfsError) -> Errno {
         VfsError::MetadataBudgetExhausted => Errno::ENOSPC,
         // File-size cap is "exceeds the maximum file size" -> EFBIG.
         VfsError::FileSizeExceedsCap => Errno::EFBIG,
+        // Tolerant-recovery sessions refuse every mutation; EROFS
+        // tells cp/rsync/editors the truth ("read-only file system")
+        // instead of a generic I/O error.
+        VfsError::ReadOnlyMount => Errno::EROFS,
         _ => Errno::EIO,
     }
 }
@@ -638,8 +658,11 @@ impl Filesystem for LuksboxFs {
                 return;
             }
         }
-        if size.is_some() || mode.is_some() {
-            self.maybe_flush_now(&mut vfs);
+        if (size.is_some() || mode.is_some())
+            && let Err(e) = self.maybe_flush_now(&mut vfs)
+        {
+            reply.error(errno(&e));
+            return;
         }
         // attr() takes its own lock so drop ours first.
         drop(vfs);
@@ -799,7 +822,10 @@ impl Filesystem for LuksboxFs {
             };
             match vfs.create_with_mode(parent.0, name, effective_mode) {
                 Ok(id) => {
-                    self.maybe_flush_now(&mut vfs);
+                    if let Err(e) = self.maybe_flush_now(&mut vfs) {
+                        reply.error(errno(&e));
+                        return;
+                    }
                     id
                 }
                 Err(e) => {
@@ -850,7 +876,10 @@ impl Filesystem for LuksboxFs {
                     // that case within LAZY_FLUSH_INTERVAL_SECS, and
                     // the final unmount flush in destroy() catches
                     // anything still in flight.
-                    self.maybe_flush_now(&mut vfs);
+                    if let Err(e) = self.maybe_flush_now(&mut vfs) {
+                        reply.error(errno(&e));
+                        return;
+                    }
                     id
                 }
                 Err(e) => {
@@ -871,9 +900,9 @@ impl Filesystem for LuksboxFs {
             return;
         };
         let r = match self.vfs.lock() {
-            Ok(mut v) => v.unlink(parent.0, name).map(|_| {
-                self.maybe_flush_now(&mut v);
-            }),
+            Ok(mut v) => v
+                .unlink(parent.0, name)
+                .and_then(|_| self.maybe_flush_now(&mut v)),
             Err(_) => {
                 reply.error(Errno::EIO);
                 return;
@@ -891,9 +920,9 @@ impl Filesystem for LuksboxFs {
             return;
         };
         let r = match self.vfs.lock() {
-            Ok(mut v) => v.rmdir(parent.0, name).map(|_| {
-                self.maybe_flush_now(&mut v);
-            }),
+            Ok(mut v) => v
+                .rmdir(parent.0, name)
+                .and_then(|_| self.maybe_flush_now(&mut v)),
             Err(_) => {
                 reply.error(Errno::EIO);
                 return;
@@ -962,9 +991,8 @@ impl Filesystem for LuksboxFs {
                     reply.error(Errno::EEXIST);
                     return;
                 }
-                v.rename(parent.0, name, newparent.0, newname).map(|_| {
-                    self.maybe_flush_now(&mut v);
-                })
+                v.rename(parent.0, name, newparent.0, newname)
+                    .and_then(|_| self.maybe_flush_now(&mut v))
             }
             Err(_) => {
                 reply.error(Errno::EIO);
@@ -987,10 +1015,14 @@ impl Filesystem for LuksboxFs {
     ) {
         // FUSE flush() is called on every close(2). POSIX does NOT
         // require close() to be durable -- that's fsync()'s job.
-        // Deferred under Layer 1; eager only in --sync mode.
+        // Deferred under Layer 1; eager only in --sync mode, where a
+        // failed flush (ENOSPC/EIO on the vault file) must surface
+        // at close(2) instead of silently reporting success.
         if let Ok(mut v) = self.vfs.lock() {
-            self.maybe_flush_now(&mut v);
-            reply.ok();
+            match self.maybe_flush_now(&mut v) {
+                Ok(()) => reply.ok(),
+                Err(e) => reply.error(errno(&e)),
+            }
         } else {
             reply.error(Errno::EIO);
         }
@@ -1040,9 +1072,12 @@ impl Filesystem for LuksboxFs {
     ) {
         // Final close of an fd. Same POSIX rule as flush() above:
         // close() is not required to be durable. Deferred under
-        // Layer 1.
-        if let Ok(mut v) = self.vfs.lock() {
-            self.maybe_flush_now(&mut v);
+        // Layer 1; in --sync mode a failed flush surfaces here too.
+        if let Ok(mut v) = self.vfs.lock()
+            && let Err(e) = self.maybe_flush_now(&mut v)
+        {
+            reply.error(errno(&e));
+            return;
         }
         reply.ok();
     }
@@ -1059,13 +1094,13 @@ impl Filesystem for LuksboxFs {
     }
 
     fn destroy(&mut self) {
-        // Signal the deferred-flush timer thread to exit. Dropping
-        // the Sender is enough -- the timer's recv_timeout returns
-        // Disconnected on the next iteration. Doing it explicitly
-        // here means the thread exits within milliseconds of
-        // unmount, not after up to LAZY_FLUSH_INTERVAL_SECS more
-        // sleeping. Same Mutex<Option<_>>::take() pattern as
-        // pending modal teardown elsewhere.
+        // Stop the deferred-flush timer thread by dropping the
+        // Sender: the timer's recv_timeout wakes with Disconnected
+        // immediately instead of after up to
+        // LAZY_FLUSH_INTERVAL_SECS more sleeping. The
+        // Mutex<Option<_>> wrapper exists only so destroy(), which
+        // takes &mut self but can race Drop, can take() the Sender
+        // exactly once.
         if let Ok(mut tx) = self.timer_stop_tx.lock()
             && let Some(tx) = tx.take()
         {
@@ -1073,9 +1108,13 @@ impl Filesystem for LuksboxFs {
         }
         // Final flush before the FS handle dies. Catches any
         // deferred metadata changes since the last timer tick AND
-        // (in --sync mode) is a defensive no-op.
-        if let Ok(mut v) = self.vfs.lock() {
-            let _ = v.flush();
+        // (in --sync mode) is a defensive no-op. destroy() has no
+        // syscall to report to, so log -- this is the last chance
+        // to tell the user their final changes did not persist.
+        if let Ok(mut v) = self.vfs.lock()
+            && let Err(e) = v.flush()
+        {
+            eprintln!("luksbox-mount: final unmount flush failed: {e}");
         }
     }
 
@@ -1150,7 +1189,10 @@ impl Filesystem for LuksboxFs {
         let id = match self.vfs.lock() {
             Ok(mut v) => match v.symlink(parent.0, link_name, target_str) {
                 Ok(id) => {
-                    self.maybe_flush_now(&mut v);
+                    if let Err(e) = self.maybe_flush_now(&mut v) {
+                        reply.error(errno(&e));
+                        return;
+                    }
                     id
                 }
                 Err(e) => {
@@ -1218,9 +1260,9 @@ impl Filesystem for LuksboxFs {
             return;
         };
         let r = match self.vfs.lock() {
-            Ok(mut v) => v.link(ino.0, newparent.0, newname).map(|_| {
-                self.maybe_flush_now(&mut v);
-            }),
+            Ok(mut v) => v
+                .link(ino.0, newparent.0, newname)
+                .and_then(|_| self.maybe_flush_now(&mut v)),
             Err(_) => {
                 reply.error(Errno::EIO);
                 return;

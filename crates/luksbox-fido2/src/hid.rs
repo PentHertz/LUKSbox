@@ -392,11 +392,7 @@ impl Fido2Authenticator for HidAuthenticator {
             )?;
             checked_at(
                 "fido_assert_set_hmac_salt",
-                fido_assert_set_hmac_salt(
-                    assert.ptr,
-                    salt_to_send.as_ptr(),
-                    salt_to_send.len(),
-                ),
+                fido_assert_set_hmac_salt(assert.ptr, salt_to_send.as_ptr(), salt_to_send.len()),
             )?;
             checked_at(
                 "fido_assert_set_up",
@@ -714,6 +710,7 @@ fn map_err_at(call: &'static str, rc: c_int) -> Error {
 ///   - Windows Hello not set up at all (no PIN/biometric enrolled).
 ///   - Camera/fingerprint hardware unavailable when only that
 ///     method is enrolled.
+///
 /// We don't have enough info to disambiguate, so the wrapper lists
 /// all four. Better than the raw libfido2 string by a wide margin.
 fn maybe_winhello_context<T>(

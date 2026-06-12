@@ -120,7 +120,9 @@ impl KeyEncryptionKey {
     /// stack before the field assignment, leaving 32 bytes of KEK material
     /// readable in the stack frame after the move. This form constructs
     /// the destination first and writes the bytes into it through a
-    /// borrowed pointer, so no anonymous Copy temporary exists.
+    /// borrowed pointer, removing that extra anonymous Copy temporary
+    /// (Rust does not guarantee NRVO, so the return-slot move below can
+    /// still copy).
     ///
     /// NOTE: `KeyEncryptionKey`'s inline `[u8; KEY_LEN]` storage means
     /// the returned value still carries 32 bytes by value through the
