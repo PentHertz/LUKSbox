@@ -226,7 +226,7 @@ where
 
 // ---- types ----------------------------------------------------------------
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CreateOpts {
     pub path: PathBuf,
     pub header_path: Option<PathBuf>,
@@ -279,6 +279,35 @@ pub struct CreateOpts {
     pub use_v3_format: bool,
 }
 
+// Hand-written redacting Debug: `CreateOpts` carries up to four
+// `Option<Zeroizing<String>>` secrets. The derived Debug would print
+// them through `Zeroizing<String>`'s passthrough Debug, so a stray
+// `dbg!(&opts)` would leak the passphrase/PIN. Show the identifying
+// non-secret fields, redact every secret, and elide the rest with `..`
+// so a future field can't silently become a leak here.
+impl std::fmt::Debug for CreateOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateOpts")
+            .field("path", &self.path)
+            .field("kind", &self.kind)
+            .field("use_deniable", &self.use_deniable)
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .field(
+                "backup_passphrase",
+                &self.backup_passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .field("pin", &self.pin.as_ref().map(|_| "<redacted>"))
+            .field(
+                "hybrid_seed_pw",
+                &self.hybrid_seed_pw.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SlotKindArg {
     Passphrase,
@@ -294,7 +323,7 @@ pub enum SlotKindArg {
     HybridPq1024Fido2,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct UnlockOpts {
     pub path: PathBuf,
     pub header_path: Option<PathBuf>,
@@ -334,6 +363,29 @@ pub struct UnlockOpts {
     /// `OpenedVault::tolerated_inodes`. Use only when a normal open
     /// failed with `metadata blob deserialization failed`.
     pub recovery_mode: bool,
+}
+
+// Hand-written redacting Debug, same rationale as `CreateOpts`:
+// `UnlockOpts` holds `passphrase`/`pin`/`hybrid_seed_pw` secrets that
+// the derived Debug would print verbatim.
+impl std::fmt::Debug for UnlockOpts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UnlockOpts")
+            .field("path", &self.path)
+            .field("method", &self.method)
+            .field("use_deniable", &self.use_deniable)
+            .field("recovery_mode", &self.recovery_mode)
+            .field(
+                "passphrase",
+                &self.passphrase.as_ref().map(|_| "<redacted>"),
+            )
+            .field("pin", &self.pin.as_ref().map(|_| "<redacted>"))
+            .field(
+                "hybrid_seed_pw",
+                &self.hybrid_seed_pw.as_ref().map(|_| "<redacted>"),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 // `Tpm2*` and `HybridPqTpm2*` variants are constructed only from

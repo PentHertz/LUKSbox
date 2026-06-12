@@ -256,6 +256,24 @@ const SIZE_HEADER_LEN: usize = 8;
 /// `Error::FileSizeExceedsCap` instead of a panic / OOM.
 pub const MAX_FILE_SIZE: u64 = 1u64 << 44;
 
+// The chunk AAD binds each chunk to its index via a u32 (see
+// `chunk::chunk_aad` and the `chunk_idx as u32` casts on the write /
+// rotate paths). That is only sound while the largest reachable chunk
+// index fits in a u32. For the dominant (non-hide-size) path the
+// largest index is `MAX_FILE_SIZE / CHUNK_PLAINTEXT_SIZE - 1`; pin it
+// to u32 range so raising MAX_FILE_SIZE past 1<<44 fails the build
+// instead of silently truncating index 2^32 to 0 (which would let two
+// chunks of one file share an AAD and defeat the position-binding
+// defense). Hide-size mode adds one chunk (the size header), nudging
+// the theoretical max to exactly 2^32; that single edge stays
+// unreachable because `check_metadata_budget_for_chunks` refuses tens
+// of GB of ChunkRefs long before -- but never widen MAX_FILE_SIZE
+// without re-deriving this bound.
+const _: () = assert!(
+    MAX_FILE_SIZE / (CHUNK_PLAINTEXT_SIZE as u64) - 1 <= u32::MAX as u64,
+    "MAX_FILE_SIZE too large: a chunk index would overflow the u32 in the chunk AAD",
+);
+
 /// Number of chunks needed to hold a file of `real_size` bytes, accounting
 /// for the chunk-0 size-header in `hide_size` mode.
 ///
@@ -1009,6 +1027,37 @@ fn validate_metadata_tree(
         }
     }
 
+    // Reachability from ROOT. The per-inode checks above prove the
+    // reachable subgraph is a tree (each directory has a single
+    // referencing entry; entry_count == link_count), but they do NOT
+    // exclude a DISCONNECTED component: e.g. two directories A and B
+    // that each hold the other as their one child and name each other
+    // as parent. Each is referenced exactly once and has link_count 1,
+    // so every local check passes, yet neither is reachable from root.
+    // Honest writes never produce such an orphan (or orphan cycle); it
+    // would waste metadata budget, re-persist on every flush, and is
+    // the one shape that could feed the tolerated-inode path resolver
+    // (a root DFS without a visited set) an unterminating walk if it
+    // ever became reachable. Require the root-reachable set to cover
+    // every inode.
+    let mut reachable = BTreeSet::new();
+    reachable.insert(ROOT_ID);
+    let mut stack = vec![ROOT_ID];
+    while let Some(id) = stack.pop() {
+        // Each id was either ROOT_ID or a child entry already proven
+        // to resolve in `inodes` by the loop above; `?` over `unwrap`
+        // keeps this panic-free under any future refactor.
+        let inode = tree.inodes.get(&id).ok_or(Error::MetadataDeserialize)?;
+        for &child_id in inode.children.values() {
+            if reachable.insert(child_id) {
+                stack.push(child_id);
+            }
+        }
+    }
+    if reachable.len() != tree.inodes.len() {
+        return invalid_metadata();
+    }
+
     let mut free_chunks = BTreeSet::new();
     for &id in &tree.free_chunks {
         if id >= tree.next_chunk_id
@@ -1340,6 +1389,14 @@ impl Vfs {
         // returned Err) don't leak into this open's report.
         let _ = take_tolerated_inodes();
         let blob = container.read_metadata()?;
+        // Opt-in diagnostic (off by default). When set, this prints the
+        // first 32 bytes of the DECRYPTED metadata tree (postcard
+        // magic + counters) and, further down, inode ids/kinds/sizes
+        // and rejected symlink targets. That is vault-internal
+        // *metadata* (structure / filenames), never key material, the
+        // MVK, a passphrase, a PIN, or file *content* -- none of those
+        // are in scope on this path. Still, stderr is often captured in
+        // logs, so leave it unset outside active debugging.
         let debug = std::env::var_os("LUKSBOX_DEBUG_OPEN").is_some();
         if debug {
             let head_len = blob.len().min(32);
@@ -4896,6 +4953,44 @@ mod tests {
         match vfs.flush() {
             Err(Error::MetadataDeserialize) => {} // validator caught it
             Ok(()) => panic!("flush must reject link_count == 0"),
+            Err(e) => panic!("expected MetadataDeserialize, got {e:?}"),
+        }
+    }
+
+    /// **Security / integrity**: a DISCONNECTED directory cycle (two
+    /// dirs that reference each other but are unreachable from root)
+    /// passes every local per-inode check -- each is referenced once,
+    /// link_count 1, parent is a directory -- yet must be rejected by
+    /// the root-reachability pass. Honest writes never produce one;
+    /// accepting it would waste metadata budget and (if it ever became
+    /// reachable) feed the tolerated-inode path resolver a walk it
+    /// could not terminate.
+    #[test]
+    fn disconnected_directory_cycle_is_rejected_at_flush() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let a = vfs.mkdir(root, "a").unwrap();
+        let b = vfs.mkdir(root, "b").unwrap();
+        // Detach both from root, then wire them into a 2-node cycle
+        // that names each other as parent. Every local check passes;
+        // only the root-reachability pass can catch this.
+        vfs.tree.inodes.get_mut(&root).unwrap().children.clear();
+        {
+            let ia = vfs.tree.inodes.get_mut(&a).unwrap();
+            ia.parent = b;
+            ia.children.insert("to_b".to_string(), b);
+        }
+        {
+            let ib = vfs.tree.inodes.get_mut(&b).unwrap();
+            ib.parent = a;
+            ib.children.insert("to_a".to_string(), a);
+        }
+        vfs.dirty = true;
+        match vfs.flush() {
+            Err(Error::MetadataDeserialize) => {}
+            Ok(()) => panic!("flush must reject an orphan directory cycle"),
             Err(e) => panic!("expected MetadataDeserialize, got {e:?}"),
         }
     }

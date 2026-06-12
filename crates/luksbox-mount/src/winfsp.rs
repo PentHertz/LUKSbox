@@ -244,6 +244,12 @@ fn winfsp_debug() -> bool {
 /// Call inside a callback to log a one-line trace. The `result`
 /// closure is invoked AFTER the body to format the outcome - pass
 /// `Ok(...)` or `Err(STATUS_..)` as a string.
+///
+/// Gated behind `LUKSBOX_WINFSP_DEBUG` (off by default). The traces
+/// include in-vault filenames / paths and NTSTATUS codes -- that is
+/// vault-internal metadata, never key material, the MVK, a passphrase,
+/// a PIN, or file content. stderr is often captured in logs, so leave
+/// it unset outside active debugging.
 macro_rules! winfsp_trace {
     ($cb:expr, $args:expr) => {
         if $crate::winfsp::winfsp_debug() {

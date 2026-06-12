@@ -56,8 +56,8 @@ use std::io::Read;
 use std::path::Path;
 
 use hmac::{Hmac, Mac};
-use luksbox_core::MasterVolumeKey;
 use luksbox_core::file_util::{atomic_secure_create_new, atomic_secure_write};
+use luksbox_core::{MasterVolumeKey, SubKey};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
@@ -120,9 +120,12 @@ pub struct AnchorContents {
     pub generation: u64,
 }
 
-fn anchor_key(mvk: &MasterVolumeKey, header_salt: &[u8; 32]) -> [u8; 32] {
-    let key = mvk.derive_subkey(header_salt, ANCHOR_INFO);
-    *key
+fn anchor_key(mvk: &MasterVolumeKey, header_salt: &[u8; 32]) -> SubKey {
+    // Return the `Zeroizing`-backed SubKey rather than dereferencing
+    // to a bare `[u8; 32]`: this HMAC key is derived from the MVK and
+    // must be wiped on drop, not left as a plain stack array. Callers
+    // pass `&key` to `compute_mac`, which deref-coerces to `&[u8; 32]`.
+    mvk.derive_subkey(header_salt, ANCHOR_INFO)
 }
 
 fn compute_mac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
@@ -289,8 +292,12 @@ const _: () = assert!(
         == DENIABLE_ANCHOR_SIZE
 );
 
-fn deniable_anchor_key(mvk: &MasterVolumeKey, per_vault_salt: &[u8; 32]) -> [u8; 32] {
-    *mvk.derive_subkey(per_vault_salt, DENIABLE_ANCHOR_INFO)
+fn deniable_anchor_key(mvk: &MasterVolumeKey, per_vault_salt: &[u8; 32]) -> SubKey {
+    // Keep the MVK-derived AEAD key inside its `Zeroizing` wrapper
+    // (wiped on drop) instead of returning a bare `[u8; 32]`. Callers
+    // pass `&key` to `aead::seal`/`aead::open`, which deref-coerces to
+    // `&[u8; 32]`.
+    mvk.derive_subkey(per_vault_salt, DENIABLE_ANCHOR_INFO)
 }
 
 fn deniable_anchor_aad(per_vault_salt: &[u8; 32]) -> Vec<u8> {
