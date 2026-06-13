@@ -236,6 +236,14 @@ path.
 - `ReadOnlyMount` maps to EROFS over FUSE so cp/rsync/editors
   see "read-only file system" on recovery mounts instead of a
   generic I/O error.
+- **Ubuntu 26.04 (resolute) support in CI/CD.** Releases now ship a
+  native `luksbox_*_resolute_{amd64,arm64}.deb` and matching tarball,
+  built inside an `ubuntu:26.04` container so cargo-deb resolves the
+  26.04 dependency sonames (which bump again past noble). CI gains a
+  containerised 26.04 test lane (workspace + hardware profiles) that
+  runs the suite against the 26.04 library/toolchain stack. Both run
+  in a container because GitHub has no native `ubuntu-26.04` hosted
+  runner yet; the workflows note where to switch to it once it lands.
 
 ### Notes
 

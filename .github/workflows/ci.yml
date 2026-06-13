@@ -77,6 +77,61 @@ jobs:
       - name: Run ${{ matrix.profile }} tests
         run: ${{ matrix.cmd }}
 
+  # ---- Ubuntu 26.04 (resolute) compatibility lane ------------------------
+  # Builds + runs the workspace test suite against the Ubuntu 26.04
+  # ("resolute") library + toolchain stack -- newer libfido2 / libtss2 /
+  # openssl / glibc than the 22.04 host runners the rest of the matrix
+  # uses. This is the lane that catches the "new distro bumped a -dev
+  # package soname / API" breakage class (cf. the Debian trixie fixes).
+  #
+  # Runs INSIDE an `ubuntu:26.04` container on a 24.04 host because
+  # GitHub does not (yet) publish a native `ubuntu-26.04` hosted runner
+  # image; the container pins the real 26.04 package set, which is the
+  # whole point of the check. Same containerised pattern release.yml
+  # uses for the Debian trixie .deb build. Switch `runs-on` to
+  # `ubuntu-26.04` and drop the `container:` line once GitHub ships the
+  # native image.
+  test-ubuntu-2604:
+    name: test 26.04 resolute (${{ matrix.profile }})
+    runs-on: ubuntu-24.04
+    container: ubuntu:26.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - profile: workspace
+            cmd: "cargo test --workspace --exclude luksbox-gui --exclude luksbox-fuzz --exclude luksbox-fuzz-afl"
+          - profile: workspace-hardware
+            cmd: "cargo test --workspace --features luksbox-cli/hardware --exclude luksbox-gui --exclude luksbox-fuzz --exclude luksbox-fuzz-afl"
+    steps:
+      # The bare ubuntu:26.04 image lacks git (checkout), curl +
+      # ca-certificates (rustup installer download), and a C toolchain
+      # (linking + libfido2-sys bindgen). Install them BEFORE checkout
+      # and the toolchain action, same ordering as release.yml's
+      # container bootstrap.
+      - name: Bootstrap container
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates curl build-essential
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-test-2604-${{ matrix.profile }}
+      - name: Linux deps
+        uses: ./.github/actions/apt-install
+        with:
+          # libclang-dev + clang are pre-installed on the hosted ubuntu
+          # runners (no-op there) but NOT in the bare container:
+          # libfido2-sys's build script runs bindgen, which needs
+          # libclang to parse the system libfido2 headers.
+          packages: |
+            pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
+            libtss2-dev libclang-dev clang
+      - name: Run ${{ matrix.profile }} tests
+        run: ${{ matrix.cmd }}
+
   # ---- Windows mount integration tests (WinFsp kernel mount) -------------
   # Mounts a real luksbox vault on a free drive letter via the WinFsp
   # kernel driver, exercises it through Win32, then tears it down. Catches
