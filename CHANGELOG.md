@@ -54,6 +54,24 @@ feeding the raw salt and V4 slots still failed cross-platform with
 Windows backend so existing V4 vaults open on every platform with
 no recreation.
 
+**Unlock-time salt-convention fallback (Windows).** Because
+`webauthn.dll`'s salt transform cannot be observed from outside the
+DLL, every FIDO2 unlock path now tries the slot's declared
+salt-prehash convention first and, on Windows only, falls back to
+the opposite convention if the first attempt fails to authenticate,
+using whichever opens the slot. This makes a vault open regardless
+of which convention reproduces the device salt webauthn.dll feeds
+the authenticator, at the cost of one extra Windows Hello tap on the
+fallback. Applied uniformly to both FIDO2 keyslot kinds
+(`Fido2HmacSecret` wrap and `Fido2DerivedMvk` direct) and to the
+fused TPM+FIDO2 and hybrid-PQ-FIDO2 paths, in both the CLI and GUI.
+libfido2 (Linux/macOS) is deterministic, so non-Windows builds keep
+the single-attempt behaviour (no extra touch). This does NOT rescue
+the case where webauthn.dll applies the W3C "WebAuthn PRF" prefix
+(neither convention can reproduce a plain-SHA-256 device salt then);
+that would need a format change, which the `xplatform_hmac_probe`
+example can confirm.
+
 **v0.2.x compatibility:** under the corrected (passthrough) model,
 V1/V2/V3 FIDO2 slots feed the raw salt on every backend, so they
 now unlock cross-platform too -- the Windows backend no longer

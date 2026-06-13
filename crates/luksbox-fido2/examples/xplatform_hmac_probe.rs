@@ -17,25 +17,39 @@
 //! it: enroll one throwaway credential, then compare the device's
 //! hmac-secret output across the candidate transforms.
 //!
+//! IMPORTANT -- hold user-verification (UV) constant. The CTAP2
+//! hmac-secret output also depends on whether UV happened: the
+//! authenticator keeps `CredRandomWithUV` and `CredRandomWithoutUV`
+//! and HMACs with a different one each way. Windows' webauthn.dll
+//! always performs UV; libfido2 only does UV when a PIN is supplied.
+//! So set `LUKSBOX_FIDO2_PIN` on BOTH runs (any correct PIN for the
+//! key) -- otherwise the WithUV/WithoutUV difference makes everything
+//! mismatch and masks the salt signal.
+//!
 //! HOW TO RUN (same physical authenticator on both machines):
 //!   1. Linux / macOS:
-//!        cargo run -p luksbox-fido2 --features hardware \
-//!          --example xplatform_hmac_probe
+//!        LUKSBOX_FIDO2_PIN=<pin> cargo run -p luksbox-fido2 \
+//!          --features hardware --example xplatform_hmac_probe
 //!      Touch the key when prompted. It prints a `PROBE_CRED_ID=` line
 //!      plus three outputs A / B / C.
 //!   2. Windows (same key plugged in), using the printed cred id:
-//!        $env:PROBE_CRED_ID="<hex from step 1>"
+//!        $env:LUKSBOX_FIDO2_PIN="<pin>"; $env:PROBE_CRED_ID="<hex>"
 //!        cargo run -p luksbox-fido2 --features hardware \
 //!          --example xplatform_hmac_probe
-//!      It prints output W.
-//!   3. Whichever of A / B / C equals W identifies Windows' transform:
-//!        W == A  -> Windows passes the salt RAW (no hash). Fix: V4
-//!                   must NOT prehash on Linux (raw salt on both).
-//!        W == B  -> Windows does plain SHA-256(salt). The current fix
-//!                   is correct and the bug is elsewhere -- report back.
-//!        W == C  -> Windows does SHA-256("WebAuthn PRF"\0 || salt)
-//!                   (the W3C PRF prefix). Fix: Linux V4 must hash with
-//!                   that same prefix before sending to libfido2.
+//!      It prints W_raw (prehash=false) and W_pre (prehash=true).
+//!   3. Compare to the Linux A / B / C to identify webauthn.dll's
+//!      transform T (where A=HMAC(salt), B=HMAC(SHA-256(salt)),
+//!      C=HMAC(SHA-256("WebAuthn PRF"\0||salt))):
+//!        W_raw==A && W_pre==B -> T is a passthrough; V4 prehash is
+//!                   correct and a residual failure is NOT the salt.
+//!        W_raw==B  -> T = plain SHA-256. Fix: Windows must NOT prehash
+//!                   (pass the raw salt for V4).
+//!        W_raw==C  -> T = SHA-256 with the W3C "WebAuthn PRF" prefix.
+//!                   Fix: both sides must use the prefixed salt;
+//!                   existing V4 vaults need recreation.
+//!        none match -> the libfido2-created credential isn't usable
+//!                   for hmac-secret through webauthn.dll (deeper
+//!                   credential-portability problem).
 //!
 //! SECURITY NOTE: this prints raw hmac-secret bytes for a THROWAWAY
 //! credential and a fixed public salt. Use a test key / test
@@ -73,6 +87,15 @@ fn prf_prefixed(salt: &[u8; 32]) -> [u8; 32] {
 
 fn main() {
     let pin = std::env::var("LUKSBOX_FIDO2_PIN").ok();
+    if pin.is_none() {
+        eprintln!(
+            "WARNING: LUKSBOX_FIDO2_PIN is not set. libfido2 will assert \
+             WITHOUT user verification (CredRandomWithoutUV) while \
+             webauthn.dll always verifies (CredRandomWithUV), so the \
+             outputs will NOT be comparable across platforms. Set \
+             LUKSBOX_FIDO2_PIN on BOTH runs and re-run."
+        );
+    }
     let mut auth = HidAuthenticator::new();
 
     // Fixed, public probe salt so both machines use identical input.
@@ -127,15 +150,32 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     {
-        // webauthn.dll applies its own transform T to `salt`.
-        // prehash=false is rejected by the webauthn backend, so use
-        // true -- the real V4 unlock path.
-        eprintln!("TOUCH / Windows Hello for W...");
-        let w = auth
+        // webauthn.dll applies an unknown transform T to whatever bytes
+        // the backend hands it. Measure BOTH backend conventions so we
+        // can identify T by comparison with the Linux A/B/C:
+        //   W_raw = HMAC(CredRandom, T(salt))         (prehash=false)
+        //   W_pre = HMAC(CredRandom, T(SHA-256(salt))) (prehash=true)
+        eprintln!("TOUCH / Windows Hello for W_raw (prehash=false)...");
+        let w_raw = auth
+            .hmac_secret(RP_ID, &cred_id, &salt, false, pin.as_deref())
+            .expect("assert W_raw");
+        eprintln!("TOUCH / Windows Hello for W_pre (prehash=true)...");
+        let w_pre = auth
             .hmac_secret(RP_ID, &cred_id, &salt, true, pin.as_deref())
-            .expect("assert W");
-        println!("W_windows      = {}", hex(&*w));
+            .expect("assert W_pre");
+        println!("W_raw (prehash=false) = {}", hex(&*w_raw));
+        println!("W_pre (prehash=true)  = {}", hex(&*w_pre));
         println!();
-        println!("Compare W_windows to the A/B/C printed by the Linux run.");
+        println!("Interpret against the Linux A/B/C (see file header):");
+        println!("  W_raw == A  && W_pre == B  -> webauthn.dll is a PASSTHROUGH.");
+        println!("       V4 (prehash) is correct; if the vault still fails the");
+        println!("       problem is NOT the salt (report back).");
+        println!("  W_raw == B                 -> webauthn.dll does plain SHA-256.");
+        println!("       Fix: Windows must NOT prehash (pass raw salt for V4).");
+        println!("  W_raw == C                 -> webauthn.dll adds the PRF prefix.");
+        println!("       Cross-platform needs the prefixed salt on BOTH sides;");
+        println!("       existing V4 vaults must be recreated.");
+        println!("  matches none               -> credential not portable across");
+        println!("       the libfido2/webauthn.dll boundary (deeper issue).");
     }
 }

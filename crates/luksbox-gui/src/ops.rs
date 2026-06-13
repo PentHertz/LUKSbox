@@ -2990,6 +2990,29 @@ fn deniable_tpm_unseal_from_bytes(
     Ok(*unsealed)
 }
 
+/// Salt-prehash conventions to try, in order, when unlocking a FIDO2
+/// keyslot. On Windows, `webauthn.dll` applies an opaque transform to
+/// the hmac-secret salt that we cannot observe or override, so a slot
+/// enrolled under one convention may need the *other* fed to
+/// `webauthn.dll` to reproduce the device salt the slot was created
+/// with. Try the slot's declared convention first and, if the open
+/// fails, fall back to the opposite, using whichever unlocks (one extra
+/// Windows Hello tap only on the fallback). libfido2 (Linux/macOS) is
+/// deterministic, so the declared convention is always correct there
+/// and we try only it. Mirrors the deniable-envelope probe above and
+/// the CLI's `fido2_salt_conventions`.
+#[cfg(feature = "hardware")]
+fn fido2_salt_conventions(declared_prehash: bool) -> Vec<bool> {
+    #[cfg(target_os = "windows")]
+    {
+        vec![declared_prehash, !declared_prehash]
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![declared_prehash]
+    }
+}
+
 #[cfg(feature = "hardware")]
 fn unlock_with_fido2(
     path: &Path,
@@ -3013,30 +3036,35 @@ fn unlock_with_fido2(
         ) {
             continue;
         }
-        let hmac_secret = match auth.hmac_secret(
-            RP_ID,
-            &slot.fido2_cred_id,
-            &slot.fido2_hmac_salt,
-            slot.fido2_salt_prehashed(),
-            Some(pin),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(format!("FIDO2: {e}"));
-                continue;
+        // Declared salt convention first, then (Windows) the opposite,
+        // since webauthn.dll's salt transform is opaque. Covers both
+        // Fido2HmacSecret (wrap) and Fido2DerivedMvk (direct).
+        for prehash in fido2_salt_conventions(slot.fido2_salt_prehashed()) {
+            let hmac_secret = match auth.hmac_secret(
+                RP_ID,
+                &slot.fido2_cred_id,
+                &slot.fido2_hmac_salt,
+                prehash,
+                Some(pin),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(format!("FIDO2: {e}"));
+                    continue;
+                }
+            };
+            match Container::open(
+                path,
+                header_path,
+                UnlockMaterial::Fido2 {
+                    passphrase: None,
+                    cred_id: &slot.fido2_cred_id,
+                    hmac_secret: &hmac_secret,
+                },
+            ) {
+                Ok(c) => return Ok(c),
+                Err(e) => last_err = Some(e.to_string()),
             }
-        };
-        match Container::open(
-            path,
-            header_path,
-            UnlockMaterial::Fido2 {
-                passphrase: None,
-                cred_id: &slot.fido2_cred_id,
-                hmac_secret: &hmac_secret,
-            },
-        ) {
-            Ok(c) => return Ok(c),
-            Err(e) => last_err = Some(e.to_string()),
         }
     }
     Err(last_err.unwrap_or_else(|| "no FIDO2 keyslot in this vault".into()))
@@ -3152,40 +3180,44 @@ fn unlock_with_tpm2_fido2(
             Some(c) => c.to_vec(),
             None => continue,
         };
-        let hmac_secret = match auth.hmac_secret(
-            RP_ID,
-            &stored_cred,
-            &slot.fido2_hmac_salt,
-            slot.fido2_salt_prehashed(),
-            Some(pin),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(format!("FIDO2 hmac-secret: {e}"));
-                continue;
+        // Declared salt convention first, then (Windows) the opposite,
+        // because webauthn.dll's salt transform is opaque.
+        for prehash in fido2_salt_conventions(slot.fido2_salt_prehashed()) {
+            let hmac_secret = match auth.hmac_secret(
+                RP_ID,
+                &stored_cred,
+                &slot.fido2_hmac_salt,
+                prehash,
+                Some(pin),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(format!("FIDO2 hmac-secret: {e}"));
+                    continue;
+                }
+            };
+            let mut unseal = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
+                let parsed = SealedBlob::from_bytes(blob)
+                    .map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
+                let kek = sealer
+                    .unseal(&parsed)
+                    .map_err(|e| format!("TPM unseal: {e}"))?;
+                let mut out = [0u8; 32];
+                out.copy_from_slice(kek.as_slice());
+                Ok(out)
+            };
+            match Container::open(
+                path,
+                header_path,
+                UnlockMaterial::Tpm2Fido2 {
+                    unseal: &mut unseal,
+                    cred_id: &stored_cred,
+                    hmac_secret: &hmac_secret,
+                },
+            ) {
+                Ok(cont) => return Ok(cont),
+                Err(e) => last_err = Some(e.to_string()),
             }
-        };
-        let mut unseal = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
-            let parsed = SealedBlob::from_bytes(blob)
-                .map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
-            let kek = sealer
-                .unseal(&parsed)
-                .map_err(|e| format!("TPM unseal: {e}"))?;
-            let mut out = [0u8; 32];
-            out.copy_from_slice(kek.as_slice());
-            Ok(out)
-        };
-        match Container::open(
-            path,
-            header_path,
-            UnlockMaterial::Tpm2Fido2 {
-                unseal: &mut unseal,
-                cred_id: &stored_cred,
-                hmac_secret: &hmac_secret,
-            },
-        ) {
-            Ok(cont) => return Ok(cont),
-            Err(e) => last_err = Some(e.to_string()),
         }
     }
     Err(last_err.unwrap_or_else(|| {
@@ -3372,19 +3404,6 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
                 continue;
             }
         };
-        let hmac_secret = match auth.hmac_secret(
-            RP_ID,
-            &stored_cred,
-            &slot.fido2_hmac_salt,
-            slot.fido2_salt_prehashed(),
-            Some(pin),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(format!("FIDO2: {e}"));
-                continue;
-            }
-        };
         let pq_shared = match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
             Ok(s) => s,
             Err(e) => {
@@ -3392,28 +3411,45 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
                 continue;
             }
         };
-        let mut unseal = |blob: &[u8]| -> Result<[u8; 32], String> {
-            let parsed = SealedBlob::from_bytes(blob)
-                .map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
-            let kek = sealer
-                .unseal(&parsed)
-                .map_err(|e| format!("TPM unseal: {e}"))?;
-            let mut out = [0u8; 32];
-            out.copy_from_slice(kek.as_slice());
-            Ok(out)
-        };
-        match Container::open(
-            path,
-            header_path,
-            UnlockMaterial::HybridPqTpm2Fido2 {
-                unseal: &mut unseal,
-                cred_id: &stored_cred,
-                hmac_secret: &hmac_secret,
-                pq_shared: &pq_shared,
-            },
-        ) {
-            Ok(c) => return Ok(c),
-            Err(e) => last_err = Some(e.to_string()),
+        // Declared salt convention first, then (Windows) the opposite,
+        // because webauthn.dll's salt transform is opaque.
+        for prehash in fido2_salt_conventions(slot.fido2_salt_prehashed()) {
+            let hmac_secret = match auth.hmac_secret(
+                RP_ID,
+                &stored_cred,
+                &slot.fido2_hmac_salt,
+                prehash,
+                Some(pin),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(format!("FIDO2: {e}"));
+                    continue;
+                }
+            };
+            let mut unseal = |blob: &[u8]| -> Result<[u8; 32], String> {
+                let parsed = SealedBlob::from_bytes(blob)
+                    .map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
+                let kek = sealer
+                    .unseal(&parsed)
+                    .map_err(|e| format!("TPM unseal: {e}"))?;
+                let mut out = [0u8; 32];
+                out.copy_from_slice(kek.as_slice());
+                Ok(out)
+            };
+            match Container::open(
+                path,
+                header_path,
+                UnlockMaterial::HybridPqTpm2Fido2 {
+                    unseal: &mut unseal,
+                    cred_id: &stored_cred,
+                    hmac_secret: &hmac_secret,
+                    pq_shared: &pq_shared,
+                },
+            ) {
+                Ok(c) => return Ok(c),
+                Err(e) => last_err = Some(e.to_string()),
+            }
         }
     }
     Err(last_err.unwrap_or_else(|| "no hybrid-pq-tpm2-fido2 slot matched all 3 factors".into()))
@@ -3535,19 +3571,6 @@ fn unlock_with_hybrid_pq_fido2(
                 continue;
             }
         };
-        let hmac_secret = match auth.hmac_secret(
-            RP_ID,
-            &slot.fido2_cred_id,
-            &slot.fido2_hmac_salt,
-            slot.fido2_salt_prehashed(),
-            Some(pin),
-        ) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(format!("FIDO2: {e}"));
-                continue;
-            }
-        };
         let pq_shared = match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
             Ok(s) => s,
             Err(e) => {
@@ -3555,18 +3578,35 @@ fn unlock_with_hybrid_pq_fido2(
                 continue;
             }
         };
-        match Container::open(
-            path,
-            header_path,
-            UnlockMaterial::HybridPqFido2 {
-                passphrase: None,
-                cred_id: &slot.fido2_cred_id,
-                hmac_secret: &hmac_secret,
-                pq_shared: &pq_shared,
-            },
-        ) {
-            Ok(c) => return Ok(c),
-            Err(e) => last_err = Some(format!("open slot {slot_idx}: {e}")),
+        // Declared salt convention first, then (Windows) the opposite,
+        // because webauthn.dll's salt transform is opaque.
+        for prehash in fido2_salt_conventions(slot.fido2_salt_prehashed()) {
+            let hmac_secret = match auth.hmac_secret(
+                RP_ID,
+                &slot.fido2_cred_id,
+                &slot.fido2_hmac_salt,
+                prehash,
+                Some(pin),
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(format!("FIDO2: {e}"));
+                    continue;
+                }
+            };
+            match Container::open(
+                path,
+                header_path,
+                UnlockMaterial::HybridPqFido2 {
+                    passphrase: None,
+                    cred_id: &slot.fido2_cred_id,
+                    hmac_secret: &hmac_secret,
+                    pq_shared: &pq_shared,
+                },
+            ) {
+                Ok(c) => return Ok(c),
+                Err(e) => last_err = Some(format!("open slot {slot_idx}: {e}")),
+            }
         }
     }
     Err(last_err.unwrap_or_else(|| "hybrid-fido2 unlock failed".into()))
