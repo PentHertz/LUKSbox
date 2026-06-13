@@ -22,30 +22,51 @@ Cross-platform FIDO2 keyslots and an in-place migration path.
 
 A FIDO2 keyslot enrolled on Linux or macOS in v0.2.2 or earlier
 could not unlock the vault on Windows, and a slot enrolled on
-Windows could not unlock on Linux or macOS. Root cause: the
-Linux/macOS backend (libfido2) passed the hmac-secret salt raw to
-the authenticator, while the Windows backend (webauthn.dll, via
-`pHmacSecretSaltValues`) SHA-256-prehashed the salt internally per
-the W3C WebAuthn Level 3 PRF specification. Same authenticator,
-same salt bytes on disk, two different HMAC outputs, two
-different KEKs, AEAD-unwrap failure on the other platform. See
-the v0.2.2 "Known limitations" note for the user-visible
-diagnostic.
+Windows could not unlock on Linux or macOS. Root cause: the two
+backends fed the authenticator's CTAP2 hmac-secret extension
+DIFFERENT salt bytes. libfido2 (Linux/macOS) forwards the 32-byte
+salt to the device unchanged. The Windows backend assumed
+`webauthn.dll` (raw hmac-secret via `pHmacSecretSaltValues`,
+`bEnablePrf = 0`) internally SHA-256-prehashed the salt -- it does
+NOT; that raw path is also a passthrough (the
+`SHA-256("WebAuthn PRF"\0 || input)` transform applies only to the
+higher-level PRF *extension* API, which we don't use). Same
+authenticator, same on-disk salt, the two paths handed the device
+different bytes -> two different HMAC outputs, two different KEKs,
+AEAD-unwrap failure on the other platform.
 
-**Fix:** new on-disk slot version `AAD_VERSION_V4` (byte layout
-identical to V3; only the wire interpretation of the
-`fido2_hmac_salt` field changes). V4 callers prehash the salt
-explicitly on the libfido2 side, matching what webauthn.dll
-already does, so both backends converge on
-`HMAC-SHA256(device_secret, SHA-256(salt))`. V4 slots open on
-Linux, macOS, and Windows alike.
+**Fix (two parts):**
+- New on-disk slot version `AAD_VERSION_V4` defines the canonical
+  device salt as `SHA-256(salt)` (V1/V2/V3 used the raw salt).
+- BOTH backends now apply that transform LOCALLY and symmetrically
+  before handing the bytes to the authenticator: `hid.rs`
+  SHA-256s the salt for V4, and `webauthn.rs` now does the SAME
+  SHA-256 itself (rather than passing the raw salt and relying on
+  a DLL-side hash that never happened). Both platforms therefore
+  feed the device `SHA-256(salt)` for V4 and the identical raw salt
+  for V1/V2/V3, converging on one
+  `HMAC-SHA256(device_secret, device_salt)`.
 
-**v0.2.x compatibility:** existing V1/V2/V3 FIDO2 slots continue
-to open on Linux/macOS under their original raw-salt convention
-(`fido2_salt_prehashed()` returns false based on the slot's
-`aad_version` byte). They explicitly do NOT open on Windows;
-webauthn.dll returns a clear error pointing at the migration
-command rather than producing wrong HMAC bytes.
+The earlier v0.3.0 attempt only changed the libfido2 side on the
+mistaken belief that webauthn.dll prehashed; that left Windows
+feeding the raw salt and V4 slots still failed cross-platform with
+`crypto: keyslot authentication failed`. This revision corrects the
+Windows backend so existing V4 vaults open on every platform with
+no recreation.
+
+**v0.2.x compatibility:** under the corrected (passthrough) model,
+V1/V2/V3 FIDO2 slots feed the raw salt on every backend, so they
+now unlock cross-platform too -- the Windows backend no longer
+errors out on them. (Migration to V4 remains available but is no
+longer required purely for cross-platform access.)
+
+**Verification status:** the Windows backend change compiles for
+`x86_64-pc-windows-{gnu,msvc}` and is logically symmetric with the
+libfido2 path, but the maintainers' CI cannot exercise a physical
+authenticator through webauthn.dll. Confirm on real Windows
+hardware before relying on it; the
+`xplatform_hmac_probe` example pins the exact device-salt each
+backend produces if a mismatch persists.
 
 **Migration:** `luksbox migrate-fido2-slot <vault> --slot N` on
 Linux or macOS bundles enroll+revoke: it registers a fresh credential on

@@ -384,33 +384,27 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
         prehash_salt: bool,
         _pin: Option<&str>,
     ) -> Result<HmacSecret, Error> {
-        // V1/V2/V3 keyslots (the "raw salt" wire convention) cannot
-        // unlock on Windows. webauthn.dll, when fed via
-        // `pHmacSecretSaltValues`, always SHA-256s the salt before
-        // forwarding to the authenticator (W3C WebAuthn Level 3 PRF
-        // behaviour); the API offers no way to opt out. Producing a
-        // wrong HMAC and letting the AEAD fail downstream would
-        // surface as the generic "keyslot authentication failed"
-        // error, which a v0.2.2 user spent a long debugging session
-        // tracing to this exact root cause. We short-circuit with a
-        // clear pointer at the v0.3.0 migration tool instead.
-        if !prehash_salt {
-            return Err(Error::Other(
-                "this FIDO2 keyslot was enrolled on Linux/macOS under \
-                 the pre-v0.3.0 wire convention and cannot unlock on \
-                 Windows. The Linux backend (libfido2) passes the \
-                 hmac-secret salt raw to the authenticator, while the \
-                 Windows backend (webauthn.dll) prehashes it with \
-                 SHA-256 per the W3C WebAuthn Level 3 PRF spec; the \
-                 two paths produce different HMAC outputs from the \
-                 same authenticator. Migrate the slot to the \
-                 cross-platform v0.3.0 convention by running \
-                 `luksbox migrate-fido2-slot <vault> --slot N` on \
-                 Linux or macOS, or enroll a backup passphrase \
-                 keyslot for cross-platform access."
-                    .into(),
-            ));
-        }
+        // Salt convention -- the crux of cross-platform FIDO2.
+        //
+        // The raw CTAP2 hmac-secret path we use here
+        // (`pHmacSecretSaltValues` / `pGlobalHmacSalt`, with
+        // `bEnablePrf = 0` at credential creation) forwards the
+        // 32-byte salt to the authenticator UNCHANGED -- the same
+        // passthrough libfido2 performs. (The
+        // SHA-256("WebAuthn PRF"\0 || input) transform the W3C spec
+        // mandates applies only to the higher-level PRF *extension*
+        // API, which we deliberately do not use.)
+        //
+        // Earlier code assumed webauthn.dll prehashed the salt and so
+        // passed it raw here; it does NOT, so a V4 slot (whose Linux
+        // creator fed the device SHA-256(salt) via hid.rs) saw the raw
+        // salt on Windows -> different HMAC -> different KEK ->
+        // `keyslot authentication failed`. The fix: apply the same
+        // local transform the libfido2 backend does, so BOTH platforms
+        // feed the authenticator identical bytes. `prehash_salt` true
+        // (V4) -> device sees SHA-256(salt); false (V1/V2/V3) -> device
+        // sees the raw salt. This makes every FIDO2 slot version unlock
+        // cross-platform, no migration required.
 
         // Defence-in-depth on caller-supplied bytes. cred_id comes
         // from the .lbx vault keyslot; a corrupted or tampered keyslot
@@ -472,7 +466,18 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
         // (`pHmacSecretSaltValues`) on the OPTIONS struct, not in the
         // generic Extensions array. The Global salt applies to every
         // credential in the allow-list (we have one).
-        let mut salt_buf: [u8; 32] = *salt;
+        // Apply the V4 prehash locally (see the salt-convention note
+        // above), mirroring `hid.rs` so Linux and Windows feed the
+        // authenticator byte-identical salts. webauthn.dll forwards
+        // these bytes to the CTAP2 hmac-secret extension unchanged.
+        let mut salt_buf: [u8; 32] = if prehash_salt {
+            use sha2::{Digest, Sha256};
+            let mut out = [0u8; 32];
+            out.copy_from_slice(&Sha256::digest(salt));
+            out
+        } else {
+            *salt
+        };
         let mut hmac_salt = WEBAUTHN_HMAC_SECRET_SALT {
             cbFirst: salt_buf.len() as u32,
             pbFirst: salt_buf.as_mut_ptr(),

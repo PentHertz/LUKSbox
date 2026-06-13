@@ -366,15 +366,20 @@ enum Command {
         kdf_target_time: Option<String>,
         /// Override the encrypted metadata region size. Accepts a
         /// human-readable byte count: `4M`, `8M`, `16777216`, etc.
-        /// Default and cap are both 16 MiB (the on-disk format
-        /// limit); practical vault-data headroom is roughly 8-10 GiB
-        /// before the chunk-reference list overflows. Lower this only
-        /// for tiny demo vaults where 16 MiB of minimum file size is
-        /// too much; higher values are rejected here at the CLI
-        /// boundary because the on-disk parser would also reject them.
-        /// The value is stored in the header at create time and used
-        /// unchanged on every later open; you cannot resize an
-        /// existing vault.
+        /// Default and cap are both 64 MiB (raised from 16 MiB in
+        /// v0.2.1; the on-disk format limit). This region is
+        /// PREALLOCATED at create time regardless of how much data you
+        /// store, so an otherwise-empty vault is already ~64 MiB on
+        /// disk (a v3 vault also writes a same-size `.lbx.meta-bak`
+        /// mirror, so ~128 MiB total). The region holds the encrypted
+        /// directory tree; 64 MiB gives headroom for thousands of
+        /// files / many GiB of chunk references. Lower it (e.g. `4M`,
+        /// `1M`) for small vaults to shrink the footprint -- this only
+        /// caps how many files/chunks the vault can hold, not the data
+        /// size of any one file. Higher values are rejected here at the
+        /// CLI boundary because the on-disk parser would also reject
+        /// them. Stored in the header at create time and used unchanged
+        /// on every later open; you cannot resize an existing vault.
         #[arg(long, value_name = "BYTES")]
         metadata_size: Option<String>,
         /// Metadata format for the new vault.
