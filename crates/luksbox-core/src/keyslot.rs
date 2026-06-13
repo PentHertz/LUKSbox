@@ -143,17 +143,23 @@ const OFF_KIND: usize = 0;
 /// - `AAD_VERSION_V4 = 3`: byte layout identical to V3 (same AAD
 ///   shape, same cred_id/hmac_salt offsets). The only difference is
 ///   the WIRE-side interpretation of `fido2_hmac_salt` for FIDO2-
-///   touching slot kinds: V4 slots require the salt to be SHA-256
-///   prehashed before reaching the authenticator. On the libfido2
-///   (Linux + macOS) side we apply the prehash explicitly; on the
-///   webauthn.dll (Windows) side webauthn.dll already prehashes
-///   internally per W3C WebAuthn Level 3 PRF behaviour, so we send
-///   the raw salt and let the API do its thing. Both backends
-///   converge on the authenticator computing
-///   `HMAC-SHA256(device_secret, SHA-256(salt))`, fixing the
-///   v0.2.2 cross-platform incompatibility where libfido2 sent the
-///   salt raw and webauthn.dll prehashed it for the same on-disk
-///   slot. V4 slots are cross-platform; V1/V2/V3 FIDO2 slots stay
+///   touching slot kinds: V4 slots use the W3C WebAuthn-PRF salt
+///   derivation, so the authenticator computes
+///   `HMAC-SHA256(device_secret, T(fido2_hmac_salt))` where
+///   `T(x) = SHA-256("WebAuthn PRF"\0 || x)`. On the libfido2
+///   (Linux + macOS) side we apply `T` explicitly before the device
+///   (libfido2 forwards salts verbatim); on the webauthn.dll
+///   (Windows) side we forward the RAW salt and webauthn.dll applies
+///   the *identical* `T` internally. Both backends converge on the
+///   same device input, fixing the cross-platform incompatibility.
+///
+///   IMPORTANT (V4 redefined): an EARLIER v0.3.0 build defined V4 as a
+///   plain `SHA-256(salt)` prehash. That never actually round-tripped
+///   through Windows, because webauthn.dll applies the PRF-prefixed
+///   `T`, not a bare SHA-256 -- so that build's V4 vaults are
+///   libfido2-only and cannot be opened by this build (the device
+///   input differs). V4 now denotes the PRF-prefixed convention. V4
+///   slots are cross-platform; V1/V2/V3 FIDO2 slots stay
 ///   Linux/macOS-only.
 ///
 /// Stored INSIDE the AAD region (offset 1, within the 0..76 range), so
@@ -497,15 +503,23 @@ impl Keyslot {
         matches!(self.kind, SlotKind::Empty)
     }
 
-    /// Does this slot's wire format require the FIDO2 hmac-secret
-    /// salt to be SHA-256 prehashed before reaching the authenticator?
+    /// Does this slot's wire format use the V4 cross-platform FIDO2
+    /// salt convention (the W3C WebAuthn-PRF derivation
+    /// `T(x) = SHA-256("WebAuthn PRF"\0 || x)`) before the salt reaches
+    /// the authenticator? The boolean is forwarded to
+    /// `Fido2Authenticator::hmac_secret`'s `prehash_salt` parameter.
     ///
-    /// V1/V2/V3 FIDO2 slots: no -- libfido2 sends the raw salt. These
-    /// slots are Linux/macOS-only because webauthn.dll on Windows
-    /// always prehashes, producing a different HMAC output.
-    /// V4+ FIDO2 slots: yes -- libfido2 callers prehash explicitly
-    /// (this function returns true), and webauthn.dll prehashes on
-    /// its own. Both converge cross-platform.
+    /// V1/V2/V3 FIDO2 slots: false -- libfido2 sends the raw salt.
+    /// These slots are Linux/macOS-only because webauthn.dll on Windows
+    /// unconditionally applies `T`, producing a different HMAC output.
+    /// V4+ FIDO2 slots: true -- the libfido2 backend applies `T`
+    /// locally, and the Windows backend forwards the raw salt and lets
+    /// webauthn.dll apply the identical `T`. Both converge
+    /// cross-platform.
+    ///
+    /// (The name predates the V4 redefinition: it is no longer a plain
+    /// SHA-256 "prehash" but the PRF-prefixed derivation. Kept as-is to
+    /// avoid churning ~80 call sites; semantics are documented here.)
     ///
     /// Non-FIDO2 slot kinds return false (the result is unused for
     /// them; `fido2_hmac_salt` is all zeros and never sent to a

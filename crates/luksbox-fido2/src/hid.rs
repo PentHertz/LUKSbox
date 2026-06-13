@@ -353,18 +353,20 @@ impl Fido2Authenticator for HidAuthenticator {
         let rp = cstring(rp_id)?;
 
         // V4 slots (`prehash_salt=true`) want the authenticator to see
-        // SHA-256(salt) so the wire HMAC matches what webauthn.dll
-        // produces on Windows (which prehashes automatically). libfido2
-        // is a CTAP2-level library and passes whatever bytes we hand
-        // it to the device verbatim, so we have to do the prehash
-        // ourselves here. The Zeroizing wrapper scrubs the 32 B
-        // digest after this method returns regardless of unwind path.
+        // T(salt) = SHA-256("WebAuthn PRF"\0 || salt), so the wire HMAC
+        // matches what webauthn.dll produces on Windows. webauthn.dll
+        // does NOT pass the salt through unchanged and does NOT do a
+        // plain SHA-256 either: it applies the full W3C WebAuthn-PRF
+        // derivation internally (empirically confirmed via the
+        // xplatform_hmac_probe example). libfido2 is a CTAP2-level
+        // library and forwards whatever bytes we hand it to the device
+        // verbatim, so we apply T ourselves here via the shared
+        // `webauthn_prf_salt` helper (single source of truth). The
+        // Zeroizing wrapper scrubs the 32 B value after this method
+        // returns regardless of unwind path. (The salt is a public
+        // header value, but we keep the hygiene uniform.)
         let salt_to_send: Zeroizing<[u8; 32]> = if prehash_salt {
-            use sha2::{Digest, Sha256};
-            let mut out = Zeroizing::new([0u8; 32]);
-            let digest = Sha256::digest(salt);
-            out.copy_from_slice(&digest);
-            out
+            Zeroizing::new(crate::authenticator::webauthn_prf_salt(salt))
         } else {
             Zeroizing::new(*salt)
         };

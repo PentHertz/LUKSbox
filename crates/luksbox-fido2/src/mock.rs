@@ -114,19 +114,18 @@ impl Fido2Authenticator for MockAuthenticator {
             .creds
             .get(cred_id)
             .ok_or_else(|| Error::Other("unknown credential".into()))?;
-        // Mirror libfido2 semantics: the mock is a CTAP2-level device,
-        // so it sees whatever the caller chose to prehash. The Linux
-        // path SHA-256s before reaching the device when `prehash_salt`
-        // is set; the Windows path can't be modelled by this mock
-        // (webauthn.dll always prehashes regardless), but the
-        // cross-platform round-trip test in luksbox-core uses two
-        // mock instances and the helper from `keyslot.rs` to model
-        // both wire paths converging.
+        // Mirror the real converged wire behaviour: the mock is a
+        // CTAP2-level device, so it HMACs whatever bytes reach it. The
+        // libfido2 path applies T(salt) = SHA-256("WebAuthn PRF"\0 ||
+        // salt) locally when `prehash_salt` is set; the Windows path
+        // forwards the raw salt and webauthn.dll applies the same T.
+        // Both converge on the device seeing T(salt), so the mock
+        // applies T here for `prehash_salt = true`. The cross-platform
+        // round-trip test in luksbox-core models the Windows side by
+        // computing T(salt) itself and calling with `prehash=false`.
         let mut effective_salt = [0u8; 32];
         if prehash_salt {
-            use sha2::Digest as _;
-            let digest = Sha256::digest(salt);
-            effective_salt.copy_from_slice(&digest);
+            effective_salt.copy_from_slice(&crate::authenticator::webauthn_prf_salt(salt));
         } else {
             effective_salt.copy_from_slice(salt);
         }

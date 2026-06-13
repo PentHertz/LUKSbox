@@ -7,6 +7,46 @@ use crate::error::Error;
 /// across versions so re-enrollment isn't needed on upgrade.
 pub const RP_ID: &str = "luksbox.local";
 
+/// The W3C WebAuthn Level 3 PRF → CTAP2 hmac-secret salt derivation:
+/// `SHA-256("WebAuthn PRF" ‖ 0x00 ‖ salt)`.
+///
+/// This is the exact byte sequence the authenticator must HMAC for a V4
+/// (cross-platform) luksbox keyslot, and it is the single source of
+/// truth shared by every backend:
+///
+/// - **libfido2** (Linux/macOS, `hid.rs`): applies this transform
+///   *locally* before handing the result to the device, because
+///   libfido2 forwards salts to the device verbatim.
+/// - **webauthn.dll** (Windows, `webauthn.rs`): does NOT call this — the
+///   Windows WebAuthn API applies exactly this derivation *internally*
+///   to any salt on the hmac-secret path (empirically confirmed with
+///   the `xplatform_hmac_probe` example: passing the raw salt on Windows
+///   reproduces this function's output computed on Linux). So the
+///   Windows backend forwards the RAW salt and lets the OS apply `T`.
+/// - **MockAuthenticator**: applies this transform when
+///   `prehash_salt = true` so unit tests model the real converged wire
+///   behaviour.
+///
+/// Why this precise construction: Microsoft's webauthn.dll is not a salt
+/// passthrough and does not do a plain `SHA-256(salt)`. luksbox ≤ v0.3.0
+/// assumed one of those two; both were wrong, which is what made FIDO2
+/// vaults platform-locked. The only convention that round-trips through
+/// webauthn.dll is this PRF-prefixed one, so V4 adopts it on every
+/// platform.
+///
+/// The salt is a public per-vault value (it lives in the slot header),
+/// so neither the input nor the output is secret; no zeroization needed.
+pub fn webauthn_prf_salt(salt: &[u8; 32]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"WebAuthn PRF");
+    h.update([0x00]);
+    h.update(salt);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&h.finalize());
+    out
+}
+
 #[derive(Debug, Clone)]
 pub struct Credential {
     pub id: Vec<u8>,
@@ -106,22 +146,26 @@ pub trait Fido2Authenticator {
 
     /// Compute hmac-secret(salt) for an existing credential.
     ///
-    /// `prehash_salt`: governs the on-wire convention. When true, the
-    /// authenticator must be driven so it computes
-    /// `HMAC-SHA256(device_secret, SHA-256(salt))` (v0.3.0 cross-
-    /// platform "V4" slot convention). When false, it must compute
-    /// `HMAC-SHA256(device_secret, salt)` (pre-v0.3.0 V1/V2/V3
-    /// convention, Linux/macOS only).
+    /// `prehash_salt`: selects the on-wire salt convention. When true,
+    /// the authenticator must end up computing
+    /// `HMAC-SHA256(device_secret, T(salt))` where
+    /// `T(salt) = SHA-256("WebAuthn PRF"\0 ‖ salt)` (see
+    /// [`webauthn_prf_salt`]). This is the v0.3.0 cross-platform "V4"
+    /// slot convention. When false, it must compute
+    /// `HMAC-SHA256(device_secret, salt)` (the pre-v0.3.0 V1/V2/V3
+    /// raw-salt convention, Linux/macOS only).
     ///
-    /// Backend behaviour:
-    /// - libfido2 (Linux/macOS): SHA-256s the salt locally when
-    ///   `prehash_salt=true`; passes it raw when false.
-    /// - webauthn.dll (Windows): always prehashes internally per
-    ///   W3C WebAuthn Level 3 PRF behaviour, so the param can only
-    ///   honour `true`. On `false` (V1/V2/V3 slot) it returns an
-    ///   `Error::Other` whose message points at the migration
-    ///   command rather than producing wrong bytes.
-    /// - mock: mirrors libfido2 semantics for tests.
+    /// Backend behaviour for `prehash_salt = true`:
+    /// - libfido2 (Linux/macOS): applies `T(salt)` locally via
+    ///   [`webauthn_prf_salt`] and forwards the result, because
+    ///   libfido2 hands the device whatever bytes we give it.
+    /// - webauthn.dll (Windows): forwards the RAW salt. The Windows
+    ///   WebAuthn API applies `T` to it internally, so the device sees
+    ///   the same `T(salt)` as the libfido2 path. (For `false` /
+    ///   V1/V2/V3 slots there is no way to suppress `T`, so those
+    ///   slots cannot be unlocked on Windows.)
+    /// - mock: applies `T(salt)` when true to mirror the converged
+    ///   wire behaviour for tests.
     fn hmac_secret(
         &mut self,
         rp_id: &str,

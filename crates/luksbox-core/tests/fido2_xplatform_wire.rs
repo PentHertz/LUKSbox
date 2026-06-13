@@ -7,22 +7,26 @@
 //! path and the Windows webauthn.dll path, by simulating both
 //! wire-side transformations through the in-memory MockAuthenticator.
 //!
-//! Background: in v0.2.2, libfido2 (Linux/macOS) passed the
-//! hmac-secret salt raw to the authenticator while webauthn.dll
-//! (Windows) SHA-256 prehashed it internally per W3C WebAuthn Level
-//! 3 PRF behaviour. The two backends derived different HMAC outputs
-//! from the same authenticator + salt + credential, making any
-//! FIDO2-bearing vault platform-locked. v0.3.0 closes this by
-//! requiring V4 callers to prehash explicitly on the libfido2 side
-//! (matching what webauthn.dll already does), so both paths feed
-//! the device `SHA-256(salt)`. This test file is the regression
-//! guard for that property.
+//! Background: libfido2 (Linux/macOS) passes the hmac-secret salt raw
+//! to the authenticator, while webauthn.dll (Windows) applies the W3C
+//! WebAuthn-PRF derivation `T(x) = SHA-256("WebAuthn PRF"\0 || x)` to
+//! the salt internally — even on the raw CTAP2 hmac-secret path
+//! (empirically confirmed via the `xplatform_hmac_probe` example). The
+//! two backends therefore derive different HMAC outputs from the same
+//! authenticator + salt + credential, making a raw-salt FIDO2 vault
+//! platform-locked. The V4 convention closes this by having the
+//! libfido2 side apply the *identical* `T` explicitly (via
+//! `webauthn_prf_salt`) so both paths feed the device `T(salt)`. This
+//! test file is the regression guard for that property.
+//!
+//! NOTE: an earlier v0.3.0 build modelled webauthn.dll as a plain
+//! `SHA-256(salt)` prehash. That was wrong — webauthn.dll applies the
+//! PRF-prefixed `T`, not a bare SHA-256 — so this file now models `T`.
 
 use luksbox_core::aead::CipherSuite;
 use luksbox_core::kdf::Argon2idParams;
 use luksbox_core::{AAD_VERSION_V4, Keyslot, MasterVolumeKey};
-use luksbox_fido2::{Fido2Authenticator, MockAuthenticator, RP_ID};
-use sha2::{Digest, Sha256};
+use luksbox_fido2::{Fido2Authenticator, MockAuthenticator, RP_ID, webauthn_prf_salt};
 
 const HEADER_SALT: [u8; 32] = [0x42; 32];
 const TEST_KDF: Argon2idParams = Argon2idParams {
@@ -35,14 +39,14 @@ const TEST_KDF: Argon2idParams = Argon2idParams {
 /// SAME 32 bytes given the SAME slot. We simulate both backends
 /// against a single MockAuthenticator (acts as the device):
 /// - "Linux V4 path": call `hmac_secret(..., prehash_salt=true, ...)`.
-///   The mock applies `SHA-256(salt)` locally before HMACing, exactly
-///   like the libfido2 backend will after the v0.3.0 patch.
-/// - "Windows V4 path": webauthn.dll prehashes for us on the way to
-///   the device. We model that by manually computing `SHA-256(salt)`
-///   in the test and then calling `hmac_secret(..., prehash_salt=false,
-///   ...)` with the already-hashed bytes. The mock then HMACs that
-///   verbatim, which is what the YubiKey would actually do after
-///   webauthn.dll fed it `SHA-256(salt)`.
+///   The mock applies `T(salt) = SHA-256("WebAuthn PRF"\0 || salt)`
+///   locally before HMACing, exactly like the libfido2 backend does.
+/// - "Windows V4 path": the Windows backend forwards the RAW salt and
+///   webauthn.dll applies `T` internally on the way to the device. We
+///   model that by computing `T(salt)` in the test and then calling
+///   `hmac_secret(..., prehash_salt=false, ...)` with the already-
+///   transformed bytes. The mock HMACs that verbatim, which is what the
+///   authenticator actually does after webauthn.dll fed it `T(salt)`.
 ///
 /// Both code paths must produce byte-identical HMAC outputs.
 #[test]
@@ -51,56 +55,61 @@ fn v4_wire_convention_converges_libfido2_and_webauthn() {
     let er = device.enroll(RP_ID, b"user", None).unwrap();
     let salt: [u8; 32] = [0xA7; 32];
 
-    // Linux libfido2 path: caller asks the device for prehashed-salt
-    // mode and the device's wire input is SHA-256(salt).
+    // Linux libfido2 path: caller asks the device for the V4 convention
+    // and the device's wire input is T(salt).
     let linux_out = device
         .hmac_secret(RP_ID, &er.credential.id, &salt, true, None)
         .expect("linux V4 hmac_secret");
 
-    // Windows webauthn.dll path: caller passes raw salt, webauthn.dll
-    // prehashes internally before forwarding to the device. Model by
-    // pre-hashing in the test and asking the mock for raw-salt mode.
-    let prehashed_salt: [u8; 32] = Sha256::digest(salt).into();
+    // Windows webauthn.dll path: caller forwards the raw salt and
+    // webauthn.dll applies T internally before the device. Model by
+    // computing T(salt) in the test and asking the mock for raw-salt
+    // mode (the mock then HMACs T(salt) verbatim).
+    let transformed_salt: [u8; 32] = webauthn_prf_salt(&salt);
     let windows_out = device
-        .hmac_secret(RP_ID, &er.credential.id, &prehashed_salt, false, None)
-        .expect("windows V4 hmac_secret (prehash applied at caller)");
+        .hmac_secret(RP_ID, &er.credential.id, &transformed_salt, false, None)
+        .expect("windows V4 hmac_secret (T applied externally)");
 
     assert_eq!(
         linux_out, windows_out,
         "V4 wire convention must produce identical HMAC outputs from \
-         libfido2 (prehash=true) and webauthn.dll (prehash applied \
-         externally + prehash=false to mock the post-API device input)",
+         libfido2 (prehash=true, T applied locally) and webauthn.dll \
+         (T applied by the OS + prehash=false to mock the post-API \
+         device input)",
     );
 }
 
-/// Document the pre-v0.3.0 bug for posterity: under the old V3 wire
-/// convention, the same (device, credential, salt) tuple produced
-/// DIFFERENT HMAC outputs on the two backends. This test asserts
-/// the divergence, so any future regression that reintroduces it on
-/// a V4 slot would be visible against this baseline.
+/// Document the legacy V1/V2/V3 raw-salt bug for posterity: under the
+/// raw-salt convention, the same (device, credential, salt) tuple
+/// produces DIFFERENT HMAC outputs on the two backends, because Windows
+/// applies `T` and libfido2 does not. This test asserts the divergence,
+/// so any future regression that reintroduces a raw-salt slot as
+/// cross-platform would be visible against this baseline.
 #[test]
 fn v3_wire_convention_diverged_pre_v0_3_0() {
     let mut device = MockAuthenticator::new();
     let er = device.enroll(RP_ID, b"user", None).unwrap();
     let salt: [u8; 32] = [0xA7; 32];
 
-    // Pre-v0.3.0 Linux libfido2: raw salt to the device.
+    // Legacy Linux libfido2: raw salt to the device.
     let linux_v3 = device
         .hmac_secret(RP_ID, &er.credential.id, &salt, false, None)
         .unwrap();
 
-    // Pre-v0.3.0 Windows webauthn.dll: salt SHA-256d before the
-    // device sees it.
-    let prehashed_salt: [u8; 32] = Sha256::digest(salt).into();
+    // Legacy Windows webauthn.dll: the OS applies T(salt) before the
+    // device sees it (modelled by transforming in the test, then
+    // raw-salt mode on the mock).
+    let transformed_salt: [u8; 32] = webauthn_prf_salt(&salt);
     let windows_v3 = device
-        .hmac_secret(RP_ID, &er.credential.id, &prehashed_salt, false, None)
+        .hmac_secret(RP_ID, &er.credential.id, &transformed_salt, false, None)
         .unwrap();
 
     assert_ne!(
         linux_v3, windows_v3,
-        "V3 wire convention DID diverge between libfido2 and webauthn.dll \
-         in v0.2.2 (this is the bug v0.3.0 fixes). If this ever starts \
-         passing, something has silently changed the v0.2.2-era behaviour.",
+        "Raw-salt (V1/V2/V3) convention DID diverge between libfido2 \
+         (raw) and webauthn.dll (applies T). This is the bug the V4 \
+         convention fixes. If this ever starts passing, something has \
+         silently changed the legacy behaviour.",
     );
 }
 
@@ -156,12 +165,12 @@ fn v4_keyslot_roundtrips_through_both_backend_simulations() {
         .expect("V4 slot must unlock on the simulated Linux path");
     assert_eq!(recovered_linux.as_bytes(), mvk.as_bytes());
 
-    // Unlock via the "Windows V4 path" -- caller passes raw salt to
-    // webauthn.dll, which prehashes; modelled by manual prehash then
-    // mock with `prehash_salt=false`.
-    let prehashed_salt: [u8; 32] = Sha256::digest(parsed.fido2_hmac_salt).into();
+    // Unlock via the "Windows V4 path" -- caller forwards the raw salt
+    // to webauthn.dll, which applies T; modelled by computing T(salt)
+    // then mock with `prehash_salt=false`.
+    let transformed_salt: [u8; 32] = webauthn_prf_salt(&parsed.fido2_hmac_salt);
     let unlock_windows = device
-        .hmac_secret(RP_ID, &parsed.fido2_cred_id, &prehashed_salt, false, None)
+        .hmac_secret(RP_ID, &parsed.fido2_cred_id, &transformed_salt, false, None)
         .unwrap();
     let recovered_windows = parsed
         .unlock_fido2(CipherSuite::Aes256Gcm, None, &unlock_windows, &HEADER_SALT)

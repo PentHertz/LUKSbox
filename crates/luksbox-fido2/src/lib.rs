@@ -54,7 +54,9 @@ pub mod hid;
 #[cfg(all(feature = "hardware", target_os = "windows"))]
 pub mod webauthn;
 
-pub use crate::authenticator::{Credential, EnrollResult, Fido2Authenticator, HmacSecret, RP_ID};
+pub use crate::authenticator::{
+    Credential, EnrollResult, Fido2Authenticator, HmacSecret, RP_ID, webauthn_prf_salt,
+};
 pub use crate::error::Error;
 pub use crate::mock::MockAuthenticator;
 

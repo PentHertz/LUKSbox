@@ -386,25 +386,32 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
     ) -> Result<HmacSecret, Error> {
         // Salt convention -- the crux of cross-platform FIDO2.
         //
-        // The raw CTAP2 hmac-secret path we use here
-        // (`pHmacSecretSaltValues` / `pGlobalHmacSalt`, with
-        // `bEnablePrf = 0` at credential creation) forwards the
-        // 32-byte salt to the authenticator UNCHANGED -- the same
-        // passthrough libfido2 performs. (The
-        // SHA-256("WebAuthn PRF"\0 || input) transform the W3C spec
-        // mandates applies only to the higher-level PRF *extension*
-        // API, which we deliberately do not use.)
+        // EMPIRICAL FACT (confirmed via the xplatform_hmac_probe
+        // example, same physical key on Linux + Windows): webauthn.dll
+        // does NOT forward the salt unchanged on the raw CTAP2
+        // hmac-secret path (`pHmacSecretSaltValues` / `pGlobalHmacSalt`,
+        // `bEnablePrf = 0`). It applies the full W3C WebAuthn-PRF
+        // derivation `T(x) = SHA-256("WebAuthn PRF"\0 || x)` to the salt
+        // before the authenticator HMACs it -- the same transform the
+        // W3C PRF *extension* mandates, applied even on this lower-level
+        // path. (Two earlier assumptions -- "passthrough" and "plain
+        // SHA-256" -- were both wrong; that is what platform-locked
+        // FIDO2 vaults.)
         //
-        // Earlier code assumed webauthn.dll prehashed the salt and so
-        // passed it raw here; it does NOT, so a V4 slot (whose Linux
-        // creator fed the device SHA-256(salt) via hid.rs) saw the raw
-        // salt on Windows -> different HMAC -> different KEK ->
-        // `keyslot authentication failed`. The fix: apply the same
-        // local transform the libfido2 backend does, so BOTH platforms
-        // feed the authenticator identical bytes. `prehash_salt` true
-        // (V4) -> device sees SHA-256(salt); false (V1/V2/V3) -> device
-        // sees the raw salt. This makes every FIDO2 slot version unlock
-        // cross-platform, no migration required.
+        // Therefore the V4 cross-platform convention's canonical device
+        // input IS T(salt), and we get it for free by forwarding the
+        // RAW salt and letting webauthn.dll apply T. On the libfido2
+        // side (hid.rs) we compute the identical T(salt) locally via
+        // `webauthn_prf_salt`, so both platforms feed the authenticator
+        // byte-identical bytes.
+        //
+        // `prehash_salt` is informational on Windows: there is no way to
+        // make webauthn.dll NOT apply T, so legacy raw-salt V1/V2/V3
+        // slots (`prehash_salt = false`) cannot be unlocked here -- they
+        // remain libfido2-only. We always forward the raw salt; for a V4
+        // slot that is exactly right, for a legacy slot it will
+        // (correctly) fail to match.
+        let _ = prehash_salt;
 
         // Defence-in-depth on caller-supplied bytes. cred_id comes
         // from the .lbx vault keyslot; a corrupted or tampered keyslot
@@ -466,18 +473,12 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
         // (`pHmacSecretSaltValues`) on the OPTIONS struct, not in the
         // generic Extensions array. The Global salt applies to every
         // credential in the allow-list (we have one).
-        // Apply the V4 prehash locally (see the salt-convention note
-        // above), mirroring `hid.rs` so Linux and Windows feed the
-        // authenticator byte-identical salts. webauthn.dll forwards
-        // these bytes to the CTAP2 hmac-secret extension unchanged.
-        let mut salt_buf: [u8; 32] = if prehash_salt {
-            use sha2::{Digest, Sha256};
-            let mut out = [0u8; 32];
-            out.copy_from_slice(&Sha256::digest(salt));
-            out
-        } else {
-            *salt
-        };
+        // Forward the RAW salt: webauthn.dll applies T(salt) =
+        // SHA-256("WebAuthn PRF"\0 || salt) itself before the device
+        // HMACs it (see the salt-convention note above), so the device
+        // ends up seeing the same bytes the libfido2 path computes
+        // locally via `webauthn_prf_salt`.
+        let mut salt_buf: [u8; 32] = *salt;
         let mut hmac_salt = WEBAUTHN_HMAC_SECRET_SALT {
             cbFirst: salt_buf.len() as u32,
             pbFirst: salt_buf.as_mut_ptr(),
