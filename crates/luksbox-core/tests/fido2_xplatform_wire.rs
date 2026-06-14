@@ -10,7 +10,7 @@
 //! Background: libfido2 (Linux/macOS) passes the hmac-secret salt raw
 //! to the authenticator, while webauthn.dll (Windows) applies the W3C
 //! WebAuthn-PRF derivation `T(x) = SHA-256("WebAuthn PRF"\0 || x)` to
-//! the salt internally — even on the raw CTAP2 hmac-secret path
+//! the salt internally, even on the raw CTAP2 hmac-secret path
 //! (empirically confirmed via the `xplatform_hmac_probe` example). The
 //! two backends therefore derive different HMAC outputs from the same
 //! authenticator + salt + credential, making a raw-salt FIDO2 vault
@@ -20,8 +20,8 @@
 //! test file is the regression guard for that property.
 //!
 //! NOTE: an earlier v0.3.0 build modelled webauthn.dll as a plain
-//! `SHA-256(salt)` prehash. That was wrong — webauthn.dll applies the
-//! PRF-prefixed `T`, not a bare SHA-256 — so this file now models `T`.
+//! `SHA-256(salt)` prehash. That was wrong: webauthn.dll applies the
+//! PRF-prefixed `T`, not a bare SHA-256, so this file now models `T`.
 
 use luksbox_core::aead::CipherSuite;
 use luksbox_core::kdf::Argon2idParams;

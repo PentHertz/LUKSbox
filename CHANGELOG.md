@@ -247,6 +247,27 @@ C-side `TPM2B_AUTH` slot until the Context dropped. Seal had the
 same pattern around `Esys_Create`. All flushes now run on every
 path.
 
+### Security hardening (review follow-up)
+
+- **Detached-header lock survives a sidecar rewrite.** In
+  detached-header mode, `persist_header` / `restore_header_bytes`
+  replace the sidecar via `atomic_secure_write` (temp+fsync+rename)
+  and reopen the handle, but the reopened fd pointed at the new inode
+  *without* re-taking the advisory lock, so the old lock stayed on the
+  now-unlinked pre-rename inode, so the sidecar lock invariant was
+  silently lost after any header persist/restore. The new fd is now
+  re-locked (honoring `LUKSBOX_NO_LOCK`) before the old handle is
+  dropped. `crates/luksbox-format/src/container.rs`.
+- **Keyslot serialization can't panic or truncate on an
+  externally-built slot.** `Keyslot` fields are `pub`, so external
+  crate code can bypass the `new_*` constructors' length validation.
+  `to_bytes` / `build_aead_aad` now clamp the variable-length cred_id
+  region to the slot's capacity (with a `debug_assert`), turning a
+  would-be out-of-bounds slice panic and a silent `len as u16`
+  truncation into a bounded copy. No behavior change for any slot
+  built through the public constructors (cred_id is already capped at
+  `FIDO2_CRED_ID_MAX`). `crates/luksbox-core/src/keyslot.rs`.
+
 ### Added
 
 - `crates/luksbox-core/tests/fido2_xplatform_wire.rs`: three

@@ -3047,6 +3047,15 @@ impl Container {
                 // pre-rename inode on POSIX). Without this the
                 // existing lock is on the wrong file going forward.
                 let new_hf = OpenOptions::new().read(true).write(true).open(&hp)?;
+                // Re-lock the new inode before swapping in the handle.
+                // `atomic_secure_write` renamed a fresh file over the
+                // sidecar, so the old handle's advisory lock sits on the
+                // now-unlinked pre-rename inode; without re-locking here,
+                // the sidecar lock invariant is silently lost for the
+                // rest of the container's life. The old handle (and its
+                // stale lock) is released when it is overwritten just
+                // below. `lock_handles` honors `LUKSBOX_NO_LOCK`.
+                lock_handles(&[(&new_hf, hp.as_path())])?;
                 if let HeaderStorage::Detached(hf, _) = &mut self.header_storage {
                     *hf = new_hf;
                 }
@@ -3105,6 +3114,15 @@ impl Container {
                 let hp = hp.clone();
                 atomic_secure_write(&hp, bytes)?;
                 let new_hf = OpenOptions::new().read(true).write(true).open(&hp)?;
+                // Re-lock the new inode before swapping in the handle.
+                // `atomic_secure_write` renamed a fresh file over the
+                // sidecar, so the old handle's advisory lock sits on the
+                // now-unlinked pre-rename inode; without re-locking here,
+                // the sidecar lock invariant is silently lost for the
+                // rest of the container's life. The old handle (and its
+                // stale lock) is released when it is overwritten just
+                // below. `lock_handles` honors `LUKSBOX_NO_LOCK`.
+                lock_handles(&[(&new_hf, hp.as_path())])?;
                 if let HeaderStorage::Detached(hf, _) = &mut self.header_storage {
                     *hf = new_hf;
                 }

@@ -1625,11 +1625,16 @@ impl Keyslot {
     fn build_aead_aad(&self, header_salt: &[u8; 32]) -> Vec<u8> {
         let mut buf = vec![0u8; SLOT_SIZE];
         self.write_aad_region(&mut buf);
-        let (_cred_max, off_hmac_salt) = slot_layout(self.aad_version);
+        let (cred_max, off_hmac_salt) = slot_layout(self.aad_version);
         if self.aad_version >= AAD_VERSION_V2 {
             // Mirror what to_bytes lays down for the cred / hmac_salt
-            // fields so the AAD matches what we persist.
-            let cred_len = self.fido2_cred_id.len() as u16;
+            // fields so the AAD matches what we persist. Same defensive
+            // clamp as `to_bytes` (a no-op for constructor-built slots;
+            // it bounds an oversized externally-built cred_id so AAD
+            // computation can't panic or `as u16`-truncate, and stays
+            // byte-identical to what `to_bytes` writes).
+            let cred = &self.fido2_cred_id[..self.fido2_cred_id.len().min(cred_max)];
+            let cred_len = cred.len() as u16;
             // SECURITY: this list MUST mirror the equivalent matches!()
             // in `to_bytes` exactly. Any kind that writes a real
             // hmac_salt via to_bytes MUST also include it in AAD here,
@@ -1659,8 +1664,7 @@ impl Keyslot {
             buf[OFF_CRED_LEN..OFF_CRED_LEN + 2].copy_from_slice(&cred_len.to_le_bytes());
             buf[OFF_HMAC_SALT_LEN..OFF_HMAC_SALT_LEN + 2].copy_from_slice(&salt_len.to_le_bytes());
             if cred_len > 0 {
-                buf[OFF_CRED..OFF_CRED + self.fido2_cred_id.len()]
-                    .copy_from_slice(&self.fido2_cred_id);
+                buf[OFF_CRED..OFF_CRED + cred.len()].copy_from_slice(cred);
             }
             if salt_len > 0 {
                 buf[off_hmac_salt..off_hmac_salt + FIDO2_HMAC_SALT_LEN]
@@ -1709,11 +1713,27 @@ impl Keyslot {
         buf[OFF_WRAPPED_CT..OFF_WRAPPED_CT + 32].copy_from_slice(&self.wrapped_ct);
         buf[OFF_WRAPPED_TAG..OFF_WRAPPED_TAG + 16].copy_from_slice(&self.wrapped_tag);
 
+        let (cred_max, off_hmac_salt) = slot_layout(self.aad_version);
         // `cred_len` is the length of whatever sits in the
         // variable-length region: a real FIDO2 cred_id for the
         // FIDO2 / hybrid-FIDO2 kinds, the TPM SealedBlob bytes for
         // Tpm2Sealed, zero for passphrase-only kinds.
-        let cred_len = self.fido2_cred_id.len() as u16;
+        //
+        // Defense-in-depth: every `new_*` constructor caps this length
+        // at FIDO2_CRED_ID_MAX (<= `cred_max` for the slot's version),
+        // so the clamp below is a no-op for any slot built through the
+        // public API. It only guards against an externally-constructed
+        // `Keyslot` (the fields are `pub`) carrying an oversized buffer,
+        // turning a would-be out-of-bounds slice panic and a silent
+        // `as u16` truncation into a bounded copy. Debug builds assert
+        // so the bug surfaces in tests rather than in production.
+        debug_assert!(
+            self.fido2_cred_id.len() <= cred_max,
+            "cred_id length {} exceeds slot region {cred_max}; Keyslot built outside new_*",
+            self.fido2_cred_id.len()
+        );
+        let cred = &self.fido2_cred_id[..self.fido2_cred_id.len().min(cred_max)];
+        let cred_len = cred.len() as u16;
         // `salt_len` is non-zero only when the slot actually
         // carries a FIDO2 hmac_salt. TPM-sealed slots have no
         // FIDO2 component so this stays 0.
@@ -1731,11 +1751,10 @@ impl Keyslot {
         } else {
             0
         };
-        let (_cred_max, off_hmac_salt) = slot_layout(self.aad_version);
         buf[OFF_CRED_LEN..OFF_CRED_LEN + 2].copy_from_slice(&cred_len.to_le_bytes());
         buf[OFF_HMAC_SALT_LEN..OFF_HMAC_SALT_LEN + 2].copy_from_slice(&salt_len.to_le_bytes());
         if cred_len > 0 {
-            buf[OFF_CRED..OFF_CRED + self.fido2_cred_id.len()].copy_from_slice(&self.fido2_cred_id);
+            buf[OFF_CRED..OFF_CRED + cred.len()].copy_from_slice(cred);
         }
         if salt_len > 0 {
             buf[off_hmac_salt..off_hmac_salt + FIDO2_HMAC_SALT_LEN]
@@ -1899,6 +1918,71 @@ mod tests {
                 .unlock_passphrase(suite, b"wrong passphrase", &header_salt)
                 .is_err()
         );
+    }
+
+    // ---- Regression: serialization is panic-safe against an
+    // externally-constructed (constructor-bypassing) Keyslot whose
+    // cred_id exceeds the slot region. The `new_*` constructors cap
+    // cred_id at FIDO2_CRED_ID_MAX, but the struct fields are `pub`, so
+    // external crate code can build an invalid slot. `to_bytes` /
+    // `build_aead_aad` must not out-of-bounds panic or silently
+    // `as u16`-truncate; they clamp to the region with a debug_assert.
+
+    /// Build an invalid slot directly via its public fields (bypassing
+    /// the length-validating constructors): cred_id is 1000 B, far over
+    /// the 352 B V4 cap.
+    fn oversized_external_slot() -> Keyslot {
+        Keyslot {
+            kind: SlotKind::Fido2HmacSecret,
+            aad_version: AAD_VERSION_V4,
+            uuid: [0u8; 16],
+            kdf_params: Argon2idParams {
+                m_cost_kib: 0,
+                t_cost: 0,
+                p_cost: 0,
+            },
+            kdf_salt: [0u8; 32],
+            aead_nonce: [0u8; 12],
+            wrapped_ct: [0u8; 32],
+            wrapped_tag: [0u8; 16],
+            fido2_cred_id: vec![0xABu8; 1000],
+            fido2_hmac_salt: [0x42u8; 32],
+        }
+    }
+
+    /// The clamp must not affect the largest *valid* cred_id: a cred_id
+    /// exactly at the V4 cap round-trips unchanged.
+    #[test]
+    fn to_bytes_roundtrips_cred_id_at_max() {
+        let cred = vec![0xCDu8; FIDO2_CRED_ID_MAX];
+        let slot = Keyslot::new_fido2_derived_mvk(&cred, [0x42u8; 32]).unwrap();
+        let bytes = slot.to_bytes();
+        let restored = Keyslot::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.fido2_cred_id, cred);
+    }
+
+    /// In debug builds the oversized slot trips the `debug_assert`, so
+    /// the misuse surfaces loudly during development/testing.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "exceeds slot region")]
+    fn oversized_external_cred_id_asserts_in_debug() {
+        let _ = oversized_external_slot().to_bytes();
+    }
+
+    /// In release builds (`cargo test --release`) the `debug_assert` is
+    /// compiled out, so the clamp is what protects us: `to_bytes` and
+    /// `build_aead_aad` must complete without panicking and the on-disk
+    /// `cred_len` must be clamped to the region capacity (not the bogus
+    /// 1000, and not a `u16`-truncated value).
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn oversized_external_cred_id_clamps_in_release() {
+        let bytes = oversized_external_slot().to_bytes();
+        let cred_len = u16::from_le_bytes([bytes[OFF_CRED_LEN], bytes[OFF_CRED_LEN + 1]]);
+        assert_eq!(cred_len as usize, FIDO2_CRED_ID_MAX);
+        // The companion AAD path must also be panic-safe on the same slot.
+        let _ = oversized_external_slot().build_aead_aad(&[0u8; 32]);
     }
 
     #[test]

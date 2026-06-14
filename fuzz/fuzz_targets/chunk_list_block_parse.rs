@@ -5,8 +5,8 @@
 
 //! Fuzz `chunk::parse_chunk_list_block` (v3 metadata format). The
 //! parser sees the decrypted plaintext of a chunk-list block (the
-//! AEAD has already verified that an MVK-holder authored these bytes
-//! — we're inside the trust boundary). Even so, a malicious vault
+//! AEAD has already verified that an MVK-holder authored these bytes,
+//! so we're inside the trust boundary). Even so, a malicious vault
 //! author or a future format-version slip could plant bytes whose
 //! `count` field is out of range, whose entries are bogus, or whose
 //! next-pointer drives an iterator into a loop. The parser MUST:

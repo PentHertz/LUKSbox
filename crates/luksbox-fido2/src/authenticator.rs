@@ -7,7 +7,7 @@ use crate::error::Error;
 /// across versions so re-enrollment isn't needed on upgrade.
 pub const RP_ID: &str = "luksbox.local";
 
-/// The W3C WebAuthn Level 3 PRF → CTAP2 hmac-secret salt derivation:
+/// The W3C WebAuthn Level 3 PRF to CTAP2 hmac-secret salt derivation:
 /// `SHA-256("WebAuthn PRF" ‖ 0x00 ‖ salt)`.
 ///
 /// This is the exact byte sequence the authenticator must HMAC for a V4
@@ -17,7 +17,7 @@ pub const RP_ID: &str = "luksbox.local";
 /// - **libfido2** (Linux/macOS, `hid.rs`): applies this transform
 ///   *locally* before handing the result to the device, because
 ///   libfido2 forwards salts to the device verbatim.
-/// - **webauthn.dll** (Windows, `webauthn.rs`): does NOT call this — the
+/// - **webauthn.dll** (Windows, `webauthn.rs`): does NOT call this; the
 ///   Windows WebAuthn API applies exactly this derivation *internally*
 ///   to any salt on the hmac-secret path (empirically confirmed with
 ///   the `xplatform_hmac_probe` example: passing the raw salt on Windows

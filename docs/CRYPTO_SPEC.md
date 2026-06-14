@@ -525,13 +525,13 @@ and are cross-platform.
 > **History / migration note.** An earlier v0.3.0 build defined V4 as a
 > plain `SHA-256(salt)` prehash, on the mistaken assumption that
 > webauthn.dll either passed the salt through unchanged or did a bare
-> SHA-256. Neither is true — it applies the PRF-prefixed `T`. Vaults
+> SHA-256. Neither is true: it applies the PRF-prefixed `T`. Vaults
 > whose FIDO2 slot was created by that earlier build therefore still
 > won't open on Windows (and won't open under the corrected build at
 > all, since the device input differs); **recreate the FIDO2 slot** to
 > get a working cross-platform V4 slot. Also note webauthn.dll *always*
 > performs user verification, while libfido2 only does so when a PIN is
-> supplied — enroll the FIDO2 slot **with a PIN** so both platforms use
+> supplied. Enroll the FIDO2 slot **with a PIN** so both platforms use
 > the same `CredRandomWithUV` secret.
 
 ### 3.3 Key derivation tree
