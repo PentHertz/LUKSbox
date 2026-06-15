@@ -14,7 +14,7 @@ canonical record.
 
 ---
 
-## [v0.3.0] - unreleased
+## [v0.3.0] - 2026-06-15
 
 Cross-platform FIDO2 keyslots and an in-place migration path.
 
@@ -267,6 +267,15 @@ path.
   truncation into a bounded copy. No behavior change for any slot
   built through the public constructors (cred_id is already capped at
   `FIDO2_CRED_ID_MAX`). `crates/luksbox-core/src/keyslot.rs`.
+
+### Fixed: GUI create-vault picker hid extensionless vaults
+
+The "New vault file" save dialog applied an `.lbx`-only filter, which
+hid extensionless vaults (the old default name was `secret`) and made
+it awkward to pick or overwrite them. The filter is gone, matching the
+no-filter behavior already used by the open-existing picker (#12).
+`crates/luksbox-gui/src/app.rs`. Thanks to Matt Van Horn
+(@mvanhorn) for the fix (#15).
 
 ### Added
 
