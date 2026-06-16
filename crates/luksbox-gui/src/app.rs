@@ -3025,9 +3025,12 @@ impl LuksboxApp {
                         submit_via_enter = true;
                     }
                     if ui.add_sized([browse_w, CONTROL_H], ghost_button("Browse")).clicked()
+                        // No `add_filter()` call: `&["lbx"]` hides
+                        // extensionless vaults (the old default name was
+                        // `secret`). See `open_existing_picker` for why no
+                        // filter variant works cross-platform (#12).
                         && let Some(p) = rfd::FileDialog::new()
                             .set_title("New vault file")
-                            .add_filter("LUKSbox vault", &["lbx"])
                             .save_file()
                         {
                             self.create.path = p.display().to_string();
@@ -6026,8 +6029,9 @@ impl LuksboxApp {
     ///
     /// The two backends report completion differently:
     ///  - InProcess: receiver fires with the worker thread's
-    ///     `Result<(), String>`.
+    ///    `Result<(), String>`.
     ///  - Subprocess: child.try_wait() returns Some(ExitStatus).
+    ///
     /// Both translate into the same view transition.
     fn poll_mount(&mut self) {
         let Some(ms) = self.mount_status.as_mut() else {
@@ -6270,6 +6274,55 @@ impl LuksboxApp {
                                     .small()
                                     .color(theme::FAINT),
                                 );
+                            }
+                            // V0.3.0 cross-platform tag: V4 FIDO2 slots
+                            // (the new default) open on Linux, macOS, and
+                            // Windows; older V1/V2/V3 FIDO2 slots are
+                            // Linux/macOS-only because libfido2 and
+                            // webauthn.dll prehash the hmac-secret salt
+                            // differently. Surface this in the slot table
+                            // so users can find the slots they need to
+                            // migrate before crossing platforms.
+                            if slot.touches_fido2() {
+                                if slot.fido2_salt_prehashed() {
+                                    ui.label(
+                                        RichText::new("V4: cross-platform (Linux/macOS/Windows)")
+                                            .small()
+                                            .color(theme::FAINT),
+                                    );
+                                } else if slot.kind
+                                    == luksbox_core::SlotKind::Fido2HmacSecret
+                                {
+                                    // aad_version is 0-based on disk
+                                    // (AAD_VERSION_V1 = 0); show the
+                                    // 1-based label users see in docs.
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "V{}: Linux/macOS-only \
+                                             (pre-v0.3.0; run `luksbox \
+                                             migrate-fido2-slot <vault> \
+                                             --slot {i}` for cross-platform)",
+                                            slot.aad_version + 1
+                                        ))
+                                        .small()
+                                        .color(theme::WARN),
+                                    );
+                                } else {
+                                    // migrate-fido2-slot refuses
+                                    // non-wrap-style kinds; don't send
+                                    // the user to a dead end.
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "V{}: Linux/macOS-only \
+                                             (pre-v0.3.0; no migration for \
+                                             this slot kind yet -- re-enroll \
+                                             on v0.3.0 for cross-platform)",
+                                            slot.aad_version + 1
+                                        ))
+                                        .small()
+                                        .color(theme::WARN),
+                                    );
+                                }
                             }
                         });
                     ui.add_space(8.0);

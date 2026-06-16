@@ -18,7 +18,7 @@
 //!
 //! Invariants checked:
 //! 1. `SlotPayload::new` either accepts an input with `Ok(_)` or
-//!    rejects it with `Err(Error::InvalidField)` — never panics.
+//!    rejects it with `Err(Error::InvalidField)`, never panics.
 //! 2. Any payload that `new()` + `encode()` accepts MUST also
 //!    `decode()` successfully (the constructor's contract is the
 //!    decoder's input contract).
@@ -48,7 +48,7 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // Pick a kind from the eight valid tags. Modulo 8 ensures every
-    // iteration produces a real variant — `DeniableKindTag::from_u8`
+    // iteration produces a real variant; `DeniableKindTag::from_u8`
     // is exercised separately in `slot_payload_decode`.
     let kind = match data[0] % 8 {
         0 => DeniableKindTag::Passphrase,

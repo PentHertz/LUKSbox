@@ -63,3 +63,12 @@ required-features = ["hardware"]
 [[example]]
 name = "probe"
 required-features = ["hardware"]
+
+# Cross-platform hmac-secret salt-convention probe. Run on Linux +
+# Windows with the same key to determine exactly what webauthn.dll
+# does to the salt (raw / plain SHA-256 / PRF-prefixed SHA-256), which
+# decides whether the V4 prehash convention is correct. See the file
+# header for the procedure.
+[[example]]
+name = "xplatform_hmac_probe"
+required-features = ["hardware"]

@@ -109,7 +109,7 @@ fn multi_slot_mixed_kinds_each_credential_opens_its_own_slot() {
     let env_pp = try_open_envelope_v2(&header, &admin, CIPHER, None).unwrap();
     assert_eq!(env_pp.matched_slot_idx, 0);
     assert_eq!(env_pp.payload.kind, DeniableKindTag::Passphrase);
-    let opened_pp = complete_open_v2(env_pp, &admin, CIPHER).unwrap();
+    let opened_pp = complete_open_v2(&env_pp, &admin, CIPHER).unwrap();
     assert_eq!(opened_pp.mvk.as_bytes(), mvk.as_bytes());
 
     // Open as FIDO2: must land on slot 3, kind=Fido2Passphrase.
@@ -117,7 +117,7 @@ fn multi_slot_mixed_kinds_each_credential_opens_its_own_slot() {
     assert_eq!(env_fido.matched_slot_idx, 3);
     assert_eq!(env_fido.payload.kind, DeniableKindTag::Fido2Passphrase);
     assert_eq!(env_fido.payload.cred_id, fido_mat.cred_id);
-    let opened_fido = complete_open_v2(env_fido, &fido, CIPHER).unwrap();
+    let opened_fido = complete_open_v2(&env_fido, &fido, CIPHER).unwrap();
     assert_eq!(opened_fido.mvk.as_bytes(), mvk.as_bytes());
 }
 
@@ -229,7 +229,7 @@ fn hybrid_envelope_pass_and_mlkem_shared_are_independent_inputs() {
     };
     let env = try_open_envelope_v2(&header, &cred_wrong_shared, CIPHER, None)
         .expect("phase 1 envelope discovery depends only on passphrase");
-    let err = complete_open_v2(env, &cred_wrong_shared, CIPHER)
+    let err = complete_open_v2(&env, &cred_wrong_shared, CIPHER)
         .err()
         .expect("phase 2 MVK unwrap with wrong shared must fail");
     assert!(matches!(err, Error::OpaqueUnlockFailed));
@@ -246,7 +246,7 @@ fn hybrid_envelope_pass_and_mlkem_shared_are_independent_inputs() {
         mlkem_shared: &shared2_arr,
     };
     let env = try_open_envelope_v2(&header, &cred_mixed, CIPHER, None).unwrap();
-    let err = complete_open_v2(env, &cred_mixed, CIPHER).err().unwrap();
+    let err = complete_open_v2(&env, &cred_mixed, CIPHER).err().unwrap();
     assert!(matches!(err, Error::OpaqueUnlockFailed));
 
     // (c): wrong pass fails at phase 1 regardless of shared.
@@ -262,7 +262,7 @@ fn hybrid_envelope_pass_and_mlkem_shared_are_independent_inputs() {
 
     // Sanity: positive open with correct (pass, shared).
     let env = try_open_envelope_v2(&header, &cred_create, CIPHER, None).unwrap();
-    let _ = complete_open_v2(env, &cred_create, CIPHER).unwrap();
+    let _ = complete_open_v2(&env, &cred_create, CIPHER).unwrap();
 }
 
 // -----------------------------------------------------------------
@@ -341,13 +341,13 @@ fn rotation_with_mixed_kept_set_preserves_kept_and_drops_others() {
 
     // Admin still opens, recovers new MVK.
     let env = try_open_envelope_v2(&header, &admin, CIPHER, None).unwrap();
-    let opened = complete_open_v2(env, &admin, CIPHER).unwrap();
+    let opened = complete_open_v2(&env, &admin, CIPHER).unwrap();
     assert_eq!(opened.mvk.as_bytes(), new_mvk.as_bytes());
     assert_eq!(opened.matched_slot_idx, 0);
 
     // TPM still opens, recovers same new MVK.
     let env = try_open_envelope_v2(&header, &tpm, CIPHER, None).unwrap();
-    let opened = complete_open_v2(env, &tpm, CIPHER).unwrap();
+    let opened = complete_open_v2(&env, &tpm, CIPHER).unwrap();
     assert_eq!(opened.mvk.as_bytes(), new_mvk.as_bytes());
     assert_eq!(opened.matched_slot_idx, 6);
 
@@ -408,14 +408,14 @@ fn add_slot_of_different_kind_after_init_round_trips_both_slots() {
 
     // Admin still opens.
     let env = try_open_envelope_v2(&header, &admin, CIPHER, None).unwrap();
-    let opened = complete_open_v2(env, &admin, CIPHER).unwrap();
+    let opened = complete_open_v2(&env, &admin, CIPHER).unwrap();
     assert_eq!(opened.mvk.as_bytes(), mvk.as_bytes());
 
     // TPM slot opens with the same MVK, recovers the embedded blob.
     let env = try_open_envelope_v2(&header, &tpm, CIPHER, None).unwrap();
     assert_eq!(env.payload.kind, DeniableKindTag::TpmPassphrase);
     assert_eq!(env.payload.tpm_blob, tpm_mat.tpm_blob);
-    let opened = complete_open_v2(env, &tpm, CIPHER).unwrap();
+    let opened = complete_open_v2(&env, &tpm, CIPHER).unwrap();
     assert_eq!(opened.mvk.as_bytes(), mvk.as_bytes());
     assert_eq!(opened.matched_slot_idx, 4);
 }
@@ -492,7 +492,7 @@ fn second_passphrase_slot_unlocks_under_non_default_cipher() {
     // Admin still opens at slot 0 under the non-default cipher.
     let env_admin = try_open_envelope_v2(&header, &admin, NON_DEFAULT, None).unwrap();
     assert_eq!(env_admin.matched_slot_idx, 0);
-    let opened_admin = complete_open_v2(env_admin, &admin, NON_DEFAULT).unwrap();
+    let opened_admin = complete_open_v2(&env_admin, &admin, NON_DEFAULT).unwrap();
     assert_eq!(opened_admin.mvk.as_bytes(), mvk.as_bytes());
 
     // Slot 1 (the freshly-enrolled second passphrase) must open
@@ -500,7 +500,7 @@ fn second_passphrase_slot_unlocks_under_non_default_cipher() {
     let env_second = try_open_envelope_v2(&header, &second, NON_DEFAULT, None).unwrap();
     assert_eq!(env_second.matched_slot_idx, 1);
     assert_eq!(env_second.payload.kind, DeniableKindTag::Passphrase);
-    let opened_second = complete_open_v2(env_second, &second, NON_DEFAULT).unwrap();
+    let opened_second = complete_open_v2(&env_second, &second, NON_DEFAULT).unwrap();
     assert_eq!(
         opened_second.mvk.as_bytes(),
         mvk.as_bytes(),
@@ -519,7 +519,7 @@ fn second_passphrase_slot_unlocks_under_non_default_cipher() {
     )
     .unwrap();
     assert_eq!(env_hinted.matched_slot_idx, 1);
-    let opened_hinted = complete_open_v2(env_hinted, &second, NON_DEFAULT).unwrap();
+    let opened_hinted = complete_open_v2(&env_hinted, &second, NON_DEFAULT).unwrap();
     assert_eq!(opened_hinted.mvk.as_bytes(), mvk.as_bytes());
 }
 
@@ -608,7 +608,7 @@ fn deniable_enroll_hybrid_pq_passphrase_round_trips() {
     assert_eq!(env.matched_slot_idx, 3, "discovery must pick slot 3");
     assert_eq!(env.payload.kind, DeniableKindTag::HybridPqPassphrase);
 
-    let opened = complete_open_v2(env, &cred, CIPHER).unwrap();
+    let opened = complete_open_v2(&env, &cred, CIPHER).unwrap();
     let original_mvk = opened.mvk.as_bytes().to_vec();
 
     // Sanity: admin slot 0 still opens with the original credential.
@@ -626,7 +626,7 @@ fn deniable_enroll_hybrid_pq_passphrase_round_trips() {
     )
     .unwrap();
     assert_eq!(env_admin.matched_slot_idx, 0);
-    let opened_admin = complete_open_v2(env_admin, &admin, CIPHER).unwrap();
+    let opened_admin = complete_open_v2(&env_admin, &admin, CIPHER).unwrap();
     assert_eq!(
         opened_admin.mvk.as_bytes(),
         original_mvk.as_slice(),
@@ -683,4 +683,54 @@ fn hybrid_sidecar_rejects_duplicate_slot_idx_at_write() {
         msg.contains("duplicate") && msg.contains("slot 1"),
         "error must mention 'duplicate' + 'slot 1', got: {msg}"
     );
+}
+
+// -----------------------------------------------------------------
+// Test: FIDO2 salt-convention probe mechanics.
+//
+// Deniable v2 envelopes record no hmac-secret salt-convention
+// marker (unlike keyslots, which carry `aad_version`), so the
+// front-ends probe at unlock time: try the v0.3.0 prehashed
+// convention first, and on `OpaqueUnlockFailed` retry with the
+// raw-salt output that v0.2.1/v0.2.2 envelopes recorded. This test
+// pins the API contract the probe depends on: a failed phase-2
+// completion hands the envelope handle back intact (no re-discovery
+// Argon2id run), and the retried completion with the correct
+// secondary output succeeds. The two distinct hmac values stand in
+// for HMAC(secret, SHA256(salt)) vs HMAC(secret, salt).
+#[test]
+fn failed_complete_hands_envelope_back_for_salt_convention_retry() {
+    // Envelope created with the "raw" output (a v0.2.x vault).
+    let hmac_raw = [0x11u8; 32];
+    let hmac_prehashed = [0x22u8; 32];
+    let create_cred = DeniableCredential::Fido2Passphrase {
+        passphrase: b"probe-pass",
+        argon2: cheap_params(),
+        hmac_secret_output: &hmac_raw,
+    };
+    let material = DeniableMaterial {
+        cred_id: vec![0xc1; 64],
+        hmac_salt: Some([0xd1; 32]),
+        tpm_blob: Vec::new(),
+    };
+    let header = fresh_vault(&create_cred, &material, 0);
+
+    // Phase 1 needs only the passphrase.
+    let env = try_open_envelope_v2(&header, &create_cred, CIPHER, None).unwrap();
+    assert_eq!(env.payload.kind, DeniableKindTag::Fido2Passphrase);
+
+    // First attempt with the WRONG (prehashed) output fails with the
+    // generic opaque error and must not consume the envelope: the
+    // borrow-based complete_open_v2 leaves it reusable.
+    let wrong_cred = DeniableCredential::Fido2Passphrase {
+        passphrase: b"probe-pass",
+        argon2: cheap_params(),
+        hmac_secret_output: &hmac_prehashed,
+    };
+    let err = complete_open_v2(&env, &wrong_cred, CIPHER).err().unwrap();
+    assert!(matches!(err, Error::OpaqueUnlockFailed), "{err:?}");
+
+    // Retry with the raw output against the SAME envelope succeeds.
+    let opened = complete_open_v2(&env, &create_cred, CIPHER).unwrap();
+    assert_eq!(opened.matched_slot_idx, 0);
 }

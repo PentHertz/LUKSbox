@@ -12,6 +12,7 @@ use std::ffi::{CStr, CString};
 use std::os::raw::c_int;
 
 use rand_core::{OsRng, RngCore};
+use zeroize::Zeroizing;
 
 use crate::authenticator::{Credential, EnrollResult, Fido2Authenticator, HmacSecret};
 use crate::error::Error;
@@ -343,12 +344,32 @@ impl Fido2Authenticator for HidAuthenticator {
         rp_id: &str,
         cred_id: &[u8],
         salt: &[u8; 32],
+        prehash_salt: bool,
         pin: Option<&str>,
     ) -> Result<HmacSecret, Error> {
         let dev = open_device(self.device_path.as_deref())?;
         let assert = AssertHandle::new()?;
 
         let rp = cstring(rp_id)?;
+
+        // V4 slots (`prehash_salt=true`) want the authenticator to see
+        // T(salt) = SHA-256("WebAuthn PRF"\0 || salt), so the wire HMAC
+        // matches what webauthn.dll produces on Windows. webauthn.dll
+        // does NOT pass the salt through unchanged and does NOT do a
+        // plain SHA-256 either: it applies the full W3C WebAuthn-PRF
+        // derivation internally (empirically confirmed via the
+        // xplatform_hmac_probe example). libfido2 is a CTAP2-level
+        // library and forwards whatever bytes we hand it to the device
+        // verbatim, so we apply T ourselves here via the shared
+        // `webauthn_prf_salt` helper (single source of truth). The
+        // Zeroizing wrapper scrubs the 32 B value after this method
+        // returns regardless of unwind path. (The salt is a public
+        // header value, but we keep the hygiene uniform.)
+        let salt_to_send: Zeroizing<[u8; 32]> = if prehash_salt {
+            Zeroizing::new(crate::authenticator::webauthn_prf_salt(salt))
+        } else {
+            Zeroizing::new(*salt)
+        };
 
         unsafe {
             checked_at(
@@ -373,7 +394,7 @@ impl Fido2Authenticator for HidAuthenticator {
             )?;
             checked_at(
                 "fido_assert_set_hmac_salt",
-                fido_assert_set_hmac_salt(assert.ptr, salt.as_ptr(), salt.len()),
+                fido_assert_set_hmac_salt(assert.ptr, salt_to_send.as_ptr(), salt_to_send.len()),
             )?;
             checked_at(
                 "fido_assert_set_up",
@@ -691,6 +712,7 @@ fn map_err_at(call: &'static str, rc: c_int) -> Error {
 ///   - Windows Hello not set up at all (no PIN/biometric enrolled).
 ///   - Camera/fingerprint hardware unavailable when only that
 ///     method is enrolled.
+///
 /// We don't have enough info to disambiguate, so the wrapper lists
 /// all four. Better than the raw libfido2 string by a wide margin.
 fn maybe_winhello_context<T>(

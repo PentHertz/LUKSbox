@@ -463,10 +463,16 @@ AEAD AAD scope:
   V2 (legacy):       bytes [0..76] || bytes [124..288] || header_salt
                                        ^^^^^^^^^^^^^^^^
                                        cred_id + hmac_salt protected
-  V3 (current):      bytes [0..76] || bytes [124..512] || header_salt
+  V3 (legacy):       bytes [0..76] || bytes [124..512] || header_salt
                                        ^^^^^^^^^^^^^^^^
                                        full extended cred_id (352 B max)
                                        + hmac_salt protected
+  V4 (current):      same bytes/AAD as V3. Differs ONLY in the FIDO2
+                     hmac-secret salt WIRE convention (see "Why V4
+                     exists" below): the authenticator HMACs
+                     T(fido2_hmac_salt), T(x)=SHA-256("WebAuthn PRF"\0||x),
+                     instead of the raw salt. Makes FIDO2 slots
+                     cross-platform (Linux/macOS <-> Windows).
 ```
 
 **Why V3 exists**: some FIDO2 authenticators emit credential IDs
@@ -480,9 +486,53 @@ aren't always publicly documented. The V1/V2 layout hard-capped at
 `Fido2CredIdTooLong`. V3 reorganizes the slot to give cred_id 352
 bytes of capacity (covers every authenticator we've seen reports of,
 with margin) while keeping the slot size at 512 bytes, so on-disk
-vault format isn't broken. New slots created by `Keyslot::new_*`
-default to V3; V1/V2 vaults still on disk continue to read under
-their original layout.
+vault format isn't broken. V1/V2 vaults still on disk continue to read
+under their original layout.
+
+**Why V4 exists (FIDO2 cross-platform salt convention)**: the byte
+layout is identical to V3; V4 changes only *what bytes the
+authenticator HMACs* for FIDO2-touching slot kinds. This fixes a
+platform lock-in: the same on-disk FIDO2 slot would fail to unlock
+when the vault was created on one OS and opened on another.
+
+The root cause is that the two FIDO2 backends do not feed the
+authenticator the same salt:
+
+- **libfido2** (Linux/macOS) is a CTAP2-level library: it forwards the
+  hmac-secret salt to the device **verbatim**.
+- **webauthn.dll** (Windows) is *not* a passthrough. Even on the raw
+  CTAP2 hmac-secret path (`pHmacSecretSaltValues`, `bEnablePrf=0`), it
+  applies the W3C WebAuthn-PRF derivation
+  `T(x) = SHA-256("WebAuthn PRF" ‖ 0x00 ‖ x)` to the salt before the
+  device sees it. This was confirmed empirically with the
+  `xplatform_hmac_probe` example (same physical key on both OSes): the
+  Windows output for a raw salt equals the Linux output for `T(salt)`.
+
+V4 makes both backends converge on the device computing
+`HMAC-SHA256(device_secret, T(fido2_hmac_salt))`:
+
+- On **libfido2**, luksbox applies `T` itself (via
+  `luksbox_fido2::webauthn_prf_salt`) before handing the salt to the
+  device.
+- On **webauthn.dll**, luksbox forwards the **raw** salt and lets
+  Windows apply the identical `T`.
+
+Because `T` is one-way, a legacy raw-salt slot (V1/V2/V3) can never be
+reproduced through webauthn.dll, so those FIDO2 slots remain
+Linux/macOS-only. New slots created by `Keyslot::new_*` default to V4
+and are cross-platform.
+
+> **History / migration note.** An earlier v0.3.0 build defined V4 as a
+> plain `SHA-256(salt)` prehash, on the mistaken assumption that
+> webauthn.dll either passed the salt through unchanged or did a bare
+> SHA-256. Neither is true: it applies the PRF-prefixed `T`. Vaults
+> whose FIDO2 slot was created by that earlier build therefore still
+> won't open on Windows (and won't open under the corrected build at
+> all, since the device input differs); **recreate the FIDO2 slot** to
+> get a working cross-platform V4 slot. Also note webauthn.dll *always*
+> performs user verification, while libfido2 only does so when a PIN is
+> supplied. Enroll the FIDO2 slot **with a PIN** so both platforms use
+> the same `CredRandomWithUV` secret.
 
 ### 3.3 Key derivation tree
 

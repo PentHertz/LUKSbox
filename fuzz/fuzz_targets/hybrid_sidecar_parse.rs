@@ -4,7 +4,7 @@
 #![no_main]
 
 //! Parse arbitrary bytes as a `.hybrid` sidecar file. The parser handles
-//! v1 (legacy ML-KEM-768 only) and v2 (per-entry level byte → variable
+//! v1 (legacy ML-KEM-768 only) and v2 (per-entry level byte selects variable
 //! entry size). Hostile inputs we want to ensure never panic / overflow:
 //!   - claim count > MAX_ENTRIES
 //!   - claim level byte = 0 / 0xff

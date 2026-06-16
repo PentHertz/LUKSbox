@@ -9,7 +9,7 @@
 //! Threat model: an attacker who has somehow obtained the MVK (or
 //! is a malicious co-tenant of a vault who can craft a valid
 //! metadata blob) feeds attacker-controlled bytes through the
-//! decrypt → magic-prefix-check → postcard-decode → walk-tree path.
+//! decrypt -> magic-prefix-check -> postcard-decode -> walk-tree path.
 //! We want every step to either reject cleanly or produce a
 //! structurally valid DirectoryTree that can be interrogated
 //! without panic.

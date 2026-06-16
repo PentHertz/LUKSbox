@@ -244,6 +244,12 @@ fn winfsp_debug() -> bool {
 /// Call inside a callback to log a one-line trace. The `result`
 /// closure is invoked AFTER the body to format the outcome - pass
 /// `Ok(...)` or `Err(STATUS_..)` as a string.
+///
+/// Gated behind `LUKSBOX_WINFSP_DEBUG` (off by default). The traces
+/// include in-vault filenames / paths and NTSTATUS codes -- that is
+/// vault-internal metadata, never key material, the MVK, a passphrase,
+/// a PIN, or file content. stderr is often captured in logs, so leave
+/// it unset outside active debugging.
 macro_rules! winfsp_trace {
     ($cb:expr, $args:expr) => {
         if $crate::winfsp::winfsp_debug() {
@@ -397,8 +403,13 @@ impl LuksboxFs {
                                 break;
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                if let Ok(mut v) = timer_vfs.lock() {
-                                    let _ = v.flush();
+                                if let Ok(mut v) = timer_vfs.lock()
+                                    && let Err(e) = v.flush()
+                                {
+                                    // Same rationale as the FUSE3
+                                    // adapter: no syscall to report
+                                    // to from a timer tick, so log.
+                                    eprintln!("luksbox-mount: deferred flush failed: {e}");
                                 }
                             }
                         }
@@ -423,8 +434,14 @@ impl LuksboxFs {
     /// every cleanup persists immediately, restoring pre-Layer-1
     /// data-loss-on-forced-kill semantics.
     fn maybe_flush_now(&self, vfs: &mut Vfs) {
-        if self.sync_mode {
-            let _ = vfs.flush();
+        if self.sync_mode
+            && let Err(e) = vfs.flush()
+        {
+            // WinFsp callbacks at these call sites have already
+            // committed their reply, so log rather than silently
+            // dropping the failure; fsync/FlushFileBuffers still
+            // propagates errors eagerly.
+            eprintln!("luksbox-mount: --sync flush failed: {e}");
         }
     }
 
@@ -453,8 +470,10 @@ impl Drop for LuksboxFs {
         {
             drop(tx);
         }
-        if let Ok(mut vfs) = self.inner.lock() {
-            let _ = vfs.flush();
+        if let Ok(mut vfs) = self.inner.lock()
+            && let Err(e) = vfs.flush()
+        {
+            eprintln!("luksbox-mount: final unmount flush failed: {e}");
         }
     }
 }

@@ -256,6 +256,24 @@ const SIZE_HEADER_LEN: usize = 8;
 /// `Error::FileSizeExceedsCap` instead of a panic / OOM.
 pub const MAX_FILE_SIZE: u64 = 1u64 << 44;
 
+// The chunk AAD binds each chunk to its index via a u32 (see
+// `chunk::chunk_aad` and the `chunk_idx as u32` casts on the write /
+// rotate paths). That is only sound while the largest reachable chunk
+// index fits in a u32. For the dominant (non-hide-size) path the
+// largest index is `MAX_FILE_SIZE / CHUNK_PLAINTEXT_SIZE - 1`; pin it
+// to u32 range so raising MAX_FILE_SIZE past 1<<44 fails the build
+// instead of silently truncating index 2^32 to 0 (which would let two
+// chunks of one file share an AAD and defeat the position-binding
+// defense). Hide-size mode adds one chunk (the size header), nudging
+// the theoretical max to exactly 2^32; that single edge stays
+// unreachable because `check_metadata_budget_for_chunks` refuses tens
+// of GB of ChunkRefs long before -- but never widen MAX_FILE_SIZE
+// without re-deriving this bound.
+const _: () = assert!(
+    MAX_FILE_SIZE / (CHUNK_PLAINTEXT_SIZE as u64) - 1 <= u32::MAX as u64,
+    "MAX_FILE_SIZE too large: a chunk index would overflow the u32 in the chunk AAD",
+);
+
 /// Number of chunks needed to hold a file of `real_size` bytes, accounting
 /// for the chunk-0 size-header in `hide_size` mode.
 ///
@@ -593,7 +611,9 @@ pub fn set_tolerate_bad_chunk_lists(v: bool) -> TolerateBadChunkListsGuard {
 /// CLI procedure documented in the changelog.
 pub fn tolerate_bad_chunk_lists() -> bool {
     TOLERATE_BAD_CHUNK_LISTS_TLS.with(|c| c.get())
-        || std::env::var_os("LUKSBOX_TOLERATE_BAD_CHUNK_LISTS").is_some()
+        || std::env::var("LUKSBOX_TOLERATE_BAD_CHUNK_LISTS")
+            .map(|v| !matches!(v.as_str(), "" | "0" | "false" | "no"))
+            .unwrap_or(false)
 }
 
 thread_local! {
@@ -639,13 +659,18 @@ fn use_v3_for_fresh_vault() -> bool {
     if let Some(v) = FORMAT_V3_THREAD_LOCAL.with(|c| c.get()) {
         return v;
     }
-    // Default v3 from this release on. The historic env var name
-    // (`LUKSBOX_FORMAT_V2`) is kept; an explicit "0"/"false"/"no"
-    // value opts back to v2 for users who need to keep new vaults
-    // openable by pre-v0.2.0 LUKSbox binaries.
+    // Default v3 from this release on. Setting `LUKSBOX_FORMAT_V2`
+    // to ANY non-empty value opts into v2 (fresh creates stay v2,
+    // and the flush-time auto-upgrade is vetoed). Released docs
+    // disagree on the value -- the CLI help / GUI / CRYPTO_SPEC say
+    // `=1`, the v0.2.0 changelog says `=0` -- while the previous
+    // implementation honored only `=0`, so users following the CLI
+    // help got a silent permanent upgrade. Treating "the var is
+    // set at all" as "this user cares about v2 compat" makes every
+    // released instruction correct and removes the footgun.
     !matches!(
         std::env::var(FORMAT_V3_ENV_VAR).as_deref(),
-        Ok("0") | Ok("false") | Ok("no") | Ok("off")
+        Ok(v) if !v.is_empty()
     )
 }
 
@@ -1002,6 +1027,37 @@ fn validate_metadata_tree(
         }
     }
 
+    // Reachability from ROOT. The per-inode checks above prove the
+    // reachable subgraph is a tree (each directory has a single
+    // referencing entry; entry_count == link_count), but they do NOT
+    // exclude a DISCONNECTED component: e.g. two directories A and B
+    // that each hold the other as their one child and name each other
+    // as parent. Each is referenced exactly once and has link_count 1,
+    // so every local check passes, yet neither is reachable from root.
+    // Honest writes never produce such an orphan (or orphan cycle); it
+    // would waste metadata budget, re-persist on every flush, and is
+    // the one shape that could feed the tolerated-inode path resolver
+    // (a root DFS without a visited set) an unterminating walk if it
+    // ever became reachable. Require the root-reachable set to cover
+    // every inode.
+    let mut reachable = BTreeSet::new();
+    reachable.insert(ROOT_ID);
+    let mut stack = vec![ROOT_ID];
+    while let Some(id) = stack.pop() {
+        // Each id was either ROOT_ID or a child entry already proven
+        // to resolve in `inodes` by the loop above; `?` over `unwrap`
+        // keeps this panic-free under any future refactor.
+        let inode = tree.inodes.get(&id).ok_or(Error::MetadataDeserialize)?;
+        for &child_id in inode.children.values() {
+            if reachable.insert(child_id) {
+                stack.push(child_id);
+            }
+        }
+    }
+    if reachable.len() != tree.inodes.len() {
+        return invalid_metadata();
+    }
+
     let mut free_chunks = BTreeSet::new();
     for &id in &tree.free_chunks {
         if id >= tree.next_chunk_id
@@ -1302,12 +1358,15 @@ pub struct Vfs {
     ///   - `write` and `truncate` (chunks added / removed / rewritten)
     ///   - `create_with_mode` (new inode, in case it transitions to
     ///     external before next flush)
+    ///
     /// Paths that REMOVE an entry (because the inode is gone):
     ///   - `unlink` / `rmdir`
+    ///
     /// Paths that mark ALL inodes dirty (full re-spill required):
     ///   - format upgrade in `Vfs::flush` (e.g. V2 -> V5)
     ///   - MVK rotation (every chunk gets re-encrypted under the
     ///     new MVK, so every chunk-list block too)
+    ///
     /// Paths that DON'T mark (chunks vec unchanged):
     ///   - `chmod`, `rename`, `link`, `mkdir`, `symlink` -- those
     ///     touch the in-memory tree but the chunk-list chain is
@@ -1330,6 +1389,14 @@ impl Vfs {
         // returned Err) don't leak into this open's report.
         let _ = take_tolerated_inodes();
         let blob = container.read_metadata()?;
+        // Opt-in diagnostic (off by default). When set, this prints the
+        // first 32 bytes of the DECRYPTED metadata tree (postcard
+        // magic + counters) and, further down, inode ids/kinds/sizes
+        // and rejected symlink targets. That is vault-internal
+        // *metadata* (structure / filenames), never key material, the
+        // MVK, a passphrase, a PIN, or file *content* -- none of those
+        // are in scope on this path. Still, stderr is often captured in
+        // logs, so leave it unset outside active debugging.
         let debug = std::env::var_os("LUKSBOX_DEBUG_OPEN").is_some();
         if debug {
             let head_len = blob.len().min(32);
@@ -1600,6 +1667,22 @@ impl Vfs {
         }
     }
 
+    /// Refuse mutation on a recovered (lossy) instance. Keyed on the
+    /// per-instance `tolerated_inodes` report, NOT on the transient
+    /// `tolerate_bad_chunk_lists()` thread-local/env flag: the UI
+    /// guard that enabled recovery for the `Vfs::open` call has long
+    /// dropped by the time a mount worker or GUI thread mutates the
+    /// Vfs, and conversely a leftover env var must not freeze
+    /// healthy vaults. Called at the top of every mutating op so a
+    /// recovery session can never dirty the tree (writes would also
+    /// recycle the broken files' chunk slots on disk immediately).
+    fn ensure_writable(&self) -> Result<(), Error> {
+        if !self.tolerated_inodes.is_empty() {
+            return Err(Error::ReadOnlyMount);
+        }
+        Ok(())
+    }
+
     pub fn flush(&mut self) -> Result<(), Error> {
         // Tolerant-recovery mode: if the open path zeroed any
         // inode's chunks/size because its chunk-list chain failed
@@ -1607,9 +1690,19 @@ impl Vfs {
         // disk. Persisting it would overwrite the original
         // `chunks_external` pointers and `size` permanently --
         // destroying any chance of brute-force recovering the
-        // broken files later. Refuse the flush in this mode.
-        if tolerate_bad_chunk_lists() {
-            return Err(Error::ReadOnlyMount);
+        // broken files later. Mutating ops are refused via
+        // `ensure_writable`, so the tree stays clean and flush
+        // no-ops (close()/unmount keep working); a dirty tree here
+        // means something bypassed the gate and we refuse rather
+        // than persist the lossy tree. This branch also skips the
+        // mirror-recovery force-flush below: rewriting the live
+        // region from a lossy tree is exactly the overwrite this
+        // mode exists to prevent.
+        if !self.tolerated_inodes.is_empty() {
+            if self.dirty {
+                return Err(Error::ReadOnlyMount);
+            }
+            return Ok(());
         }
         // Force a flush even when the tree is clean if the most recent
         // open recovered the metadata blob from a sidecar mirror. The
@@ -1629,8 +1722,7 @@ impl Vfs {
         // v0.2.1 auto-upgrade: any flush against a LUKSBOX1 vault
         // bumps it to LUKSBOX2 + LBM5. One-way; the next crash gets
         // mirror recovery, but the cost is that pre-v0.3 binaries
-        // can no longer open the vault. The user picked auto-upgrade
-        // on next flush explicitly.
+        // can no longer open the vault.
         //
         // Explicit deniable-mode exclusion: deniable vaults must NOT
         // auto-upgrade, because the upgrade implies on-disk sidecar
@@ -1640,8 +1732,18 @@ impl Vfs {
         // overwrite + internal-redundancy crash-safety story. See
         // `Container::is_v2_format` for the parallel guard on the
         // write path.
+        //
+        // `use_v3_for_fresh_vault()` gate: the CLI has always
+        // documented `LUKSBOX_FORMAT_V2=1` as suppressing this
+        // trigger (the whole point of `--format v2` is sharing the
+        // vault with pre-v0.2.1 binaries), but no suppression check
+        // existed here -- one flush from any v0.2.1+ binary
+        // silently and permanently upgraded the vault out from
+        // under the older readers. The same toggle that picks the
+        // fresh-vault format now also vetoes the upgrade.
         if self.container.header.version_major == luksbox_core::VERSION_MAJOR_V1
             && !self.container.is_deniable()
+            && use_v3_for_fresh_vault()
         {
             self.container.header.version_major = luksbox_core::VERSION_MAJOR_V2;
             self.container.mark_header_dirty();
@@ -2446,6 +2548,7 @@ impl Vfs {
     }
 
     pub fn mkdir(&mut self, parent: FileId, name: &str) -> Result<FileId, Error> {
+        self.ensure_writable()?;
         validate_name(name)?;
         self.require_dir(parent)?;
         if self.tree.inodes[&parent].children.contains_key(name) {
@@ -2502,6 +2605,7 @@ impl Vfs {
         name: &str,
         mode: u32,
     ) -> Result<FileId, Error> {
+        self.ensure_writable()?;
         validate_name(name)?;
         self.require_dir(parent)?;
         if self.tree.inodes[&parent].children.contains_key(name) {
@@ -2598,6 +2702,10 @@ impl Vfs {
     }
 
     pub fn write(&mut self, id: FileId, offset: u64, buf: &[u8]) -> Result<usize, Error> {
+        // Gated even before the empty-buf fast path: write() rewrites
+        // existing chunks on disk at call time, so on a recovered
+        // instance it must fail loudly, not depend on flush.
+        self.ensure_writable()?;
         if buf.is_empty() {
             return Ok(0);
         }
@@ -2739,6 +2847,7 @@ impl Vfs {
     }
 
     pub fn truncate(&mut self, id: FileId, new_size: u64) -> Result<(), Error> {
+        self.ensure_writable()?;
         // R13-07: refuse oversize truncates for the same reason as
         // write(): the chunk-allocation loop below would otherwise
         // commit zeros for billions of chunks before the host runs
@@ -2834,6 +2943,7 @@ impl Vfs {
     /// file, ciphertext substitution" -- the former is a recoverable
     /// space bug, the latter is a confidentiality bug.
     pub fn unlink(&mut self, parent: FileId, name: &str) -> Result<(), Error> {
+        self.ensure_writable()?;
         let parent_inode = self.require_dir(parent)?;
         let target_id = *parent_inode.children.get(name).ok_or(Error::NotFound)?;
         let target = self.tree.inodes.get(&target_id).unwrap();
@@ -2902,6 +3012,7 @@ impl Vfs {
     /// caller-supplied user-space data), just store them as-is.
     /// Mount layers mask out bits they don't understand.
     pub fn chmod(&mut self, id: FileId, mode: u32) -> Result<(), Error> {
+        self.ensure_writable()?;
         let inode = self.tree.inodes.get_mut(&id).ok_or(Error::NotFound)?;
         // Mask to the POSIX-defined mode bits (12 bits: 0o7777 =
         // setuid|setgid|sticky + 9 permission bits). Higher bits
@@ -2943,6 +3054,7 @@ impl Vfs {
     /// result stays within the vault root could be added later as
     /// an opt-in.
     pub fn symlink(&mut self, parent: FileId, name: &str, target: &str) -> Result<FileId, Error> {
+        self.ensure_writable()?;
         validate_name(name)?;
         if !is_safe_symlink_target(target) {
             return Err(Error::InvalidPath(target.to_string()));
@@ -3021,6 +3133,7 @@ impl Vfs {
         new_parent: FileId,
         new_name: &str,
     ) -> Result<(), Error> {
+        self.ensure_writable()?;
         validate_name(new_name)?;
 
         // Validate target. Only regular files can be hardlinked
@@ -3071,6 +3184,7 @@ impl Vfs {
     }
 
     pub fn rmdir(&mut self, parent: FileId, name: &str) -> Result<(), Error> {
+        self.ensure_writable()?;
         let parent_inode = self.require_dir(parent)?;
         let target_id = *parent_inode.children.get(name).ok_or(Error::NotFound)?;
         let target = self.tree.inodes.get(&target_id).unwrap();
@@ -3123,6 +3237,7 @@ impl Vfs {
         new_parent: FileId,
         new_name: &str,
     ) -> Result<(), Error> {
+        self.ensure_writable()?;
         validate_name(old_name)?;
         validate_name(new_name)?;
 
@@ -3175,10 +3290,10 @@ impl Vfs {
         let displaced = {
             let new_dir = self.tree.inodes.get(&new_parent).unwrap();
             if let Some(&dst_id) = new_dir.children.get(new_name) {
-                // Same inode would only happen via hardlinks, which we
-                // don't support yet. Defensive: treat as no-op so a
-                // future hardlink patch can't accidentally drop the
-                // only reference to the inode.
+                // Source and target are hardlinks to the same inode:
+                // POSIX rename(2) requires this to be a no-op success
+                // (and doing anything else could drop the only
+                // remaining reference to the inode).
                 if src_id == dst_id {
                     return Ok(());
                 }
@@ -3199,25 +3314,41 @@ impl Vfs {
             }
         };
 
-        // ---- Phase 2: free the displaced inode's data chunks ------------
-        // Only file inodes have chunks; empty directories have none.
-        // Matches the cleanup path in `unlink` so we don't leak data-
-        // area slots when a file is replaced via rename. Borrow-scope
-        // block keeps the immutable `inodes.get` alive only as long as
-        // it takes to clone out the chunk lists, so the subsequent
-        // `tree.free_chunk_id` (mutates `tree.free_chunks`) compiles.
+        // ---- Phase 2: drop the displaced inode's directory entry --------
+        // Mirrors `unlink`: rename-over-target removes ONE directory
+        // entry for the target, so decrement `link_count` and free
+        // chunks + chunk-list blocks only when the last hardlink is
+        // gone. Freeing unconditionally here (the pre-hardlink
+        // behaviour) would leave any surviving links dangling: their
+        // chunk slots get reused and overwritten by the next write,
+        // and `validate_metadata_tree` then fails every flush.
+        // Saturating-sub for the same corrupt-vault reason as
+        // `unlink`. Borrow-scope block keeps the immutable
+        // `inodes.get` alive only as long as it takes to clone out
+        // the chunk lists, so the subsequent `tree.free_chunk_id`
+        // (mutates `tree.free_chunks`) compiles.
         if let Some(dst_id) = displaced {
-            let (chunks, list_blocks) = {
-                let dst = self.tree.inodes.get(&dst_id).unwrap();
-                (dst.chunks.clone(), dst.external_list_blocks.clone())
+            let now_zero = {
+                let dst = self.tree.inodes.get_mut(&dst_id).unwrap();
+                dst.link_count = dst.link_count.saturating_sub(1);
+                dst.link_count == 0
             };
-            for cref in chunks {
-                self.tree.free_chunk_id(cref.id);
+            if now_zero {
+                let (chunks, list_blocks) = {
+                    let dst = self.tree.inodes.get(&dst_id).unwrap();
+                    (dst.chunks.clone(), dst.external_list_blocks.clone())
+                };
+                for cref in chunks {
+                    self.tree.free_chunk_id(cref.id);
+                }
+                for cref in list_blocks {
+                    self.tree.free_chunk_id(cref.id);
+                }
+                self.tree.inodes.remove(&dst_id);
+                // Layer 2: same bookkeeping as `unlink` -- the inode
+                // is gone, drop any pending dirty marker for it.
+                self.chunks_dirty.remove(&dst_id);
             }
-            for cref in list_blocks {
-                self.tree.free_chunk_id(cref.id);
-            }
-            self.tree.inodes.remove(&dst_id);
         }
 
         // ---- Phase 3: move the directory entry --------------------------
@@ -3313,6 +3444,7 @@ impl Vfs {
         credentials: Vec<SlotCredential>,
         kdf_params: luksbox_core::Argon2idParams,
     ) -> Result<(), Error> {
+        self.ensure_writable()?;
         use luksbox_core::{MasterVolumeKey, SlotKind};
 
         // Reject any fido2-direct slots upfront.
@@ -3558,6 +3690,7 @@ impl Vfs {
         &mut self,
         credentials: Vec<DeniableRotationCredential>,
     ) -> Result<(), Error> {
+        self.ensure_writable()?;
         use luksbox_core::deniable::DeniableCredential;
 
         if !self.container.is_deniable() {
@@ -4648,8 +4781,16 @@ mod tests {
     fn flush_without_v4_features_still_upgrades_v1_vault_to_v5() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("a.lbx");
-        let _v2_guard = set_format_v3_override(Some(false));
-        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        // Guard scoped to vault creation only: it simulates a vault
+        // BUILT by a v0.2.0 binary. By flush time no v2 preference
+        // is active (the modern-binary-opens-old-vault scenario), so
+        // the auto-upgrade must fire. Holding the guard across the
+        // flush would instead model an explicit v2 opt-in, which
+        // vetoes the upgrade -- pinned by the test below.
+        let mut vfs = {
+            let _v2_guard = set_format_v3_override(Some(false));
+            Vfs::open(create_container(&path)).unwrap()
+        };
         let root = vfs.root_id();
         let f = vfs.create(root, "x").unwrap();
         vfs.write(f, 0, b"hi").unwrap();
@@ -4668,6 +4809,41 @@ mod tests {
             luksbox_core::VERSION_MAJOR_V2,
             "v0.2.0-envelope vault must upgrade to LUKSBOX2 header on first flush"
         );
+    }
+
+    /// The v2 opt-in (`LUKSBOX_FORMAT_V2` env var / the format
+    /// override used by `create --format v2`) must veto the
+    /// flush-time auto-upgrade: the whole point of a v2 vault is
+    /// staying readable by pre-v0.2.1 binaries, and the CLI has
+    /// always documented the env var as suppressing the trigger,
+    /// but no such check existed until v0.3.0 -- one flush from a
+    /// newer binary silently upgraded the vault permanently.
+    #[test]
+    fn v2_opt_in_vetoes_flush_auto_upgrade() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let _v2_guard = set_format_v3_override(Some(false));
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "x").unwrap();
+        vfs.write(f, 0, b"hi").unwrap();
+        vfs.flush().unwrap();
+        assert!(
+            !vfs.uses_v5_metadata(),
+            "explicit v2 opt-in must keep LBM2 metadata across flush"
+        );
+        assert_eq!(
+            vfs.container.header.version_major,
+            luksbox_core::VERSION_MAJOR_V1,
+            "explicit v2 opt-in must keep the LUKSBOX1 header"
+        );
+        // The vault must still round-trip under the same opt-in.
+        drop(vfs);
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        let f = vfs.lookup(vfs.root_id(), "x").unwrap();
+        let mut buf = [0u8; 2];
+        assert_eq!(vfs.read(f, 0, &mut buf).unwrap(), 2);
+        assert_eq!(&buf, b"hi");
     }
 
     /// **Critical security invariant**: hardlinks share chunks.
@@ -4777,6 +4953,44 @@ mod tests {
         match vfs.flush() {
             Err(Error::MetadataDeserialize) => {} // validator caught it
             Ok(()) => panic!("flush must reject link_count == 0"),
+            Err(e) => panic!("expected MetadataDeserialize, got {e:?}"),
+        }
+    }
+
+    /// **Security / integrity**: a DISCONNECTED directory cycle (two
+    /// dirs that reference each other but are unreachable from root)
+    /// passes every local per-inode check -- each is referenced once,
+    /// link_count 1, parent is a directory -- yet must be rejected by
+    /// the root-reachability pass. Honest writes never produce one;
+    /// accepting it would waste metadata budget and (if it ever became
+    /// reachable) feed the tolerated-inode path resolver a walk it
+    /// could not terminate.
+    #[test]
+    fn disconnected_directory_cycle_is_rejected_at_flush() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let a = vfs.mkdir(root, "a").unwrap();
+        let b = vfs.mkdir(root, "b").unwrap();
+        // Detach both from root, then wire them into a 2-node cycle
+        // that names each other as parent. Every local check passes;
+        // only the root-reachability pass can catch this.
+        vfs.tree.inodes.get_mut(&root).unwrap().children.clear();
+        {
+            let ia = vfs.tree.inodes.get_mut(&a).unwrap();
+            ia.parent = b;
+            ia.children.insert("to_b".to_string(), b);
+        }
+        {
+            let ib = vfs.tree.inodes.get_mut(&b).unwrap();
+            ib.parent = a;
+            ib.children.insert("to_a".to_string(), a);
+        }
+        vfs.dirty = true;
+        match vfs.flush() {
+            Err(Error::MetadataDeserialize) => {}
+            Ok(()) => panic!("flush must reject an orphan directory cycle"),
             Err(e) => panic!("expected MetadataDeserialize, got {e:?}"),
         }
     }
@@ -7294,5 +7508,212 @@ mod tests {
         vfs.tree.next_file_id = u64::MAX;
         let err = vfs.create(root, "x").unwrap_err();
         assert!(matches!(err, Error::IdSpaceExhausted), "{err:?}");
+    }
+
+    // ---- tolerant-recovery read-only enforcement ---------------------
+
+    /// Build a vault holding one spilled file ("big") whose first
+    /// chunk-list block we corrupt on disk, plus one healthy inline
+    /// file ("healthy.txt"). Returns the healthy file's content.
+    fn build_vault_with_broken_chunk_list(path: &Path) -> Vec<u8> {
+        let mut vfs = Vfs::open(create_container(path)).unwrap();
+        let root = vfs.root_id();
+
+        let healthy_content = b"survives recovery".to_vec();
+        let h = vfs.create(root, "healthy.txt").unwrap();
+        vfs.write(h, 0, &healthy_content).unwrap();
+
+        // 2 MiB = 512 chunks, past V5_INLINE_CHUNK_THRESHOLD (256),
+        // so flush spills the chunk list to external blocks.
+        let f = vfs.create(root, "big").unwrap();
+        let big: Vec<u8> = (0..2 * 1024 * 1024).map(|i| (i & 0xFF) as u8).collect();
+        vfs.write(f, 0, &big).unwrap();
+        vfs.flush().unwrap();
+
+        let externals = vfs.tree.inodes[&f].external_list_blocks.clone();
+        assert!(
+            !externals.is_empty(),
+            "test premise: 512 chunks must spill on a default-format vault"
+        );
+        let data_offset = vfs.container.data_offset();
+        let slot = chunk::slot_offset(data_offset, externals[0].id).unwrap();
+        drop(vfs);
+
+        // Flip bytes inside the chunk-list block's ciphertext so the
+        // chain walk fails AEAD at the next open.
+        use std::io::{Read as _, Seek, SeekFrom, Write as _};
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.seek(SeekFrom::Start(slot + 16)).unwrap();
+        let mut bytes = [0u8; 8];
+        file.read_exact(&mut bytes).unwrap();
+        for b in &mut bytes {
+            *b = !*b;
+        }
+        file.seek(SeekFrom::Start(slot + 16)).unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+
+        healthy_content
+    }
+
+    #[test]
+    fn recovered_instance_refuses_mutation_and_preserves_disk_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("broken.lbx");
+        let healthy_content = build_vault_with_broken_chunk_list(&path);
+
+        // Without tolerance the open must hard-fail.
+        let err = match Vfs::open(open_container(&path)) {
+            Ok(_) => panic!("corrupted chain must reject a non-tolerant open"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, Error::MetadataDeserialize), "{err:?}");
+
+        // Open with the guard scoped exactly like the GUI and wizard
+        // do: held across Vfs::open only, dropped immediately after.
+        let mut vfs = {
+            let _g = set_tolerate_bad_chunk_lists(true);
+            Vfs::open(open_container(&path)).unwrap()
+        };
+        assert_eq!(vfs.tolerated_inodes().len(), 1);
+        assert!(vfs.tolerated_inodes()[0].path.contains("big"));
+
+        // The guard is gone, but the INSTANCE must stay read-only:
+        // every mutating op refuses with ReadOnlyMount.
+        let root = vfs.root_id();
+        let h = vfs.lookup(root, "healthy.txt").unwrap();
+        let err = vfs.write(h, 0, b"x").unwrap_err();
+        assert!(matches!(err, Error::ReadOnlyMount), "{err:?}");
+        let err = vfs.create(root, "new.txt").unwrap_err();
+        assert!(matches!(err, Error::ReadOnlyMount), "{err:?}");
+        let err = vfs.mkdir(root, "newdir").unwrap_err();
+        assert!(matches!(err, Error::ReadOnlyMount), "{err:?}");
+        let err = vfs.unlink(root, "healthy.txt").unwrap_err();
+        assert!(matches!(err, Error::ReadOnlyMount), "{err:?}");
+        let err = vfs.truncate(h, 0).unwrap_err();
+        assert!(matches!(err, Error::ReadOnlyMount), "{err:?}");
+        let err = vfs.chmod(h, 0o600).unwrap_err();
+        assert!(matches!(err, Error::ReadOnlyMount), "{err:?}");
+        let err = vfs
+            .rename(root, "healthy.txt", root, "renamed")
+            .unwrap_err();
+        assert!(matches!(err, Error::ReadOnlyMount), "{err:?}");
+
+        // Reads of healthy files keep working (that's the point of
+        // recovery mode), the broken file reads as empty.
+        let mut buf = vec![0u8; healthy_content.len()];
+        let n = vfs.read(h, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], &healthy_content[..]);
+        let b = vfs.lookup(root, "big").unwrap();
+        assert_eq!(vfs.stat(b).unwrap().size, 0);
+
+        // Clean flush no-ops and close() succeeds, so unmount works.
+        vfs.flush().unwrap();
+        vfs.close().unwrap();
+
+        // The recovery session must not have touched the on-disk
+        // metadata: a fresh non-tolerant open still sees the broken
+        // chain (the original chunk pointers survived for later
+        // brute-force recovery).
+        let err = match Vfs::open(open_container(&path)) {
+            Ok(_) => panic!("recovery session must not repair/overwrite the chain"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, Error::MetadataDeserialize), "{err:?}");
+    }
+
+    #[test]
+    fn stale_recovery_flag_does_not_freeze_healthy_vaults() {
+        // A leftover tolerance flag (env var exported, or a guard
+        // held wider than intended) must not make healthy vaults
+        // read-only: the gate is the per-instance recovery report,
+        // not the transient flag.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("healthy.lbx");
+        let _g = set_tolerate_bad_chunk_lists(true);
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        assert!(vfs.tolerated_inodes().is_empty());
+        let root = vfs.root_id();
+        let f = vfs.create(root, "ok.txt").unwrap();
+        vfs.write(f, 0, b"writable").unwrap();
+        vfs.flush().unwrap();
+    }
+
+    // ---- rename-over-hardlinked-target refcounting -------------------
+
+    #[test]
+    fn rename_over_hardlinked_target_keeps_surviving_link() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+
+        let a = vfs.create(root, "a").unwrap();
+        let content_a = b"original content behind two links".to_vec();
+        vfs.write(a, 0, &content_a).unwrap();
+        vfs.link(a, root, "b").unwrap();
+        assert_eq!(vfs.tree.inodes[&a].link_count, 2);
+
+        let c = vfs.create(root, "c").unwrap();
+        vfs.write(c, 0, b"replacement").unwrap();
+
+        // Displace one of the two hardlinks via rename. The inode
+        // must survive (one link left), keep its chunks, and stay
+        // reachable through the other entry.
+        vfs.rename(root, "c", root, "b").unwrap();
+        assert_eq!(vfs.tree.inodes[&a].link_count, 1);
+        let still_a = vfs.lookup(root, "a").unwrap();
+        assert_eq!(still_a, a);
+
+        // Write a filler file: if rename had freed the surviving
+        // link's chunk slots, this write would recycle and overwrite
+        // them on disk.
+        let filler = vfs.create(root, "filler").unwrap();
+        vfs.write(filler, 0, &vec![0xEE; 64 * 1024]).unwrap();
+
+        let mut buf = vec![0u8; content_a.len()];
+        let n = vfs.read(a, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], &content_a[..]);
+
+        // The tree must still validate (no dangling child) and the
+        // whole state must survive a flush + reopen.
+        vfs.flush().unwrap();
+        drop(vfs);
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let a = vfs.lookup(root, "a").unwrap();
+        let mut buf = vec![0u8; content_a.len()];
+        let n = vfs.read(a, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..n], &content_a[..]);
+        assert_eq!(vfs.tree.inodes[&a].link_count, 1);
+
+        // Displacing the LAST link must still free the inode.
+        let d = vfs.create(root, "d").unwrap();
+        vfs.write(d, 0, b"displaces last link").unwrap();
+        vfs.rename(root, "d", root, "a").unwrap();
+        assert!(!vfs.tree.inodes.contains_key(&a));
+        vfs.flush().unwrap();
+    }
+
+    #[test]
+    fn rename_hardlink_onto_itself_is_noop() {
+        // POSIX rename(2): old and new resolving to the same inode
+        // is a no-op success; both entries must survive.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let a = vfs.create(root, "a").unwrap();
+        vfs.write(a, 0, b"data").unwrap();
+        vfs.link(a, root, "b").unwrap();
+        vfs.rename(root, "a", root, "b").unwrap();
+        assert_eq!(vfs.lookup(root, "a").unwrap(), a);
+        assert_eq!(vfs.lookup(root, "b").unwrap(), a);
+        assert_eq!(vfs.tree.inodes[&a].link_count, 2);
+        vfs.flush().unwrap();
     }
 }

@@ -14,7 +14,7 @@
 //!   - `simulate_unseal_error()`          -return Err(TpmError(...)) on next unseal
 //!   - `simulate_seal_error()`            -return Err(TpmError(...)) on next seal
 //!   - `forget_blobs()`                   -drop all known blobs (rogue swap to a
-//!                                           different chip; subsequent unseal fails)
+//!     different chip; subsequent unseal fails)
 //!
 //! The format-layer's `UnlockMaterial::Tpm2 { unseal: closure }` already
 //! takes a closure, so tests just wrap a `MockTpm2Sealer` in a closure

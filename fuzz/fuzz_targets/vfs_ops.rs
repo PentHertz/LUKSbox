@@ -3,16 +3,16 @@
 
 #![no_main]
 
-//! Fuzz the VFS mutating operations — `mkdir`, `create`, `rename`,
-//! `unlink`, `lookup`, `readdir`, and `write` — with attacker-
+//! Fuzz the VFS mutating operations (`mkdir`, `create`, `rename`,
+//! `unlink`, `lookup`, `readdir`, and `write`) with attacker-
 //! controlled name strings and offsets, all on a real
 //! `Container`-backed `Vfs` instance.
 //!
 //! Threat model: the user has unlocked the vault legitimately. The
 //! attacker can only reach the VFS via path / name strings (FUSE
 //! callbacks, WinFsp, CLI args). We want every name they can
-//! provide — UTF-8 garbage, `..`, embedded NUL, slashes, oversized,
-//! reserved windows names, control chars — to be either accepted
+//! provide (UTF-8 garbage, `..`, embedded NUL, slashes, oversized,
+//! reserved windows names, control chars) to be either accepted
 //! cleanly or rejected with a typed `Error`. Never panic, never
 //! corrupt the in-memory tree, never leak file IDs across renames.
 //!
@@ -124,7 +124,7 @@ fn run_program(vfs: &mut Vfs, mut cursor: &[u8]) {
 
         // Read a name length byte (clamped 0..=64) and grab that many
         // bytes; lossy-decode to a UTF-8 string. The lossy step
-        // doesn't sanitize control chars, NULs, slashes, ... — those
+        // doesn't sanitize control chars, NULs, slashes, ...; those
         // hit `validate_name` in production. That's the point.
         let name_len = take(&mut cursor, 1).first().copied().unwrap_or(0) as usize;
         let name_bytes = take(&mut cursor, name_len.min(64));
@@ -179,7 +179,7 @@ fn run_program(vfs: &mut Vfs, mut cursor: &[u8]) {
                 // write to one of our known FileIds at a fuzzer-derived
                 // offset and short payload. Writes only succeed on
                 // file inodes; mkdir-created dirs return Err which is
-                // fine — we just don't want a panic.
+                // fine; we just don't want a panic.
                 let off_bytes = take(&mut cursor, 4);
                 let mut off = 0u32;
                 for (i, b) in off_bytes.iter().enumerate() {
@@ -190,7 +190,7 @@ fn run_program(vfs: &mut Vfs, mut cursor: &[u8]) {
                 let _ = vfs.write(parent, (off & 0xFFFF) as u64, payload);
             }
             7 => {
-                // flush — exercises the postcard-encode + AEAD-encrypt
+                // flush. Exercises the postcard-encode + AEAD-encrypt
                 // + anchor write path with the current tree state.
                 let _ = vfs.flush();
             }

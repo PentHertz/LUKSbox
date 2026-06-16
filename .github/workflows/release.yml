@@ -47,33 +47,34 @@ jobs:
     name: ${{ matrix.target }}${{ matrix.ubuntu_codename && format(' ({0})', matrix.ubuntu_codename) || '' }}
     runs-on: ${{ matrix.runner }}
     # Per-matrix container: most entries run on the host runner
-    # (container is null / unset). The Trixie entries set
-    # `container: debian:trixie` which moves the entire job inside a
-    # fresh Debian 13 container so cargo-deb's `$auto` ELF-derived
-    # dependencies pin trixie-correct package names instead of
-    # noble-shaped ones (libfuse3-4 vs libfuse3-3, etc.). The
-    # bootstrap step below installs the minimum tooling a
-    # `debian:trixie` base image lacks (git for checkout, curl + ca-
-    # certificates for rustup, build-essential for native deps).
+    # (container is null / unset). The Trixie and 26.04/resolute
+    # entries set `container: debian:trixie` / `container: ubuntu:26.04`
+    # which moves the entire job inside a fresh container so cargo-deb's
+    # `$auto` ELF-derived dependencies pin that distro's package names
+    # instead of noble-shaped ones (libfuse3-4 vs libfuse3-3, etc.).
+    # The bootstrap step below installs the minimum tooling a bare base
+    # image lacks (git for checkout, curl + ca-certificates for rustup,
+    # build-essential for native deps).
     container: ${{ matrix.container || null }}
     strategy:
       fail-fast: false
       matrix:
         # ----------------------------------------------------------------
-        # Linux is matrixed twice along an extra `ubuntu_codename`
-        # dimension (jammy vs noble). cargo-deb's `$auto`-derived
+        # Linux is matrixed along an extra `ubuntu_codename` dimension
+        # (jammy / noble / trixie / resolute). cargo-deb's `$auto`-derived
         # `Depends:` line bakes in the BUILD HOST's package names with
         # `>=` minimums (e.g. `libtss2-mu0 (>= 3.0.1)` on jammy vs
         # `libtss2-mu-4.0.1-0t64 (>= 3.0.1)` on noble after the t64
         # transition). A jammy-built .deb refuses to install on noble
         # because `libtss2-mu0` no longer exists there, and vice versa.
         # We ship one .deb per release so users pick the matching
-        # codename for their distro.
+        # codename for their distro. trixie + resolute build inside a
+        # container (no native runner image) for the same reason.
         #
         # The .rpm uses SONAMEs (e.g. `libtss2-mu.so.0()(64bit)`) which
         # are version-constraint-free and stable across Fedora/RHEL
         # releases. We build it only on jammy (one per arch); no need
-        # for a noble variant.
+        # for a noble / trixie / resolute variant.
         # ----------------------------------------------------------------
         include:
           # Linux x86_64 - Ubuntu 22.04 (jammy). Covers Ubuntu 22.04 +
@@ -142,6 +143,31 @@ jobs:
             container: debian:trixie
             build_rpm: false
             archive: luksbox-${{ github.ref_name }}-aarch64-linux-trixie.tar.gz
+          # Linux x86_64 - Ubuntu 26.04 (resolute). Same containerised
+          # pattern as the trixie entries: built INSIDE an
+          # `ubuntu:26.04` Docker container on the Ubuntu 24.04 runner
+          # because GitHub Actions has no native 26.04 hosted runner
+          # image yet. Inside the container cargo-deb's `$auto` resolves
+          # the 26.04-correct package names (the post-t64 sonames may
+          # differ again from noble), so the .deb installs cleanly on
+          # 26.04 instead of failing with "unmet dependencies" the way a
+          # noble-built artifact can. Drop `container:` and switch
+          # `runner` to `ubuntu-26.04` once GitHub ships the image.
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            ubuntu_codename: resolute
+            container: ubuntu:26.04
+            build_rpm: false
+            archive: luksbox-${{ github.ref_name }}-x86_64-linux-resolute.tar.gz
+          # Linux aarch64 - Ubuntu 26.04 (resolute). Native ARM64 runner
+          # + ARM64 `ubuntu:26.04` container (Docker pulls the matching
+          # linux/arm64 variant on the arm64 runner, no QEMU).
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            ubuntu_codename: resolute
+            container: ubuntu:26.04
+            build_rpm: false
+            archive: luksbox-${{ github.ref_name }}-aarch64-linux-resolute.tar.gz
           - target: x86_64-pc-windows-msvc
             runner: windows-latest
             archive: luksbox-${{ github.ref_name }}-x86_64-windows.zip
@@ -182,16 +208,15 @@ jobs:
             archive: luksbox-${{ github.ref_name }}-aarch64-macos-macfuse.dmg
 
     steps:
-      # Trixie-only: install minimum tooling the `debian:trixie` base
-      # image lacks. Must run BEFORE actions/checkout (needs git) and
-      # before dtolnay/rust-toolchain (needs curl + ca-certificates
-      # for rustup's installer download). build-essential pulls in
-      # gcc + linker so cargo can link the resulting binaries against
-      # the native shared libs we install in the "Linux deps (apt)"
-      # step below. No-op (skipped) on every other matrix entry
-      # because they run on the host runner where these are
-      # pre-installed.
-      - name: Bootstrap Trixie container
+      # Container entries only (debian:trixie, ubuntu:26.04): install
+      # the minimum tooling the bare base image lacks. Must run BEFORE
+      # actions/checkout (needs git) and before dtolnay/rust-toolchain
+      # (needs curl + ca-certificates for rustup's installer download).
+      # build-essential pulls in gcc + linker so cargo can link the
+      # resulting binaries against the native shared libs we install in
+      # the "Linux deps (apt)" step below. No-op (skipped) on every
+      # host-runner matrix entry because those ship these pre-installed.
+      - name: Bootstrap container (Debian/Ubuntu)
         if: matrix.container
         run: |
           apt-get update
@@ -2198,7 +2223,7 @@ jobs:
               automatically. Registers a `luksbox-gui` desktop
               launcher and a MIME type for `.lbx` files.
 
-            **Linux (Ubuntu 24.04+, Debian 13+ trixie, .deb):**
+            **Linux (Ubuntu 24.04 noble, .deb):**
               download `luksbox_*_noble_amd64.deb` (or `_arm64`) and
               install with `sudo apt install ./luksbox_*_noble_amd64.deb`.
               Same package layout as the jammy build, but with
@@ -2206,6 +2231,16 @@ jobs:
               `libfido2-1t64`, `libtss2-mu-4.0.1-0t64`, etc.). The
               jammy and noble .deb files cannot be installed
               interchangeably, the dependency names differ.
+
+            **Linux (Debian 13 trixie / Ubuntu 26.04 resolute, .deb):**
+              these distros bump shared-library sonames again past
+              noble, so they get their own builds. Download
+              `luksbox_*_trixie_amd64.deb` on Debian 13 or
+              `luksbox_*_resolute_amd64.deb` on Ubuntu 26.04 (or the
+              matching `_arm64`) and install with `sudo apt install
+              ./<file>`. Each .deb's dependency names are resolved
+              against its own distro, so install the one matching your
+              release rather than the noble build.
 
             **Linux (Fedora / RHEL / Rocky / Alma, .rpm):** download
               `luksbox-*.x86_64.rpm` (or `aarch64.rpm`) and install

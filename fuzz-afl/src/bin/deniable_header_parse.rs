@@ -50,7 +50,7 @@ fn main() {
             ),
         };
 
-        match complete_open_v2(envelope, &cred, cipher) {
+        match complete_open_v2(&envelope, &cred, cipher) {
             Ok(_) => {}
             Err(Error::OpaqueUnlockFailed) => {}
             Err(other) => panic!(

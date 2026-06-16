@@ -140,18 +140,43 @@ const OFF_KIND: usize = 0;
 ///   format and reason vary per vendor and aren't always publicly
 ///   documented). Any byte not part of a structured field is random
 ///   padding for entropy obfuscation.
+/// - `AAD_VERSION_V4 = 3`: byte layout identical to V3 (same AAD
+///   shape, same cred_id/hmac_salt offsets). The only difference is
+///   the WIRE-side interpretation of `fido2_hmac_salt` for FIDO2-
+///   touching slot kinds: V4 slots use the W3C WebAuthn-PRF salt
+///   derivation, so the authenticator computes
+///   `HMAC-SHA256(device_secret, T(fido2_hmac_salt))` where
+///   `T(x) = SHA-256("WebAuthn PRF"\0 || x)`. On the libfido2
+///   (Linux + macOS) side we apply `T` explicitly before the device
+///   (libfido2 forwards salts verbatim); on the webauthn.dll
+///   (Windows) side we forward the RAW salt and webauthn.dll applies
+///   the *identical* `T` internally. Both backends converge on the
+///   same device input, fixing the cross-platform incompatibility.
+///
+///   IMPORTANT (V4 redefined): an EARLIER v0.3.0 build defined V4 as a
+///   plain `SHA-256(salt)` prehash. That never actually round-tripped
+///   through Windows, because webauthn.dll applies the PRF-prefixed
+///   `T`, not a bare SHA-256 -- so that build's V4 vaults are
+///   libfido2-only and cannot be opened by this build (the device
+///   input differs). V4 now denotes the PRF-prefixed convention. V4
+///   slots are cross-platform; V1/V2/V3 FIDO2 slots stay
+///   Linux/macOS-only.
 ///
 /// Stored INSIDE the AAD region (offset 1, within the 0..76 range), so
 /// a tamper that flips the version byte at unwrap time changes the
 /// AAD shape AND tags a different byte sequence, breaking the AEAD.
 ///
-/// Existing V1/V2 vaults on disk continue to read under their original
-/// layout. New slots created by any `Keyslot::new_*` constructor are
-/// V3 to support every authenticator out of the box.
+/// Existing V1/V2/V3 vaults on disk continue to read under their
+/// original layout/wire format. New slots created by any
+/// `Keyslot::new_*` constructor are V4: passphrase / TPM slots gain
+/// nothing from V4 (no FIDO2 salt to prehash) but the version bump
+/// is uniform so `aad_version >= V4` is a single test for "this
+/// vault was created post-FIDO2-cross-platform-fix".
 const OFF_AAD_VERSION: usize = 1;
 pub const AAD_VERSION_V1: u8 = 0;
 pub const AAD_VERSION_V2: u8 = 1;
 pub const AAD_VERSION_V3: u8 = 2;
+pub const AAD_VERSION_V4: u8 = 3;
 const OFF_UUID: usize = 4;
 const OFF_M_COST: usize = 20;
 const OFF_T_COST: usize = 24;
@@ -421,7 +446,7 @@ impl SlotKind {
 pub struct Keyslot {
     pub kind: SlotKind,
     /// AEAD AAD shape, see `OFF_AAD_VERSION` doc. Set by every
-    /// `Keyslot::new_*` constructor to `AAD_VERSION_V2`. Read by
+    /// `Keyslot::new_*` constructor to `AAD_VERSION_V4`. Read by
     /// `from_bytes` from the on-disk byte. Empty slots leave it 0.
     pub aad_version: u8,
     pub uuid: [u8; 16],
@@ -478,6 +503,48 @@ impl Keyslot {
         matches!(self.kind, SlotKind::Empty)
     }
 
+    /// Does this slot's wire format use the V4 cross-platform FIDO2
+    /// salt convention (the W3C WebAuthn-PRF derivation
+    /// `T(x) = SHA-256("WebAuthn PRF"\0 || x)`) before the salt reaches
+    /// the authenticator? The boolean is forwarded to
+    /// `Fido2Authenticator::hmac_secret`'s `prehash_salt` parameter.
+    ///
+    /// V1/V2/V3 FIDO2 slots: false -- libfido2 sends the raw salt.
+    /// These slots are Linux/macOS-only because webauthn.dll on Windows
+    /// unconditionally applies `T`, producing a different HMAC output.
+    /// V4+ FIDO2 slots: true -- the libfido2 backend applies `T`
+    /// locally, and the Windows backend forwards the raw salt and lets
+    /// webauthn.dll apply the identical `T`. Both converge
+    /// cross-platform.
+    ///
+    /// (The name predates the V4 redefinition: it is no longer a plain
+    /// SHA-256 "prehash" but the PRF-prefixed derivation. Kept as-is to
+    /// avoid churning ~80 call sites; semantics are documented here.)
+    ///
+    /// Non-FIDO2 slot kinds return false (the result is unused for
+    /// them; `fido2_hmac_salt` is all zeros and never sent to a
+    /// device).
+    pub fn fido2_salt_prehashed(&self) -> bool {
+        self.aad_version >= AAD_VERSION_V4
+    }
+
+    /// True for any slot kind whose unlock path drives the FIDO2
+    /// hmac-secret extension. Useful for the Windows "v1/v2/v3
+    /// FIDO2 slot is Linux-only, run `luksbox migrate-fido2-slot`"
+    /// guard at unlock time and for the `luksbox info` slot table.
+    pub fn touches_fido2(&self) -> bool {
+        matches!(
+            self.kind,
+            SlotKind::Fido2HmacSecret
+                | SlotKind::Fido2DerivedMvk
+                | SlotKind::HybridPqKemFido2
+                | SlotKind::HybridPqKem1024Fido2
+                | SlotKind::Tpm2Fido2
+                | SlotKind::HybridPqKemTpm2Fido2
+                | SlotKind::HybridPqKem1024Tpm2Fido2
+        )
+    }
+
     /// Create a passphrase keyslot wrapping `mvk`.
     pub fn new_passphrase(
         suite: CipherSuite,
@@ -501,7 +568,7 @@ impl Keyslot {
 
         let mut slot = Self {
             kind: SlotKind::Passphrase,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params,
             kdf_salt,
@@ -547,7 +614,7 @@ impl Keyslot {
 
         let mut slot = Self {
             kind: SlotKind::Fido2HmacSecret,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params,
             kdf_salt,
@@ -604,7 +671,7 @@ impl Keyslot {
 
         let mut slot = Self {
             kind: SlotKind::Tpm2Sealed,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             // No Argon2id is run for TPM-sealed slots - the KEK
             // comes from the TPM unseal directly. Zero params
@@ -738,7 +805,7 @@ impl Keyslot {
 
         let mut slot = Self {
             kind: SlotKind::Tpm2Fido2,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             // No Argon2id for the fused kind, both inputs are
             // already 32-byte high-entropy values, HKDF mixing is
@@ -863,7 +930,7 @@ impl Keyslot {
             .map_err(|e| Error::OsRng(e.to_string()))?;
         let mut slot = Self {
             kind: SlotKind::Tpm2SealedPin,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params: Argon2idParams {
                 m_cost_kib: 0,
@@ -915,7 +982,7 @@ impl Keyslot {
             .map_err(|e| Error::OsRng(e.to_string()))?;
         let mut slot = Self {
             kind: SlotKind::HybridPqKemTpm2,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params: Argon2idParams {
                 m_cost_kib: 0,
@@ -1003,7 +1070,7 @@ impl Keyslot {
             .map_err(|e| Error::OsRng(e.to_string()))?;
         let mut slot = Self {
             kind: SlotKind::HybridPqKemTpm2Fido2,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params: Argon2idParams {
                 m_cost_kib: 0,
@@ -1191,7 +1258,7 @@ impl Keyslot {
 
         let mut slot = Self {
             kind,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params,
             kdf_salt,
@@ -1337,7 +1404,7 @@ impl Keyslot {
 
         let mut slot = Self {
             kind,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             kdf_params,
             kdf_salt,
@@ -1427,7 +1494,7 @@ impl Keyslot {
             .map_err(|e| Error::OsRng(e.to_string()))?;
         Ok(Self {
             kind: SlotKind::Fido2DerivedMvk,
-            aad_version: AAD_VERSION_V3,
+            aad_version: AAD_VERSION_V4,
             uuid,
             // KDF/AEAD params here are unused for derived-MVK slots, but
             // we fill them with non-zero junk so the slot is byte-shape
@@ -1558,11 +1625,16 @@ impl Keyslot {
     fn build_aead_aad(&self, header_salt: &[u8; 32]) -> Vec<u8> {
         let mut buf = vec![0u8; SLOT_SIZE];
         self.write_aad_region(&mut buf);
-        let (_cred_max, off_hmac_salt) = slot_layout(self.aad_version);
+        let (cred_max, off_hmac_salt) = slot_layout(self.aad_version);
         if self.aad_version >= AAD_VERSION_V2 {
             // Mirror what to_bytes lays down for the cred / hmac_salt
-            // fields so the AAD matches what we persist.
-            let cred_len = self.fido2_cred_id.len() as u16;
+            // fields so the AAD matches what we persist. Same defensive
+            // clamp as `to_bytes` (a no-op for constructor-built slots;
+            // it bounds an oversized externally-built cred_id so AAD
+            // computation can't panic or `as u16`-truncate, and stays
+            // byte-identical to what `to_bytes` writes).
+            let cred = &self.fido2_cred_id[..self.fido2_cred_id.len().min(cred_max)];
+            let cred_len = cred.len() as u16;
             // SECURITY: this list MUST mirror the equivalent matches!()
             // in `to_bytes` exactly. Any kind that writes a real
             // hmac_salt via to_bytes MUST also include it in AAD here,
@@ -1592,8 +1664,7 @@ impl Keyslot {
             buf[OFF_CRED_LEN..OFF_CRED_LEN + 2].copy_from_slice(&cred_len.to_le_bytes());
             buf[OFF_HMAC_SALT_LEN..OFF_HMAC_SALT_LEN + 2].copy_from_slice(&salt_len.to_le_bytes());
             if cred_len > 0 {
-                buf[OFF_CRED..OFF_CRED + self.fido2_cred_id.len()]
-                    .copy_from_slice(&self.fido2_cred_id);
+                buf[OFF_CRED..OFF_CRED + cred.len()].copy_from_slice(cred);
             }
             if salt_len > 0 {
                 buf[off_hmac_salt..off_hmac_salt + FIDO2_HMAC_SALT_LEN]
@@ -1642,11 +1713,27 @@ impl Keyslot {
         buf[OFF_WRAPPED_CT..OFF_WRAPPED_CT + 32].copy_from_slice(&self.wrapped_ct);
         buf[OFF_WRAPPED_TAG..OFF_WRAPPED_TAG + 16].copy_from_slice(&self.wrapped_tag);
 
+        let (cred_max, off_hmac_salt) = slot_layout(self.aad_version);
         // `cred_len` is the length of whatever sits in the
         // variable-length region: a real FIDO2 cred_id for the
         // FIDO2 / hybrid-FIDO2 kinds, the TPM SealedBlob bytes for
         // Tpm2Sealed, zero for passphrase-only kinds.
-        let cred_len = self.fido2_cred_id.len() as u16;
+        //
+        // Defense-in-depth: every `new_*` constructor caps this length
+        // at FIDO2_CRED_ID_MAX (<= `cred_max` for the slot's version),
+        // so the clamp below is a no-op for any slot built through the
+        // public API. It only guards against an externally-constructed
+        // `Keyslot` (the fields are `pub`) carrying an oversized buffer,
+        // turning a would-be out-of-bounds slice panic and a silent
+        // `as u16` truncation into a bounded copy. Debug builds assert
+        // so the bug surfaces in tests rather than in production.
+        debug_assert!(
+            self.fido2_cred_id.len() <= cred_max,
+            "cred_id length {} exceeds slot region {cred_max}; Keyslot built outside new_*",
+            self.fido2_cred_id.len()
+        );
+        let cred = &self.fido2_cred_id[..self.fido2_cred_id.len().min(cred_max)];
+        let cred_len = cred.len() as u16;
         // `salt_len` is non-zero only when the slot actually
         // carries a FIDO2 hmac_salt. TPM-sealed slots have no
         // FIDO2 component so this stays 0.
@@ -1664,11 +1751,10 @@ impl Keyslot {
         } else {
             0
         };
-        let (_cred_max, off_hmac_salt) = slot_layout(self.aad_version);
         buf[OFF_CRED_LEN..OFF_CRED_LEN + 2].copy_from_slice(&cred_len.to_le_bytes());
         buf[OFF_HMAC_SALT_LEN..OFF_HMAC_SALT_LEN + 2].copy_from_slice(&salt_len.to_le_bytes());
         if cred_len > 0 {
-            buf[OFF_CRED..OFF_CRED + self.fido2_cred_id.len()].copy_from_slice(&self.fido2_cred_id);
+            buf[OFF_CRED..OFF_CRED + cred.len()].copy_from_slice(cred);
         }
         if salt_len > 0 {
             buf[off_hmac_salt..off_hmac_salt + FIDO2_HMAC_SALT_LEN]
@@ -1688,7 +1774,7 @@ impl Keyslot {
         // currently rejected to avoid silently treating unknown shapes
         // as one we know.
         let aad_version = buf[OFF_AAD_VERSION];
-        if aad_version > AAD_VERSION_V3 {
+        if aad_version > AAD_VERSION_V4 {
             return Err(Error::InvalidField);
         }
         let mut uuid = [0u8; 16];
@@ -1832,6 +1918,71 @@ mod tests {
                 .unlock_passphrase(suite, b"wrong passphrase", &header_salt)
                 .is_err()
         );
+    }
+
+    // ---- Regression: serialization is panic-safe against an
+    // externally-constructed (constructor-bypassing) Keyslot whose
+    // cred_id exceeds the slot region. The `new_*` constructors cap
+    // cred_id at FIDO2_CRED_ID_MAX, but the struct fields are `pub`, so
+    // external crate code can build an invalid slot. `to_bytes` /
+    // `build_aead_aad` must not out-of-bounds panic or silently
+    // `as u16`-truncate; they clamp to the region with a debug_assert.
+
+    /// Build an invalid slot directly via its public fields (bypassing
+    /// the length-validating constructors): cred_id is 1000 B, far over
+    /// the 352 B V4 cap.
+    fn oversized_external_slot() -> Keyslot {
+        Keyslot {
+            kind: SlotKind::Fido2HmacSecret,
+            aad_version: AAD_VERSION_V4,
+            uuid: [0u8; 16],
+            kdf_params: Argon2idParams {
+                m_cost_kib: 0,
+                t_cost: 0,
+                p_cost: 0,
+            },
+            kdf_salt: [0u8; 32],
+            aead_nonce: [0u8; 12],
+            wrapped_ct: [0u8; 32],
+            wrapped_tag: [0u8; 16],
+            fido2_cred_id: vec![0xABu8; 1000],
+            fido2_hmac_salt: [0x42u8; 32],
+        }
+    }
+
+    /// The clamp must not affect the largest *valid* cred_id: a cred_id
+    /// exactly at the V4 cap round-trips unchanged.
+    #[test]
+    fn to_bytes_roundtrips_cred_id_at_max() {
+        let cred = vec![0xCDu8; FIDO2_CRED_ID_MAX];
+        let slot = Keyslot::new_fido2_derived_mvk(&cred, [0x42u8; 32]).unwrap();
+        let bytes = slot.to_bytes();
+        let restored = Keyslot::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.fido2_cred_id, cred);
+    }
+
+    /// In debug builds the oversized slot trips the `debug_assert`, so
+    /// the misuse surfaces loudly during development/testing.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "exceeds slot region")]
+    fn oversized_external_cred_id_asserts_in_debug() {
+        let _ = oversized_external_slot().to_bytes();
+    }
+
+    /// In release builds (`cargo test --release`) the `debug_assert` is
+    /// compiled out, so the clamp is what protects us: `to_bytes` and
+    /// `build_aead_aad` must complete without panicking and the on-disk
+    /// `cred_len` must be clamped to the region capacity (not the bogus
+    /// 1000, and not a `u16`-truncated value).
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn oversized_external_cred_id_clamps_in_release() {
+        let bytes = oversized_external_slot().to_bytes();
+        let cred_len = u16::from_le_bytes([bytes[OFF_CRED_LEN], bytes[OFF_CRED_LEN + 1]]);
+        assert_eq!(cred_len as usize, FIDO2_CRED_ID_MAX);
+        // The companion AAD path must also be panic-safe on the same slot.
+        let _ = oversized_external_slot().build_aead_aad(&[0u8; 32]);
     }
 
     #[test]
@@ -2004,7 +2155,7 @@ mod tests {
 
         let slot = Keyslot::new_tpm2(suite, &mvk, &kek, &fake_blob, &header_salt).unwrap();
         assert_eq!(slot.kind, SlotKind::Tpm2Sealed);
-        assert_eq!(slot.aad_version, AAD_VERSION_V3);
+        assert_eq!(slot.aad_version, AAD_VERSION_V4);
         assert_eq!(slot.tpm2_sealed_blob().unwrap(), fake_blob.as_slice());
 
         // Round-trip through the on-disk byte layout.

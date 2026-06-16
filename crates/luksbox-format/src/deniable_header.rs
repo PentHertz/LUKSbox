@@ -606,8 +606,12 @@ pub fn try_open_envelope_v2(
 /// The `credential.kind_tag()` MUST match `opened.payload.kind` or
 /// this returns `Error::OpaqueUnlockFailed` (the caller asked for a
 /// variant that does not match what the slot actually carries).
+///
+/// Borrows `opened` (reads only) so a failed attempt leaves the
+/// envelope intact for a retry with a different secondary-factor
+/// output -- the FIDO2 salt-convention probe depends on this.
 pub fn complete_open_v2(
-    opened: OpenedDeniableEnvelope,
+    opened: &OpenedDeniableEnvelope,
     credential: &luksbox_core::deniable::DeniableCredential,
     cipher_suite: CipherSuite,
 ) -> Result<OpenedDeniableHeader, Error> {
@@ -992,7 +996,7 @@ mod tests {
             opened_env.payload.kind,
             luksbox_core::deniable::DeniableKindTag::Passphrase
         );
-        let opened = complete_open_v2(opened_env, &cred, CipherSuite::Aes256GcmSiv).unwrap();
+        let opened = complete_open_v2(&opened_env, &cred, CipherSuite::Aes256GcmSiv).unwrap();
         assert_eq!(opened.mvk.as_bytes(), mvk.as_bytes());
         assert_eq!(opened.inner, inner);
         assert_eq!(opened.matched_slot_idx, 3);
@@ -1023,7 +1027,7 @@ mod tests {
         // produce the hmac_output the caller already has).
         assert_eq!(opened_env.payload.cred_id, material.cred_id);
         assert_eq!(opened_env.payload.hmac_salt, material.hmac_salt);
-        let opened = complete_open_v2(opened_env, &cred, CipherSuite::Aes256GcmSiv).unwrap();
+        let opened = complete_open_v2(&opened_env, &cred, CipherSuite::Aes256GcmSiv).unwrap();
         assert_eq!(opened.mvk.as_bytes(), mvk.as_bytes());
     }
 
@@ -1051,7 +1055,7 @@ mod tests {
             try_open_envelope_v2(&header, &cred, CipherSuite::ChaCha20Poly1305, None).unwrap();
         assert_eq!(opened_env.payload.tpm_blob, blob);
         assert!(opened_env.payload.cred_id.is_empty());
-        let opened = complete_open_v2(opened_env, &cred, CipherSuite::ChaCha20Poly1305).unwrap();
+        let opened = complete_open_v2(&opened_env, &cred, CipherSuite::ChaCha20Poly1305).unwrap();
         assert_eq!(opened.mvk.as_bytes(), mvk.as_bytes());
     }
 
@@ -1107,7 +1111,7 @@ mod tests {
             argon2: cheap_test_params(),
             hmac_secret_output: &hmac_out,
         };
-        let err = complete_open_v2(opened_env, &wrong_kind, CipherSuite::Aes256GcmSiv)
+        let err = complete_open_v2(&opened_env, &wrong_kind, CipherSuite::Aes256GcmSiv)
             .err()
             .unwrap();
         assert!(matches!(err, Error::OpaqueUnlockFailed));
@@ -1226,7 +1230,7 @@ mod tests {
         // Open with the same credential against the rotated header
         // and confirm we recover the new MVK.
         let env = try_open_envelope_v2(&header, &cred, CipherSuite::Aes256GcmSiv, None).unwrap();
-        let opened = complete_open_v2(env, &cred, CipherSuite::Aes256GcmSiv).unwrap();
+        let opened = complete_open_v2(&env, &cred, CipherSuite::Aes256GcmSiv).unwrap();
         assert_eq!(opened.mvk.as_bytes(), new_mvk.as_bytes());
         assert_eq!(opened.matched_slot_idx, 2);
     }
@@ -1257,7 +1261,7 @@ mod tests {
         let salt: [u8; DENIABLE_SALT_SIZE] = header[..DENIABLE_SALT_SIZE].try_into().unwrap();
         let env_open =
             try_open_envelope_v2(&header, &admin, CipherSuite::Aes256GcmSiv, None).unwrap();
-        let opened_admin = complete_open_v2(env_open, &admin, CipherSuite::Aes256GcmSiv).unwrap();
+        let opened_admin = complete_open_v2(&env_open, &admin, CipherSuite::Aes256GcmSiv).unwrap();
         let admin_mvk = opened_admin.mvk;
         let header_arr: &mut [u8; DENIABLE_HEADER_SIZE] = (&mut header[..]).try_into().unwrap();
         install_slot_v2(
@@ -1289,7 +1293,7 @@ mod tests {
         let env_admin =
             try_open_envelope_v2(&header, &admin, CipherSuite::Aes256GcmSiv, None).unwrap();
         assert_eq!(env_admin.matched_slot_idx, 0);
-        complete_open_v2(env_admin, &admin, CipherSuite::Aes256GcmSiv).unwrap();
+        complete_open_v2(&env_admin, &admin, CipherSuite::Aes256GcmSiv).unwrap();
 
         // Bob's envelope is now random noise.
         let bob_err = try_open_envelope_v2(&header, &bob, CipherSuite::Aes256GcmSiv, None)

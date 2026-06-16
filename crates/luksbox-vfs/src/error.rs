@@ -81,12 +81,16 @@ pub enum Error {
     #[error("metadata region exhausted (vault holds too many chunks for its metadata budget)")]
     MetadataBudgetExhausted,
 
-    /// Refused a flush because the vault was opened in tolerant
-    /// recovery mode (`LUKSBOX_TOLERATE_BAD_CHUNK_LISTS=1`). Some
-    /// inode rows had their chunks vec and `size` zeroed so the
-    /// open could complete; persisting that tree would overwrite
-    /// the original on-disk metadata permanently. Mount read-only
-    /// and copy data out; never write to a tolerant-recovered vault.
-    #[error("vault opened in tolerant recovery mode; writes/flush refused (mount read-only)")]
+    /// Refused a mutation because this Vfs instance recovered one
+    /// or more inodes at open time (tolerant recovery mode zeroed
+    /// their chunks vec and `size` so the open could complete).
+    /// The in-memory tree is lossy: persisting it would overwrite
+    /// the original on-disk chunk pointers permanently, and any
+    /// write could recycle the broken files' chunk slots. Every
+    /// mutating op and any dirty flush on such an instance returns
+    /// this error; clean flushes no-op so close()/unmount still
+    /// work. Keyed on the per-instance recovery report, not the
+    /// transient thread-local/env flag that enabled the open.
+    #[error("vault holds recovered (lossy) inodes; mutation refused (mount is read-only)")]
     ReadOnlyMount,
 }

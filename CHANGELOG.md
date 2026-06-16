@@ -14,6 +14,309 @@ canonical record.
 
 ---
 
+## [v0.3.0] - 2026-06-15
+
+Cross-platform FIDO2 keyslots and an in-place migration path.
+
+### Fixed: FIDO2 keyslots no longer platform-locked
+
+A FIDO2 keyslot enrolled on Linux or macOS could not unlock the
+vault on Windows, and a slot enrolled on Windows could not unlock on
+Linux or macOS. Root cause: the two backends feed the
+authenticator's CTAP2 hmac-secret extension DIFFERENT salt bytes.
+libfido2 (Linux/macOS) forwards the 32-byte salt to the device
+unchanged. `webauthn.dll` (Windows), even on the raw hmac-secret
+path (`pHmacSecretSaltValues`, `bEnablePrf = 0`), is NOT a
+passthrough: it applies the W3C WebAuthn-PRF derivation
+`T(x) = SHA-256("WebAuthn PRF"\0 || x)` to the salt before the
+device sees it. Same authenticator, same on-disk salt, the two
+paths handed the device different bytes -> two different HMAC
+outputs, two different KEKs, AEAD-unwrap failure on the other
+platform.
+
+This was confirmed empirically with the `xplatform_hmac_probe`
+example (same physical key on both OSes): Windows' output for a raw
+salt equals Linux's output for `T(salt)`, and equals neither the raw
+salt nor a plain `SHA-256(salt)`.
+
+**Fix:**
+- On-disk slot version `AAD_VERSION_V4` defines the canonical device
+  salt as `T(salt) = SHA-256("WebAuthn PRF"\0 || salt)` (V1/V2/V3
+  used the raw salt).
+- Both backends converge on the device computing
+  `HMAC-SHA256(device_secret, T(salt))`:
+  - `hid.rs` (libfido2) applies `T` LOCALLY via the shared
+    `luksbox_fido2::webauthn_prf_salt` helper before handing the
+    salt to the device.
+  - `webauthn.rs` (Windows) forwards the RAW salt and lets
+    `webauthn.dll` apply the identical `T` itself.
+
+**History of this fix:** two earlier v0.3.0 attempts modelled
+`webauthn.dll` wrongly -- first as a passthrough, then as a plain
+`SHA-256(salt)` prehash. It is neither; it applies the PRF-prefixed
+`T`. Both earlier models left V4 slots failing cross-platform with
+`crypto: keyslot authentication failed`. `AAD_VERSION_V4` is now
+*redefined* to the PRF-prefixed convention.
+
+**Migration required for affected vaults.** Because `T` is one-way,
+a FIDO2 slot whose device salt is the raw salt (V1/V2/V3) or a plain
+`SHA-256(salt)` (the earlier mislabelled-V4 build) can NEVER be
+reproduced through `webauthn.dll`. Such slots cannot be opened on
+Windows by any code change; **recreate the FIDO2 slot** under this
+build to get a working cross-platform V4 slot. New slots created by
+`Keyslot::new_*` are V4 and cross-platform by construction.
+
+**User verification (UV) caveat.** `webauthn.dll` ALWAYS performs
+user verification, while libfido2 only does so when a PIN is
+supplied -- the two select different per-credential secrets
+(`CredRandomWithUV` vs `CredRandomWithoutUV`). Enroll the FIDO2 slot
+**with a PIN** so both platforms derive from the same secret;
+otherwise the slot still mismatches across platforms even with the
+salt fix.
+
+**Verification status:** the salt convention is pinned by the
+`fido2_xplatform_wire.rs` regression tests (which now model `T`) and
+by the `xplatform_hmac_probe` example on real hardware. The Windows
+backend compiles for `x86_64-pc-windows-{gnu,msvc}`.
+
+**Migration:** `luksbox migrate-fido2-slot <vault> --slot N` on
+Linux or macOS bundles enroll+revoke: it registers a fresh credential on
+the same authenticator under the V4 convention, writes the new
+slot at the first free index, and revokes the old slot. The
+migration is in-place (no vault rewrite), idempotent against
+already-V4 slots, and atomic against the header mirror protocol
+(no `header-bak` divergence on crash mid-migration). See the
+[CLI page](https://luksbox.penthertz.com/docs/cli/migrate-fido2-slot/)
+for the full flow.
+
+**Scope of the migration command in v0.3.0:** only `Fido2HmacSecret`
+slots. `Fido2DerivedMvk` (`--kind fido2-direct`) slots cannot be
+migrated because their MVK is derived directly from the
+authenticator output; recreating the vault is the only path.
+Fused TPM+FIDO2 and hybrid-PQ-FIDO2 variants are also outside
+the v0.3.0 migration scope -- the command rejects them with a
+clear message. Workaround for those slot kinds: enroll a backup
+passphrase or non-fused FIDO2 slot from Linux, use it from
+Windows, plan a deeper migration for v0.3.1+.
+
+**Surface changes:**
+- `Fido2Authenticator::hmac_secret` gains a `prehash_salt: bool`
+  parameter. Out-of-tree callers that implemented the trait need
+  to add the parameter and route it to their CTAP2 layer.
+- `Keyslot::fido2_salt_prehashed(&self) -> bool` returns whether
+  this slot's wire convention requires the prehash (V4+) or
+  passes the salt raw (V1/V2/V3).
+- `Keyslot::touches_fido2(&self) -> bool` returns true for any
+  slot kind whose unlock path drives the FIDO2 hmac-secret
+  extension. Useful for the slot table + the cross-platform
+  compat indicator.
+- `luksbox info` prints `compat: V4 cross-platform` or
+  `compat: V{1,2,3} Linux/macOS-only -- migrate with ...` per
+  FIDO2-touching slot.
+- The GUI's Keyslots view shows the same compat status under
+  each FIDO2 slot row, with the migration command spelled out.
+- The mock authenticator (`MockAuthenticator::hmac_secret`)
+  prehashes when `prehash_salt=true` and passes the salt raw
+  otherwise, mirroring libfido2 semantics for unit tests.
+
+### Fixed: `luksbox mount` default mode refused to start
+
+`luksbox mount <vault> <mountpoint>` (the default daemonizing
+form) failed on Linux with `refusing to daemonize from a
+multithreaded process` once the deferred-flush timer landed in
+v0.2.x. `mount()` constructed the `LuksboxFs` (which spawns the
+`luksbox-flush-timer` thread when `--sync` is off) BEFORE the
+fork, then the pre-fork single-threaded check immediately saw
+that timer thread and refused. `--foreground` worked because it
+skipped the fork. Fix: move `LuksboxFs::new` into the child
+branch of `run_daemonized`, after fork and after
+`detach_from_terminal`. The parent never spawns the timer, the
+check passes, and the child owns its timer like every other
+helper thread. The assert now also names the offending threads
+in its error message so the next regression of this shape will
+be obvious from the user-visible diagnostic instead of a silent
+count.
+
+### Fixed: deniable FIDO2 envelopes from v0.2.1/v0.2.2 could not unlock
+
+The keyslot fix above versioned the salt convention via
+`aad_version`, but deniable v2 envelopes carry no equivalent
+marker, and the v0.3.0 unlock paths initially hard-coded the new
+prehashed convention. A FIDO2-bearing deniable vault created by
+v0.2.1/v0.2.2 on Linux/macOS (raw-salt convention) would compute
+the wrong `KEK_factors`, fail the inner AEAD, and surface the
+intentionally generic unlock failure -- indistinguishable from a
+wrong passphrase, recoverable only by downgrading the binary.
+
+**Fix: convention probe at unlock.** All three front-ends (CLI,
+wizard, GUI) now try the V4 prehashed convention first; if the
+inner MVK unwrap fails, they drive the authenticator once more
+with the raw-salt convention. New envelopes unlock on the first
+touch; pre-v0.3.0 envelopes cost one extra touch (the PIN is
+asked once). Supporting API:
+`Container::complete_open_v2_deniable_reusable` hands the
+envelope handle back on failure so the retry skips the Argon2id
+discovery phase and keeps the vault file lock, and
+`deniable_header::complete_open_v2` now borrows the opened
+envelope instead of consuming it. A future envelope revision can
+record the convention explicitly and retire the probe.
+
+### Fixed: tolerant-recovery vaults were not actually read-only
+
+The corrupted-vault recovery mode (wizard checkbox, GUI checkbox,
+`LUKSBOX_TOLERATE_BAD_CHUNK_LISTS`) promises a read-only session:
+broken inodes are installed as zero-byte placeholders so the rest
+of the vault can be copied out, and the lossy in-memory tree must
+never overwrite the on-disk metadata (that would permanently
+destroy the broken files' chunk pointers and any chance of later
+recovery). The enforcement was keyed on the transient thread-local
+flag, which the GUI and wizard drop right after `Vfs::open`
+returns -- so the recovered vault was in fact fully writable and
+the first flush destroyed exactly what the mode exists to protect.
+`write()` was worse: it rewrites chunks on disk at call time with
+bumped generations, so writing to a healthy file during a recovery
+session corrupted it for subsequent normal opens.
+
+**Fix:** the gate is now the per-instance recovery report
+(`tolerated_inodes`), checked by every mutating Vfs op (write,
+truncate, create, mkdir, unlink, rmdir, rename, link, symlink,
+chmod, MVK rotation) which now return `ReadOnlyMount` (EROFS over
+FUSE), and by `flush` (clean flushes no-op so unmount still
+works). Corollary fixes: a leftover
+`LUKSBOX_TOLERATE_BAD_CHUNK_LISTS` no longer freezes flushes on
+healthy vaults (the env var also now treats `0`/`false`/`no`/empty
+as off), and the whole recovery mode gained its first regression
+tests, including one that proves a recovery session leaves the
+broken chain bytes on disk untouched.
+
+### Fixed: rename over a hardlinked file orphaned the surviving links
+
+`rename(2)` onto an existing target freed ALL of the displaced
+inode's chunks and removed it outright -- correct before
+hardlinks existed, data loss after: with `ln a b`, a rename onto
+`b` left `a` pointing at a removed inode (panic on next access),
+its freed chunk slots were recycled by the next write (silent
+ciphertext overwrite of `a`'s content), and
+`validate_metadata_tree` then failed every flush for the rest of
+the session. The displace path now mirrors `unlink`: decrement
+`link_count`, free chunks and chunk-list blocks only when the last
+link is gone, and clear the Layer-2 dirty marker alongside.
+Covered by new hardlink+rename regression tests, including the
+rename-onto-the-same-inode no-op required by POSIX.
+
+### Fixed: `--sync` mount reported success when the flush failed
+
+In `--sync` mode every mutating FUSE op drives an immediate
+`Vfs::flush`, but the Layer-1 refactor discarded its result, so a
+vault-file write failure (ENOSPC, EIO) was reported to the
+syscall as success -- the pre-Layer-1 handlers returned EIO here.
+The flush result now propagates to every mutating handler and to
+the `flush()` (close(2)) and `release()` callbacks. In deferred
+mode, the timer-tick and unmount-time flushes now log failures to
+stderr instead of dropping them silently (there is no syscall to
+report to from a timer). The FUSE-T adapter propagates the same
+way; WinFsp logs at its commit-style call sites.
+
+### Fixed: `LUKSBOX_FORMAT_V2` was ignored where it mattered most
+
+Two defects around the v2-format opt-out. First, released docs
+disagreed on the value: the CLI help, GUI tooltip, and
+CRYPTO_SPEC.md said `LUKSBOX_FORMAT_V2=1` keeps v2, while the
+v0.2.0 changelog said `=0` -- and the implementation honored only
+`=0`, so anyone following the binary's own `--help` silently got
+a v3 vault. The variable now opts into v2 when set to ANY
+non-empty value, which makes every released instruction correct.
+Second, the documented suppression of the flush-time auto-upgrade
+did not exist at all: the upgrade gate checked only the header
+version, so one flush from a v0.2.1+ binary permanently upgraded
+a deliberately-v2 vault out from under the pre-v0.2.1 readers it
+was created for. The same toggle now vetoes the upgrade. Verified
+live: with the variable set, create/put/cat keep the vault v2 and
+`migrate-to-v3` accepts it; with the variable unset, the default
+auto-upgrade still fires.
+
+### Fixed: TPM handles and PIN copy leaked on failed unseal
+
+`Tpm2Sealer::unseal_with_pin` flushed its transient handles (SRK,
+loaded object, and now also the per-operation HMAC session, which
+was never flushed anywhere) only on success. On the most common
+failure -- wrong PIN at `Esys_Unseal` -- the early return stranded
+two transient handles per attempt (TPMs commonly expose about 3
+transient slots) and left the PIN bytes in the ESYS context's
+C-side `TPM2B_AUTH` slot until the Context dropped. Seal had the
+same pattern around `Esys_Create`. All flushes now run on every
+path.
+
+### Security hardening (review follow-up)
+
+- **Detached-header lock survives a sidecar rewrite.** In
+  detached-header mode, `persist_header` / `restore_header_bytes`
+  replace the sidecar via `atomic_secure_write` (temp+fsync+rename)
+  and reopen the handle, but the reopened fd pointed at the new inode
+  *without* re-taking the advisory lock, so the old lock stayed on the
+  now-unlinked pre-rename inode, so the sidecar lock invariant was
+  silently lost after any header persist/restore. The new fd is now
+  re-locked (honoring `LUKSBOX_NO_LOCK`) before the old handle is
+  dropped. `crates/luksbox-format/src/container.rs`.
+- **Keyslot serialization can't panic or truncate on an
+  externally-built slot.** `Keyslot` fields are `pub`, so external
+  crate code can bypass the `new_*` constructors' length validation.
+  `to_bytes` / `build_aead_aad` now clamp the variable-length cred_id
+  region to the slot's capacity (with a `debug_assert`), turning a
+  would-be out-of-bounds slice panic and a silent `len as u16`
+  truncation into a bounded copy. No behavior change for any slot
+  built through the public constructors (cred_id is already capped at
+  `FIDO2_CRED_ID_MAX`). `crates/luksbox-core/src/keyslot.rs`.
+
+### Fixed: GUI create-vault picker hid extensionless vaults
+
+The "New vault file" save dialog applied an `.lbx`-only filter, which
+hid extensionless vaults (the old default name was `secret`) and made
+it awkward to pick or overwrite them. The filter is gone, matching the
+no-filter behavior already used by the open-existing picker (#12).
+`crates/luksbox-gui/src/app.rs`. Thanks to Matt Van Horn
+(@mvanhorn) for the fix (#15).
+
+### Added
+
+- `crates/luksbox-core/tests/fido2_xplatform_wire.rs`: three
+  regression tests that simulate both wire paths through the
+  mock authenticator and assert byte-identical HMAC outputs
+  under the V4 convention. Round-trips a V4 keyslot through
+  enroll-on-Linux-simulated-path + unlock-on-Windows-simulated-
+  path to lock in the cross-platform property.
+- `MockAuthenticator::prehash_salt_changes_output`: a sanity
+  test that the V3 -> V4 wire-format divergence still produces
+  different HMAC bytes under the mock, so any future regression
+  that silently undoes the prehash on the libfido2 side would
+  trip this test before it ships.
+- Slot compat labels (CLI `info`, wizard, GUI) now print the
+  correct 1-based version (a V1 slot displayed as "V0"), only
+  point at `migrate-fido2-slot` for the wrap-style slots the
+  command accepts, and spell out the required vault path
+  argument.
+- `ReadOnlyMount` maps to EROFS over FUSE so cp/rsync/editors
+  see "read-only file system" on recovery mounts instead of a
+  generic I/O error.
+- **Ubuntu 26.04 (resolute) support in CI/CD.** Releases now ship a
+  native `luksbox_*_resolute_{amd64,arm64}.deb` and matching tarball,
+  built inside an `ubuntu:26.04` container so cargo-deb resolves the
+  26.04 dependency sonames (which bump again past noble). CI gains a
+  containerised 26.04 test lane (workspace + hardware profiles) that
+  runs the suite against the 26.04 library/toolchain stack. Both run
+  in a container because GitHub has no native `ubuntu-26.04` hosted
+  runner yet; the workflows note where to switch to it once it lands.
+
+### Notes
+
+- No on-disk format change for non-FIDO2 slot kinds. The V3 ->
+  V4 bump affects every new keyslot constructor for uniformity
+  (so `aad_version >= V4` is a single test for "this vault was
+  created post-FIDO2-cross-platform-fix"), but passphrase / TPM
+  slots gain nothing functional from V4 vs V3.
+- Workspace version stays at 0.2.2 until v0.3.0 is tagged.
+  Bumping is a release-engineering step, not part of the patch.
+
 ## [v0.2.2] - 2026-06-02
 
 Critical durability fix on top of v0.2.1. **Closes a real-user
@@ -288,6 +591,36 @@ only prevents future occurrences.
   its older `chunks_external` pointers reference slots whose
   data chunks haven't since been reused. Not automated in this
   release.
+
+### Known limitations
+
+- **FIDO2 keyslots are platform-locked between Linux and Windows
+  in this release.** A vault enrolled with `--kind fido2` (or any
+  hybrid-PQ FIDO2 variant) on Linux fails to unlock on Windows
+  with `keyslot authentication failed` (wrap variant) or
+  `Header authentication failed` (direct-MVK variant); the
+  reverse direction fails identically. Cause: the Linux backend
+  (libfido2) feeds the raw 32 B hmac-secret salt to the
+  authenticator, while the Windows backend (webauthn.dll, via
+  `pHmacSecretSaltValues`) SHA-256s the salt internally before
+  forwarding to the same authenticator, per W3C WebAuthn Level 3
+  PRF behaviour. Same `device_secret`, two different HMAC
+  outputs, two different KEKs. Neither side can be overridden
+  from outside the platform library. **macOS / Linux interop is
+  unaffected** (both use libfido2). Passphrase, TPM 2.0, and
+  hybrid-PQ-passphrase keyslots are unaffected.
+
+  *Workaround:* enroll a backup passphrase keyslot on either
+  platform; passphrase unlock is byte-identical everywhere.
+
+  *Fix queued for v0.3.0:* a versioned FIDO2 keyslot record
+  (AAD_VERSION_V4) whose V4 form prehashes the salt on Linux as
+  well, so both backends converge on
+  `HMAC-SHA256(device_secret, SHA-256(salt))`. Pre-V4 slots keep
+  opening on Linux for backwards compatibility; a
+  `luksbox migrate-fido2-slot --slot N` helper bundles
+  enroll+revoke for migrating in place. See the v0.3.0 entry
+  above for details.
 
 ## [v0.2.1] - 2026-05-22
 

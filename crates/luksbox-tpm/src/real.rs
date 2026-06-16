@@ -27,7 +27,7 @@ use tss_esapi::{
     Context, TctiNameConf,
     attributes::ObjectAttributesBuilder,
     constants::SessionType,
-    handles::ObjectHandle,
+    handles::{ObjectHandle, SessionHandle},
     interface_types::{
         algorithm::{HashingAlgorithm, PublicAlgorithm},
         ecc::EccCurve,
@@ -116,13 +116,24 @@ impl Tpm2Sealer {
         let session = self.start_hmac_session()?;
         self.ctx.set_sessions((Some(session), None, None));
 
-        let primary = self.create_srk(session)?;
-        let result = self.create_sealed_object(primary.key_handle.into(), plaintext, pin)?;
+        let primary = match self.create_srk(session) {
+            Ok(p) => p,
+            Err(e) => {
+                self.flush_session(session);
+                return Err(e);
+            }
+        };
+        let result = self.create_sealed_object(primary.key_handle.into(), plaintext, pin);
 
-        // Flush the SRK transient handle so we don't leak handles
-        // across many seal operations (TPMs typically have a small
-        // handle table - about 3 transient slots is common).
+        // Flush the SRK transient handle and the HMAC session so we
+        // don't leak handles across many seal operations (TPMs
+        // typically have a small handle table - about 3 transient
+        // slots is common). Runs on the error path too: a failed
+        // `Esys_Create` (e.g. PIN too long for the policy) must not
+        // strand the SRK until the Context drops.
         let _ = self.ctx.flush_context(primary.key_handle.into());
+        self.flush_session(session);
+        let result = result?;
 
         let public_bytes = result
             .out_public
@@ -163,50 +174,71 @@ impl Tpm2Sealer {
         let session = self.start_hmac_session()?;
         self.ctx.set_sessions((Some(session), None, None));
 
-        let primary = self.create_srk(session)?;
+        let primary = match self.create_srk(session) {
+            Ok(p) => p,
+            Err(e) => {
+                self.flush_session(session);
+                return Err(e);
+            }
+        };
 
-        let public = tss_esapi::structures::Public::unmarshall(&blob.public)
-            .map_err(|e| Error::TpmError(format!("unmarshall TPM2B_PUBLIC: {e}")))?;
-        let private = Private::try_from(blob.private.clone())
-            .map_err(|e| Error::TpmError(format!("private blob too large: {e}")))?;
+        // Everything fallible from here runs inside the closure so
+        // the handle flushes below execute on EVERY path. The wrong-
+        // PIN case (`Esys_Unseal` failing) is the most common exit
+        // and previously skipped the flushes, stranding the SRK +
+        // loaded object handles (TPMs commonly have about 3
+        // transient slots) and the PIN copy described below until
+        // the Context dropped.
+        let mut loaded_obj: Option<ObjectHandle> = None;
+        let unseal_result = (|| {
+            let public = tss_esapi::structures::Public::unmarshall(&blob.public)
+                .map_err(|e| Error::TpmError(format!("unmarshall TPM2B_PUBLIC: {e}")))?;
+            let private = Private::try_from(blob.private.clone())
+                .map_err(|e| Error::TpmError(format!("private blob too large: {e}")))?;
 
-        let loaded = self
-            .ctx
-            .load(primary.key_handle, private, public)
-            .map_err(|e| Error::TpmError(format!("Esys_Load: {e}")))?;
+            let loaded = self
+                .ctx
+                .load(primary.key_handle, private, public)
+                .map_err(|e| Error::TpmError(format!("Esys_Load: {e}")))?;
+            loaded_obj = Some(loaded.into());
 
-        // If the blob was sealed with a PIN, set it on the loaded
-        // object's auth slot so the next Esys_Unseal carries the
-        // correct password session value.
-        if let Some(pin_bytes) = pin {
-            // `Auth::try_from(&[u8])` copies the PIN into the Rust-side
-            // `Auth` value. In tss-esapi 7.7.0 that storage is
-            // `Zeroizing<Vec<u8>>` (see `structures::buffers`), so the
-            // Rust copy is wiped on the implicit `Drop` of `auth` below.
-            //
-            // What is NOT cleaned up: once `tr_set_auth` succeeds, ESAPI
-            // marshals the bytes into the C-side ESYS context's internal
-            // `TPM2B_AUTH` slot for the loaded object. That C-side copy
-            // is upstream-owned and tss-esapi 7.x does not zeroize it
-            // when the Context drops -- only when the same auth slot is
-            // overwritten or the object is flushed. We immediately flush
-            // the loaded object below (`flush_context(loaded.into())`),
-            // which is the best ESAPI-side mitigation available without
-            // bumping past tss-esapi 7.x.
-            let auth = Auth::try_from(pin_bytes)
-                .map_err(|e| Error::TpmError(format!("PIN too long: {e}")))?;
+            // If the blob was sealed with a PIN, set it on the loaded
+            // object's auth slot so the next Esys_Unseal carries the
+            // correct password session value.
+            if let Some(pin_bytes) = pin {
+                // `Auth::try_from(&[u8])` copies the PIN into the Rust-side
+                // `Auth` value. In tss-esapi 7.7.0 that storage is
+                // `Zeroizing<Vec<u8>>` (see `structures::buffers`), so the
+                // Rust copy is wiped on the implicit `Drop` of `auth` below.
+                //
+                // What is NOT cleaned up: once `tr_set_auth` succeeds, ESAPI
+                // marshals the bytes into the C-side ESYS context's internal
+                // `TPM2B_AUTH` slot for the loaded object. That C-side copy
+                // is upstream-owned and tss-esapi 7.x does not zeroize it
+                // when the Context drops -- only when the same auth slot is
+                // overwritten or the object is flushed. The flush of the
+                // loaded object after this closure (which now runs on
+                // error paths too, including wrong-PIN) is the best
+                // ESAPI-side mitigation available without bumping past
+                // tss-esapi 7.x.
+                let auth = Auth::try_from(pin_bytes)
+                    .map_err(|e| Error::TpmError(format!("PIN too long: {e}")))?;
+                self.ctx
+                    .tr_set_auth(loaded.into(), auth)
+                    .map_err(|e| Error::TpmError(format!("Esys_TR_SetAuth (PIN): {e}")))?;
+            }
+
             self.ctx
-                .tr_set_auth(loaded.into(), auth)
-                .map_err(|e| Error::TpmError(format!("Esys_TR_SetAuth (PIN): {e}")))?;
+                .unseal(ObjectHandle::from(loaded))
+                .map_err(|e| Error::TpmError(format!("Esys_Unseal: {e}")))
+        })();
+
+        if let Some(h) = loaded_obj {
+            let _ = self.ctx.flush_context(h);
         }
-
-        let unsealed = self
-            .ctx
-            .unseal(ObjectHandle::from(loaded))
-            .map_err(|e| Error::TpmError(format!("Esys_Unseal: {e}")))?;
-
-        let _ = self.ctx.flush_context(loaded.into());
         let _ = self.ctx.flush_context(primary.key_handle.into());
+        self.flush_session(session);
+        let unsealed = unseal_result?;
 
         // `SensitiveData` is a buffer type; `value()` returns the
         // unsealed plaintext bytes.
@@ -224,6 +256,17 @@ impl Tpm2Sealer {
     }
 
     // ---- internal helpers --------------------------------------------
+
+    /// Best-effort teardown of the per-operation HMAC session.
+    /// `start_auth_session` allocates a transient session handle
+    /// that, unlike the SRK / loaded-object handles, was never
+    /// flushed anywhere -- one leaked per seal/unseal call until
+    /// the Context dropped. Clear the context's session slot first
+    /// so ESYS never holds a reference to a flushed handle.
+    fn flush_session(&mut self, session: AuthSession) {
+        self.ctx.clear_sessions();
+        let _ = self.ctx.flush_context(SessionHandle::from(session).into());
+    }
 
     fn start_hmac_session(&mut self) -> Result<AuthSession, Error> {
         let session = self

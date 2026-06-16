@@ -99,6 +99,7 @@ impl Fido2Authenticator for MockAuthenticator {
         _rp_id: &str,
         cred_id: &[u8],
         salt: &[u8; 32],
+        prehash_salt: bool,
         _pin: Option<&str>,
     ) -> Result<HmacSecret, Error> {
         if self.fail_touch {
@@ -113,8 +114,23 @@ impl Fido2Authenticator for MockAuthenticator {
             .creds
             .get(cred_id)
             .ok_or_else(|| Error::Other("unknown credential".into()))?;
+        // Mirror the real converged wire behaviour: the mock is a
+        // CTAP2-level device, so it HMACs whatever bytes reach it. The
+        // libfido2 path applies T(salt) = SHA-256("WebAuthn PRF"\0 ||
+        // salt) locally when `prehash_salt` is set; the Windows path
+        // forwards the raw salt and webauthn.dll applies the same T.
+        // Both converge on the device seeing T(salt), so the mock
+        // applies T here for `prehash_salt = true`. The cross-platform
+        // round-trip test in luksbox-core models the Windows side by
+        // computing T(salt) itself and calling with `prehash=false`.
+        let mut effective_salt = [0u8; 32];
+        if prehash_salt {
+            effective_salt.copy_from_slice(&crate::authenticator::webauthn_prf_salt(salt));
+        } else {
+            effective_salt.copy_from_slice(salt);
+        }
         let mut mac = <Hmac<Sha256>>::new_from_slice(secret).expect("HMAC any-len");
-        mac.update(salt);
+        mac.update(&effective_salt);
         let out = mac.finalize().into_bytes();
         let mut hmac = [0u8; 32];
         hmac.copy_from_slice(&out);
@@ -132,10 +148,10 @@ mod tests {
         let r = auth.enroll("luksbox.local", b"user", None).unwrap();
         let salt = [0x42u8; 32];
         let a = auth
-            .hmac_secret("luksbox.local", &r.credential.id, &salt, None)
+            .hmac_secret("luksbox.local", &r.credential.id, &salt, true, None)
             .unwrap();
         let b = auth
-            .hmac_secret("luksbox.local", &r.credential.id, &salt, None)
+            .hmac_secret("luksbox.local", &r.credential.id, &salt, true, None)
             .unwrap();
         assert_eq!(a, b);
     }
@@ -147,10 +163,10 @@ mod tests {
         let s1 = [0x01u8; 32];
         let s2 = [0x02u8; 32];
         let o1 = auth
-            .hmac_secret("luksbox.local", &r.credential.id, &s1, None)
+            .hmac_secret("luksbox.local", &r.credential.id, &s1, true, None)
             .unwrap();
         let o2 = auth
-            .hmac_secret("luksbox.local", &r.credential.id, &s2, None)
+            .hmac_secret("luksbox.local", &r.credential.id, &s2, true, None)
             .unwrap();
         assert_ne!(o1, o2);
     }
@@ -158,7 +174,7 @@ mod tests {
     #[test]
     fn unknown_credential_rejected() {
         let mut auth = MockAuthenticator::new();
-        let r = auth.hmac_secret("luksbox.local", b"nope", &[0u8; 32], None);
+        let r = auth.hmac_secret("luksbox.local", b"nope", &[0u8; 32], true, None);
         assert!(r.is_err());
     }
 
@@ -167,7 +183,28 @@ mod tests {
         let mut auth = MockAuthenticator::new();
         let r = auth.enroll("luksbox.local", b"u", None).unwrap();
         auth.simulate_no_touch();
-        let r2 = auth.hmac_secret("luksbox.local", &r.credential.id, &[0u8; 32], None);
+        let r2 = auth.hmac_secret("luksbox.local", &r.credential.id, &[0u8; 32], true, None);
         assert!(matches!(r2, Err(Error::TouchTimeout)));
+    }
+
+    #[test]
+    fn prehash_salt_changes_output() {
+        // Locks in the V3 -> V4 wire-format divergence: the same
+        // (credential, salt) tuple with prehash=true vs prehash=false
+        // produces different HMAC bytes. This is the property that
+        // makes a V3 (raw-salt) keyslot incompatible with the V4
+        // (prehashed-salt) unlock convention and is exactly what was
+        // happening cross-platform between libfido2 (raw) and
+        // webauthn.dll (prehashed) before the v0.3.0 fix.
+        let mut auth = MockAuthenticator::new();
+        let r = auth.enroll("luksbox.local", b"u", None).unwrap();
+        let salt = [0x55u8; 32];
+        let raw = auth
+            .hmac_secret("luksbox.local", &r.credential.id, &salt, false, None)
+            .unwrap();
+        let prehashed = auth
+            .hmac_secret("luksbox.local", &r.credential.id, &salt, true, None)
+            .unwrap();
+        assert_ne!(raw, prehashed);
     }
 }

@@ -753,7 +753,6 @@ pub mod slot_payload {
     /// `decode`. The wrapped-MVK fields are opaque to this module -
     /// callers seal them with `KEK_factors` before constructing the
     /// payload and open them with `KEK_factors` after decoding.
-    #[derive(Debug)]
     pub struct SlotPayload {
         pub kind: DeniableKindTag,
         pub cred_id: Vec<u8>,
@@ -766,6 +765,22 @@ pub mod slot_payload {
         /// `KEK_factors`-sealed MVK + tag: exactly
         /// `KEY_LEN + SLOT_TAG_LEN = 48 bytes`.
         pub wrapped_mvk_ct_and_tag: [u8; KEY_LEN + SLOT_TAG_LEN],
+    }
+
+    // Hand-written redacting Debug instead of a derive. The
+    // wrapped-MVK bytes are AEAD ciphertext (not the MVK plaintext),
+    // but redact them anyway and print only shapes, so that adding a
+    // plaintext field later can't silently leak through `{:?}`.
+    impl core::fmt::Debug for SlotPayload {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("SlotPayload")
+                .field("kind", &self.kind)
+                .field("cred_id_len", &self.cred_id.len())
+                .field("has_hmac_salt", &self.hmac_salt.is_some())
+                .field("tpm_blob_len", &self.tpm_blob.len())
+                .field("wrapped_mvk", &"<redacted>")
+                .finish()
+        }
     }
 
     impl Drop for SlotPayload {
