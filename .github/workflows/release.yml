@@ -2061,17 +2061,31 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           # Distinct artifact name so it doesn't collide with the .dmg
-          # uploaded under matrix.target below. The release job's
+          # uploaded under the generic step below. The release job's
           # download-artifact has merge-multiple: true so both end up
-          # in artifacts/.
-          name: ${{ matrix.target }}-portable
+          # in artifacts/. Include fuse_backend: the two macOS legs
+          # share matrix.target (aarch64-apple-darwin), so without it
+          # the fuset and macfuse portable tarballs would upload under
+          # the same artifact name and merge-multiple would keep only
+          # one of them.
+          name: ${{ matrix.target }}-${{ matrix.fuse_backend }}-portable
           path: ${{ env.MACOS_PORTABLE_PATH }}
           if-no-files-found: error
           retention-days: 14
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          # The artifact NAME is the transport key the release job
+          # de-duplicates on (download-artifact merge-multiple keeps a
+          # single file per name). matrix.target alone is NOT unique:
+          # the four Linux legs share a target across ubuntu_codename
+          # (jammy/noble/trixie/resolute), and the two macOS legs share
+          # aarch64-apple-darwin across fuse_backend (fuset/macfuse).
+          # Append both so every leg's archive (.tar.gz / .zip / .dmg)
+          # lands under a unique name and survives into the release.
+          # Both vars are empty on legs that don't set them (e.g.
+          # Windows -> "x86_64-pc-windows-msvc--"), which is harmless.
+          name: ${{ matrix.target }}-${{ matrix.ubuntu_codename }}-${{ matrix.fuse_backend }}
           path: ${{ matrix.archive }}
           if-no-files-found: error
           retention-days: 14
