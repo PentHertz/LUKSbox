@@ -114,7 +114,12 @@ pub fn derive_kek(
     // it before `p` is moved into `Argon2::new`.
     let block_count = p.block_count();
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, p);
-    let mut out = [0u8; KEY_LEN];
+    // `Zeroizing<[u8; KEY_LEN]>` so the finished KEK is wiped on drop. The
+    // array is `Copy`, so `KeyEncryptionKey::from_zeroizing` reads it without
+    // moving it out; the local copy is then scrubbed when `out` drops -
+    // including panic / early-return paths. Matches the hybrid KEK paths
+    // below, which already wrap their output for the same reason.
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
 
     // Allocate Argon2id's working memory ourselves with a *fallible*
     // reservation instead of letting `hash_password_into` allocate it via an
@@ -135,7 +140,8 @@ pub fn derive_kek(
     })?;
     memory.resize(block_count, Block::new());
 
-    let result = argon2.hash_password_into_with_memory(passphrase, salt, &mut out, &mut memory);
+    let result =
+        argon2.hash_password_into_with_memory(passphrase, salt, out.as_mut_slice(), &mut memory);
 
     // Scrub Argon2id's working memory before it is freed: those blocks hold
     // password-derived intermediate state. The argon2 crate never wipes this
@@ -148,7 +154,7 @@ pub fn derive_kek(
     }
 
     result.map_err(|_| Error::Kdf)?;
-    Ok(KeyEncryptionKey::from_bytes(out))
+    Ok(KeyEncryptionKey::from_zeroizing(&out))
 }
 
 /// Combine a passphrase with a 32-byte FIDO2 hmac-secret output before stretching.
