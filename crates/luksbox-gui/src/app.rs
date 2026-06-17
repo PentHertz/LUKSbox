@@ -1032,6 +1032,11 @@ pub struct LuksboxApp {
     /// confirmation we drop the vault and run the action, on cancel
     /// we drop the action and stay on the current view.
     confirm_lock: Option<NavigateAction>,
+    /// Set when the user confirms switching vaults while one is MOUNTED.
+    /// We trigger a clean unmount and stash the navigation here, then run
+    /// it from `poll_mount` once the mount session has fully torn down, so
+    /// the new vault never inherits the old mount's "Vault mounted" panel.
+    nav_after_unmount: Option<NavigateAction>,
     /// Active clipboard auto-clear job. `Some` between the moment the
     /// user clicks "Copy to clipboard" and the deadline (default 30 s
     /// later). The per-frame `tick_clipboard_guard` checks expiry and
@@ -1345,6 +1350,7 @@ impl LuksboxApp {
             mount_status: None,
             pending_picker: None,
             confirm_lock: None,
+            nav_after_unmount: None,
             clipboard_guard: None,
             prefs: preferences::load(),
             pending_clipboard_warning: None,
@@ -1584,6 +1590,14 @@ impl eframe::App for LuksboxApp {
         // Drive pending ops; repaint quickly while one is in flight.
         self.poll_pending(&ctx);
         self.poll_mount();
+        // If a vault-switch confirmation deferred its navigation until the
+        // mount tore down, `poll_mount` has now cleared `mount_status`; run
+        // the navigation so the user lands on the new open/create flow.
+        if self.mount_status.is_none()
+            && let Some(action) = self.nav_after_unmount.take()
+        {
+            self.execute_navigate(action);
+        }
         self.poll_picker();
         // Clipboard auto-clear runs on every frame because the deadline
         // can elapse between paints. `tick_clipboard_guard` is a no-op
@@ -2645,7 +2659,12 @@ impl LuksboxApp {
     /// currently-open vault. If there's no vault, runs the action
     /// directly; if there is, defers it behind the confirm-lock modal.
     fn request_navigate(&mut self, action: NavigateAction) {
-        if self.vault.is_none() {
+        // A MOUNTED vault has its Vfs moved into the mount thread, so
+        // `self.vault` is None even though a session is live. Gate the
+        // confirm on EITHER an open vault or an active mount, otherwise
+        // switching vaults while mounted would skip the modal and leave the
+        // stale "Vault mounted" panel showing over the new vault.
+        if self.vault.is_none() && self.mount_status.is_none() {
             self.execute_navigate(action);
         } else {
             self.confirm_lock = Some(action);
@@ -6991,6 +7010,40 @@ impl LuksboxApp {
             NavigateAction::GoWelcome => "return to the welcome screen".into(),
         };
 
+        // A MOUNTED vault needs to be torn down (unmount) before locking;
+        // an open-but-unmounted vault just needs the lock. Word the modal
+        // and button for whichever case we are in.
+        let mounted = self.mount_status.is_some();
+        let mount_point = self
+            .mount_status
+            .as_ref()
+            .map(|ms| ms.mountpoint.display().to_string());
+        let title = if mounted {
+            "Unmount current vault first?"
+        } else {
+            "Lock current vault first?"
+        };
+        let body = if mounted {
+            format!(
+                "The vault mounted at {} is still live. To {next_label} we need to \
+                 unmount and lock it first, which flushes any pending writes, tears \
+                 down the mount, and drops the file handle so the vault can be \
+                 reopened cleanly.",
+                mount_point.as_deref().unwrap_or("(unknown mountpoint)")
+            )
+        } else {
+            format!(
+                "{open_path} is still open. To {next_label} we need to lock it \
+                 first, which flushes any pending writes and drops the file \
+                 handle so the vault can be reopened cleanly."
+            )
+        };
+        let confirm_label = if mounted {
+            "Unmount and continue"
+        } else {
+            "Lock and continue"
+        };
+
         let mut decision: Option<bool> = None; // Some(true)=lock+go, Some(false)=cancel
 
         let modal = egui::Modal::new(egui::Id::new("confirm-lock-modal"))
@@ -7003,21 +7056,9 @@ impl LuksboxApp {
             )
             .show(ctx, |ui| {
                 ui.set_min_width(capped_width(ui, 460.0));
-                ui.label(
-                    RichText::new("Lock current vault first?")
-                        .size(16.0)
-                        .strong(),
-                );
+                ui.label(RichText::new(title).size(16.0).strong());
                 ui.add_space(8.0);
-                ui.label(
-                    RichText::new(format!(
-                        "{open_path} is still open. To {next_label} we need to lock it \
-                         first, which flushes any pending writes and drops the file \
-                         handle so the vault can be reopened cleanly."
-                    ))
-                    .color(theme::DIM)
-                    .size(12.0),
-                );
+                ui.label(RichText::new(&body).color(theme::DIM).size(12.0));
                 ui.add_space(14.0);
                 ui.separator();
                 ui.add_space(10.0);
@@ -7025,7 +7066,7 @@ impl LuksboxApp {
                 if ui
                     .add_sized(
                         [capped_width(ui, 420.0), 30.0],
-                        primary_button("Lock and continue"),
+                        primary_button(confirm_label),
                     )
                     .clicked()
                 {
@@ -7050,7 +7091,16 @@ impl LuksboxApp {
         match decision {
             Some(true) => {
                 let action = self.confirm_lock.take().expect("checked above");
-                self.execute_navigate(action);
+                if self.mount_status.is_some() {
+                    // Tear the mount down cleanly (same path as the Unmount
+                    // button), and defer the navigation until `poll_mount`
+                    // confirms the session ended so we never show the new
+                    // vault under the old "Vault mounted" panel.
+                    self.request_unmount();
+                    self.nav_after_unmount = Some(action);
+                } else {
+                    self.execute_navigate(action);
+                }
             }
             Some(false) => {
                 self.confirm_lock = None;

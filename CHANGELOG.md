@@ -119,6 +119,19 @@ Two narrow race conditions in the file-handling layer were closed:
   key material; read-only and metadata commands (`umount`, `info`,
   `header-dump`, and similar) no longer print it.
 
+### Fixed: GUI no longer carries a mounted vault into a new open/create
+
+Switching to another vault in the GUI while one was mounted left the
+previous vault's "Vault mounted" panel (with its "Unmount" button)
+showing over the new vault, and an unclean unmount could leave that state
+stuck until the application was restarted. The confirmation that gates a
+vault switch was checking only for an open (unmounted) vault; a mounted
+vault has its filesystem handed to the mount thread, so that check
+missed it. The GUI now recognizes a live mount when you switch, shows a
+confirmation popup ("Unmount current vault first?"), and on confirm
+unmounts cleanly before continuing, so the new vault always opens with a
+fresh view.
+
 ## [v0.3.0] - 2026-06-15
 
 Cross-platform FIDO2 keyslots and an in-place migration path.
