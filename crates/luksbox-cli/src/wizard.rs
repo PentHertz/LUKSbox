@@ -221,6 +221,20 @@ fn ask_den_cipher(theme: &ColorfulTheme, label: &str) -> Result<luksbox_core::Ci
 }
 
 fn ask_den_kdf(theme: &ColorfulTheme, label: &str) -> Result<luksbox_core::Argon2idParams> {
+    ask_kdf_strength(theme, label, 1)
+}
+
+/// Argon2id strength picker. `default_idx` selects the highlighted preset
+/// (0 = Interactive, 1 = Moderate, 2 = Sensitive, 3 = Custom). The "Custom"
+/// branch lets the user drop the memory cost well below the 256 MiB
+/// Interactive preset, which is what makes enrolment possible on
+/// memory-constrained hosts (small VMs, containers with a tight cgroup
+/// limit, QubesOS AppVMs) where a 256 MiB Argon2id buffer won't allocate.
+fn ask_kdf_strength(
+    theme: &ColorfulTheme,
+    label: &str,
+    default_idx: usize,
+) -> Result<luksbox_core::Argon2idParams> {
     use luksbox_core::Argon2idParams;
     let preset_idx = Select::with_theme(theme)
         .with_prompt(label)
@@ -228,9 +242,9 @@ fn ask_den_kdf(theme: &ColorfulTheme, label: &str) -> Result<luksbox_core::Argon
             "Interactive (256 MiB, t=3, p=4)  ~500 ms per attempt",
             "Moderate    (512 MiB, t=4, p=4)  ~1.5 s  per attempt",
             "Sensitive   (1 GiB,   t=5, p=4)  ~3-4 s  per attempt",
-            "Custom (advanced)",
+            "Custom (advanced - lower memory for constrained VMs / AppVMs)",
         ])
-        .default(1)
+        .default(default_idx)
         .interact()?;
     Ok(match preset_idx {
         0 => Argon2idParams::INTERACTIVE,
@@ -4195,16 +4209,17 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                 if cont.is_deniable() {
                     let slot_idx = ask_deniable_slot_idx(theme, &cont)?;
                     let pw = ask_new_passphrase(theme, "New passphrase")?;
-                    eprintln!("Stretching with Argon2id (around 500 ms)...");
-                    let idx =
-                        cont.enroll_passphrase_deniable(slot_idx, pw.as_bytes(), kdf_params())?;
+                    let kdf = ask_kdf_strength(theme, "Argon2id strength", 0)?;
+                    eprintln!("Stretching with Argon2id...");
+                    let idx = cont.enroll_passphrase_deniable(slot_idx, pw.as_bytes(), kdf)?;
                     cont.persist_header()?;
                     println!("OK enrolled passphrase in slot {idx}");
                     Ok(())
                 } else {
                     let pw = ask_new_passphrase(theme, "New passphrase")?;
-                    eprintln!("Stretching with Argon2id (around 500 ms)...");
-                    let idx = cont.enroll_passphrase(pw.as_bytes(), kdf_params())?;
+                    let kdf = ask_kdf_strength(theme, "Argon2id strength", 0)?;
+                    eprintln!("Stretching with Argon2id...");
+                    let idx = cont.enroll_passphrase(pw.as_bytes(), kdf)?;
                     cont.persist_header()?;
                     println!("OK enrolled passphrase in slot {idx}");
                     Ok(())
@@ -4555,6 +4570,13 @@ fn enroll_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
             .with_prompt("FIDO2 PIN")
             .interact()?,
     );
+    // Asked before the touch prompts so the user isn't holding a finger on
+    // the authenticator while a menu waits. A FIDO2-wrapped slot tolerates a
+    // low Argon2id memory cost well: its entropy comes from the hardware
+    // hmac-secret, not a human passphrase, so the picker is the supported way
+    // to enrol on constrained hosts (small VMs / AppVMs) where 256 MiB
+    // won't allocate.
+    let kdf = ask_kdf_strength(theme, "Argon2id strength", 0)?;
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
 
@@ -4570,7 +4592,7 @@ fn enroll_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
-    let idx = c.enroll_fido2(None, &hmac_secret, &cred_id, hmac_salt, kdf_params())?;
+    let idx = c.enroll_fido2(None, &hmac_secret, &cred_id, hmac_salt, kdf)?;
     c.persist_header()?;
     println!("OK enrolled FIDO2 credential in slot {idx}");
     Ok(())
