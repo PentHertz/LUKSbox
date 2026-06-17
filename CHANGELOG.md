@@ -14,6 +14,43 @@ canonical record.
 
 ---
 
+## [Unreleased]
+
+### Security: Windows extraction no longer redirectable through an intermediate junction
+
+`luksbox_core::file_util::secure_create_or_truncate` (the helper behind
+`luksbox get`, the wizard/GUI extract, and recovery extraction) had a
+Windows-only gap left open after the Round 13 R13-01 Unix fix. The
+Windows branch did `create(true).truncate(true)` on the caller-supplied
+path and only checked `FILE_ATTRIBUTE_REPARSE_POINT` on the FINAL path
+component, AFTER truncating. Two consequences:
+
+- An attacker-controlled **intermediate** directory (e.g. a junction
+  `C:\tmp\extract` -> `C:\Windows\System32`) silently redirected the
+  plaintext write/truncate. Under an elevated run this is a privileged
+  arbitrary-overwrite primitive.
+- Even a final-component reparse point had its target truncated before
+  the attribute check could refuse it.
+
+The Windows path now refuses to extract through ANY reparse point
+(junction / symlink / mount point) anywhere in the path -- a stricter
+posture than the Unix branch, which deliberately follows legitimate
+intermediate symlinks. It takes the lexically-absolute target
+(`std::path::absolute`, which resolves no reparse points), opens it
+WITHOUT truncating, refuses a reparse-point / directory final component,
+then uses `GetFinalPathNameByHandleW` to require the handle's resolved
+path to equal the literal target. Because the OS always follows
+intermediate junctions, any junction crossed on the way to the file
+makes the resolved path differ from the literal one -> refused, with no
+destructive truncation and a redirected pre-existing target left
+untouched. A user who genuinely wants to extract beneath a junction must
+resolve it manually first.
+
+Regression coverage: `crates/luksbox-core/tests/windows_extract_junction.rs`
+(fresh create, replace/truncate, intermediate junction refused without
+redirect/truncation, final-component junction refused without destroying
+its target).
+
 ## [v0.3.0] - 2026-06-15
 
 Cross-platform FIDO2 keyslots and an in-place migration path.

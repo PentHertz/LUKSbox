@@ -327,9 +327,51 @@ pub fn secure_create_or_truncate(path: &Path) -> io::Result<File> {
     // access to a system-controlled ancestor, which is a much
     // bigger privilege than redirecting one extraction.
     //
-    // Windows: keep the existing `FILE_FLAG_OPEN_REPARSE_POINT` +
-    // `FILE_ATTRIBUTE_REPARSE_POINT` rejection. The intermediate-
-    // junction problem on Windows is tracked separately under R12-15.
+    // Windows (R12-15 follow-up): STRICTER than the Unix branch by
+    // design. The old path did `create(true).truncate(true)` on the
+    // caller-supplied path and only checked `FILE_ATTRIBUTE_REPARSE_POINT`
+    // on the FINAL component AFTER truncating -- so (a) an intermediate
+    // junction (`C:\tmp\extract` -> `C:\Windows\System32`) silently
+    // redirected the create, and (b) even a final-component reparse point
+    // had its target truncated before the attribute check could refuse it.
+    //
+    // Policy on Windows: refuse to extract through ANY reparse point
+    // (junction / symlink / mount point) anywhere in the path -- the
+    // finding's "component-wise reparse refusal" option. Unlike the Unix
+    // branch (which deliberately follows legitimate intermediate symlinks
+    // such as `~/extracted -> /mnt/usb`), Windows extraction targets must
+    // be free of junctions end-to-end. A user who genuinely wants to
+    // extract beneath a junction must resolve it manually first. This is
+    // the safer posture against attacker-staged junctions, which on
+    // Windows are the realistic redirect/privileged-overwrite vector.
+    //
+    // Flow:
+    //   1. `std::path::absolute(path)` -- make the target absolute and
+    //      lexically normalize `.` / `..` WITHOUT touching the filesystem
+    //      and WITHOUT resolving any reparse point. So `abs` is exactly
+    //      the path the caller named, never a junction's target.
+    //   2. Open `abs` WITHOUT truncating, with FILE_FLAG_OPEN_REPARSE_POINT
+    //      so a final-component symlink/junction is opened as the link
+    //      itself rather than followed.
+    //   3. Refuse if the opened handle is itself a reparse point or a
+    //      directory -- BEFORE any truncation, so a final-component link
+    //      is never destroyed.
+    //   4. `GetFinalPathNameByHandleW` the handle and require its resolved
+    //      path to equal `abs`. Any junction crossed on the way to the
+    //      file (intermediate components are ALWAYS followed by the OS,
+    //      regardless of FILE_FLAG_OPEN_REPARSE_POINT) makes the resolved
+    //      path differ from the literal `abs` -> refuse without truncating.
+    //      A final-component junction is caught by step 3 instead (it
+    //      resolves to itself, so the path compare alone would miss it).
+    //   5. Only now truncate to 0 (`set_len`) for replace semantics.
+    //
+    // Residual race (same class as the Unix branch): an attacker who can
+    // write to an ancestor directory can swap a component into a junction
+    // between step 1 and step 2. Step 4 detects the resulting redirect and
+    // refuses; the dangerous truncation never fires. The only residual
+    // artifact is a possible 0-byte file `create()` planted at the
+    // attacker-chosen location -- harmless, since that directory is already
+    // attacker-controlled, and never a destructive overwrite.
     #[cfg(unix)]
     {
         use std::ffi::CString;
@@ -419,32 +461,158 @@ pub fn secure_create_or_truncate(path: &Path) -> io::Result<File> {
         Ok(f)
     }
 
-    // Non-Unix path: preserve the prior Windows-only flow.
-    #[cfg(not(unix))]
+    // Windows path: refuse extraction through ANY junction / reparse
+    // point in the path (see the flow comment above).
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+
+        // (1) Lexically-absolute target. Does NOT touch the filesystem and
+        // does NOT resolve any reparse point, so `abs` is exactly the path
+        // the caller named -- never a junction's target.
+        let abs = std::path::absolute(path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("resolving extraction path {}: {e}", path.display()),
+            )
+        })?;
+
+        // (2) Open WITHOUT truncating; open a final reparse point as the
+        // link itself rather than following it.
+        let f = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&abs)?;
+
+        // (3) Refuse a reparse-point / directory final component BEFORE
+        // truncating, so a pre-existing link/dir is never destroyed. This
+        // catches a final-component junction, which step (4) cannot (a
+        // reparse point opened with FILE_FLAG_OPEN_REPARSE_POINT resolves
+        // to itself).
+        let attrs = f.metadata()?.file_attributes();
+        if attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "extraction destination is a reparse point (symlink / junction); refused",
+            ));
+        }
+        if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "extraction destination is a directory; refused",
+            ));
+        }
+
+        // (4) Require the handle's resolved path to equal the literal
+        // `abs`. The OS always follows intermediate junctions, so if any
+        // component along the path was a junction, the resolved path
+        // differs from `abs` -- refuse without truncating.
+        let resolved = final_path_by_handle(&f)?;
+        if !windows_paths_eq_ci(&resolved, &abs) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "extraction target {} resolved to {} \
+                     (a junction in the path redirected the write); refused. \
+                     Resolve the junction manually and retry.",
+                    abs.display(),
+                    resolved.display()
+                ),
+            ));
+        }
+
+        // (5) Verified junction-free target -- truncate now for replace
+        // semantics.
+        f.set_len(0)?;
+        Ok(f)
+    }
+
+    // Other non-Unix, non-Windows targets (none built today): plain
+    // create+truncate. No reparse semantics to defend.
+    #[cfg(not(any(unix, windows)))]
     {
         let mut o = OpenOptions::new();
         o.read(true).write(true).create(true).truncate(true);
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000.
-            o.custom_flags(0x0020_0000);
-        }
-        let f = o.open(path)?;
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt as _;
-            // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
-            let attrs = f.metadata()?.file_attributes();
-            if attrs & 0x0000_0400 != 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "extraction destination is a reparse point (symlink / junction); refused",
-                ));
-            }
-        }
-        Ok(f)
+        o.open(path)
     }
+}
+
+/// Canonical path of an open handle, via `GetFinalPathNameByHandleW`.
+/// Used by `secure_create_or_truncate` on Windows to confirm a just-
+/// opened handle landed at the expected `canon\basename` rather than
+/// being redirected through an intermediate junction.
+#[cfg(windows)]
+fn final_path_by_handle(f: &File) -> io::Result<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFinalPathNameByHandleW(
+            handle: *mut core::ffi::c_void,
+            path: *mut u16,
+            len: u32,
+            flags: u32,
+        ) -> u32;
+    }
+
+    // VOLUME_NAME_DOS (0) yields a `\\?\C:\...` form, matching what
+    // `std::fs::canonicalize` returns for the parent.
+    const VOLUME_NAME_DOS: u32 = 0x0;
+    // `RawHandle` is already `*mut c_void`; no cast needed.
+    let handle = f.as_raw_handle();
+
+    // First call with a NULL buffer returns the required length INCLUDING
+    // the terminating NUL; the second (with an adequate buffer) returns
+    // the length EXCLUDING it.
+    // SAFETY: handle is a valid open handle owned by `f`.
+    let needed = unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, VOLUME_NAME_DOS) };
+    if needed == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buf = vec![0u16; needed as usize];
+    // SAFETY: buf has `needed` u16 slots; handle is valid.
+    let written =
+        unsafe { GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, VOLUME_NAME_DOS) };
+    if written == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let w = (written as usize).min(buf.len());
+    Ok(PathBuf::from(OsString::from_wide(&buf[..w])))
+}
+
+/// Case-insensitive Windows path comparison that first strips the
+/// extended-length (`\\?\` / `\\?\UNC\`) prefix so the two operands are
+/// in the same form. `GetFinalPathNameByHandleW` returns a verbatim
+/// `\\?\C:\...` path; `std::path::absolute` returns a plain `C:\...`
+/// (or `\\server\share\...`) path. NTFS is case-folding and both
+/// operands describe the same on-disk path when no junction was crossed,
+/// so an ASCII-case-insensitive compare of the normalized forms avoids
+/// false redirect alarms from prefix / drive-letter / component case
+/// differences.
+#[cfg(windows)]
+fn windows_paths_eq_ci(a: &Path, b: &Path) -> bool {
+    fn normalize(p: &Path) -> String {
+        let s = p.as_os_str().to_string_lossy();
+        // `\\?\UNC\server\share\..` describes the share `\\server\share\..`.
+        let s = if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            s.into_owned()
+        };
+        // Ignore a single trailing separator difference.
+        s.trim_end_matches('\\').to_string()
+    }
+    normalize(a).eq_ignore_ascii_case(&normalize(b))
 }
 
 /// Owned wrapper around a raw parent-directory file descriptor for the
