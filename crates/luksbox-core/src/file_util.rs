@@ -573,14 +573,16 @@ fn final_path_by_handle(f: &File) -> io::Result<PathBuf> {
     // the terminating NUL; the second (with an adequate buffer) returns
     // the length EXCLUDING it.
     // SAFETY: handle is a valid open handle owned by `f`.
-    let needed = unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, VOLUME_NAME_DOS) };
+    let needed =
+        unsafe { GetFinalPathNameByHandleW(handle, std::ptr::null_mut(), 0, VOLUME_NAME_DOS) };
     if needed == 0 {
         return Err(io::Error::last_os_error());
     }
     let mut buf = vec![0u16; needed as usize];
     // SAFETY: buf has `needed` u16 slots; handle is valid.
-    let written =
-        unsafe { GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, VOLUME_NAME_DOS) };
+    let written = unsafe {
+        GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(), buf.len() as u32, VOLUME_NAME_DOS)
+    };
     if written == 0 {
         return Err(io::Error::last_os_error());
     }

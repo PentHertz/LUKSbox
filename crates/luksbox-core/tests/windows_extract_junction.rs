@@ -106,8 +106,8 @@ fn final_component_junction_is_refused_without_destroying_target() {
     let evil = dir.path().join("evil");
     make_junction(&evil, &victim_dir);
 
-    let err = secure_create_or_truncate(&evil)
-        .expect_err("a reparse-point destination must be refused");
+    let err =
+        secure_create_or_truncate(&evil).expect_err("a reparse-point destination must be refused");
     // Either our explicit reparse-point refusal (InvalidInput) or the OS
     // refusing to open the directory reparse point for write is fine --
     // the security property is that the write is refused.

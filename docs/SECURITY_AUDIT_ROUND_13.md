@@ -252,18 +252,18 @@ cargo test --test round13_seed_file -p luksbox-pq
   Linux path to `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH)`
   when available (Linux ≥ 5.6) to close the residual
   canonicalize->parent_fd race. Tracked as a follow-up.
-- **Done (post-release follow-up):** the Windows branch of
+- **Done (v0.3.1):** the Windows branch of
   `secure_create_or_truncate` was hardened. It used to truncate the
   caller-supplied path and only reject a FINAL-component reparse point
   afterward, so an intermediate junction could redirect (and
-  pre-truncate) the extraction -- a privileged-overwrite class under
+  pre-truncate) the extraction: a privileged-overwrite class under
   elevated runs. The Windows policy is now STRICTER than Unix: it
   refuses to extract through ANY junction / reparse point in the path
   (whereas the Unix branch deliberately follows legitimate intermediate
   symlinks). It takes the lexically-absolute target (`std::path::absolute`,
   resolving no reparse points), opens without truncating, refuses a
   reparse/dir final component, and requires `GetFinalPathNameByHandleW`
-  to equal the literal target before truncating -- any junction crossed
+  to equal the literal target before truncating; any junction crossed
   makes the resolved path differ and is refused. A user who wants to
   extract beneath a junction must resolve it manually first. The
   residual race (an attacker swapping a component between the absolute

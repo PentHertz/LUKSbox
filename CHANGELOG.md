@@ -14,7 +14,10 @@ canonical record.
 
 ---
 
-## [Unreleased]
+## [v0.3.1] - 2026-06-17
+
+Hardening and usability fixes, with a focus on running unprivileged on
+QubesOS AppVMs and closing several file-handling race conditions.
 
 ### Security: Windows extraction no longer redirectable through an intermediate junction
 
@@ -22,34 +25,99 @@ canonical record.
 `luksbox get`, the wizard/GUI extract, and recovery extraction) had a
 Windows-only gap left open after the Round 13 R13-01 Unix fix. The
 Windows branch did `create(true).truncate(true)` on the caller-supplied
-path and only checked `FILE_ATTRIBUTE_REPARSE_POINT` on the FINAL path
-component, AFTER truncating. Two consequences:
+path and only checked `FILE_ATTRIBUTE_REPARSE_POINT` on the final path
+component, after truncating. Two consequences:
 
-- An attacker-controlled **intermediate** directory (e.g. a junction
-  `C:\tmp\extract` -> `C:\Windows\System32`) silently redirected the
-  plaintext write/truncate. Under an elevated run this is a privileged
-  arbitrary-overwrite primitive.
+- An attacker-controlled **intermediate** directory (for example a
+  junction `C:\tmp\extract` pointing at `C:\Windows\System32`) silently
+  redirected the plaintext write/truncate. Under an elevated run this is
+  a privileged arbitrary-overwrite primitive.
 - Even a final-component reparse point had its target truncated before
   the attribute check could refuse it.
 
-The Windows path now refuses to extract through ANY reparse point
-(junction / symlink / mount point) anywhere in the path -- a stricter
-posture than the Unix branch, which deliberately follows legitimate
-intermediate symlinks. It takes the lexically-absolute target
+The Windows path now refuses to extract through any reparse point
+(junction, symlink, or mount point) anywhere in the path; this is a
+stricter posture than the Unix branch, which deliberately follows
+legitimate intermediate symlinks. It takes the lexically-absolute target
 (`std::path::absolute`, which resolves no reparse points), opens it
-WITHOUT truncating, refuses a reparse-point / directory final component,
-then uses `GetFinalPathNameByHandleW` to require the handle's resolved
-path to equal the literal target. Because the OS always follows
+without truncating, refuses a reparse-point or directory final
+component, then uses `GetFinalPathNameByHandleW` to require the handle's
+resolved path to equal the literal target. Because the OS always follows
 intermediate junctions, any junction crossed on the way to the file
-makes the resolved path differ from the literal one -> refused, with no
-destructive truncation and a redirected pre-existing target left
-untouched. A user who genuinely wants to extract beneath a junction must
-resolve it manually first.
+makes the resolved path differ from the literal one, so the write is
+refused with no destructive truncation and any redirected pre-existing
+target left untouched. A user who genuinely wants to extract beneath a
+junction must resolve it manually first.
 
 Regression coverage: `crates/luksbox-core/tests/windows_extract_junction.rs`
 (fresh create, replace/truncate, intermediate junction refused without
 redirect/truncation, final-component junction refused without destroying
 its target).
+
+### Security: failure-closed symlink handling and detached-header re-lock (TOCTOU)
+
+Two narrow race conditions in the file-handling layer were closed:
+
+- Strict `LUKSBOX_NO_FOLLOW_SYMLINKS=1` mode used a stat-then-open
+  pattern (`symlink_metadata` followed by a plain open), so an attacker
+  who swapped a symlink in between the two calls could still make the
+  open follow it. Both gate sites (`open_existing_read_no_follow_policy`
+  and the container's `open_rw_checked`) now apply the refusal
+  atomically with the open itself: `O_NOFOLLOW` on Unix (an `ELOOP`
+  becomes the policy refusal), `FILE_FLAG_OPEN_REPARSE_POINT` plus an
+  attribute check on Windows.
+- The detached-header sidecar was rewritten atomically (temp, fsync,
+  rename) and then reopened by path with a plain open, so a racing
+  directory swap could attach the advisory lock to the wrong inode.
+  `atomic_secure_write` now returns the inode it committed, and the
+  reopen uses `O_NOFOLLOW` plus an inode-equality check against that
+  value, so a swapped symlink or a swapped regular file is refused with
+  `PathSubstituted`.
+
+### Security: stronger memory locking on constrained hosts, old kernels, and macOS
+
+- The `SecretBox` heap fallback (used on Linux kernels older than 5.14
+  that lack `memfd_secret`, and as the normal backing on macOS and the
+  BSDs) now locks its page per allocation with `mlock`/`munlock`, rather
+  than relying solely on the process-wide `mlockall`. This makes the
+  per-secret locking that the macOS messaging already promised actually
+  true, and closes the old-kernel gap on a finite memlock ceiling.
+- `mlockall` now arms `MCL_FUTURE` only when `RLIMIT_MEMLOCK` is
+  unlimited. On a finite ceiling it would otherwise force every later
+  allocation to be locked, so any allocation past the ceiling failed
+  with `ENOMEM` instead of swapping; on a QubesOS AppVM (128 MiB
+  ceiling) that bricked both keyslot creation (the 256 MiB Argon2id
+  buffer) and the GUI (Mesa framebuffers). Key material itself stays
+  locked via `memfd_secret` or the per-allocation lock above.
+- The Argon2id working matrix and the derived key buffer are now
+  zeroized after use, including on the error and early-return paths.
+
+### Fixed: QubesOS AppVMs now work unprivileged
+
+- The GUI no longer fails with `NoGlutinConfigs` where there is no GPU
+  (QubesOS AppVMs, headless or forwarded X11). It re-executes itself
+  once with `LIBGL_ALWAYS_SOFTWARE=1` to use Mesa's software renderer,
+  then falls back to an actionable hint if that is unavailable too.
+- Adding a keyslot on a host that cannot allocate the Argon2id buffer
+  now returns a clear `KdfOutOfMemory` error (with the size needed)
+  instead of aborting the process with a bare allocation failure.
+- Combined with the `MCL_FUTURE` change above, both the GUI and keyslot
+  creation now work on a stock QubesOS AppVM with no `sudo` and no
+  template changes.
+
+### Changed: wizard and TUI keyslot flow
+
+- Removed the post-creation "Enroll a FIDO2 keyslot now?" prompt. It
+  fired even with no authenticator plugged in (a guaranteed failure) and
+  duplicates the keyslot manager; you can add FIDO2 or any other keyslot
+  later via "Open an existing vault" then "Manage keyslots".
+- When two authenticators report the same "Manufacturer Product" label
+  (for example two identical YubiKeys), the picker now appends each
+  device's path so they can be told apart. This covers both the TUI and
+  the GUI, which share the enumeration.
+- The "memory not locked" warning is shown only for commands that handle
+  key material; read-only and metadata commands (`umount`, `info`,
+  `header-dump`, and similar) no longer print it.
 
 ## [v0.3.0] - 2026-06-15
 
