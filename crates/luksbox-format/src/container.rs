@@ -659,6 +659,7 @@ impl Container {
     /// and `hmac_secret`, and (b) generated a Kyber keypair + encapsulated
     /// to obtain `pq_shared`. The matching Kyber ciphertext goes in the
     /// `.hybrid` sidecar; the seed goes in the user's `.kyber` file.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_with_hybrid_pq_fido2(
         path: &Path,
         header_path: Option<&Path>,
@@ -687,6 +688,7 @@ impl Container {
     }
 
     /// ML-KEM-1024 variant of `create_with_hybrid_pq_fido2`.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_with_hybrid_pq_1024_fido2(
         path: &Path,
         header_path: Option<&Path>,
@@ -797,6 +799,7 @@ impl Container {
     }
 
     /// Create a new container on disk with a single FIDO2 keyslot.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_with_fido2(
         path: &Path,
         header_path: Option<&Path>,
@@ -821,6 +824,7 @@ impl Container {
     }
 
     /// Variant of `create_with_fido2` taking an extra `flags` u32.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_with_fido2_flags(
         path: &Path,
         header_path: Option<&Path>,

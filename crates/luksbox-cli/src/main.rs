@@ -1036,11 +1036,20 @@ fn main() -> ExitCode {
     // keying material. Both calls are best-effort; mlock typically fails
     // for unprivileged users with low RLIMIT_MEMLOCK and we just warn.
     secret_mem::disable_core_dumps();
-    if let Err(e) = secret_mem::enable_memory_lock() {
-        eprintln!("warning: memory not locked: {e}");
-    }
+    let memlock = secret_mem::enable_memory_lock();
     maybe_warn_about_software_aes();
     let cli = Cli::parse();
+    // Surface the "memory not locked" warning only for commands that actually
+    // derive a KEK or keep the MVK resident. On a finite RLIMIT_MEMLOCK (e.g. a
+    // QubesOS AppVM) `enable_memory_lock` now returns a warning on every run;
+    // printing it for read-only / metadata-only commands (umount, info, header
+    // dump/backup/restore, device listing, passphrase generation) is pure
+    // noise, since none of them hold key material that swap could expose.
+    if let Err(e) = &memlock
+        && command_touches_key_material(&cli.command)
+    {
+        eprintln!("warning: memory not locked: {e}");
+    }
     match dispatch(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -1048,6 +1057,24 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Whether a subcommand derives a KEK or keeps the MVK resident, and so
+/// benefits from the process being memory-locked. The default arm returns
+/// `true` (warn), so a newly added key-handling command can never silently
+/// slip through unwarned; only the explicitly listed read-only / metadata-only
+/// commands suppress the "memory not locked" notice.
+fn command_touches_key_material(cmd: &Command) -> bool {
+    !matches!(
+        cmd,
+        Command::Info { .. }
+            | Command::Umount { .. }
+            | Command::ListFido2Devices
+            | Command::Genpass
+            | Command::HeaderDump { .. }
+            | Command::HeaderBackup { .. }
+            | Command::HeaderRestore { .. }
+    )
 }
 
 fn dispatch(cli: Cli) -> Result<()> {
@@ -3281,6 +3308,7 @@ pub(crate) fn copy_out(vfs: &mut Vfs, file_id: FileId, dst: &mut impl Write) -> 
 
 // ----- commands --------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_create(
     path: &Path,
     cipher: &str,
@@ -5455,6 +5483,7 @@ fn parse_cli_den_cred(s: &str) -> Result<CliDenCred> {
 // envelope at create time and recovered from the envelope at unlock
 // time; no CLI / env-var ingestion path remains.
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_deniable_init(
     path: &Path,
     cipher: &str,
@@ -5593,6 +5622,7 @@ fn cmd_deniable_info(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_deniable_mount(
     path: &Path,
     cipher: &str,

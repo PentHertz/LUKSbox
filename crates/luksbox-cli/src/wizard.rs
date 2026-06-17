@@ -2768,16 +2768,11 @@ fn create_passphrase(
         eprintln!("  anchor file initialized at {}", ap.display());
     }
     println!("OK created {}", vault.display());
-
-    if Confirm::with_theme(theme)
-        .with_prompt("Enroll a FIDO2 keyslot now? (recommended)")
-        .default(true)
-        .interact()?
-        && let Err(e) = enroll_fido2_into(theme, &mut cont)
-    {
-        eprintln!("FAIL FIDO2 enroll failed: {e}");
-        eprintln!("  (vault still usable via passphrase; you can try again later)");
-    }
+    // No post-creation FIDO2 nag: it fired even with no authenticator plugged
+    // in (guaranteeing a confusing FAIL) and is redundant with the keyslot
+    // manager. Add FIDO2 or any other keyslot later via
+    // "Open an existing vault" -> "Manage keyslots".
+    eprintln!("  add more keyslots later via \"Open an existing vault\" -> \"Manage keyslots\"");
 
     maybe_mount_now(theme, cont, vault)
 }
