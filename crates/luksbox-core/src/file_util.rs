@@ -93,23 +93,73 @@ pub fn secure_create_new(path: &Path) -> io::Result<File> {
 /// `File::open`: legitimate users who symlink their vault path don't
 /// pay any cost.
 pub fn open_existing_read_no_follow_policy(path: &Path) -> io::Result<File> {
-    if std::env::var_os("LUKSBOX_NO_FOLLOW_SYMLINKS").is_some() {
-        // Stat without following so the check sees the symlink
-        // itself, not its target.
-        match std::fs::symlink_metadata(path) {
-            Ok(m) if m.file_type().is_symlink() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "path {} is a symlink and LUKSBOX_NO_FOLLOW_SYMLINKS=1 is set",
-                        path.display()
-                    ),
-                ));
-            }
-            _ => {}
-        }
+    if std::env::var_os("LUKSBOX_NO_FOLLOW_SYMLINKS").is_none() {
+        // Default: follow symlinks, matching `File::open`.
+        return File::open(path);
     }
-    File::open(path)
+    // Strict mode. Refuse a symlinked final component *atomically with the
+    // open itself* rather than stat-then-open: the previous symlink_metadata
+    // check left a TOCTOU window where an attacker could swap a symlink in
+    // after the stat but before `File::open` followed it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        return match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            // O_NOFOLLOW makes open(2) fail with ELOOP on a symlinked final
+            // component; surface it as the policy refusal.
+            Err(e) if e.raw_os_error() == Some(libc::ELOOP) => Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "path {} is a symlink and LUKSBOX_NO_FOLLOW_SYMLINKS=1 is set",
+                    path.display()
+                ),
+            )),
+            other => other,
+        };
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+        // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000: open the reparse point
+        // itself rather than following it, then reject if it is one. Same
+        // pattern as `secure_open_existing_no_follow`. The attribute check is
+        // on the opened handle, so there's no separate stat to race.
+        let f = OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000)
+            .open(path)?;
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+        if f.metadata()?.file_attributes() & 0x0000_0400 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "path {} is a reparse point (symlink/junction) and \
+                     LUKSBOX_NO_FOLLOW_SYMLINKS=1 is set",
+                    path.display()
+                ),
+            ));
+        }
+        Ok(f)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        // No O_NOFOLLOW equivalent; fall back to the (raceable) stat-then-open
+        // check so strict mode still rejects the common case.
+        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "path {} is a symlink and LUKSBOX_NO_FOLLOW_SYMLINKS=1 is set",
+                    path.display()
+                ),
+            ));
+        }
+        File::open(path)
+    }
 }
 
 /// Open an EXISTING file with read+write access, refusing to follow
@@ -541,11 +591,79 @@ pub fn sync_parent_dir(path: &Path) -> io::Result<()> {
     }
 }
 
+/// Stable per-file identity key: `(device, inode)` on Unix,
+/// `(volume_serial, file_index)` on Windows. Two open handles yield the same
+/// key iff they refer to the same on-disk file. Used to bind a just-committed
+/// atomic write to the handle a caller re-opens, so a path swap between commit
+/// and re-open is detected rather than silently latching onto the wrong file.
+#[cfg(unix)]
+pub fn inode_key(f: &File) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let m = f.metadata()?;
+    Ok((m.dev(), m.ino()))
+}
+
+/// Windows variant: the std-lib equivalents (`MetadataExt::volume_serial_number`
+/// / `file_index`) are still nightly-only behind `windows_by_handle`
+/// (rust-lang/rust#63010), so we call `GetFileInformationByHandle` directly.
+#[cfg(windows)]
+pub fn inode_key(f: &File) -> io::Result<(u64, u64)> {
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    struct Filetime {
+        low: u32,
+        high: u32,
+    }
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        attrs: u32,
+        creation: Filetime,
+        last_access: Filetime,
+        last_write: Filetime,
+        volume_serial: u32,
+        size_high: u32,
+        size_low: u32,
+        num_links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(
+            handle: *mut core::ffi::c_void,
+            info: *mut ByHandleFileInformation,
+        ) -> i32;
+    }
+
+    let handle = f.as_raw_handle() as *mut core::ffi::c_void;
+    let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
+    let ok = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let info = unsafe { info.assume_init() };
+    let vol = u64::from(info.volume_serial);
+    let idx = (u64::from(info.index_high) << 32) | u64::from(info.index_low);
+    Ok((vol, idx))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub fn inode_key(f: &File) -> io::Result<(u64, u64)> {
+    let _ = f;
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "inode_key: platform not supported",
+    ))
+}
+
 /// Build a `<path>.tmp.<16hex>` neighbour path, write `bytes` to it
 /// with `secure_create_new` (mode 0600 on POSIX), fsync the file, and
-/// return the temp path. The caller is responsible for commit
+/// return the temp path plus its `inode_key`. `rename(2)` / `MoveFileExW`
+/// preserve file identity, so the returned key is also the identity the
+/// committed `path` will have. The caller is responsible for commit
 /// (rename or hard-link) and cleanup on failure.
-fn write_secure_tmp_for(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
+fn write_secure_tmp_for(path: &Path, bytes: &[u8]) -> io::Result<(PathBuf, (u64, u64))> {
     use std::io::Write as _;
 
     let mut rand_bytes = [0u8; 8];
@@ -566,8 +684,12 @@ fn write_secure_tmp_for(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
     f.write_all(bytes)?;
     f.flush()?;
     f.sync_all()?;
+    // Capture the temp file's identity while we still hold the handle; it
+    // survives the caller's rename/hard-link commit, so the caller can verify
+    // a later re-open lands on this exact inode.
+    let key = inode_key(&f)?;
     drop(f);
-    Ok(tmp_path)
+    Ok((tmp_path, key))
 }
 
 /// Atomic, owner-only file replacement: write `bytes` to a unique
@@ -580,15 +702,22 @@ fn write_secure_tmp_for(path: &Path, bytes: &[u8]) -> io::Result<PathBuf> {
 /// Replace semantics: if `path` exists it will be overwritten. For
 /// no-clobber semantics (refuses to overwrite, and refuses to follow
 /// a pre-existing symlink at `path`), use `atomic_secure_create_new`.
-pub fn atomic_secure_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp_path = write_secure_tmp_for(path, bytes)?;
+///
+/// Returns the committed file's `inode_key`. A caller that must re-open
+/// `path` afterwards (e.g. to re-attach an advisory lock) can re-open with
+/// `O_NOFOLLOW` and confirm the re-opened handle's `inode_key` matches this
+/// value, closing the rename->reopen race where an attacker swaps `path` in
+/// between.
+pub fn atomic_secure_write(path: &Path, bytes: &[u8]) -> io::Result<(u64, u64)> {
+    let (tmp_path, key) = write_secure_tmp_for(path, bytes)?;
     // POSIX rename is atomic on the same filesystem. Windows uses
     // MoveFileExW with MOVEFILE_REPLACE_EXISTING.
     if let Err(e) = std::fs::rename(&tmp_path, path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
     }
-    sync_parent_dir(path)
+    sync_parent_dir(path)?;
+    Ok(key)
 }
 
 /// Atomic, owner-only file creation that **refuses to overwrite**.
@@ -616,7 +745,7 @@ pub fn atomic_secure_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// best-effort cleaned up so a retry doesn't trip its own
 /// `create_new(true)` guard.
 pub fn atomic_secure_create_new(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let tmp_path = write_secure_tmp_for(path, bytes)?;
+    let (tmp_path, _committed_inode) = write_secure_tmp_for(path, bytes)?;
     match commit_create_new(&tmp_path, path) {
         Ok(()) => {
             // POSIX `link(2)` leaves tmp_path pointing at the same
@@ -1066,6 +1195,34 @@ mod tests {
         // Real path still opens.
         let _f = open_existing_read_no_follow_policy(&real)
             .expect("non-symlink path still opens under no-follow");
+    }
+
+    /// Finding #3 regression: `atomic_secure_write` must report the inode it
+    /// actually committed, so a caller can bind a re-open to it. A fresh open
+    /// of the path resolves to that exact inode, and a subsequent rewrite
+    /// installs (and reports) a different inode.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_secure_write_returns_committed_inode() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sidecar.hdr");
+
+        let committed = atomic_secure_write(&path, b"v1").unwrap();
+        let reopened = File::open(&path).unwrap();
+        assert_eq!(
+            inode_key(&reopened).unwrap(),
+            committed,
+            "a fresh open must be the inode atomic_secure_write reported"
+        );
+
+        // temp+rename installs a fresh inode; the returned key tracks it.
+        let committed2 = atomic_secure_write(&path, b"v2").unwrap();
+        let reopened2 = File::open(&path).unwrap();
+        assert_eq!(inode_key(&reopened2).unwrap(), committed2);
+        assert_ne!(
+            committed, committed2,
+            "rename over the path installs a new inode"
+        );
     }
 
     #[cfg(unix)]
