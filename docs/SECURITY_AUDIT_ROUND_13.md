@@ -234,7 +234,7 @@ cargo test --test round13_seed_file -p luksbox-pq
 
 | ID | Severity | Status | Fix location |
 |---|---|---|---|
-| R13-01 | HIGH | **Fixed** | `crates/luksbox-core/src/file_util.rs::secure_create_or_truncate` -- Unix path uses `openat(parent_dir_fd, basename, O_RDWR\|O_CREAT\|O_TRUNC\|O_NOFOLLOW, 0600)` against a canonical parent fd; permission narrowed via `fchmod` on the open fd. Windows path keeps `FILE_FLAG_OPEN_REPARSE_POINT` + `FILE_ATTRIBUTE_REPARSE_POINT` rejection. |
+| R13-01 | HIGH | **Fixed** | `crates/luksbox-core/src/file_util.rs::secure_create_or_truncate` -- Unix path uses `openat(parent_dir_fd, basename, O_RDWR\|O_CREAT\|O_TRUNC\|O_NOFOLLOW, 0600)` against a canonical parent fd; permission narrowed via `fchmod` on the open fd. Windows path (post-release follow-up) refuses ANY junction/reparse point in the path (stricter than Unix, which follows legitimate intermediate symlinks): `std::path::absolute` (resolves nothing) -> open WITHOUT truncating + `FILE_FLAG_OPEN_REPARSE_POINT` -> refuse reparse/dir final component -> require `GetFinalPathNameByHandleW` to equal the literal target (any junction crossed differs) -> only then `set_len(0)`. See `crates/luksbox-core/tests/windows_extract_junction.rs`. |
 | R13-02 | HIGH | **Fixed** | `crates/luksbox-format/src/container.rs::restore_header_bytes` + `crates/luksbox-cli/src/main.rs::cmd_header_restore` -- inline path reuses container's verified `self.file`; detached path goes through `atomic_secure_write`. `--no-verify` direct write path adds `O_NOFOLLOW` + Windows reparse-point rejection. |
 | R13-03 | MEDIUM | **Fixed** | `crates/luksbox-vfs/src/vfs.rs::real_size` clamps chunk-0 size header against allocated capacity; values past `chunks.len() * CHUNK_PLAINTEXT_SIZE - SIZE_HEADER_LEN` return `Error::MetadataDeserialize`. |
 | R13-04 | MEDIUM | **Fixed** | `crates/luksbox-format/src/container.rs::persist_header` uses `sync_all()` on inline + deniable, `atomic_secure_write` on detached, then re-opens the lock handle to the new inode. |
@@ -252,5 +252,22 @@ cargo test --test round13_seed_file -p luksbox-pq
   Linux path to `openat2(RESOLVE_NO_SYMLINKS|RESOLVE_BENEATH)`
   when available (Linux ≥ 5.6) to close the residual
   canonicalize->parent_fd race. Tracked as a follow-up.
+- **Done (v0.3.1):** the Windows branch of
+  `secure_create_or_truncate` was hardened. It used to truncate the
+  caller-supplied path and only reject a FINAL-component reparse point
+  afterward, so an intermediate junction could redirect (and
+  pre-truncate) the extraction: a privileged-overwrite class under
+  elevated runs. The Windows policy is now STRICTER than Unix: it
+  refuses to extract through ANY junction / reparse point in the path
+  (whereas the Unix branch deliberately follows legitimate intermediate
+  symlinks). It takes the lexically-absolute target (`std::path::absolute`,
+  resolving no reparse points), opens without truncating, refuses a
+  reparse/dir final component, and requires `GetFinalPathNameByHandleW`
+  to equal the literal target before truncating; any junction crossed
+  makes the resolved path differ and is refused. A user who wants to
+  extract beneath a junction must resolve it manually first. The
+  residual race (an attacker swapping a component between the absolute
+  resolution and the open) is detected by the final-path check; the
+  destructive truncate never fires.
 - Round 14 scope to be driven by the planned external pentest
   engagement (see `SECURITY.md` Tier 1).

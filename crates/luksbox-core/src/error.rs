@@ -32,6 +32,13 @@ pub enum Error {
     #[error("KDF failure")]
     Kdf,
 
+    #[error(
+        "not enough memory for Argon2id: needs {needed_kib} KiB ({needed_mib} MiB) of \
+         contiguous RAM. This host (small VM, container cgroup, or QubesOS AppVM) could \
+         not provide it. Give the machine more RAM, or create the keyslot on a larger host."
+    )]
+    KdfOutOfMemory { needed_kib: u32, needed_mib: u32 },
+
     #[error("AEAD failure")]
     Aead,
 

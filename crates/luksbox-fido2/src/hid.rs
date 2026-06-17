@@ -143,7 +143,28 @@ impl HidAuthenticator {
                 let label = format_label(&mfr, &prod);
                 out.push(DeviceInfo { path, label });
             }
+            disambiguate_duplicate_labels(&mut out);
             Ok(out)
+        }
+    }
+}
+
+/// When two or more authenticators report the identical "Manufacturer
+/// Product" label - e.g. two YubiKeys of the same model - the device picker
+/// (TUI `select_fido2_device` and the GUI dropdown both render `label`) shows
+/// indistinguishable entries. Append each colliding device's libfido2 path so
+/// the user can tell them apart and correlate with the physical port / hidraw
+/// node. Unique labels are left untouched so the common single-key case stays
+/// clean.
+fn disambiguate_duplicate_labels(devices: &mut [DeviceInfo]) {
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for d in devices.iter() {
+        *counts.entry(d.label.clone()).or_insert(0) += 1;
+    }
+    for d in devices.iter_mut() {
+        if counts.get(&d.label).copied().unwrap_or(0) > 1 {
+            d.label = format!("{} [{}]", d.label, d.path);
         }
     }
 }
@@ -822,5 +843,42 @@ mod tests {
             matches!(e, Error::TouchTimeout),
             "USER_PRESENCE_REQUIRED should map to TouchTimeout"
         );
+    }
+
+    fn dev(path: &str, label: &str) -> DeviceInfo {
+        DeviceInfo {
+            path: path.to_string(),
+            label: label.to_string(),
+        }
+    }
+
+    #[test]
+    fn duplicate_labels_get_path_suffix_unique_labels_untouched() {
+        let mut devices = vec![
+            dev("/dev/hidraw0", "Yubico YubiKey OTP+FIDO+CCID"),
+            dev("/dev/hidraw1", "Yubico YubiKey OTP+FIDO+CCID"),
+            dev("/dev/hidraw2", "Nitrokey 3"),
+        ];
+        disambiguate_duplicate_labels(&mut devices);
+
+        // The two identical YubiKeys are now distinguishable by path...
+        assert_eq!(
+            devices[0].label,
+            "Yubico YubiKey OTP+FIDO+CCID [/dev/hidraw0]"
+        );
+        assert_eq!(
+            devices[1].label,
+            "Yubico YubiKey OTP+FIDO+CCID [/dev/hidraw1]"
+        );
+        assert_ne!(devices[0].label, devices[1].label);
+        // ...and the lone Nitrokey is left clean.
+        assert_eq!(devices[2].label, "Nitrokey 3");
+    }
+
+    #[test]
+    fn single_device_label_is_not_suffixed() {
+        let mut devices = vec![dev("/dev/hidraw0", "SoloKeys Solo 2")];
+        disambiguate_duplicate_labels(&mut devices);
+        assert_eq!(devices[0].label, "SoloKeys Solo 2");
     }
 }

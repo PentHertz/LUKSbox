@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Penthertz <https://penthertz.com> (https://x.com/PentHertz)
 
-use argon2::{Algorithm, Argon2, Params, Version};
-use zeroize::Zeroizing;
+use argon2::{Algorithm, Argon2, Block, Params, Version};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::Error;
 use crate::key::{KEY_LEN, KeyEncryptionKey};
@@ -110,12 +110,51 @@ pub fn derive_kek(
         Some(KEY_LEN),
     )
     .map_err(|_| Error::Kdf)?;
+    // Number of 1 KiB scratch blocks Argon2id needs for these params. Capture
+    // it before `p` is moved into `Argon2::new`.
+    let block_count = p.block_count();
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, p);
-    let mut out = [0u8; KEY_LEN];
-    argon2
-        .hash_password_into(passphrase, salt, &mut out)
-        .map_err(|_| Error::Kdf)?;
-    Ok(KeyEncryptionKey::from_bytes(out))
+    // `Zeroizing<[u8; KEY_LEN]>` so the finished KEK is wiped on drop. The
+    // array is `Copy`, so `KeyEncryptionKey::from_zeroizing` reads it without
+    // moving it out; the local copy is then scrubbed when `out` drops -
+    // including panic / early-return paths. Matches the hybrid KEK paths
+    // below, which already wrap their output for the same reason.
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+
+    // Allocate Argon2id's working memory ourselves with a *fallible*
+    // reservation instead of letting `hash_password_into` allocate it via an
+    // infallible `Vec`. On a memory-starved host (small VM, a container with a
+    // tight cgroup memory limit, or a QubesOS AppVM that hasn't been granted
+    // enough RAM) the infallible path hits the global allocator's
+    // `handle_alloc_error`, which *aborts the whole process* - the user sees a
+    // bare "memory allocation of N bytes failed / Aborted" and loses the
+    // session. `try_reserve_exact` lets us turn that into a clean, actionable
+    // error the CLI/GUI can render and recover from.
+    let mut memory: Vec<Block> = Vec::new();
+    memory.try_reserve_exact(block_count).map_err(|_| {
+        let needed_kib = block_count as u32; // 1 block == 1 KiB
+        Error::KdfOutOfMemory {
+            needed_kib,
+            needed_mib: needed_kib / 1024,
+        }
+    })?;
+    memory.resize(block_count, Block::new());
+
+    let result =
+        argon2.hash_password_into_with_memory(passphrase, salt, out.as_mut_slice(), &mut memory);
+
+    // Scrub Argon2id's working memory before it is freed: those blocks hold
+    // password-derived intermediate state. The argon2 crate never wipes this
+    // buffer (`Block` is `#[derive(Copy)]`, so it has no `Drop`), and the old
+    // internal-`Vec` path dropped it in the clear. Now that we own the buffer
+    // we zeroize it on both the success and error paths - a strict improvement
+    // over the previous behaviour, not a regression.
+    for blk in memory.iter_mut() {
+        blk.zeroize();
+    }
+
+    result.map_err(|_| Error::Kdf)?;
+    Ok(KeyEncryptionKey::from_zeroizing(&out))
 }
 
 /// Combine a passphrase with a 32-byte FIDO2 hmac-secret output before stretching.
@@ -272,5 +311,43 @@ mod tests {
             derive_hybrid_fido2_kek(b"\xff", &hmac, &pq, &salt, Argon2idParams::TEST_ONLY,),
             Err(Error::InvalidField)
         ));
+    }
+
+    /// `derive_kek` switched from the argon2 crate's internal `Vec<Block>`
+    /// allocation to a caller-owned, fallibly-reserved buffer that we zeroize
+    /// after use. The output must stay deterministic and identical across
+    /// calls; if the buffer were mis-sized, fed in the wrong order, or scrubbed
+    /// before `finalize` read it, the bytes would change and every existing
+    /// vault would fail to unlock. Pin the round-trip stability here.
+    #[test]
+    fn derive_kek_is_deterministic_over_owned_buffer() {
+        let salt = [7u8; 32];
+        let a = derive_kek(b"correct horse", &salt, Argon2idParams::TEST_ONLY).unwrap();
+        let b = derive_kek(b"correct horse", &salt, Argon2idParams::TEST_ONLY).unwrap();
+        assert_eq!(
+            a.as_bytes(),
+            b.as_bytes(),
+            "same passphrase+salt+params must yield identical KEK bytes"
+        );
+        // A different passphrase must diverge (sanity: we're not returning a
+        // zeroed/constant buffer).
+        let c = derive_kek(b"correct hose", &salt, Argon2idParams::TEST_ONLY).unwrap();
+        assert_ne!(a.as_bytes(), c.as_bytes());
+        assert_ne!(a.as_bytes(), &[0u8; KEY_LEN]);
+    }
+
+    /// Larger-than-test params still derive successfully through the owned
+    /// buffer path (exercises a realistic multi-MiB `block_count`, not just
+    /// the 8 KiB `TEST_ONLY` floor). Kept modest so the suite stays fast.
+    #[test]
+    fn derive_kek_owned_buffer_handles_realistic_block_count() {
+        let salt = [3u8; 32];
+        let params = Argon2idParams {
+            m_cost_kib: 4 * 1024, // 4 MiB: many blocks, still quick
+            t_cost: 2,
+            p_cost: 2,
+        };
+        let k = derive_kek(b"vault passphrase", &salt, params).unwrap();
+        assert_ne!(k.as_bytes(), &[0u8; KEY_LEN]);
     }
 }

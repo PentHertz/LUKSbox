@@ -55,6 +55,11 @@
 //! credential and a fixed public salt. Use a test key / test
 //! credential; don't paste the output anywhere tied to a real vault.
 
+// The HOW-TO-RUN block above is an intentionally aligned ASCII layout
+// (numbered steps with indented commands and an A/B/C transform table);
+// reflowing it to satisfy the doc-list-indent lint would mangle it.
+#![allow(clippy::doc_overindented_list_items)]
+
 use luksbox_fido2::{Fido2Authenticator, HidAuthenticator, RP_ID, random_user_handle};
 
 fn hex(b: &[u8]) -> String {
@@ -62,7 +67,7 @@ fn hex(b: &[u8]) -> String {
 }
 
 fn decode_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     (0..s.len())

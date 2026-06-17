@@ -186,8 +186,13 @@ pub struct FileAttr {
 // macOS build fails with E0308 mismatched types; without `u32` on
 // the lhs the Linux build's caller-side arithmetic (e.g.
 // `S_IFDIR | 0o700u32`) would force callers to platform-cast.
+// The `as u32` is a no-op on Linux (where clippy runs) but required on
+// macOS where `S_IF*` are u16; allow the resulting false-positive lint.
+#[allow(clippy::unnecessary_cast)]
 pub const S_IFDIR: u32 = libc::S_IFDIR as u32;
+#[allow(clippy::unnecessary_cast)]
 pub const S_IFREG: u32 = libc::S_IFREG as u32;
+#[allow(clippy::unnecessary_cast)]
 pub const S_IFLNK: u32 = libc::S_IFLNK as u32;
 
 /// One entry as fed into the readdir callback's filler function.

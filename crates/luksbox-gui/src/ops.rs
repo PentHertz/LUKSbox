@@ -1995,6 +1995,7 @@ fn create_fido2_direct(
 /// a Kyber keypair, encapsulates against the public key, builds the
 /// keyslot under the combined KEK, and writes the public Kyber blobs
 /// (sidecar) + secret seed (`.kyber` file) to disk.
+#[allow(clippy::too_many_arguments)]
 fn create_hybrid_pq(
     path: &Path,
     header_path: Option<&Path>,
@@ -2059,6 +2060,7 @@ fn create_hybrid_pq(
 /// decapsulation. The `.kyber` seed file is encrypted under
 /// `seed_passphrase` (defence in depth, separate from the FIDO2 PIN).
 #[cfg(feature = "hardware")]
+#[allow(clippy::too_many_arguments)]
 fn create_hybrid_pq_fido2(
     path: &Path,
     header_path: Option<&Path>,
@@ -2140,6 +2142,7 @@ fn create_hybrid_pq_fido2(
 }
 
 #[cfg(not(feature = "hardware"))]
+#[allow(clippy::too_many_arguments)]
 fn create_hybrid_pq_fido2(
     _path: &Path,
     _header_path: Option<&Path>,
@@ -2738,6 +2741,7 @@ fn open_vfs_with_optional_recovery(cont: Container, recovery_mode: bool) -> Resu
 /// Generates the .kyber seed file and the .hybrid sidecar
 /// alongside the vault (these ARE format-tells per
 /// docs/DENIABLE_HEADER.md, documented and accepted for PQ).
+#[allow(clippy::too_many_arguments)]
 fn create_hybrid_pq_passphrase_deniable(
     path: &Path,
     cipher: CipherSuite,
@@ -2796,6 +2800,7 @@ fn create_hybrid_pq_passphrase_deniable(
 }
 
 #[cfg(feature = "hardware")]
+#[allow(clippy::too_many_arguments)]
 fn create_hybrid_pq_fido2_deniable(
     path: &Path,
     cipher: CipherSuite,
@@ -4268,6 +4273,7 @@ pub fn enroll_tpm2_fido2_deniable(
 /// sealed blob is embedded in the slot envelope; the `.kyber` seed
 /// file remains a sidecar (PQ material is not folded into v2 slots).
 #[cfg(all(feature = "hardware", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
 pub fn enroll_hybrid_pq_tpm2_deniable(
     vfs: &mut Vfs,
     slot_idx: usize,
@@ -4345,6 +4351,7 @@ pub fn enroll_hybrid_pq_tpm2_deniable(
 /// passphrase. TPM blob and FIDO2 material live in the slot
 /// envelope; ML-KEM material stays in the `.kyber` sidecar.
 #[cfg(all(feature = "hardware", target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
 pub fn enroll_hybrid_pq_tpm2_fido2_deniable(
     vfs: &mut Vfs,
     slot_idx: usize,
@@ -5450,6 +5457,7 @@ fn rollback_sidecar(sidecar: &Path, prior: &[luksbox_format::hybrid_sidecar::Hyb
 /// passphrase with a FIDO2 PIN + ML-KEM keypair, all bound to a
 /// specific deniable slot index.
 #[cfg(feature = "hardware")]
+#[allow(clippy::too_many_arguments)]
 pub fn enroll_hybrid_pq_fido2_deniable(
     vfs: &mut Vfs,
     vault_path: &Path,
@@ -5569,6 +5577,7 @@ pub fn enroll_hybrid_pq_fido2_deniable(
 }
 
 #[cfg(not(feature = "hardware"))]
+#[allow(clippy::too_many_arguments)]
 pub fn enroll_hybrid_pq_fido2_deniable(
     _vfs: &mut Vfs,
     _vault_path: &Path,

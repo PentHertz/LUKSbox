@@ -10,13 +10,23 @@
 //!    every secret in the process's heap and stack) on a panic / segfault.
 //!    Always succeeds for unprivileged users since it only *lowers* a limit.
 //!
-//! 2. **`enable_memory_lock`**, via `mlockall(MCL_CURRENT | MCL_FUTURE)`.
-//!    Prevents kernel from swapping process pages to disk and from including
-//!    them in a hibernate image. Requires `RLIMIT_MEMLOCK` >= process RSS;
-//!    on most distros the default is 64 KiB which is too small for a
-//!    process holding 256 MiB of Argon2id state. We log a warning and
-//!    continue when permission is refused, the rest of the secret-handling
-//!    chain (zeroize-on-drop, constant-time compares) still applies.
+//! 2. **`enable_memory_lock`**, via `mlockall`. Prevents the kernel from
+//!    swapping process pages to disk and from including them in a hibernate
+//!    image. `MCL_CURRENT` (pin the current resident set) is always armed.
+//!    `MCL_FUTURE` (pin every *later* allocation too) is armed **only when
+//!    `RLIMIT_MEMLOCK` is unlimited**, because on a finite ceiling it turns
+//!    into a landmine: `mlockall(2)` itself succeeds (startup RSS is tiny)
+//!    but every subsequent allocation that would exceed the ceiling then
+//!    fails with `ENOMEM` instead of swapping. That is what broke keyslot
+//!    creation (the 256 MiB Argon2id buffer) and even the GUI (Mesa's
+//!    `llvmpipe` framebuffers -> `NoGlutinConfigs`) on QubesOS AppVMs, whose
+//!    128 MiB ceiling is high enough for `mlockall` to succeed yet too low
+//!    for those allocations. On a finite ceiling we log a warning and lean on
+//!    the per-allocation `mlock` inside `SecretBox` for the key material,
+//!    which is small enough to fit any sane ceiling. We also log a warning
+//!    and continue when permission is refused outright; the rest of the
+//!    secret-handling chain (zeroize-on-drop, constant-time compares) still
+//!    applies.
 //!
 //! Call once near the top of `main()`. No-op on non-Unix targets.
 
@@ -90,8 +100,32 @@ pub fn disable_core_dumps() {}
 /// just warn).
 #[cfg(unix)]
 pub fn enable_memory_lock() -> Result<(), String> {
+    // Raise the soft RLIMIT_MEMLOCK to the hard ceiling first. An unprivileged
+    // process may always raise rlim_cur up to rlim_max, and mlockall(2) checks
+    // the soft limit, so this lets a deployment that bumps only the hard limit
+    // (`* hard memlock unlimited`, or systemd DefaultLimitMEMLOCK=infinity for
+    // services) get full locking automatically.
+    let limit = raise_memlock_soft_to_hard();
+    let unlimited = limit == libc::RLIM_INFINITY;
+
+    // Arm MCL_FUTURE only when the ceiling is unlimited. On a finite ceiling
+    // it would force every later allocation to be locked, and any allocation
+    // past the ceiling then fails with ENOMEM instead of swapping. mlockall(2)
+    // succeeds here regardless (startup RSS is tiny), so the breakage surfaces
+    // far away: the 256 MiB Argon2id KDF buffer can't be reserved and Mesa's
+    // llvmpipe renderer can't allocate framebuffers (NoGlutinConfigs). QubesOS
+    // AppVMs ship a 128 MiB ceiling - high enough for mlockall to succeed, low
+    // enough to break both - which is exactly the trap. SecretBox still mlocks
+    // the key material itself per-allocation, so dropping MCL_FUTURE only
+    // exposes large transient buffers to swap, not the keys.
+    let flags = if unlimited {
+        libc::MCL_CURRENT | libc::MCL_FUTURE
+    } else {
+        libc::MCL_CURRENT
+    };
+
     // SAFETY: mlockall is signal-safe; flag bits are POSIX-defined.
-    let r = unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) };
+    let r = unsafe { libc::mlockall(flags) };
     if r != 0 {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::EPERM) {
@@ -130,7 +164,54 @@ pub fn enable_memory_lock() -> Result<(), String> {
         }
         return Err(format!("mlockall failed: {err}"));
     }
+
+    if !unlimited {
+        // mlockall(MCL_CURRENT) succeeded: the resident set is pinned, but we
+        // deliberately left MCL_FUTURE off so the finite memlock ceiling can't
+        // make later large allocations fail (which is what bricks keyslot
+        // creation and the GUI on QubesOS AppVMs). Key material is still
+        // locked per-allocation by SecretBox. Tell the user how to opt into
+        // full process locking if they want it.
+        return Err(format!(
+            "RLIMIT_MEMLOCK is finite (~{} MiB); pinned the current working set \
+             but not future allocations, so large transient buffers (e.g. the \
+             Argon2id KDF state) may be swappable. Key material itself stays \
+             locked per-allocation. For full process locking set memlock \
+             unlimited and re-login: `* hard memlock unlimited` in \
+             /etc/security/limits.conf (or a limits.d drop-in), or run as root.",
+            limit / (1024 * 1024)
+        ));
+    }
     Ok(())
+}
+
+/// Raise the soft `RLIMIT_MEMLOCK` to the hard ceiling when there's headroom
+/// and return the resulting soft limit (`RLIM_INFINITY` when unlimited).
+/// Best-effort: on any getrlimit/setrlimit failure we return 0, which the
+/// caller treats as a finite ceiling (the conservative choice - it suppresses
+/// MCL_FUTURE rather than risk arming it on an unknown limit).
+#[cfg(unix)]
+fn raise_memlock_soft_to_hard() -> libc::rlim_t {
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: valid struct pointer, known-valid resource id.
+    if unsafe { libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut rlim) } != 0 {
+        return 0;
+    }
+    if rlim.rlim_cur < rlim.rlim_max {
+        let raised = libc::rlimit {
+            rlim_cur: rlim.rlim_max,
+            rlim_max: rlim.rlim_max,
+        };
+        // SAFETY: only raising the soft limit up to the existing hard limit,
+        // which is always permitted for an unprivileged process.
+        if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &raised) } == 0 {
+            return rlim.rlim_max;
+        }
+    }
+    rlim.rlim_cur
 }
 
 /// macOS swap-encryption state, derived from `sysctl vm.swapusage`.
@@ -255,6 +336,50 @@ mod tests {
         assert_eq!(r, 0, "getrlimit must succeed");
         assert_eq!(rlim.rlim_cur, 0, "soft limit must be 0 after hardening");
         assert_eq!(rlim.rlim_max, 0, "hard limit must be 0 after hardening");
+    }
+
+    /// `enable_memory_lock()` must never abort and must never arm
+    /// `MCL_FUTURE` on a finite `RLIMIT_MEMLOCK`. We can't observe the flags
+    /// directly, but we can prove the regression that motivated the fix: after
+    /// calling it, a 256 MiB allocation (the Argon2id INTERACTIVE preset) must
+    /// still succeed even when the memlock ceiling is far below that. We
+    /// constrain the ceiling for this process to a Qubes-like 128 MiB first.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn enable_memory_lock_leaves_large_allocs_working_under_finite_ceiling() {
+        // Lower the hard ceiling to 128 MiB so raise_memlock_soft_to_hard()
+        // can't climb back to unlimited; this mimics a QubesOS AppVM.
+        const QUBES_LIKE: libc::rlim_t = 128 * 1024 * 1024;
+        let cap = libc::rlimit {
+            rlim_cur: QUBES_LIKE,
+            rlim_max: QUBES_LIKE,
+        };
+        // SAFETY: only lowering an rlimit, always permitted.
+        let set = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &cap) };
+        if set != 0 {
+            // Sandbox forbids touching the rlimit; nothing to assert.
+            return;
+        }
+
+        // With a finite ceiling this returns Err (the informative
+        // partial-lock warning) but must NOT abort the process.
+        let res = enable_memory_lock();
+        assert!(
+            res.is_err(),
+            "finite ceiling should report a partial-lock warning, got {res:?}"
+        );
+
+        // The whole point: MCL_FUTURE must be OFF, so a 256 MiB buffer past
+        // the 128 MiB ceiling still allocates instead of failing with ENOMEM.
+        let mut big: Vec<u8> = Vec::new();
+        big.try_reserve_exact(256 * 1024 * 1024)
+            .expect("256 MiB allocation must succeed when MCL_FUTURE is not armed");
+        big.resize(256 * 1024 * 1024, 0);
+        // Touch a few pages so the resize isn't optimised away.
+        let last = big.len() - 1;
+        big[0] = 1;
+        big[last] = 1;
+        assert_eq!(big[0] as usize + big[last] as usize, 2);
     }
 
     /// After `disable_core_dumps()` on Linux, `prctl(PR_GET_DUMPABLE)` MUST

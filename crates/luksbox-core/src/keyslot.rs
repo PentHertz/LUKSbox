@@ -586,6 +586,7 @@ impl Keyslot {
     /// Create a FIDO2 hmac-secret keyslot wrapping `mvk`. `hmac_secret` is the
     /// 32-byte authenticator output for `fido2_hmac_salt`, optionally combined
     /// with a passphrase before stretching.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_fido2(
         suite: CipherSuite,
         mvk: &MasterVolumeKey,
@@ -767,6 +768,7 @@ impl Keyslot {
     /// object (about 280 B) this fits with margin; for larger cred IDs
     /// (Google Titan about 288 B) it overflows and this constructor
     /// returns `Fido2CredIdTooLong`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_tpm2_fido2(
         suite: CipherSuite,
         mvk: &MasterVolumeKey,
@@ -1034,6 +1036,7 @@ impl Keyslot {
     /// same sub-format as `Tpm2Fido2` (`[tpm_blob_len|blob|cred_id]`
     /// in the variable region + hmac_salt at OFF_HMAC_SALT_V3);
     /// only the kind byte differs.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_hybrid_pq_tpm2_fido2(
         suite: CipherSuite,
         mvk: &MasterVolumeKey,
@@ -1155,6 +1158,7 @@ impl Keyslot {
     }
 
     /// ML-KEM-1024 variant of `new_hybrid_pq_tpm2_fido2`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_hybrid_pq_1024_tpm2_fido2(
         suite: CipherSuite,
         mvk: &MasterVolumeKey,
@@ -1322,6 +1326,7 @@ impl Keyslot {
 
     /// Build a hybrid FIDO2 + ML-KEM keyslot wrapping `mvk`. Defaults
     /// to ML-KEM-768; use `new_hybrid_pq_1024_fido2` for ML-KEM-1024.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_hybrid_pq_fido2(
         suite: CipherSuite,
         mvk: &MasterVolumeKey,
@@ -1348,6 +1353,7 @@ impl Keyslot {
     }
 
     /// ML-KEM-1024 variant of `new_hybrid_pq_fido2`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_hybrid_pq_1024_fido2(
         suite: CipherSuite,
         mvk: &MasterVolumeKey,
@@ -1373,6 +1379,7 @@ impl Keyslot {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_hybrid_pq_fido2(
         kind: SlotKind,
         suite: CipherSuite,

@@ -144,14 +144,14 @@ enum Inner {
         fd: libc::c_int,
         page_size: usize,
     },
-    /// Heap allocation. On Windows we additionally call `VirtualLock`
-    /// at construction (and `VirtualUnlock` at drop) to keep the page
-    /// out of the swap file; the `Box` ownership semantics are
-    /// unchanged. On Unix-but-not-Linux (macOS, BSD) the page is
-    /// covered by the process-wide `mlockall` from
-    /// `secret_mem::enable_memory_lock`. On Linux this variant is
-    /// only used when `memfd_secret` itself was unavailable, in
-    /// which case `mlockall` is again the live mitigation.
+    /// Heap allocation. We lock the page out of swap per-allocation at
+    /// construction and unlock it at drop: `mlock`/`munlock` on Unix,
+    /// `VirtualLock`/`VirtualUnlock` on Windows. This no longer leans on the
+    /// process-wide `mlockall`, which only arms `MCL_FUTURE` when
+    /// `RLIMIT_MEMLOCK` is unlimited and so wouldn't cover this allocation on a
+    /// finite-ceiling host. On Linux this variant is only reached when
+    /// `memfd_secret` was unavailable (kernel < 5.14); on macOS/BSD it is the
+    /// normal backing. The `Box` ownership semantics are unchanged.
     Heap(Box<[u8; KEY_LEN]>),
 }
 
@@ -181,6 +181,23 @@ impl SecretBox {
             }
         }
         let boxed = Box::new([0u8; KEY_LEN]);
+        // On Unix without `memfd_secret` (older Linux kernels, macOS, the
+        // BSDs) this Heap variant is the live secret backing, so lock the page
+        // per-allocation rather than relying solely on the process-wide
+        // `mlockall`. That matters because `mlockall` only arms `MCL_FUTURE`
+        // when `RLIMIT_MEMLOCK` is unlimited (see `secret_mem`); on a finite
+        // ceiling (e.g. a QubesOS AppVM) future allocations are otherwise
+        // swappable. A 32-byte `mlock` fits any sane ceiling. Best-effort:
+        // failure is silent (the `Zeroize`-on-drop wipe stays the realistic
+        // mitigation). Page-granular, like `VirtualLock` below.
+        #[cfg(unix)]
+        {
+            // SAFETY: pointer is to a live Box we just allocated; KEY_LEN is
+            // within the allocation. mlock is signal-safe.
+            unsafe {
+                let _ = libc::mlock(boxed.as_ptr() as *const libc::c_void, KEY_LEN);
+            }
+        }
         // On Windows, lock the page so the secret bytes don't end up
         // in pagefile.sys. Best-effort: failure is silent (the
         // `Zeroize`-on-drop wipe still runs and is the realistic
@@ -318,6 +335,15 @@ impl Drop for SecretBox {
                 // are zeroed before the page becomes swappable
                 // again.
                 b.zeroize();
+                #[cfg(unix)]
+                {
+                    // SAFETY: same pointer + size we passed to mlock at
+                    // construction. munlock on an unlocked page is harmless;
+                    // we ignore the return value.
+                    unsafe {
+                        let _ = libc::munlock(b.as_ptr() as *const libc::c_void, KEY_LEN);
+                    }
+                }
                 #[cfg(target_os = "windows")]
                 {
                     // SAFETY: same pointer + size we passed to

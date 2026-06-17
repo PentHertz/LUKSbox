@@ -37,66 +37,13 @@ fn append_extension(path: &Path, ext: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-#[cfg(unix)]
+/// Stable per-file identity: `(device, inode)` on Unix,
+/// `(volume_serial, file_index)` on Windows. Delegates to
+/// `luksbox_core::file_util::inode_key` so the exact same definition is used
+/// here and by `atomic_secure_write` when it reports a committed inode (the
+/// re-lock path compares the two for equality).
 fn inode_of(f: &File) -> std::io::Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let m = f.metadata()?;
-    Ok((m.dev(), m.ino()))
-}
-
-#[cfg(windows)]
-fn inode_of(f: &File) -> std::io::Result<(u64, u64)> {
-    // The std-lib equivalents (`MetadataExt::volume_serial_number` /
-    // `file_index`) are still nightly-only behind `windows_by_handle`
-    // (rust-lang/rust#63010), so we call kernel32 directly. Same data,
-    // same syscall the std method would have invoked.
-    use std::os::windows::io::AsRawHandle;
-
-    #[repr(C)]
-    struct Filetime {
-        low: u32,
-        high: u32,
-    }
-    #[repr(C)]
-    struct ByHandleFileInformation {
-        attrs: u32,
-        creation: Filetime,
-        last_access: Filetime,
-        last_write: Filetime,
-        volume_serial: u32,
-        size_high: u32,
-        size_low: u32,
-        num_links: u32,
-        index_high: u32,
-        index_low: u32,
-    }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GetFileInformationByHandle(
-            handle: *mut core::ffi::c_void,
-            info: *mut ByHandleFileInformation,
-        ) -> i32;
-    }
-
-    let handle = f.as_raw_handle() as *mut core::ffi::c_void;
-    let mut info = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
-    let ok = unsafe { GetFileInformationByHandle(handle, info.as_mut_ptr()) };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let info = unsafe { info.assume_init() };
-    let vol = u64::from(info.volume_serial);
-    let idx = (u64::from(info.index_high) << 32) | u64::from(info.index_low);
-    Ok((vol, idx))
-}
-
-/// Detect whether `path` is a symlink WITHOUT following it. Used by
-/// the `LUKSBOX_NO_FOLLOW_SYMLINKS=1` opt-in mode to refuse
-/// symlinked vault files entirely.
-fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_symlink())
-        .unwrap_or(false)
+    luksbox_core::file_util::inode_key(f)
 }
 
 /// Operation kinds recorded in the per-thread flush op log. Used by
@@ -224,16 +171,58 @@ fn open_rw_checked(
     path: &Path,
     expected_inode: Option<(u64, u64)>,
 ) -> Result<(File, (u64, u64), PathBuf), Error> {
-    if std::env::var_os("LUKSBOX_NO_FOLLOW_SYMLINKS").is_some() && is_symlink(path) {
-        return Err(Error::SymlinkRefused {
-            path: path.display().to_string(),
-        });
+    let no_follow = std::env::var_os("LUKSBOX_NO_FOLLOW_SYMLINKS").is_some();
+    // Strict no-follow mode must be failure-closed: refuse a symlinked /
+    // reparse-point final component *atomically with the open* (O_NOFOLLOW on
+    // Unix, FILE_FLAG_OPEN_REPARSE_POINT + attribute check on Windows) rather
+    // than the previous stat-then-open `is_symlink` test, which an attacker
+    // with write access to the parent could race by swapping a symlink in
+    // after the check but before the open followed it.
+    let mut o = OpenOptions::new();
+    o.read(true).write(true);
+    #[cfg(unix)]
+    {
+        if no_follow {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            o.custom_flags(libc::O_NOFOLLOW);
+        }
     }
-    let f = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|e| map_io_err_to_vault_locked(e, path))?;
+    #[cfg(windows)]
+    {
+        if no_follow {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+            o.custom_flags(0x0020_0000);
+        }
+    }
+    let f = match o.open(path) {
+        Ok(f) => f,
+        // O_NOFOLLOW makes open(2) fail with ELOOP on a symlinked final
+        // component; surface it as the policy refusal, not a generic IO error.
+        #[cfg(unix)]
+        Err(e) if no_follow && e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(Error::SymlinkRefused {
+                path: path.display().to_string(),
+            });
+        }
+        Err(e) => return Err(map_io_err_to_vault_locked(e, path)),
+    };
+    #[cfg(windows)]
+    {
+        if no_follow {
+            use std::os::windows::fs::MetadataExt as _;
+            // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+            let attrs = f
+                .metadata()
+                .map_err(|e| map_io_err_to_vault_locked(e, path))?
+                .file_attributes();
+            if attrs & 0x0000_0400 != 0 {
+                return Err(Error::SymlinkRefused {
+                    path: path.display().to_string(),
+                });
+            }
+        }
+    }
     let actual = inode_of(&f).map_err(|e| map_io_err_to_vault_locked(e, path))?;
     if let Some(expected) = expected_inode
         && actual != expected
@@ -252,6 +241,61 @@ fn open_rw_checked(
     // behaviour, not worse).
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     Ok((f, actual, canonical))
+}
+
+/// Re-open a path that `atomic_secure_write` just committed, refusing to follow
+/// a symlink / reparse point at the final component AND verifying the re-opened
+/// handle is the exact inode that was committed. Closes the rename->reopen race
+/// on the detached-header sidecar: a directory attacker who swaps `path` (a
+/// symlink, or a different regular file) between the rename and this re-open
+/// would otherwise make the advisory lock latch onto the wrong inode. The
+/// no-follow is unconditional here because the committed file is always a
+/// freshly-renamed regular file, so a legitimate caller never hits ELOOP.
+fn reopen_committed_no_follow(path: &Path, expected: (u64, u64)) -> Result<File, Error> {
+    let mut o = OpenOptions::new();
+    o.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        o.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+        o.custom_flags(0x0020_0000);
+    }
+    let f = match o.open(path) {
+        Ok(f) => f,
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(Error::PathSubstituted {
+                path: path.display().to_string(),
+            });
+        }
+        Err(e) => return Err(map_io_err_to_vault_locked(e, path)),
+    };
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+        let attrs = f
+            .metadata()
+            .map_err(|e| map_io_err_to_vault_locked(e, path))?
+            .file_attributes();
+        if attrs & 0x0000_0400 != 0 {
+            return Err(Error::PathSubstituted {
+                path: path.display().to_string(),
+            });
+        }
+    }
+    let actual = inode_of(&f).map_err(|e| map_io_err_to_vault_locked(e, path))?;
+    if actual != expected {
+        return Err(Error::PathSubstituted {
+            path: path.display().to_string(),
+        });
+    }
+    Ok(f)
 }
 
 /// After we have opened a file and taken its lock, confirm that the path the
@@ -659,6 +703,7 @@ impl Container {
     /// and `hmac_secret`, and (b) generated a Kyber keypair + encapsulated
     /// to obtain `pq_shared`. The matching Kyber ciphertext goes in the
     /// `.hybrid` sidecar; the seed goes in the user's `.kyber` file.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_with_hybrid_pq_fido2(
         path: &Path,
         header_path: Option<&Path>,
@@ -687,6 +732,7 @@ impl Container {
     }
 
     /// ML-KEM-1024 variant of `create_with_hybrid_pq_fido2`.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_with_hybrid_pq_1024_fido2(
         path: &Path,
         header_path: Option<&Path>,
@@ -797,6 +843,7 @@ impl Container {
     }
 
     /// Create a new container on disk with a single FIDO2 keyslot.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_with_fido2(
         path: &Path,
         header_path: Option<&Path>,
@@ -821,6 +868,7 @@ impl Container {
     }
 
     /// Variant of `create_with_fido2` taking an extra `flags` u32.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_with_fido2_flags(
         path: &Path,
         header_path: Option<&Path>,
@@ -3041,12 +3089,14 @@ impl Container {
                 // the temp+fsync+rename helper so a crash mid-write
                 // never leaves the sidecar truncated.
                 let hp = hp.clone();
-                atomic_secure_write(&hp, &bytes)?;
-                // Re-open the handle so it points at the new inode
-                // (the old handle still refers to the unlinked
-                // pre-rename inode on POSIX). Without this the
-                // existing lock is on the wrong file going forward.
-                let new_hf = OpenOptions::new().read(true).write(true).open(&hp)?;
+                let committed = atomic_secure_write(&hp, &bytes)?;
+                // Re-open the handle so it points at the new inode (the old
+                // handle still refers to the unlinked pre-rename inode on
+                // POSIX). Re-open with O_NOFOLLOW + inode-equality against the
+                // inode atomic_secure_write just committed, so a directory
+                // attacker who swaps `hp` between the rename and this re-open
+                // can't make the advisory lock latch onto the wrong inode.
+                let new_hf = reopen_committed_no_follow(&hp, committed)?;
                 // Re-lock the new inode before swapping in the handle.
                 // `atomic_secure_write` renamed a fresh file over the
                 // sidecar, so the old handle's advisory lock sits on the
@@ -3112,8 +3162,8 @@ impl Container {
             }
             HeaderStorage::Detached(_, hp) => {
                 let hp = hp.clone();
-                atomic_secure_write(&hp, bytes)?;
-                let new_hf = OpenOptions::new().read(true).write(true).open(&hp)?;
+                let committed = atomic_secure_write(&hp, bytes)?;
+                let new_hf = reopen_committed_no_follow(&hp, committed)?;
                 // Re-lock the new inode before swapping in the handle.
                 // `atomic_secure_write` renamed a fresh file over the
                 // sidecar, so the old handle's advisory lock sits on the
@@ -3910,6 +3960,43 @@ mod tests {
             t_cost: 1,
             p_cost: 1,
         }
+    }
+
+    /// Finding #3 regression: `reopen_committed_no_follow` accepts the inode
+    /// `atomic_secure_write` committed, but refuses a mismatched inode (path
+    /// swapped for a different regular file) and a symlink swapped in at the
+    /// path (the rename->reopen race that would otherwise attach the sidecar
+    /// lock to the wrong inode).
+    #[cfg(unix)]
+    #[test]
+    fn reopen_committed_no_follow_binds_to_committed_inode() {
+        let dir = tempdir().unwrap();
+        let hp = dir.path().join("header.sidecar");
+
+        // Happy path: the inode we commit is the inode we re-open.
+        let committed = atomic_secure_write(&hp, b"hdr-v1").unwrap();
+        let f = reopen_committed_no_follow(&hp, committed)
+            .expect("re-open of the just-committed inode must succeed");
+        assert_eq!(inode_of(&f).unwrap(), committed);
+
+        // Wrong expected inode => PathSubstituted (a different regular file
+        // was swapped in between rename and re-open).
+        let bogus = (committed.0, committed.1.wrapping_add(1));
+        assert!(matches!(
+            reopen_committed_no_follow(&hp, bogus),
+            Err(Error::PathSubstituted { .. })
+        ));
+
+        // Attacker swaps a symlink in at the path: O_NOFOLLOW => ELOOP =>
+        // PathSubstituted, so the lock can't be redirected through it.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"do not lock me").unwrap();
+        std::fs::remove_file(&hp).unwrap();
+        std::os::unix::fs::symlink(&victim, &hp).unwrap();
+        assert!(matches!(
+            reopen_committed_no_follow(&hp, committed),
+            Err(Error::PathSubstituted { .. })
+        ));
     }
 
     #[test]

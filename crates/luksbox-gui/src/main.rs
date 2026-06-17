@@ -44,7 +44,7 @@ fn main() -> eframe::Result<()> {
             .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "LUKSbox",
         opts,
         Box::new(|cc| {
@@ -68,7 +68,54 @@ fn main() -> eframe::Result<()> {
             }
             Ok(Box::new(LuksboxApp::new_with_vault(initial_vault)))
         }),
-    )
+    );
+
+    // QubesOS AppVMs, VMs without 3D acceleration, and remote/forwarded X11
+    // sessions expose no hardware OpenGL config, so glutin aborts with
+    // `NoGlutinConfigs` before a window ever opens. Mesa's llvmpipe software
+    // rasteriser renders egui perfectly well, so re-exec ourselves once with
+    // LIBGL_ALWAYS_SOFTWARE=1 rather than making the user discover that env
+    // var from a stack trace.
+    #[cfg(target_os = "linux")]
+    if matches!(&result, Err(eframe::Error::NoGlutinConfigs(..))) {
+        return retry_with_software_gl(result);
+    }
+    result
+}
+
+/// Re-launch the process with Mesa software rendering forced on, after the
+/// hardware-GL path failed with `NoGlutinConfigs`. A sentinel env var caps
+/// this at a single retry: if software GL is missing too, we fall through to
+/// an actionable hint instead of looping or dumping a second glutin trace.
+#[cfg(target_os = "linux")]
+fn retry_with_software_gl(original: eframe::Result<()>) -> eframe::Result<()> {
+    use std::os::unix::process::CommandExt;
+
+    if std::env::var_os("LUKSBOX_GUI_SWRAST_RETRY").is_some() {
+        eprintln!(
+            "luksbox-gui: no usable OpenGL backend, even with software rendering.\n\
+             This is common on QubesOS AppVMs and headless or remote X11 sessions.\n\
+             Install Mesa's software rasteriser, then retry:\n\n  \
+             sudo apt install libgl1-mesa-dri    # Debian / Ubuntu / Qubes\n  \
+             sudo dnf install mesa-dri-drivers   # Fedora / RHEL\n\n  \
+             LIBGL_ALWAYS_SOFTWARE=1 luksbox-gui\n\n\
+             The `luksbox` CLI needs no GPU and works regardless."
+        );
+        return original;
+    }
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(_) => return original,
+    };
+    // exec() replaces this process and only returns on failure.
+    let err = std::process::Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env("LIBGL_ALWAYS_SOFTWARE", "1")
+        .env("LUKSBOX_GUI_SWRAST_RETRY", "1")
+        .exec();
+    eprintln!("luksbox-gui: could not re-exec with software rendering: {err}");
+    original
 }
 
 /// Decode a PNG into the (raw RGBA, width, height) shape eframe wants.
