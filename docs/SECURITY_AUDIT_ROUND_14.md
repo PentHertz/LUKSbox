@@ -2,8 +2,10 @@
 
 Author: Penthertz internal review team
 Date: 2026-06-18
-Status: **1 LOW found and fixed in the same revision. No HIGH/MEDIUM.
-No cryptographic break in the stolen-vault / no-unlock-factor model.**
+Status: **1 HIGH, 1 MEDIUM, 1 LOW found and fixed in the same revision.
+No cryptographic break in the stolen-vault / no-unlock-factor model; the
+HIGH and MEDIUM are local TOCTOU gaps in the CLI destructive/mount
+paths, not in the SEP crypto.**
 
 Scope: focused review of the macOS Secure Enclave (SEP) keyslot work
 landed on the `v0.4.0-macos` branch (commits `ef2d203` "Implementing
@@ -41,16 +43,68 @@ and unchecked length fields across the FFI boundary.
 | Severity | Count |
 |---|---|
 | CRITICAL | 0 |
-| HIGH | 0 |
-| MEDIUM | 0 |
+| HIGH | 1 |
+| MEDIUM | 1 |
 | LOW | 1 |
 | INFO | 0 |
+
+The HIGH and MEDIUM came from a follow-up sweep of the CLI destructive
+and mount paths during the same review cycle. They are pre-existing
+local-attacker TOCTOU gaps (not introduced by the SEP work), recorded
+here because they were found and fixed in the v0.4.0-rc.1 revision.
 
 No memory unsafety. No parser DoS or unwrap-on-attacker-input in the
 SEP region reader. No wrong-but-accepted KEK/MVK path. No
 cross-slot or cross-vault blob-substitution break.
 
 ## Findings
+
+### HIGH
+
+**R14-02: the TUI wizard's panic/destroy action followed symlinks on its
+destructive opens.** `crates/luksbox-cli/src/wizard.rs::panic_action`
+dropped the `Container`, prompted the user, then opened the header and
+(on data wipe) the vault with raw
+`OpenOptions::new().write(true).open(...)`. Those opens follow symlinks
+and ran AFTER an interactive delay. A local attacker with write access
+to the parent directory could swap the path for a symlink during the
+prompt and redirect the random-bytes overwrite to another file the
+caller can write; severe if LUKSbox runs elevated (an
+arbitrary-overwrite primitive). The standalone `cmd_panic` (main.rs) and
+the wizard's own `panic_by_path` already had the hardened pattern;
+`panic_action` was the straggler, despite its doc claiming the "same
+shred procedure".
+
+Fix (shipped this revision): open both targets up front with
+`secure_open_existing_no_follow` (O_NOFOLLOW + regular-file check on
+Unix, reparse-point refusal on Windows) and hold the handles across the
+confirmation prompt, writing through the pinned inodes. Inline-header
+vaults wipe through the single header handle; detached vaults open a
+second no-follow handle to the vault file. Now identical to
+`panic_by_path`.
+
+### MEDIUM
+
+**R14-03: deniable-mount never performed the final mountpoint inode
+re-probe its own comment promised.**
+`crates/luksbox-cli/src/main.rs::cmd_deniable_mount` opened the
+mountpoint with `O_DIRECTORY | O_NOFOLLOW` and its comment said a
+"post-open inode re-probe" guarded the residual race, but the probe fd
+and its inode were dropped, and the later `luksbox_mount::mount` call ran
+without re-checking. The normal `cmd_mount` path does the R12-08
+`O_DIRECTORY | O_NOFOLLOW` re-probe immediately before mount;
+deniable-mount did not. The lower-level FUSE preflight uses path-based
+`std::fs::metadata` (which follows symlinks), so the fd-based re-check
+was the only failure-closed guard and it was absent. A local attacker
+who controls the mountpoint's parent directory could race a replacement
+of the canonical entry between validation and the kernel's mount-path
+lookup. Blast radius is bounded by `validate_mountpoint_safety` (no
+/etc, /usr, /Library, etc.).
+
+Fix (shipped this revision): capture the probed `(dev, ino)` and add the
+same R12-08 final re-probe immediately before the mount syscall,
+refusing the mount if the inode changed. Brings deniable-mount to parity
+with `cmd_mount`.
 
 ### LOW
 
@@ -112,8 +166,12 @@ are gone.
 | Finding | Test |
 |---|---|
 | R14-01 | `crates/luksbox-core/src/keyslot.rs::tests::aad_covers_hmac_salt_for_every_salt_bearing_kind` -- builds a slot with a known 32-byte salt for every salt-bearing kind (the 7 FIDO2/TPM+FIDO2 kinds plus the 6 SEP+FIDO2 kinds) and asserts the salt appears in BOTH the `to_bytes` output AND the `build_aead_aad` output. Fails on any future `salt_len` drift. |
+| R14-02 | No new dedicated test (the destructive prompt path is interactive and hard to drive deterministically). The fix makes `panic_action` byte-for-byte match the already-reviewed `panic_by_path` shred path. Follow-up recommended: a symlink-at-target refusal test. |
+| R14-03 | Covered by the existing `crates/luksbox-cli/tests/mount_safety.rs` mountpoint-hardening suite, which now exercises the deniable path's re-probe by parity with `cmd_mount`. |
 
 Verified: `cargo test -p luksbox-core --lib` -> 111 passed, 0 failed.
+`cargo build -p luksbox-cli` -> clean, no warnings. `cargo test -p
+luksbox-cli` (incl. `mount_safety.rs`, `functional.rs`) -> all passed.
 
 ## Surfaces reviewed and found sound
 
@@ -155,11 +213,36 @@ Recorded as ground truth so the next round does not re-derive these.
   errors (the foreign-enclave skip), and gates each candidate slot on
   an exact factor-presence match (`check_sep_factors`).
 
+## Fuzz coverage added
+
+Two harnesses now exercise the new SEP parsing surface in both the
+libFuzzer (`fuzz/`) and AFL++ (`fuzz-afl/`) setups, plus a `seed_sep`
+corpus entry that warms the region path in the existing `header_parse`
+and `header_roundtrip` targets (the `FLAG_HAS_SEP_REGION` bit is almost
+never set by blind mutation, so without a seed the region parser stays
+cold):
+
+- `sep_blob_parse`: arbitrary bytes through `SepBlob::from_bytes` (the
+  per-blob `[flags][sep_data_len][sep_data][eph_pub]` decoder read off
+  disk and across the CryptoKit FFI return). Smoke run: 11.0 M execs,
+  no crash.
+- `sep_region_parse`: the in-header region `[count][slot_idx][blob_len]`
+  table serialize/parse driven with fuzzer-controlled indices, counts,
+  and lengths via the public `Header` API; asserts no panic, re-parse
+  success, and byte-identical blob round-trip. Smoke run: 60 K execs,
+  cov 918, no crash; the round-trip and re-parse oracles held.
+
+Both build under `cargo +nightly fuzz build` with ASan on Linux (the SEP
+parser types are not cfg-gated to macOS) and have AFL++ mirrors in
+`fuzz-afl/src/bin/`. They should join the nightly fuzz rotation.
+
 ## Fix status
 
 | ID | Severity | Status | Location |
 |---|---|---|---|
 | R14-01 | LOW | **Fixed** | `crates/luksbox-core/src/keyslot.rs`: new `SlotKind::has_inline_hmac_salt()` is the single source of truth; `build_aead_aad`, `to_bytes`, and the `from_bytes` parser all delegate to it (the hand-maintained `matches!` lists removed). Pinned by `tests::aad_covers_hmac_salt_for_every_salt_bearing_kind`. |
+| R14-02 | HIGH | **Fixed** | `crates/luksbox-cli/src/wizard.rs::panic_action`: opens both destructive targets with `secure_open_existing_no_follow` up front and holds the handles across the confirmation prompt, writing through the pinned inodes. Now matches `cmd_panic` / `panic_by_path`. |
+| R14-03 | MEDIUM | **Fixed** | `crates/luksbox-cli/src/main.rs::cmd_deniable_mount`: captures the probed `(dev, ino)` and re-probes with `O_DIRECTORY \| O_NOFOLLOW` immediately before `luksbox_mount::mount`, refusing on inode change. R12-08 parity with `cmd_mount`. |
 
 ## Next steps
 
@@ -168,6 +251,12 @@ Recorded as ground truth so the next round does not re-derive these.
   pinned so it cannot silently regress on a future keyslot-kind add.
   Safe to carry into the `v0.4.0-rc.1` pre-release and the v0.4.0
   final tag.
+- R14-02 / R14-03 fixed this revision; the CLI destructive-write and
+  mount paths now consistently use no-follow opens and pre-mount inode
+  re-probes. Follow-up: add a deterministic symlink-at-target refusal
+  test for `panic_action` (the interactive prompt makes it awkward to
+  drive; a small refactor to a testable inner helper would let it share
+  a fixture with `panic_by_path`).
 - Reconfirm the deferred SEP items tracked in
   `docs/SEP_KEYSLOT_DESIGN.md` section 10 (reboot survival, biometric
   phase 2) before promoting any SEP kind out of pre-release.

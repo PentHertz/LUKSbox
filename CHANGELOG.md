@@ -49,6 +49,29 @@ again on a future keyslot-kind addition. Pinned by a new parity test,
 `aad_covers_hmac_salt_for_every_salt_bearing_kind`. See
 `docs/SECURITY_AUDIT_ROUND_14.md`.
 
+### Security: hardened the CLI panic/destroy and deniable-mount paths against local symlink races (audit R14-02, R14-03)
+
+Two pre-existing local-attacker TOCTOU gaps in the CLI, found in the same
+review cycle and fixed here:
+
+- The TUI wizard's panic/destroy action (`panic_action`) opened its
+  destructive targets with symlink-following `OpenOptions` AFTER the
+  confirmation prompt, so a local attacker with write access to the
+  parent directory could swap in a symlink during the prompt and
+  redirect the random-bytes overwrite to another file (an arbitrary
+  overwrite primitive if LUKSbox runs elevated). It now opens both
+  targets up front with `secure_open_existing_no_follow` and holds the
+  handles across the prompt, matching the already-hardened `cmd_panic`
+  and `panic_by_path`.
+- Deniable-mount (`cmd_deniable_mount`) promised a pre-mount mountpoint
+  inode re-probe in its own comment but never performed one, unlike the
+  normal `mount` command. It now captures the probed `(dev, ino)` and
+  re-checks with `O_DIRECTORY | O_NOFOLLOW` immediately before the mount
+  syscall, refusing if the mountpoint was swapped. The blast radius was
+  already bounded by the mountpoint deny-list.
+
+See `docs/SECURITY_AUDIT_ROUND_14.md`.
+
 ---
 
 ## [v0.3.1] - 2026-06-17

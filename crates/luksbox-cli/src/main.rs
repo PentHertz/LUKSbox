@@ -6658,7 +6658,7 @@ fn cmd_deniable_mount(
     // post-open inode re-probe protect the residual race between
     // our drop(fd) and the kernel's mount-path lookup.
     #[cfg(not(target_os = "windows"))]
-    let mp_abs: std::path::PathBuf = {
+    let mp_abs: (std::path::PathBuf, Option<(u64, u64)>) = {
         use std::os::unix::fs::OpenOptionsExt as _;
         let probe = std::fs::OpenOptions::new()
             .read(true)
@@ -6674,15 +6674,28 @@ fn cmd_deniable_mount(
                 };
                 cli_err!("mountpoint {} {kind}: {e}", mountpoint.display())
             })?;
+        // Capture the probed (dev, ino) so the post-open re-probe below
+        // (Round 12 fix R12-08) can detect a path-swap immediately
+        // before the mount syscall. `cmd_mount` does the same; the
+        // comment above promised this re-probe but the inode pair was
+        // previously dropped, leaving the residual race uncovered.
+        use std::os::unix::fs::MetadataExt as _;
+        let probe_meta = probe
+            .metadata()
+            .map_err(|e| cli_err!("cannot stat mountpoint {}: {e}", mountpoint.display()))?;
+        let probe_inode_pair = (probe_meta.dev(), probe_meta.ino());
         drop(probe);
         let canonical = mountpoint
             .canonicalize()
             .map_err(|e| cli_err!("cannot resolve {}: {e}", mountpoint.display()))?;
         validate_mountpoint_safety(mountpoint, &canonical)?;
-        canonical
+        (canonical, Some(probe_inode_pair))
     };
     #[cfg(target_os = "windows")]
-    let mp_abs: std::path::PathBuf = mountpoint.to_path_buf();
+    let (mp_abs, _probe_inode): (std::path::PathBuf, Option<(u64, u64)>) =
+        (mountpoint.to_path_buf(), None);
+    #[cfg(not(target_os = "windows"))]
+    let (mp_abs, probe_inode) = mp_abs;
 
     let mut container = cli_open_deniable_v2(path, cipher_suite, argon2_params, cred, kyber_path)?;
 
@@ -6715,6 +6728,43 @@ fn cmd_deniable_mount(
             }
         }
     }
+    // Round 12 fix R12-08 (parity with `cmd_mount`): re-probe the
+    // canonical mountpoint inode IMMEDIATELY before the mount syscall
+    // and refuse if it changed. validate_mountpoint_safety bounds the
+    // blast radius to user-writable paths, but this catches the narrow
+    // window where an attacker on the mountpoint's parent dir renames a
+    // symlink over the canonical entry between our initial probe and the
+    // kernel's mount-path lookup. The lower-level FUSE preflight uses
+    // path-based `metadata()` (follows symlinks), so this fd-based
+    // re-check is the failure-closed guard.
+    #[cfg(unix)]
+    if let Some(expected) = probe_inode {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let final_probe = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&mp_abs)
+            .map_err(|e| {
+                cli_err!(
+                    "mountpoint {} could not be re-verified before mount: {e}",
+                    mp_abs.display()
+                )
+            })?;
+        let m = final_probe.metadata().map_err(|e| {
+            cli_err!(
+                "cannot stat mountpoint {} for re-verify: {e}",
+                mp_abs.display()
+            )
+        })?;
+        if (m.dev(), m.ino()) != expected {
+            return Err(cli_err!(
+                "mountpoint {} was swapped between probe and mount; refusing",
+                mp_abs.display()
+            ));
+        }
+        drop(final_probe);
+    }
+
     luksbox_mount::mount(vfs, &mp_abs, !foreground, sync_mode)?;
     Ok(())
 }

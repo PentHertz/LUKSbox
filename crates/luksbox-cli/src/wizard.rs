@@ -4491,6 +4491,40 @@ fn panic_action(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Result<
         .with_prompt("ALSO overwrite the entire vault data area? (slow; recommended on SSD only as last resort, see SECURITY.md)")
         .default(false)
         .interact()?;
+    use luksbox_core::file_util::secure_open_existing_no_follow;
+    use rand_core::{OsRng, RngCore};
+    use std::io::{Seek, SeekFrom, Write};
+
+    // Open the destructive targets BEFORE the final confirmation, with
+    // no-follow semantics, and hold the handles across the prompt.
+    // Mirrors `cmd_panic` (main.rs) and `panic_by_path`: a raw
+    // `OpenOptions::open` performed after an interactive delay follows
+    // symlinks, so a local attacker with write access to the parent
+    // directory could swap in a symlink between the prompt and the open
+    // and redirect the random-bytes overwrite to another file (severe
+    // if luksbox runs elevated). The held handle pins the inode for the
+    // duration of the prompt; a later rename or symlink swap cannot
+    // redirect our writes.
+    let mut hf = secure_open_existing_no_follow(&header_target).map_err(|e| {
+        format!(
+            "refusing to open {} for destructive overwrite: {e}",
+            header_target.display()
+        )
+    })?;
+    // Detached-header + data wipe needs a separate no-follow handle to
+    // the vault file; the inline case wipes through `hf` (the header IS
+    // the first 8 KB of the vault file). Opened before the final
+    // confirmation so it is pinned across the delay too.
+    let mut vf_opt = if wipe_data && !inline {
+        Some(
+            secure_open_existing_no_follow(vault)
+                .map_err(|e| format!("refusing to open {} for data wipe: {e}", vault.display()))?,
+        )
+    } else {
+        None
+    };
+    let len = std::fs::metadata(vault).map(|m| m.len()).unwrap_or(0);
+
     eprintln!("This is IRREVERSIBLE. There is NO undo. There is NO recovery.");
     let expected = format!("DESTROY {}", vault.display());
     let typed: String = Input::with_theme(theme)
@@ -4502,11 +4536,6 @@ fn panic_action(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Result<
         return Ok(false);
     }
 
-    use rand_core::{OsRng, RngCore};
-    use std::fs::OpenOptions;
-    use std::io::{Seek, SeekFrom, Write};
-
-    let mut hf = OpenOptions::new().write(true).open(&header_target)?;
     let mut buf = [0u8; HEADER_SIZE];
     OsRng.fill_bytes(&mut buf);
     hf.seek(SeekFrom::Start(0))?;
@@ -4518,8 +4547,9 @@ fn panic_action(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Result<
     );
 
     if wipe_data {
-        let mut vf = OpenOptions::new().write(true).open(vault)?;
-        let len = std::fs::metadata(vault)?.len();
+        // Inline: reuse `hf` (the header IS the first 8 KB of the
+        // vault file). Detached: write through the separate `vf_opt`.
+        let vf: &mut std::fs::File = vf_opt.as_mut().unwrap_or(&mut hf);
         vf.seek(SeekFrom::Start(0))?;
         let mut chunk = vec![0u8; 1 << 20];
         let mut written = 0u64;

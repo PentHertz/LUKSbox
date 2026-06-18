@@ -32,6 +32,10 @@ luksbox-pq = { path = "../crates/luksbox-pq" }
 # no DirectoryTree walk), so this dep doesn't drag in the heavy
 # Container init cost on every fuzz iteration.
 luksbox-vfs = { path = "../crates/luksbox-vfs" }
+# SEP per-blob decoder + in-header region parse/serialize. `hardware`
+# stays OFF: parser types compile on every host (CryptoKit FFI ops are
+# cfg-gated to macOS), so the SEP harnesses run on a Linux fuzz server.
+luksbox-sep = { path = "../crates/luksbox-sep" }
 tempfile = "3"
 # bincode kept for any legacy harness that hasn't migrated yet;
 # new harnesses prefer postcard to match the production decoder.
@@ -77,6 +81,14 @@ path = "src/bin/metadata_parse.rs"
 [[bin]]
 name = "seed_file_parse"
 path = "src/bin/seed_file_parse.rs"
+
+[[bin]]
+name = "sep_blob_parse"
+path = "src/bin/sep_blob_parse.rs"
+
+[[bin]]
+name = "sep_region_parse"
+path = "src/bin/sep_region_parse.rs"
 
 [[bin]]
 name = "slot_payload_decode"
