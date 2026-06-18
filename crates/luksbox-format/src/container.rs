@@ -1697,7 +1697,11 @@ impl Container {
     /// clear error rather than silently writing to the wrong place.
     fn guard_no_deniable_slot_mutation(&self) -> Result<(), Error> {
         if self.is_deniable() {
-            return Err(Error::Crypto(luksbox_core::Error::InvalidField));
+            // Descriptive error (was a bare `InvalidField` that surfaced
+            // to users as the opaque "crypto: invalid field value"). All
+            // hardware enrolls (SEP/TPM/FIDO2) and revoke funnel through
+            // here; deniable slots are fixed at create time.
+            return Err(Error::DeniableSlotMutationUnsupported);
         }
         Ok(())
     }
@@ -4649,7 +4653,8 @@ mod tests {
         assert!(cont.header.sep_blob(plain_idx).is_some());
         assert!(cont.header.has_sep_region());
         assert!(
-            !path.with_extension("lbx.sep").exists() && !dir.path().join("v.lbx.sep").exists(),
+            !path.with_extension("lbx.sep").exists()
+                && !dir.path().join("v.lbx.sep").exists(),
             "no external .lbx.sep file must be created"
         );
         cont.persist_header().unwrap();
@@ -4658,10 +4663,7 @@ mod tests {
         // Re-open the plain SEP slot via a closure that maps the
         // in-header blob -> shared secret (the role of SepSealer).
         let mut unseal = |blob: &[u8]| -> Result<[u8; 32], String> {
-            mock_sep
-                .get(blob)
-                .copied()
-                .ok_or_else(|| "foreign enclave".into())
+            mock_sep.get(blob).copied().ok_or_else(|| "foreign enclave".into())
         };
         let cont = Container::open(
             &path,
@@ -4675,15 +4677,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cont.header.keyslots[plain_idx].kind, SlotKind::SepSealed);
-        assert_eq!(cont.header.keyslots[hy_idx].kind, SlotKind::HybridPqKemSep);
+        assert_eq!(
+            cont.header.keyslots[hy_idx].kind,
+            SlotKind::HybridPqKemSep
+        );
         drop(cont);
 
         // The hybrid slot opens when the pq factor is also supplied.
         let mut unseal2 = |blob: &[u8]| -> Result<[u8; 32], String> {
-            mock_sep
-                .get(blob)
-                .copied()
-                .ok_or_else(|| "foreign enclave".into())
+            mock_sep.get(blob).copied().ok_or_else(|| "foreign enclave".into())
         };
         Container::open(
             &path,
@@ -4761,9 +4763,10 @@ mod tests {
         drop(cont);
 
         // SEP unlock must still work after the swap.
-        let mut unseal = |b: &[u8]| -> std::result::Result<[u8; 32], String> {
-            mock.get(b).copied().ok_or_else(|| "miss".into())
-        };
+        let mut unseal =
+            |b: &[u8]| -> std::result::Result<[u8; 32], String> {
+                mock.get(b).copied().ok_or_else(|| "miss".into())
+            };
         Container::open(
             &path,
             None,
@@ -5708,6 +5711,56 @@ mod tests {
         let c_open = Container::complete_open_v2_deniable(env, &cred).unwrap();
         assert_eq!(c_open.mvk_clone().as_bytes(), mvk_before.as_bytes());
         assert_eq!(c_open.deniable_unlocked_slot(), Some(2));
+    }
+
+    /// SEP (and any hardware) keyslot enrollment on a deniable vault is
+    /// unsupported and must surface the descriptive
+    /// `DeniableSlotMutationUnsupported` error, NOT the opaque
+    /// `crypto: invalid field value` users hit in the GUI. The guard
+    /// fires before any SEP material is touched, so dummy material is
+    /// fine here.
+    #[test]
+    fn enroll_sep_on_deniable_vault_is_refused_clearly() {
+        use crate::deniable_header::DeniableMaterial;
+        use luksbox_core::deniable::DeniableCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let cred = DeniableCredential::Passphrase {
+            passphrase: b"envelope-pass",
+            argon2: cheap_argon2(),
+        };
+        let material = DeniableMaterial {
+            cred_id: Vec::new(),
+            hmac_salt: None,
+            tpm_blob: Vec::new(),
+        };
+        let mut c = Container::create_with_credential_v2_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            2,
+            &cred,
+            &material,
+        )
+        .unwrap();
+        assert!(c.is_deniable());
+
+        let r = c.enroll_sep(
+            SlotKind::SepSealed,
+            &[0u8; 32],
+            &[],
+            None,
+            None,
+            cheap_argon2(),
+            None,
+            &[],
+            [0u8; 32],
+        );
+        assert!(
+            matches!(r, Err(Error::DeniableSlotMutationUnsupported)),
+            "SEP enroll on a deniable vault must return the descriptive error, got {r:?}"
+        );
     }
 
     #[test]

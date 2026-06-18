@@ -105,6 +105,34 @@ LLM-assisted source review. None is SEP-related; all are fixed here.
 
 See `docs/SECURITY_AUDIT_ROUND_14.md`.
 
+### Fixed: Secure Enclave in deniable mode is now refused clearly instead of a cryptic error
+
+Selecting any Secure Enclave keyslot for a deniable vault previously
+created the vault, failed at SEP enrollment with the opaque
+`crypto: invalid field value`, and rolled the create back (and the GUI
+showed no envelope-passphrase field, because SEP is passwordless). SEP
+cannot back a deniable vault: deniable slots are fixed at creation time,
+every deniable credential variant requires a passphrase, and the deniable
+slot envelope carries no SEP material. Fixed across all three frontends:
+
+- **Backend:** `guard_no_deniable_slot_mutation` now returns a
+  descriptive `DeniableSlotMutationUnsupported` error (instead of the
+  opaque `InvalidField`), covering every post-create hardware enroll
+  (SEP / TPM / FIDO2) on a deniable vault.
+- **GUI:** hides the Secure Enclave factor in deniable mode (with a
+  short explanatory note), so the combination can't be selected.
+- **CLI:** the SEP/TPM-create surface (`deniable-init`) never offered
+  SEP (its credential set has no SEP variant), and `enroll --kind sep*`
+  on a deniable vault now refuses *before* touching the Secure Enclave
+  (no wasted Touch ID prompt) in `cmd_enroll_sep`,
+  `cmd_enroll_sep_fused`, and `cmd_enroll_hybrid_pq_sep`.
+- **TUI/wizard:** the deniable-create flow never offered SEP; the
+  keyslot manager already refused SEP enroll on deniable vaults before
+  sealing, and the message now states the real reason instead of
+  "not exposed yet".
+
+See `docs/SEP_KEYSLOT_DESIGN.md` section 10.
+
 ---
 
 ## [v0.3.1] - 2026-06-17

@@ -1224,7 +1224,9 @@ fn dispatch(cli: Cli) -> Result<()> {
             SlotKindArg::SepBiometric => cmd_enroll_sep(&path, &unlock, true),
             SlotKindArg::HybridPqSep => cmd_enroll_hybrid_pq_sep(&path, &unlock, 768),
             SlotKindArg::HybridPqSep1024 => cmd_enroll_hybrid_pq_sep(&path, &unlock, 1024),
-            SlotKindArg::SepFido2 => cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2, None),
+            SlotKindArg::SepFido2 => {
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2, None)
+            }
             SlotKindArg::SepPassphrase => {
                 cmd_enroll_sep_fused(&path, &unlock, SepFactors::Passphrase, None)
             }
@@ -2642,9 +2644,7 @@ fn pick_unlock_suggestion(keyslots: &[luksbox_core::Keyslot]) -> &'static str {
     let any_sep_fido2 = keyslots
         .iter()
         .any(|s| s.kind.is_sep() && s.kind.is_sep_fido2() && !s.kind.is_hybrid_pq());
-    let any_sep_hybrid = keyslots
-        .iter()
-        .any(|s| s.kind.is_sep() && s.kind.is_hybrid_pq());
+    let any_sep_hybrid = keyslots.iter().any(|s| s.kind.is_sep() && s.kind.is_hybrid_pq());
     let any_sep_hybrid_fido2 = keyslots
         .iter()
         .any(|s| s.kind.is_sep() && s.kind.is_sep_fido2() && s.kind.is_hybrid_pq());
@@ -3084,7 +3084,11 @@ fn open_container_tpm2(_path: &Path, _header_path: Option<&Path>) -> Result<Cont
 /// ID on biometric slots. The container reads each slot's SEP blob
 /// from the in-header SEP region and feeds it to the closure.
 #[cfg(feature = "hardware")]
-fn open_container_sep(path: &Path, header_path: Option<&Path>, fido2: bool) -> Result<Container> {
+fn open_container_sep(
+    path: &Path,
+    header_path: Option<&Path>,
+    fido2: bool,
+) -> Result<Container> {
     // Pre-scan the header to detect "no SEP slots" before we open the
     // Secure Enclave. This covers the NON-hybrid SEP kinds (plain,
     // biometric, +FIDO2, +passphrase, +FIDO2+passphrase); the hybrid
@@ -3132,10 +3136,9 @@ fn open_sep_common(
     // Does any in-scope SEP slot need a passphrase? If so, prompt once
     // up-front and reuse it for every passphrase-bearing slot.
     let want_pq = pq_shared_for.is_some();
-    let needs_pp = header
-        .keyslots
-        .iter()
-        .any(|s| s.kind.is_sep() && s.kind.is_sep_passphrase() && s.kind.is_hybrid_pq() == want_pq);
+    let needs_pp = header.keyslots.iter().any(|s| {
+        s.kind.is_sep() && s.kind.is_sep_passphrase() && s.kind.is_hybrid_pq() == want_pq
+    });
     let passphrase = if needs_pp {
         Some(read_passphrase("slot passphrase: ")?)
     } else {
@@ -3307,11 +3310,7 @@ fn open_container_hybrid_pq_sep(
     drop(f);
     let header = Header::from_bytes(&header_bytes)?;
 
-    if !header
-        .keyslots
-        .iter()
-        .any(|s| s.kind.is_sep() && s.kind.is_hybrid_pq())
-    {
+    if !header.keyslots.iter().any(|s| s.kind.is_sep() && s.kind.is_hybrid_pq()) {
         return Err(
             "vault has no hybrid Secure Enclave + ML-KEM keyslot; enroll one with \
              `luksbox enroll <vault> --kind hybrid-pq-sep[-fido2|-passphrase|...]`."
@@ -4446,7 +4445,9 @@ fn cmd_info(path: &Path) -> Result<()> {
                 } else {
                     ""
                 };
-                println!("  {i}: secure-enclave{bio} (macOS; SEP material in-header)");
+                println!(
+                    "  {i}: secure-enclave{bio} (macOS; SEP material in-header)"
+                );
             }
             SlotKind::HybridPqKemSep | SlotKind::HybridPqKem1024Sep => {
                 let level = if s.kind == SlotKind::HybridPqKem1024Sep {
@@ -4459,9 +4460,9 @@ fn cmd_info(path: &Path) -> Result<()> {
                      SEP material in-header, ML-KEM in .lbx.hybrid)"
                 );
             }
-            SlotKind::SepFido2 => {
-                println!("  {i}: secure-enclave + FIDO2 (macOS; SEP material in-header)")
-            }
+            SlotKind::SepFido2 => println!(
+                "  {i}: secure-enclave + FIDO2 (macOS; SEP material in-header)"
+            ),
             SlotKind::HybridPqKemSepFido2 => println!(
                 "  {i}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + ML-KEM-768; \
                  SEP material in-header, ML-KEM in .lbx.hybrid)"
@@ -4470,9 +4471,9 @@ fn cmd_info(path: &Path) -> Result<()> {
                 "  {i}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + ML-KEM-1024; \
                  SEP material in-header, ML-KEM in .lbx.hybrid)"
             ),
-            SlotKind::SepPassphrase => {
-                println!("  {i}: secure-enclave + passphrase (macOS; SEP material in-header)")
-            }
+            SlotKind::SepPassphrase => println!(
+                "  {i}: secure-enclave + passphrase (macOS; SEP material in-header)"
+            ),
             SlotKind::HybridPqKemSepPassphrase => println!(
                 "  {i}: hybrid-pq-sep (macOS Secure Enclave + passphrase + ML-KEM-768; \
                  SEP material in-header, ML-KEM in .lbx.hybrid)"
@@ -4740,6 +4741,17 @@ fn cmd_enroll_sep(path: &Path, unlock: &UnlockArgs, biometric: bool) -> Result<(
     use luksbox_sep::SepSealer;
 
     let mut c = open_container(path, unlock)?;
+
+    // Refuse on deniable vaults BEFORE touching the Secure Enclave, so
+    // the user doesn't get a Touch ID prompt + enclave seal only to be
+    // told it's unsupported (the backend guard in `enroll_sep` would
+    // otherwise fire after the seal). SEP is not a deniable credential
+    // and deniable slots are fixed at creation time.
+    if c.is_deniable() {
+        return Err(luksbox_format::Error::DeniableSlotMutationUnsupported
+            .to_string()
+            .into());
+    }
 
     // Open the Secure Enclave BEFORE sealing so an enclave-not-
     // available error surfaces before we touch the vault.
@@ -5096,6 +5108,15 @@ fn cmd_enroll_hybrid_pq_sep(path: &Path, unlock: &UnlockArgs, kem_size: u16) -> 
     bootstrap_unlock.pq_hybrid = None;
     let mut c = open_container(path, &bootstrap_unlock)?;
 
+    // Refuse on deniable vaults before any Secure Enclave / ML-KEM work,
+    // mirroring cmd_enroll_sep / cmd_enroll_sep_fused. SEP is not a
+    // deniable credential; deniable slots are fixed at creation time.
+    if c.is_deniable() {
+        return Err(luksbox_format::Error::DeniableSlotMutationUnsupported
+            .to_string()
+            .into());
+    }
+
     let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
     let seed_pw = read_passphrase_confirmed(".kyber seed-file passphrase: ")?;
 
@@ -5282,6 +5303,15 @@ fn cmd_enroll_sep_fused(
     let mut bootstrap_unlock = unlock.clone();
     bootstrap_unlock.pq_hybrid = None;
     let mut c = open_container(path, &bootstrap_unlock)?;
+
+    // Refuse on deniable vaults before any Secure Enclave / ML-KEM work
+    // (and any Touch ID prompt), mirroring cmd_enroll_sep. SEP is not a
+    // deniable credential; deniable slots are fixed at creation time.
+    if c.is_deniable() {
+        return Err(luksbox_format::Error::DeniableSlotMutationUnsupported
+            .to_string()
+            .into());
+    }
 
     // Open the Secure Enclave BEFORE generating any secret material,
     // so a missing-enclave error surfaces before we touch the vault.
@@ -6750,12 +6780,9 @@ fn cmd_deniable_mount(
                     mp_abs.display()
                 )
             })?;
-        let m = final_probe.metadata().map_err(|e| {
-            cli_err!(
-                "cannot stat mountpoint {} for re-verify: {e}",
-                mp_abs.display()
-            )
-        })?;
+        let m = final_probe
+            .metadata()
+            .map_err(|e| cli_err!("cannot stat mountpoint {} for re-verify: {e}", mp_abs.display()))?;
         if (m.dev(), m.ino()) != expected {
             return Err(cli_err!(
                 "mountpoint {} was swapped between probe and mount; refusing",

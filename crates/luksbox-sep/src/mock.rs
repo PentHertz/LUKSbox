@@ -61,18 +61,12 @@ impl MockSepSealer {
     }
 
     pub fn force_unsealed_truncated(&mut self, len: usize) {
-        assert!(
-            len < SEALED_SECRET_LEN,
-            "use force_unsealed_oversized for >= 32"
-        );
+        assert!(len < SEALED_SECRET_LEN, "use force_unsealed_oversized for >= 32");
         self.forced_unsealed = Some(vec![0xa5; len]);
     }
 
     pub fn force_unsealed_oversized(&mut self, len: usize) {
-        assert!(
-            len > SEALED_SECRET_LEN,
-            "use force_unsealed_truncated for < 32"
-        );
+        assert!(len > SEALED_SECRET_LEN, "use force_unsealed_truncated for < 32");
         self.forced_unsealed = Some(vec![0x5a; len]);
     }
 
@@ -95,9 +89,7 @@ impl MockSepSealer {
         self.seal_inner(false)
     }
 
-    pub fn seal_biometric(
-        &mut self,
-    ) -> Result<(Zeroizing<[u8; SEALED_SECRET_LEN]>, SepBlob), Error> {
+    pub fn seal_biometric(&mut self) -> Result<(Zeroizing<[u8; SEALED_SECRET_LEN]>, SepBlob), Error> {
         self.seal_inner(true)
     }
 

@@ -80,4 +80,20 @@ pub enum Error {
          re-encrypts chunks under the new MVK."
     )]
     DeniableRotationRequiresEmptyVault,
+
+    /// Post-create keyslot enrollment (or revocation) was attempted on a
+    /// deniable vault. Deniable vaults fix their slot set at
+    /// vault-creation time: adding or removing a keyslot afterward would
+    /// perturb the random-looking byte pattern observably and break the
+    /// deniability invariant. In particular, Secure Enclave (SEP), TPM,
+    /// and FIDO2 keyslots cannot be added to a deniable vault after
+    /// creation, and SEP has no deniable path at all (the deniable slot
+    /// envelope carries no SEP `dataRepresentation` material).
+    #[error(
+        "keyslot enrollment is not supported on deniable vaults: deniable \
+         slots are fixed at vault-creation time, so Secure Enclave / TPM / \
+         FIDO2 keyslots cannot be added to a deniable header. Secure Enclave \
+         is not available in deniable mode at all."
+    )]
+    DeniableSlotMutationUnsupported,
 }
