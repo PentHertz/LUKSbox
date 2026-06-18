@@ -6405,6 +6405,19 @@ impl LuksboxApp {
     }
 
     fn start_get_dir(&mut self, name: &str) {
+        // R14-05 (audit F2): the top-level `parent_dir.join(name)` below
+        // takes a vault-supplied name. `get_dir_recursive` already guards
+        // child names, but the top-level join did not, so on Windows a
+        // forged entry name like `C:evil` (drive-letter) or
+        // `x:Zone.Identifier` (ADS) could escape the chosen folder. Apply
+        // the same guard here. POSIX names are unaffected (the `:` rule
+        // is windows-gated inside the helper).
+        if ops::name_escapes_directory(name) {
+            self.toast_err(format!(
+                "refusing to extract {name:?}: the name would escape the chosen destination folder"
+            ));
+            return;
+        }
         let inner = join_path(&self.cwd, name);
         let Some(parent_dir) = rfd::FileDialog::new()
             .set_title("Choose destination folder for the recursive extract")

@@ -2,10 +2,10 @@
 
 Author: Penthertz internal review team
 Date: 2026-06-18
-Status: **1 HIGH, 1 MEDIUM, 1 LOW found and fixed in the same revision.
-No cryptographic break in the stolen-vault / no-unlock-factor model; the
-HIGH and MEDIUM are local TOCTOU gaps in the CLI destructive/mount
-paths, not in the SEP crypto.**
+Status: **1 HIGH, 2 MEDIUM, 3 LOW found and fixed in the same revision.
+No cryptographic break in the stolen-vault / no-unlock-factor model; all
+six are local TOCTOU / path-confusion gaps in the CLI/GUI
+destructive/mount/extract paths, not in the SEP crypto.**
 
 Scope: focused review of the macOS Secure Enclave (SEP) keyslot work
 landed on the `v0.4.0-macos` branch (commits `ef2d203` "Implementing
@@ -44,14 +44,24 @@ and unchecked length fields across the FFI boundary.
 |---|---|
 | CRITICAL | 0 |
 | HIGH | 1 |
-| MEDIUM | 1 |
-| LOW | 1 |
+| MEDIUM | 2 |
+| LOW | 3 |
 | INFO | 0 |
 
-The HIGH and MEDIUM came from a follow-up sweep of the CLI destructive
-and mount paths during the same review cycle. They are pre-existing
-local-attacker TOCTOU gaps (not introduced by the SEP work), recorded
-here because they were found and fixed in the v0.4.0-rc.1 revision.
+R14-02 and R14-03 came from an internal follow-up sweep of the CLI
+destructive and mount paths during the same review cycle.
+
+R14-04, R14-05, and R14-06 were reported via coordinated disclosure
+(`security@penthertz.com`) by **Garry Jean-Baptiste** (garry@reyse.ai),
+who found them with LLM-assisted white-box source review against
+`ef690a8`. R14-04 (F1) is the precise pattern the Round-13 fix R13-02
+closed, surviving in the rotation-abort sibling the single R13 sweep did
+not enumerate; R14-05/06 (F2/F3) are Windows-only GUI-extract
+name-confusion issues.
+
+All six are pre-existing local-attacker TOCTOU / path-confusion gaps
+(not introduced by the SEP work), recorded here because they were found
+and fixed in the v0.4.0-rc.1 revision.
 
 No memory unsafety. No parser DoS or unwrap-on-attacker-input in the
 SEP region reader. No wrong-but-accepted KEK/MVK path. No
@@ -105,6 +115,43 @@ Fix (shipped this revision): capture the probed `(dev, ino)` and add the
 same R12-08 final re-probe immediately before the mount syscall,
 refusing the mount if the inode changed. Brings deniable-mount to parity
 with `cmd_mount`.
+
+**R14-04 (external, F1): rotation abort reopened the vault path without
+O_NOFOLLOW / inode-recheck (completes R13-02).**
+`crates/luksbox-format/src/container.rs::abort_atomic_rotation` reopened
+`committed_data_path` with a bare
+`OpenOptions::new().read().write().open(...)` and assigned it to
+`self.file`; `Container::drop` then calls `persist_header`, writing
+HEADER_SIZE bytes (8 KiB, 36 KiB deniable) at offset 0.
+`begin_atomic_rotation` releases the original flock (it swaps `self.file`
+to the temp), so during the rotation window a directory-level attacker
+can swap the vault path for a symlink and the abort/Drop write lands on
+the symlink target: an 8 KiB overwrite of an attacker-chosen file the
+process can write (severe under an elevated run). Both `rotate_mvk` and
+`rotate_mvk_deniable` funnel their abort through this one function, so a
+single site is affected (the report listed two; current code shares one).
+
+This is the exact pattern R13-02 removed from `restore_header_bytes`,
+surviving in the rotation-abort sibling. The correct helper
+`reopen_committed_no_follow` (O_NOFOLLOW + inode-equality ->
+`PathSubstituted`) already existed and was used at the R13-02 sites.
+
+Reachability is narrow: the Drop write only fires when `header_dirty ==
+true` at abort, set only at the last line of `install_rotated_mvk_multi`
+and cleared by `persist_header` on success. Because the chunk rekey is
+in-place, realistic failures (ENOSPC) land in the bulk phase before
+install, where the Drop write is a no-op. The window is a failure in the
+final `persist_header` step, which an unprivileged attacker cannot
+reliably induce, hence defense-in-depth / Low-Medium, not a turnkey
+primitive.
+
+Fix (shipped this revision): `RotationState` now captures the committed
+vault's `(dev, ino)` from the held handle at `begin_atomic_rotation` (via
+a new `LbxFile::inode_pair`), and `abort_atomic_rotation` routes its
+reopen through `reopen_committed_no_follow` bound to that inode. A
+swapped path fails closed with `PathSubstituted` and the header write
+never reaches a foreign file. Pinned by
+`abort_atomic_rotation_refuses_symlinked_path`.
 
 ### LOW
 
@@ -161,6 +208,30 @@ independently at any call site and cannot drift again on a future
 keyslot-kind addition. The previous hand-maintained `matches!` lists
 are gone.
 
+**R14-05 (external, F2): GUI bulk-extract top-level join skipped the
+directory-escape guard (Windows).** `crates/luksbox-gui/src/app.rs::
+start_get_dir` computed `parent_dir.join(name)` from a vault-supplied
+entry name without calling `name_escapes_directory`. That guard is
+applied to child entries inside `get_dir_recursive` but not to the
+top-level name, so on Windows a forged entry named e.g. `C:evil`
+(drive-letter, which `Path::join` treats as an absolute reset) extracted
+outside the chosen folder. POSIX is unaffected. Fix: apply
+`name_escapes_directory` (now `pub(crate)`) to the top-level name in
+`start_get_dir` and refuse on match.
+
+**R14-06 (external, F3): `:` in a vault entry name allowed a Windows
+alternate-data-stream write.** A POSIX-legal name such as
+`malware.exe:Zone.Identifier` passed `validate_name` (which rejects
+`/ \ NUL . ..` but not `:`) and, on Windows extraction, would target the
+ADS of `malware.exe`. We deliberately did NOT add a `:` rejection to
+`validate_name`: it runs at metadata-load time (`vfs.rs:892`), so a
+blanket reject would make existing POSIX vaults that legitimately contain
+`:` in a filename fail to load (a compat break / availability bug). The
+report suggested the `validate_name` route; the compat-safe fix instead
+extends the already-Windows-gated `name_escapes_directory` to reject any
+`:` on Windows (subsuming the drive-letter case), so POSIX vaults keep
+loading and extracting `:`-names while Windows extraction refuses ADS.
+
 ## New regression coverage
 
 | Finding | Test |
@@ -168,10 +239,15 @@ are gone.
 | R14-01 | `crates/luksbox-core/src/keyslot.rs::tests::aad_covers_hmac_salt_for_every_salt_bearing_kind` -- builds a slot with a known 32-byte salt for every salt-bearing kind (the 7 FIDO2/TPM+FIDO2 kinds plus the 6 SEP+FIDO2 kinds) and asserts the salt appears in BOTH the `to_bytes` output AND the `build_aead_aad` output. Fails on any future `salt_len` drift. |
 | R14-02 | No new dedicated test (the destructive prompt path is interactive and hard to drive deterministically). The fix makes `panic_action` byte-for-byte match the already-reviewed `panic_by_path` shred path. Follow-up recommended: a symlink-at-target refusal test. |
 | R14-03 | Covered by the existing `crates/luksbox-cli/tests/mount_safety.rs` mountpoint-hardening suite, which now exercises the deniable path's re-probe by parity with `cmd_mount`. |
+| R14-04 | `crates/luksbox-format/src/container.rs::tests::abort_atomic_rotation_refuses_symlinked_path` -- creates a real vault, `begin_atomic_rotation`, swaps the committed path for a symlink to a victim file, asserts `abort_atomic_rotation` returns `PathSubstituted` and that Drop leaves the victim byte-unchanged. |
+| R14-05 / R14-06 | `crates/luksbox-gui/src/ops.rs` `name_escapes_directory_tests`: `windows_ads_colon_is_rejected` (Windows ADS `:` refused), `windows_drive_letter_prefix_is_rejected` (still passes), and `posix_colon_name_is_allowed` (POSIX `:` names still accepted, pinning the compat boundary). |
 
 Verified: `cargo test -p luksbox-core --lib` -> 111 passed, 0 failed.
-`cargo build -p luksbox-cli` -> clean, no warnings. `cargo test -p
-luksbox-cli` (incl. `mount_safety.rs`, `functional.rs`) -> all passed.
+`cargo test -p luksbox-format --lib` -> 109 passed (incl. R14-04 + the
+`LbxFile::inode_pair` trait change across the sim backends).
+`cargo build -p luksbox-cli` -> clean. `cargo build -p luksbox-gui` ->
+clean; `name_escapes_directory_tests` pass. `cargo test -p luksbox-cli`
+(incl. `mount_safety.rs`, `functional.rs`) -> all passed.
 
 ## Surfaces reviewed and found sound
 
@@ -243,6 +319,9 @@ parser types are not cfg-gated to macOS) and have AFL++ mirrors in
 | R14-01 | LOW | **Fixed** | `crates/luksbox-core/src/keyslot.rs`: new `SlotKind::has_inline_hmac_salt()` is the single source of truth; `build_aead_aad`, `to_bytes`, and the `from_bytes` parser all delegate to it (the hand-maintained `matches!` lists removed). Pinned by `tests::aad_covers_hmac_salt_for_every_salt_bearing_kind`. |
 | R14-02 | HIGH | **Fixed** | `crates/luksbox-cli/src/wizard.rs::panic_action`: opens both destructive targets with `secure_open_existing_no_follow` up front and holds the handles across the confirmation prompt, writing through the pinned inodes. Now matches `cmd_panic` / `panic_by_path`. |
 | R14-03 | MEDIUM | **Fixed** | `crates/luksbox-cli/src/main.rs::cmd_deniable_mount`: captures the probed `(dev, ino)` and re-probes with `O_DIRECTORY \| O_NOFOLLOW` immediately before `luksbox_mount::mount`, refusing on inode change. R12-08 parity with `cmd_mount`. |
+| R14-04 | MEDIUM | **Fixed** | `crates/luksbox-format/src/container.rs`: `RotationState` captures the committed `(dev,ino)` at `begin_atomic_rotation` (new `LbxFile::inode_pair`); `abort_atomic_rotation` reopens via `reopen_committed_no_follow` bound to it. Pinned by `abort_atomic_rotation_refuses_symlinked_path`. Credit: Garry Jean-Baptiste (garry@reyse.ai). |
+| R14-05 | LOW | **Fixed** | `crates/luksbox-gui/src/app.rs::start_get_dir`: applies `name_escapes_directory` (now `pub(crate)`) to the top-level vault name before the join. Credit: Garry Jean-Baptiste (garry@reyse.ai). |
+| R14-06 | LOW | **Fixed** | `crates/luksbox-gui/src/ops.rs::name_escapes_directory`: rejects any `:` on Windows (ADS + drive-letter). `validate_name` deliberately left unchanged to preserve load of POSIX vaults containing `:`. Credit: Garry Jean-Baptiste (garry@reyse.ai). |
 
 ## Next steps
 

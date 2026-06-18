@@ -72,6 +72,39 @@ review cycle and fixed here:
 
 See `docs/SECURITY_AUDIT_ROUND_14.md`.
 
+### Security: rotation-abort symlink hardening and Windows extract name-confusion (audit R14-04/05/06)
+
+Three pre-existing local-attacker issues reported via coordinated
+disclosure by **Garry Jean-Baptiste** (garry@reyse.ai), found with
+LLM-assisted source review. None is SEP-related; all are fixed here.
+
+- **R14-04 (completes R13-02):** `Container::abort_atomic_rotation`
+  reopened the vault path with a bare `open()` (no `O_NOFOLLOW`, no
+  inode recheck) on a failed key rotation; the subsequent `Drop` ->
+  `persist_header` then wrote 8 KiB at offset 0. Because
+  `begin_atomic_rotation` releases the original lock, a directory-level
+  attacker could swap the path for a symlink during the rotation window
+  and redirect that write. Reachability is narrow (it only fires on a
+  failure in the final `persist_header` step), so it is
+  defense-in-depth. Fixed by capturing the committed `(dev,ino)` at
+  `begin_atomic_rotation` and routing the abort reopen through
+  `reopen_committed_no_follow` (the same helper R13-02 used), so a
+  swapped path fails closed with `PathSubstituted`. Covers both the
+  standard and deniable rotation aborts (they share one function).
+- **R14-05 (Windows, GUI):** the bulk-extract top-level join
+  (`start_get_dir`) did not apply the `name_escapes_directory` guard to
+  the vault-supplied name, so a forged entry like `C:evil` could escape
+  the chosen folder on Windows. The guard is now applied to the
+  top-level name too.
+- **R14-06 (Windows, GUI):** a `:` in a vault entry name
+  (`malware.exe:Zone.Identifier`) could target a Windows alternate data
+  stream on extraction. Rather than reject `:` in `validate_name` (which
+  runs at load time and would break existing POSIX vaults that
+  legitimately contain `:`), the Windows-gated `name_escapes_directory`
+  now rejects any `:`, leaving POSIX behaviour unchanged.
+
+See `docs/SECURITY_AUDIT_ROUND_14.md`.
+
 ---
 
 ## [v0.3.1] - 2026-06-17

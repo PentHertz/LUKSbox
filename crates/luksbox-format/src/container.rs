@@ -69,11 +69,22 @@ pub enum FlushOp {
 /// the std I/O traits -- it's an inherent on `std::fs::File`).
 pub trait LbxFile: std::io::Read + std::io::Write + std::io::Seek + Send {
     fn sync_all(&mut self) -> std::io::Result<()>;
+    /// `(device, inode)` identity of the backing handle. Used to bind a
+    /// later no-follow reopen to the exact file we currently hold, so a
+    /// directory-level attacker cannot redirect a rotation-abort write
+    /// through a symlink swapped in at the path (audit R14-04). Real
+    /// files return their inode key; the in-memory sim backends (which
+    /// never run on the real-filesystem rotation path) return a
+    /// sentinel.
+    fn inode_pair(&self) -> std::io::Result<(u64, u64)>;
 }
 
 impl LbxFile for std::fs::File {
     fn sync_all(&mut self) -> std::io::Result<()> {
         std::fs::File::sync_all(self)
+    }
+    fn inode_pair(&self) -> std::io::Result<(u64, u64)> {
+        inode_of(self)
     }
 }
 
@@ -586,6 +597,12 @@ pub struct Container {
 struct RotationState {
     tmp_data_path: PathBuf,
     committed_data_path: PathBuf,
+    /// `(device, inode)` of the committed vault captured from the held
+    /// handle at `begin_atomic_rotation`. `abort_atomic_rotation` binds
+    /// its no-follow reopen to this so a directory-level attacker who
+    /// swaps `committed_data_path` for a symlink during the rotation
+    /// window cannot redirect the abort/Drop header write (audit R14-04).
+    committed_inode: (u64, u64),
 }
 
 /// Companion state attached to a Container when the vault uses a
@@ -3495,6 +3512,12 @@ impl Container {
         // Flush any pending writes on the original before we copy.
         self.file.flush()?;
 
+        // R14-04: capture the committed vault's (dev,ino) from the
+        // handle we currently hold (before `self.file` is reassigned to
+        // the temp below). The abort path rebinds to this exact inode
+        // with a no-follow reopen instead of blindly following the path.
+        let committed_inode = self.file.inode_pair()?;
+
         // Round 12 fix R12-10: create the rotation tmp atomically with
         // `O_CREAT|O_EXCL|O_NOFOLLOW` at mode 0600 BEFORE copying
         // content into it. The previous flow did `std::fs::copy` (which
@@ -3549,6 +3572,7 @@ impl Container {
         self.rotation = Some(RotationState {
             tmp_data_path: tmp,
             committed_data_path: original,
+            committed_inode,
         });
         Ok(())
     }
@@ -3628,10 +3652,18 @@ impl Container {
 
         // Reopen original BEFORE dropping the temp handle so we never
         // leave self.file in a half-valid state.
-        let original_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&state.committed_data_path)?;
+        //
+        // R14-04 (completes R13-02): route this through
+        // `reopen_committed_no_follow` bound to the inode captured at
+        // `begin_atomic_rotation`. A bare path open here followed a
+        // symlink an attacker could plant during the rotation window
+        // (the original flock is released at `begin`), and the
+        // subsequent `Drop` -> `persist_header` then wrote HEADER_SIZE
+        // bytes through it. With the no-follow + inode-equality check, a
+        // swapped path now fails closed with `PathSubstituted` and the
+        // header write never reaches a foreign file.
+        let original_file =
+            reopen_committed_no_follow(&state.committed_data_path, state.committed_inode)?;
         self.file = Box::new(original_file);
         self.path = state.committed_data_path;
 
@@ -4128,6 +4160,59 @@ mod tests {
             reopen_committed_no_follow(&hp, committed),
             Err(Error::PathSubstituted { .. })
         ));
+    }
+
+    /// R14-04 regression (audit F1, reported by Garry Jean-Baptiste,
+    /// garry@reyse.ai): a directory-level attacker who swaps the
+    /// committed vault path for a symlink during the rotation window
+    /// must not redirect the abort/Drop header write. The abort reopen
+    /// is bound (O_NOFOLLOW + inode-equality) to the inode captured at
+    /// `begin_atomic_rotation`, so the swap fails closed with
+    /// `PathSubstituted` and the victim file is left untouched.
+    #[cfg(unix)]
+    #[test]
+    fn abort_atomic_rotation_refuses_symlinked_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.lbx");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"victim-must-not-be-overwritten").unwrap();
+
+        Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"correct horse",
+        )
+        .unwrap();
+
+        let mut cont =
+            Container::open(&path, None, UnlockMaterial::Passphrase(b"correct horse")).unwrap();
+        assert!(cont.supports_atomic_rotation());
+        cont.begin_atomic_rotation().unwrap();
+
+        // Attacker swaps the committed path for a symlink to the victim
+        // during the rotation window (the original flock was released at
+        // begin; begin already copied the original into <path>.rotating).
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        // Abort must fail closed: the no-follow reopen bound to the
+        // captured inode rejects the symlink.
+        assert!(matches!(
+            cont.abort_atomic_rotation(),
+            Err(Error::PathSubstituted { .. })
+        ));
+
+        // Drop runs persist_header on whatever self.file still is (the
+        // temp, not the victim). Confirm the victim was never overwritten
+        // with header bytes.
+        drop(cont);
+        let after = std::fs::read(&victim).unwrap();
+        assert_eq!(
+            after, b"victim-must-not-be-overwritten",
+            "abort must not redirect the header write through the swapped symlink"
+        );
     }
 
     #[test]

@@ -4356,25 +4356,24 @@ pub fn get_dir_recursive(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<u64
 /// directory-traversal component (`..` or `.`), is empty, or starts
 /// with a Windows drive-letter prefix triggers rejection. Cheap, no
 /// I/O.
-fn name_escapes_directory(name: &str) -> bool {
+pub(crate) fn name_escapes_directory(name: &str) -> bool {
     if name.is_empty() || name == "." || name == ".." {
         return true;
     }
     if name.contains('/') || name.contains('\\') {
         return true;
     }
-    // Windows drive-letter prefix (e.g. "C:foo"). `Path::join` on
-    // Windows treats a string with this prefix as the new full path,
-    // discarding the base. POSIX paths can legitimately contain `:`
-    // so the check is windows-gated.
+    // On Windows `:` is never valid in a filename: it introduces either
+    // a drive-letter prefix (e.g. "C:foo", which `Path::join` treats as
+    // an absolute reset, discarding the base directory -- audit F2) or
+    // an alternate data stream (e.g. "file.exe:Zone.Identifier", which
+    // would target the ADS of `file.exe` -- audit F3). POSIX names can
+    // legitimately contain `:`, so the rejection is windows-gated.
+    // Rejecting any `:` subsumes the drive-letter prefix case.
     #[cfg(windows)]
     {
-        let bytes = name.as_bytes();
-        if bytes.len() >= 2 && bytes[1] == b':' {
-            let c = bytes[0];
-            if c.is_ascii_alphabetic() {
-                return true;
-            }
+        if name.contains(':') {
+            return true;
         }
     }
     false
@@ -4419,6 +4418,24 @@ mod name_escapes_directory_tests {
     fn windows_drive_letter_prefix_is_rejected() {
         assert!(name_escapes_directory("C:malicious"));
         assert!(name_escapes_directory("d:foo"));
+    }
+
+    /// R14-06 (audit F3): on Windows, a `:` anywhere in the name targets
+    /// an alternate data stream, so it must be rejected even when it is
+    /// not a drive-letter prefix. POSIX builds still accept `:` names.
+    #[cfg(windows)]
+    #[test]
+    fn windows_ads_colon_is_rejected() {
+        assert!(name_escapes_directory("malware.exe:Zone.Identifier"));
+        assert!(name_escapes_directory("readme:hidden"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn posix_colon_name_is_allowed() {
+        // `:` is a legal POSIX filename byte; the windows-only ADS guard
+        // must not reject it on POSIX (existing vaults can contain it).
+        assert!(!name_escapes_directory("time-12:30.log"));
     }
 }
 
