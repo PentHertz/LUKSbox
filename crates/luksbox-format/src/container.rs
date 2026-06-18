@@ -507,6 +507,26 @@ pub enum UnlockMaterial<'a> {
         hmac_secret: &'a [u8; 32],
         pq_shared: &'a [u8; 32],
     },
+    /// macOS Secure Enclave slot, ANY SEP kind. The `unseal` closure
+    /// receives the slot's opaque `SepBlob` bytes (read from the
+    /// in-header SEP region, NOT a sidecar) and must return the 32-byte
+    /// ECDH shared secret; the caller (CLI/GUI) wraps
+    /// `luksbox_sep::SepSealer::unseal`. This keeps `luksbox-format`
+    /// SEP-agnostic - no CryptoKit / Swift dependency here.
+    ///
+    /// The optional factors must match the targeted slot kind, the
+    /// dispatcher skips SEP slots whose required factors weren't
+    /// supplied: `hmac_secret` for the SEP+FIDO2 kinds, `passphrase`
+    /// for the SEP+passphrase kinds, `pq_shared` for the hybrid SEP
+    /// kinds. Per-slot closure errors (foreign enclave, cancelled
+    /// biometric, SEP unavailable) are tolerated so a vault with SEP
+    /// slots from multiple machines can still find the local one.
+    Sep {
+        unseal: &'a mut dyn FnMut(&[u8]) -> Result<[u8; 32], String>,
+        hmac_secret: Option<&'a [u8; 32]>,
+        passphrase: Option<&'a [u8]>,
+        pq_shared: Option<&'a [u8; 32]>,
+    },
 }
 
 /// Open `.lbx` container backed by a file on disk.
@@ -2490,6 +2510,59 @@ impl Container {
         Ok(idx)
     }
 
+    /// Add a macOS Secure Enclave keyslot of ANY SEP kind. The caller
+    /// (CLI/GUI) has run `luksbox_sep::SepSealer::seal` to obtain
+    /// `sep_shared` (the 32-byte ECDH shared secret feeding the KEK)
+    /// and `sep_blob` (the opaque `SepBlob` bytes to persist). The
+    /// supplied factors must match `kind`: `hmac_secret` + `cred_id` +
+    /// `hmac_salt` for SEP+FIDO2 kinds, `passphrase` + `kdf_params`
+    /// for SEP+passphrase kinds, `pq_shared` for hybrid kinds
+    /// (the ML-KEM pubkey+ciphertext remain the caller's to store in
+    /// the `.lbx.hybrid` sidecar).
+    ///
+    /// The SEP material goes in the in-header SEP region (no external
+    /// `.lbx.sep` file). Returns `Error::SepRegionFull` if the blob
+    /// would overflow that region.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enroll_sep(
+        &mut self,
+        kind: SlotKind,
+        sep_shared: &[u8; 32],
+        sep_blob: &[u8],
+        hmac_secret: Option<&[u8; 32]>,
+        passphrase: Option<&[u8]>,
+        kdf_params: Argon2idParams,
+        pq_shared: Option<&[u8; 32]>,
+        cred_id: &[u8],
+        hmac_salt: [u8; 32],
+    ) -> Result<usize, Error> {
+        self.guard_no_deniable_slot_mutation()?;
+        let idx = self.header.first_free_slot()?;
+        let slot = Keyslot::new_sep(
+            self.header.cipher_suite,
+            &self.mvk,
+            kind,
+            sep_shared,
+            hmac_secret,
+            passphrase,
+            kdf_params,
+            pq_shared,
+            cred_id,
+            hmac_salt,
+            &self.header.header_salt,
+        )?;
+        self.header.install_slot(idx, slot)?;
+        // Store the opaque SEP material in the in-header SEP region.
+        // On failure (region full) roll the slot back so we don't leave
+        // a SEP keyslot with no recoverable material.
+        if let Err(e) = self.header.set_sep_blob(idx, sep_blob.to_vec()) {
+            self.header.revoke_slot(idx).ok();
+            return Err(e.into());
+        }
+        self.header_dirty = true;
+        Ok(idx)
+    }
+
     /// Add a hybrid TPM 2.0 + ML-KEM-768 keyslot. Caller has
     /// generated a Kyber keypair, encapsulated against it to get
     /// `pq_shared`, and is responsible for storing the matching
@@ -3944,6 +4017,59 @@ fn try_unlock(
             }
             Err(Error::UnlockFailed)
         }
+        UnlockMaterial::Sep {
+            unseal,
+            hmac_secret,
+            passphrase,
+            pq_shared,
+        } => {
+            // Iterate every SEP slot. For each, the SEP material is
+            // read from the in-header SEP region (no sidecar); the
+            // caller's closure turns it into the 32-byte ECDH shared
+            // secret, then `unlock_sep` re-derives the KEK from the
+            // shared secret plus whichever fused factors the kind
+            // requires. First success wins. Like the TPM arm we do NOT
+            // iterate to constant time: SEP unseal is a hardware call
+            // (and may prompt for biometric), and which slot index
+            // unsealed is already public (kinds are unencrypted).
+            for (idx, slot) in header.keyslots.iter().enumerate() {
+                if !slot.kind.is_sep() {
+                    continue;
+                }
+                // Skip SEP slots whose required factor set doesn't
+                // match what the caller supplied (e.g. a SEP+FIDO2
+                // slot when no hmac_secret was given).
+                if slot.kind.is_sep_fido2() != hmac_secret.is_some()
+                    || slot.kind.is_sep_passphrase() != passphrase.is_some()
+                    || slot.kind.is_hybrid_pq() != pq_shared.is_some()
+                {
+                    continue;
+                }
+                let blob = match header.sep_blob(idx) {
+                    Some(b) => b,
+                    // SEP slot kind but no in-header material: corrupt
+                    // or partially-written. Skip rather than error.
+                    None => continue,
+                };
+                let sep_shared = match unseal(blob) {
+                    Ok(s) => s,
+                    // Foreign enclave / cancelled biometric / SEP
+                    // unavailable: tolerated, try the next slot.
+                    Err(_) => continue,
+                };
+                if let Ok(mvk) = slot.unlock_sep(
+                    suite,
+                    &sep_shared,
+                    *hmac_secret,
+                    *passphrase,
+                    *pq_shared,
+                    &header.header_salt,
+                ) {
+                    return Ok(mvk);
+                }
+            }
+            Err(Error::UnlockFailed)
+        }
     }
 }
 
@@ -4369,6 +4495,133 @@ mod tests {
         // If we got here, the MVK was recovered + the metadata
         // blob decrypted, which proves the unwrap worked.
         assert_eq!(cont.header.keyslots[slot_idx].kind, SlotKind::Tpm2Sealed);
+    }
+
+    /// `Container::enroll_sep` + `UnlockMaterial::Sep` round-trip the
+    /// MVK through the IN-HEADER SEP region (no `.lbx.sep` file): the
+    /// SEP blob survives persist + clean re-open, a genuine shared
+    /// secret unlocks, and a rogue/foreign-enclave secret does not.
+    /// Covers both a plain `SepSealed` slot and a hybrid
+    /// `HybridPqKemSep` slot (extra pq factor).
+    #[test]
+    fn sep_enroll_open_roundtrip_mocked() {
+        use std::collections::HashMap;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v.lbx");
+
+        let mut cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            test_params(),
+            b"bootstrap",
+        )
+        .unwrap();
+
+        // Stand-in SEP: "seal" produced this opaque blob for this
+        // shared secret. The format layer treats the blob as opaque,
+        // so a fake byte vector exercises the in-header region exactly.
+        let sep_shared = [0x37u8; 32];
+        let sep_blob = vec![0xA5u8; 349]; // ~plain dataRep+eph envelope size
+        let pq_shared = [0x88u8; 32];
+        let sep_blob_hy = vec![0xB6u8; 349];
+        let mut mock_sep: HashMap<Vec<u8>, [u8; 32]> = HashMap::new();
+        mock_sep.insert(sep_blob.clone(), sep_shared);
+        mock_sep.insert(sep_blob_hy.clone(), sep_shared);
+
+        let plain_idx = cont
+            .enroll_sep(
+                SlotKind::SepSealed,
+                &sep_shared,
+                &sep_blob,
+                None,
+                None,
+                test_params(),
+                None,
+                &[],
+                [0u8; 32],
+            )
+            .unwrap();
+        let hy_idx = cont
+            .enroll_sep(
+                SlotKind::HybridPqKemSep,
+                &sep_shared,
+                &sep_blob_hy,
+                None,
+                None,
+                test_params(),
+                Some(&pq_shared),
+                &[],
+                [0u8; 32],
+            )
+            .unwrap();
+        // Material landed in the in-header region, not a sidecar.
+        assert!(cont.header.sep_blob(plain_idx).is_some());
+        assert!(cont.header.has_sep_region());
+        assert!(
+            !path.with_extension("lbx.sep").exists() && !dir.path().join("v.lbx.sep").exists(),
+            "no external .lbx.sep file must be created"
+        );
+        cont.persist_header().unwrap();
+        drop(cont);
+
+        // Re-open the plain SEP slot via a closure that maps the
+        // in-header blob -> shared secret (the role of SepSealer).
+        let mut unseal = |blob: &[u8]| -> Result<[u8; 32], String> {
+            mock_sep
+                .get(blob)
+                .copied()
+                .ok_or_else(|| "foreign enclave".into())
+        };
+        let cont = Container::open(
+            &path,
+            None,
+            UnlockMaterial::Sep {
+                unseal: &mut unseal,
+                hmac_secret: None,
+                passphrase: None,
+                pq_shared: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(cont.header.keyslots[plain_idx].kind, SlotKind::SepSealed);
+        assert_eq!(cont.header.keyslots[hy_idx].kind, SlotKind::HybridPqKemSep);
+        drop(cont);
+
+        // The hybrid slot opens when the pq factor is also supplied.
+        let mut unseal2 = |blob: &[u8]| -> Result<[u8; 32], String> {
+            mock_sep
+                .get(blob)
+                .copied()
+                .ok_or_else(|| "foreign enclave".into())
+        };
+        Container::open(
+            &path,
+            None,
+            UnlockMaterial::Sep {
+                unseal: &mut unseal2,
+                hmac_secret: None,
+                passphrase: None,
+                pq_shared: Some(&pq_shared),
+            },
+        )
+        .unwrap();
+
+        // Rogue enclave: closure returns a well-formed but WRONG secret
+        // for every blob -> no slot unlocks (AEAD rejects the KEK), and
+        // we get a clean error, never a null/partial MVK.
+        let mut rogue = |_blob: &[u8]| -> Result<[u8; 32], String> { Ok([0x99u8; 32]) };
+        let r = Container::open(
+            &path,
+            None,
+            UnlockMaterial::Sep {
+                unseal: &mut rogue,
+                hmac_secret: None,
+                passphrase: None,
+                pq_shared: None,
+            },
+        );
+        assert!(r.is_err(), "rogue SEP secret must not open the vault");
     }
 
     #[test]

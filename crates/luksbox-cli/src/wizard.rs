@@ -2000,6 +2000,58 @@ fn format_slot(idx: usize, slot: &luksbox_core::Keyslot, with_kdf: bool) -> Stri
                  sealed_blob {blob_len} B; both factors required)"
             )
         }
+        SlotKind::SepSealed | SlotKind::SepSealedBiometric => {
+            let bio = if slot.kind == SlotKind::SepSealedBiometric {
+                " + biometry"
+            } else {
+                ""
+            };
+            format!("  {idx}: secure-enclave{bio} (macOS; SEP material in-header)")
+        }
+        SlotKind::HybridPqKemSep | SlotKind::HybridPqKem1024Sep => {
+            let level = if slot.kind == SlotKind::HybridPqKem1024Sep {
+                "1024"
+            } else {
+                "768"
+            };
+            format!(
+                "  {idx}: hybrid-pq-sep (macOS Secure Enclave + ML-KEM-{level}; \
+                 SEP material in-header, ML-KEM in .lbx.hybrid)"
+            )
+        }
+        SlotKind::SepFido2 => {
+            format!("  {idx}: secure-enclave + FIDO2 (macOS; SEP material in-header)")
+        }
+        SlotKind::HybridPqKemSepFido2 => format!(
+            "  {idx}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + ML-KEM-768; \
+             SEP material in-header, ML-KEM in .lbx.hybrid)"
+        ),
+        SlotKind::HybridPqKem1024SepFido2 => format!(
+            "  {idx}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + ML-KEM-1024; \
+             SEP material in-header, ML-KEM in .lbx.hybrid)"
+        ),
+        SlotKind::SepPassphrase => {
+            format!("  {idx}: secure-enclave + passphrase (macOS; SEP material in-header)")
+        }
+        SlotKind::HybridPqKemSepPassphrase => format!(
+            "  {idx}: hybrid-pq-sep (macOS Secure Enclave + passphrase + ML-KEM-768; \
+             SEP material in-header, ML-KEM in .lbx.hybrid)"
+        ),
+        SlotKind::HybridPqKem1024SepPassphrase => format!(
+            "  {idx}: hybrid-pq-sep (macOS Secure Enclave + passphrase + ML-KEM-1024; \
+             SEP material in-header, ML-KEM in .lbx.hybrid)"
+        ),
+        SlotKind::SepFido2Passphrase => {
+            format!("  {idx}: secure-enclave + FIDO2 + passphrase (macOS; SEP material in-header)")
+        }
+        SlotKind::HybridPqKemSepFido2Passphrase => format!(
+            "  {idx}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + passphrase + ML-KEM-768; \
+             SEP material in-header, ML-KEM in .lbx.hybrid)"
+        ),
+        SlotKind::HybridPqKem1024SepFido2Passphrase => format!(
+            "  {idx}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + passphrase + ML-KEM-1024; \
+             SEP material in-header, ML-KEM in .lbx.hybrid)"
+        ),
     }
 }
 
@@ -2115,16 +2167,36 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
             "3-factor TPM 2.0 + FIDO2 + ML-KEM-1024 (paranoid; bootstrap passphrase kept as backup)",
         ]);
     }
+    #[cfg(target_os = "macos")]
+    {
+        items.extend_from_slice(&[
+            "Secure Enclave (this Mac; bootstrap passphrase kept as backup)",
+            "Secure Enclave + Touch ID (this Mac + biometry; bootstrap passphrase kept as backup)",
+            "Hybrid Secure Enclave + ML-KEM-768 (2-factor; bootstrap passphrase kept as backup)",
+            "Hybrid Secure Enclave + ML-KEM-1024 (2-factor; bootstrap passphrase kept as backup)",
+            "Fused Secure Enclave + FIDO2 (both required; bootstrap passphrase kept as backup)",
+            "Fused Secure Enclave + passphrase (SEP + a slot passphrase; bootstrap passphrase kept as backup)",
+            "Fused Secure Enclave + FIDO2 + passphrase (3-factor; bootstrap passphrase kept as backup)",
+            "Hybrid Secure Enclave + FIDO2 + ML-KEM-768 (3-factor; bootstrap passphrase kept as backup)",
+            "Hybrid Secure Enclave + FIDO2 + ML-KEM-1024 (3-factor; bootstrap passphrase kept as backup)",
+            "Hybrid Secure Enclave + passphrase + ML-KEM-768 (3-factor; bootstrap passphrase kept as backup)",
+            "Hybrid Secure Enclave + passphrase + ML-KEM-1024 (3-factor; bootstrap passphrase kept as backup)",
+            "Hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-768 (4-factor; bootstrap passphrase kept as backup)",
+            "Hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-1024 (4-factor; bootstrap passphrase kept as backup)",
+        ]);
+    }
     let kind_choice = Select::with_theme(theme)
         .with_prompt("Initial keyslot kind")
         .items(&items)
         .default(0)
         .interact()?;
 
-    // FIDO2-direct + all four hybrid kinds + all TPM kinds skip
+    // FIDO2-direct + all four hybrid kinds + all TPM / SEP kinds skip
     // pad/hide-sizes prompts (they have their own follow-on prompts
     // and the size-hardening flags don't apply to keyslot wrapping).
-    let opts = ask_create_options(theme, matches!(kind_choice, 2..=13))?;
+    // On macOS the SEP block runs to index 19; on Linux the TPM block
+    // ends at 13.
+    let opts = ask_create_options(theme, matches!(kind_choice, 2..=19))?;
 
     match kind_choice {
         0 => create_passphrase(theme, &pb, header_path.as_deref(), cipher, &opts)?,
@@ -2225,6 +2297,135 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
             &opts,
             TpmBootstrap::HybridPqFido2(luksbox_pq::PqParams::Ml1024),
         )?,
+        #[cfg(target_os = "macos")]
+        7 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::Plain,
+        )?,
+        #[cfg(target_os = "macos")]
+        8 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::Biometric,
+        )?,
+        #[cfg(target_os = "macos")]
+        9 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::HybridPq(luksbox_pq::PqParams::Ml768),
+        )?,
+        #[cfg(target_os = "macos")]
+        10 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::HybridPq(luksbox_pq::PqParams::Ml1024),
+        )?,
+        #[cfg(target_os = "macos")]
+        11 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::Fused(crate::SepFactors::Fido2, None),
+        )?,
+        #[cfg(target_os = "macos")]
+        12 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::Fused(crate::SepFactors::Passphrase, None),
+        )?,
+        #[cfg(target_os = "macos")]
+        13 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::Fused(crate::SepFactors::Fido2Passphrase, None),
+        )?,
+        #[cfg(target_os = "macos")]
+        14 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::Fused(crate::SepFactors::Fido2, Some(luksbox_pq::PqParams::Ml768)),
+        )?,
+        #[cfg(target_os = "macos")]
+        15 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::Fused(crate::SepFactors::Fido2, Some(luksbox_pq::PqParams::Ml1024)),
+        )?,
+        #[cfg(target_os = "macos")]
+        16 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::Fused(
+                crate::SepFactors::Passphrase,
+                Some(luksbox_pq::PqParams::Ml768),
+            ),
+        )?,
+        #[cfg(target_os = "macos")]
+        17 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::Fused(
+                crate::SepFactors::Passphrase,
+                Some(luksbox_pq::PqParams::Ml1024),
+            ),
+        )?,
+        #[cfg(target_os = "macos")]
+        18 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::Fused(
+                crate::SepFactors::Fido2Passphrase,
+                Some(luksbox_pq::PqParams::Ml768),
+            ),
+        )?,
+        #[cfg(target_os = "macos")]
+        19 => create_with_sep_bootstrap(
+            theme,
+            &pb,
+            header_path.as_deref(),
+            cipher,
+            &opts,
+            SepBootstrap::Fused(
+                crate::SepFactors::Fido2Passphrase,
+                Some(luksbox_pq::PqParams::Ml1024),
+            ),
+        )?,
         _ => unreachable!(),
     }
     Ok(())
@@ -2263,6 +2464,152 @@ enum TpmBootstrap {
     Fido2,
     HybridPq(luksbox_pq::PqParams),
     HybridPqFido2(luksbox_pq::PqParams),
+}
+
+/// Which Secure Enclave keyslot kind to bootstrap a new vault with
+/// (macOS create flow). Mirrors `TpmBootstrap`.
+#[cfg(target_os = "macos")]
+enum SepBootstrap {
+    Plain,
+    Biometric,
+    HybridPq(luksbox_pq::PqParams),
+    /// Fused SEP + FIDO2 / passphrase combinations, optionally hybrid
+    /// (Some(params) = + ML-KEM). `factors` carries which extra
+    /// secrets are bound.
+    Fused(crate::SepFactors, Option<luksbox_pq::PqParams>),
+}
+
+/// Create a vault with a bootstrap passphrase, then immediately add
+/// the chosen Secure Enclave slot. Mirrors `create_with_tpm_bootstrap`
+/// (recovery-friendly default): a SEP slot can't be slot 0, so we
+/// bootstrap with a passphrase, enroll the SEP slot, move it to slot
+/// 0, and keep the passphrase as a backup unless explicitly revoked.
+#[cfg(target_os = "macos")]
+fn create_with_sep_bootstrap(
+    theme: &ColorfulTheme,
+    vault: &Path,
+    header: Option<&Path>,
+    cipher: CipherSuite,
+    opts: &CreateOptions,
+    kind: SepBootstrap,
+) -> Result<()> {
+    eprintln!(
+        "WARNING: Secure Enclave keyslots only open on the Mac that sealed them.\n  \
+         If the machine is lost or wiped, that slot is gone."
+    );
+    if !Confirm::with_theme(theme)
+        .with_prompt("Continue with Secure Enclave-backed creation?")
+        .default(true)
+        .interact()?
+    {
+        return Ok(());
+    }
+
+    // Pre-flight: try to open the Secure Enclave BEFORE creating the
+    // vault file, so a no-SEP failure surfaces without leaving a
+    // half-built vault on disk.
+    #[cfg(feature = "hardware")]
+    {
+        let probe = luksbox_sep::SepSealer::new();
+        if let Err(e) = probe {
+            return Err(format!(
+                "Secure Enclave unavailable, refusing to create a SEP-bound vault \
+                 that wouldn't have its primary keyslot:\n\n{e}"
+            )
+            .into());
+        }
+    }
+
+    let pw = ask_new_passphrase(theme, "Backup passphrase")?;
+    eprintln!("Stretching passphrase with Argon2id (around 500 ms)...");
+    let mut cont = Container::create_with_passphrase_flags(
+        vault,
+        header,
+        cipher,
+        kdf_params(),
+        opts.flags,
+        pw.as_bytes(),
+    )?;
+    if let Some(ap) = &opts.anchor {
+        cont.init_anchor(ap.clone(), 1)?;
+        eprintln!("  anchor file initialized at {}", ap.display());
+    }
+    println!(
+        "OK created {} (bootstrapping with backup passphrase; SEP keyslot will move to slot 0)",
+        vault.display()
+    );
+
+    let vp = cont.vault_path().to_path_buf();
+    let is_hybrid = matches!(
+        kind,
+        SepBootstrap::HybridPq(_) | SepBootstrap::Fused(_, Some(_))
+    );
+    let r = match kind {
+        SepBootstrap::Plain => enroll_sep_into(theme, &mut cont, false),
+        SepBootstrap::Biometric => enroll_sep_into(theme, &mut cont, true),
+        SepBootstrap::HybridPq(p) => enroll_hybrid_pq_sep_into(theme, &mut cont, &vp, p),
+        SepBootstrap::Fused(factors, params) => {
+            enroll_sep_fused_into(theme, &mut cont, &vp, factors, params)
+        }
+    };
+    if let Err(e) = r {
+        // Atomic-create contract: roll back the bootstrap vault so we
+        // don't leave a passphrase-only orphan when the SEP enroll
+        // fails. Same shape as create_with_tpm_bootstrap.
+        eprintln!("FAIL Secure Enclave enroll failed: {e}");
+        eprintln!("  rolling back the bootstrap vault to leave no orphan files...");
+        drop(cont);
+        let _ = std::fs::remove_file(vault);
+        if let Some(hp) = header {
+            let _ = std::fs::remove_file(hp);
+        }
+        if let Some(ap) = &opts.anchor {
+            let _ = std::fs::remove_file(ap);
+        }
+        let sidecar = luksbox_format::hybrid_sidecar::sidecar_path(vault);
+        let _ = std::fs::remove_file(&sidecar);
+        return Err(format!("vault create rolled back: {e}").into());
+    }
+
+    // Move the SEP slot to index 0 (mirrors the TPM bootstrap). The
+    // bootstrap path made exactly one slot (passphrase at 0) and the
+    // SEP enroll took the next Empty (1), so swapping (0, 1) is
+    // unambiguous.
+    cont.swap_slots(0, 1)
+        .map_err(|e| format!("post-enroll swap_slots: {e}"))?;
+    if is_hybrid {
+        let sidecar = luksbox_format::hybrid_sidecar::sidecar_path(vault);
+        if sidecar.exists()
+            && let Ok(mut entries) = luksbox_format::hybrid_sidecar::read(&sidecar)
+        {
+            for e in &mut entries {
+                if e.slot_idx == 1 {
+                    e.slot_idx = 0;
+                }
+            }
+            let _ = luksbox_format::hybrid_sidecar::write_with_binding(
+                &sidecar,
+                &entries,
+                cont.header_salt(),
+            );
+        }
+    }
+    cont.persist_header()?;
+    println!("OK moved Secure Enclave keyslot to slot 0 (backup passphrase now in slot 1)");
+
+    if Confirm::with_theme(theme)
+        .with_prompt("Revoke the backup passphrase now? (NOT recommended; loses the recovery path)")
+        .default(false)
+        .interact()?
+    {
+        cont.revoke_slot(1)?;
+        cont.persist_header()?;
+        println!("OK backup passphrase revoked. Vault is now Secure Enclave-only.");
+    } else {
+        println!("OK backup passphrase retained in slot 1 (recovery path preserved)");
+    }
+
+    maybe_mount_now(theme, cont, vault)
 }
 
 /// Create a vault with a bootstrap passphrase, then immediately add
@@ -3247,6 +3594,28 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
             SlotKind::HybridPqKemTpm2Fido2 | SlotKind::HybridPqKem1024Tpm2Fido2
         )
     });
+    // Secure Enclave kinds: plain + biometric share one unlock helper
+    // (the SEP prompts for Touch ID on biometric slots); the two
+    // hybrid SEP kinds share another. The fused FIDO2 / passphrase
+    // SEP kinds collect their extra factors inside the unlock helper.
+    // Mirrors the TPM grouping. `is_sep_fido2()` / `is_sep_passphrase()`
+    // distinguish which factors a slot binds.
+    let has_sep = header
+        .keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && !s.kind.is_hybrid_pq() && !s.kind.is_sep_fido2());
+    let has_sep_fido2 = header
+        .keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && !s.kind.is_hybrid_pq() && s.kind.is_sep_fido2());
+    let has_hybrid_pq_sep = header
+        .keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && s.kind.is_hybrid_pq() && !s.kind.is_sep_fido2());
+    let has_hybrid_pq_sep_fido2 = header
+        .keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && s.kind.is_hybrid_pq() && s.kind.is_sep_fido2());
 
     // Auto-detect FIDO2 authenticator(s); prompt-on-multiple is
     // suppressed if the user already picked at wizard start (or
@@ -3286,6 +3655,31 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
             options.push("Hybrid TPM 2.0 + FIDO2 + ML-KEM (3-factor)");
         }
     }
+    // Secure Enclave unlock options only on macOS. The slot-detection
+    // vars stay live on all platforms so the binding compiles; on
+    // non-macOS the user just doesn't see the unreachable choices.
+    #[cfg(target_os = "macos")]
+    {
+        if has_sep {
+            options.push("Secure Enclave (this Mac)");
+        }
+        if has_sep_fido2 {
+            options.push("Fused Secure Enclave + FIDO2");
+        }
+        if has_hybrid_pq_sep {
+            options.push("Hybrid Secure Enclave + ML-KEM (2-factor)");
+        }
+        if has_hybrid_pq_sep_fido2 {
+            options.push("Hybrid Secure Enclave + FIDO2 + ML-KEM");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (
+        has_sep,
+        has_sep_fido2,
+        has_hybrid_pq_sep,
+        has_hybrid_pq_sep_fido2,
+    );
     #[cfg(not(target_os = "linux"))]
     let _ = (
         has_tpm2,
@@ -3372,6 +3766,18 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
             }
             "Hybrid TPM 2.0 + FIDO2 + ML-KEM (3-factor)" => {
                 unlock_via_hybrid_pq_tpm2_fido2(theme, &vault, header_path.as_deref(), &header)?
+            }
+            "Secure Enclave (this Mac)" => {
+                unlock_via_sep(theme, &vault, header_path.as_deref(), &header)?
+            }
+            "Fused Secure Enclave + FIDO2" => {
+                unlock_via_sep_fido2(theme, &vault, header_path.as_deref(), &header)?
+            }
+            "Hybrid Secure Enclave + ML-KEM (2-factor)" => {
+                unlock_via_hybrid_pq_sep(theme, &vault, header_path.as_deref(), &header)?
+            }
+            "Hybrid Secure Enclave + FIDO2 + ML-KEM" => {
+                unlock_via_hybrid_pq_sep_fido2(theme, &vault, header_path.as_deref(), &header)?
             }
             _ => unreachable!(),
         })
@@ -3902,6 +4308,26 @@ fn rotate_mvk_action(theme: &ColorfulTheme, cont: Container) -> Result<Container
                 )
                 .into());
             }
+            SlotKind::SepSealed
+            | SlotKind::SepSealedBiometric
+            | SlotKind::HybridPqKemSep
+            | SlotKind::HybridPqKem1024Sep
+            | SlotKind::SepFido2
+            | SlotKind::HybridPqKemSepFido2
+            | SlotKind::HybridPqKem1024SepFido2
+            | SlotKind::SepPassphrase
+            | SlotKind::HybridPqKemSepPassphrase
+            | SlotKind::HybridPqKem1024SepPassphrase
+            | SlotKind::SepFido2Passphrase
+            | SlotKind::HybridPqKemSepFido2Passphrase
+            | SlotKind::HybridPqKem1024SepFido2Passphrase => {
+                return Err(format!(
+                    "slot {idx} is Secure Enclave-bound; rotation of SEP slots isn't \
+                     supported by the wizard yet. Workaround: `luksbox revoke <vault> \
+                     --slot {idx}` then re-enroll."
+                )
+                .into());
+            }
             SlotKind::Empty => unreachable!(),
         };
         credentials.push(cred);
@@ -4156,6 +4582,24 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                 "Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-1024 keyslot",
             ]);
         }
+        #[cfg(target_os = "macos")]
+        {
+            menu.extend_from_slice(&[
+                "Add a Secure Enclave keyslot (this Mac)",
+                "Add a Secure Enclave + Touch ID keyslot",
+                "Add a hybrid Secure Enclave + ML-KEM-768 keyslot",
+                "Add a hybrid Secure Enclave + ML-KEM-1024 keyslot",
+                "Add a fused Secure Enclave + FIDO2 keyslot (both required)",
+                "Add a fused Secure Enclave + passphrase keyslot",
+                "Add a fused Secure Enclave + FIDO2 + passphrase keyslot (3-factor)",
+                "Add a hybrid Secure Enclave + FIDO2 + ML-KEM-768 keyslot",
+                "Add a hybrid Secure Enclave + FIDO2 + ML-KEM-1024 keyslot",
+                "Add a hybrid Secure Enclave + passphrase + ML-KEM-768 keyslot",
+                "Add a hybrid Secure Enclave + passphrase + ML-KEM-1024 keyslot",
+                "Add a hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-768 keyslot (4-factor)",
+                "Add a hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-1024 keyslot (4-factor)",
+            ]);
+        }
         menu.extend_from_slice(&[
             "Update an existing keyslot's secret in place",
             "Revoke a keyslot",
@@ -4186,7 +4630,24 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             13..=15 => choice,
             _ => unreachable!(),
         };
-        #[cfg(not(target_os = "linux"))]
+        // macOS: choices 0..=5 are the PQ rows, 6..=9 are the four
+        // base Secure Enclave rows (remapped to actions 16..=19),
+        // 10..=18 are the nine fused SEP rows (remapped to actions
+        // 20..=28), then 19/20/21 are update/revoke/back.
+        #[cfg(target_os = "macos")]
+        let action = match choice {
+            0..=5 => choice,
+            6 => 16,
+            7 => 17,
+            8 => 18,
+            9 => 19,
+            10..=18 => choice + 10, // 10->20 .. 18->28
+            19 => 13,
+            20 => 14,
+            21 => 15,
+            _ => unreachable!(),
+        };
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         let action = match choice {
             0..=5 => choice,
             6 => 13,
@@ -4394,6 +4855,77 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                         &vp,
                         luksbox_pq::PqParams::Ml1024,
                     )
+                }
+            }
+            #[cfg(target_os = "macos")]
+            16 => {
+                if cont.is_deniable() {
+                    Err("Secure Enclave deniable enroll is not exposed yet.".into())
+                } else {
+                    enroll_sep_into(theme, &mut cont, false)
+                }
+            }
+            #[cfg(target_os = "macos")]
+            17 => {
+                if cont.is_deniable() {
+                    Err("Secure Enclave deniable enroll is not exposed yet.".into())
+                } else {
+                    enroll_sep_into(theme, &mut cont, true)
+                }
+            }
+            #[cfg(target_os = "macos")]
+            18 => {
+                let vp = cont.vault_path().to_path_buf();
+                if cont.is_deniable() {
+                    Err("Secure Enclave deniable enroll is not exposed yet.".into())
+                } else {
+                    enroll_hybrid_pq_sep_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml768)
+                }
+            }
+            #[cfg(target_os = "macos")]
+            19 => {
+                let vp = cont.vault_path().to_path_buf();
+                if cont.is_deniable() {
+                    Err("Secure Enclave deniable enroll is not exposed yet.".into())
+                } else {
+                    enroll_hybrid_pq_sep_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml1024)
+                }
+            }
+            // ===== fused Secure Enclave rows (macOS) =====
+            // Actions 20..=28 cover SEP+FIDO2 / +passphrase / +both,
+            // plain and hybrid (ML-KEM-768/1024). Generalized through
+            // enroll_sep_fused_into.
+            #[cfg(target_os = "macos")]
+            20..=28 => {
+                if cont.is_deniable() {
+                    Err("Secure Enclave deniable enroll is not exposed yet.".into())
+                } else {
+                    let vp = cont.vault_path().to_path_buf();
+                    let (factors, params) = match action {
+                        20 => (crate::SepFactors::Fido2, None),
+                        21 => (crate::SepFactors::Passphrase, None),
+                        22 => (crate::SepFactors::Fido2Passphrase, None),
+                        23 => (crate::SepFactors::Fido2, Some(luksbox_pq::PqParams::Ml768)),
+                        24 => (crate::SepFactors::Fido2, Some(luksbox_pq::PqParams::Ml1024)),
+                        25 => (
+                            crate::SepFactors::Passphrase,
+                            Some(luksbox_pq::PqParams::Ml768),
+                        ),
+                        26 => (
+                            crate::SepFactors::Passphrase,
+                            Some(luksbox_pq::PqParams::Ml1024),
+                        ),
+                        27 => (
+                            crate::SepFactors::Fido2Passphrase,
+                            Some(luksbox_pq::PqParams::Ml768),
+                        ),
+                        28 => (
+                            crate::SepFactors::Fido2Passphrase,
+                            Some(luksbox_pq::PqParams::Ml1024),
+                        ),
+                        _ => unreachable!(),
+                    };
+                    enroll_sep_fused_into(theme, &mut cont, &vp, factors, params)
                 }
             }
             13 => update_keyslot_action(theme, &mut cont),
@@ -5271,6 +5803,312 @@ fn enroll_tpm2_into(_theme: &ColorfulTheme, _c: &mut Container) -> Result<()> {
     )
 }
 
+/// Enroll a macOS Secure Enclave keyslot into an already-open
+/// container. Mirrors `enroll_tpm2_into`; `biometric` gates the slot
+/// behind a Touch ID / user-presence check at every unlock.
+#[cfg(feature = "hardware")]
+fn enroll_sep_into(_theme: &ColorfulTheme, c: &mut Container, biometric: bool) -> Result<()> {
+    use luksbox_sep::SepSealer;
+
+    let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
+    let (kind, label) = if biometric {
+        (
+            luksbox_core::SlotKind::SepSealedBiometric,
+            "Secure Enclave + Touch ID",
+        )
+    } else {
+        (luksbox_core::SlotKind::SepSealed, "Secure Enclave")
+    };
+
+    eprintln!("sealing KEK under the local Secure Enclave...");
+    let (sep_shared, blob) = if biometric {
+        sealer
+            .seal_biometric()
+            .map_err(|e| format!("SEP seal (biometric): {e}"))?
+    } else {
+        sealer.seal().map_err(|e| format!("SEP seal: {e}"))?
+    };
+    let blob_bytes = blob.to_bytes();
+
+    let idx = c.enroll_sep(
+        kind,
+        &sep_shared,
+        &blob_bytes,
+        None,
+        None,
+        kdf_params(),
+        None,
+        &[],
+        [0u8; 32],
+    )?;
+    c.persist_header()?;
+    println!(
+        "OK enrolled {label} keyslot in slot {idx} (sealed {} B)",
+        blob_bytes.len()
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "hardware"))]
+fn enroll_sep_into(_theme: &ColorfulTheme, _c: &mut Container, _biometric: bool) -> Result<()> {
+    Err(
+        "Secure Enclave support not compiled in (rebuild with --features hardware; \
+         Secure Enclave keyslots only work on macOS hardware)"
+            .into(),
+    )
+}
+
+/// Hybrid Secure Enclave + ML-KEM-{768,1024} enroll into an
+/// already-open container. Mirrors `enroll_hybrid_pq_tpm2_into`: the
+/// SEP supplies the classical half, ML-KEM the post-quantum half;
+/// writes the .lbx.hybrid sidecar entry + the Kyber seed file.
+#[cfg(feature = "hardware")]
+fn enroll_hybrid_pq_sep_into(
+    theme: &ColorfulTheme,
+    c: &mut Container,
+    vault: &Path,
+    params: luksbox_pq::PqParams,
+) -> Result<()> {
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
+    use luksbox_sep::SepSealer;
+
+    let (level_label, kind) = match params {
+        PqParams::Ml768 => ("ML-KEM-768", luksbox_core::SlotKind::HybridPqKemSep),
+        PqParams::Ml1024 => ("ML-KEM-1024", luksbox_core::SlotKind::HybridPqKem1024Sep),
+    };
+    eprintln!(
+        "Hybrid Secure Enclave + {level_label} keyslot. KEK = HKDF(salt,\n  \
+         sep_shared || pq_shared). Both the local Secure Enclave AND a\n  \
+         separate .kyber seed file (kept on different storage from the\n  \
+         .lbx) will be required at every unlock."
+    );
+    let kyber_path = ask_path(theme, "Path for the new Kyber seed (.kyber) file")?;
+    if kyber_path.exists() {
+        return Err(format!("{} already exists", kyber_path.display()).into());
+    }
+    let seed_pw = ask_new_passphrase(theme, "Seed-file passphrase")?;
+
+    let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
+
+    eprintln!("sealing SEP half under the local Secure Enclave...");
+    let (sep_shared, blob) = sealer.seal().map_err(|e| format!("SEP seal: {e}"))?;
+    let blob_bytes = blob.to_bytes();
+
+    eprintln!("generating {level_label} keypair...");
+    let (pk, seed) = keygen_with(params);
+    let (ct, pq_shared) =
+        encapsulate_with(params, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
+
+    let idx = c.enroll_sep(
+        kind,
+        &sep_shared,
+        &blob_bytes,
+        None,
+        None,
+        kdf_params(),
+        Some(&pq_shared),
+        &[],
+        [0u8; 32],
+    )?;
+    c.persist_header()?;
+
+    let sidecar = hybrid_sidecar::sidecar_path(vault);
+    let mut entries = if sidecar.exists() {
+        hybrid_sidecar::read(&sidecar).map_err(|e| format!("read existing hybrid sidecar: {e}"))?
+    } else {
+        Vec::new()
+    };
+    entries.push(HybridEntry {
+        slot_idx: idx as u8,
+        level: params,
+        pubkey: pk,
+        ciphertext: ct,
+    });
+    hybrid_sidecar::write(&sidecar, &entries).map_err(|e| format!("write hybrid sidecar: {e}"))?;
+
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )
+    .map_err(|e| format!("write kyber seed: {e}"))?;
+
+    println!(
+        "OK enrolled hybrid Secure Enclave + {level_label} keyslot in slot {idx}\n  \
+         Kyber seed: {} (MOVE TO SEPARATE STORAGE - lose it = lose this slot)",
+        kyber_path.display()
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "hardware"))]
+fn enroll_hybrid_pq_sep_into(
+    _theme: &ColorfulTheme,
+    _c: &mut Container,
+    _vault: &Path,
+    _params: luksbox_pq::PqParams,
+) -> Result<()> {
+    Err("hybrid-pq-sep enroll requires --features hardware".into())
+}
+
+/// Enroll a fused Secure Enclave keyslot (SEP + FIDO2 / passphrase /
+/// hybrid-PQ combinations) into an already-open container. The
+/// wizard analog of `crate::cmd_enroll_sep_fused`: the SEP always
+/// supplies the classical machine-bound half (plain `seal()`, never
+/// biometric), and `factors` + optional `params` decide which extra
+/// secrets are collected. For hybrid kinds the `.lbx.hybrid` sidecar
+/// entry + the (passphrase-encrypted) `.kyber` seed are written.
+#[cfg(feature = "hardware")]
+fn enroll_sep_fused_into(
+    theme: &ColorfulTheme,
+    c: &mut Container,
+    vault: &Path,
+    factors: crate::SepFactors,
+    params: Option<luksbox_pq::PqParams>,
+) -> Result<()> {
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{encapsulate_with, keygen_with, seed_file};
+    use luksbox_sep::SepSealer;
+
+    let kem_size = params.map(|p| match p {
+        luksbox_pq::PqParams::Ml768 => 768u16,
+        luksbox_pq::PqParams::Ml1024 => 1024u16,
+    });
+    let kind = factors.slot_kind(kem_size)?;
+
+    if factors.has_fido2() {
+        fido2_preflight()?;
+    }
+    let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
+
+    // Collect destinations + passphrases before any hardware step.
+    let (kyber_path, seed_pw) = if params.is_some() {
+        let kp = ask_path(theme, "Path for the new Kyber seed (.kyber) file")?;
+        if kp.exists() {
+            return Err(format!("{} already exists", kp.display()).into());
+        }
+        let pw = ask_new_passphrase(theme, "Seed-file passphrase")?;
+        (Some(kp), Some(pw))
+    } else {
+        (None, None)
+    };
+    let new_pw = if factors.has_passphrase() {
+        Some(ask_new_passphrase(theme, "New slot passphrase")?)
+    } else {
+        None
+    };
+
+    // FIDO2 half: fresh credential + hmac_secret, same as
+    // enroll_tpm2_fido2_into.
+    let fido2 = if factors.has_fido2() {
+        use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+        use rand_core::{OsRng, RngCore};
+        let pin = wizard_prompt_fido2_pin(theme)?;
+        let mut auth = crate::make_fido2_authenticator();
+        let user_handle = random_user_handle()?;
+        eprintln!("Touch your FIDO2 authenticator to register a new credential...");
+        let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
+        let cred_id = er.credential.id;
+        let mut hmac_salt = [0u8; 32];
+        OsRng.fill_bytes(&mut hmac_salt);
+        eprintln!("Touch again to derive the FIDO2 half...");
+        let hmac_secret: [u8; 32] =
+            *auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
+        Some((cred_id, hmac_salt, hmac_secret))
+    } else {
+        None
+    };
+
+    eprintln!("sealing SEP half under the local Secure Enclave...");
+    let (sep_shared, blob) = sealer.seal().map_err(|e| format!("SEP seal: {e}"))?;
+    let blob_bytes = blob.to_bytes();
+
+    let pq = match params {
+        Some(p) => {
+            eprintln!("generating ML-KEM keypair...");
+            let (pk, seed) = keygen_with(p);
+            let (ct, pq_shared) =
+                encapsulate_with(p, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
+            Some((p, pk, seed, ct, pq_shared))
+        }
+        None => None,
+    };
+
+    let hmac_secret_ref = fido2.as_ref().map(|(_, _, hs)| hs);
+    let passphrase_ref = new_pw.as_ref().map(|p| p.as_bytes());
+    let pq_shared_ref = pq.as_ref().map(|(_, _, _, _, s)| &**s);
+    let cred_id_ref: &[u8] = fido2
+        .as_ref()
+        .map(|(cred, _, _)| cred.as_slice())
+        .unwrap_or(&[]);
+    let hmac_salt = fido2.as_ref().map(|(_, s, _)| *s).unwrap_or([0u8; 32]);
+
+    let idx = c.enroll_sep(
+        kind,
+        &sep_shared,
+        &blob_bytes,
+        hmac_secret_ref,
+        passphrase_ref,
+        kdf_params(),
+        pq_shared_ref,
+        cred_id_ref,
+        hmac_salt,
+    )?;
+
+    match pq {
+        None => {
+            c.persist_header()?;
+            println!("OK enrolled {kind:?} keyslot in slot {idx}");
+        }
+        Some((p, pk, seed, ct, _)) => {
+            c.persist_header()?;
+            let sidecar = hybrid_sidecar::sidecar_path(vault);
+            let mut entries = if sidecar.exists() {
+                hybrid_sidecar::read(&sidecar)
+                    .map_err(|e| format!("read existing hybrid sidecar: {e}"))?
+            } else {
+                Vec::new()
+            };
+            entries.push(HybridEntry {
+                slot_idx: idx as u8,
+                level: p,
+                pubkey: pk,
+                ciphertext: ct,
+            });
+            hybrid_sidecar::write(&sidecar, &entries)
+                .map_err(|e| format!("write hybrid sidecar: {e}"))?;
+            let kyber_path = kyber_path.expect("hybrid implies a kyber path");
+            let seed_pw = seed_pw.expect("hybrid implies a seed passphrase");
+            seed_file::write(
+                &kyber_path,
+                &seed,
+                seed_pw.as_bytes(),
+                seed_file::KdfParams::default(),
+            )
+            .map_err(|e| format!("write kyber seed: {e}"))?;
+            println!(
+                "OK enrolled {kind:?} keyslot in slot {idx}\n  \
+                 Kyber seed: {} (MOVE TO SEPARATE STORAGE - lose it = lose this slot)",
+                kyber_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "hardware"))]
+fn enroll_sep_fused_into(
+    _theme: &ColorfulTheme,
+    _c: &mut Container,
+    _vault: &Path,
+    _factors: crate::SepFactors,
+    _params: Option<luksbox_pq::PqParams>,
+) -> Result<()> {
+    Err("fused Secure Enclave enroll requires --features hardware".into())
+}
+
 #[cfg(feature = "hardware")]
 fn enroll_tpm2_pin_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     use luksbox_tpm::Tpm2Sealer;
@@ -6041,6 +6879,248 @@ fn unlock_via_tpm2(
     _header: &Header,
 ) -> Result<Container> {
     Err("TPM 2.0 support not compiled in".into())
+}
+
+/// Generalized macOS Secure Enclave unlock. Iterates every SEP slot
+/// whose factor profile matches (`want_fido2` / `want_pq`; the
+/// passphrase factor is auto-detected per-slot), collects the
+/// matching extra factors, and hands `Container::open` an
+/// `UnlockMaterial::Sep` whose factor set the core dispatcher uses to
+/// pick the right slot. The wizard analog of `crate::open_sep_common`.
+#[cfg(feature = "hardware")]
+fn unlock_via_sep_common(
+    theme: &ColorfulTheme,
+    vault: &Path,
+    header_path: Option<&Path>,
+    header: &Header,
+    want_fido2: bool,
+    want_pq: bool,
+) -> Result<Container> {
+    use luksbox_sep::{SepBlob, SepSealer};
+
+    // Hybrid kinds: load the .kyber seed + sidecar once.
+    let pq_ctx = if want_pq {
+        use luksbox_format::hybrid_sidecar;
+        use luksbox_pq::seed_file;
+        let kyber_path = ask_path(theme, "Path to the Kyber seed (.kyber) file")?;
+        if !kyber_path.is_file() {
+            return Err(format!("{} is not a file", kyber_path.display()).into());
+        }
+        let seed_pw = zeroize::Zeroizing::new(
+            Password::with_theme(theme)
+                .with_prompt(".kyber seed-file passphrase")
+                .interact()?,
+        );
+        let seed = seed_file::read(&kyber_path, seed_pw.as_bytes())
+            .map_err(|e| format!("read kyber seed: {e}"))?;
+        let sidecar_path = hybrid_sidecar::sidecar_path(vault);
+        let entries = hybrid_sidecar::read(&sidecar_path)
+            .map_err(|e| format!("read hybrid sidecar at {}: {e}", sidecar_path.display()))?;
+        Some((seed, entries))
+    } else {
+        None
+    };
+
+    // Prompt the slot passphrase once if any matching slot needs it.
+    let needs_pp = header.keyslots.iter().any(|s| {
+        s.kind.is_sep()
+            && s.kind.is_sep_passphrase()
+            && s.kind.is_hybrid_pq() == want_pq
+            && s.kind.is_sep_fido2() == want_fido2
+    });
+    let passphrase = if needs_pp {
+        Some(zeroize::Zeroizing::new(
+            Password::with_theme(theme)
+                .with_prompt("Slot passphrase")
+                .interact()?,
+        ))
+    } else {
+        None
+    };
+
+    // FIDO2 PIN once if we're collecting FIDO2 halves.
+    let fido2_pin = if want_fido2 {
+        fido2_preflight()?;
+        Some(wizard_prompt_fido2_pin(theme)?)
+    } else {
+        None
+    };
+
+    let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
+    let mut last_err: Option<String> = None;
+
+    for (idx, slot) in header.keyslots.iter().enumerate() {
+        if !slot.kind.is_sep()
+            || slot.kind.is_hybrid_pq() != want_pq
+            || slot.kind.is_sep_fido2() != want_fido2
+        {
+            continue;
+        }
+
+        // PQ shared secret for this slot.
+        let pq = match &pq_ctx {
+            Some((seed, entries)) => {
+                use luksbox_format::hybrid_sidecar;
+                let entry = match hybrid_sidecar::find(entries, idx as u8) {
+                    Some(e) => e,
+                    None => {
+                        last_err = Some(format!("no hybrid sidecar entry for slot {idx}"));
+                        continue;
+                    }
+                };
+                match luksbox_pq::decapsulate_with(entry.level, seed, &entry.ciphertext) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        last_err = Some(format!("decap slot {idx}: {e}"));
+                        continue;
+                    }
+                }
+            }
+            None => None,
+        };
+
+        // FIDO2 hmac-secret for this slot (derived from stored cred_id).
+        let hmac_secret = if want_fido2 {
+            let pin = fido2_pin.as_ref().expect("want_fido2 implies a PIN");
+            match wizard_sep_fido2_hmac(slot, pin) {
+                Ok(hs) => Some(hs),
+                Err(e) => {
+                    last_err = Some(format!("FIDO2 slot {idx}: {e}"));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut unseal = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
+            let sb = SepBlob::from_bytes(blob).map_err(|e| e.to_string())?;
+            let s = sealer.unseal(&sb).map_err(|e| e.to_string())?;
+            let mut out = [0u8; 32];
+            out.copy_from_slice(s.as_slice());
+            Ok(out)
+        };
+
+        match Container::open(
+            vault,
+            header_path,
+            UnlockMaterial::Sep {
+                unseal: &mut unseal,
+                hmac_secret: hmac_secret.as_ref(),
+                passphrase: passphrase.as_ref().map(|p| p.as_bytes()),
+                pq_shared: pq.as_deref(),
+            },
+        ) {
+            Ok(c) => return Ok(c),
+            Err(e) => last_err = Some(format!("open slot {idx}: {e}")),
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| "no matching Secure Enclave slot opened".into())
+        .into())
+}
+
+/// Derive the FIDO2 hmac-secret half for a SEP+FIDO2 slot in the
+/// wizard, from the slot's stored cred_id + hmac_salt.
+#[cfg(feature = "hardware")]
+fn wizard_sep_fido2_hmac(
+    slot: &luksbox_core::Keyslot,
+    pin: &str,
+) -> std::result::Result<[u8; 32], String> {
+    use luksbox_fido2::{Fido2Authenticator, RP_ID};
+    let cred = &slot.fido2_cred_id;
+    if cred.is_empty() {
+        return Err("SEP+FIDO2 slot has no stored cred_id".into());
+    }
+    let mut auth = crate::make_fido2_authenticator();
+    eprintln!("Touch your FIDO2 authenticator to unlock the SEP+FIDO2 slot...");
+    let prehash_first = slot.fido2_salt_prehashed();
+    for prehash in [prehash_first, !prehash_first] {
+        if let Ok(hs) = auth.hmac_secret(RP_ID, cred, &slot.fido2_hmac_salt, prehash, Some(pin)) {
+            return Ok(*hs);
+        }
+    }
+    Err("FIDO2 hmac-secret derivation failed".into())
+}
+
+#[cfg(feature = "hardware")]
+fn unlock_via_sep(
+    theme: &ColorfulTheme,
+    vault: &Path,
+    header_path: Option<&Path>,
+    header: &Header,
+) -> Result<Container> {
+    unlock_via_sep_common(theme, vault, header_path, header, false, false)
+}
+
+#[cfg(feature = "hardware")]
+fn unlock_via_sep_fido2(
+    theme: &ColorfulTheme,
+    vault: &Path,
+    header_path: Option<&Path>,
+    header: &Header,
+) -> Result<Container> {
+    unlock_via_sep_common(theme, vault, header_path, header, true, false)
+}
+
+#[cfg(feature = "hardware")]
+fn unlock_via_hybrid_pq_sep(
+    theme: &ColorfulTheme,
+    vault: &Path,
+    header_path: Option<&Path>,
+    header: &Header,
+) -> Result<Container> {
+    unlock_via_sep_common(theme, vault, header_path, header, false, true)
+}
+
+#[cfg(feature = "hardware")]
+fn unlock_via_hybrid_pq_sep_fido2(
+    theme: &ColorfulTheme,
+    vault: &Path,
+    header_path: Option<&Path>,
+    header: &Header,
+) -> Result<Container> {
+    unlock_via_sep_common(theme, vault, header_path, header, true, true)
+}
+
+#[cfg(not(feature = "hardware"))]
+fn unlock_via_sep(
+    _theme: &ColorfulTheme,
+    _vault: &Path,
+    _header_path: Option<&Path>,
+    _header: &Header,
+) -> Result<Container> {
+    Err("Secure Enclave support not compiled in".into())
+}
+
+#[cfg(not(feature = "hardware"))]
+fn unlock_via_sep_fido2(
+    _theme: &ColorfulTheme,
+    _vault: &Path,
+    _header_path: Option<&Path>,
+    _header: &Header,
+) -> Result<Container> {
+    Err("Secure Enclave support not compiled in".into())
+}
+
+#[cfg(not(feature = "hardware"))]
+fn unlock_via_hybrid_pq_sep(
+    _theme: &ColorfulTheme,
+    _vault: &Path,
+    _header_path: Option<&Path>,
+    _header: &Header,
+) -> Result<Container> {
+    Err("hybrid-pq-sep unlock requires --features hardware".into())
+}
+
+#[cfg(not(feature = "hardware"))]
+fn unlock_via_hybrid_pq_sep_fido2(
+    _theme: &ColorfulTheme,
+    _vault: &Path,
+    _header_path: Option<&Path>,
+    _header: &Header,
+) -> Result<Container> {
+    Err("hybrid-pq-sep unlock requires --features hardware".into())
 }
 
 #[cfg(feature = "hardware")]

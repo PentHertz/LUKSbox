@@ -112,6 +112,9 @@ enum Factor {
     Passphrase,
     Fido2,
     Tpm2,
+    /// macOS Secure Enclave (SEP). Only shown on macOS in the create
+    /// picker, mirroring how Tpm2 is Linux-gated.
+    Sep,
 }
 impl Factor {
     fn label(self) -> &'static str {
@@ -119,6 +122,7 @@ impl Factor {
             Self::Passphrase => "Passphrase only",
             Self::Fido2 => "FIDO2 authenticator",
             Self::Tpm2 => "TPM 2.0 (this machine)",
+            Self::Sep => "Secure Enclave (this Mac)",
         }
     }
 }
@@ -158,6 +162,18 @@ enum CreateKind {
     HybridPqTpm2Fido2,
     /// 3-factor: hybrid PQ + TPM + FIDO2 (ML-KEM-1024).
     HybridPq1024Tpm2Fido2,
+    /// Secure Enclave bootstrap (macOS). The vault is created with a
+    /// backup passphrase first (kept as recovery), then the SEP slot
+    /// is added and moved to slot 0.
+    Sep,
+    /// Secure Enclave + Touch ID bootstrap (macOS). Same pattern as
+    /// `Sep`; unlock requires a Touch ID prompt.
+    SepBiometric,
+    /// Hybrid PQ + Secure Enclave bootstrap (ML-KEM-768). Requires the
+    /// .kyber seed file + seed-file passphrase + the local SEP.
+    HybridPqSep,
+    /// Hybrid PQ + Secure Enclave bootstrap (ML-KEM-1024).
+    HybridPqSep1024,
 }
 impl CreateKind {
     fn to_arg(self) -> SlotKindArg {
@@ -180,7 +196,21 @@ impl CreateKind {
             | Self::HybridPq1024Tpm2
             | Self::HybridPqTpm2Fido2
             | Self::HybridPq1024Tpm2Fido2 => SlotKindArg::Passphrase,
+            // SEP kinds bootstrap as Passphrase too: the vault is
+            // created with the backup passphrase, then the SEP slot is
+            // added in a follow-on step (create_vault_with_sep_bootstrap).
+            Self::Sep | Self::SepBiometric | Self::HybridPqSep | Self::HybridPqSep1024 => {
+                SlotKindArg::Passphrase
+            }
         }
+    }
+    /// True for any of the SEP-bootstrap kinds, used to gate the
+    /// recovery-warning panel and the post-create SEP-add follow-up.
+    fn is_sep_bootstrap(self) -> bool {
+        matches!(
+            self,
+            Self::Sep | Self::SepBiometric | Self::HybridPqSep | Self::HybridPqSep1024
+        )
     }
     /// True for any of the TPM-bootstrap kinds, used to gate the
     /// recovery-warning panel and the post-create TPM-add follow-up.
@@ -212,6 +242,9 @@ impl CreateKind {
             | Self::HybridPq1024Tpm2
             | Self::HybridPqTpm2Fido2
             | Self::HybridPq1024Tpm2Fido2 => Factor::Tpm2,
+            Self::Sep | Self::SepBiometric | Self::HybridPqSep | Self::HybridPqSep1024 => {
+                Factor::Sep
+            }
         }
     }
     /// True iff the kind needs a FIDO2 touch (and prompts for a FIDO2 PIN).
@@ -607,6 +640,31 @@ impl AddHybridTpm2Form {
     }
 }
 
+/// State for the "Add hybrid Secure Enclave + ML-KEM" modal (macOS).
+/// Captures the destination .kyber path (kept on separate trusted
+/// storage) and the passphrase that encrypts that file at rest.
+/// `kem_size` is 768 or 1024. Mirrors `AddHybridTpm2Form` minus the
+/// deniable extras (SEP has no deniable variant).
+struct AddHybridSepForm {
+    kyber_path: String,
+    seed_pw: Zeroizing<String>,
+    seed_pw_confirm: Zeroizing<String>,
+    kem_size: u16,
+}
+
+impl AddHybridSepForm {
+    // Only called from the macOS-only modal triggers in `update`.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    fn new(kem_size: u16) -> Self {
+        Self {
+            kyber_path: String::new(),
+            seed_pw: Zeroizing::default(),
+            seed_pw_confirm: Zeroizing::default(),
+            kem_size,
+        }
+    }
+}
+
 /// Which submit path triggered the empty-passphrase warning modal.
 /// On confirm we re-fire the matching submit with the bypass flag
 /// set; on cancel we just clear the state and let the user keep
@@ -769,6 +827,14 @@ enum Pending {
     EnrollHybridPqTpm2Fido2 {
         rx: Receiver<VaultRet<usize>>,
     },
+    /// macOS Secure Enclave enroll (plain or biometric).
+    EnrollSep {
+        rx: Receiver<VaultRet<usize>>,
+    },
+    /// Hybrid Secure Enclave + ML-KEM enroll.
+    EnrollHybridPqSep {
+        rx: Receiver<VaultRet<usize>>,
+    },
     /// Non-TPM hybrid: passphrase + ML-KEM. Worker generates a
     /// Kyber keypair, installs the slot, writes the .hybrid
     /// sidecar entry and the .kyber seed file.
@@ -841,6 +907,10 @@ impl Pending {
             Pending::EnrollHybridPqTpm2 { .. } => {
                 "hybrid TPM + ML-KEM enroll: sealing TPM half + generating Kyber keypair..."
                     .to_string()
+            }
+            Pending::EnrollSep { .. } => "sealing key under the Secure Enclave...".to_string(),
+            Pending::EnrollHybridPqSep { .. } => {
+                "sealing key under the Secure Enclave + ML-KEM...".to_string()
             }
             Pending::EnrollHybridPqTpm2Fido2 { .. } => {
                 format!("3-factor TPM+FIDO2+ML-KEM enroll - {auth_verb} + TPM seal + Kyber keygen")
@@ -1007,6 +1077,10 @@ pub struct LuksboxApp {
     /// shared secret derive the slot KEK. Available on every
     /// platform with FIDO2 hardware support.
     add_hybrid_pq_fido2_modal: Option<AddHybridPqFido2Form>,
+    /// Form state for the "Add hybrid Secure Enclave + ML-KEM(-1024)"
+    /// modal (macOS). Captures the destination .kyber path + seed-file
+    /// passphrase + the chosen ML-KEM size (768 / 1024).
+    add_hybrid_sep_modal: Option<AddHybridSepForm>,
     /// When a TPM-bootstrap CreateKind was selected, the create flow
     /// first creates the vault with a passphrase; once that succeeds
     /// and the vault is installed in `self.vault`, this field triggers
@@ -1343,6 +1417,7 @@ impl LuksboxApp {
             add_hybrid_tpm2_fido2_modal: None,
             add_hybrid_pq_modal: None,
             add_hybrid_pq_fido2_modal: None,
+            add_hybrid_sep_modal: None,
             empty_passphrase_confirm: None,
             rotate_modal: None,
             mkdir_input: None,
@@ -1503,6 +1578,9 @@ impl LuksboxApp {
                             form.kyber_path = s2.clone();
                         }
                         if let Some(form) = self.add_hybrid_pq_fido2_modal.as_mut() {
+                            form.kyber_path = s.clone();
+                        }
+                        if let Some(form) = self.add_hybrid_sep_modal.as_mut() {
                             form.kyber_path = s;
                         }
                     }
@@ -1977,6 +2055,39 @@ impl LuksboxApp {
                     self.pending = Some(Pending::EnrollHybridPqTpm2Fido2 { rx });
                 }
                 Err(_) => self.toast_err("3-factor enroll task crashed"),
+            },
+            Pending::EnrollSep { rx } => match rx.try_recv() {
+                Ok((vault, result)) => {
+                    match result {
+                        Ok(idx) => {
+                            self.toast_ok(format!("enrolled Secure Enclave in slot {idx}"));
+                        }
+                        Err(e) => self.toast_err(e),
+                    }
+                    self.vault = Some(vault);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Pending::EnrollSep { rx });
+                }
+                Err(_) => self.toast_err("Secure Enclave enroll task crashed"),
+            },
+            Pending::EnrollHybridPqSep { rx } => match rx.try_recv() {
+                Ok((mut vault, result)) => {
+                    match result {
+                        Ok(idx) => {
+                            vault.has_hybrid_pq = true;
+                            self.toast_ok(format!(
+                                "enrolled hybrid Secure Enclave + ML-KEM in slot {idx}"
+                            ));
+                        }
+                        Err(e) => self.toast_err(e),
+                    }
+                    self.vault = Some(vault);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Pending::EnrollHybridPqSep { rx });
+                }
+                Err(_) => self.toast_err("hybrid Secure Enclave + ML-KEM enroll task crashed"),
             },
             Pending::EnrollHybridPqPassphrase { rx } => match rx.try_recv() {
                 Ok((mut vault, result)) => {
@@ -3135,11 +3246,17 @@ impl LuksboxApp {
                 ui.radio_value(&mut factor, Factor::Fido2, Factor::Fido2.label());
                 #[cfg(target_os = "linux")]
                 ui.radio_value(&mut factor, Factor::Tpm2, Factor::Tpm2.label());
+                // Secure Enclave: macOS only, mirroring the Linux-only
+                // TPM radio above.
+                if cfg!(target_os = "macos") {
+                    ui.radio_value(&mut factor, Factor::Sep, Factor::Sep.label());
+                }
                 if factor != prev {
                     self.create.kind = match factor {
                         Factor::Passphrase => CreateKind::Passphrase,
                         Factor::Fido2 => CreateKind::Fido2,
                         Factor::Tpm2 => CreateKind::Tpm2,
+                        Factor::Sep => CreateKind::Sep,
                     };
                 }
             });
@@ -3190,6 +3307,16 @@ impl LuksboxApp {
                         ui.radio_value(&mut self.create.kind, CreateKind::HybridPq1024Tpm2Fido2,
                             "3-factor: TPM 2.0 + FIDO2 + ML-KEM-1024. Strongest configuration.");
                     }
+                    Factor::Sep => {
+                        ui.radio_value(&mut self.create.kind, CreateKind::Sep,
+                            "Secure Enclave, wrap key sealed under this Mac's Secure Enclave. Bootstrap passphrase REQUIRED (also acts as recovery if the Mac is lost).");
+                        ui.radio_value(&mut self.create.kind, CreateKind::SepBiometric,
+                            "Secure Enclave + Touch ID, unseal requires a Touch ID prompt at every unlock. Bootstrap passphrase kept as recovery.");
+                        ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSep,
+                            "Hybrid Secure Enclave + ML-KEM-768. PQ + Mac-bound. .kyber seed file required.");
+                        ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSep1024,
+                            "Hybrid Secure Enclave + ML-KEM-1024. Strongest 2-factor PQ + Secure Enclave.");
+                    }
                 }
             });
 
@@ -3216,6 +3343,34 @@ impl LuksboxApp {
                             "Hybrid TPM + ML-KEM (post-quantum) variants require a separate \
                              .kyber seed file; create the vault with one of the kinds above, \
                              then use Manage Keyslots -> Add hybrid TPM to bring those in.",
+                        )
+                        .color(theme::FAINT)
+                        .size(11.0),
+                    );
+                });
+            }
+
+            // SEP-bootstrap recovery warning panel. Shown only when a
+            // Secure Enclave kind is selected; mirrors the TPM panel.
+            if self.create.kind.is_sep_bootstrap() {
+                section(ui, "Secure Enclave bootstrap recovery", |ui| {
+                    ui.label(
+                        RichText::new(
+                            "Secure Enclave keyslots ONLY open on the Mac that sealed them. \
+                             If the machine is lost or wiped, that slot is gone. To stay \
+                             recoverable, this flow keeps the backup passphrase as slot 0 by \
+                             default. You can revoke it later (Manage Keyslots -> Revoke) once \
+                             you've added a second backup, but DO NOT skip the backup \
+                             passphrase below.",
+                        )
+                        .color(theme::WARN)
+                        .size(12.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(
+                            "Hybrid Secure Enclave + ML-KEM (post-quantum) variants require a \
+                             separate .kyber seed file; pick a path for it below.",
                         )
                         .color(theme::FAINT)
                         .size(11.0),
@@ -3967,6 +4122,106 @@ impl LuksboxApp {
                         }
                     });
                 }
+                CreateKind::Sep | CreateKind::SepBiometric => {
+                    let title = if self.create.kind == CreateKind::SepBiometric {
+                        "Secure Enclave + Touch ID"
+                    } else {
+                        "Secure Enclave"
+                    };
+                    section(ui, title, |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Bootstrap passphrase (REQUIRED, also acts as recovery path if \
+                                 the Mac is lost)",
+                            )
+                            .color(theme::WARN)
+                            .size(12.0),
+                        );
+                        let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
+                            .password(true);
+                        ui.add_sized([form_width(ui), CONTROL_H], te);
+                        strength_meter(ui, &self.create.passphrase);
+                        ui.add_space(6.0);
+                        if ui
+                            .add_sized(
+                                [form_width(ui), CONTROL_H],
+                                ghost_button("Generate strong passphrase..."),
+                            )
+                            .clicked()
+                        {
+                            self.open_passgen(PassgenTarget::CreatePrimary);
+                        }
+                        ui.label(
+                            RichText::new(
+                                "After the vault is created, the Secure Enclave keyslot will be \
+                                 added automatically. macOS only; requires a Secure Enclave.",
+                            )
+                            .color(theme::FAINT)
+                            .size(12.0),
+                        );
+                    });
+                }
+                CreateKind::HybridPqSep | CreateKind::HybridPqSep1024 => {
+                    let title = if self.create.kind == CreateKind::HybridPqSep1024 {
+                        "Hybrid Secure Enclave + ML-KEM-1024"
+                    } else {
+                        "Hybrid Secure Enclave + ML-KEM-768"
+                    };
+                    section(ui, title, |ui| {
+                        ui.label(
+                            RichText::new(
+                                "Bootstrap passphrase (REQUIRED, also acts as recovery path if \
+                                 the Mac is lost)",
+                            )
+                            .color(theme::WARN)
+                            .size(12.0),
+                        );
+                        let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
+                            .password(true);
+                        ui.add_sized([form_width(ui), CONTROL_H], te);
+                        strength_meter(ui, &self.create.passphrase);
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new(
+                                "Seed-file passphrase (encrypts the .kyber seed at rest. Leave \
+                                 blank to reuse the bootstrap passphrase above.)",
+                            )
+                            .color(theme::DIM)
+                            .size(12.0),
+                        );
+                        let te = egui::TextEdit::singleline(&mut *self.create.hybrid_seed_pw)
+                            .password(true);
+                        ui.add_sized([form_width(ui), CONTROL_H], te);
+                        ui.add_space(10.0);
+                        ui.label(
+                            RichText::new(
+                                "Path to write the secret .kyber seed file (KEEP ON SEPARATE \
+                                 STORAGE, USB stick. Lose the Mac OR the seed = lose this slot.)",
+                            )
+                            .color(theme::WARN)
+                            .size(12.0),
+                        );
+                        ui.add_sized(
+                            [form_width(ui), CONTROL_H],
+                            egui::TextEdit::singleline(&mut self.create.hybrid_kyber_path)
+                                .hint_text(path_hints::usb("vault.kyber")),
+                        );
+                        ui.add_space(4.0);
+                        if ui
+                            .add_sized(
+                                [form_width(ui), CONTROL_H],
+                                ghost_button("Browse for .kyber save location..."),
+                            )
+                            .clicked()
+                        {
+                            self.start_save_picker(
+                                "Where to save the Kyber seed",
+                                "vault.kyber",
+                                PickerTarget::CreateHybridKyber,
+                            );
+                        }
+                    });
+                }
             }
 
             // KDF strength only matters for kinds that stretch a
@@ -4410,6 +4665,57 @@ impl LuksboxApp {
             return;
         }
 
+        // SEP-bootstrap path: mirror the TPM path. Pre-flight the
+        // enclave so a missing-SEP failure surfaces BEFORE we touch
+        // disk, then dispatch the atomic create+enroll worker that
+        // rolls back the vault on failure.
+        let sep_bootstrap_kind: Option<ops::SepBootstrapKind> = match self.create.kind {
+            CreateKind::Sep => Some(ops::SepBootstrapKind::Sep),
+            CreateKind::SepBiometric => Some(ops::SepBootstrapKind::SepBiometric),
+            CreateKind::HybridPqSep | CreateKind::HybridPqSep1024 => {
+                if self.create.hybrid_kyber_path.trim().is_empty() {
+                    self.toast_err("hybrid SEP kind requires a path for the .kyber seed file");
+                    return;
+                }
+                let kem_size = if self.create.kind == CreateKind::HybridPqSep1024 {
+                    1024
+                } else {
+                    768
+                };
+                // Seed-file passphrase: prefer the explicit
+                // `hybrid_seed_pw` field if the user filled it; fall
+                // back to the bootstrap passphrase from
+                // `opts.passphrase` otherwise.
+                let seed_pw = {
+                    let explicit = std::mem::take(&mut self.create.hybrid_seed_pw);
+                    if !explicit.is_empty() {
+                        explicit
+                    } else {
+                        opts.passphrase
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(|| zeroize::Zeroizing::new(String::new()))
+                    }
+                };
+                Some(ops::SepBootstrapKind::HybridPqSep {
+                    kyber_path: PathBuf::from(self.create.hybrid_kyber_path.trim()),
+                    seed_pw,
+                    kem_size,
+                })
+            }
+            _ => None,
+        };
+
+        if let Some(kind) = sep_bootstrap_kind {
+            if let Err(e) = ops::pre_check_sep() {
+                self.toast_err(e);
+                return;
+            }
+            let rx = ops::spawn(move || ops::create_vault_with_sep_bootstrap(opts, kind));
+            self.pending = Some(Pending::CreateWithTpmBootstrap { rx, needs_touch });
+            return;
+        }
+
         let rx = ops::spawn(move || ops::create_vault(opts));
         self.pending = Some(Pending::Create { rx, needs_touch });
     }
@@ -4801,12 +5107,27 @@ impl LuksboxApp {
                     "Hybrid TPM 2.0 + FIDO2 + ML-KEM (3 factors)",
                 );
             }
+            // Secure Enclave unlock options: macOS only, mirroring the
+            // Linux-only TPM radios above.
+            if cfg!(target_os = "macos") {
+                ui.radio_value(
+                    &mut self.unlock.method,
+                    UnlockMethod::Sep,
+                    "Secure Enclave (this Mac; Touch ID prompt for biometric slots)",
+                );
+                ui.radio_value(
+                    &mut self.unlock.method,
+                    UnlockMethod::HybridPqSep,
+                    "Hybrid Secure Enclave + ML-KEM (PQ + Mac-bound)",
+                );
+            }
             if matches!(
                 self.unlock.method,
                 UnlockMethod::HybridPq
                     | UnlockMethod::HybridPqFido2
                     | UnlockMethod::HybridPqTpm2
                     | UnlockMethod::HybridPqTpm2Fido2
+                    | UnlockMethod::HybridPqSep
             ) {
                 ui.label(
                     RichText::new(
@@ -5252,6 +5573,68 @@ impl LuksboxApp {
                     );
                 });
             }
+            UnlockMethod::Sep => {
+                section(ui, "Secure Enclave", |ui| {
+                    ui.label(
+                        RichText::new(
+                            "No passphrase needed - this Mac's Secure Enclave will unseal the \
+                             wrap key. Biometric slots prompt for Touch ID.",
+                        )
+                        .color(theme::FAINT)
+                        .size(12.0),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new("macOS only. Only opens on the Mac that sealed the slot.")
+                            .color(theme::FAINT)
+                            .size(11.0),
+                    );
+                });
+            }
+            UnlockMethod::HybridPqSep => {
+                section(ui, "Hybrid Secure Enclave + ML-KEM", |ui| {
+                    ui.label(
+                        RichText::new("Seed-file passphrase (encrypts the .kyber seed)")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    let te =
+                        egui::TextEdit::singleline(&mut *self.unlock.passphrase).password(true);
+                    ui.add_sized([form_width(ui), CONTROL_H], te);
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Path to the .kyber seed file")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    ui.horizontal(|ui| {
+                        let (field_w, browse_w) = trailing_button_row_widths(ui, 400.0, 90.0);
+                        ui.add_sized(
+                            [field_w, CONTROL_H],
+                            egui::TextEdit::singleline(&mut self.unlock.hybrid_kyber_path)
+                                .hint_text(path_hints::usb("vault.kyber")),
+                        );
+                        if ui
+                            .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
+                            .clicked()
+                        {
+                            self.start_open_picker(
+                                "Kyber seed file",
+                                PickerTarget::UnlockHybridKyber,
+                            );
+                        }
+                    });
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "Two factors: this Mac's Secure Enclave AND the .kyber seed file. \
+                             Closes the quantum-attack gap of plain Secure Enclave.",
+                        )
+                        .color(theme::FAINT)
+                        .size(12.0),
+                    );
+                });
+            }
         }
     }
 
@@ -5287,6 +5670,7 @@ impl LuksboxApp {
                         | UnlockMethod::HybridPqFido2
                         | UnlockMethod::HybridPqTpm2
                         | UnlockMethod::HybridPqTpm2Fido2
+                        | UnlockMethod::HybridPqSep
                 ) {
                 Some(std::mem::take(&mut self.unlock.passphrase))
             } else {
@@ -5310,6 +5694,7 @@ impl LuksboxApp {
                     | UnlockMethod::HybridPqFido2
                     | UnlockMethod::HybridPqTpm2
                     | UnlockMethod::HybridPqTpm2Fido2
+                    | UnlockMethod::HybridPqSep
             ) {
                 if self.unlock.hybrid_kyber_path.trim().is_empty() {
                     self.toast_err("hybrid mode requires the .kyber seed file path");
@@ -6216,6 +6601,35 @@ impl LuksboxApp {
                                     SlotKind::HybridPqKem1024Tpm2Fido2 => {
                                         "tpm2 + fido2 + ML-KEM-1024"
                                     }
+                                    SlotKind::SepSealed => "secure enclave (macOS)",
+                                    SlotKind::SepSealedBiometric => "secure enclave + biometry",
+                                    SlotKind::HybridPqKemSep => "secure enclave + ML-KEM-768",
+                                    SlotKind::HybridPqKem1024Sep => {
+                                        "secure enclave + ML-KEM-1024"
+                                    }
+                                    SlotKind::SepFido2 => "secure enclave + FIDO2",
+                                    SlotKind::HybridPqKemSepFido2 => {
+                                        "secure enclave + FIDO2 + ML-KEM-768"
+                                    }
+                                    SlotKind::HybridPqKem1024SepFido2 => {
+                                        "secure enclave + FIDO2 + ML-KEM-1024"
+                                    }
+                                    SlotKind::SepPassphrase => "secure enclave + passphrase",
+                                    SlotKind::HybridPqKemSepPassphrase => {
+                                        "secure enclave + passphrase + ML-KEM-768"
+                                    }
+                                    SlotKind::HybridPqKem1024SepPassphrase => {
+                                        "secure enclave + passphrase + ML-KEM-1024"
+                                    }
+                                    SlotKind::SepFido2Passphrase => {
+                                        "secure enclave + FIDO2 + passphrase"
+                                    }
+                                    SlotKind::HybridPqKemSepFido2Passphrase => {
+                                        "secure enclave + FIDO2 + passphrase + ML-KEM-768"
+                                    }
+                                    SlotKind::HybridPqKem1024SepFido2Passphrase => {
+                                        "secure enclave + FIDO2 + passphrase + ML-KEM-1024"
+                                    }
                                 };
                                 let kc = match slot.kind {
                                     SlotKind::Empty => theme::FAINT,
@@ -6242,6 +6656,24 @@ impl LuksboxApp {
                                     | SlotKind::HybridPqKemTpm2Fido2
                                     | SlotKind::HybridPqKem1024Tpm2
                                     | SlotKind::HybridPqKem1024Tpm2Fido2 => theme::WARN,
+                                    // Secure Enclave: same trust tier
+                                    // as TPM/FIDO2 (hardware-bound);
+                                    // PQ-hybrid SEP variants use WARN
+                                    // like the other sidecar kinds.
+                                    SlotKind::SepSealed | SlotKind::SepSealedBiometric => {
+                                        theme::ACCENT
+                                    }
+                                    SlotKind::HybridPqKemSep
+                                    | SlotKind::HybridPqKem1024Sep
+                                    | SlotKind::SepFido2
+                                    | SlotKind::HybridPqKemSepFido2
+                                    | SlotKind::HybridPqKem1024SepFido2
+                                    | SlotKind::SepPassphrase
+                                    | SlotKind::HybridPqKemSepPassphrase
+                                    | SlotKind::HybridPqKem1024SepPassphrase
+                                    | SlotKind::SepFido2Passphrase
+                                    | SlotKind::HybridPqKemSepFido2Passphrase
+                                    | SlotKind::HybridPqKem1024SepFido2Passphrase => theme::WARN,
                                 };
                                 theme::pill(ui, RichText::new(kind_label).small().color(kc), kc);
                                 if !matches!(slot.kind, SlotKind::Empty) {
@@ -6626,6 +7058,100 @@ impl LuksboxApp {
                         self.toast_err(e);
                     } else {
                         self.add_hybrid_tpm2_fido2_modal = Some(AddHybridTpm2Fido2Form::new(1024));
+                    }
+                }
+
+                // Secure Enclave "Add keyslot" buttons only on macOS.
+                // Plain + biometric enroll directly (no modal); the
+                // hybrid variants open a modal to collect the .kyber
+                // path + seed-file passphrase. Each pre-flights the
+                // enclave before doing anything.
+                #[cfg(target_os = "macos")]
+                if ui
+                    .add_sized(
+                        [row_w, 32.0],
+                        ghost_button("+ Add Secure Enclave keyslot (this Mac)"),
+                    )
+                    .on_hover_text(
+                        "Adds a Secure Enclave-bound keyslot. The wrap key is sealed by this \
+                 Mac's Secure Enclave; no passphrase needed. macOS only. Only opens on the \
+                 Mac that sealed it - if the machine is lost or wiped, this slot is gone. \
+                 Keep a passphrase or other recovery keyslot.",
+                    )
+                    .clicked()
+                {
+                    if let Err(e) = ops::pre_check_sep() {
+                        self.toast_err(e);
+                    } else if let Some(v) = self.vault.take() {
+                        let (tx, rx) = std::sync::mpsc::channel::<VaultRet<usize>>();
+                        std::thread::spawn(move || {
+                            let mut v = v;
+                            let r = ops::enroll_sep(&mut v.vfs, false);
+                            let _ = tx.send((v, r));
+                        });
+                        self.pending = Some(Pending::EnrollSep { rx });
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                if ui
+                    .add_sized(
+                        [row_w, 32.0],
+                        ghost_button("+ Add Secure Enclave + Touch ID keyslot"),
+                    )
+                    .on_hover_text(
+                        "Adds a Secure Enclave keyslot that requires a Touch ID prompt at every \
+                 unlock. Same Mac-bound caveat as the plain Secure Enclave slot. Keep a \
+                 recovery keyslot.",
+                    )
+                    .clicked()
+                {
+                    if let Err(e) = ops::pre_check_sep() {
+                        self.toast_err(e);
+                    } else if let Some(v) = self.vault.take() {
+                        let (tx, rx) = std::sync::mpsc::channel::<VaultRet<usize>>();
+                        std::thread::spawn(move || {
+                            let mut v = v;
+                            let r = ops::enroll_sep(&mut v.vfs, true);
+                            let _ = tx.send((v, r));
+                        });
+                        self.pending = Some(Pending::EnrollSep { rx });
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                if ui
+                    .add_sized(
+                        [row_w, 32.0],
+                        ghost_button("+ Add hybrid Secure Enclave + ML-KEM-768 keyslot"),
+                    )
+                    .on_hover_text(
+                        "2-factor: this Mac's Secure Enclave AND a separate .kyber seed file \
+                 (kept on different storage from the .lbx). Closes the quantum-attack gap of \
+                 plain Secure Enclave.",
+                    )
+                    .clicked()
+                {
+                    if let Err(e) = ops::pre_check_sep() {
+                        self.toast_err(e);
+                    } else {
+                        self.add_hybrid_sep_modal = Some(AddHybridSepForm::new(768));
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                if ui
+                    .add_sized(
+                        [row_w, 32.0],
+                        ghost_button("+ Add hybrid Secure Enclave + ML-KEM-1024 keyslot"),
+                    )
+                    .on_hover_text(
+                        "Same 2-factor shape as the ML-KEM-768 variant but uses ML-KEM-1024 \
+                 (NIST Cat-5, AES-256-equivalent PQ strength).",
+                    )
+                    .clicked()
+                {
+                    if let Err(e) = ops::pre_check_sep() {
+                        self.toast_err(e);
+                    } else {
+                        self.add_hybrid_sep_modal = Some(AddHybridSepForm::new(1024));
                     }
                 }
 
@@ -8165,6 +8691,122 @@ impl LuksboxApp {
             self.add_hybrid_tpm2_modal = None;
         }
 
+        // Add hybrid Secure Enclave + ML-KEM modal (macOS). Mirrors the
+        // hybrid-TPM modal minus the deniable extras.
+        let mut close_hs = false;
+        let mut submit_hs = false;
+        let mut hs_err: Option<String> = None;
+        let mut open_hs_picker = false;
+        if let Some(form) = self.add_hybrid_sep_modal.as_mut() {
+            let title = format!(
+                "Add hybrid Secure Enclave + ML-KEM-{} keyslot",
+                form.kem_size
+            );
+            egui::Window::new(title)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .collapsible(false)
+                .resizable(false)
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new("Path for the new .kyber seed file")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    ui.horizontal(|ui| {
+                        let (field_w, browse_w) = trailing_button_row_widths(ui, 320.0, 90.0);
+                        ui.add_sized(
+                            [field_w, CONTROL_H],
+                            egui::TextEdit::singleline(&mut form.kyber_path)
+                                .hint_text(path_hints::usb("vault.kyber")),
+                        );
+                        if ui
+                            .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
+                            .clicked()
+                        {
+                            open_hs_picker = true;
+                        }
+                    });
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Seed-file passphrase (encrypts the .kyber at rest)")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    let te = egui::TextEdit::singleline(&mut *form.seed_pw).password(true);
+                    ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Confirm passphrase")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    let te = egui::TextEdit::singleline(&mut *form.seed_pw_confirm).password(true);
+                    ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "MOVE THIS FILE TO SEPARATE TRUSTED STORAGE (USB stick, offline \
+                             machine) so an attacker who steals the .lbx can't also grab the \
+                             seed. Lose the seed = lose this keyslot.",
+                        )
+                        .color(theme::WARN)
+                        .size(11.0),
+                    );
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.add(ghost_button("Cancel")).clicked() {
+                            close_hs = true;
+                        }
+                        if ui.add(primary_button("Enroll")).clicked() {
+                            if form.kyber_path.trim().is_empty() {
+                                hs_err = Some(".kyber path cannot be empty".into());
+                            } else if form.seed_pw.is_empty() {
+                                hs_err = Some("seed-file passphrase cannot be empty".into());
+                            } else if *form.seed_pw != *form.seed_pw_confirm {
+                                hs_err = Some("passphrases do not match".into());
+                            } else {
+                                submit_hs = true;
+                            }
+                        }
+                    });
+                });
+        }
+        if open_hs_picker {
+            self.start_save_picker(
+                "New .kyber seed file",
+                "vault.kyber",
+                PickerTarget::AddHybridKyber,
+            );
+        }
+        if let Some(e) = hs_err {
+            self.toast_err(e);
+        }
+        if submit_hs {
+            if let Some(form) = self.add_hybrid_sep_modal.take()
+                && let Some(v) = self.vault.take()
+            {
+                let kyber_path = std::path::PathBuf::from(form.kyber_path);
+                let seed_pw = form.seed_pw;
+                let kem_size = form.kem_size;
+                let vault_path = v.vault_path.clone();
+                let (tx, rx) = std::sync::mpsc::channel::<VaultRet<usize>>();
+                std::thread::spawn(move || {
+                    let mut v = v;
+                    let r = ops::enroll_hybrid_pq_sep(
+                        &mut v.vfs,
+                        &vault_path,
+                        &kyber_path,
+                        &seed_pw,
+                        kem_size,
+                    );
+                    let _ = tx.send((v, r));
+                });
+                self.pending = Some(Pending::EnrollHybridPqSep { rx });
+            }
+        } else if close_hs {
+            self.add_hybrid_sep_modal = None;
+        }
+
         // Add 3-factor TPM + FIDO2 + ML-KEM modal.
         let mut close_h3 = false;
         let mut submit_h3 = false;
@@ -9186,6 +9828,25 @@ impl LuksboxApp {
             SlotKind::HybridPqKemTpm2Fido2 => "hybrid TPM 2.0 + FIDO2 + ML-KEM-768",
             SlotKind::HybridPqKem1024Tpm2 => "hybrid TPM 2.0 + ML-KEM-1024",
             SlotKind::HybridPqKem1024Tpm2Fido2 => "hybrid TPM 2.0 + FIDO2 + ML-KEM-1024",
+            SlotKind::SepSealed => "Secure Enclave (machine-bound)",
+            SlotKind::SepSealedBiometric => "Secure Enclave + biometry",
+            SlotKind::HybridPqKemSep => "hybrid Secure Enclave + ML-KEM-768",
+            SlotKind::HybridPqKem1024Sep => "hybrid Secure Enclave + ML-KEM-1024",
+            SlotKind::SepFido2 => "Secure Enclave + FIDO2",
+            SlotKind::HybridPqKemSepFido2 => "hybrid Secure Enclave + FIDO2 + ML-KEM-768",
+            SlotKind::HybridPqKem1024SepFido2 => "hybrid Secure Enclave + FIDO2 + ML-KEM-1024",
+            SlotKind::SepPassphrase => "Secure Enclave + passphrase",
+            SlotKind::HybridPqKemSepPassphrase => "hybrid Secure Enclave + passphrase + ML-KEM-768",
+            SlotKind::HybridPqKem1024SepPassphrase => {
+                "hybrid Secure Enclave + passphrase + ML-KEM-1024"
+            }
+            SlotKind::SepFido2Passphrase => "Secure Enclave + FIDO2 + passphrase",
+            SlotKind::HybridPqKemSepFido2Passphrase => {
+                "hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-768"
+            }
+            SlotKind::HybridPqKem1024SepFido2Passphrase => {
+                "hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-1024"
+            }
         };
         let mut confirmed = false;
         let mut cancelled = false;

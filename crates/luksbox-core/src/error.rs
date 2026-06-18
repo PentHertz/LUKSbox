@@ -48,6 +48,9 @@ pub enum Error {
     #[error("no free keyslot")]
     NoFreeKeyslot,
 
+    #[error("in-header Secure Enclave region full")]
+    SepRegionFull,
+
     #[error("keyslot is empty")]
     EmptyKeyslot,
 

@@ -1,0 +1,29 @@
+[package]
+name = "luksbox-sep"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "macOS Secure Enclave-backed derive/unwrap of the LUKSbox Master Volume Key"
+
+[features]
+# Off by default so a default `cargo build` of the workspace needs no
+# Swift toolchain. macOS release builds enable it via `--features
+# hardware`. Like luksbox-tpm's `hardware`, this is a meta-feature: it
+# only DOES anything on macOS (the only platform with a Secure
+# Enclave). On every other target, enabling it is a no-op and the
+# source falls back to the `NotCompiledIn` stub. See
+# docs/SEP_KEYSLOT_DESIGN.md.
+default = []
+hardware = []
+
+[dependencies]
+zeroize = { workspace = true }
+thiserror = { workspace = true }
+# Used by the in-memory MockSepSealer (tests + adversary scenarios).
+# Not gated on `hardware`: the mock works on every platform without a
+# Secure Enclave or Swift toolchain.
+rand_core = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

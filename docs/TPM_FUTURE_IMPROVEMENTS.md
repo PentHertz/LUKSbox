@@ -170,6 +170,15 @@ required, despite the misconception.
 
 ## 2. macOS Secure Enclave (parity with Linux/Windows TPM)
 
+> **Superseded by `docs/SEP_KEYSLOT_DESIGN.md` (2026-06-18).** Spikes on
+> an Apple M2 with zero signing identities proved the dataRepresentation
+> path needs **no** Apple Developer enrollment and **no**
+> `keychain-access-groups` entitlement, so the "blocked on enrollment"
+> note below is wrong for the shipped design. The design doc also
+> resolves storage to a `.lbx.sep` sidecar (the SEP blob is 353–496 B
+> and does not fit the 352 B inline keyslot region). The notes below are
+> kept for historical context.
+
 The macOS analog is the Secure Enclave (SEP) on Apple Silicon and T2
 Intel Macs. Distinct from TPM in:
 

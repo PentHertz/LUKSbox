@@ -2496,6 +2496,7 @@ dependencies = [
  "luksbox-format",
  "luksbox-mount",
  "luksbox-pq",
+ "luksbox-sep",
  "luksbox-tpm",
  "luksbox-vfs",
  "rand_core 0.6.4",
@@ -2604,6 +2605,7 @@ dependencies = [
  "luksbox-format",
  "luksbox-mount",
  "luksbox-pq",
+ "luksbox-sep",
  "luksbox-tpm",
  "luksbox-vfs",
  "rand_core 0.6.4",
@@ -2652,6 +2654,16 @@ dependencies = [
  "rand_core 0.6.4",
  "sha2",
  "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
+name = "luksbox-sep"
+version = "0.3.1"
+dependencies = [
+ "rand_core 0.6.4",
  "tempfile",
  "thiserror 2.0.18",
  "zeroize",

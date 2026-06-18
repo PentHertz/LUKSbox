@@ -11,6 +11,7 @@ members = [
     "crates/luksbox-cli",
     "crates/luksbox-gui",
     "crates/luksbox-tpm",
+    "crates/luksbox-sep",
     "crates/luksbox-ct-bench",
 ]
 

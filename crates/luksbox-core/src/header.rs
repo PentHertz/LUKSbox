@@ -111,6 +111,27 @@ pub const FLAG_HAS_HEADER_MIRROR: u32 = 1 << 2;
 /// against the mirror behaves identically to one against the live region.
 pub const FLAG_HAS_METADATA_MIRROR: u32 = 1 << 3;
 
+/// Bit 4 of `Header::flags`. When set, the previously-RNG-filled
+/// reserved region between the keyslot array and the HMAC carries a
+/// structured **Secure Enclave region**: per-slot opaque SEP material
+/// (the CryptoKit `dataRepresentation` + ephemeral pubkey) for
+/// macOS SEP keyslot kinds, so SEP vaults need no external `.lbx.sep`
+/// sidecar. The region is HMAC-authenticated (it lives below
+/// `OFF_HMAC`), so a tamper flipping this bit or editing the region
+/// fails `verify_hmac`. Old binaries that predate this flag treated
+/// the region as random padding; a vault that sets the flag also
+/// carries SEP-kind keyslots those binaries already can't open, so
+/// there is no silent-misread hazard. See `docs/SEP_KEYSLOT_DESIGN.md`.
+pub const FLAG_HAS_SEP_REGION: u32 = 1 << 4;
+
+/// Start of the in-header Secure Enclave region: immediately after the
+/// keyslot array, reusing the bytes that are otherwise RNG padding.
+const OFF_SEP_REGION: usize = OFF_KEYSLOTS + MAX_KEYSLOTS * SLOT_SIZE;
+/// Length of the SEP region (up to the HMAC trailer). ~3968 B; holds
+/// >=8 plain or ~7 biometric per-slot SEP blobs. Enrollment rejects a
+/// SEP slot that would overflow it (see `sep_region_fits`).
+const SEP_REGION_LEN: usize = OFF_HMAC - OFF_SEP_REGION;
+
 const _: () = assert!(OFF_KEYSLOTS + MAX_KEYSLOTS * SLOT_SIZE <= OFF_HMAC);
 
 #[derive(Clone)]
@@ -124,6 +145,13 @@ pub struct Header {
     pub metadata_size: u64,
     pub data_offset: u64,
     pub keyslots: [Keyslot; MAX_KEYSLOTS],
+    /// Per-slot opaque Secure Enclave material, indexed by keyslot
+    /// index. `Some(bytes)` for macOS SEP keyslot kinds (the encoded
+    /// `luksbox_sep::SepBlob`); `None` otherwise. Stored in the
+    /// in-header SEP region (gated by `FLAG_HAS_SEP_REGION`) instead of
+    /// an external `.lbx.sep` sidecar. `header.rs` treats each entry as
+    /// an opaque byte blob; the `luksbox-sep` crate owns its structure.
+    pub sep_blobs: [Option<Vec<u8>>; MAX_KEYSLOTS],
     /// On-disk format major version. `1` = LUKSBOX1 (v0.2.0 and earlier,
     /// no sidecar mirrors). `2` = LUKSBOX2 (v0.2.1+, supports the
     /// header/metadata mirror sidecars guarded by FLAG_HAS_*_MIRROR).
@@ -157,6 +185,7 @@ impl Header {
             metadata_size: 0,
             data_offset,
             keyslots: core::array::from_fn(|_| Keyslot::empty()),
+            sep_blobs: core::array::from_fn(|_| None),
             version_major: VERSION_MAJOR_V1,
         })
     }
@@ -194,6 +223,58 @@ impl Header {
         (self.flags & FLAG_HAS_METADATA_MIRROR) != 0
     }
 
+    /// Whether this header carries an in-header Secure Enclave region.
+    pub fn has_sep_region(&self) -> bool {
+        (self.flags & FLAG_HAS_SEP_REGION) != 0
+    }
+
+    /// Opaque SEP material for slot `idx`, if any.
+    pub fn sep_blob(&self, idx: usize) -> Option<&[u8]> {
+        self.sep_blobs.get(idx).and_then(|b| b.as_deref())
+    }
+
+    /// Attach opaque SEP material to slot `idx` (called by enroll for a
+    /// SEP keyslot). Sets `FLAG_HAS_SEP_REGION`. Returns
+    /// `Error::InvalidKeyslotIndex` for an out-of-range index, or
+    /// `Error::SepRegionFull` if the blob would overflow the in-header
+    /// SEP region once all current blobs are accounted for.
+    pub fn set_sep_blob(&mut self, idx: usize, blob: Vec<u8>) -> Result<(), Error> {
+        if idx >= MAX_KEYSLOTS {
+            return Err(Error::InvalidKeyslotIndex(idx));
+        }
+        let prev = self.sep_blobs[idx].take();
+        self.sep_blobs[idx] = Some(blob);
+        if self.sep_region_required_len() > SEP_REGION_LEN {
+            // Roll back so the header stays consistent.
+            self.sep_blobs[idx] = prev;
+            return Err(Error::SepRegionFull);
+        }
+        self.flags |= FLAG_HAS_SEP_REGION;
+        Ok(())
+    }
+
+    /// Drop slot `idx`'s SEP material (if any). Clears
+    /// `FLAG_HAS_SEP_REGION` once no slots carry SEP material.
+    pub fn clear_sep_blob(&mut self, idx: usize) {
+        if idx < MAX_KEYSLOTS {
+            self.sep_blobs[idx] = None;
+        }
+        if self.sep_blobs.iter().all(Option::is_none) {
+            self.flags &= !FLAG_HAS_SEP_REGION;
+        }
+    }
+
+    /// Bytes the SEP region would occupy on disk for the current blobs:
+    /// `1` (count) + sum of `1 (slot_idx) + 2 (len) + blob_len`.
+    fn sep_region_required_len(&self) -> usize {
+        1 + self
+            .sep_blobs
+            .iter()
+            .flatten()
+            .map(|b| 3 + b.len())
+            .sum::<usize>()
+    }
+
     /// Find the lowest-index empty slot.
     pub fn first_free_slot(&self) -> Result<usize, Error> {
         self.keyslots
@@ -215,6 +296,9 @@ impl Header {
             return Err(Error::InvalidKeyslotIndex(idx));
         }
         self.keyslots[idx] = Keyslot::empty();
+        // Drop any SEP material bound to the now-empty slot so the
+        // in-header region doesn't keep a dangling blob.
+        self.clear_sep_blob(idx);
         Ok(())
     }
 
@@ -349,6 +433,16 @@ impl Header {
             keyslots[i] = Keyslot::from_bytes(slot_bytes)?;
         }
 
+        // In-header Secure Enclave region (gated by the flag). Absent ->
+        // all-None. Parsed pre-HMAC, so malformed input is rejected
+        // rather than trusted; a genuine tamper additionally fails the
+        // HMAC check the caller runs after MVK recovery.
+        let sep_blobs = if flags & FLAG_HAS_SEP_REGION != 0 {
+            Self::parse_sep_region(buf)?
+        } else {
+            core::array::from_fn(|_| None)
+        };
+
         Ok(Self {
             cipher_suite,
             kdf,
@@ -359,6 +453,7 @@ impl Header {
             metadata_size,
             data_offset,
             keyslots,
+            sep_blobs,
             version_major,
         })
     }
@@ -422,7 +517,71 @@ impl Header {
             let off = OFF_KEYSLOTS + i * SLOT_SIZE;
             buf[off..off + SLOT_SIZE].copy_from_slice(&slot.to_bytes());
         }
+
+        // In-header Secure Enclave region. When any slot carries SEP
+        // material, overwrite the prefix of the (already RNG-filled)
+        // reserved area with a packed table:
+        //   [count: u8] then, per populated slot,
+        //   [slot_idx: u8][blob_len: u16 LE][blob bytes]
+        // The trailing bytes stay random. Capacity is guaranteed by
+        // `set_sep_blob` (which rejects an overflowing blob), so this
+        // write fits; debug_assert pins the invariant in tests.
+        if self.has_sep_region() {
+            debug_assert!(self.sep_region_required_len() <= SEP_REGION_LEN);
+            let count = self.sep_blobs.iter().filter(|b| b.is_some()).count() as u8;
+            let mut w = OFF_SEP_REGION;
+            buf[w] = count;
+            w += 1;
+            for (i, blob) in self.sep_blobs.iter().enumerate() {
+                let Some(blob) = blob else { continue };
+                let entry_len = 3 + blob.len();
+                if w + entry_len > OFF_HMAC {
+                    // Unreachable given the set_sep_blob capacity check;
+                    // guard against corruption rather than panic.
+                    debug_assert!(false, "SEP region overflow during serialize");
+                    break;
+                }
+                buf[w] = i as u8;
+                w += 1;
+                buf[w..w + 2].copy_from_slice(&(blob.len() as u16).to_le_bytes());
+                w += 2;
+                buf[w..w + blob.len()].copy_from_slice(blob);
+                w += blob.len();
+            }
+        }
         buf
+    }
+
+    /// Parse the in-header SEP region into per-slot opaque blobs. Runs
+    /// before HMAC verification, so it must reject malformed input
+    /// rather than panic. Returns all-`None` when the region is absent.
+    fn parse_sep_region(buf: &[u8; HEADER_SIZE]) -> Result<[Option<Vec<u8>>; MAX_KEYSLOTS], Error> {
+        let mut out: [Option<Vec<u8>>; MAX_KEYSLOTS] = core::array::from_fn(|_| None);
+        let region = &buf[OFF_SEP_REGION..OFF_HMAC];
+        let count = region[0] as usize;
+        if count > MAX_KEYSLOTS {
+            return Err(Error::InvalidField);
+        }
+        let mut p = 1usize;
+        for _ in 0..count {
+            // slot_idx + len prefix.
+            if p + 3 > region.len() {
+                return Err(Error::InvalidField);
+            }
+            let slot_idx = region[p] as usize;
+            let blob_len = u16::from_le_bytes([region[p + 1], region[p + 2]]) as usize;
+            p += 3;
+            if slot_idx >= MAX_KEYSLOTS || p + blob_len > region.len() {
+                return Err(Error::InvalidField);
+            }
+            if out[slot_idx].is_some() {
+                // Duplicate slot index in the table.
+                return Err(Error::InvalidField);
+            }
+            out[slot_idx] = Some(region[p..p + blob_len].to_vec());
+            p += blob_len;
+        }
+        Ok(out)
     }
 }
 
@@ -704,5 +863,151 @@ mod tests {
         // raises it from 16 MiB (v0.2.0) to 64 MiB to fit large-vault
         // chunk-ref tables without spilling to ENOSPC.
         assert_eq!(MAX_METADATA_SIZE, 64 << 20);
+    }
+
+    fn header_with_pp_slot(mvk: &MasterVolumeKey) -> Header {
+        let suite = CipherSuite::Aes256Gcm;
+        let mut header = Header::new(suite, KdfId::Argon2id, 4096, HEADER_SIZE as u64);
+        let slot = Keyslot::new_passphrase(
+            suite,
+            mvk,
+            b"pw",
+            Argon2idParams::TEST_ONLY,
+            &header.header_salt,
+        )
+        .unwrap();
+        header.install_slot(0, slot).unwrap();
+        header
+    }
+
+    /// The in-header SEP region round-trips through to_bytes/from_bytes
+    /// and stays HMAC-authenticated.
+    #[test]
+    fn sep_region_roundtrip_and_authenticated() {
+        let mvk = MasterVolumeKey::from_bytes([0x21; 32]);
+        let mut header = header_with_pp_slot(&mvk);
+        assert!(!header.has_sep_region());
+        let blob = vec![0xC3u8; 352];
+        header.set_sep_blob(2, blob.clone()).unwrap();
+        assert!(header.has_sep_region());
+
+        let bytes = header.to_bytes(&mvk);
+        let parsed = Header::from_bytes(&bytes).unwrap();
+        assert!(parsed.has_sep_region());
+        assert_eq!(parsed.sep_blob(2), Some(blob.as_slice()));
+        assert_eq!(parsed.sep_blob(0), None);
+        // HMAC covers the SEP region.
+        parsed.verify_hmac(&bytes, &mvk).unwrap();
+    }
+
+    /// Security: tampering a byte inside the SEP region breaks the
+    /// header HMAC (the region lives below OFF_HMAC).
+    #[test]
+    fn sep_region_tamper_breaks_hmac() {
+        let mvk = MasterVolumeKey::from_bytes([0x22; 32]);
+        let mut header = header_with_pp_slot(&mvk);
+        header.set_sep_blob(1, vec![0x5Au8; 200]).unwrap();
+        let mut bytes = header.to_bytes(&mvk);
+        // Flip a byte well inside the SEP blob payload.
+        bytes[OFF_SEP_REGION + 16] ^= 0xFF;
+        let parsed = Header::from_bytes(&bytes).unwrap();
+        assert!(
+            parsed.verify_hmac(&bytes, &mvk).is_err(),
+            "tampered SEP region must fail HMAC"
+        );
+    }
+
+    /// Security: a malformed SEP region (flag set, but the table claims
+    /// a length that overruns the region, or a bad count, or a
+    /// duplicate slot index) is rejected by from_bytes rather than
+    /// panicking or yielding garbage blobs.
+    #[test]
+    fn sep_region_malformed_rejected() {
+        let mvk = MasterVolumeKey::from_bytes([0x23; 32]);
+        let header = header_with_pp_slot(&mvk);
+        let base = header.to_bytes(&mvk);
+
+        // Helper: set the flag bit and write a raw region prefix.
+        let craft = |region_prefix: &[u8]| -> [u8; HEADER_SIZE] {
+            let mut b = base;
+            let mut flags = u32::from_le_bytes(b[OFF_FLAGS..OFF_FLAGS + 4].try_into().unwrap());
+            flags |= FLAG_HAS_SEP_REGION;
+            b[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+            b[OFF_SEP_REGION..OFF_SEP_REGION + region_prefix.len()].copy_from_slice(region_prefix);
+            b
+        };
+
+        // count=1, slot_idx=0, blob_len=0xFFFF (overruns region).
+        let overrun = craft(&[1u8, 0u8, 0xFF, 0xFF]);
+        assert!(matches!(
+            Header::from_bytes(&overrun),
+            Err(Error::InvalidField)
+        ));
+
+        // count=9 > MAX_KEYSLOTS.
+        let bad_count = craft(&[9u8]);
+        assert!(matches!(
+            Header::from_bytes(&bad_count),
+            Err(Error::InvalidField)
+        ));
+
+        // Duplicate slot_idx (two entries both for slot 0).
+        let dup = craft(&[2u8, 0u8, 1u8, 0u8, 0xAB, 0u8, 1u8, 0u8, 0xCD]);
+        assert!(matches!(Header::from_bytes(&dup), Err(Error::InvalidField)));
+
+        // slot_idx out of range.
+        let bad_idx = craft(&[1u8, 99u8, 1u8, 0u8, 0xAB]);
+        assert!(matches!(
+            Header::from_bytes(&bad_idx),
+            Err(Error::InvalidField)
+        ));
+    }
+
+    /// Security: a blob that would overflow the in-header SEP region is
+    /// rejected by set_sep_blob, leaving the header unchanged (no
+    /// silent truncation, no flag set).
+    #[test]
+    fn sep_region_capacity_enforced() {
+        let mvk = MasterVolumeKey::from_bytes([0x24; 32]);
+        let mut header = header_with_pp_slot(&mvk);
+        let too_big = vec![0u8; SEP_REGION_LEN]; // larger than the region can frame
+        assert!(matches!(
+            header.set_sep_blob(0, too_big),
+            Err(Error::SepRegionFull)
+        ));
+        assert!(
+            !header.has_sep_region(),
+            "rejected blob must not set the flag"
+        );
+        assert_eq!(header.sep_blob(0), None);
+    }
+
+    /// Revoking a slot drops its SEP material and clears the flag once
+    /// no SEP blobs remain.
+    #[test]
+    fn revoke_clears_sep_blob() {
+        let mvk = MasterVolumeKey::from_bytes([0x25; 32]);
+        let mut header = header_with_pp_slot(&mvk);
+        header.set_sep_blob(0, vec![0x01u8; 100]).unwrap();
+        assert!(header.has_sep_region());
+        header.revoke_slot(0).unwrap();
+        assert_eq!(header.sep_blob(0), None);
+        assert!(
+            !header.has_sep_region(),
+            "flag cleared when last SEP blob removed"
+        );
+    }
+
+    /// A header WITHOUT the flag never parses a SEP region, even if the
+    /// padding bytes happen to look like a table (old vaults are byte-
+    /// identical and read with no SEP blobs).
+    #[test]
+    fn no_flag_means_no_sep_region() {
+        let mvk = MasterVolumeKey::from_bytes([0x26; 32]);
+        let header = header_with_pp_slot(&mvk);
+        let bytes = header.to_bytes(&mvk);
+        let parsed = Header::from_bytes(&bytes).unwrap();
+        assert!(!parsed.has_sep_region());
+        assert!(parsed.sep_blobs.iter().all(Option::is_none));
     }
 }
