@@ -2875,6 +2875,11 @@ impl Container {
         }
         if a != b {
             self.header.keyslots.swap(a, b);
+            // The in-header Secure Enclave region is indexed by slot,
+            // so the per-slot SEP material must move with its keyslot;
+            // otherwise a SEP slot ends up pointing at the wrong (or no)
+            // blob and `--sep` unlock fails with UnlockFailed.
+            self.header.sep_blobs.swap(a, b);
             self.header_dirty = true;
         }
         Ok(())
@@ -4559,7 +4564,8 @@ mod tests {
         assert!(cont.header.sep_blob(plain_idx).is_some());
         assert!(cont.header.has_sep_region());
         assert!(
-            !path.with_extension("lbx.sep").exists() && !dir.path().join("v.lbx.sep").exists(),
+            !path.with_extension("lbx.sep").exists()
+                && !dir.path().join("v.lbx.sep").exists(),
             "no external .lbx.sep file must be created"
         );
         cont.persist_header().unwrap();
@@ -4568,10 +4574,7 @@ mod tests {
         // Re-open the plain SEP slot via a closure that maps the
         // in-header blob -> shared secret (the role of SepSealer).
         let mut unseal = |blob: &[u8]| -> Result<[u8; 32], String> {
-            mock_sep
-                .get(blob)
-                .copied()
-                .ok_or_else(|| "foreign enclave".into())
+            mock_sep.get(blob).copied().ok_or_else(|| "foreign enclave".into())
         };
         let cont = Container::open(
             &path,
@@ -4585,15 +4588,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cont.header.keyslots[plain_idx].kind, SlotKind::SepSealed);
-        assert_eq!(cont.header.keyslots[hy_idx].kind, SlotKind::HybridPqKemSep);
+        assert_eq!(
+            cont.header.keyslots[hy_idx].kind,
+            SlotKind::HybridPqKemSep
+        );
         drop(cont);
 
         // The hybrid slot opens when the pq factor is also supplied.
         let mut unseal2 = |blob: &[u8]| -> Result<[u8; 32], String> {
-            mock_sep
-                .get(blob)
-                .copied()
-                .ok_or_else(|| "foreign enclave".into())
+            mock_sep.get(blob).copied().ok_or_else(|| "foreign enclave".into())
         };
         Container::open(
             &path,
@@ -4622,6 +4625,70 @@ mod tests {
             },
         );
         assert!(r.is_err(), "rogue SEP secret must not open the vault");
+    }
+
+    /// Regression: `swap_slots` must move the in-header SEP material
+    /// with its keyslot. The GUI's SEP-bootstrap create enrolls SEP in
+    /// the next free slot then swaps it to slot 0; if the `sep_blobs`
+    /// entry didn't move too, the SEP slot would point at no blob and
+    /// `--sep` unlock would fail with UnlockFailed.
+    #[test]
+    fn sep_swap_slots_moves_in_header_blob() {
+        use std::collections::HashMap;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v.lbx");
+        let mut cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            test_params(),
+            b"bootstrap",
+        )
+        .unwrap();
+        let sep_shared = [0x5eu8; 32];
+        let sep_blob = vec![0xC3u8; 349];
+        let mut mock: HashMap<Vec<u8>, [u8; 32]> = HashMap::new();
+        mock.insert(sep_blob.clone(), sep_shared);
+
+        let idx = cont
+            .enroll_sep(
+                SlotKind::SepSealed,
+                &sep_shared,
+                &sep_blob,
+                None,
+                None,
+                test_params(),
+                None,
+                &[],
+                [0u8; 32],
+            )
+            .unwrap();
+        assert!(idx > 0, "bootstrap passphrase occupies slot 0");
+
+        // Move SEP to slot 0 (the GUI bootstrap behavior).
+        cont.swap_slots(0, idx).unwrap();
+        assert!(cont.header.sep_blob(0).is_some(), "blob moved to slot 0");
+        assert!(cont.header.sep_blob(idx).is_none(), "old index cleared");
+        assert_eq!(cont.header.keyslots[0].kind, SlotKind::SepSealed);
+        cont.persist_header().unwrap();
+        drop(cont);
+
+        // SEP unlock must still work after the swap.
+        let mut unseal =
+            |b: &[u8]| -> std::result::Result<[u8; 32], String> {
+                mock.get(b).copied().ok_or_else(|| "miss".into())
+            };
+        Container::open(
+            &path,
+            None,
+            UnlockMaterial::Sep {
+                unseal: &mut unseal,
+                hmac_secret: None,
+                passphrase: None,
+                pq_shared: None,
+            },
+        )
+        .expect("SEP unlock must succeed after swap_slots");
     }
 
     #[test]

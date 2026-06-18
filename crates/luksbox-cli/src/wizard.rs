@@ -2019,9 +2019,9 @@ fn format_slot(idx: usize, slot: &luksbox_core::Keyslot, with_kdf: bool) -> Stri
                  SEP material in-header, ML-KEM in .lbx.hybrid)"
             )
         }
-        SlotKind::SepFido2 => {
-            format!("  {idx}: secure-enclave + FIDO2 (macOS; SEP material in-header)")
-        }
+        SlotKind::SepFido2 => format!(
+            "  {idx}: secure-enclave + FIDO2 (macOS; SEP material in-header)"
+        ),
         SlotKind::HybridPqKemSepFido2 => format!(
             "  {idx}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + ML-KEM-768; \
              SEP material in-header, ML-KEM in .lbx.hybrid)"
@@ -2030,9 +2030,9 @@ fn format_slot(idx: usize, slot: &luksbox_core::Keyslot, with_kdf: bool) -> Stri
             "  {idx}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + ML-KEM-1024; \
              SEP material in-header, ML-KEM in .lbx.hybrid)"
         ),
-        SlotKind::SepPassphrase => {
-            format!("  {idx}: secure-enclave + passphrase (macOS; SEP material in-header)")
-        }
+        SlotKind::SepPassphrase => format!(
+            "  {idx}: secure-enclave + passphrase (macOS; SEP material in-header)"
+        ),
         SlotKind::HybridPqKemSepPassphrase => format!(
             "  {idx}: hybrid-pq-sep (macOS Secure Enclave + passphrase + ML-KEM-768; \
              SEP material in-header, ML-KEM in .lbx.hybrid)"
@@ -2041,9 +2041,9 @@ fn format_slot(idx: usize, slot: &luksbox_core::Keyslot, with_kdf: bool) -> Stri
             "  {idx}: hybrid-pq-sep (macOS Secure Enclave + passphrase + ML-KEM-1024; \
              SEP material in-header, ML-KEM in .lbx.hybrid)"
         ),
-        SlotKind::SepFido2Passphrase => {
-            format!("  {idx}: secure-enclave + FIDO2 + passphrase (macOS; SEP material in-header)")
-        }
+        SlotKind::SepFido2Passphrase => format!(
+            "  {idx}: secure-enclave + FIDO2 + passphrase (macOS; SEP material in-header)"
+        ),
         SlotKind::HybridPqKemSepFido2Passphrase => format!(
             "  {idx}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + passphrase + ML-KEM-768; \
              SEP material in-header, ML-KEM in .lbx.hybrid)"
@@ -4905,8 +4905,14 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                         20 => (crate::SepFactors::Fido2, None),
                         21 => (crate::SepFactors::Passphrase, None),
                         22 => (crate::SepFactors::Fido2Passphrase, None),
-                        23 => (crate::SepFactors::Fido2, Some(luksbox_pq::PqParams::Ml768)),
-                        24 => (crate::SepFactors::Fido2, Some(luksbox_pq::PqParams::Ml1024)),
+                        23 => (
+                            crate::SepFactors::Fido2,
+                            Some(luksbox_pq::PqParams::Ml768),
+                        ),
+                        24 => (
+                            crate::SepFactors::Fido2,
+                            Some(luksbox_pq::PqParams::Ml1024),
+                        ),
                         25 => (
                             crate::SepFactors::Passphrase,
                             Some(luksbox_pq::PqParams::Ml768),
@@ -6039,10 +6045,7 @@ fn enroll_sep_fused_into(
     let hmac_secret_ref = fido2.as_ref().map(|(_, _, hs)| hs);
     let passphrase_ref = new_pw.as_ref().map(|p| p.as_bytes());
     let pq_shared_ref = pq.as_ref().map(|(_, _, _, _, s)| &**s);
-    let cred_id_ref: &[u8] = fido2
-        .as_ref()
-        .map(|(cred, _, _)| cred.as_slice())
-        .unwrap_or(&[]);
+    let cred_id_ref: &[u8] = fido2.as_ref().map(|(cred, _, _)| cred.as_slice()).unwrap_or(&[]);
     let hmac_salt = fido2.as_ref().map(|(_, s, _)| *s).unwrap_or([0u8; 32]);
 
     let idx = c.enroll_sep(

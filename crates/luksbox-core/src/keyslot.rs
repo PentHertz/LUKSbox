@@ -942,12 +942,7 @@ impl Keyslot {
         hmac_salt: [u8; 32],
         header_salt: &[u8; 32],
     ) -> Result<Self, Error> {
-        Self::check_sep_factors(
-            kind,
-            hmac_secret.is_some(),
-            passphrase.is_some(),
-            pq_shared.is_some(),
-        )?;
+        Self::check_sep_factors(kind, hmac_secret.is_some(), passphrase.is_some(), pq_shared.is_some())?;
         Self::reject_null_factor(sep_shared)?;
         if let Some(h) = hmac_secret {
             Self::reject_null_factor(h)?;
@@ -2538,12 +2533,7 @@ mod tests {
             (SlotKind::HybridPqKem1024SepPassphrase, false, true, true),
             (SlotKind::SepFido2Passphrase, true, true, false),
             (SlotKind::HybridPqKemSepFido2Passphrase, true, true, true),
-            (
-                SlotKind::HybridPqKem1024SepFido2Passphrase,
-                true,
-                true,
-                true,
-            ),
+            (SlotKind::HybridPqKem1024SepFido2Passphrase, true, true, true),
         ];
 
         for (kind, needs_fido2, needs_pass, needs_pq) in matrix {
@@ -2553,16 +2543,7 @@ mod tests {
             let cred: &[u8] = if needs_fido2 { &cred_id } else { &[] };
 
             let slot = Keyslot::new_sep(
-                suite,
-                &mvk,
-                kind,
-                &sep_shared,
-                fido2,
-                pass,
-                params,
-                pq,
-                cred,
-                hmac_salt,
+                suite, &mvk, kind, &sep_shared, fido2, pass, params, pq, cred, hmac_salt,
                 &header_salt,
             )
             .unwrap_or_else(|e| panic!("new_sep({kind:?}) failed: {e:?}"));
@@ -2600,14 +2581,7 @@ mod tests {
             if needs_pass {
                 assert!(
                     restored
-                        .unlock_sep(
-                            suite,
-                            &sep_shared,
-                            fido2,
-                            Some(b"wrong-pass"),
-                            pq,
-                            &header_salt
-                        )
+                        .unlock_sep(suite, &sep_shared, fido2, Some(b"wrong-pass"), pq, &header_salt)
                         .is_err(),
                     "{kind:?} wrong passphrase must fail"
                 );
@@ -2615,14 +2589,7 @@ mod tests {
             if needs_pq {
                 assert!(
                     restored
-                        .unlock_sep(
-                            suite,
-                            &sep_shared,
-                            fido2,
-                            pass,
-                            Some(&[0u8; 32]),
-                            &header_salt
-                        )
+                        .unlock_sep(suite, &sep_shared, fido2, pass, Some(&[0u8; 32]), &header_salt)
                         .is_err(),
                     "{kind:?} wrong pq_shared must fail"
                 );
@@ -2642,51 +2609,21 @@ mod tests {
         // Plain SepSealed with a stray FIDO2 factor -> error.
         assert!(matches!(
             Keyslot::new_sep(
-                suite,
-                &mvk,
-                SlotKind::SepSealed,
-                &sep,
-                Some(&[1u8; 32]),
-                None,
-                p,
-                None,
-                &[],
-                [0; 32],
-                &hs,
+                suite, &mvk, SlotKind::SepSealed, &sep, Some(&[1u8; 32]), None, p, None, &[], [0; 32], &hs,
             ),
             Err(Error::InvalidField)
         ));
         // SepFido2 missing its FIDO2 factor -> error.
         assert!(matches!(
             Keyslot::new_sep(
-                suite,
-                &mvk,
-                SlotKind::SepFido2,
-                &sep,
-                None,
-                None,
-                p,
-                None,
-                b"cred",
-                [0; 32],
-                &hs,
+                suite, &mvk, SlotKind::SepFido2, &sep, None, None, p, None, b"cred", [0; 32], &hs,
             ),
             Err(Error::InvalidField)
         ));
         // Non-SEP kind -> error.
         assert!(matches!(
             Keyslot::new_sep(
-                suite,
-                &mvk,
-                SlotKind::Passphrase,
-                &sep,
-                None,
-                None,
-                p,
-                None,
-                &[],
-                [0; 32],
-                &hs,
+                suite, &mvk, SlotKind::Passphrase, &sep, None, None, p, None, &[], [0; 32], &hs,
             ),
             Err(Error::InvalidField)
         ));
@@ -2706,72 +2643,25 @@ mod tests {
 
         // Enroll with all-zero SEP shared secret -> rejected.
         assert!(matches!(
-            Keyslot::new_sep(
-                suite,
-                &mvk,
-                SlotKind::SepSealed,
-                &zero,
-                None,
-                None,
-                p,
-                None,
-                &[],
-                [0; 32],
-                &hs
-            ),
+            Keyslot::new_sep(suite, &mvk, SlotKind::SepSealed, &zero, None, None, p, None, &[], [0; 32], &hs),
             Err(Error::InvalidField)
         ));
         // Enroll hybrid with all-zero pq factor -> rejected.
         assert!(matches!(
-            Keyslot::new_sep(
-                suite,
-                &mvk,
-                SlotKind::HybridPqKemSep,
-                &good,
-                None,
-                None,
-                p,
-                Some(&zero),
-                &[],
-                [0; 32],
-                &hs
-            ),
+            Keyslot::new_sep(suite, &mvk, SlotKind::HybridPqKemSep, &good, None, None, p, Some(&zero), &[], [0; 32], &hs),
             Err(Error::InvalidField)
         ));
         // Enroll fused with all-zero FIDO2 factor -> rejected.
         assert!(matches!(
-            Keyslot::new_sep(
-                suite,
-                &mvk,
-                SlotKind::SepFido2,
-                &good,
-                Some(&zero),
-                None,
-                p,
-                None,
-                b"cred",
-                [0xAA; 32],
-                &hs
-            ),
+            Keyslot::new_sep(suite, &mvk, SlotKind::SepFido2, &good, Some(&zero), None, p, None, b"cred", [0xAA; 32], &hs),
             Err(Error::InvalidField)
         ));
 
         // A valid slot must REFUSE to unlock if a null secret is later
         // presented (e.g. enclave gone, caller substitutes zeros).
-        let slot = Keyslot::new_sep(
-            suite,
-            &mvk,
-            SlotKind::SepSealed,
-            &good,
-            None,
-            None,
-            p,
-            None,
-            &[],
-            [0; 32],
-            &hs,
-        )
-        .unwrap();
+        let slot =
+            Keyslot::new_sep(suite, &mvk, SlotKind::SepSealed, &good, None, None, p, None, &[], [0; 32], &hs)
+                .unwrap();
         assert!(matches!(
             slot.unlock_sep(suite, &zero, None, None, None, &hs),
             Err(Error::InvalidField)
@@ -2791,33 +2681,16 @@ mod tests {
         let attacker = [0x43u8; 32]; // differs by one bit region
         let p = Argon2idParams::TEST_ONLY;
 
-        let slot = Keyslot::new_sep(
-            suite,
-            &mvk,
-            SlotKind::SepSealed,
-            &genuine,
-            None,
-            None,
-            p,
-            None,
-            &[],
-            [0; 32],
-            &hs,
-        )
-        .unwrap();
+        let slot =
+            Keyslot::new_sep(suite, &mvk, SlotKind::SepSealed, &genuine, None, None, p, None, &[], [0; 32], &hs)
+                .unwrap();
         let bytes = slot.to_bytes();
         let restored = Keyslot::from_bytes(&bytes).unwrap();
         // Genuine secret unlocks; attacker secret does not (no null/
         // partial MVK leaks out -- it's an Err, not a zero key).
+        assert!(restored.unlock_sep(suite, &genuine, None, None, None, &hs).is_ok());
         assert!(
-            restored
-                .unlock_sep(suite, &genuine, None, None, None, &hs)
-                .is_ok()
-        );
-        assert!(
-            restored
-                .unlock_sep(suite, &attacker, None, None, None, &hs)
-                .is_err(),
+            restored.unlock_sep(suite, &attacker, None, None, None, &hs).is_err(),
             "rogue SEP secret must not unlock"
         );
     }
@@ -2932,19 +2805,10 @@ mod tests {
         assert_eq!(SlotKind::from_u8(17).unwrap(), SlotKind::HybridPqKemSep);
         assert_eq!(SlotKind::from_u8(18).unwrap(), SlotKind::HybridPqKem1024Sep);
         assert_eq!(SlotKind::from_u8(19).unwrap(), SlotKind::SepFido2);
-        assert_eq!(
-            SlotKind::from_u8(20).unwrap(),
-            SlotKind::HybridPqKemSepFido2
-        );
-        assert_eq!(
-            SlotKind::from_u8(21).unwrap(),
-            SlotKind::HybridPqKem1024SepFido2
-        );
+        assert_eq!(SlotKind::from_u8(20).unwrap(), SlotKind::HybridPqKemSepFido2);
+        assert_eq!(SlotKind::from_u8(21).unwrap(), SlotKind::HybridPqKem1024SepFido2);
         assert_eq!(SlotKind::from_u8(22).unwrap(), SlotKind::SepPassphrase);
-        assert_eq!(
-            SlotKind::from_u8(23).unwrap(),
-            SlotKind::HybridPqKemSepPassphrase
-        );
+        assert_eq!(SlotKind::from_u8(23).unwrap(), SlotKind::HybridPqKemSepPassphrase);
         assert_eq!(
             SlotKind::from_u8(24).unwrap(),
             SlotKind::HybridPqKem1024SepPassphrase
