@@ -1,6 +1,6 @@
 # LUKSbox security architecture
 
-Status: 2026-05-06.
+Status: 2026-06-18 (adds macOS Secure Enclave keyslots).
 
 This document is the security map for LUKSbox. It explains what is
 protected, which mechanisms provide that protection, where attacks fail,
@@ -19,6 +19,7 @@ flowchart LR
     User[User knowledge<br/>passphrase or PIN] --> Unlock[Unlock material]
     FIDO[FIDO2 authenticator<br/>hmac-secret] --> Unlock
     TPM[TPM 2.0<br/>sealed KEK] --> Unlock
+    SEP[macOS Secure Enclave<br/>non-extractable P-256 key] --> Unlock
     PQ[ML-KEM seed file<br/>separate storage] --> Unlock
 
     Unlock --> KEK[Key encryption key]
@@ -50,6 +51,7 @@ flowchart TD
     Header --> Keyslot0["Keyslot<br/>AEAD-wrapped MVK"]
     Keyslot0 --> AAD["Authenticated AAD<br/>kind, salts, nonce, cred_id, header_salt"]
     Header --> HMAC["HMAC-SHA256<br/>bytes 0..8160"]
+    Header --> SepRegion["In-header SEP region<br/>per-slot ECDH material<br/>(covered by header HMAC)"]
 
     MetadataRegion --> TreeValidation["Post-auth validation<br/>root, parents, children,<br/>chunk ids, generations, offset bounds"]
     DataRegion --> Chunk["Chunk<br/>nonce + AEAD(4096 bytes) + tag"]
@@ -73,6 +75,9 @@ Important properties:
   position, and generation counter.
 - Detached headers remove the visible vault header from the `.lbx`; without
   the sidecar, the vault file is random-looking data.
+- The in-header Secure Enclave region (when a SEP keyslot is present) sits
+  inside the HMAC-authenticated byte range, so editing it or flipping its
+  flag is detected on unlock.
 
 ## 3. Unlock flow
 
@@ -145,6 +150,7 @@ Current limitation:
 | Full rollback | Optional external anchor | Detects rollback only if anchor is not rolled back with the vault |
 | FIDO2 | CTAP2 hmac-secret | Device secret stays inside authenticator |
 | TPM | TPM sealed KEK | KEK can be bound to the local TPM and optional PIN |
+| Secure Enclave (macOS) | ECDH against a non-extractable SEP P-256 key, then HKDF to a KEK | KEK only re-derives on the originating enclave; the private key never leaves the SEP |
 | PQ hybrid | ML-KEM shared secret mixed into KEK derivation | Hybrid slots require the classical factor and PQ seed side |
 | Filesystem permissions | 0600 files, 0700 created directories | Reduces accidental local multi-user exposure |
 | Runtime memory | Zeroizing buffers and Linux `memfd_secret` where available | Reduces post-use memory disclosure, not a defense against a hostile kernel |
@@ -157,6 +163,9 @@ Current limitation:
 | Steals `.lbx` and user chose a weak passphrase | Possibly | Offline guessing can eventually find weak passphrases |
 | Steals `.lbx` but not detached `.hdr` | No practical unlock path | The vault file lacks keyslots and header metadata |
 | Steals `.lbx` and `.hdr`, but not FIDO2/TPM/PQ factor | No practical unlock path | Matching keyslot cannot derive the KEK |
+| Steals `.lbx` with a SEP slot, runs it on another Mac or a PC | No practical unlock path | SEP material re-derives only on the originating enclave; `init(dataRepresentation:)` rejects elsewhere and the slot is skipped |
+| Steals `.lbx` plus the original Mac, SEP slot, no biometric | Yes, for that slot | SEP analog of the TPM "no-PIN" baseline; mitigate with `SepSealedBiometric` (Touch ID) or a fused FIDO2 / passphrase factor |
+| Tampers with the in-header SEP region or its flag | No plaintext; denial of service possible | Region is inside the header HMAC range; `verify_hmac` rejects |
 | Tampers with header bytes | No plaintext; denial of service possible | HMAC or keyslot AEAD rejects |
 | Tampers with metadata ciphertext | No plaintext; denial of service possible | Metadata AEAD rejects |
 | Crafts authenticated metadata with huge chunk IDs | No | VFS rejects metadata before offset arithmetic is used |
@@ -187,6 +196,9 @@ Current limitation:
   the vault.
 - Detached-header MVK rotation needs a future two-file commit protocol before
   it has the same crash guarantees as inline rotation.
+- A Secure Enclave (SEP) slot is bound to one Mac and cannot be moved to
+  another machine. Always keep a passphrase or FIDO2 backup slot so the vault
+  survives a wiped, replaced, or unavailable enclave.
 
 ## 8. Fixed in the 2026-05-06 security pass
 

@@ -1706,7 +1706,13 @@ pub fn create_vault_with_sep_bootstrap(
             kyber_path,
             seed_pw,
             kem_size,
-        } => enroll_hybrid_pq_sep(&mut opened.vfs, &vault_path, &kyber_path, &seed_pw, kem_size),
+        } => enroll_hybrid_pq_sep(
+            &mut opened.vfs,
+            &vault_path,
+            &kyber_path,
+            &seed_pw,
+            kem_size,
+        ),
         SepBootstrapKind::SepFused {
             factors,
             kem_size,
@@ -3467,9 +3473,10 @@ fn open_sep_common(
     let want_pq = pq_shared_for.is_some();
 
     // Does any in-scope slot need a passphrase / FIDO2?
-    let needs_pp = header.keyslots.iter().any(|s| {
-        s.kind.is_sep() && s.kind.is_sep_passphrase() && s.kind.is_hybrid_pq() == want_pq
-    });
+    let needs_pp = header
+        .keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && s.kind.is_sep_passphrase() && s.kind.is_hybrid_pq() == want_pq);
     let any_fido2_slot = header
         .keyslots
         .iter()
@@ -3528,7 +3535,9 @@ fn open_sep_common(
         // conventions, mirroring the CLI's open path.
         let hmac_secret = if slot.kind.is_sep_fido2() {
             let pin = pin.expect("collect_fido2 implies a PIN");
-            let auth = auth.as_mut().expect("collect_fido2 implies an authenticator");
+            let auth = auth
+                .as_mut()
+                .expect("collect_fido2 implies an authenticator");
             if slot.fido2_cred_id.is_empty() {
                 last_err = Some(format!("FIDO2 slot {idx} has no stored cred_id"));
                 continue;
@@ -5291,8 +5300,8 @@ pub fn enroll_sep_fused(
     };
 
     let kyber_path = if params.is_some() {
-        let kp = kyber_path
-            .ok_or("hybrid SEP enroll requires a path to write the .kyber seed file")?;
+        let kp =
+            kyber_path.ok_or("hybrid SEP enroll requires a path to write the .kyber seed file")?;
         if kp.exists() {
             return Err(format!("{} already exists", kp.display()));
         }
