@@ -147,6 +147,10 @@ pub mod hkdf_info {
     pub const KEK_PQ_TPM_PASSPHRASE: &[u8] = b"luksbox-deniable-v2/kek/pq+tpm+passphrase";
     pub const KEK_PQ_TPM_FIDO2_PASSPHRASE: &[u8] =
         b"luksbox-deniable-v2/kek/pq+tpm+fido2+passphrase";
+    /// macOS Secure Enclave + passphrase. SEP is the deniable analog of
+    /// TPM: the enclave returns a 32-byte ECDH secret (`sep_shared`)
+    /// that mixes into the inner KEK exactly like the TPM `unsealed`.
+    pub const KEK_SEP_PASSPHRASE: &[u8] = b"luksbox-deniable-v2/kek/sep+passphrase";
 }
 
 /// Build the AAD bound into a slot's AEAD computation:
@@ -408,6 +412,17 @@ pub enum DeniableCredential<'a> {
         unsealed: &'a [u8; 32],
         hmac_secret_output: &'a [u8; 32],
     },
+    /// Passphrase + macOS Secure Enclave (SEP). The SEP blob (the
+    /// CryptoKit `dataRepresentation` + ephemeral pubkey) lives inside
+    /// the slot envelope (carried in the same field as the TPM sealed
+    /// blob); `sep_shared` is the 32-byte ECDH secret the enclave
+    /// returns when the host re-derives the key from that blob, the SEP
+    /// analog of TPM's `unsealed`.
+    SepPassphrase {
+        passphrase: &'a [u8],
+        argon2: Argon2idParams,
+        sep_shared: &'a [u8; 32],
+    },
     /// Passphrase + PQ-hybrid (ML-KEM). Caller has done the ML-KEM
     /// decapsulation (using the `.kyber` sidecar) and supplies the
     /// 32-byte shared secret.
@@ -455,6 +470,7 @@ pub enum DeniableKindTag {
     HybridPqFido2Passphrase = 6,
     HybridPqTpmPassphrase = 7,
     HybridPqTpmFido2Passphrase = 8,
+    SepPassphrase = 9,
 }
 
 impl DeniableKindTag {
@@ -468,6 +484,7 @@ impl DeniableKindTag {
             6 => Some(Self::HybridPqFido2Passphrase),
             7 => Some(Self::HybridPqTpmPassphrase),
             8 => Some(Self::HybridPqTpmFido2Passphrase),
+            9 => Some(Self::SepPassphrase),
             _ => None,
         }
     }
@@ -493,6 +510,7 @@ impl DeniableCredential<'_> {
             Self::HybridPqFido2Passphrase { .. } => DeniableKindTag::HybridPqFido2Passphrase,
             Self::HybridPqTpmPassphrase { .. } => DeniableKindTag::HybridPqTpmPassphrase,
             Self::HybridPqTpmFido2Passphrase { .. } => DeniableKindTag::HybridPqTpmFido2Passphrase,
+            Self::SepPassphrase { .. } => DeniableKindTag::SepPassphrase,
         }
     }
 
@@ -520,6 +538,9 @@ impl DeniableCredential<'_> {
                 passphrase, argon2, ..
             }
             | Self::HybridPqTpmFido2Passphrase {
+                passphrase, argon2, ..
+            }
+            | Self::SepPassphrase {
                 passphrase, argon2, ..
             } => (passphrase, *argon2),
         }
@@ -625,6 +646,11 @@ impl DeniableCredential<'_> {
                 ],
                 hkdf_info::KEK_PQ_TPM_FIDO2_PASSPHRASE,
             ),
+            Self::SepPassphrase { sep_shared, .. } => hkdf_combine(
+                per_vault_salt,
+                &[envelope_kek.as_bytes().as_slice(), sep_shared.as_slice()],
+                hkdf_info::KEK_SEP_PASSPHRASE,
+            ),
         }
     }
 
@@ -641,6 +667,7 @@ impl DeniableCredential<'_> {
             Self::HybridPqFido2Passphrase { .. } => "pq+fido2+passphrase",
             Self::HybridPqTpmPassphrase { .. } => "pq+tpm+passphrase",
             Self::HybridPqTpmFido2Passphrase { .. } => "pq+tpm+fido2+passphrase",
+            Self::SepPassphrase { .. } => "sep+passphrase",
         }
     }
 }

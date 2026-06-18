@@ -114,7 +114,9 @@ impl SepSealer {
             return Err(seal_status_err(status));
         }
         if sep_data_len == 0 || sep_data_len > SEP_DATA_CAP {
-            return Err(Error::SepError("shim reported invalid sep_data length".into()));
+            return Err(Error::SepError(
+                "shim reported invalid sep_data length".into(),
+            ));
         }
         reject_null_secret(&shared)?;
         sep_data.truncate(sep_data_len);

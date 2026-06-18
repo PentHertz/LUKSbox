@@ -4653,8 +4653,7 @@ mod tests {
         assert!(cont.header.sep_blob(plain_idx).is_some());
         assert!(cont.header.has_sep_region());
         assert!(
-            !path.with_extension("lbx.sep").exists()
-                && !dir.path().join("v.lbx.sep").exists(),
+            !path.with_extension("lbx.sep").exists() && !dir.path().join("v.lbx.sep").exists(),
             "no external .lbx.sep file must be created"
         );
         cont.persist_header().unwrap();
@@ -4663,7 +4662,10 @@ mod tests {
         // Re-open the plain SEP slot via a closure that maps the
         // in-header blob -> shared secret (the role of SepSealer).
         let mut unseal = |blob: &[u8]| -> Result<[u8; 32], String> {
-            mock_sep.get(blob).copied().ok_or_else(|| "foreign enclave".into())
+            mock_sep
+                .get(blob)
+                .copied()
+                .ok_or_else(|| "foreign enclave".into())
         };
         let cont = Container::open(
             &path,
@@ -4677,15 +4679,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cont.header.keyslots[plain_idx].kind, SlotKind::SepSealed);
-        assert_eq!(
-            cont.header.keyslots[hy_idx].kind,
-            SlotKind::HybridPqKemSep
-        );
+        assert_eq!(cont.header.keyslots[hy_idx].kind, SlotKind::HybridPqKemSep);
         drop(cont);
 
         // The hybrid slot opens when the pq factor is also supplied.
         let mut unseal2 = |blob: &[u8]| -> Result<[u8; 32], String> {
-            mock_sep.get(blob).copied().ok_or_else(|| "foreign enclave".into())
+            mock_sep
+                .get(blob)
+                .copied()
+                .ok_or_else(|| "foreign enclave".into())
         };
         Container::open(
             &path,
@@ -4763,10 +4765,9 @@ mod tests {
         drop(cont);
 
         // SEP unlock must still work after the swap.
-        let mut unseal =
-            |b: &[u8]| -> std::result::Result<[u8; 32], String> {
-                mock.get(b).copied().ok_or_else(|| "miss".into())
-            };
+        let mut unseal = |b: &[u8]| -> std::result::Result<[u8; 32], String> {
+            mock.get(b).copied().ok_or_else(|| "miss".into())
+        };
         Container::open(
             &path,
             None,
@@ -5552,7 +5553,7 @@ mod tests {
         )
         .unwrap();
         let err = c.enroll_passphrase(b"bob", cheap_argon2()).err().unwrap();
-        assert!(matches!(err, Error::Crypto(_)));
+        assert!(matches!(err, Error::DeniableSlotMutationUnsupported));
     }
 
     #[test]
@@ -5808,6 +5809,82 @@ mod tests {
         assert_eq!(env.payload().tpm_blob, blob);
         let c = Container::complete_open_v2_deniable(env, &cred).unwrap();
         assert_eq!(c.mvk_clone().as_bytes(), mvk_before.as_bytes());
+    }
+
+    /// SEP + envelope passphrase in deniable mode (the macOS analog of
+    /// the TPM deniable path). The SEP blob rides in the slot envelope's
+    /// hardware-blob field; `sep_shared` is mocked here (no enclave on
+    /// CI) and on macOS comes from the SEP seal/unseal. Proves the crypto
+    /// round-trips and that the SEP factor is load-bearing.
+    #[test]
+    fn deniable_container_sep_passphrase_round_trip() {
+        use crate::deniable_header::DeniableMaterial;
+        use luksbox_core::deniable::DeniableCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let sep_shared = [0x5eu8; 32];
+        let cred = DeniableCredential::SepPassphrase {
+            passphrase: b"vault-pass",
+            argon2: cheap_argon2(),
+            sep_shared: &sep_shared,
+        };
+        // Realistic biometric-sized SEP blob (~496 B), well under the
+        // 4000 B deniable material budget.
+        let blob = vec![0x9au8; 496];
+        let material = DeniableMaterial {
+            cred_id: Vec::new(),
+            hmac_salt: None,
+            tpm_blob: blob.clone(),
+        };
+        let c = Container::create_with_credential_v2_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            5,
+            &cred,
+            &material,
+        )
+        .unwrap();
+        let mvk_before = c.mvk_clone();
+        assert!(c.is_deniable());
+        drop(c);
+
+        let env = Container::try_open_envelope_v2_deniable(
+            &path,
+            None,
+            &cred,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )
+        .unwrap();
+        // SEP blob round-trips so the frontend can re-derive sep_shared
+        // from it before completing the open.
+        assert_eq!(env.payload().tpm_blob, blob);
+        let c = Container::complete_open_v2_deniable(env, &cred).unwrap();
+        assert_eq!(c.mvk_clone().as_bytes(), mvk_before.as_bytes());
+        drop(c); // release the vault lock before the negative re-open
+
+        // Wrong sep_shared: phase 1 still opens on the passphrase
+        // (envelope discovery), but phase 2 must fail to unwrap the MVK.
+        let wrong_shared = [0u8; 32];
+        let wrong = DeniableCredential::SepPassphrase {
+            passphrase: b"vault-pass",
+            argon2: cheap_argon2(),
+            sep_shared: &wrong_shared,
+        };
+        let env2 = Container::try_open_envelope_v2_deniable(
+            &path,
+            None,
+            &wrong,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )
+        .unwrap();
+        assert!(
+            Container::complete_open_v2_deniable(env2, &wrong).is_err(),
+            "wrong sep_shared must not unwrap the MVK"
+        );
     }
 
     #[test]

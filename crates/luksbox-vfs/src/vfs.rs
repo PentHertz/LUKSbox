@@ -108,6 +108,19 @@ fn build_borrowed_deniable_credential(
                 unsealed: u,
             }
         }
+        K::SepPassphrase => {
+            // SEP reuses the `unsealed` carrier for its 32-byte ECDH
+            // shared secret (the macOS analog of the TPM unseal output).
+            let s = c.unsealed.as_ref().ok_or_else(bad_kind)?;
+            if c.hmac_secret_output.is_some() || c.mlkem_shared.is_some() {
+                return Err(bad_kind());
+            }
+            DC::SepPassphrase {
+                passphrase: pp,
+                argon2: arg,
+                sep_shared: s,
+            }
+        }
         K::TpmFido2Passphrase => {
             let u = c.unsealed.as_ref().ok_or_else(bad_kind)?;
             let hs = c.hmac_secret_output.as_ref().ok_or_else(bad_kind)?;
