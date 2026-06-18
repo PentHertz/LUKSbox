@@ -404,6 +404,10 @@ struct CreateForm {
     /// produces a SINGLE TPM slot; if the chip dies, the vault is
     /// permanently unrecoverable.
     skip_tpm_bootstrap_passphrase: bool,
+    /// Secure Enclave analog of `skip_tpm_bootstrap_passphrase`: when
+    /// set (standard mode, plain/biometric SEP), the vault is created
+    /// with a single SEP slot and no backup passphrase.
+    skip_sep_bootstrap_passphrase: bool,
     /// Opt-in toggle for the 3-factor TPM combos (Tpm2Fido2,
     /// HybridPqTpm2*, HybridPqTpm2Fido2*) to add a passphrase
     /// recovery slot. Default OFF (single multi-factor slot, all
@@ -451,6 +455,7 @@ impl Default for CreateForm {
             use_deniable: false,
             enable_backup_passphrase: false,
             skip_tpm_bootstrap_passphrase: false,
+            skip_sep_bootstrap_passphrase: false,
             enable_recovery_passphrase: false,
             // v3 default from v0.2.0 onward. The create dialog's
             // "On-disk format" panel still lets the user pick v2
@@ -3532,8 +3537,12 @@ impl LuksboxApp {
             }
 
             // SEP-bootstrap recovery warning panel. Shown only when a
-            // Secure Enclave kind is selected; mirrors the TPM panel.
-            if self.create.kind.is_sep_bootstrap() {
+            // Secure Enclave kind is selected in STANDARD mode; mirrors
+            // the TPM panel. Hidden in deniable mode, where there is no
+            // separate slot-0 backup passphrase (the passphrase is the
+            // envelope), so the "keep a backup slot" advice would mislead
+            // and duplicate the per-kind passphrase section below.
+            if self.create.kind.is_sep_bootstrap() && !self.create.use_deniable {
                 section(ui, "Secure Enclave bootstrap recovery", |ui| {
                     ui.label(
                         RichText::new(
@@ -3588,6 +3597,16 @@ impl LuksboxApp {
                                 .password(true);
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [form_width(ui), CONTROL_H],
+                                    ghost_button("Generate strong passphrase..."),
+                                )
+                                .clicked()
+                            {
+                                self.open_passgen(PassgenTarget::CreatePrimary);
+                            }
                             ui.label(
                                 RichText::new(
                                     "This passphrase opens the slot envelope at unlock time. \
@@ -3885,6 +3904,15 @@ impl LuksboxApp {
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
                             ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [form_width(ui), CONTROL_H],
+                                    ghost_button("Generate strong passphrase..."),
+                                )
+                                .clicked()
+                            {
+                                self.open_passgen(PassgenTarget::CreatePrimary);
+                            }
                             ui.label(
                                 RichText::new(
                                     "Deniable: the TPM sealed blob lives inside the slot \
@@ -3952,6 +3980,15 @@ impl LuksboxApp {
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
                             ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [form_width(ui), CONTROL_H],
+                                    ghost_button("Generate strong passphrase..."),
+                                )
+                                .clicked()
+                            {
+                                self.open_passgen(PassgenTarget::CreatePrimary);
+                            }
                         } else {
                             ui.checkbox(
                                 &mut self.create.skip_tpm_bootstrap_passphrase,
@@ -3977,6 +4014,16 @@ impl LuksboxApp {
                                     .password(true);
                                 ui.add_sized([form_width(ui), CONTROL_H], te);
                                 strength_meter(ui, &self.create.passphrase);
+                                ui.add_space(6.0);
+                                if ui
+                                    .add_sized(
+                                        [form_width(ui), CONTROL_H],
+                                        ghost_button("Generate strong passphrase..."),
+                                    )
+                                    .clicked()
+                                {
+                                    self.open_passgen(PassgenTarget::CreatePrimary);
+                                }
                                 ui.add_space(8.0);
                             }
                         }
@@ -4008,6 +4055,15 @@ impl LuksboxApp {
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
                             ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [form_width(ui), CONTROL_H],
+                                    ghost_button("Generate strong passphrase..."),
+                                )
+                                .clicked()
+                            {
+                                self.open_passgen(PassgenTarget::CreatePrimary);
+                            }
                             ui.label(
                                 RichText::new(
                                     "Deniable: TPM blob + FIDO2 cred_id/hmac_salt live \
@@ -4039,6 +4095,15 @@ impl LuksboxApp {
                                 ui.add_sized([form_width(ui), CONTROL_H], te);
                                 strength_meter(ui, &self.create.passphrase);
                                 ui.add_space(6.0);
+                                if ui
+                                    .add_sized(
+                                        [form_width(ui), CONTROL_H],
+                                        ghost_button("Generate strong passphrase..."),
+                                    )
+                                    .clicked()
+                                {
+                                    self.open_passgen(PassgenTarget::CreatePrimary);
+                                }
                             } else {
                                 ui.label(
                                     RichText::new(
@@ -4075,6 +4140,15 @@ impl LuksboxApp {
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
                             ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [form_width(ui), CONTROL_H],
+                                    ghost_button("Generate strong passphrase..."),
+                                )
+                                .clicked()
+                            {
+                                self.open_passgen(PassgenTarget::CreatePrimary);
+                            }
                             ui.label(
                                 RichText::new(
                                     "Deniable: TPM blob embedded in slot envelope. All three \
@@ -4201,6 +4275,15 @@ impl LuksboxApp {
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
                             ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [form_width(ui), CONTROL_H],
+                                    ghost_button("Generate strong passphrase..."),
+                                )
+                                .clicked()
+                            {
+                                self.open_passgen(PassgenTarget::CreatePrimary);
+                            }
                             ui.label(
                                 RichText::new(
                                     "Deniable: 4 factors required at every unlock (envelope \
@@ -4234,6 +4317,16 @@ impl LuksboxApp {
                                 .password(true);
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [form_width(ui), CONTROL_H],
+                                    ghost_button("Generate strong passphrase..."),
+                                )
+                                .clicked()
+                            {
+                                self.open_passgen(PassgenTarget::CreatePrimary);
+                            }
                             ui.add_space(8.0);
                         }
                         ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
@@ -4309,28 +4402,58 @@ impl LuksboxApp {
                     } else {
                         "Secure Enclave"
                     };
+                    let deniable = self.create.use_deniable;
                     section(ui, title, |ui| {
-                        ui.label(
-                            RichText::new(
-                                "Bootstrap passphrase (REQUIRED, also acts as recovery path if \
-                                 the Mac is lost)",
-                            )
-                            .color(theme::WARN)
-                            .size(12.0),
-                        );
-                        let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
-                            .password(true);
-                        ui.add_sized([form_width(ui), CONTROL_H], te);
-                        strength_meter(ui, &self.create.passphrase);
-                        ui.add_space(6.0);
-                        if ui
-                            .add_sized(
-                                [form_width(ui), CONTROL_H],
-                                ghost_button("Generate strong passphrase..."),
-                            )
-                            .clicked()
-                        {
-                            self.open_passgen(PassgenTarget::CreatePrimary);
+                        // Standard mode: optionally skip the backup
+                        // passphrase entirely (single SEP slot, no
+                        // recovery). Mirrors the TPM "skip bootstrap"
+                        // option. Deniable always needs the envelope
+                        // passphrase, so the checkbox is standard-only.
+                        if !deniable {
+                            ui.checkbox(
+                                &mut self.create.skip_sep_bootstrap_passphrase,
+                                "Skip backup passphrase (single Secure Enclave slot, no recovery if the Mac is lost)",
+                            );
+                            if self.create.skip_sep_bootstrap_passphrase {
+                                ui.label(
+                                    RichText::new(
+                                        "No backup: if this Mac's Secure Enclave is wiped or \
+                                         replaced, or the Mac is lost, the vault is PERMANENTLY \
+                                         unrecoverable.",
+                                    )
+                                    .color(theme::WARN)
+                                    .size(11.0),
+                                );
+                                ui.add_space(6.0);
+                            }
+                        }
+                        if deniable || !self.create.skip_sep_bootstrap_passphrase {
+                            ui.label(
+                                RichText::new(if deniable {
+                                    "Envelope passphrase (deniable - required; this passphrase opens \
+                                     the slot envelope at unlock, the Secure Enclave is the second \
+                                     factor)"
+                                } else {
+                                    "Bootstrap passphrase (REQUIRED, also acts as recovery path if \
+                                     the Mac is lost)"
+                                })
+                                .color(theme::WARN)
+                                .size(12.0),
+                            );
+                            let te = egui::TextEdit::singleline(&mut *self.create.passphrase)
+                                .password(true);
+                            ui.add_sized([form_width(ui), CONTROL_H], te);
+                            strength_meter(ui, &self.create.passphrase);
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [form_width(ui), CONTROL_H],
+                                    ghost_button("Generate strong passphrase..."),
+                                )
+                                .clicked()
+                            {
+                                self.open_passgen(PassgenTarget::CreatePrimary);
+                            }
                         }
                         ui.label(
                             RichText::new(
@@ -4348,12 +4471,17 @@ impl LuksboxApp {
                     } else {
                         "Hybrid Secure Enclave + ML-KEM-768"
                     };
+                    let deniable = self.create.use_deniable;
                     section(ui, title, |ui| {
                         ui.label(
-                            RichText::new(
+                            RichText::new(if deniable {
+                                "Envelope passphrase (deniable - required; this passphrase opens \
+                                 the slot envelope at unlock, the Secure Enclave is the second \
+                                 factor)"
+                            } else {
                                 "Bootstrap passphrase (REQUIRED, also acts as recovery path if \
-                                 the Mac is lost)",
-                            )
+                                 the Mac is lost)"
+                            })
                             .color(theme::WARN)
                             .size(12.0),
                         );
@@ -4361,6 +4489,16 @@ impl LuksboxApp {
                             .password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         strength_meter(ui, &self.create.passphrase);
+                        ui.add_space(6.0);
+                        if ui
+                            .add_sized(
+                                [form_width(ui), CONTROL_H],
+                                ghost_button("Generate strong passphrase..."),
+                            )
+                            .clicked()
+                        {
+                            self.open_passgen(PassgenTarget::CreatePrimary);
+                        }
                         ui.add_space(8.0);
                         ui.label(
                             RichText::new(
@@ -4373,6 +4511,16 @@ impl LuksboxApp {
                         let te = egui::TextEdit::singleline(&mut *self.create.hybrid_seed_pw)
                             .password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
+                        ui.add_space(6.0);
+                        if ui
+                            .add_sized(
+                                [form_width(ui), CONTROL_H],
+                                ghost_button("Generate strong seed-file passphrase..."),
+                            )
+                            .clicked()
+                        {
+                            self.open_passgen(PassgenTarget::CreateSeedPw);
+                        }
                         ui.add_space(10.0);
                         ui.label(
                             RichText::new(
@@ -4419,15 +4567,20 @@ impl LuksboxApp {
                         .expect("fused arm implies sep_fused() is Some");
                     let has_fido2 = factors.has_fido2();
                     let has_pp = factors.has_passphrase();
+                    let deniable = self.create.use_deniable;
                     section(ui, "Fused Secure Enclave", |ui| {
-                        // Bootstrap / recovery passphrase: always present
-                        // (the vault is created with it at slot 0, kept as
-                        // recovery; the fused SEP slot is then moved to 0).
+                        // Bootstrap / recovery passphrase in standard mode;
+                        // the envelope passphrase in deniable mode (same
+                        // field, different role).
                         ui.label(
-                            RichText::new(
+                            RichText::new(if deniable {
+                                "Envelope passphrase (deniable - required; opens the slot \
+                                 envelope at unlock, the Secure Enclave + FIDO2 are the other \
+                                 factors)"
+                            } else {
                                 "Bootstrap passphrase (REQUIRED, also acts as recovery path if \
-                                 the Mac is lost)",
-                            )
+                                 the Mac is lost)"
+                            })
                             .color(theme::WARN)
                             .size(12.0),
                         );
@@ -4435,6 +4588,16 @@ impl LuksboxApp {
                             .password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         strength_meter(ui, &self.create.passphrase);
+                        ui.add_space(6.0);
+                        if ui
+                            .add_sized(
+                                [form_width(ui), CONTROL_H],
+                                ghost_button("Generate strong passphrase..."),
+                            )
+                            .clicked()
+                        {
+                            self.open_passgen(PassgenTarget::CreatePrimary);
+                        }
                         ui.add_space(8.0);
 
                         if has_fido2 {
@@ -4469,6 +4632,16 @@ impl LuksboxApp {
                                     .password(true);
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.backup_passphrase);
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [form_width(ui), CONTROL_H],
+                                    ghost_button("Generate strong slot passphrase..."),
+                                )
+                                .clicked()
+                            {
+                                self.open_passgen(PassgenTarget::CreateBackup);
+                            }
                             ui.add_space(8.0);
                         }
 
@@ -4484,6 +4657,16 @@ impl LuksboxApp {
                             let te = egui::TextEdit::singleline(&mut *self.create.hybrid_seed_pw)
                                 .password(true);
                             ui.add_sized([form_width(ui), CONTROL_H], te);
+                            ui.add_space(6.0);
+                            if ui
+                                .add_sized(
+                                    [form_width(ui), CONTROL_H],
+                                    ghost_button("Generate strong seed-file passphrase..."),
+                                )
+                                .clicked()
+                            {
+                                self.open_passgen(PassgenTarget::CreateSeedPw);
+                            }
                             ui.add_space(10.0);
                             ui.label(
                                 RichText::new(
@@ -4974,6 +5157,28 @@ impl LuksboxApp {
             return;
         }
 
+        // SEP-only path (skip backup passphrase): single Secure Enclave
+        // slot, no recovery. Mirrors the TPM-only path. Standard mode
+        // only; deniable always needs the envelope passphrase.
+        if cfg!(target_os = "macos")
+            && self.create.skip_sep_bootstrap_passphrase
+            && !self.create.use_deniable
+            && matches!(self.create.kind, CreateKind::Sep | CreateKind::SepBiometric)
+        {
+            if let Err(e) = ops::pre_check_sep() {
+                self.toast_err(e);
+                return;
+            }
+            let biometric = self.create.kind == CreateKind::SepBiometric;
+            let rx = ops::spawn(move || ops::create_vault_sep_only(opts, biometric));
+            self.pending = Some(Pending::CreateWithTpmBootstrap {
+                rx,
+                needs_touch,
+                slot_label: "Secure Enclave",
+            });
+            return;
+        }
+
         // SEP-bootstrap path: mirror the TPM path. Pre-flight the
         // enclave so a missing-SEP failure surfaces BEFORE we touch
         // disk, then dispatch the atomic create+enroll worker that
@@ -5015,7 +5220,9 @@ impl LuksboxApp {
             k if k.sep_fused().is_some() => {
                 let (factors, kem_size) = k.sep_fused().expect("guarded by is_some()");
                 if kem_size.is_some() && self.create.hybrid_kyber_path.trim().is_empty() {
-                    self.toast_err("hybrid fused SEP kind requires a path for the .kyber seed file");
+                    self.toast_err(
+                        "hybrid fused SEP kind requires a path for the .kyber seed file",
+                    );
                     return;
                 }
                 let pin = std::mem::take(&mut self.create.pin);
@@ -5960,9 +6167,11 @@ impl LuksboxApp {
                     );
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new("Slot passphrase (only for Secure Enclave + passphrase slots)")
-                            .color(theme::DIM)
-                            .size(12.0),
+                        RichText::new(
+                            "Slot passphrase (only for Secure Enclave + passphrase slots)",
+                        )
+                        .color(theme::DIM)
+                        .size(12.0),
                     );
                     ui.add_sized(
                         [form_width(ui), CONTROL_H],
@@ -5970,11 +6179,9 @@ impl LuksboxApp {
                     );
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new(
-                            "macOS only. Only opens on the Mac that sealed the slot.",
-                        )
-                        .color(theme::FAINT)
-                        .size(11.0),
+                        RichText::new("macOS only. Only opens on the Mac that sealed the slot.")
+                            .color(theme::FAINT)
+                            .size(11.0),
                     );
                 });
             }
@@ -6013,9 +6220,11 @@ impl LuksboxApp {
                     });
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new("FIDO2 PIN (only for fused hybrid Secure Enclave + FIDO2 slots)")
-                            .color(theme::DIM)
-                            .size(12.0),
+                        RichText::new(
+                            "FIDO2 PIN (only for fused hybrid Secure Enclave + FIDO2 slots)",
+                        )
+                        .color(theme::DIM)
+                        .size(12.0),
                     );
                     ui.add_sized(
                         [form_width(ui), CONTROL_H],
@@ -6154,14 +6363,15 @@ impl LuksboxApp {
             deniable_kdf: self.unlock.deniable_kdf,
             recovery_mode: self.unlock.recovery_mode,
         };
-        let needs_touch = matches!(
-            opts.method,
-            UnlockMethod::Fido2
-                | UnlockMethod::HybridPqFido2
-                | UnlockMethod::Tpm2Fido2
-                | UnlockMethod::HybridPqTpm2Fido2
-        ) || (matches!(opts.method, UnlockMethod::Sep | UnlockMethod::HybridPqSep)
-            && opts.pin.as_ref().map(|p| !p.is_empty()).unwrap_or(false));
+        let needs_touch =
+            matches!(
+                opts.method,
+                UnlockMethod::Fido2
+                    | UnlockMethod::HybridPqFido2
+                    | UnlockMethod::Tpm2Fido2
+                    | UnlockMethod::HybridPqTpm2Fido2
+            ) || (matches!(opts.method, UnlockMethod::Sep | UnlockMethod::HybridPqSep)
+                && opts.pin.as_ref().map(|p| !p.is_empty()).unwrap_or(false));
         let rx = ops::spawn(move || ops::unlock_vault(opts));
         self.pending = Some(Pending::Unlock { rx, needs_touch });
     }
@@ -9152,7 +9362,10 @@ impl LuksboxApp {
         let mut hs_err: Option<String> = None;
         let mut open_hs_picker = false;
         if let Some(form) = self.add_hybrid_sep_modal.as_mut() {
-            let title = format!("Add hybrid Secure Enclave + ML-KEM-{} keyslot", form.kem_size);
+            let title = format!(
+                "Add hybrid Secure Enclave + ML-KEM-{} keyslot",
+                form.kem_size
+            );
             egui::Window::new(title)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .collapsible(false)
@@ -9329,8 +9542,7 @@ impl LuksboxApp {
                                 .size(12.0),
                         );
                         ui.horizontal(|ui| {
-                            let (field_w, browse_w) =
-                                trailing_button_row_widths(ui, 320.0, 90.0);
+                            let (field_w, browse_w) = trailing_button_row_widths(ui, 320.0, 90.0);
                             ui.add_sized(
                                 [field_w, CONTROL_H],
                                 egui::TextEdit::singleline(&mut form.kyber_path)
@@ -9345,11 +9557,9 @@ impl LuksboxApp {
                         });
                         ui.add_space(6.0);
                         ui.label(
-                            RichText::new(
-                                "Seed-file passphrase (encrypts the .kyber at rest)",
-                            )
-                            .color(theme::DIM)
-                            .size(12.0),
+                            RichText::new("Seed-file passphrase (encrypts the .kyber at rest)")
+                                .color(theme::DIM)
+                                .size(12.0),
                         );
                         ui.add_sized(
                             [capped_width(ui, 320.0), CONTROL_H],

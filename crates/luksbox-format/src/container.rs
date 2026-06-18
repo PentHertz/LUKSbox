@@ -953,6 +953,48 @@ impl Container {
         })
     }
 
+    /// Create a vault whose ONLY keyslot is a macOS Secure Enclave slot
+    /// (plain `SepSealed` or biometric `SepSealedBiometric`). No
+    /// passphrase, no other recovery path: if the enclave is wiped or
+    /// replaced (or the Mac is lost) the vault is permanently
+    /// unrecoverable, the SEP analog of `create_with_tpm2`. The caller
+    /// has already run `SepSealer::seal` and supplies the 32-byte ECDH
+    /// shared secret for the in-process wrap plus the opaque `SepBlob`
+    /// bytes to store in the in-header SEP region. This constructor is
+    /// platform-independent (it only handles already-sealed material);
+    /// only the sealing itself is macOS-gated.
+    pub fn create_with_sep(
+        path: &Path,
+        header_path: Option<&Path>,
+        cipher: CipherSuite,
+        flags: u32,
+        kind: SlotKind,
+        sep_shared: &[u8; 32],
+        sep_blob: &[u8],
+    ) -> Result<Self, Error> {
+        let mut cont = Self::create_internal(path, header_path, cipher, flags, |mvk, header| {
+            Keyslot::new_sep(
+                cipher,
+                mvk,
+                kind,
+                sep_shared,
+                None,
+                None,
+                Argon2idParams::INTERACTIVE,
+                None,
+                &[],
+                [0u8; 32],
+                &header.header_salt,
+            )
+        })?;
+        // The SepBlob lives in the in-header SEP region, not the
+        // 512-byte keyslot, so set it after create and re-persist.
+        cont.header.set_sep_blob(0, sep_blob.to_vec())?;
+        cont.header_dirty = true;
+        cont.persist_header()?;
+        Ok(cont)
+    }
+
     /// PIN-bound variant of `create_with_tpm2`. Same single-slot,
     /// no-recovery story; the sealed blob must have been produced by
     /// `Tpm2Sealer::seal_with_pin`.
@@ -4219,6 +4261,39 @@ mod tests {
         );
     }
 
+    /// `create_with_sep` makes a single SEP keyslot with NO passphrase
+    /// recovery slot (the "skip backup passphrase" SEP-only path,
+    /// mirroring `create_with_tpm2`). The opaque SepBlob round-trips
+    /// through the in-header region. (Open requires the enclave, so this
+    /// only checks the on-disk shape, not a full unlock.)
+    #[test]
+    fn create_with_sep_makes_single_sep_slot_no_passphrase() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sep-only.lbx");
+        let sep_shared = [0x5eu8; 32];
+        let sep_blob = vec![0x9au8; 353];
+        let c = Container::create_with_sep(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            luksbox_core::SlotKind::SepSealed,
+            &sep_shared,
+            &sep_blob,
+        )
+        .unwrap();
+        assert_eq!(c.header.keyslots[0].kind, luksbox_core::SlotKind::SepSealed);
+        assert!(c.header.has_sep_region());
+        assert_eq!(c.header.sep_blob(0), Some(sep_blob.as_slice()));
+        // No passphrase / other recovery slot was created.
+        assert!(
+            c.header.keyslots[1..]
+                .iter()
+                .all(|k| k.kind == luksbox_core::SlotKind::Empty),
+            "create_with_sep must leave slots 1.. empty (no backup passphrase)"
+        );
+    }
+
     #[test]
     fn create_and_reopen_with_passphrase() {
         let dir = tempdir().unwrap();
@@ -4653,8 +4728,7 @@ mod tests {
         assert!(cont.header.sep_blob(plain_idx).is_some());
         assert!(cont.header.has_sep_region());
         assert!(
-            !path.with_extension("lbx.sep").exists()
-                && !dir.path().join("v.lbx.sep").exists(),
+            !path.with_extension("lbx.sep").exists() && !dir.path().join("v.lbx.sep").exists(),
             "no external .lbx.sep file must be created"
         );
         cont.persist_header().unwrap();
@@ -4663,7 +4737,10 @@ mod tests {
         // Re-open the plain SEP slot via a closure that maps the
         // in-header blob -> shared secret (the role of SepSealer).
         let mut unseal = |blob: &[u8]| -> Result<[u8; 32], String> {
-            mock_sep.get(blob).copied().ok_or_else(|| "foreign enclave".into())
+            mock_sep
+                .get(blob)
+                .copied()
+                .ok_or_else(|| "foreign enclave".into())
         };
         let cont = Container::open(
             &path,
@@ -4677,15 +4754,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cont.header.keyslots[plain_idx].kind, SlotKind::SepSealed);
-        assert_eq!(
-            cont.header.keyslots[hy_idx].kind,
-            SlotKind::HybridPqKemSep
-        );
+        assert_eq!(cont.header.keyslots[hy_idx].kind, SlotKind::HybridPqKemSep);
         drop(cont);
 
         // The hybrid slot opens when the pq factor is also supplied.
         let mut unseal2 = |blob: &[u8]| -> Result<[u8; 32], String> {
-            mock_sep.get(blob).copied().ok_or_else(|| "foreign enclave".into())
+            mock_sep
+                .get(blob)
+                .copied()
+                .ok_or_else(|| "foreign enclave".into())
         };
         Container::open(
             &path,
@@ -4763,10 +4840,9 @@ mod tests {
         drop(cont);
 
         // SEP unlock must still work after the swap.
-        let mut unseal =
-            |b: &[u8]| -> std::result::Result<[u8; 32], String> {
-                mock.get(b).copied().ok_or_else(|| "miss".into())
-            };
+        let mut unseal = |b: &[u8]| -> std::result::Result<[u8; 32], String> {
+            mock.get(b).copied().ok_or_else(|| "miss".into())
+        };
         Container::open(
             &path,
             None,

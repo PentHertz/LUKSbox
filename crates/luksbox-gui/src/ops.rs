@@ -1722,7 +1722,13 @@ pub fn create_vault_with_sep_bootstrap(
             kyber_path,
             seed_pw,
             kem_size,
-        } => enroll_hybrid_pq_sep(&mut opened.vfs, &vault_path, &kyber_path, &seed_pw, kem_size),
+        } => enroll_hybrid_pq_sep(
+            &mut opened.vfs,
+            &vault_path,
+            &kyber_path,
+            &seed_pw,
+            kem_size,
+        ),
         SepBootstrapKind::SepFused {
             factors,
             kem_size,
@@ -1958,14 +1964,13 @@ fn create_sep_passphrase_deniable(
                     seed,
                     seed_pw,
                 ));
-                let cred =
-                    luksbox_core::deniable::DeniableCredential::HybridPqSepFido2Passphrase {
-                        passphrase: envelope_pw.as_bytes(),
-                        argon2: kdf_params,
-                        mlkem_shared: &shared,
-                        sep_shared: &sep_shared,
-                        hmac_secret_output: &hmac_secret,
-                    };
+                let cred = luksbox_core::deniable::DeniableCredential::HybridPqSepFido2Passphrase {
+                    passphrase: envelope_pw.as_bytes(),
+                    argon2: kdf_params,
+                    mlkem_shared: &shared,
+                    sep_shared: &sep_shared,
+                    hmac_secret_output: &hmac_secret,
+                };
                 let material = DeniableMaterial {
                     cred_id,
                     hmac_salt: Some(hmac_salt),
@@ -2082,6 +2087,86 @@ fn create_sep_passphrase_deniable(
     _opts: CreateOpts,
     _kind: SepBootstrapKind,
 ) -> Result<OpenedVault, String> {
+    Err("Secure Enclave is macOS-only".into())
+}
+
+/// Create a vault whose ONLY keyslot is a macOS Secure Enclave slot
+/// (no backup passphrase). The SEP analog of `create_vault_tpm2_only`,
+/// reached from the GUI "Skip backup passphrase" checkbox. If the
+/// enclave is wiped/replaced the vault is permanently unrecoverable.
+#[cfg(all(feature = "hardware", target_os = "macos"))]
+pub fn create_vault_sep_only(opts: CreateOpts, biometric: bool) -> Result<OpenedVault, String> {
+    use luksbox_core::SlotKind;
+    use luksbox_sep::SepSealer;
+
+    let vault_path = opts.path.clone();
+    let header_path = opts.header_path.clone();
+    let anchor_path = opts.anchor_path.clone();
+    let mut flags = 0u32;
+    if opts.pad_files || opts.hide_sizes {
+        flags |= FLAG_PAD_FILES_POW2;
+    }
+    if opts.hide_sizes {
+        flags |= FLAG_HIDE_SIZE_HEADER;
+    }
+
+    let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
+    let kind = if biometric {
+        SlotKind::SepSealedBiometric
+    } else {
+        SlotKind::SepSealed
+    };
+    let (sep_shared, blob) = if biometric {
+        sealer
+            .seal_biometric()
+            .map_err(|e| format!("SEP seal (biometric): {e}"))?
+    } else {
+        sealer.seal().map_err(|e| format!("SEP seal: {e}"))?
+    };
+    let blob_bytes = blob.to_bytes();
+
+    let mut cont = Container::create_with_sep(
+        &vault_path,
+        header_path.as_deref(),
+        opts.cipher,
+        flags,
+        kind,
+        &sep_shared,
+        &blob_bytes,
+    )
+    .map_err(|e| {
+        let _ = std::fs::remove_file(&vault_path);
+        format!("Secure Enclave-only vault create failed: {e}")
+    })?;
+
+    if let Some(ap) = anchor_path.as_ref()
+        && let Err(e) = cont.init_anchor(ap.clone(), 1).map_err(estr)
+    {
+        drop(cont);
+        let _ = std::fs::remove_file(&vault_path);
+        let _ = std::fs::remove_file(ap);
+        return Err(format!("anchor init failed: {e}"));
+    }
+
+    let cipher = cipher_label(cont.header.cipher_suite).to_string();
+    let vfs = Vfs::open(cont).map_err(estr)?;
+    Ok(OpenedVault {
+        vfs,
+        vault_path,
+        header_path,
+        anchor_path,
+        cipher_label: cipher,
+        has_fido2: false,
+        has_hybrid_pq: false,
+        has_tpm: false,
+        deniable_fido2_recovery: None,
+        deniable_tpm_blob_path: None,
+        tolerated_inodes: Vec::new(),
+    })
+}
+
+#[cfg(not(all(feature = "hardware", target_os = "macos")))]
+pub fn create_vault_sep_only(_opts: CreateOpts, _biometric: bool) -> Result<OpenedVault, String> {
     Err("Secure Enclave is macOS-only".into())
 }
 
@@ -3063,8 +3148,12 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
                 match Container::complete_open_v2_deniable_reusable(envelope, &cred) {
                     Ok(c) => c,
                     Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
-                        let hmac_secret =
-                            deniable_fido2_hmac_from_payload(&opts, &payload_cred_id, &salt, false)?;
+                        let hmac_secret = deniable_fido2_hmac_from_payload(
+                            &opts,
+                            &payload_cred_id,
+                            &salt,
+                            false,
+                        )?;
                         let cred = luksbox_core::deniable::DeniableCredential::SepFido2Passphrase {
                             passphrase: pw.as_bytes(),
                             argon2: kdf_params,
@@ -3106,8 +3195,12 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
                 match Container::complete_open_v2_deniable_reusable(envelope, &cred) {
                     Ok(c) => c,
                     Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
-                        let hmac_secret =
-                            deniable_fido2_hmac_from_payload(&opts, &payload_cred_id, &salt, false)?;
+                        let hmac_secret = deniable_fido2_hmac_from_payload(
+                            &opts,
+                            &payload_cred_id,
+                            &salt,
+                            false,
+                        )?;
                         let cred =
                             luksbox_core::deniable::DeniableCredential::HybridPqSepFido2Passphrase {
                                 passphrase: pw.as_bytes(),
@@ -3889,9 +3982,10 @@ fn open_sep_common(
     let want_pq = pq_shared_for.is_some();
 
     // Does any in-scope slot need a passphrase / FIDO2?
-    let needs_pp = header.keyslots.iter().any(|s| {
-        s.kind.is_sep() && s.kind.is_sep_passphrase() && s.kind.is_hybrid_pq() == want_pq
-    });
+    let needs_pp = header
+        .keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && s.kind.is_sep_passphrase() && s.kind.is_hybrid_pq() == want_pq);
     let any_fido2_slot = header
         .keyslots
         .iter()
@@ -3950,7 +4044,9 @@ fn open_sep_common(
         // conventions, mirroring the CLI's open path.
         let hmac_secret = if slot.kind.is_sep_fido2() {
             let pin = pin.expect("collect_fido2 implies a PIN");
-            let auth = auth.as_mut().expect("collect_fido2 implies an authenticator");
+            let auth = auth
+                .as_mut()
+                .expect("collect_fido2 implies an authenticator");
             if slot.fido2_cred_id.is_empty() {
                 last_err = Some(format!("FIDO2 slot {idx} has no stored cred_id"));
                 continue;
@@ -5730,8 +5826,8 @@ pub fn enroll_sep_fused(
     };
 
     let kyber_path = if params.is_some() {
-        let kp = kyber_path
-            .ok_or("hybrid SEP enroll requires a path to write the .kyber seed file")?;
+        let kp =
+            kyber_path.ok_or("hybrid SEP enroll requires a path to write the .kyber seed file")?;
         if kp.exists() {
             return Err(format!("{} already exists", kp.display()));
         }
