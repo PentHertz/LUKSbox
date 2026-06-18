@@ -562,6 +562,30 @@ impl SlotKind {
         )
     }
 
+    /// True for every keyslot kind that stores a 32-byte FIDO2
+    /// `hmac_salt` in its inline 512-byte slot region. This is the
+    /// SINGLE source of truth for the slot's `salt_len` field: the
+    /// `from_bytes` parser, `to_bytes` (what is written to disk), and
+    /// `build_aead_aad` (what the AEAD authenticates) all delegate
+    /// here. If those sites were allowed to encode the set
+    /// independently they could drift, and a kind that writes a salt
+    /// the AEAD does not cover is born; that happened for the TPM+FIDO2
+    /// kinds (restored 2026-05) and again for SEP+FIDO2 (restored
+    /// 2026-06). Keep this the only definition of the set, pinned by
+    /// `aad_covers_hmac_salt_for_every_salt_bearing_kind`.
+    pub fn has_inline_hmac_salt(self) -> bool {
+        matches!(
+            self,
+            Self::Fido2HmacSecret
+                | Self::Fido2DerivedMvk
+                | Self::HybridPqKemFido2
+                | Self::HybridPqKem1024Fido2
+                | Self::Tpm2Fido2
+                | Self::HybridPqKemTpm2Fido2
+                | Self::HybridPqKem1024Tpm2Fido2
+        ) || self.is_sep_fido2()
+    }
+
     /// True for SEP kinds that ALSO require an Argon2id passphrase.
     /// These run Argon2id over the slot's `kdf_salt` / `kdf_params`.
     pub fn is_sep_passphrase(self) -> bool {
@@ -2012,28 +2036,13 @@ impl Keyslot {
             // byte-identical to what `to_bytes` writes).
             let cred = &self.fido2_cred_id[..self.fido2_cred_id.len().min(cred_max)];
             let cred_len = cred.len() as u16;
-            // SECURITY: this list MUST mirror the equivalent matches!()
-            // in `to_bytes` exactly. Any kind that writes a real
-            // hmac_salt via to_bytes MUST also include it in AAD here,
-            // otherwise the salt bytes are written to disk but excluded
-            // from AEAD coverage; an attacker could then flip the salt
-            // without breaking the wrap, causing the user's FIDO2
-            // authenticator to return a different hmac_secret at unlock
-            // time -> AEAD fails -> denial of service. Not a key
-            // recovery break (HMAC-SHA-256 second-preimage is
-            // infeasible) but a design-invariant break worth pinning
-            // with a test. The three fused TPM+FIDO2 kinds were missed
-            // when they were originally added; restored 2026-05.
-            let salt_len = if matches!(
-                self.kind,
-                SlotKind::Fido2HmacSecret
-                    | SlotKind::Fido2DerivedMvk
-                    | SlotKind::HybridPqKemFido2
-                    | SlotKind::HybridPqKem1024Fido2
-                    | SlotKind::Tpm2Fido2
-                    | SlotKind::HybridPqKemTpm2Fido2
-                    | SlotKind::HybridPqKem1024Tpm2Fido2,
-            ) {
+            // SECURITY: `salt_len` here (what the AAD authenticates)
+            // MUST equal `salt_len` in `to_bytes` (what is written to
+            // disk), or the salt is persisted but excluded from AEAD
+            // coverage. Both delegate to the single
+            // `SlotKind::has_inline_hmac_salt()` source of truth so the
+            // two sites cannot drift; see that method for the history.
+            let salt_len = if self.kind.has_inline_hmac_salt() {
                 FIDO2_HMAC_SALT_LEN as u16
             } else {
                 0
@@ -2112,19 +2121,11 @@ impl Keyslot {
         let cred = &self.fido2_cred_id[..self.fido2_cred_id.len().min(cred_max)];
         let cred_len = cred.len() as u16;
         // `salt_len` is non-zero only when the slot actually
-        // carries a FIDO2 hmac_salt. TPM-sealed slots have no
-        // FIDO2 component so this stays 0.
-        let salt_len = if matches!(
-            self.kind,
-            SlotKind::Fido2HmacSecret
-                | SlotKind::Fido2DerivedMvk
-                | SlotKind::HybridPqKemFido2
-                | SlotKind::HybridPqKem1024Fido2
-                | SlotKind::Tpm2Fido2
-                | SlotKind::HybridPqKemTpm2Fido2
-                | SlotKind::HybridPqKem1024Tpm2Fido2,
-        ) || self.kind.is_sep_fido2()
-        {
+        // carries a FIDO2 hmac_salt. TPM-sealed and plain-SEP slots
+        // have no FIDO2 component so this stays 0. MUST match the AAD
+        // decision in `build_aead_aad`; both delegate to the single
+        // `has_inline_hmac_salt()` source of truth.
+        let salt_len = if self.kind.has_inline_hmac_salt() {
             FIDO2_HMAC_SALT_LEN as u16
         } else {
             0
@@ -2212,17 +2213,7 @@ impl Keyslot {
         }
         let mut fido2_cred_id = Vec::new();
         let mut fido2_hmac_salt = [0u8; 32];
-        if matches!(
-            kind,
-            SlotKind::Fido2HmacSecret
-                | SlotKind::Fido2DerivedMvk
-                | SlotKind::HybridPqKemFido2
-                | SlotKind::HybridPqKem1024Fido2
-                | SlotKind::Tpm2Fido2
-                | SlotKind::HybridPqKemTpm2Fido2
-                | SlotKind::HybridPqKem1024Tpm2Fido2,
-        ) || kind.is_sep_fido2()
-        {
+        if kind.has_inline_hmac_salt() {
             if salt_len != FIDO2_HMAC_SALT_LEN {
                 return Err(Error::InvalidField);
             }
@@ -2377,6 +2368,65 @@ mod tests {
         assert_eq!(cred_len as usize, FIDO2_CRED_ID_MAX);
         // The companion AAD path must also be panic-safe on the same slot.
         let _ = oversized_external_slot().build_aead_aad(&[0u8; 32]);
+    }
+
+    /// R14-01 regression: every kind that writes a 32-byte FIDO2
+    /// `hmac_salt` to disk via `to_bytes` MUST also bind that salt into
+    /// the AEAD AAD via `build_aead_aad`. If the two `salt_len`
+    /// decisions drift (they did for TPM+FIDO2, then for SEP+FIDO2 on
+    /// the v0.4.0 branch), the salt is persisted but unauthenticated.
+    /// Pin parity by asserting the salt appears in BOTH the on-disk
+    /// bytes and the AAD for every salt-bearing kind.
+    #[test]
+    fn aad_covers_hmac_salt_for_every_salt_bearing_kind() {
+        const SALT: [u8; 32] = [0x42u8; 32];
+        let salt_bearing = [
+            SlotKind::Fido2HmacSecret,
+            SlotKind::Fido2DerivedMvk,
+            SlotKind::HybridPqKemFido2,
+            SlotKind::HybridPqKem1024Fido2,
+            SlotKind::Tpm2Fido2,
+            SlotKind::HybridPqKemTpm2Fido2,
+            SlotKind::HybridPqKem1024Tpm2Fido2,
+            SlotKind::SepFido2,
+            SlotKind::HybridPqKemSepFido2,
+            SlotKind::HybridPqKem1024SepFido2,
+            SlotKind::SepFido2Passphrase,
+            SlotKind::HybridPqKemSepFido2Passphrase,
+            SlotKind::HybridPqKem1024SepFido2Passphrase,
+        ];
+        for kind in salt_bearing {
+            assert!(
+                kind.has_inline_hmac_salt(),
+                "{kind:?} is salt-bearing but has_inline_hmac_salt() is false"
+            );
+            let slot = Keyslot {
+                kind,
+                aad_version: AAD_VERSION_V4,
+                uuid: [0u8; 16],
+                kdf_params: Argon2idParams {
+                    m_cost_kib: 0,
+                    t_cost: 0,
+                    p_cost: 0,
+                },
+                kdf_salt: [0u8; 32],
+                aead_nonce: [0u8; 12],
+                wrapped_ct: [0u8; 32],
+                wrapped_tag: [0u8; 16],
+                fido2_cred_id: vec![0u8; 4],
+                fido2_hmac_salt: SALT,
+            };
+            let on_disk = slot.to_bytes();
+            let aad = slot.build_aead_aad(&[0u8; 32]);
+            assert!(
+                on_disk.windows(32).any(|w| w == SALT),
+                "{kind:?}: to_bytes did not persist the hmac_salt"
+            );
+            assert!(
+                aad.windows(32).any(|w| w == SALT),
+                "{kind:?}: build_aead_aad did NOT cover the hmac_salt (R14-01 regression)"
+            );
+        }
     }
 
     #[test]

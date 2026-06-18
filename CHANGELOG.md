@@ -14,6 +14,43 @@ canonical record.
 
 ---
 
+## [v0.4.0-rc.1] - 2026-06-18
+
+Release candidate for the v0.4.0 line. Headline feature: macOS Secure
+Enclave (SEP) keyslots on Apple Silicon and T2 Macs. See the design
+notes in `docs/SEP_KEYSLOT_DESIGN.md` and the focused security review in
+`docs/SECURITY_AUDIT_ROUND_14.md`.
+
+### Added: macOS Secure Enclave (SEP) keyslots
+
+Bind a keyslot to the machine's Secure Enclave via CryptoKit
+`SecureEnclave.P256.KeyAgreement` (ECDH + HKDF, derive-mode). The
+per-slot SEP material lives in a new in-header region (gated by
+`FLAG_HAS_SEP_REGION`, covered by the header HMAC), so SEP vaults need
+no external sidecar and the header geometry is unchanged. 13 keyslot
+kinds: plain, biometric (Touch ID), fused with FIDO2 and/or a
+passphrase, and ML-KEM-768 / ML-KEM-1024 hybrids. Recovery follows the
+TPM model: keep a backup passphrase slot, since a wiped or replaced
+enclave makes a SEP slot unopenable. Full mechanism in
+`docs/CRYPTO_SPEC.md` section 21 and `docs/SECURITY_ARCHITECTURE.md`.
+
+### Security: SEP+FIDO2 keyslots now bind the FIDO2 hmac_salt into AEAD coverage (audit R14-01)
+
+The Round 14 SEP review found the six SEP+FIDO2 keyslot kinds wrote the
+32-byte `fido2_hmac_salt` to the slot but omitted it from the AEAD AAD,
+because the `salt_len` decision in `build_aead_aad` had drifted from the
+one in `to_bytes` when the SEP kinds were added. The salt stayed covered
+by the MVK-keyed header HMAC, so the realistic impact was a targeted
+slot lockout that already required holding the MVK, not a key-recovery
+or unlock bypass. Fixed by making `SlotKind::has_inline_hmac_salt()` the
+single source of truth that `build_aead_aad`, `to_bytes`, and the
+`from_bytes` parser all share, so the salt-bearing set can never drift
+again on a future keyslot-kind addition. Pinned by a new parity test,
+`aad_covers_hmac_salt_for_every_salt_bearing_kind`. See
+`docs/SECURITY_AUDIT_ROUND_14.md`.
+
+---
+
 ## [v0.3.1] - 2026-06-17
 
 Hardening and usability fixes, with a focus on running unprivileged on
