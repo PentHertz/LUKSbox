@@ -183,6 +183,46 @@ fn build_borrowed_deniable_credential(
                 hmac_secret_output: hs,
             }
         }
+        // SEP variants reuse the `unsealed` carrier for the enclave's
+        // 32-byte ECDH secret (the macOS analog of the TPM unseal output).
+        K::SepFido2Passphrase => {
+            let u = c.unsealed.as_ref().ok_or_else(bad_kind)?;
+            let hs = c.hmac_secret_output.as_ref().ok_or_else(bad_kind)?;
+            if c.mlkem_shared.is_some() {
+                return Err(bad_kind());
+            }
+            DC::SepFido2Passphrase {
+                passphrase: pp,
+                argon2: arg,
+                sep_shared: u,
+                hmac_secret_output: hs,
+            }
+        }
+        K::HybridPqSepPassphrase => {
+            let m = c.mlkem_shared.as_ref().ok_or_else(bad_kind)?;
+            let u = c.unsealed.as_ref().ok_or_else(bad_kind)?;
+            if c.hmac_secret_output.is_some() {
+                return Err(bad_kind());
+            }
+            DC::HybridPqSepPassphrase {
+                passphrase: pp,
+                argon2: arg,
+                mlkem_shared: m,
+                sep_shared: u,
+            }
+        }
+        K::HybridPqSepFido2Passphrase => {
+            let m = c.mlkem_shared.as_ref().ok_or_else(bad_kind)?;
+            let u = c.unsealed.as_ref().ok_or_else(bad_kind)?;
+            let hs = c.hmac_secret_output.as_ref().ok_or_else(bad_kind)?;
+            DC::HybridPqSepFido2Passphrase {
+                passphrase: pp,
+                argon2: arg,
+                mlkem_shared: m,
+                sep_shared: u,
+                hmac_secret_output: hs,
+            }
+        }
     };
     Ok((c.slot_idx, cred, &c.material))
 }

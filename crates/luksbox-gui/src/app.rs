@@ -3463,11 +3463,11 @@ impl LuksboxApp {
                             "Secure Enclave, wrap key sealed under this Mac's Secure Enclave. Bootstrap passphrase REQUIRED (also acts as recovery if the Mac is lost).");
                         ui.radio_value(&mut self.create.kind, CreateKind::SepBiometric,
                             "Secure Enclave + Touch ID, unseal requires a Touch ID prompt at every unlock. Bootstrap passphrase kept as recovery.");
-                        // The hybrid / fused SEP variants below have no
-                        // deniable credential yet, so they are hidden in
-                        // deniable mode (only plain / Touch ID SEP, which
-                        // map to the SepPassphrase deniable credential).
-                        if !self.create.use_deniable {
+                        // Deniable-compatible variants (shown in both
+                        // standard and deniable mode). In deniable mode the
+                        // bootstrap passphrase is the envelope; SEP + the
+                        // optional FIDO2 / ML-KEM factors map to the
+                        // Sep* deniable credentials.
                         ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSep,
                             "Hybrid Secure Enclave + ML-KEM-768. PQ + Mac-bound. .kyber seed file required.");
                         ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSep1024,
@@ -3476,22 +3476,26 @@ impl LuksboxApp {
                         ui.label(RichText::new("Fused (extra factor required at every unlock)").color(theme::DIM).size(12.0));
                         ui.radio_value(&mut self.create.kind, CreateKind::SepFido2,
                             "Secure Enclave + FIDO2. Both this Mac AND the authenticator required.");
-                        ui.radio_value(&mut self.create.kind, CreateKind::SepPassphrase,
-                            "Secure Enclave + passphrase. This Mac AND a dedicated slot passphrase.");
-                        ui.radio_value(&mut self.create.kind, CreateKind::SepFido2Passphrase,
-                            "Secure Enclave + FIDO2 + passphrase. Three factors.");
                         ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSepFido2,
                             "Hybrid Secure Enclave + FIDO2 + ML-KEM-768.");
                         ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSep1024Fido2,
                             "Hybrid Secure Enclave + FIDO2 + ML-KEM-1024.");
-                        ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSepPassphrase,
-                            "Hybrid Secure Enclave + passphrase + ML-KEM-768.");
-                        ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSep1024Passphrase,
-                            "Hybrid Secure Enclave + passphrase + ML-KEM-1024.");
-                        ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSepFido2Passphrase,
-                            "Hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-768.");
-                        ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSep1024Fido2Passphrase,
-                            "Hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-1024.");
+                        // The slot-passphrase fused variants add a SECOND
+                        // passphrase, which would collide with the deniable
+                        // envelope passphrase, so they are standard-only.
+                        if !self.create.use_deniable {
+                            ui.radio_value(&mut self.create.kind, CreateKind::SepPassphrase,
+                                "Secure Enclave + passphrase. This Mac AND a dedicated slot passphrase.");
+                            ui.radio_value(&mut self.create.kind, CreateKind::SepFido2Passphrase,
+                                "Secure Enclave + FIDO2 + passphrase. Three factors.");
+                            ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSepPassphrase,
+                                "Hybrid Secure Enclave + passphrase + ML-KEM-768.");
+                            ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSep1024Passphrase,
+                                "Hybrid Secure Enclave + passphrase + ML-KEM-1024.");
+                            ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSepFido2Passphrase,
+                                "Hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-768.");
+                            ui.radio_value(&mut self.create.kind, CreateKind::HybridPqSep1024Fido2Passphrase,
+                                "Hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-1024.");
                         }
                     }
                 }
@@ -5464,6 +5468,22 @@ impl LuksboxApp {
                     UnlockMethod::HybridPqSep,
                     "Hybrid Secure Enclave + ML-KEM (PQ + Mac-bound)",
                 );
+                // Fused SEP+FIDO2 variants exist only as deniable
+                // credentials (standard fused SEP slots open via the
+                // plain "Secure Enclave" method, which collects every
+                // factor per slot).
+                if self.unlock.use_deniable {
+                    ui.radio_value(
+                        &mut self.unlock.method,
+                        UnlockMethod::SepFido2,
+                        "Secure Enclave + FIDO2 (deniable)",
+                    );
+                    ui.radio_value(
+                        &mut self.unlock.method,
+                        UnlockMethod::HybridPqSepFido2,
+                        "Hybrid Secure Enclave + FIDO2 + ML-KEM (deniable)",
+                    );
+                }
             }
             if matches!(
                 self.unlock.method,
@@ -5496,7 +5516,7 @@ impl LuksboxApp {
                     }
                 });
             }
-            UnlockMethod::Fido2 => {
+            UnlockMethod::Fido2 | UnlockMethod::SepFido2 => {
                 let use_deniable = self.unlock.use_deniable;
                 section(ui, "FIDO2 PIN", |ui| {
                     if use_deniable {
@@ -5843,7 +5863,7 @@ impl LuksboxApp {
                     );
                 });
             }
-            UnlockMethod::HybridPqFido2 => {
+            UnlockMethod::HybridPqFido2 | UnlockMethod::HybridPqSepFido2 => {
                 let use_deniable = self.unlock.use_deniable;
                 section(ui, "Hybrid (FIDO2 + Kyber)", |ui| {
                     if use_deniable {

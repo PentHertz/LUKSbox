@@ -5886,6 +5886,57 @@ mod tests {
         );
     }
 
+    /// 4-factor SEP + FIDO2 + PQ + passphrase in deniable mode (the
+    /// deepest SEP deniable credential). Mirrors the TPM 4-factor test;
+    /// sep_shared / hmac / mlkem are mocked (no hardware on CI). Proves
+    /// create -> envelope-open -> complete round-trips.
+    #[test]
+    fn deniable_container_hybrid_pq_sep_fido2_round_trip() {
+        use crate::deniable_header::DeniableMaterial;
+        use luksbox_core::deniable::DeniableCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let mlkem = [0x01u8; 32];
+        let sep_shared = [0x5eu8; 32];
+        let hmac = [0x03u8; 32];
+        let cred = DeniableCredential::HybridPqSepFido2Passphrase {
+            passphrase: b"vault-pass",
+            argon2: cheap_argon2(),
+            mlkem_shared: &mlkem,
+            sep_shared: &sep_shared,
+            hmac_secret_output: &hmac,
+        };
+        let material = DeniableMaterial {
+            cred_id: vec![0x10; 80],
+            hmac_salt: Some([0x20; 32]),
+            // SEP blob rides in the hardware-blob field.
+            tpm_blob: vec![0x9a; 496],
+        };
+        let c = Container::create_with_credential_v2_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            7,
+            &cred,
+            &material,
+        )
+        .unwrap();
+        let mvk_before = c.mvk_clone();
+        drop(c);
+
+        let env = Container::try_open_envelope_v2_deniable(
+            &path,
+            None,
+            &cred,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )
+        .unwrap();
+        let c = Container::complete_open_v2_deniable(env, &cred).unwrap();
+        assert_eq!(c.mvk_clone().as_bytes(), mvk_before.as_bytes());
+    }
+
     #[test]
     fn deniable_container_hybrid_pq_tpm_fido2_round_trip() {
         // v2: 4-factor hybrid-PQ + TPM + FIDO2 + passphrase.

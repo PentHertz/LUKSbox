@@ -181,6 +181,14 @@ enum DenCredKind {
     HybridPqTpm2,
     #[cfg(all(feature = "hardware", target_os = "linux"))]
     HybridPqTpmFido2,
+    #[cfg(all(feature = "hardware", target_os = "macos"))]
+    Sep,
+    #[cfg(all(feature = "hardware", target_os = "macos"))]
+    SepFido2,
+    #[cfg(all(feature = "hardware", target_os = "macos"))]
+    HybridPqSep,
+    #[cfg(all(feature = "hardware", target_os = "macos"))]
+    HybridPqSepFido2,
 }
 
 impl DenCredKind {
@@ -198,6 +206,14 @@ impl DenCredKind {
             Self::HybridPqTpm2 => "Hybrid PQ + TPM 2.0",
             #[cfg(all(feature = "hardware", target_os = "linux"))]
             Self::HybridPqTpmFido2 => "3-factor: PQ + TPM + FIDO2",
+            #[cfg(all(feature = "hardware", target_os = "macos"))]
+            Self::Sep => "Secure Enclave (this Mac) + passphrase",
+            #[cfg(all(feature = "hardware", target_os = "macos"))]
+            Self::SepFido2 => "Secure Enclave + FIDO2 (both factors)",
+            #[cfg(all(feature = "hardware", target_os = "macos"))]
+            Self::HybridPqSep => "Hybrid PQ + Secure Enclave",
+            #[cfg(all(feature = "hardware", target_os = "macos"))]
+            Self::HybridPqSepFido2 => "4-factor: PQ + Secure Enclave + FIDO2",
         }
     }
 }
@@ -300,6 +316,13 @@ fn available_den_kinds() -> Vec<DenCredKind> {
         v.push(DenCredKind::Tpm2Fido2);
         v.push(DenCredKind::HybridPqTpm2);
         v.push(DenCredKind::HybridPqTpmFido2);
+    }
+    #[cfg(all(feature = "hardware", target_os = "macos"))]
+    {
+        v.push(DenCredKind::Sep);
+        v.push(DenCredKind::SepFido2);
+        v.push(DenCredKind::HybridPqSep);
+        v.push(DenCredKind::HybridPqSepFido2);
     }
     v
 }
@@ -457,6 +480,27 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
             false,
             &mut recovery,
         )?,
+        // SEP variants reuse the CLI create helpers (they do their own
+        // interactive prompts), so the wizard only collects the .kyber
+        // path for the hybrid kinds.
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        DenCredKind::Sep => {
+            crate::cli_create_sep_deniable_v2(&path, cipher_suite, argon2_params)?
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        DenCredKind::SepFido2 => {
+            crate::cli_create_sep_fido2_deniable_v2(&path, cipher_suite, argon2_params)?
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        DenCredKind::HybridPqSep => {
+            let kp = ask_path(theme, "Path for the .kyber seed file")?;
+            crate::cli_create_pq_sep_deniable_v2(&path, cipher_suite, argon2_params, &kp, false)?
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        DenCredKind::HybridPqSepFido2 => {
+            let kp = ask_path(theme, "Path for the .kyber seed file")?;
+            crate::cli_create_pq_sep_fido2_deniable_v2(&path, cipher_suite, argon2_params, &kp, false)?
+        }
     };
 
     if let Some(ap) = &anchor_path {
@@ -1111,6 +1155,14 @@ fn open_deniable_by_kind(
         DenCredKind::HybridPqTpm2 => DeniableKindTag::HybridPqTpmPassphrase,
         #[cfg(all(feature = "hardware", target_os = "linux"))]
         DenCredKind::HybridPqTpmFido2 => DeniableKindTag::HybridPqTpmFido2Passphrase,
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        DenCredKind::Sep => DeniableKindTag::SepPassphrase,
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        DenCredKind::SepFido2 => DeniableKindTag::SepFido2Passphrase,
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        DenCredKind::HybridPqSep => DeniableKindTag::HybridPqSepPassphrase,
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        DenCredKind::HybridPqSepFido2 => DeniableKindTag::HybridPqSepFido2Passphrase,
     };
 
     // Phase 1.
@@ -1324,6 +1376,97 @@ fn open_deniable_by_kind(
                         argon2,
                         mlkem_shared: &shared,
                         unsealed: &unsealed,
+                        hmac_secret_output: &hmac_secret,
+                    };
+                    Ok(luksbox_format::Container::complete_open_v2_deniable(
+                        envelope, &cred,
+                    )?)
+                }
+                Err((_, e)) => Err(e.into()),
+            }
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        DenCredKind::Sep => {
+            let sep_shared = crate::cli_sep_unseal_from_bytes(&tpm_blob)?;
+            let cred = DeniableCredential::SepPassphrase {
+                passphrase: pass.as_bytes(),
+                argon2,
+                sep_shared: &sep_shared,
+            };
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
+            )?)
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        DenCredKind::SepFido2 => {
+            let sep_shared = crate::cli_sep_unseal_from_bytes(&tpm_blob)?;
+            let salt = salt_opt
+                .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
+            let pin = wizard_prompt_fido2_pin(theme)?;
+            let hmac_secret = wizard_fido2_hmac_from_payload(&cred_id, &salt, true, &pin)?;
+            let cred = DeniableCredential::SepFido2Passphrase {
+                passphrase: pass.as_bytes(),
+                argon2,
+                sep_shared: &sep_shared,
+                hmac_secret_output: &hmac_secret,
+            };
+            match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred) {
+                Ok(c) => Ok(c),
+                Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                    wizard_deniable_raw_salt_retry_notice();
+                    let hmac_secret = wizard_fido2_hmac_from_payload(&cred_id, &salt, false, &pin)?;
+                    let cred = DeniableCredential::SepFido2Passphrase {
+                        passphrase: pass.as_bytes(),
+                        argon2,
+                        sep_shared: &sep_shared,
+                        hmac_secret_output: &hmac_secret,
+                    };
+                    Ok(luksbox_format::Container::complete_open_v2_deniable(
+                        envelope, &cred,
+                    )?)
+                }
+                Err((_, e)) => Err(e.into()),
+            }
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        DenCredKind::HybridPqSep => {
+            let shared = ask_pq_decap_for_deniable(theme, vault, &pass, matched_slot_idx)?;
+            let sep_shared = crate::cli_sep_unseal_from_bytes(&tpm_blob)?;
+            let cred = DeniableCredential::HybridPqSepPassphrase {
+                passphrase: pass.as_bytes(),
+                argon2,
+                mlkem_shared: &shared,
+                sep_shared: &sep_shared,
+            };
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
+            )?)
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        DenCredKind::HybridPqSepFido2 => {
+            let shared = ask_pq_decap_for_deniable(theme, vault, &pass, matched_slot_idx)?;
+            let sep_shared = crate::cli_sep_unseal_from_bytes(&tpm_blob)?;
+            let salt = salt_opt
+                .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
+            let pin = wizard_prompt_fido2_pin(theme)?;
+            let hmac_secret = wizard_fido2_hmac_from_payload(&cred_id, &salt, true, &pin)?;
+            let cred = DeniableCredential::HybridPqSepFido2Passphrase {
+                passphrase: pass.as_bytes(),
+                argon2,
+                mlkem_shared: &shared,
+                sep_shared: &sep_shared,
+                hmac_secret_output: &hmac_secret,
+            };
+            match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred) {
+                Ok(c) => Ok(c),
+                Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                    wizard_deniable_raw_salt_retry_notice();
+                    let hmac_secret = wizard_fido2_hmac_from_payload(&cred_id, &salt, false, &pin)?;
+                    let cred = DeniableCredential::HybridPqSepFido2Passphrase {
+                        passphrase: pass.as_bytes(),
+                        argon2,
+                        mlkem_shared: &shared,
+                        sep_shared: &sep_shared,
                         hmac_secret_output: &hmac_secret,
                     };
                     Ok(luksbox_format::Container::complete_open_v2_deniable(

@@ -429,6 +429,12 @@ pub enum UnlockMethod {
     /// Hybrid Secure Enclave + ML-KEM unlock. Requires the .kyber
     /// seed file + its passphrase + the local Secure Enclave.
     HybridPqSep,
+    /// Fused Secure Enclave + FIDO2 unlock (deniable mode). Requires
+    /// both the local enclave AND the authenticator.
+    SepFido2,
+    /// Hybrid Secure Enclave + FIDO2 + ML-KEM unlock (deniable mode).
+    /// Enclave + authenticator + `.kyber` seed.
+    HybridPqSepFido2,
 }
 
 pub struct OpenedVault {
@@ -1804,22 +1810,10 @@ fn create_sep_passphrase_deniable(
     use luksbox_format::deniable_header::DeniableMaterial;
     use luksbox_sep::SepSealer;
 
-    let biometric = match kind {
-        SepBootstrapKind::Sep => false,
-        SepBootstrapKind::SepBiometric => true,
-        _ => {
-            return Err(
-                "deniable mode supports only plain Secure Enclave (optionally with Touch ID); \
-                 the fused / hybrid SEP kinds have no deniable credential yet. Pick \
-                 'Secure Enclave' or 'Secure Enclave + Touch ID'."
-                    .into(),
-            );
-        }
-    };
     if opts.header_path.is_some() {
         return Err("detached headers are not yet supported in deniable mode".into());
     }
-    let pw = opts
+    let envelope_pw = opts
         .passphrase
         .clone()
         .ok_or("a passphrase is required for the deniable Secure Enclave envelope")?;
@@ -1833,62 +1827,249 @@ fn create_sep_passphrase_deniable(
     }
     let vault_path = opts.path.clone();
     let anchor_path = opts.anchor_path.clone();
+    let cipher = opts.cipher;
+
+    let mut sidecars_on_disk: Vec<PathBuf> = Vec::new();
+    let mut hybrid_entries: Option<(luksbox_pq::PqParams, Vec<u8>, Vec<u8>)> = None;
+    let mut kyber_to_write: Option<(
+        PathBuf,
+        zeroize::Zeroizing<[u8; luksbox_pq::SEED_LEN]>,
+        Zeroizing<String>,
+    )> = None;
+    let mut has_fido2 = false;
 
     // Seal under the enclave BEFORE creating any file so a missing /
     // unavailable enclave fails before we touch the disk.
     let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
-    let (sep_shared, blob) = if biometric {
-        sealer
-            .seal_biometric()
-            .map_err(|e| format!("SEP seal (biometric): {e}"))?
-    } else {
-        sealer.seal().map_err(|e| format!("SEP seal: {e}"))?
-    };
-    let blob_bytes = blob.to_bytes();
 
-    let cred = luksbox_core::deniable::DeniableCredential::SepPassphrase {
-        passphrase: pw.as_bytes(),
-        argon2: kdf_params,
-        sep_shared: &sep_shared,
+    let cont_res = match kind {
+        SepBootstrapKind::Sep | SepBootstrapKind::SepBiometric => {
+            let biometric = matches!(kind, SepBootstrapKind::SepBiometric);
+            let (sep_shared, blob) = if biometric {
+                sealer
+                    .seal_biometric()
+                    .map_err(|e| format!("SEP seal (biometric): {e}"))?
+            } else {
+                sealer.seal().map_err(|e| format!("SEP seal: {e}"))?
+            };
+            let cred = luksbox_core::deniable::DeniableCredential::SepPassphrase {
+                passphrase: envelope_pw.as_bytes(),
+                argon2: kdf_params,
+                sep_shared: &sep_shared,
+            };
+            let material = DeniableMaterial {
+                cred_id: Vec::new(),
+                hmac_salt: None,
+                tpm_blob: blob.to_bytes(),
+            };
+            Container::create_with_credential_v2_deniable(
+                &vault_path,
+                None,
+                cipher,
+                flags,
+                0,
+                &cred,
+                &material,
+            )
+        }
+        SepBootstrapKind::HybridPqSep {
+            kyber_path,
+            seed_pw,
+            kem_size,
+        } => {
+            use luksbox_pq::{encapsulate_with, keygen_with};
+            let params = if kem_size == 1024 {
+                luksbox_pq::PqParams::Ml1024
+            } else {
+                luksbox_pq::PqParams::Ml768
+            };
+            let (pk, seed) = keygen_with(params);
+            let (ct, shared) = encapsulate_with(params, &pk).map_err(estr)?;
+            let (sep_shared, blob) = sealer.seal().map_err(|e| format!("SEP seal: {e}"))?;
+            hybrid_entries = Some((params, pk, ct));
+            kyber_to_write = Some((kyber_path, seed, seed_pw));
+            let cred = luksbox_core::deniable::DeniableCredential::HybridPqSepPassphrase {
+                passphrase: envelope_pw.as_bytes(),
+                argon2: kdf_params,
+                mlkem_shared: &shared,
+                sep_shared: &sep_shared,
+            };
+            let material = DeniableMaterial {
+                cred_id: Vec::new(),
+                hmac_salt: None,
+                tpm_blob: blob.to_bytes(),
+            };
+            Container::create_with_credential_v2_deniable(
+                &vault_path,
+                None,
+                cipher,
+                flags,
+                0,
+                &cred,
+                &material,
+            )
+        }
+        SepBootstrapKind::SepFused {
+            factors,
+            kem_size,
+            pin,
+            passphrase: _slot_pp,
+            kyber_path,
+            seed_pw,
+        } => {
+            // In deniable mode the envelope passphrase IS the passphrase
+            // factor, so a fused SEP slot must add FIDO2 (otherwise it is
+            // just SepPassphrase, handled above).
+            if !factors.has_fido2() {
+                return Err(
+                    "in deniable mode a fused Secure Enclave slot must include FIDO2; for \
+                     SEP + passphrase use the plain 'Secure Enclave' variant (its passphrase \
+                     is the envelope)."
+                        .into(),
+                );
+            }
+            use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+            let mut auth = make_fido2_authenticator();
+            let user_handle = random_user_handle().map_err(estr)?;
+            let er = auth.enroll(RP_ID, &user_handle, Some(&pin)).map_err(estr)?;
+            let cred_id = er.credential.id;
+            let mut hmac_salt = [0u8; 32];
+            OsRng
+                .try_fill_bytes(&mut hmac_salt)
+                .map_err(|e| format!("OS RNG failure: {e}"))?;
+            let hmac_secret = auth
+                .hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))
+                .map_err(estr)?;
+            has_fido2 = true;
+            let (sep_shared, blob) = sealer.seal().map_err(|e| format!("SEP seal: {e}"))?;
+
+            if let Some(ks) = kem_size {
+                use luksbox_pq::{encapsulate_with, keygen_with};
+                let params = if ks == 1024 {
+                    luksbox_pq::PqParams::Ml1024
+                } else {
+                    luksbox_pq::PqParams::Ml768
+                };
+                let (pk, seed) = keygen_with(params);
+                let (ct, shared) = encapsulate_with(params, &pk).map_err(estr)?;
+                hybrid_entries = Some((params, pk, ct));
+                kyber_to_write = Some((
+                    kyber_path.ok_or("hybrid SEP+FIDO2 requires a .kyber path")?,
+                    seed,
+                    seed_pw,
+                ));
+                let cred =
+                    luksbox_core::deniable::DeniableCredential::HybridPqSepFido2Passphrase {
+                        passphrase: envelope_pw.as_bytes(),
+                        argon2: kdf_params,
+                        mlkem_shared: &shared,
+                        sep_shared: &sep_shared,
+                        hmac_secret_output: &hmac_secret,
+                    };
+                let material = DeniableMaterial {
+                    cred_id,
+                    hmac_salt: Some(hmac_salt),
+                    tpm_blob: blob.to_bytes(),
+                };
+                Container::create_with_credential_v2_deniable(
+                    &vault_path,
+                    None,
+                    cipher,
+                    flags,
+                    0,
+                    &cred,
+                    &material,
+                )
+            } else {
+                let cred = luksbox_core::deniable::DeniableCredential::SepFido2Passphrase {
+                    passphrase: envelope_pw.as_bytes(),
+                    argon2: kdf_params,
+                    sep_shared: &sep_shared,
+                    hmac_secret_output: &hmac_secret,
+                };
+                let material = DeniableMaterial {
+                    cred_id,
+                    hmac_salt: Some(hmac_salt),
+                    tpm_blob: blob.to_bytes(),
+                };
+                Container::create_with_credential_v2_deniable(
+                    &vault_path,
+                    None,
+                    cipher,
+                    flags,
+                    0,
+                    &cred,
+                    &material,
+                )
+            }
+        }
     };
-    let material = DeniableMaterial {
-        cred_id: Vec::new(),
-        hmac_salt: None,
-        tpm_blob: blob_bytes,
-    };
-    let mut cont = Container::create_with_credential_v2_deniable(
-        &vault_path,
-        None,
-        opts.cipher,
-        flags,
-        0,
-        &cred,
-        &material,
-    )
-    .map_err(|e| {
+
+    let mut cont = cont_res.map_err(|e| {
         let _ = std::fs::remove_file(&vault_path);
         format!("deniable Secure Enclave vault create failed: {e}")
     })?;
+
+    // Write the hybrid sidecar + .kyber seed now that the vault exists.
+    if let Some((params, pk, ct)) = hybrid_entries {
+        use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+        let sidecar = hybrid_sidecar::sidecar_path(&vault_path);
+        if let Err(e) = hybrid_sidecar::write(
+            &sidecar,
+            &[HybridEntry {
+                slot_idx: 0,
+                level: params,
+                pubkey: pk,
+                ciphertext: ct,
+            }],
+        ) {
+            drop(cont);
+            let _ = std::fs::remove_file(&vault_path);
+            let _ = std::fs::remove_file(&sidecar);
+            return Err(format!("hybrid sidecar write: {e}"));
+        }
+        sidecars_on_disk.push(sidecar);
+    }
+    if let Some((kyber_path, seed, seed_pw)) = kyber_to_write {
+        use luksbox_pq::seed_file;
+        if let Err(e) = seed_file::write(
+            &kyber_path,
+            &seed,
+            seed_pw.as_bytes(),
+            seed_file::KdfParams::default(),
+        ) {
+            drop(cont);
+            let _ = std::fs::remove_file(&vault_path);
+            for sc in &sidecars_on_disk {
+                let _ = std::fs::remove_file(sc);
+            }
+            return Err(format!(".kyber write: {e}"));
+        }
+    }
 
     if let Some(ap) = anchor_path.as_ref()
         && let Err(e) = cont.init_anchor(ap.clone(), 1).map_err(estr)
     {
         drop(cont);
         let _ = std::fs::remove_file(&vault_path);
+        for sc in &sidecars_on_disk {
+            let _ = std::fs::remove_file(sc);
+        }
         let _ = std::fs::remove_file(ap);
         return Err(format!("anchor init failed: {e}"));
     }
 
-    let cipher = cipher_label(cont.header.cipher_suite).to_string();
+    let has_hybrid_pq = !sidecars_on_disk.is_empty();
+    let cipher_lbl = cipher_label(cont.header.cipher_suite).to_string();
     let vfs = Vfs::open(cont).map_err(estr)?;
     Ok(OpenedVault {
         vfs,
         vault_path,
         header_path: None,
         anchor_path,
-        cipher_label: cipher,
-        has_fido2: false,
-        has_hybrid_pq: false,
+        cipher_label: cipher_lbl,
+        has_fido2,
+        has_hybrid_pq,
         has_tpm: false,
         deniable_fido2_recovery: None,
         deniable_tpm_blob_path: None,
@@ -2595,6 +2776,12 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
             UnlockMethod::HybridPqFido2 => DeniableKindTag::HybridPqFido2Passphrase,
             #[cfg(all(feature = "hardware", target_os = "macos"))]
             UnlockMethod::Sep => DeniableKindTag::SepPassphrase,
+            #[cfg(all(feature = "hardware", target_os = "macos"))]
+            UnlockMethod::SepFido2 => DeniableKindTag::SepFido2Passphrase,
+            #[cfg(all(feature = "hardware", target_os = "macos"))]
+            UnlockMethod::HybridPqSep => DeniableKindTag::HybridPqSepPassphrase,
+            #[cfg(all(feature = "hardware", target_os = "macos"))]
+            UnlockMethod::HybridPqSepFido2 => DeniableKindTag::HybridPqSepFido2Passphrase,
             #[cfg(all(feature = "hardware", target_os = "linux"))]
             UnlockMethod::Tpm2 | UnlockMethod::Tpm2Pin => DeniableKindTag::TpmPassphrase,
             #[cfg(all(feature = "hardware", target_os = "linux"))]
@@ -2860,6 +3047,80 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
                 };
                 Container::complete_open_v2_deniable(envelope, &cred).map_err(estr)?
             }
+            #[cfg(all(feature = "hardware", target_os = "macos"))]
+            UnlockMethod::SepFido2 => {
+                let sep_shared = deniable_sep_unseal_from_bytes(&payload_tpm_blob)?;
+                let salt =
+                    payload_hmac_salt.ok_or("envelope missing hmac_salt for FIDO2 variant")?;
+                let hmac_secret =
+                    deniable_fido2_hmac_from_payload(&opts, &payload_cred_id, &salt, true)?;
+                let cred = luksbox_core::deniable::DeniableCredential::SepFido2Passphrase {
+                    passphrase: pw.as_bytes(),
+                    argon2: kdf_params,
+                    sep_shared: &sep_shared,
+                    hmac_secret_output: &hmac_secret,
+                };
+                match Container::complete_open_v2_deniable_reusable(envelope, &cred) {
+                    Ok(c) => c,
+                    Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                        let hmac_secret =
+                            deniable_fido2_hmac_from_payload(&opts, &payload_cred_id, &salt, false)?;
+                        let cred = luksbox_core::deniable::DeniableCredential::SepFido2Passphrase {
+                            passphrase: pw.as_bytes(),
+                            argon2: kdf_params,
+                            sep_shared: &sep_shared,
+                            hmac_secret_output: &hmac_secret,
+                        };
+                        Container::complete_open_v2_deniable(envelope, &cred).map_err(estr)?
+                    }
+                    Err((_, e)) => return Err(estr(e)),
+                }
+            }
+            #[cfg(all(feature = "hardware", target_os = "macos"))]
+            UnlockMethod::HybridPqSep => {
+                let shared = deniable_pq_decap(&opts, matched_slot_idx)?;
+                let sep_shared = deniable_sep_unseal_from_bytes(&payload_tpm_blob)?;
+                let cred = luksbox_core::deniable::DeniableCredential::HybridPqSepPassphrase {
+                    passphrase: pw.as_bytes(),
+                    argon2: kdf_params,
+                    mlkem_shared: &shared,
+                    sep_shared: &sep_shared,
+                };
+                Container::complete_open_v2_deniable(envelope, &cred).map_err(estr)?
+            }
+            #[cfg(all(feature = "hardware", target_os = "macos"))]
+            UnlockMethod::HybridPqSepFido2 => {
+                let shared = deniable_pq_decap(&opts, matched_slot_idx)?;
+                let sep_shared = deniable_sep_unseal_from_bytes(&payload_tpm_blob)?;
+                let salt =
+                    payload_hmac_salt.ok_or("envelope missing hmac_salt for FIDO2 variant")?;
+                let hmac_secret =
+                    deniable_fido2_hmac_from_payload(&opts, &payload_cred_id, &salt, true)?;
+                let cred = luksbox_core::deniable::DeniableCredential::HybridPqSepFido2Passphrase {
+                    passphrase: pw.as_bytes(),
+                    argon2: kdf_params,
+                    mlkem_shared: &shared,
+                    sep_shared: &sep_shared,
+                    hmac_secret_output: &hmac_secret,
+                };
+                match Container::complete_open_v2_deniable_reusable(envelope, &cred) {
+                    Ok(c) => c,
+                    Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                        let hmac_secret =
+                            deniable_fido2_hmac_from_payload(&opts, &payload_cred_id, &salt, false)?;
+                        let cred =
+                            luksbox_core::deniable::DeniableCredential::HybridPqSepFido2Passphrase {
+                                passphrase: pw.as_bytes(),
+                                argon2: kdf_params,
+                                mlkem_shared: &shared,
+                                sep_shared: &sep_shared,
+                                hmac_secret_output: &hmac_secret,
+                            };
+                        Container::complete_open_v2_deniable(envelope, &cred).map_err(estr)?
+                    }
+                    Err((_, e)) => return Err(estr(e)),
+                }
+            }
             _ => {
                 return Err(format!(
                     "unlock method {:?} not yet supported in deniable mode on this platform",
@@ -3067,6 +3328,16 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
                 pin,
                 slot_pp,
             )?
+        }
+        // SepFido2 / HybridPqSepFido2 are deniable-only discovery hints
+        // (standard vaults reach fused/hybrid SEP slots via the `Sep` /
+        // `HybridPqSep` methods, which collect all factors per slot).
+        UnlockMethod::SepFido2 | UnlockMethod::HybridPqSepFido2 => {
+            return Err(
+                "the SEP+FIDO2 unlock methods are used only in deniable mode; for a standard \
+                 vault use the 'Secure Enclave' method, which collects every factor per slot"
+                    .into(),
+            );
         }
     };
     let trusted_gen = if let Some(ap) = opts.anchor_path.as_ref() {

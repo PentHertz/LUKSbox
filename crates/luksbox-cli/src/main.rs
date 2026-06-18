@@ -6496,6 +6496,10 @@ enum CliDenCred {
     TpmFido2,
     PqTpm,
     PqTpmFido2,
+    Sep,
+    SepFido2,
+    PqSep,
+    PqSepFido2,
 }
 
 fn parse_cli_den_cred(s: &str) -> Result<CliDenCred> {
@@ -6508,6 +6512,10 @@ fn parse_cli_den_cred(s: &str) -> Result<CliDenCred> {
         "tpm-fido2" => Ok(CliDenCred::TpmFido2),
         "pq-tpm" => Ok(CliDenCred::PqTpm),
         "pq-tpm-fido2" => Ok(CliDenCred::PqTpmFido2),
+        "sep" => Ok(CliDenCred::Sep),
+        "sep-fido2" => Ok(CliDenCred::SepFido2),
+        "pq-sep" => Ok(CliDenCred::PqSep),
+        "pq-sep-fido2" => Ok(CliDenCred::PqSepFido2),
         _ => Err(cli_err!(
             "unknown --credential '{}'. Choices: passphrase, fido2, pq-passphrase, pq-fido2, tpm, tpm-fido2, pq-tpm, pq-tpm-fido2",
             s
@@ -6600,6 +6608,24 @@ fn cmd_deniable_init(
             return Err(cli_err!(
                 "TPM is Linux-only today; Windows TPM is tracked as a follow-up"
             ));
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::Sep => cli_create_sep_deniable_v2(path, cipher_suite, argon2_params)?,
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::SepFido2 => cli_create_sep_fido2_deniable_v2(path, cipher_suite, argon2_params)?,
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::PqSep => {
+            let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required for pq-sep"))?;
+            cli_create_pq_sep_deniable_v2(path, cipher_suite, argon2_params, kp, pq_1024)?
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::PqSepFido2 => {
+            let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required for pq-sep-fido2"))?;
+            cli_create_pq_sep_fido2_deniable_v2(path, cipher_suite, argon2_params, kp, pq_1024)?
+        }
+        #[cfg(not(all(feature = "hardware", target_os = "macos")))]
+        CliDenCred::Sep | CliDenCred::SepFido2 | CliDenCred::PqSep | CliDenCred::PqSepFido2 => {
+            return Err(cli_err!("Secure Enclave is macOS-only"));
         }
     };
 
@@ -6827,6 +6853,212 @@ fn prompt_pass_twice(p1: &str, p2: &str) -> Result<zeroize::Zeroizing<String>> {
 /// out of the slot envelope after phase 1 trial-decrypt succeeds.
 /// `cred` is the user's choice of variant; if it does not match
 /// what the matched slot actually carries, phase 2 fails opaquely.
+#[cfg(all(feature = "hardware", target_os = "macos"))]
+fn cli_create_sep_deniable_v2(
+    path: &Path,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+) -> Result<luksbox_format::Container> {
+    use luksbox_format::deniable_header::DeniableMaterial;
+    use luksbox_sep::SepSealer;
+    let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
+    let mut sealer = SepSealer::new().map_err(|e| cli_err!("{e}"))?;
+    let (sep_shared, blob) = sealer.seal().map_err(|e| cli_err!("SEP seal: {e}"))?;
+    let cred = luksbox_core::deniable::DeniableCredential::SepPassphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+        sep_shared: &sep_shared,
+    };
+    let material = DeniableMaterial {
+        cred_id: Vec::new(),
+        hmac_salt: None,
+        tpm_blob: blob.to_bytes(),
+    };
+    Ok(luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?)
+}
+
+#[cfg(all(feature = "hardware", target_os = "macos"))]
+fn cli_create_sep_fido2_deniable_v2(
+    path: &Path,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+) -> Result<luksbox_format::Container> {
+    use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::deniable_header::DeniableMaterial;
+    use luksbox_sep::SepSealer;
+    use rand_core::RngCore;
+    let pass = prompt_pass_twice("Envelope passphrase: ", "Confirm:             ")?;
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    let mut auth = make_fido2_authenticator();
+    let user_handle = random_user_handle()?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
+    let cred_id = er.credential.id;
+    let mut hmac_salt = [0u8; 32];
+    rand_core::OsRng
+        .try_fill_bytes(&mut hmac_salt)
+        .map_err(|e| cli_err!("OS RNG: {e}"))?;
+    let hmac = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin.as_str()))?;
+    let mut sealer = SepSealer::new().map_err(|e| cli_err!("{e}"))?;
+    let (sep_shared, blob) = sealer.seal().map_err(|e| cli_err!("SEP seal: {e}"))?;
+    let cred = luksbox_core::deniable::DeniableCredential::SepFido2Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+        sep_shared: &sep_shared,
+        hmac_secret_output: &hmac,
+    };
+    let material = DeniableMaterial {
+        cred_id,
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: blob.to_bytes(),
+    };
+    Ok(luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?)
+}
+
+#[cfg(all(feature = "hardware", target_os = "macos"))]
+fn cli_create_pq_sep_deniable_v2(
+    path: &Path,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+    kyber_path: &Path,
+    pq_1024: bool,
+) -> Result<luksbox_format::Container> {
+    use luksbox_format::deniable_header::DeniableMaterial;
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
+    use luksbox_sep::SepSealer;
+    let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
+    let seed_pw =
+        zeroize::Zeroizing::new(rpassword::prompt_password(".kyber seed-file passphrase: ")?);
+    let params = if pq_1024 {
+        PqParams::Ml1024
+    } else {
+        PqParams::Ml768
+    };
+    let (pk, seed) = keygen_with(params);
+    let (ct, shared) = encapsulate_with(params, &pk)?;
+    let mut sealer = SepSealer::new().map_err(|e| cli_err!("{e}"))?;
+    let (sep_shared, blob) = sealer.seal().map_err(|e| cli_err!("SEP seal: {e}"))?;
+    let cred = luksbox_core::deniable::DeniableCredential::HybridPqSepPassphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+        mlkem_shared: &shared,
+        sep_shared: &sep_shared,
+    };
+    let material = DeniableMaterial {
+        cred_id: Vec::new(),
+        hmac_salt: None,
+        tpm_blob: blob.to_bytes(),
+    };
+    let cont = luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
+    let sidecar = hybrid_sidecar::sidecar_path(path);
+    hybrid_sidecar::write(
+        &sidecar,
+        &[HybridEntry {
+            slot_idx: 0,
+            level: params,
+            pubkey: pk,
+            ciphertext: ct,
+        }],
+    )?;
+    seed_file::write(
+        kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )?;
+    Ok(cont)
+}
+
+#[cfg(all(feature = "hardware", target_os = "macos"))]
+fn cli_create_pq_sep_fido2_deniable_v2(
+    path: &Path,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+    kyber_path: &Path,
+    pq_1024: bool,
+) -> Result<luksbox_format::Container> {
+    use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::deniable_header::DeniableMaterial;
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
+    use luksbox_sep::SepSealer;
+    use rand_core::RngCore;
+    let pass = prompt_pass_twice("Envelope passphrase: ", "Confirm:             ")?;
+    let seed_pw =
+        zeroize::Zeroizing::new(rpassword::prompt_password(".kyber seed-file passphrase: ")?);
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    let mut auth = make_fido2_authenticator();
+    let user_handle = random_user_handle()?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
+    let cred_id = er.credential.id;
+    let mut hmac_salt = [0u8; 32];
+    rand_core::OsRng
+        .try_fill_bytes(&mut hmac_salt)
+        .map_err(|e| cli_err!("OS RNG: {e}"))?;
+    let hmac = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin.as_str()))?;
+    let params = if pq_1024 {
+        PqParams::Ml1024
+    } else {
+        PqParams::Ml768
+    };
+    let (pk, seed) = keygen_with(params);
+    let (ct, shared) = encapsulate_with(params, &pk)?;
+    let mut sealer = SepSealer::new().map_err(|e| cli_err!("{e}"))?;
+    let (sep_shared, blob) = sealer.seal().map_err(|e| cli_err!("SEP seal: {e}"))?;
+    let cred = luksbox_core::deniable::DeniableCredential::HybridPqSepFido2Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+        mlkem_shared: &shared,
+        sep_shared: &sep_shared,
+        hmac_secret_output: &hmac,
+    };
+    let material = DeniableMaterial {
+        cred_id,
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: blob.to_bytes(),
+    };
+    let cont = luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
+    let sidecar = hybrid_sidecar::sidecar_path(path);
+    hybrid_sidecar::write(
+        &sidecar,
+        &[HybridEntry {
+            slot_idx: 0,
+            level: params,
+            pubkey: pk,
+            ciphertext: ct,
+        }],
+    )?;
+    seed_file::write(
+        kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )?;
+    Ok(cont)
+}
+
+#[cfg(all(feature = "hardware", target_os = "macos"))]
+fn cli_sep_unseal_from_bytes(blob_bytes: &[u8]) -> Result<[u8; 32]> {
+    use luksbox_sep::{SepBlob, SepSealer};
+    if blob_bytes.is_empty() {
+        return Err(cli_err!(
+            "envelope SEP blob is empty for the Secure Enclave variant"
+        ));
+    }
+    let blob = SepBlob::from_bytes(blob_bytes)?;
+    let mut sealer = SepSealer::new()?;
+    let shared = sealer.unseal(&blob)?;
+    Ok(*shared)
+}
+
 fn cli_open_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
@@ -6851,6 +7083,10 @@ fn cli_open_deniable_v2(
         CliDenCred::TpmFido2 => DeniableKindTag::TpmFido2Passphrase,
         CliDenCred::PqTpm => DeniableKindTag::HybridPqTpmPassphrase,
         CliDenCred::PqTpmFido2 => DeniableKindTag::HybridPqTpmFido2Passphrase,
+        CliDenCred::Sep => DeniableKindTag::SepPassphrase,
+        CliDenCred::SepFido2 => DeniableKindTag::SepFido2Passphrase,
+        CliDenCred::PqSep => DeniableKindTag::HybridPqSepPassphrase,
+        CliDenCred::PqSepFido2 => DeniableKindTag::HybridPqSepFido2Passphrase,
     };
 
     // Phase 1: passphrase-only credential for envelope discovery,
@@ -7080,6 +7316,103 @@ fn cli_open_deniable_v2(
         CliDenCred::Tpm | CliDenCred::TpmFido2 | CliDenCred::PqTpm | CliDenCred::PqTpmFido2 => Err(
             cli_err!("TPM is Linux-only today; Windows TPM is tracked as a follow-up"),
         ),
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::Sep => {
+            let sep_shared = cli_sep_unseal_from_bytes(&payload_tpm_blob)?;
+            let cred = DeniableCredential::SepPassphrase {
+                passphrase: pass_zeroizing.as_bytes(),
+                argon2,
+                sep_shared: &sep_shared,
+            };
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
+            )?)
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::SepFido2 => {
+            let sep_shared = cli_sep_unseal_from_bytes(&payload_tpm_blob)?;
+            let salt = payload_hmac_salt
+                .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
+            let pin = read_fido2_pin()?;
+            let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, true, &pin)?;
+            let cred = DeniableCredential::SepFido2Passphrase {
+                passphrase: pass_zeroizing.as_bytes(),
+                argon2,
+                sep_shared: &sep_shared,
+                hmac_secret_output: &hmac,
+            };
+            match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred) {
+                Ok(c) => Ok(c),
+                Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                    cli_deniable_raw_salt_retry_notice();
+                    let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, false, &pin)?;
+                    let cred = DeniableCredential::SepFido2Passphrase {
+                        passphrase: pass_zeroizing.as_bytes(),
+                        argon2,
+                        sep_shared: &sep_shared,
+                        hmac_secret_output: &hmac,
+                    };
+                    Ok(luksbox_format::Container::complete_open_v2_deniable(
+                        envelope, &cred,
+                    )?)
+                }
+                Err((_, e)) => Err(e.into()),
+            }
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::PqSep => {
+            let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
+            let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
+            let sep_shared = cli_sep_unseal_from_bytes(&payload_tpm_blob)?;
+            let cred = DeniableCredential::HybridPqSepPassphrase {
+                passphrase: pass_zeroizing.as_bytes(),
+                argon2,
+                mlkem_shared: &shared,
+                sep_shared: &sep_shared,
+            };
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
+            )?)
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::PqSepFido2 => {
+            let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
+            let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
+            let sep_shared = cli_sep_unseal_from_bytes(&payload_tpm_blob)?;
+            let salt = payload_hmac_salt
+                .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
+            let pin = read_fido2_pin()?;
+            let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, true, &pin)?;
+            let cred = DeniableCredential::HybridPqSepFido2Passphrase {
+                passphrase: pass_zeroizing.as_bytes(),
+                argon2,
+                mlkem_shared: &shared,
+                sep_shared: &sep_shared,
+                hmac_secret_output: &hmac,
+            };
+            match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred) {
+                Ok(c) => Ok(c),
+                Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                    cli_deniable_raw_salt_retry_notice();
+                    let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, false, &pin)?;
+                    let cred = DeniableCredential::HybridPqSepFido2Passphrase {
+                        passphrase: pass_zeroizing.as_bytes(),
+                        argon2,
+                        mlkem_shared: &shared,
+                        sep_shared: &sep_shared,
+                        hmac_secret_output: &hmac,
+                    };
+                    Ok(luksbox_format::Container::complete_open_v2_deniable(
+                        envelope, &cred,
+                    )?)
+                }
+                Err((_, e)) => Err(e.into()),
+            }
+        }
+        #[cfg(not(all(feature = "hardware", target_os = "macos")))]
+        CliDenCred::Sep | CliDenCred::SepFido2 | CliDenCred::PqSep | CliDenCred::PqSepFido2 => {
+            Err(cli_err!("Secure Enclave is macOS-only"))
+        }
     }
 }
 
