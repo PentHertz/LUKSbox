@@ -4728,8 +4728,7 @@ mod tests {
         assert!(cont.header.sep_blob(plain_idx).is_some());
         assert!(cont.header.has_sep_region());
         assert!(
-            !path.with_extension("lbx.sep").exists()
-                && !dir.path().join("v.lbx.sep").exists(),
+            !path.with_extension("lbx.sep").exists() && !dir.path().join("v.lbx.sep").exists(),
             "no external .lbx.sep file must be created"
         );
         cont.persist_header().unwrap();
@@ -4738,7 +4737,10 @@ mod tests {
         // Re-open the plain SEP slot via a closure that maps the
         // in-header blob -> shared secret (the role of SepSealer).
         let mut unseal = |blob: &[u8]| -> Result<[u8; 32], String> {
-            mock_sep.get(blob).copied().ok_or_else(|| "foreign enclave".into())
+            mock_sep
+                .get(blob)
+                .copied()
+                .ok_or_else(|| "foreign enclave".into())
         };
         let cont = Container::open(
             &path,
@@ -4752,15 +4754,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cont.header.keyslots[plain_idx].kind, SlotKind::SepSealed);
-        assert_eq!(
-            cont.header.keyslots[hy_idx].kind,
-            SlotKind::HybridPqKemSep
-        );
+        assert_eq!(cont.header.keyslots[hy_idx].kind, SlotKind::HybridPqKemSep);
         drop(cont);
 
         // The hybrid slot opens when the pq factor is also supplied.
         let mut unseal2 = |blob: &[u8]| -> Result<[u8; 32], String> {
-            mock_sep.get(blob).copied().ok_or_else(|| "foreign enclave".into())
+            mock_sep
+                .get(blob)
+                .copied()
+                .ok_or_else(|| "foreign enclave".into())
         };
         Container::open(
             &path,
@@ -4838,10 +4840,9 @@ mod tests {
         drop(cont);
 
         // SEP unlock must still work after the swap.
-        let mut unseal =
-            |b: &[u8]| -> std::result::Result<[u8; 32], String> {
-                mock.get(b).copied().ok_or_else(|| "miss".into())
-            };
+        let mut unseal = |b: &[u8]| -> std::result::Result<[u8; 32], String> {
+            mock.get(b).copied().ok_or_else(|| "miss".into())
+        };
         Container::open(
             &path,
             None,
