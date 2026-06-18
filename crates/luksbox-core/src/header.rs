@@ -868,14 +868,8 @@ mod tests {
     fn header_with_pp_slot(mvk: &MasterVolumeKey) -> Header {
         let suite = CipherSuite::Aes256Gcm;
         let mut header = Header::new(suite, KdfId::Argon2id, 4096, HEADER_SIZE as u64);
-        let slot = Keyslot::new_passphrase(
-            suite,
-            mvk,
-            b"pw",
-            Argon2idParams::TEST_ONLY,
-            &header.header_salt,
-        )
-        .unwrap();
+        let slot = Keyslot::new_passphrase(suite, mvk, b"pw", Argon2idParams::TEST_ONLY, &header.header_salt)
+            .unwrap();
         header.install_slot(0, slot).unwrap();
         header
     }
@@ -939,17 +933,11 @@ mod tests {
 
         // count=1, slot_idx=0, blob_len=0xFFFF (overruns region).
         let overrun = craft(&[1u8, 0u8, 0xFF, 0xFF]);
-        assert!(matches!(
-            Header::from_bytes(&overrun),
-            Err(Error::InvalidField)
-        ));
+        assert!(matches!(Header::from_bytes(&overrun), Err(Error::InvalidField)));
 
         // count=9 > MAX_KEYSLOTS.
         let bad_count = craft(&[9u8]);
-        assert!(matches!(
-            Header::from_bytes(&bad_count),
-            Err(Error::InvalidField)
-        ));
+        assert!(matches!(Header::from_bytes(&bad_count), Err(Error::InvalidField)));
 
         // Duplicate slot_idx (two entries both for slot 0).
         let dup = craft(&[2u8, 0u8, 1u8, 0u8, 0xAB, 0u8, 1u8, 0u8, 0xCD]);
@@ -957,10 +945,7 @@ mod tests {
 
         // slot_idx out of range.
         let bad_idx = craft(&[1u8, 99u8, 1u8, 0u8, 0xAB]);
-        assert!(matches!(
-            Header::from_bytes(&bad_idx),
-            Err(Error::InvalidField)
-        ));
+        assert!(matches!(Header::from_bytes(&bad_idx), Err(Error::InvalidField)));
     }
 
     /// Security: a blob that would overflow the in-header SEP region is
@@ -975,10 +960,7 @@ mod tests {
             header.set_sep_blob(0, too_big),
             Err(Error::SepRegionFull)
         ));
-        assert!(
-            !header.has_sep_region(),
-            "rejected blob must not set the flag"
-        );
+        assert!(!header.has_sep_region(), "rejected blob must not set the flag");
         assert_eq!(header.sep_blob(0), None);
     }
 
@@ -992,10 +974,7 @@ mod tests {
         assert!(header.has_sep_region());
         header.revoke_slot(0).unwrap();
         assert_eq!(header.sep_blob(0), None);
-        assert!(
-            !header.has_sep_region(),
-            "flag cleared when last SEP blob removed"
-        );
+        assert!(!header.has_sep_region(), "flag cleared when last SEP blob removed");
     }
 
     /// A header WITHOUT the flag never parses a SEP region, even if the
