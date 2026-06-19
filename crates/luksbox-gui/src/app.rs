@@ -5216,9 +5216,7 @@ impl LuksboxApp {
             k if k.sep_fused().is_some() => {
                 let (factors, kem_size) = k.sep_fused().expect("guarded by is_some()");
                 if kem_size.is_some() && self.create.hybrid_kyber_path.trim().is_empty() {
-                    self.toast_err(
-                        "hybrid fused SEP kind requires a path for the .kyber seed file",
-                    );
+                    self.toast_err("hybrid fused SEP kind requires a path for the .kyber seed file");
                     return;
                 }
                 let pin = std::mem::take(&mut self.create.pin);
@@ -6163,11 +6161,9 @@ impl LuksboxApp {
                     );
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new(
-                            "Slot passphrase (only for Secure Enclave + passphrase slots)",
-                        )
-                        .color(theme::DIM)
-                        .size(12.0),
+                        RichText::new("Slot passphrase (only for Secure Enclave + passphrase slots)")
+                            .color(theme::DIM)
+                            .size(12.0),
                     );
                     ui.add_sized(
                         [form_width(ui), CONTROL_H],
@@ -6175,9 +6171,11 @@ impl LuksboxApp {
                     );
                     ui.add_space(6.0);
                     ui.label(
-                        RichText::new("macOS only. Only opens on the Mac that sealed the slot.")
-                            .color(theme::FAINT)
-                            .size(11.0),
+                        RichText::new(
+                            "macOS only. Only opens on the Mac that sealed the slot.",
+                        )
+                        .color(theme::FAINT)
+                        .size(11.0),
                     );
                 });
             }
@@ -6216,11 +6214,9 @@ impl LuksboxApp {
                     });
                     ui.add_space(8.0);
                     ui.label(
-                        RichText::new(
-                            "FIDO2 PIN (only for fused hybrid Secure Enclave + FIDO2 slots)",
-                        )
-                        .color(theme::DIM)
-                        .size(12.0),
+                        RichText::new("FIDO2 PIN (only for fused hybrid Secure Enclave + FIDO2 slots)")
+                            .color(theme::DIM)
+                            .size(12.0),
                     );
                     ui.add_sized(
                         [form_width(ui), CONTROL_H],
@@ -6366,18 +6362,17 @@ impl LuksboxApp {
             deniable_kdf: self.unlock.deniable_kdf,
             recovery_mode: self.unlock.recovery_mode,
         };
-        let needs_touch =
-            matches!(
-                opts.method,
-                UnlockMethod::Fido2
+        let needs_touch = matches!(
+            opts.method,
+            UnlockMethod::Fido2
                 | UnlockMethod::HybridPqFido2
                 | UnlockMethod::Tpm2Fido2
                 | UnlockMethod::HybridPqTpm2Fido2
                 // Deniable SEP+FIDO2 always prompts for a touch.
                 | UnlockMethod::SepFido2
                 | UnlockMethod::HybridPqSepFido2
-            ) || (matches!(opts.method, UnlockMethod::Sep | UnlockMethod::HybridPqSep)
-                && opts.pin.as_ref().map(|p| !p.is_empty()).unwrap_or(false));
+        ) || (matches!(opts.method, UnlockMethod::Sep | UnlockMethod::HybridPqSep)
+            && opts.pin.as_ref().map(|p| !p.is_empty()).unwrap_or(false));
         let rx = ops::spawn(move || ops::unlock_vault(opts));
         self.pending = Some(Pending::Unlock { rx, needs_touch });
     }
@@ -9368,10 +9363,7 @@ impl LuksboxApp {
         let mut hs_err: Option<String> = None;
         let mut open_hs_picker = false;
         if let Some(form) = self.add_hybrid_sep_modal.as_mut() {
-            let title = format!(
-                "Add hybrid Secure Enclave + ML-KEM-{} keyslot",
-                form.kem_size
-            );
+            let title = format!("Add hybrid Secure Enclave + ML-KEM-{} keyslot", form.kem_size);
             egui::Window::new(title)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .collapsible(false)
@@ -9548,7 +9540,8 @@ impl LuksboxApp {
                                 .size(12.0),
                         );
                         ui.horizontal(|ui| {
-                            let (field_w, browse_w) = trailing_button_row_widths(ui, 320.0, 90.0);
+                            let (field_w, browse_w) =
+                                trailing_button_row_widths(ui, 320.0, 90.0);
                             ui.add_sized(
                                 [field_w, CONTROL_H],
                                 egui::TextEdit::singleline(&mut form.kyber_path)
@@ -9563,9 +9556,11 @@ impl LuksboxApp {
                         });
                         ui.add_space(6.0);
                         ui.label(
-                            RichText::new("Seed-file passphrase (encrypts the .kyber at rest)")
-                                .color(theme::DIM)
-                                .size(12.0),
+                            RichText::new(
+                                "Seed-file passphrase (encrypts the .kyber at rest)",
+                            )
+                            .color(theme::DIM)
+                            .size(12.0),
                         );
                         ui.add_sized(
                             [capped_width(ui, 320.0), CONTROL_H],

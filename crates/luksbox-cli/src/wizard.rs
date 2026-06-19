@@ -484,7 +484,9 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
         // interactive prompts), so the wizard only collects the .kyber
         // path for the hybrid kinds.
         #[cfg(all(feature = "hardware", target_os = "macos"))]
-        DenCredKind::Sep => crate::cli_create_sep_deniable_v2(&path, cipher_suite, argon2_params)?,
+        DenCredKind::Sep => {
+            crate::cli_create_sep_deniable_v2(&path, cipher_suite, argon2_params)?
+        }
         #[cfg(all(feature = "hardware", target_os = "macos"))]
         DenCredKind::SepFido2 => {
             crate::cli_create_sep_fido2_deniable_v2(&path, cipher_suite, argon2_params)?
@@ -497,13 +499,7 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
         #[cfg(all(feature = "hardware", target_os = "macos"))]
         DenCredKind::HybridPqSepFido2 => {
             let kp = ask_path(theme, "Path for the .kyber seed file")?;
-            crate::cli_create_pq_sep_fido2_deniable_v2(
-                &path,
-                cipher_suite,
-                argon2_params,
-                &kp,
-                false,
-            )?
+            crate::cli_create_pq_sep_fido2_deniable_v2(&path, cipher_suite, argon2_params, &kp, false)?
         }
     };
 
@@ -2166,9 +2162,9 @@ fn format_slot(idx: usize, slot: &luksbox_core::Keyslot, with_kdf: bool) -> Stri
                  SEP material in-header, ML-KEM in .lbx.hybrid)"
             )
         }
-        SlotKind::SepFido2 => {
-            format!("  {idx}: secure-enclave + FIDO2 (macOS; SEP material in-header)")
-        }
+        SlotKind::SepFido2 => format!(
+            "  {idx}: secure-enclave + FIDO2 (macOS; SEP material in-header)"
+        ),
         SlotKind::HybridPqKemSepFido2 => format!(
             "  {idx}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + ML-KEM-768; \
              SEP material in-header, ML-KEM in .lbx.hybrid)"
@@ -2177,9 +2173,9 @@ fn format_slot(idx: usize, slot: &luksbox_core::Keyslot, with_kdf: bool) -> Stri
             "  {idx}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + ML-KEM-1024; \
              SEP material in-header, ML-KEM in .lbx.hybrid)"
         ),
-        SlotKind::SepPassphrase => {
-            format!("  {idx}: secure-enclave + passphrase (macOS; SEP material in-header)")
-        }
+        SlotKind::SepPassphrase => format!(
+            "  {idx}: secure-enclave + passphrase (macOS; SEP material in-header)"
+        ),
         SlotKind::HybridPqKemSepPassphrase => format!(
             "  {idx}: hybrid-pq-sep (macOS Secure Enclave + passphrase + ML-KEM-768; \
              SEP material in-header, ML-KEM in .lbx.hybrid)"
@@ -2188,9 +2184,9 @@ fn format_slot(idx: usize, slot: &luksbox_core::Keyslot, with_kdf: bool) -> Stri
             "  {idx}: hybrid-pq-sep (macOS Secure Enclave + passphrase + ML-KEM-1024; \
              SEP material in-header, ML-KEM in .lbx.hybrid)"
         ),
-        SlotKind::SepFido2Passphrase => {
-            format!("  {idx}: secure-enclave + FIDO2 + passphrase (macOS; SEP material in-header)")
-        }
+        SlotKind::SepFido2Passphrase => format!(
+            "  {idx}: secure-enclave + FIDO2 + passphrase (macOS; SEP material in-header)"
+        ),
         SlotKind::HybridPqKemSepFido2Passphrase => format!(
             "  {idx}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + passphrase + ML-KEM-768; \
              SEP material in-header, ML-KEM in .lbx.hybrid)"
@@ -2316,6 +2312,13 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     {
+        // The fused "SEP + FIDO2 + passphrase" rows (logical indices
+        // 13, 18, 19) are intentionally omitted: a slot takes FIDO2 OR
+        // a passphrase as the extra factor, never both (the second is
+        // redundant), matching the GUI and the Linux TPM set. The
+        // display->logical remap right after the Select keeps the
+        // dispatch `match kind_choice` numbering stable so its arms
+        // never had to be renumbered.
         items.extend_from_slice(&[
             "Secure Enclave (this Mac; bootstrap passphrase kept as backup)",
             "Secure Enclave + Touch ID (this Mac + biometry; bootstrap passphrase kept as backup)",
@@ -2323,13 +2326,10 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
             "Hybrid Secure Enclave + ML-KEM-1024 (2-factor; bootstrap passphrase kept as backup)",
             "Fused Secure Enclave + FIDO2 (both required; bootstrap passphrase kept as backup)",
             "Fused Secure Enclave + passphrase (SEP + a slot passphrase; bootstrap passphrase kept as backup)",
-            "Fused Secure Enclave + FIDO2 + passphrase (3-factor; bootstrap passphrase kept as backup)",
             "Hybrid Secure Enclave + FIDO2 + ML-KEM-768 (3-factor; bootstrap passphrase kept as backup)",
             "Hybrid Secure Enclave + FIDO2 + ML-KEM-1024 (3-factor; bootstrap passphrase kept as backup)",
             "Hybrid Secure Enclave + passphrase + ML-KEM-768 (3-factor; bootstrap passphrase kept as backup)",
             "Hybrid Secure Enclave + passphrase + ML-KEM-1024 (3-factor; bootstrap passphrase kept as backup)",
-            "Hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-768 (4-factor; bootstrap passphrase kept as backup)",
-            "Hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-1024 (4-factor; bootstrap passphrase kept as backup)",
         ]);
     }
     let kind_choice = Select::with_theme(theme)
@@ -2337,6 +2337,15 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
         .items(&items)
         .default(0)
         .interact()?;
+    // macOS: the displayed SEP list dropped the redundant
+    // FIDO2+passphrase row (old logical 13) from the middle, so every
+    // displayed SEP row at/after that position is shifted down by one.
+    // Translate the display index back to the stable logical index the
+    // `match kind_choice` below expects. Old logical 13/18/19 (the three
+    // FIDO2+passphrase combos) are now unreachable; their match arms
+    // stay defined so existing on-disk vaults of those kinds still open.
+    #[cfg(target_os = "macos")]
+    let kind_choice = if kind_choice >= 13 { kind_choice + 1 } else { kind_choice };
 
     // FIDO2-direct + all four hybrid kinds + all TPM / SEP kinds skip
     // pad/hide-sizes prompts (they have their own follow-on prompts
@@ -4761,6 +4770,11 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
         }
         #[cfg(target_os = "macos")]
         {
+            // The fused "SEP + FIDO2 + passphrase" rows (actions 22, 27,
+            // 28) are intentionally omitted: a slot takes FIDO2 OR a
+            // passphrase as the extra factor, never both. The remap below
+            // skips action 22 so the `match action` dispatch numbering
+            // stays stable and its arms never had to be renumbered.
             menu.extend_from_slice(&[
                 "Add a Secure Enclave keyslot (this Mac)",
                 "Add a Secure Enclave + Touch ID keyslot",
@@ -4768,13 +4782,10 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                 "Add a hybrid Secure Enclave + ML-KEM-1024 keyslot",
                 "Add a fused Secure Enclave + FIDO2 keyslot (both required)",
                 "Add a fused Secure Enclave + passphrase keyslot",
-                "Add a fused Secure Enclave + FIDO2 + passphrase keyslot (3-factor)",
                 "Add a hybrid Secure Enclave + FIDO2 + ML-KEM-768 keyslot",
                 "Add a hybrid Secure Enclave + FIDO2 + ML-KEM-1024 keyslot",
                 "Add a hybrid Secure Enclave + passphrase + ML-KEM-768 keyslot",
                 "Add a hybrid Secure Enclave + passphrase + ML-KEM-1024 keyslot",
-                "Add a hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-768 keyslot (4-factor)",
-                "Add a hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-1024 keyslot (4-factor)",
             ]);
         }
         menu.extend_from_slice(&[
@@ -4808,9 +4819,15 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             _ => unreachable!(),
         };
         // macOS: choices 0..=5 are the PQ rows, 6..=9 are the four
-        // base Secure Enclave rows (remapped to actions 16..=19),
-        // 10..=18 are the nine fused SEP rows (remapped to actions
-        // 20..=28), then 19/20/21 are update/revoke/back.
+        // base Secure Enclave rows (remapped to actions 16..=19), then
+        // the six fused SEP rows we still offer (FIDO2, passphrase, and
+        // the FIDO2/passphrase x ML-KEM-768/1024 hybrids) remap to
+        // actions 20, 21, 23, 24, 25, 26. Action 22 (fused SEP + FIDO2 +
+        // passphrase) and 27/28 (the FIDO2+passphrase hybrids) are
+        // deliberately skipped: a slot uses FIDO2 OR a passphrase, not
+        // both. Their `match action` arms stay defined (so existing
+        // vaults of those kinds still open) but are now unreachable.
+        // Finally 16/17/18 are update/revoke/back.
         #[cfg(target_os = "macos")]
         let action = match choice {
             0..=5 => choice,
@@ -4818,10 +4835,15 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             7 => 17,
             8 => 18,
             9 => 19,
-            10..=18 => choice + 10, // 10->20 .. 18->28
-            19 => 13,
-            20 => 14,
-            21 => 15,
+            10 => 20, // fused SEP + FIDO2
+            11 => 21, // fused SEP + passphrase
+            12 => 23, // hybrid SEP + FIDO2 + ML-KEM-768  (22 skipped)
+            13 => 24, // hybrid SEP + FIDO2 + ML-KEM-1024
+            14 => 25, // hybrid SEP + passphrase + ML-KEM-768
+            15 => 26, // hybrid SEP + passphrase + ML-KEM-1024
+            16 => 13, // update
+            17 => 14, // revoke
+            18 => 15, // back
             _ => unreachable!(),
         };
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -5037,12 +5059,10 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             #[cfg(target_os = "macos")]
             16 => {
                 if cont.is_deniable() {
-                    Err(
-                        "Secure Enclave keyslots are not supported on deniable vaults: \
+                    Err("Secure Enclave keyslots are not supported on deniable vaults: \
                          deniable slots are fixed at creation time and Secure Enclave \
                          is not a deniable credential."
-                            .into(),
-                    )
+                        .into())
                 } else {
                     enroll_sep_into(theme, &mut cont, false)
                 }
@@ -5050,12 +5070,10 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             #[cfg(target_os = "macos")]
             17 => {
                 if cont.is_deniable() {
-                    Err(
-                        "Secure Enclave keyslots are not supported on deniable vaults: \
+                    Err("Secure Enclave keyslots are not supported on deniable vaults: \
                          deniable slots are fixed at creation time and Secure Enclave \
                          is not a deniable credential."
-                            .into(),
-                    )
+                        .into())
                 } else {
                     enroll_sep_into(theme, &mut cont, true)
                 }
@@ -5064,12 +5082,10 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             18 => {
                 let vp = cont.vault_path().to_path_buf();
                 if cont.is_deniable() {
-                    Err(
-                        "Secure Enclave keyslots are not supported on deniable vaults: \
+                    Err("Secure Enclave keyslots are not supported on deniable vaults: \
                          deniable slots are fixed at creation time and Secure Enclave \
                          is not a deniable credential."
-                            .into(),
-                    )
+                        .into())
                 } else {
                     enroll_hybrid_pq_sep_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml768)
                 }
@@ -5078,12 +5094,10 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             19 => {
                 let vp = cont.vault_path().to_path_buf();
                 if cont.is_deniable() {
-                    Err(
-                        "Secure Enclave keyslots are not supported on deniable vaults: \
+                    Err("Secure Enclave keyslots are not supported on deniable vaults: \
                          deniable slots are fixed at creation time and Secure Enclave \
                          is not a deniable credential."
-                            .into(),
-                    )
+                        .into())
                 } else {
                     enroll_hybrid_pq_sep_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml1024)
                 }
@@ -5095,20 +5109,24 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             #[cfg(target_os = "macos")]
             20..=28 => {
                 if cont.is_deniable() {
-                    Err(
-                        "Secure Enclave keyslots are not supported on deniable vaults: \
+                    Err("Secure Enclave keyslots are not supported on deniable vaults: \
                          deniable slots are fixed at creation time and Secure Enclave \
                          is not a deniable credential."
-                            .into(),
-                    )
+                        .into())
                 } else {
                     let vp = cont.vault_path().to_path_buf();
                     let (factors, params) = match action {
                         20 => (crate::SepFactors::Fido2, None),
                         21 => (crate::SepFactors::Passphrase, None),
                         22 => (crate::SepFactors::Fido2Passphrase, None),
-                        23 => (crate::SepFactors::Fido2, Some(luksbox_pq::PqParams::Ml768)),
-                        24 => (crate::SepFactors::Fido2, Some(luksbox_pq::PqParams::Ml1024)),
+                        23 => (
+                            crate::SepFactors::Fido2,
+                            Some(luksbox_pq::PqParams::Ml768),
+                        ),
+                        24 => (
+                            crate::SepFactors::Fido2,
+                            Some(luksbox_pq::PqParams::Ml1024),
+                        ),
                         25 => (
                             crate::SepFactors::Passphrase,
                             Some(luksbox_pq::PqParams::Ml768),
@@ -6241,10 +6259,7 @@ fn enroll_sep_fused_into(
     let hmac_secret_ref = fido2.as_ref().map(|(_, _, hs)| hs);
     let passphrase_ref = new_pw.as_ref().map(|p| p.as_bytes());
     let pq_shared_ref = pq.as_ref().map(|(_, _, _, _, s)| &**s);
-    let cred_id_ref: &[u8] = fido2
-        .as_ref()
-        .map(|(cred, _, _)| cred.as_slice())
-        .unwrap_or(&[]);
+    let cred_id_ref: &[u8] = fido2.as_ref().map(|(cred, _, _)| cred.as_slice()).unwrap_or(&[]);
     let hmac_salt = fido2.as_ref().map(|(_, s, _)| *s).unwrap_or([0u8; 32]);
 
     let idx = c.enroll_sep(
