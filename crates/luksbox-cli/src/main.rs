@@ -1115,6 +1115,22 @@ pub(crate) fn auth_prompt(action: &str) -> String {
     }
 }
 
+/// Sentence describing what an EMPTY secret at `prompt` would mean.
+/// The .kyber seed-file prompts get seed-specific wording (the classic
+/// "anyone with this vault file" phrasing is wrong for a seed file);
+/// everything else keeps the vault wording. Shared by the CLI's
+/// `read_passphrase_confirmed` and the wizard's `ask_new_passphrase`.
+pub(crate) fn empty_passphrase_warning(prompt: &str) -> &'static str {
+    if prompt.to_ascii_lowercase().contains("seed-file") {
+        "The seed-file passphrase is EMPTY. ANYONE who gets a copy of the \
+         .kyber seed file can use it as the post-quantum unlock factor \
+         without any secret."
+    } else {
+        "The passphrase is EMPTY. ANYONE with this vault file will be able \
+         to open it."
+    }
+}
+
 #[cfg(feature = "hardware")]
 pub(crate) fn make_fido2_authenticator() -> luksbox_fido2::HidAuthenticator {
     let path = FIDO2_DEVICE_OVERRIDE.lock().ok().and_then(|g| g.clone());
@@ -2441,10 +2457,7 @@ fn read_passphrase_confirmed(prompt: &str) -> io::Result<Zeroizing<String>> {
             && a.is_empty()
             && std::env::var_os("LUKSBOX_ACCEPT_EMPTY").is_none()
         {
-            eprintln!(
-                "warning: the passphrase is EMPTY. ANYONE with this vault file \
-                 will be able to open it."
-            );
+            eprintln!("warning: {}", empty_passphrase_warning(prompt));
             let proceed = dialoguer::Confirm::new()
                 .with_prompt("Use the empty passphrase anyway?")
                 .default(false)
@@ -2560,14 +2573,18 @@ fn open_container(path: &Path, unlock: &UnlockArgs) -> Result<Container> {
             .keyslots
             .iter()
             .any(|s| s.kind.is_hybrid_pq_passphrase());
-        let has_tpm_hybrid = header
-            .keyslots
-            .iter()
-            .any(|s| s.kind == SlotKind::HybridPqKemTpm2);
-        let has_tpm_fido_hybrid = header
-            .keyslots
-            .iter()
-            .any(|s| s.kind == SlotKind::HybridPqKemTpm2Fido2);
+        let has_tpm_hybrid = header.keyslots.iter().any(|s| {
+            matches!(
+                s.kind,
+                SlotKind::HybridPqKemTpm2 | SlotKind::HybridPqKem1024Tpm2
+            )
+        });
+        let has_tpm_fido_hybrid = header.keyslots.iter().any(|s| {
+            matches!(
+                s.kind,
+                SlotKind::HybridPqKemTpm2Fido2 | SlotKind::HybridPqKem1024Tpm2Fido2
+            )
+        });
         let has_sep_hybrid = header
             .keyslots
             .iter()
@@ -2646,7 +2663,9 @@ fn pick_unlock_suggestion(keyslots: &[luksbox_core::Keyslot]) -> &'static str {
             SlotKind::Fido2HmacSecret | SlotKind::Fido2DerivedMvk
         )
     });
-    let any_tpm2 = keyslots.iter().any(|s| s.kind == SlotKind::Tpm2Sealed);
+    let any_tpm2 = keyslots
+        .iter()
+        .any(|s| matches!(s.kind, SlotKind::Tpm2Sealed | SlotKind::Tpm2SealedPin));
     let any_tpm2_fido = keyslots.iter().any(|s| s.kind == SlotKind::Tpm2Fido2);
     let any_sep = keyslots
         .iter()
@@ -2663,8 +2682,13 @@ fn pick_unlock_suggestion(keyslots: &[luksbox_core::Keyslot]) -> &'static str {
     let any_hybrid = keyslots.iter().any(|s| {
         s.kind.is_hybrid_pq_passphrase()
             || s.kind.is_hybrid_pq_fido2()
-            || s.kind == SlotKind::HybridPqKemTpm2
-            || s.kind == SlotKind::HybridPqKemTpm2Fido2
+            || matches!(
+                s.kind,
+                SlotKind::HybridPqKemTpm2
+                    | SlotKind::HybridPqKem1024Tpm2
+                    | SlotKind::HybridPqKemTpm2Fido2
+                    | SlotKind::HybridPqKem1024Tpm2Fido2
+            )
     });
     if any_tpm2_fido {
         "--tpm2-fido2"
@@ -3155,8 +3179,8 @@ fn open_sep_common(
     };
 
     // FIDO2: open the authenticator + collect the PIN once if any
-    // in-scope slot is a SEP+FIDO2 kind (and the user asked for it via
-    // --fido2, or there's no ambiguity).
+    // in-scope slot is a SEP+FIDO2 kind AND the user asked for it via
+    // --fido2 (FIDO2 slots are skipped otherwise; see the hint below).
     let any_fido2_slot = header
         .keyslots
         .iter()
@@ -3239,7 +3263,14 @@ fn open_sep_common(
             UnlockMaterial::Sep {
                 unseal: &mut unseal,
                 hmac_secret: hmac_secret.as_ref(),
-                passphrase: passphrase.as_ref().map(|p| p.as_bytes()),
+                // Per-slot: only passphrase-bearing kinds get the
+                // passphrase. Feeding it to a plain SEP slot would make
+                // the format layer skip that slot (factor-set mismatch).
+                passphrase: if slot.kind.is_sep_passphrase() {
+                    passphrase.as_ref().map(|p| p.as_bytes())
+                } else {
+                    None
+                },
                 pq_shared: pq.as_ref(),
             },
         ) {
@@ -3248,7 +3279,15 @@ fn open_sep_common(
         }
     }
     Err(last_err
-        .unwrap_or_else(|| "no Secure Enclave keyslot matched the supplied factors".into())
+        .unwrap_or_else(|| {
+            if any_fido2_slot && !fido2 {
+                "the matching Secure Enclave keyslots need a FIDO2 authenticator; \
+                 re-run with --fido2"
+                    .into()
+            } else {
+                "no Secure Enclave keyslot matched the supplied factors".into()
+            }
+        })
         .into())
 }
 
@@ -3517,7 +3556,10 @@ fn open_container_hybrid_pq_tpm2(
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
     let mut last_err: Option<String> = None;
     for (slot_idx_usize, slot) in header.keyslots.iter().enumerate() {
-        if slot.kind != SlotKind::HybridPqKemTpm2 {
+        if !matches!(
+            slot.kind,
+            SlotKind::HybridPqKemTpm2 | SlotKind::HybridPqKem1024Tpm2
+        ) {
             continue;
         }
         let slot_idx = slot_idx_usize as u8;
@@ -3608,7 +3650,10 @@ fn open_container_hybrid_pq_tpm2_fido2(
     let mut auth = make_fido2_authenticator();
     let mut last_err: Option<String> = None;
     for (slot_idx_usize, slot) in header.keyslots.iter().enumerate() {
-        if slot.kind != SlotKind::HybridPqKemTpm2Fido2 {
+        if !matches!(
+            slot.kind,
+            SlotKind::HybridPqKemTpm2Fido2 | SlotKind::HybridPqKem1024Tpm2Fido2
+        ) {
             continue;
         }
         let slot_idx = slot_idx_usize as u8;
@@ -5689,7 +5734,18 @@ fn cmd_update(
     kind_override: Option<SlotKindArg>,
 ) -> Result<()> {
     let mut c = open_container(path, unlock)?;
-    let existing = SlotKindArg::from_core(c.header.keyslots[slot].kind)
+    let existing_kind = c
+        .header
+        .keyslots
+        .get(slot)
+        .ok_or_else(|| {
+            format!(
+                "slot {slot} is out of range (max {})",
+                luksbox_core::MAX_KEYSLOTS - 1
+            )
+        })?
+        .kind;
+    let existing = SlotKindArg::from_core(existing_kind)
         .ok_or_else(|| format!("slot {slot} is empty; nothing to update"))?;
     let target = kind_override.unwrap_or(existing);
     match target {

@@ -181,7 +181,11 @@ enum CreateKind {
     /// dedicated slot passphrase in addition to the bootstrap recovery
     /// passphrase.
     SepPassphrase,
-    /// Fused Secure Enclave + FIDO2 + passphrase.
+    /// Fused Secure Enclave + FIDO2 + passphrase. No longer offered by
+    /// the create picker (a slot takes FIDO2 OR a passphrase as its
+    /// extra factor, never both); kept so the kind-handling matches
+    /// stay exhaustive and the removal is easy to revert.
+    #[allow(dead_code)]
     SepFido2Passphrase,
     /// Hybrid PQ + Secure Enclave + FIDO2 (ML-KEM-768).
     HybridPqSepFido2,
@@ -192,8 +196,12 @@ enum CreateKind {
     /// Hybrid PQ + Secure Enclave + passphrase (ML-KEM-1024).
     HybridPqSep1024Passphrase,
     /// Hybrid PQ + Secure Enclave + FIDO2 + passphrase (ML-KEM-768).
+    /// Not offered by the picker; see `SepFido2Passphrase`.
+    #[allow(dead_code)]
     HybridPqSepFido2Passphrase,
     /// Hybrid PQ + Secure Enclave + FIDO2 + passphrase (ML-KEM-1024).
+    /// Not offered by the picker; see `SepFido2Passphrase`.
+    #[allow(dead_code)]
     HybridPqSep1024Fido2Passphrase,
 }
 impl CreateKind {
@@ -794,6 +802,11 @@ enum EmptyPassphraseTarget {
     /// User clicked "Enroll" inside the "Add passphrase keyslot"
     /// modal with the passphrase field empty.
     AddPassphraseKeyslot,
+    /// User clicked "Create vault" for a hybrid kind whose .kyber
+    /// seed file would be encrypted under an EMPTY passphrase (the
+    /// explicit seed-file field is empty AND the vault passphrase it
+    /// falls back to is empty or absent).
+    CreateVaultSeed,
 }
 
 /// State for the 3-factor "Add hybrid TPM + FIDO2 + ML-KEM" modal.
@@ -948,13 +961,17 @@ enum Pending {
     EnrollHybridPqTpm2Fido2 {
         rx: Receiver<VaultRet<usize>>,
     },
-    /// macOS Secure Enclave enroll (plain or biometric).
+    /// macOS Secure Enclave enroll (plain, biometric, or fused).
+    /// `needs_touch` is true when the fused slot includes a FIDO2
+    /// factor (the worker blocks on an authenticator touch).
     EnrollSep {
         rx: Receiver<VaultRet<usize>>,
+        needs_touch: bool,
     },
-    /// Hybrid Secure Enclave + ML-KEM enroll.
+    /// Hybrid Secure Enclave + ML-KEM enroll (plain or fused).
     EnrollHybridPqSep {
         rx: Receiver<VaultRet<usize>>,
+        needs_touch: bool,
     },
     /// Non-TPM hybrid: passphrase + ML-KEM. Worker generates a
     /// Kyber keypair, installs the slot, writes the .hybrid
@@ -1064,6 +1081,12 @@ impl Pending {
                 needs_touch: true,
                 ..
             } | Pending::CreateWithTpmBootstrap {
+                needs_touch: true,
+                ..
+            } | Pending::EnrollSep {
+                needs_touch: true,
+                ..
+            } | Pending::EnrollHybridPqSep {
                 needs_touch: true,
                 ..
             } | Pending::EnrollFido2 { .. }
@@ -2197,7 +2220,7 @@ impl LuksboxApp {
                 }
                 Err(_) => self.toast_err("3-factor enroll task crashed"),
             },
-            Pending::EnrollSep { rx } => match rx.try_recv() {
+            Pending::EnrollSep { rx, needs_touch } => match rx.try_recv() {
                 Ok((vault, result)) => {
                     match result {
                         Ok(idx) => {
@@ -2208,11 +2231,11 @@ impl LuksboxApp {
                     self.vault = Some(vault);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    self.pending = Some(Pending::EnrollSep { rx });
+                    self.pending = Some(Pending::EnrollSep { rx, needs_touch });
                 }
                 Err(_) => self.toast_err("Secure Enclave enroll task crashed"),
             },
-            Pending::EnrollHybridPqSep { rx } => match rx.try_recv() {
+            Pending::EnrollHybridPqSep { rx, needs_touch } => match rx.try_recv() {
                 Ok((mut vault, result)) => {
                     match result {
                         Ok(idx) => {
@@ -2226,7 +2249,7 @@ impl LuksboxApp {
                     self.vault = Some(vault);
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    self.pending = Some(Pending::EnrollHybridPqSep { rx });
+                    self.pending = Some(Pending::EnrollHybridPqSep { rx, needs_touch });
                 }
                 Err(_) => self.toast_err("hybrid Secure Enclave + ML-KEM enroll task crashed"),
             },
@@ -4848,6 +4871,13 @@ impl LuksboxApp {
         // the invisible-second-slot foot-gun).
         let tpm_only = (self.create.skip_tpm_bootstrap_passphrase || self.create.use_deniable)
             && matches!(self.create.kind, CreateKind::Tpm2 | CreateKind::Tpm2Pin);
+        // SEP analog of `tpm_only`: "skip backup passphrase" routes to
+        // `create_vault_sep_only` and no passphrase is collected. Unlike
+        // TPM, deniable is NOT included: deniable SEP always needs the
+        // envelope passphrase (`needs_passphrase` forces it below).
+        let sep_only = self.create.skip_sep_bootstrap_passphrase
+            && !self.create.use_deniable
+            && matches!(self.create.kind, CreateKind::Sep | CreateKind::SepBiometric);
         // 3-factor combos similarly route to the single-slot v2
         // helper when in deniable mode; when not deniable they need
         // a passphrase only if the recovery-passphrase opt-in is on.
@@ -4872,12 +4902,51 @@ impl LuksboxApp {
                 self.create.kind,
                 CreateKind::Fido2 | CreateKind::Fido2Direct
             ) && !tpm_only
+                && !sep_only
                 && !three_factor_no_passphrase);
         if needs_passphrase
             && self.create.passphrase.is_empty()
             && self.empty_passphrase_confirm.is_none()
         {
             self.empty_passphrase_confirm = Some(EmptyPassphraseTarget::CreateVault);
+            return;
+        }
+        // Seed-file analog of the guard above. Every hybrid kind
+        // writes a .kyber seed file encrypted under the explicit
+        // seed-file passphrase, falling back to the vault/envelope
+        // passphrase. When BOTH are empty (e.g. a hybrid TPM combo
+        // with the recovery passphrase opt-in off) the seed would be
+        // written under an empty passphrase with no warning; the CLI
+        // and TUI confirm here, so the GUI must too. Runs before any
+        // `mem::take` so an early return keeps the form intact.
+        let writes_kyber_seed = matches!(
+            self.create.kind,
+            CreateKind::HybridPq
+                | CreateKind::HybridPq1024
+                | CreateKind::HybridPqFido2
+                | CreateKind::HybridPq1024Fido2
+                | CreateKind::HybridPqTpm2
+                | CreateKind::HybridPq1024Tpm2
+                | CreateKind::HybridPqTpm2Fido2
+                | CreateKind::HybridPq1024Tpm2Fido2
+                | CreateKind::HybridPqSep
+                | CreateKind::HybridPqSep1024
+                | CreateKind::HybridPqSepFido2
+                | CreateKind::HybridPqSep1024Fido2
+                | CreateKind::HybridPqSepPassphrase
+                | CreateKind::HybridPqSep1024Passphrase
+                | CreateKind::HybridPqSepFido2Passphrase
+                | CreateKind::HybridPqSep1024Fido2Passphrase
+        );
+        if writes_kyber_seed
+            && self.create.hybrid_seed_pw.is_empty()
+            && (!needs_passphrase || self.create.passphrase.is_empty())
+            && !matches!(
+                self.empty_passphrase_confirm,
+                Some(EmptyPassphraseTarget::CreateVaultSeed)
+            )
+        {
+            self.empty_passphrase_confirm = Some(EmptyPassphraseTarget::CreateVaultSeed);
             return;
         }
         // No FIDO2-direct backup-passphrase guard needed anymore: the
@@ -5219,6 +5288,18 @@ impl LuksboxApp {
                     self.toast_err(
                         "hybrid fused SEP kind requires a path for the .kyber seed file",
                     );
+                    return;
+                }
+                // Same up-front checks as the enroll modal (and the TPM
+                // analogs above): an empty PIN would die mid-ceremony
+                // with a raw CTAP error, and an empty slot passphrase
+                // would enroll a slot the unlock path refuses to open.
+                if factors.has_fido2() && self.create.pin.is_empty() {
+                    self.toast_err("FIDO2 PIN required");
+                    return;
+                }
+                if factors.has_passphrase() && self.create.backup_passphrase.is_empty() {
+                    self.toast_err("slot passphrase cannot be empty");
                     return;
                 }
                 let pin = std::mem::take(&mut self.create.pin);
@@ -6351,6 +6432,7 @@ impl LuksboxApp {
                     // (optional) slot passphrase, distinct from the
                     // seed-file passphrase in `passphrase`.
                     | UnlockMethod::HybridPqSep
+                    | UnlockMethod::HybridPqSepFido2
             ) && !self.unlock.hybrid_seed_pw.is_empty()
             {
                 Some(std::mem::take(&mut self.unlock.hybrid_seed_pw))
@@ -7739,7 +7821,10 @@ impl LuksboxApp {
                             let r = ops::enroll_sep(&mut v.vfs, false);
                             let _ = tx.send((v, r));
                         });
-                        self.pending = Some(Pending::EnrollSep { rx });
+                        self.pending = Some(Pending::EnrollSep {
+                            rx,
+                            needs_touch: false,
+                        });
                     }
                 }
                 #[cfg(target_os = "macos")]
@@ -7764,7 +7849,10 @@ impl LuksboxApp {
                             let r = ops::enroll_sep(&mut v.vfs, true);
                             let _ = tx.send((v, r));
                         });
-                        self.pending = Some(Pending::EnrollSep { rx });
+                        self.pending = Some(Pending::EnrollSep {
+                            rx,
+                            needs_touch: false,
+                        });
                     }
                 }
                 #[cfg(target_os = "macos")]
@@ -7869,9 +7957,20 @@ impl LuksboxApp {
                             | SlotKind::HybridPqKem1024Fido2,
                     )
                 });
+                // Hardware-bound slots (TPM / Secure Enclave, incl. the
+                // fused + hybrid kinds) can't be re-wrapped by the GUI
+                // rotation flow; the ops pre-flight would refuse AFTER
+                // the user typed every passphrase, so gate up front.
+                let has_hw_bound = header
+                    .keyslots
+                    .iter()
+                    .any(|s| s.kind.is_tpm2() || s.kind.is_sep());
 
-                let can_rotate_in_gui =
-                    has_passphrase && !has_fido2_wrap && !has_fido2_direct && !has_hybrid;
+                let can_rotate_in_gui = has_passphrase
+                    && !has_fido2_wrap
+                    && !has_fido2_direct
+                    && !has_hybrid
+                    && !has_hw_bound;
 
                 if can_rotate_in_gui {
                     if ui
@@ -7911,6 +8010,10 @@ impl LuksboxApp {
                         "FIDO2-direct slots can't be rotated, the master key IS the authenticator \
                  output, not wrapped. Revoke the slot and recreate the vault to \
                  change keys."
+                    } else if has_hw_bound {
+                        "This vault has a TPM- or Secure Enclave-bound keyslot; those can't be \
+                 re-wrapped by the GUI rotation flow yet. Use the CLI: revoke the \
+                 hardware slot, `luksbox rotate-mvk <path>`, then re-enroll it."
                     } else if has_hybrid {
                         "Hybrid-PQ rotation isn't supported yet (would need to re-encapsulate \
                  against the existing Kyber keypair). Recreate the vault if you need \
@@ -8125,6 +8228,15 @@ impl LuksboxApp {
                  to continue?",
                 "Yes, use empty passphrase",
             ),
+            EmptyPassphraseTarget::CreateVaultSeed => (
+                "Empty seed-file passphrase, are you sure?",
+                "The .kyber seed file would be encrypted under an EMPTY passphrase: \
+                 ANYONE who gets a copy of the seed file can use it as the \
+                 post-quantum unlock factor without any secret. Fill the seed-file \
+                 passphrase field (or the vault passphrase it falls back to) to \
+                 protect it. Are you sure you want to continue?",
+                "Yes, write unprotected seed",
+            ),
         };
         let mut proceed = false;
         let mut cancel = false;
@@ -8151,7 +8263,9 @@ impl LuksboxApp {
             // sees `empty_passphrase_confirm.is_some()`, skips the
             // guard, then clears the flag.
             match target {
-                EmptyPassphraseTarget::CreateVault => self.submit_create(),
+                EmptyPassphraseTarget::CreateVault | EmptyPassphraseTarget::CreateVaultSeed => {
+                    self.submit_create()
+                }
                 EmptyPassphraseTarget::AddPassphraseKeyslot => {
                     // Bypass the modal-poll path: we already know the
                     // user hit Yes, so dispatch the enroll directly.
@@ -8470,8 +8584,17 @@ impl LuksboxApp {
 
         // Need a height bump on the touch panel to fit the Cancel
         // button row underneath the prompt without crowding the
-        // pulsing dot.
-        let panel_h = if needs_touch { 230.0 } else { 130.0 };
+        // pulsing dot; a bit more still when the two-touch step line
+        // is showing.
+        let panel_h = if needs_touch {
+            if ops::fido2_touch_stage().is_some() {
+                252.0
+            } else {
+                230.0
+            }
+        } else {
+            130.0
+        };
 
         egui::Area::new(egui::Id::new("pending-overlay"))
             .fixed_pos(egui::pos2(0.0, 0.0))
@@ -8524,6 +8647,18 @@ impl LuksboxApp {
                                         .color(theme::ACCENT)
                                         .size(15.0),
                                 );
+                                // Two-touch guidance: FIDO2 enrolls need a
+                                // second user-presence check after the
+                                // credential is registered. The worker
+                                // publishes which step it's blocked on;
+                                // without this line users touch once and
+                                // think the GUI is hung.
+                                if let Some(stage) = ops::fido2_touch_stage() {
+                                    ui.add_space(3.0);
+                                    ui.label(
+                                        RichText::new(stage).strong().color(theme::TEXT).size(12.5),
+                                    );
+                                }
                                 ui.add_space(4.0);
                                 ui.label(RichText::new(label).color(theme::DIM).size(12.0));
                                 // Cancel button + Esc hint. Only
@@ -9471,7 +9606,10 @@ impl LuksboxApp {
                     );
                     let _ = tx.send((v, r));
                 });
-                self.pending = Some(Pending::EnrollHybridPqSep { rx });
+                self.pending = Some(Pending::EnrollHybridPqSep {
+                    rx,
+                    needs_touch: false,
+                });
             }
         } else if close_hs {
             self.add_hybrid_sep_modal = None;
@@ -9632,6 +9770,7 @@ impl LuksboxApp {
                 };
                 let vault_path = v.vault_path.clone();
                 let is_hybrid = kem_size.is_some();
+                let needs_touch = factors.has_fido2();
                 let (tx, rx) = std::sync::mpsc::channel::<VaultRet<usize>>();
                 std::thread::spawn(move || {
                     let mut v = v;
@@ -9651,9 +9790,9 @@ impl LuksboxApp {
                 // result handler so `has_hybrid_pq` gets set; non-hybrid
                 // fused slots use the plain EnrollSep handler.
                 self.pending = if is_hybrid {
-                    Some(Pending::EnrollHybridPqSep { rx })
+                    Some(Pending::EnrollHybridPqSep { rx, needs_touch })
                 } else {
-                    Some(Pending::EnrollSep { rx })
+                    Some(Pending::EnrollSep { rx, needs_touch })
                 };
             }
         } else if close_sf {

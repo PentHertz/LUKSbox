@@ -1902,10 +1902,10 @@ fn ask_new_passphrase(theme: &ColorfulTheme, prompt: &str) -> Result<zeroize::Ze
         // warning.
         if s.is_empty() {
             let proceed = Confirm::with_theme(theme)
-                .with_prompt(
-                    "The passphrase is empty. ANYONE with this vault file will \
-                     be able to open it. Are you sure?",
-                )
+                .with_prompt(format!(
+                    "{} Are you sure?",
+                    crate::empty_passphrase_warning(prompt)
+                ))
                 .default(false)
                 .interact()?;
             if !proceed {
@@ -5249,7 +5249,13 @@ fn update_keyslot_action(theme: &ColorfulTheme, cont: &mut Container) -> Result<
             "Re-enroll a FIDO2 credential (same kind)",
             "Convert this slot to a passphrase keyslot",
         ],
-        _ => unreachable!(),
+        other => {
+            return Err(format!(
+                "in-place update supports passphrase and FIDO2 wrap-style keyslots only; \
+                 slot {slot_idx} is {other:?}. Revoke it and enroll a fresh keyslot instead."
+            )
+            .into());
+        }
     };
     let target_pick = Select::with_theme(theme)
         .with_prompt("New kind")
@@ -6039,6 +6045,9 @@ fn enroll_tpm2_into(_theme: &ColorfulTheme, _c: &mut Container) -> Result<()> {
 /// container. Mirrors `enroll_tpm2_into`; `biometric` gates the slot
 /// behind a Touch ID / user-presence check at every unlock.
 #[cfg(feature = "hardware")]
+// Call sites are macOS-gated wizard menu arms; dead on other targets
+// but kept compiling there for type-check coverage.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn enroll_sep_into(_theme: &ColorfulTheme, c: &mut Container, biometric: bool) -> Result<()> {
     use luksbox_sep::SepSealer;
 
@@ -6082,6 +6091,9 @@ fn enroll_sep_into(_theme: &ColorfulTheme, c: &mut Container, biometric: bool) -
 }
 
 #[cfg(not(feature = "hardware"))]
+// Call sites are macOS-gated wizard menu arms; dead on other targets
+// but kept compiling there for type-check coverage.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn enroll_sep_into(_theme: &ColorfulTheme, _c: &mut Container, _biometric: bool) -> Result<()> {
     Err(
         "Secure Enclave support not compiled in (rebuild with --features hardware; \
@@ -6095,6 +6107,9 @@ fn enroll_sep_into(_theme: &ColorfulTheme, _c: &mut Container, _biometric: bool)
 /// SEP supplies the classical half, ML-KEM the post-quantum half;
 /// writes the .lbx.hybrid sidecar entry + the Kyber seed file.
 #[cfg(feature = "hardware")]
+// Call sites are macOS-gated wizard menu arms; dead on other targets
+// but kept compiling there for type-check coverage.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn enroll_hybrid_pq_sep_into(
     theme: &ColorfulTheme,
     c: &mut Container,
@@ -6176,6 +6191,9 @@ fn enroll_hybrid_pq_sep_into(
 }
 
 #[cfg(not(feature = "hardware"))]
+// Call sites are macOS-gated wizard menu arms; dead on other targets
+// but kept compiling there for type-check coverage.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn enroll_hybrid_pq_sep_into(
     _theme: &ColorfulTheme,
     _c: &mut Container,
@@ -6193,6 +6211,9 @@ fn enroll_hybrid_pq_sep_into(
 /// secrets are collected. For hybrid kinds the `.lbx.hybrid` sidecar
 /// entry + the (passphrase-encrypted) `.kyber` seed are written.
 #[cfg(feature = "hardware")]
+// Call sites are macOS-gated wizard menu arms; dead on other targets
+// but kept compiling there for type-check coverage.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn enroll_sep_fused_into(
     theme: &ColorfulTheme,
     c: &mut Container,
@@ -6331,6 +6352,9 @@ fn enroll_sep_fused_into(
 }
 
 #[cfg(not(feature = "hardware"))]
+// Call sites are macOS-gated wizard menu arms; dead on other targets
+// but kept compiling there for type-check coverage.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn enroll_sep_fused_into(
     _theme: &ColorfulTheme,
     _c: &mut Container,

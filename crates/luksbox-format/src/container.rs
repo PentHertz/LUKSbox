@@ -3967,15 +3967,19 @@ fn try_unlock(
                 if slot.kind != SlotKind::Tpm2Fido2 {
                     continue;
                 }
-                let stored_cred = slot
-                    .tpm2_fido2_cred_id()
-                    .expect("kind == Tpm2Fido2 implies tpm2_fido2_cred_id() is Some");
+                // A hostile or corrupt vault can carry the Tpm2Fido2
+                // kind byte over a payload that doesn't parse as the
+                // [blob_len | blob | cred_id] sub-format. Skip rather
+                // than error (same policy as the Sep arm).
+                let Some(stored_cred) = slot.tpm2_fido2_cred_id() else {
+                    continue;
+                };
                 if stored_cred != *cred_id {
                     continue;
                 }
-                let tpm_blob = slot
-                    .tpm2_fido2_sealed_blob()
-                    .expect("kind == Tpm2Fido2 implies tpm2_fido2_sealed_blob() is Some");
+                let Some(tpm_blob) = slot.tpm2_fido2_sealed_blob() else {
+                    continue;
+                };
                 let tpm_unsealed = match unseal(tpm_blob) {
                     Ok(k) => k,
                     Err(_) => continue,
@@ -4000,9 +4004,11 @@ fn try_unlock(
                 ) {
                     continue;
                 }
-                let blob = slot
-                    .tpm2_sealed_blob()
-                    .expect("hybrid-pq TPM kind implies tpm2_sealed_blob() is Some");
+                // Skip malformed slots (kind byte without a parseable
+                // payload), same policy as the Sep arm.
+                let Some(blob) = slot.tpm2_sealed_blob() else {
+                    continue;
+                };
                 let tpm_kek = match unseal(blob) {
                     Ok(k) => k,
                     Err(_) => continue,
@@ -4028,15 +4034,17 @@ fn try_unlock(
                 ) {
                     continue;
                 }
-                let stored_cred = slot
-                    .tpm2_fido2_cred_id()
-                    .expect("hybrid-pq fused TPM+FIDO2 implies tpm2_fido2_cred_id() is Some");
+                // Skip malformed slots (kind byte without a parseable
+                // payload), same policy as the Sep arm.
+                let Some(stored_cred) = slot.tpm2_fido2_cred_id() else {
+                    continue;
+                };
                 if stored_cred != *cred_id {
                     continue;
                 }
-                let tpm_blob = slot
-                    .tpm2_fido2_sealed_blob()
-                    .expect("hybrid-pq fused TPM+FIDO2 implies tpm2_fido2_sealed_blob() is Some");
+                let Some(tpm_blob) = slot.tpm2_fido2_sealed_blob() else {
+                    continue;
+                };
                 let tpm_unsealed = match unseal(tpm_blob) {
                     Ok(k) => k,
                     Err(_) => continue,
@@ -4083,9 +4091,9 @@ fn try_unlock(
                 if !matches!(slot.kind, SlotKind::Tpm2Sealed | SlotKind::Tpm2SealedPin) {
                     continue;
                 }
-                let blob = slot.tpm2_sealed_blob().expect(
-                    "kind in {Tpm2Sealed, Tpm2SealedPin} implies tpm2_sealed_blob() is Some",
-                );
+                let Some(blob) = slot.tpm2_sealed_blob() else {
+                    continue;
+                };
                 let kek = match unseal(blob) {
                     Ok(k) => k,
                     Err(_) => continue,

@@ -199,11 +199,96 @@ pub fn selected_fido2_device() -> Option<String> {
     SELECTED_FIDO2_DEVICE.lock().ok().and_then(|g| g.clone())
 }
 
+// ---- FIDO2 touch progress -------------------------------------------------
+//
+// FIDO2-bearing creates/enrolls need TWO user-presence checks: a
+// makeCredential to register the credential, then a getAssertion to
+// derive the hmac-secret. The TUI narrates each step ("register a new
+// credential" / "again to derive the keyslot secret"); the GUI's
+// single static overlay led users to touch once and assume they were
+// done. `GuiAuthenticator` publishes the current step here and the
+// pending overlay re-reads it every frame. Cleared when the worker's
+// authenticator is dropped.
+
+static FIDO2_TOUCH_STAGE: Mutex<Option<&'static str>> = Mutex::new(None);
+
+pub fn fido2_touch_stage() -> Option<&'static str> {
+    FIDO2_TOUCH_STAGE.lock().ok().and_then(|g| *g)
+}
+
 #[cfg(feature = "hardware")]
-fn make_fido2_authenticator() -> luksbox_fido2::HidAuthenticator {
-    match selected_fido2_device() {
+fn set_fido2_touch_stage(stage: Option<&'static str>) {
+    if let Ok(mut g) = FIDO2_TOUCH_STAGE.lock() {
+        *g = stage;
+    }
+}
+
+/// `HidAuthenticator` wrapper that reports which of the two
+/// user-presence steps the worker is blocked on, without threading a
+/// progress channel through the 20+ ops functions that touch FIDO2.
+/// Unlock flows (a lone `hmac_secret`, no prior `enroll`) keep the
+/// generic overlay text: the step counter only appears for the
+/// enroll-then-derive pairs where the second touch surprises people.
+#[cfg(feature = "hardware")]
+pub struct GuiAuthenticator {
+    inner: luksbox_fido2::HidAuthenticator,
+    enrolled: bool,
+}
+
+#[cfg(feature = "hardware")]
+impl luksbox_fido2::Fido2Authenticator for GuiAuthenticator {
+    fn enroll(
+        &mut self,
+        rp_id: &str,
+        user_handle: &[u8],
+        pin: Option<&str>,
+    ) -> Result<luksbox_fido2::EnrollResult, luksbox_fido2::Error> {
+        set_fido2_touch_stage(Some("Step 1 of 2: register a new credential"));
+        let r = luksbox_fido2::Fido2Authenticator::enroll(&mut self.inner, rp_id, user_handle, pin);
+        self.enrolled = r.is_ok();
+        r
+    }
+
+    fn hmac_secret(
+        &mut self,
+        rp_id: &str,
+        cred_id: &[u8],
+        salt: &[u8; 32],
+        prehash_salt: bool,
+        pin: Option<&str>,
+    ) -> Result<luksbox_fido2::HmacSecret, luksbox_fido2::Error> {
+        if self.enrolled {
+            set_fido2_touch_stage(Some(
+                "Step 2 of 2: authenticate again to derive the keyslot secret",
+            ));
+        }
+        luksbox_fido2::Fido2Authenticator::hmac_secret(
+            &mut self.inner,
+            rp_id,
+            cred_id,
+            salt,
+            prehash_salt,
+            pin,
+        )
+    }
+}
+
+#[cfg(feature = "hardware")]
+impl Drop for GuiAuthenticator {
+    fn drop(&mut self) {
+        set_fido2_touch_stage(None);
+    }
+}
+
+#[cfg(feature = "hardware")]
+fn make_fido2_authenticator() -> GuiAuthenticator {
+    let inner = match selected_fido2_device() {
         Some(path) => luksbox_fido2::HidAuthenticator::with_device(path),
         None => luksbox_fido2::HidAuthenticator::new(),
+    };
+    GuiAuthenticator {
+        inner,
+        enrolled: false,
     }
 }
 
