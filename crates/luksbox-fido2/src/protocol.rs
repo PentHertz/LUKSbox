@@ -192,7 +192,7 @@ mod tests {
 
     #[test]
     fn full_hmac_secret_protocol_roundtrip() {
-        // Two software parties: platform ↔ authenticator. Verifies the entire
+        // Two software parties, platform and authenticator. Verifies the entire
         // pinUvAuthProtocol-v1 hmac-secret flow end-to-end.
         let platform = PlatformKeyAgreement::generate();
         let authenticator = PlatformKeyAgreement::generate();

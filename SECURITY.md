@@ -330,7 +330,7 @@ current branch (large |t|) until R12-01 fix lands.
   RustCrypto audits and the FIPS-203 test vectors for ML-KEM.
 - Side-channel resistance on real hardware (no `dudect` runs, no
   power-analysis testbed).
-- Multiple FIDO2 brands — partially covered. Verified on real hardware
+- Multiple FIDO2 brands: partially covered. Verified on real hardware
   (macOS, 2026-07-03): Yubico YubiKey 5 (cred_id 64 B), SoloKeys Solo
   4.1.5 (70 B), Nitrokey 3 (158 B), and Google Titan v2 (288 B) all pass
   enroll + unlock + put/get round-trip; the Titan additionally passed
@@ -352,14 +352,27 @@ are exploitable today, but each is a forward-looking risk you should weigh.
 ### Unmaintained dependencies (`cargo audit` warnings)
 
 `cargo audit` against the workspace currently surfaces **one**
-advisory, accepted and documented in `audit.toml` at the workspace
-root. CI runs `cargo audit` on every push and PR
+advisory, accepted and documented in `.cargo/audit.toml` (the only
+project-local config path cargo-audit reads; it lived at the workspace
+root before 0.4.0-rc, silently unused). CI runs `cargo audit` on every push and PR
 (`.github/workflows/ci.yml::audit`) and fails on any non-ignored
 advisory.
 
 | Crate | Used by | Advisory | Status |
 |---|---|---|---|
 | `registry 1.3` | `winfsp_wrs_sys` (transitive) -> `luksbox-mount` on Windows | RUSTSEC-2025-0026 (unmaintained) | **Windows runtime only.** Required for the `mount` subcommand on Windows via WinFsp. Non-Windows builds (Linux + macOS) do not link this chain. The `registry` crate is archived; the recommended replacement is `windows-registry`. `winfsp_wrs 0.4.1` (Jan 2026) is the latest published version and has not migrated yet (https://github.com/Scille/winfsp_wrs). When it does we drop this ignore. |
+
+A near miss worth recording: **quick-xml 0.39** (RUSTSEC-2026-0194 /
+RUSTSEC-2026-0195, DoS pair fixed in >= 0.41.0) is pulled in solely by
+the `wayland-scanner` proc macro, whose latest release pins
+`quick-xml ^0.39`. Rather than ignore the advisories (the code runs at
+compile time only and never ships in a binary, but a standing ignore
+rots), we build against a pinned commit on our fork:
+https://github.com/PentHertz/wayland-rs, which carries the exact
+wayland-scanner 0.31.10 release source plus the requirement bump to
+0.41 and upstream master's one-line API fix. The rationale lives in
+the `[patch.crates-io]` comment in `Cargo.toml`. Removal condition:
+drop the patch when upstream releases with quick-xml >= 0.41.
 
 #### Recently retired
 
@@ -679,8 +692,8 @@ risk first.
    attack against a long-lived `luksbox-gui` process.
 
 4. **Multi-vendor FIDO2 hardware testing.** Largely addressed
-   (2026-07-03): four vendors verified on real hardware — Yubico
-   YubiKey 5, SoloKeys Solo 4.1.5, Nitrokey 3, and Google Titan v2 —
+   (2026-07-03): four vendors verified on real hardware (Yubico
+   YubiKey 5, SoloKeys Solo 4.1.5, Nitrokey 3, and Google Titan v2),
    spanning cred_id sizes 64-288 B (the Titan's 288 B also exercised
    the fused SEP+FIDO2 slot budget). Vendor firmware quirks are
    exactly what pure-mock tests can't catch; the round-2 cred_id

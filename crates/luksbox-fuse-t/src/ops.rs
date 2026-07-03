@@ -6,7 +6,7 @@
 //! The strategy is the standard libfuse pattern: build a `struct
 //! fuse_operations` of `extern "C"` trampolines, hand it to
 //! `fuse_main_real` together with a `user_data` pointer to a boxed
-//! `dyn Filesystem`, then let libfuse drive the kernel↔userspace
+//! `dyn Filesystem`, then let libfuse drive the kernel/userspace
 //! event loop. Each trampoline does:
 //!
 //! 1. `fuse_get_context()->private_data` -> &dyn Filesystem

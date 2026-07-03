@@ -89,7 +89,7 @@ uses a **fundamentally different transport**:
 | Concern | macFUSE | FUSE-T |
 |---|---|---|
 | Kernel component | Kext (`io.macfuse.filesystems.macfuse`) loaded at install time | None - uses macOS's built-in NFS client |
-| Userspace ↔ kernel transport | Custom `/dev/macfuseN` character device | NFS-over-loopback (mountd, lockd, ...) |
+| Userspace/kernel transport | Custom `/dev/macfuseN` character device | NFS-over-loopback (mountd, lockd, ...) |
 | Mount syscall | `mount("macfuse", ...)` against the kext | `mount("nfs", ...)` against `localhost:port` |
 | libfuse ABI version | libfuse2 (`fuse.h` from libfuse 2.x) | libfuse3 (`fuse.h` from libfuse 3.x) |
 

@@ -5097,7 +5097,7 @@ fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) ->
     // On any failure roll back so the on-disk vault is unchanged.
     let sidecar = hybrid_sidecar::sidecar_path(path);
     let mut entries = if sidecar.exists() {
-        match hybrid_sidecar::read(&sidecar) {
+        match hybrid_sidecar::read_verified(&sidecar, c.header_salt()) {
             Ok(e) => e,
             Err(e) => {
                 let _ = c.revoke_slot(idx);
@@ -5113,7 +5113,7 @@ fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) ->
         pubkey: pk,
         ciphertext: ct,
     });
-    if let Err(e) = hybrid_sidecar::write(&sidecar, &entries) {
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
         let _ = c.revoke_slot(idx);
         return Err(format!("write hybrid sidecar: {e}").into());
     }
@@ -5129,7 +5129,7 @@ fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) ->
         if entries.is_empty() {
             let _ = std::fs::remove_file(&sidecar);
         } else {
-            let _ = hybrid_sidecar::write(&sidecar, &entries);
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
         }
         return Err(format!("write kyber seed: {e}").into());
     }
@@ -5140,7 +5140,7 @@ fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) ->
         if entries.is_empty() {
             let _ = std::fs::remove_file(&sidecar);
         } else {
-            let _ = hybrid_sidecar::write(&sidecar, &entries);
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
         }
         let _ = std::fs::remove_file(kyber_path);
         return Err(format!("persist header: {e}").into());
@@ -5239,7 +5239,7 @@ fn cmd_enroll_hybrid_pq_sep(path: &Path, unlock: &UnlockArgs, kem_size: u16) -> 
     // On any failure roll back so the on-disk vault is unchanged.
     let sidecar = hybrid_sidecar::sidecar_path(path);
     let mut entries = if sidecar.exists() {
-        match hybrid_sidecar::read(&sidecar) {
+        match hybrid_sidecar::read_verified(&sidecar, c.header_salt()) {
             Ok(e) => e,
             Err(e) => {
                 let _ = c.revoke_slot(idx);
@@ -5255,7 +5255,7 @@ fn cmd_enroll_hybrid_pq_sep(path: &Path, unlock: &UnlockArgs, kem_size: u16) -> 
         pubkey: pk,
         ciphertext: ct,
     });
-    if let Err(e) = hybrid_sidecar::write(&sidecar, &entries) {
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
         let _ = c.revoke_slot(idx);
         return Err(format!("write hybrid sidecar: {e}").into());
     }
@@ -5271,7 +5271,7 @@ fn cmd_enroll_hybrid_pq_sep(path: &Path, unlock: &UnlockArgs, kem_size: u16) -> 
         if entries.is_empty() {
             let _ = std::fs::remove_file(&sidecar);
         } else {
-            let _ = hybrid_sidecar::write(&sidecar, &entries);
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
         }
         return Err(format!("write kyber seed: {e}").into());
     }
@@ -5282,7 +5282,7 @@ fn cmd_enroll_hybrid_pq_sep(path: &Path, unlock: &UnlockArgs, kem_size: u16) -> 
         if entries.is_empty() {
             let _ = std::fs::remove_file(&sidecar);
         } else {
-            let _ = hybrid_sidecar::write(&sidecar, &entries);
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
         }
         let _ = std::fs::remove_file(kyber_path);
         return Err(format!("persist header: {e}").into());
@@ -5497,7 +5497,7 @@ fn cmd_enroll_sep_fused(
     let seed_pw = seed_pw.expect("hybrid kind implies a collected seed-file passphrase");
     let sidecar = hybrid_sidecar::sidecar_path(path);
     let mut entries = if sidecar.exists() {
-        match hybrid_sidecar::read(&sidecar) {
+        match hybrid_sidecar::read_verified(&sidecar, c.header_salt()) {
             Ok(e) => e,
             Err(e) => {
                 let _ = c.revoke_slot(idx);
@@ -5513,7 +5513,7 @@ fn cmd_enroll_sep_fused(
         pubkey: pk,
         ciphertext: ct,
     });
-    if let Err(e) = hybrid_sidecar::write(&sidecar, &entries) {
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
         let _ = c.revoke_slot(idx);
         return Err(format!("write hybrid sidecar: {e}").into());
     }
@@ -5528,7 +5528,7 @@ fn cmd_enroll_sep_fused(
         if entries.is_empty() {
             let _ = std::fs::remove_file(&sidecar);
         } else {
-            let _ = hybrid_sidecar::write(&sidecar, &entries);
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
         }
         return Err(format!("write kyber seed: {e}").into());
     }
@@ -5538,7 +5538,7 @@ fn cmd_enroll_sep_fused(
         if entries.is_empty() {
             let _ = std::fs::remove_file(&sidecar);
         } else {
-            let _ = hybrid_sidecar::write(&sidecar, &entries);
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
         }
         let _ = std::fs::remove_file(kyber_path);
         return Err(format!("persist header: {e}").into());
@@ -5689,7 +5689,7 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
 
     let sidecar = hybrid_sidecar::sidecar_path(path);
     let mut entries = if sidecar.exists() {
-        match hybrid_sidecar::read(&sidecar) {
+        match hybrid_sidecar::read_verified(&sidecar, c.header_salt()) {
             Ok(e) => e,
             Err(e) => {
                 let _ = c.revoke_slot(idx);
@@ -5705,7 +5705,7 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
         pubkey: pk,
         ciphertext: ct,
     });
-    if let Err(e) = hybrid_sidecar::write(&sidecar, &entries) {
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
         let _ = c.revoke_slot(idx);
         return Err(format!("write hybrid sidecar: {e}").into());
     }
@@ -5721,7 +5721,7 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
         if entries.is_empty() {
             let _ = std::fs::remove_file(&sidecar);
         } else {
-            let _ = hybrid_sidecar::write(&sidecar, &entries);
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
         }
         return Err(format!("write kyber seed: {e}").into());
     }
@@ -5732,7 +5732,7 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
         if entries.is_empty() {
             let _ = std::fs::remove_file(&sidecar);
         } else {
-            let _ = hybrid_sidecar::write(&sidecar, &entries);
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
         }
         let _ = std::fs::remove_file(kyber_path);
         return Err(format!("persist header: {e}").into());
@@ -7073,6 +7073,11 @@ fn cli_create_pq_sep_deniable_v2(
         path, None, cipher, 0, 0, &cred, &material,
     )?;
     let sidecar = hybrid_sidecar::sidecar_path(path);
+    // Deniable vaults keep the unbound v2 sidecar: the deniable
+    // envelope has no parseable plaintext header for read_for_vault
+    // to peek, deniable readers use `read` (which ignores bindings),
+    // and a binding would hard-link the sidecar to the vault. See
+    // the `hybrid_sidecar::write` docs.
     hybrid_sidecar::write(
         &sidecar,
         &[HybridEntry {
@@ -7143,6 +7148,11 @@ fn cli_create_pq_sep_fido2_deniable_v2(
         path, None, cipher, 0, 0, &cred, &material,
     )?;
     let sidecar = hybrid_sidecar::sidecar_path(path);
+    // Deniable vaults keep the unbound v2 sidecar: the deniable
+    // envelope has no parseable plaintext header for read_for_vault
+    // to peek, deniable readers use `read` (which ignores bindings),
+    // and a binding would hard-link the sidecar to the vault. See
+    // the `hybrid_sidecar::write` docs.
     hybrid_sidecar::write(
         &sidecar,
         &[HybridEntry {
@@ -7749,6 +7759,11 @@ fn cli_create_pq_passphrase_deniable_v2(
         &cred,
         &DeniableMaterial::passphrase_only(),
     )?;
+    // Deniable vaults keep the unbound v2 sidecar: the deniable
+    // envelope has no parseable plaintext header for read_for_vault
+    // to peek, deniable readers use `read` (which ignores bindings),
+    // and a binding would hard-link the sidecar to the vault. See
+    // the `hybrid_sidecar::write` docs.
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -7821,6 +7836,11 @@ fn cli_create_pq_fido2_deniable_v2(
     let cont = luksbox_format::Container::create_with_credential_v2_deniable(
         path, None, cipher, 0, 0, &cred, &material,
     )?;
+    // Deniable vaults keep the unbound v2 sidecar: the deniable
+    // envelope has no parseable plaintext header for read_for_vault
+    // to peek, deniable readers use `read` (which ignores bindings),
+    // and a binding would hard-link the sidecar to the vault. See
+    // the `hybrid_sidecar::write` docs.
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -7970,6 +7990,11 @@ fn cli_create_pq_tpm_deniable_v2(
     let cont = luksbox_format::Container::create_with_credential_v2_deniable(
         path, None, cipher, 0, 0, &cred, &material,
     )?;
+    // Deniable vaults keep the unbound v2 sidecar: the deniable
+    // envelope has no parseable plaintext header for read_for_vault
+    // to peek, deniable readers use `read` (which ignores bindings),
+    // and a binding would hard-link the sidecar to the vault. See
+    // the `hybrid_sidecar::write` docs.
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -8044,6 +8069,11 @@ fn cli_create_pq_tpm_fido2_deniable_v2(
     let cont = luksbox_format::Container::create_with_credential_v2_deniable(
         path, None, cipher, 0, 0, &cred, &material,
     )?;
+    // Deniable vaults keep the unbound v2 sidecar: the deniable
+    // envelope has no parseable plaintext header for read_for_vault
+    // to peek, deniable readers use `read` (which ignores bindings),
+    // and a binding would hard-link the sidecar to the vault. See
+    // the `hybrid_sidecar::write` docs.
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {

@@ -12,7 +12,8 @@
 # Strategy
 # --------
 # Default: plain `rustup target add <triple>` + the matching linker /
-# C toolchain. No Docker, no `cross`. Works for Linux ↔ Linux ↔ Windows.
+# C toolchain. No Docker, no `cross`. Works for Linux to Linux and
+# Linux to Windows.
 # macOS targets still need a real Mac (Apple SDK is not redistributable).
 #
 # Per-target host prereqs on a Debian/Ubuntu Linux build host:

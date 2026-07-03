@@ -99,7 +99,7 @@ fn main() {
         .probe("libfido2")
     {
         // pkg-config path. Minimum 1.10, matches Debian Bullseye's
-        // package; every symbol we call is ≥ 1.4 so this is conservative.
+        // package; every symbol we call exists since 1.4 so this is conservative.
         println!("cargo:rustc-env=LUKSBOX_LIBFIDO2_VERSION={}", lib.version);
         lib.include_paths
     } else if let Ok(lib) = vcpkg::find_package("libfido2") {

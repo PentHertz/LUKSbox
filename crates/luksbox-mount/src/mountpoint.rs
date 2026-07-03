@@ -13,12 +13,12 @@
 //!
 //! The two protections:
 //!
-//! 1. **`O_DIRECTORY | O_NOFOLLOW` probe** — the kernel refuses
+//! 1. **`O_DIRECTORY | O_NOFOLLOW` probe**: the kernel refuses
 //!    (`ELOOP`) if the final mountpoint component is a symlink, closing
 //!    the "swap the mountpoint for a symlink to a sensitive path"
 //!    vector. The probed `(dev, ino)` is captured.
 //! 2. **`reverify_mountpoint` re-probe immediately before the mount
-//!    syscall** (R12-08) — refuses if the inode changed since the
+//!    syscall** (R12-08): refuses if the inode changed since the
 //!    initial probe, closing the narrow window between probe and mount.
 //!    For the daemonized FUSE path this runs inside the forked child,
 //!    right before `fuser::mount2`, which is tighter than the CLI's old
@@ -139,7 +139,7 @@ pub(crate) fn harden_mountpoint(mountpoint: &Path) -> std::io::Result<(u64, u64)
 
 /// Re-probe the mountpoint inode immediately before the mount syscall
 /// and refuse if it changed since `harden_mountpoint` captured it
-/// (R12-08). Call this as close to the syscall as possible — for the
+/// (R12-08). Call this as close to the syscall as possible; for the
 /// daemonized FUSE path that means inside the forked child.
 #[cfg(unix)]
 pub(crate) fn reverify_mountpoint(mountpoint: &Path, expected: (u64, u64)) -> std::io::Result<()> {

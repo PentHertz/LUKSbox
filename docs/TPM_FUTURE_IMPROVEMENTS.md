@@ -175,7 +175,7 @@ required, despite the misconception.
 > path needs **no** Apple Developer enrollment and **no**
 > `keychain-access-groups` entitlement, so the "blocked on enrollment"
 > note below is wrong for the shipped design. The design doc also
-> resolves storage to a `.lbx.sep` sidecar (the SEP blob is 353–496 B
+> resolves storage to a `.lbx.sep` sidecar (the SEP blob is 353-496 B
 > and does not fit the 352 B inline keyslot region). The notes below are
 > kept for historical context.
 

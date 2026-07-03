@@ -41,9 +41,9 @@ use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
     aead::{Aead, Payload},
 };
-use argon2::Argon2;
+use argon2::{Argon2, Block};
 use rand_core::{OsRng, RngCore};
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{Error, SEED_LEN};
 
@@ -295,15 +295,19 @@ pub fn read(path: &Path, passphrase: &[u8]) -> Result<Zeroizing<[u8; SEED_LEN]>,
     let cipher = Aes256Gcm::new_from_slice(&*kek)
         .map_err(|e| Error::SeedFile(format!("AES-GCM init: {e}")))?;
     let nonce = Nonce::from_slice(&nonce_bytes);
-    let pt = cipher
-        .decrypt(nonce, Payload { msg: ct, aad: &aad })
-        .map_err(|_| {
-            Error::SeedFile(
-                "decryption failed, wrong passphrase, or the file has been \
-                 tampered with"
-                    .into(),
-            )
-        })?;
+    // Wrap the decrypted seed immediately: the old code held it in a
+    // plain `Vec`, copied it out, and dropped the plaintext uncleared.
+    let pt = Zeroizing::new(
+        cipher
+            .decrypt(nonce, Payload { msg: ct, aad: &aad })
+            .map_err(|_| {
+                Error::SeedFile(
+                    "decryption failed, wrong passphrase, or the file has been \
+                     tampered with"
+                        .into(),
+                )
+            })?,
+    );
     if pt.len() != SEED_LEN {
         return Err(Error::SeedFile(format!(
             "decrypted seed has wrong length: got {}, expected {}",
@@ -311,9 +315,9 @@ pub fn read(path: &Path, passphrase: &[u8]) -> Result<Zeroizing<[u8; SEED_LEN]>,
             SEED_LEN
         )));
     }
-    let mut seed = [0u8; SEED_LEN];
-    seed.copy_from_slice(&pt);
-    Ok(Zeroizing::new(seed))
+    let mut seed = Zeroizing::new([0u8; SEED_LEN]);
+    seed.copy_from_slice(&pt[..]);
+    Ok(seed)
 }
 
 fn derive_kek(
@@ -321,22 +325,53 @@ fn derive_kek(
     salt: &[u8],
     kdf: &KdfParams,
 ) -> Result<Zeroizing<[u8; 32]>, Error> {
-    let argon2 = Argon2::new(
-        argon2::Algorithm::Argon2id,
-        argon2::Version::V0x13,
-        argon2::Params::new(
-            kdf.m_cost_kib,
-            kdf.t_cost as u32,
-            kdf.p_cost as u32,
-            Some(32),
-        )
-        .map_err(|e| Error::SeedFile(format!("Argon2id params: {e}")))?,
-    );
-    let mut kek = [0u8; 32];
-    argon2
-        .hash_password_into(passphrase, salt, &mut kek)
-        .map_err(|e| Error::SeedFile(format!("Argon2id: {e}")))?;
-    Ok(Zeroizing::new(kek))
+    let params = argon2::Params::new(
+        kdf.m_cost_kib,
+        kdf.t_cost as u32,
+        kdf.p_cost as u32,
+        Some(32),
+    )
+    .map_err(|e| Error::SeedFile(format!("Argon2id params: {e}")))?;
+    // Number of 1 KiB scratch blocks Argon2id needs for these params.
+    // Capture it before `params` is moved into `Argon2::new`.
+    let block_count = params.block_count();
+    let argon2 = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params);
+    // Hash straight into a `Zeroizing` buffer so the KEK never sits in
+    // a plain stack array (the old code hashed into `[u8; 32]` and
+    // wrapped it afterwards, leaving the original stack copy behind).
+    let mut kek = Zeroizing::new([0u8; 32]);
+
+    // Allocate Argon2id's working memory ourselves with a *fallible*
+    // reservation instead of letting `hash_password_into` allocate it
+    // via an infallible `Vec`, mirroring `luksbox_core::kdf::derive_kek`.
+    // The on-disk params are capped at 512 MiB above, but on a
+    // memory-starved host (small VM, tight cgroup, QubesOS AppVM) even
+    // a legitimate 256 MiB preset can fail; the infallible path hits
+    // `handle_alloc_error` and *aborts the whole process*, while this
+    // returns a clean error the CLI/GUI can render and recover from.
+    let mut memory: Vec<Block> = Vec::new();
+    memory.try_reserve_exact(block_count).map_err(|_| {
+        Error::SeedFile(format!(
+            "not enough free memory for Argon2id ({} MiB needed to \
+             unlock this .kyber file); close other applications or \
+             grant this machine more RAM",
+            block_count / 1024
+        ))
+    })?;
+    memory.resize(block_count, Block::new());
+
+    let result =
+        argon2.hash_password_into_with_memory(passphrase, salt, kek.as_mut_slice(), &mut memory);
+
+    // Scrub Argon2id's working memory before it is freed: those blocks
+    // hold password-derived intermediate state, and the argon2 crate
+    // never wipes the buffer itself (`Block` has no `Drop`).
+    for blk in memory.iter_mut() {
+        blk.zeroize();
+    }
+
+    result.map_err(|e| Error::SeedFile(format!("Argon2id: {e}")))?;
+    Ok(kek)
 }
 
 /// AAD bound to the on-disk parameters so that an attacker who can

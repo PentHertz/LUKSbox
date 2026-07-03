@@ -156,7 +156,7 @@ fn reopen_vfs(vault: &Path) -> Vfs {
 /// process race each other: an `umount` can land between another
 /// test's mount-registration steps ("not currently mounted" while
 /// the mount table lists it), leaving zombie kernel mounts whose
-/// session thread never exits — observed as
+/// session thread never exits, observed as
 /// `three_mount_unmount_cycles_in_one_process` hanging forever on
 /// `join()` while 3 dead mounts sat in the mount table. Every test
 /// takes this lock so kernel mount ops never overlap; each test is

@@ -14,6 +14,90 @@ canonical record.
 
 ---
 
+## [v0.4.0-rc.3] - 2026-07-03
+
+Third release candidate for the v0.4.0 line, focused on hardening.
+Everything here comes out of the late-June audit passes: sidecar
+binding drift, mountpoint safety in the non-CLI frontends, the GUI
+panic action, the post-quantum seed-file unlock path, and two
+dependency advisories.
+
+### Security: hybrid PQ sidecars are vault-bound on every non-deniable path
+
+The v3 sidecar format (a 32-byte `header_salt` binding, readable by
+every LUKSbox release since v0.1.0) existed, but most production
+writers still emitted unbound v2 sidecars and several readers ignored
+the binding, so swapping a `.kyber` sidecar between vaults surfaced as
+a confusing AEAD failure instead of a clear refusal. All non-deniable
+create and enroll paths (CLI, TUI wizard, GUI) now write the binding,
+enroll-time reads verify it before appending new entries (so an enroll
+against a swapped-in foreign sidecar is refused rather than re-blessed
+under a fresh valid binding), and the last five unlock readers that
+ignored the binding now verify it. Deniable vaults deliberately keep
+the unbound v2 format: the deniable envelope has no parseable
+plaintext header to bind against, and a binding would hard-link the
+sidecar to the vault for anyone holding both files.
+
+### Security: mountpoint hardening now covers the TUI and GUI, not just the CLI
+
+The `O_DIRECTORY | O_NOFOLLOW` symlink probe and the inode re-probe
+immediately before the mount syscall (R12-08) used to live inside the
+CLI's `mount` subcommand, so TUI-wizard mounts and the GUI's
+in-process mounts ran without them. The guard moved into a shared
+`luksbox-mount` module one layer below every frontend, so all Unix
+mount entry points now inherit both protections, including inside the
+forked child on the daemonized FUSE path. Found in an external audit
+pass by Garry Jean-Baptiste (2026-06-19).
+
+### Security: the GUI panic action now destroys crash-recovery sidecars
+
+`panic` overwrote the vault header but left the `header-bak` and
+`meta-bak` crash-recovery sidecars intact, which made the whole
+destruction reversible by anyone who noticed them. The panic path now
+destroys the recovery sidecars along with the header, and removing a
+vault from the GUI also cleans up its side files instead of leaving
+them behind.
+
+### Security: `.kyber` seed-file unlock hardened (fallible KDF memory, zeroized intermediates)
+
+The seed-file KDF used Argon2's internally allocating API, so a
+memory-starved host (small VM, tight cgroup, QubesOS AppVM) aborted
+the whole process instead of reporting an error, and the unlock path
+left secret intermediates uncleared. The path now mirrors the core
+KDF: the Argon2 block buffer is reserved fallibly with a clean error
+on OOM, the KEK is derived straight into zeroizing storage, working
+memory is zeroized on both success and error paths, and the decrypted
+seed is zeroized after use. Enrollment also refuses an empty seed
+passphrase instead of silently encrypting under one.
+
+### Security: quick-xml advisories eliminated from the dependency graph
+
+`cargo audit` flagged quick-xml 0.39.3 (RUSTSEC-2026-0194,
+RUSTSEC-2026-0195, both DoS-class, fixed in 0.41.0). Its only importer
+is the `wayland-scanner` proc macro, whose latest release pins the
+vulnerable line, so the importer is vendored in
+`third_party/wayland-scanner/` with a two-line patch (the quick-xml
+requirement and upstream's own API rename). quick-xml runs at compile
+time only and is never linked into shipped binaries, but the lockfile
+now carries 0.41.0 and the audit gate passes with no quick-xml
+ignores. Also updated `anyhow` (RUSTSEC-2026-0190) and `memmap2`
+(RUSTSEC-2026-0186), and moved the audit ignore file to
+`.cargo/audit.toml`, where cargo-audit actually reads it; the old
+root-level location was silently unused.
+
+### Fixed: macOS SEP follow-through and GUI polish
+
+Remaining gaps from the rc.1 Secure Enclave work: SEP support fixes
+with updated design notes in `docs/SEP_KEYSLOT_DESIGN.md`, FUSE and
+FUSE-T mount fixes, a clearer FIDO2 touch prompt in the GUI, continued
+TUI/CLI/GUI option alignment, and expanded mount-safety and functional
+test coverage. `SECURITY.md` and `TESTING.md` updated to match.
+
+## [v0.4.0-rc.2] - 2026-06-19
+
+Small alignment release: TUI and CLI option wiring brought in line
+with the GUI, plus formatting. No on-disk format changes.
+
 ## [v0.4.0-rc.1] - 2026-06-18
 
 Release candidate for the v0.4.0 line. Headline feature: macOS Secure

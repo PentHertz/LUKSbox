@@ -1,13 +1,13 @@
-# macOS Secure Enclave keyslot — design
+# macOS Secure Enclave keyslot design
 
 Status: design, 2026-06-18. Supersedes the SEP notes in
 `docs/TPM_FUTURE_IMPROVEMENTS.md` §2 (which assumed this was blocked on
-Apple Developer enrollment — see "Signing" below; it is not, for the
+Apple Developer enrollment. See "Signing" below; it is not, for the
 shipped design).
 
 This document specifies a Secure Enclave (SEP) keyslot for macOS, the
 analog of the Linux TPM 2.0 keyslots (`SlotKind::Tpm2Sealed`,
-`HybridPqKemTpm2`, …). It folds in empirical findings from two spikes
+`HybridPqKemTpm2`, ...). It folds in empirical findings from two spikes
 run on an Apple M2 with **zero codesigning identities**.
 
 ---
@@ -28,11 +28,11 @@ run on an Apple M2 with **zero codesigning identities**.
   header-size or data-offset change, and the region is already covered
   by the header HMAC. It does *not* fit in the 512-byte keyslot (see
   §4). The `.lbx.hybrid` sidecar is still used for the ML-KEM material
-  of the hybrid SEP kinds (large, public, regenerable — unchanged).
+  of the hybrid SEP kinds (large, public, regenerable, unchanged).
 - New honest `SlotKind` variants (`SepSealed`, `HybridPqKemSep`,
   `HybridPqKem1024Sep`, plus the fused-FIDO2 and biometric forms),
   not reused `Tpm2*` kinds.
-- The format-layer unlock math is **reused unchanged** — a SEP-backed
+- The format-layer unlock math is **reused unchanged**: a SEP-backed
   `unseal` closure feeds the existing `UnlockMaterial::Tpm2` /
   `HybridPqTpm2` derivation. Only kind-byte guards and the sidecar
   plumbing are new.
@@ -49,11 +49,11 @@ the distribution form, not a requirement for biometric.
 
 ## 2. Why SEP is not "TPM with a different name"
 
-The TPM exposes a generic *seal arbitrary bytes → unseal* primitive
+The TPM exposes a generic *seal/unseal arbitrary bytes* primitive
 (`TPM2_Create` / `TPM2_Unseal`). **The Secure Enclave has no such
 primitive.** Its only building block (via `SecKey` / CryptoKit) is a
 **non-extractable P-256 key whose private half never leaves the SEP**.
-From that you get ECDH, ECDSA, and ECIES — no RSA, no SEP-resident
+From that you get ECDH, ECDSA, and ECIES: no RSA, no SEP-resident
 symmetric keys, no "store these 32 bytes."
 
 So "seal a KEK" becomes "**derive** a KEK from an ECDH agreement
@@ -87,7 +87,7 @@ mvk     = unwrap(kek, slot.wrapped_ct, slot.wrapped_tag)
 ```
 
 `init(dataRepresentation:)` succeeds **only on the originating
-enclave**; any other machine gets an error → that slot is skipped, the
+enclave**; any other machine gets an error and that slot is skipped, the
 same per-slot tolerance the TPM closure arms already have.
 
 ---
@@ -100,23 +100,24 @@ ad-hoc/linker signature (`TeamIdentifier=not set`).
 
 | Question | Result |
 |---|---|
-| SEP key-gen + ECIES wrap/unwrap of 32 B (no entitlement)? | ✅ works |
-| Persist + reload across **separate processes** via `dataRepresentation`? | ✅ seal in proc A → blob → unseal in fresh proc B |
+| SEP key-gen + ECIES wrap/unwrap of 32 B (no entitlement)? | works |
+| Persist + reload across **separate processes** via `dataRepresentation`? | works: seal in proc A, persist the blob, unseal in fresh proc B |
 | Plain SEP `dataRepresentation` size | **284 B** |
 | Biometric-gated SEP `dataRepresentation` size | **427 B** |
 | Derive-mode blob (plain): `2+284 + 2+65` | **353 B** |
 | Wrap-mode blob (plain): `+ AES-GCM box` | 415 B |
 | Biometric derive-mode blob | **496 B** |
-| Biometric unseal from a **bare CLI binary** | ❌ `LAError -4` "System authentication is running" / cancelled — a non-bundled CLI process can't own the LocalAuthentication UI |
+| Biometric unseal from a **bare CLI binary** | fails: `LAError -4` "System authentication is running" / cancelled; a non-bundled CLI process can't own the LocalAuthentication UI |
 | Reboot survival | **staged, not yet confirmed**: `~/.luksbox-sep-reboot-test/RUN_AFTER_REBOOT.sh` |
 
 Takeaways that shaped the design:
-1. The dataRepresentation path is **entitlement-free** → buildable and
-   testable now; the roadmap's "blocked on Apple enrollment" was wrong
+1. The dataRepresentation path is **entitlement-free**, so it is
+   buildable and testable now; the roadmap's "blocked on Apple enrollment" was wrong
    for this design.
-2. **Every realistic SEP blob ≥ 353 B**, and biometric is 496 B — they
-   do not fit the 352-byte inline keyslot region (§4). → in-header region.
-3. **Biometric needs an *interactive* session** (CLI, TUI, or GUI) —
+2. **Every realistic SEP blob is at least 353 B**, and biometric is
+   496 B: they do not fit the 352-byte inline keyslot region (§4),
+   hence the in-header region.
+3. **Biometric needs an *interactive* session** (CLI, TUI, or GUI),
    not a paid identity or a bundle. Only a detached/background/headless
    process can't present the auth UI. See §7.
 
@@ -125,29 +126,30 @@ Takeaways that shaped the design:
 ## 4. Storage: the in-header SEP region (V5), no external file
 
 **Decided: store the SEP material inside the `.lbx` header itself**, in
-the bytes that are otherwise random padding — *not* in the 512-byte
+the bytes that are otherwise random padding: *not* in the 512-byte
 keyslot, and *not* in a separate `.lbx.sep` file.
 
 Why not the keyslot: it is a fixed `SLOT_SIZE = 512` B record
 (`keyslot.rs:102`) with a 352 B variable region (`FIDO2_CRED_ID_MAX`,
-`keyslot.rs:115`). The plain SEP blob is 353 B and biometric is 496 B —
+`keyslot.rs:115`). The plain SEP blob is 353 B and biometric is 496 B;
 both overflow. Enlarging `SLOT_SIZE` would resize the entire keyslot
 array and shift header geometry: a major break.
 
 Why the header works: the 8 KiB header (`HEADER_SIZE = 8192`) packs 8
 keyslots ending at offset **4192** (`OFF_KEYSLOTS + 8*512`), with the
 HMAC at **8160**. The **~3968 B between them** is currently just
-RNG-filled padding — and it is **already inside the HMAC-authenticated
+RNG-filled padding, and it is **already inside the HMAC-authenticated
 range** (`compute_hmac` over `buf[..OFF_HMAC]`). We repurpose that gap
 as a structured SEP region:
 
 - No header-size change, no `metadata_offset` / `data_offset` shift
-  (those are stored fields, read on every open → old vaults untouched).
+  (those are stored fields, read on every open, so old vaults are
+  untouched).
 - Tamper protection is free: editing the region or flipping the flag
   fails `verify_hmac`.
-- Backward compatible like V1→V2: gated by **`FLAG_HAS_SEP_REGION`**
-  (bit 4 of `Header::flags`). Old vaults don't set it → byte-identical,
-  no region. A vault that sets it also carries SEP-kind keyslots that
+- Backward compatible like the V1 to V2 transition: gated by
+  **`FLAG_HAS_SEP_REGION`** (bit 4 of `Header::flags`). Old vaults
+  don't set it and stay byte-identical, no region. A vault that sets it also carries SEP-kind keyslots that
   pre-SEP binaries already can't open, so there's no silent-misread risk.
 
 ### In-header SEP region format (`header.rs`)
@@ -165,8 +167,8 @@ per slot:
 trailing bytes stay random
 ```
 
-Capacity is `SEP_REGION_LEN` ≈ **3968 B** = ≥8 plain or ~7 biometric
-SEP slots. `Header::set_sep_blob` rejects an overflowing blob with
+Capacity is `SEP_REGION_LEN`, about **3968 B**: at least 8 plain or
+about 7 biometric SEP slots. `Header::set_sep_blob` rejects an overflowing blob with
 `Error::SepRegionFull` (no silent truncation); `parse_sep_region`
 rejects a malformed table (bad count, length overrun, out-of-range or
 duplicate `slot_idx`) with `Error::InvalidField`, before HMAC
@@ -174,14 +176,14 @@ verification. `revoke_slot` drops the slot's SEP blob and clears the
 flag when none remain.
 
 The FIDO2 cred_id for SEP+FIDO2 kinds still lives in the **keyslot's
-own** 352 B region (it's small) — only the SEP `dataRepresentation` +
+own** 352 B region (it's small); only the SEP `dataRepresentation` +
 ephemeral pubkey go in the header region. The **ML-KEM material** for
 hybrid SEP kinds still uses the existing `.lbx.hybrid` sidecar (large,
-public, regenerable — unchanged); we only avoid introducing a *new*
+public, regenerable, unchanged); we only avoid introducing a *new*
 SEP-specific file.
 
-A wiped/replaced enclave → the SEP blob can't re-derive the KEK → that
-slot is unopenable, and the backup passphrase slot recovers the vault
+A wiped or replaced enclave means the SEP blob can't re-derive the
+KEK: that slot is unopenable, and the backup passphrase slot recovers the vault
 (same recoverability story as TPM, see §8).
 
 ---
@@ -231,7 +233,7 @@ Note the asymmetry vs TPM: SEP `seal` *returns* the KEK (it derives it),
 whereas TPM is handed a random KEK to seal. The container enroll API
 (§6) accommodates this.
 
-- **stub** (non-macOS, or `hardware` off): every method →
+- **stub** (non-macOS, or `hardware` off): every method returns
   `Error::NotCompiledIn`. tss-esapi's macOS build problem has no analog
   here, but we keep the same shape for a uniform call site.
 - **mock** (no feature gate): in-process deterministic ECDH/HKDF over a
@@ -241,8 +243,8 @@ whereas TPM is handed a random KEK to seal. The container enroll API
   `swiftc -emit-library -static` over `swift/SepShim.swift`, emit
   `cargo:rustc-link-lib`, and link `-framework CoreFoundation
   -framework Security -framework LocalAuthentication`. The shim exposes
-  a small `extern "C"` surface (seal → fills caller buffers + returns
-  derived KEK; unseal → returns KEK) so `real.rs` is plain FFI with no
+  a small `extern "C"` surface (seal fills caller buffers and returns
+  the derived KEK; unseal returns the KEK) so `real.rs` is plain FFI with no
   Swift types crossing the boundary.
 
 ### Cargo feature wiring
@@ -267,7 +269,7 @@ luksbox-sep = { path = "../luksbox-sep" }
 Continue the enum past 14. The full implemented matrix covers
 {none, FIDO2, passphrase, FIDO2+passphrase} × {no-PQ, ML-KEM-768,
 ML-KEM-1024}, plus the plain biometric kind (biometric is NOT crossed
-with the fusions — it stays on the base path, mirroring how the TPM
+with the fusions: it stays on the base path, mirroring how the TPM
 family keeps `Tpm2SealedPin` un-crossed with FIDO2/PQ):
 
 ```
@@ -296,7 +298,7 @@ present factors only, in that fixed order.
 
 Update: `SlotKind::from_u8`, the `is_*` predicate groups
 (`is_tpm`-style helpers gain `is_sep`), `Display`. New slots are
-`AAD_VERSION_V4` like everything else — **no new AAD version needed**,
+`AAD_VERSION_V4` like everything else: **no new AAD version needed**,
 because the variable region is empty for SEP slots (the SEP blob lives
 in the sidecar, not bytes `128..480`). This is the key reason the
 sidecar choice keeps the slot-format untouched.
@@ -327,7 +329,7 @@ pub fn enroll_hybrid_pq_sep(&mut self, kek: &[u8;32], pq_shared: &[u8;32], blob:
 ```
 
 These install the keyslot **and** return the `slot_idx` so the caller
-writes the `.lbx.sep` (and, for hybrid, `.lbx.hybrid`) entry — same
+writes the `.lbx.sep` (and, for hybrid, `.lbx.hybrid`) entry, the same
 caller-owns-the-sidecar contract `enroll_hybrid_pq_tpm2` already uses.
 `luksbox-format` stays SEP-agnostic: it receives opaque blob bytes, it
 does not link `luksbox-sep`.
@@ -357,8 +359,8 @@ captured state, exactly as the hybrid caller pre-reads `.lbx.hybrid`.
 SEP key. Seal is non-interactive; unseal triggers Touch ID at
 `sharedSecretFromKeyAgreement`.
 
-**Resolved (2026-06-18, Apple M2, 0 signing identities) — biometric
-works from BOTH the CLI and the GUI:**
+**Resolved (2026-06-18, Apple M2, 0 signing identities): biometric
+works from BOTH the CLI and the GUI.**
 
 - Verified live: `luksbox cat <vault> --sep` on a biometric-only vault
   prompts for Touch ID / passcode in an interactive terminal and
@@ -367,7 +369,7 @@ works from BOTH the CLI and the GUI:**
   process (the original spike was run with `run_in_background`), which
   gets `LAError -4` ("System authentication is running") because there
   is no logged-in session to present the auth sheet. That's a
-  *non-interactive* limitation, **not** a CLI-vs-GUI one — an earlier
+  *non-interactive* limitation, **not** a CLI-vs-GUI one; an earlier
   draft of this doc wrongly concluded the CLI couldn't do biometric.
 - No paid Apple identity or entitlement is needed. On Touch-ID Macs the
   `.userPresence` policy works from an unsigned/ad-hoc binary with no
@@ -382,7 +384,7 @@ So:
 - The bundled GUI is the nicer UX (no terminal) and is what a
   distributed build ships, but it is **not required** for biometric.
 
-### Signing — what actually gates what
+### Signing: what actually gates what
 
 - **SEP crypto + dataRepresentation persistence + biometric unlock**:
   no signing beyond the automatic ad-hoc signature; works from an
@@ -390,10 +392,10 @@ So:
   `NSFaceIDUsageDescription` in an Info.plist.)
 - **Distribution (Gatekeeper/notarization)**: a Developer ID signature
   + notarization is needed only so users can launch a *downloaded*
-  build without the right-click-open dance — orthogonal to SEP
-  functionality. The bundler accepts `--sign "Developer ID …"`.
+  build without the right-click-open dance, which is orthogonal to SEP
+  functionality. The bundler accepts `--sign "Developer ID ..."`.
 - **`keychain-access-groups` entitlement**: only needed if we ever
-  switch to keychain-resident `SecKey` (Approach A). We do **not** —
+  switch to keychain-resident `SecKey` (Approach A). We do **not**:
   the dataRepresentation design avoids it.
 
 ### Build / linking (`luksbox-sep/build.rs`)
@@ -401,11 +403,11 @@ So:
 The CryptoKit shim is compiled to a **static** archive and linked into
 the final binary, so `luksbox-cli` / `luksbox-gui` are self-contained
 (only the OS Swift runtime in `/usr/lib/swift`, present on every macOS
-≥ 10.14.4, is referenced dynamically). `build.rs` emits the `sep_real`
+since 10.14.4, is referenced dynamically). `build.rs` emits the `sep_real`
 cfg only when `target_os = "macos"`, the `hardware` feature is on, AND
 `swiftc` is present; otherwise it warns and compiles the stub. That
 keeps `--features hardware` (which also drives the FIDO2/TPM links)
-buildable everywhere — including macOS cross-builds from Linux via
+buildable everywhere, including macOS cross-builds from Linux via
 osxcross, which have clang but no `swiftc` (SEP ops then return
 `NotCompiledIn` at runtime, exactly like a non-macOS target).
 
@@ -418,10 +420,10 @@ osxcross, which have clang but no `swiftc` (SEP ops then return
   The existing create-flow default (keep a backup passphrase as slot 0)
   and the revoke guard apply unchanged. The wizard/GUI warnings written
   for TPM should be reused verbatim for SEP.
-- **Stolen vault file alone**: useless — the KEK can only be re-derived
+- **Stolen vault file alone**: useless, the KEK can only be re-derived
   on the originating enclave. Brute force against the AEAD is infeasible.
 - **Stolen vault + `.lbx.sep` sidecar, different machine**: still
-  useless — `init(dataRepresentation:)` rejects on a foreign enclave.
+  useless, `init(dataRepresentation:)` rejects on a foreign enclave.
 - **Stolen vault + sidecar + the original Mac, no biometric**: opens
   (the SEP will derive the KEK). This is the SEP analog of the TPM's
   "no PCR, no PIN" baseline. Mitigations: `SepSealedBiometric`
@@ -437,13 +439,13 @@ osxcross, which have clang but no `swiftc` (SEP ops then return
 - **Unit (any platform)**: `SepBlob` / `.lbx.sep` serialization
   round-trip and truncation rejection (like the `SealedBlob` tests in
   `luksbox-tpm/src/lib.rs`).
-- **Mock-backed (Linux CI)**: full enroll → unlock → revoke through
+- **Mock-backed (Linux CI)**: full enroll / unlock / revoke cycle through
   `container.rs` using the software `mock` SEP, plus adversary tests
-  (foreign-enclave reject, sidecar swap reject). No SEP hardware needed
-  — the analog of the swtpm suite.
+  (foreign-enclave reject, sidecar swap reject). No SEP hardware is
+  needed; this is the analog of the swtpm suite.
 - **Real hardware (macOS CI / manual)**: there is **no SEP emulator**
   (unlike swtpm). Needs an Apple-Silicon/T2 runner. Tests: plain seal
-  → fresh-process unseal; the staged **reboot-survival** check
+  then fresh-process unseal; the staged **reboot-survival** check
   (`~/.luksbox-sep-reboot-test/`) promoted into a documented manual
   gate until a self-hosted macOS runner exists.
 - **Biometric**: manual only (requires a human touch); not automatable.
@@ -452,16 +454,16 @@ osxcross, which have clang but no `swiftc` (SEP ops then return
 
 ## 10. Open items / explicitly deferred
 
-1. **Reboot survival** — documented by Apple, not yet confirmed here.
+1. **Reboot survival**: documented by Apple, not yet confirmed here.
    Confirm via the staged script before relying on it.
-2. **Biometric** (`SepSealedBiometric`) — phase 2, needs the signed
+2. **Biometric** (`SepSealedBiometric`): phase 2, needs the signed
    `.app` bundle.
-3. **`dataRepresentation` size drift** — measured 284/427 B today;
+3. **`dataRepresentation` size drift**: measured 284/427 B today;
    the `.lbx.sep` `u16` length field tolerates growth. No fixed
    assumption baked in.
-4. **Fused SEP+FIDO2 hybrid kinds** (19/20) — straightforward once the
+4. **Fused SEP+FIDO2 hybrid kinds** (19/20): straightforward once the
    plain + hybrid-PQ paths land; deferred to keep phase 1 small.
-5. **CLI biometric UX** — likely "unlock via GUI" message; finalize
+5. **CLI biometric UX**: likely "unlock via GUI" message; finalize
    when phase 2 starts.
 6. **SEP in deniable mode: available at CREATE time, never via enroll.**
    The deniable v2 format stores all authenticator material inside a
@@ -493,9 +495,9 @@ osxcross, which have clang but no `swiftc` (SEP ops then return
 Down from the roadmap's ~2 weeks now that the gate is disproven and the
 storage decision is made:
 
-- `luksbox-sep` crate (Swift shim + FFI + stub + mock): ~3–4 days
+- `luksbox-sep` crate (Swift shim + FFI + stub + mock): ~3-4 days
 - `.lbx.sep` sidecar + core/format integration: ~2 days
 - CLI + GUI surface (phase 1, no biometric): ~2 days
 - Tests (mock suite + manual hardware): ~2 days
-- Phase 2 biometric + bundle: ~3–4 days, gated on `APPLE_SIGNING.md`
+- Phase 2 biometric + bundle: ~3-4 days, gated on `APPLE_SIGNING.md`
 ```
