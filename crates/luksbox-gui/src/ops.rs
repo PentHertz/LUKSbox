@@ -28,6 +28,39 @@ fn estr<E: std::fmt::Display>(e: E) -> String {
     e.to_string()
 }
 
+/// Companion files luksbox writes next to a vault by default. Returned
+/// so the GUI's "forget AND delete" flow can offer to clean them up
+/// instead of leaving them orphaned when the `.lbx` is removed:
+///
+/// - `<vault>.header-bak` / `<vault>.meta-bak`: v3 crash-recovery
+///   mirrors, written on every metadata flush.
+/// - `<vault>.hybrid`: the hybrid-PQ sidecar (ML-KEM entries).
+/// - `<vault>.sep`: the Secure Enclave sidecar, when present.
+/// - `<vault>.rotating`: a leftover MVK-rotation tempfile from a
+///   crashed run.
+///
+/// Only paths that actually exist are returned. The detached header
+/// (`.hdr`), rollback anchor, and `.kyber` seed live at user-chosen
+/// paths that can't be derived from the vault path, so they are
+/// intentionally excluded (deleting a guessed path would be wrong).
+pub fn companion_sidecars(vault: &Path) -> Vec<PathBuf> {
+    let with_suffix = |ext: &str| -> PathBuf {
+        let mut s = vault.as_os_str().to_owned();
+        s.push(ext);
+        PathBuf::from(s)
+    };
+    [
+        with_suffix(".header-bak"),
+        with_suffix(".meta-bak"),
+        luksbox_format::hybrid_sidecar::sidecar_path(vault),
+        with_suffix(".sep"),
+        with_suffix(".rotating"),
+    ]
+    .into_iter()
+    .filter(|p| p.is_file())
+    .collect()
+}
+
 pub fn cipher_label(s: CipherSuite) -> &'static str {
     match s {
         CipherSuite::Aes256Gcm => "AES-256-GCM",
@@ -5030,6 +5063,44 @@ mod name_escapes_directory_tests {
         // `:` is a legal POSIX filename byte; the windows-only ADS guard
         // must not reject it on POSIX (existing vaults can contain it).
         assert!(!name_escapes_directory("time-12:30.log"));
+    }
+}
+
+#[cfg(test)]
+mod companion_sidecars_tests {
+    use super::companion_sidecars;
+
+    #[test]
+    fn lists_only_existing_default_companions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("v.lbx");
+        std::fs::write(&vault, b"x").unwrap();
+        // Write three known companions plus an unrelated neighbour.
+        std::fs::write(tmp.path().join("v.lbx.header-bak"), b"h").unwrap();
+        std::fs::write(tmp.path().join("v.lbx.meta-bak"), b"m").unwrap();
+        std::fs::write(tmp.path().join("v.lbx.hybrid"), b"y").unwrap();
+        std::fs::write(tmp.path().join("v.lbx.notes.txt"), b"unrelated").unwrap();
+
+        let found: Vec<String> = companion_sidecars(&vault)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(found.contains(&"v.lbx.header-bak".to_string()));
+        assert!(found.contains(&"v.lbx.meta-bak".to_string()));
+        assert!(found.contains(&"v.lbx.hybrid".to_string()));
+        // The vault itself and unrelated files must not be included.
+        assert!(!found.iter().any(|n| n == "v.lbx"));
+        assert!(!found.iter().any(|n| n.ends_with("notes.txt")));
+        assert_eq!(found.len(), 3);
+    }
+
+    #[test]
+    fn empty_when_no_companions_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("solo.lbx");
+        std::fs::write(&vault, b"x").unwrap();
+        assert!(companion_sidecars(&vault).is_empty());
     }
 }
 

@@ -11035,6 +11035,11 @@ impl LuksboxApp {
             .unwrap_or_else(|| path.display().to_string());
         let display_path = path.display().to_string();
         let file_exists = path.is_file();
+        // Companion files luksbox writes next to the vault (crash-recovery
+        // mirrors, hybrid-PQ / SEP sidecars, a stray rotation tempfile).
+        // Deleting only the .lbx used to orphan these; surface them so the
+        // user can clean them up in the same step.
+        let companions = ops::companion_sidecars(&path);
         let mut do_forget = false;
         let mut do_forget_and_delete = false;
         let mut cancel = false;
@@ -11086,24 +11091,56 @@ impl LuksboxApp {
                     }
                 });
                 ui.add_space(4.0);
-                // Destructive option: only show when the .lbx still
-                // exists on disk. Otherwise the unlink would just fail
-                // and there's nothing to delete.
-                if file_exists {
+                // Let the user know about the companion files luksbox
+                // writes by default so deleting a vault doesn't silently
+                // leave them behind.
+                if !companions.is_empty() {
+                    ui.add_space(6.0);
+                    let intro = if file_exists {
+                        "Deleting the vault will also remove these companion files \
+                         written next to it:"
+                    } else {
+                        "The .lbx file is already gone, but these companion files \
+                         written next to it are still on disk:"
+                    };
+                    ui.label(RichText::new(intro).small().color(theme::DIM));
+                    for c in &companions {
+                        let name = c
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| c.display().to_string());
+                        ui.label(RichText::new(format!("  • {name}")).small().monospace());
+                    }
+                    ui.add_space(6.0);
+                }
+                // Destructive option: offer it when the .lbx still exists,
+                // OR when it's already gone but companion files remain
+                // (the "clean up leftovers" case). Otherwise there is
+                // nothing to delete.
+                if file_exists || !companions.is_empty() {
+                    let (label, hover) = if file_exists {
+                        (
+                            "Forget AND delete the .lbx file + companions (IRREVERSIBLE)",
+                            "Removes from the recent list AND unlinks the .lbx file plus its \
+                             companion files (.header-bak, .meta-bak, .hybrid, ...). There is \
+                             no undo; do this only if you are sure the vault contents are no \
+                             longer needed.",
+                        )
+                    } else {
+                        (
+                            "Forget AND delete the leftover companion files (IRREVERSIBLE)",
+                            "The .lbx is already gone. This removes the entry from the recent \
+                             list AND deletes the orphaned companion files listed above. There \
+                             is no undo.",
+                        )
+                    };
                     ui.vertical_centered(|ui| {
                         if ui
                             .add_sized(
                                 [btn_w, CONTROL_H],
-                                egui::Button::new(
-                                    RichText::new("Forget AND delete the .lbx file (IRREVERSIBLE)")
-                                        .color(theme::DANGER),
-                                ),
+                                egui::Button::new(RichText::new(label).color(theme::DANGER)),
                             )
-                            .on_hover_text(
-                                "Removes from the recent list AND unlinks the .lbx file. \
-                                 There is no undo; do this only if you are sure the vault \
-                                 contents are no longer needed.",
-                            )
+                            .on_hover_text(hover)
                             .clicked()
                         {
                             do_forget_and_delete = true;
@@ -11127,15 +11164,37 @@ impl LuksboxApp {
             self.forget_recent_path(&path);
             self.pending_forget_recent = None;
         } else if do_forget_and_delete {
-            // Unlink first, THEN forget. If unlink fails we still
-            // forget the entry from the recent list (the file is gone
-            // from the user's perspective; the entry would be marked
-            // "missing" on the next render anyway) but surface the
-            // unlink error as a toast so the user knows the file may
-            // still be on disk.
-            match std::fs::remove_file(&path) {
-                Ok(()) => self.toast_warn(format!("deleted {}", path.display())),
-                Err(e) => self.toast_err(format!("could not delete {}: {e}", path.display())),
+            // Unlink the .lbx (if it still exists) and every companion
+            // file, THEN forget. If any unlink fails we still forget the
+            // entry from the recent list (the vault is gone from the
+            // user's perspective; the entry would be marked "missing" on
+            // the next render anyway) but surface the failures as a toast
+            // so the user knows something may still be on disk.
+            let mut deleted = 0usize;
+            let mut errors: Vec<String> = Vec::new();
+            let mut targets: Vec<PathBuf> = Vec::new();
+            if path.is_file() {
+                targets.push(path.clone());
+            }
+            targets.extend(ops::companion_sidecars(&path));
+            for t in &targets {
+                match std::fs::remove_file(t) {
+                    Ok(()) => deleted += 1,
+                    Err(e) => errors.push(format!("{}: {e}", t.display())),
+                }
+            }
+            if errors.is_empty() {
+                self.toast_warn(format!(
+                    "deleted {} file{}",
+                    deleted,
+                    if deleted == 1 { "" } else { "s" }
+                ));
+            } else {
+                self.toast_err(format!(
+                    "deleted {deleted}; {} could not be removed: {}",
+                    errors.len(),
+                    errors.join("; ")
+                ));
             }
             self.forget_recent_path(&path);
             self.pending_forget_recent = None;

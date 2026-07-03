@@ -838,10 +838,14 @@ enum Command {
         unlock: UnlockArgs,
     },
     /// ANTI-FORENSICS PANIC: irreversibly destroy a vault by overwriting
-    /// its header with random bytes. Without the header (or its backup),
-    /// the vault is mathematically unrecoverable, no keyslots to attack,
-    /// no MVK material left. Optionally also overwrites the entire vault
-    /// file. Requires explicit confirmation. There is NO undo.
+    /// its header AND its v3 crash-recovery mirror (`<header>.header-bak`)
+    /// with random bytes. Destroying both is required: with the mirror
+    /// left intact, `open` silently recovers the keyslots from it (and
+    /// self-heals the live header), so the vault would stay openable.
+    /// Afterwards there are no keyslots to attack and no MVK material
+    /// left. `--wipe-data` additionally overwrites the entire vault file
+    /// and the metadata mirror (`<vault>.meta-bak`). Requires explicit
+    /// confirmation. There is NO undo.
     Panic {
         path: PathBuf,
         /// If the vault uses a detached header sidecar, point at it here
@@ -8532,16 +8536,62 @@ fn cmd_panic(
     };
     let len_hint = std::fs::metadata(vault).map(|m| m.len()).unwrap_or(0);
 
+    // v3 crash-recovery sidecars. `panic` MUST destroy the header
+    // mirror too: without it, `Container::open` detects the randomised
+    // live header, transparently recovers the keyslots from
+    // `<header>.header-bak`, and even rewrites (self-heals) the live
+    // header from the mirror on the next open -- so the vault would
+    // stay fully openable and the "no keyslots to attack" guarantee
+    // would be false. The metadata mirror `<vault>.meta-bak` is a full
+    // copy of the encrypted metadata region; it is cryptographically
+    // dead once the keyslots are gone, so like the main metadata region
+    // it is only scrubbed under `--wipe-data`. Open the handles up-front
+    // with the same no-follow semantics and hold them across the
+    // confirmation prompt (same TOCTOU rationale as the header/vault
+    // handles above). A missing sidecar (v2 vault, or one that never got
+    // a mirror) is fine -- skip it.
+    let header_bak_path = sidecar_path(header_target, "header-bak");
+    let meta_bak_path = sidecar_path(vault, "meta-bak");
+    let open_sidecar = |p: &Path| -> Result<Option<std::fs::File>> {
+        match secure_open_existing_no_follow(p) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!(
+                "refusing to open recovery sidecar {} for destructive overwrite: {e}",
+                p.display()
+            )
+            .into()),
+        }
+    };
+    let mut header_bak_opt = open_sidecar(&header_bak_path)?;
+    let mut meta_bak_opt = if wipe_data {
+        open_sidecar(&meta_bak_path)?
+    } else {
+        None
+    };
+
     if !skip_confirm {
         eprintln!(
             "PANIC: about to overwrite the header of {} with random bytes.",
             header_target.display()
         );
+        if header_bak_opt.is_some() {
+            eprintln!(
+                "       ALSO destroying the crash-recovery header mirror {}.",
+                header_bak_path.display()
+            );
+        }
         if wipe_data {
             eprintln!(
                 "       ALSO overwriting the entire vault file ({} bytes).",
                 len_hint
             );
+            if meta_bak_opt.is_some() {
+                eprintln!(
+                    "       ALSO overwriting the metadata mirror {}.",
+                    meta_bak_path.display()
+                );
+            }
         }
         eprintln!("   This is IRREVERSIBLE. There is NO undo. There is NO recovery.");
         let expected = format!("DESTROY {}", vault.display());
@@ -8558,6 +8608,16 @@ fn cmd_panic(
     hf.seek(SeekFrom::Start(0))?;
     hf.write_all(&buf)?;
     hf.flush()?;
+    // Scrub the header mirror in full. This is the load-bearing part of
+    // the fix: leaving it intact makes the whole panic reversible.
+    if let Some(mut hbf) = header_bak_opt.take() {
+        scrub_whole_file(&mut hbf).map_err(|e| {
+            format!(
+                "failed to overwrite recovery sidecar {}: {e}",
+                header_bak_path.display()
+            )
+        })?;
+    }
     if wipe_data {
         // Inline-header case: vf_opt is None, reuse hf for the full
         // wipe. Detached-header case: write through vf_opt which
@@ -8573,9 +8633,46 @@ fn cmd_panic(
             written += n as u64;
         }
         let _ = writer.sync_all();
+        if let Some(mut mbf) = meta_bak_opt.take() {
+            scrub_whole_file(&mut mbf).map_err(|e| {
+                format!(
+                    "failed to overwrite metadata mirror {}: {e}",
+                    meta_bak_path.display()
+                )
+            })?;
+        }
     }
     println!("done.");
     Ok(())
+}
+
+/// Append `.<ext>` to a path's full filename without replacing the
+/// existing extension, matching luksbox-format's sidecar naming:
+/// `vault.lbx` + `"header-bak"` => `vault.lbx.header-bak`.
+fn sidecar_path(base: &Path, ext: &str) -> PathBuf {
+    let mut s = base.as_os_str().to_owned();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
+}
+
+/// Overwrite a file's entire current length with cryptographically
+/// random bytes and fsync. Best-effort anti-forensic scrub used by
+/// `panic` on the crash-recovery sidecars.
+fn scrub_whole_file(f: &mut std::fs::File) -> std::io::Result<()> {
+    use rand_core::{OsRng, RngCore};
+    use std::io::{Seek, SeekFrom, Write};
+    let len = f.metadata()?.len();
+    f.seek(SeekFrom::Start(0))?;
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut written = 0u64;
+    while written < len {
+        OsRng.fill_bytes(&mut chunk);
+        let n = ((len - written) as usize).min(chunk.len());
+        f.write_all(&chunk[..n])?;
+        written += n as u64;
+    }
+    f.sync_all()
 }
 
 #[cfg(test)]

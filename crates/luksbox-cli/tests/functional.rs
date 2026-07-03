@@ -572,18 +572,39 @@ fn rmdir_empty_succeeds_nonempty_fails() {
 
 // ---- panic destruction --------------------------------------------------
 
+fn read_first_bytes(path: &std::path::Path, n: usize) -> Vec<u8> {
+    use std::io::Read;
+    let mut buf = vec![0u8; n];
+    let mut f = std::fs::File::open(path).unwrap();
+    f.read_exact(&mut buf).unwrap();
+    buf
+}
+
 #[test]
 fn panic_destroy_overwrites_header() {
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
     assert_ok(&run(dir, &["create", "v.lbx"]), "create");
-    let header_before = {
-        let mut buf = vec![0u8; 8192];
-        use std::io::Read;
-        let mut f = std::fs::File::open(dir.join("v.lbx")).unwrap();
-        f.read_exact(&mut buf).unwrap();
-        buf
-    };
+    // Store a file so the vault has real metadata + so the v3 recovery
+    // sidecars are populated with a valid mirror to recover from.
+    std::fs::write(dir.join("secret.txt"), b"top secret payload").unwrap();
+    assert_ok(
+        &run(dir, &["put", "v.lbx", "secret.txt", "/secret.txt"]),
+        "put",
+    );
+
+    // Default v3 format writes a header mirror next to the vault. If it
+    // is not there, this test's premise (that panic must destroy it) no
+    // longer holds and we want to know.
+    let header_bak = dir.join("v.lbx.header-bak");
+    assert!(
+        header_bak.exists(),
+        "expected v3 header mirror {} to exist before panic",
+        header_bak.display()
+    );
+
+    let header_before = read_first_bytes(&dir.join("v.lbx"), 8192);
+    let header_bak_before = read_first_bytes(&header_bak, 8192);
 
     // The panic command needs an explicit "DESTROY <path>" confirmation
     // by default; pass -y to auto-accept (per cmd_panic in main.rs).
@@ -592,19 +613,27 @@ fn panic_destroy_overwrites_header() {
     let out = run_with(dir, &env, &["panic", "v.lbx", "-y"]);
     assert_ok(&out, "panic -y");
 
-    let header_after = {
-        let mut buf = vec![0u8; 8192];
-        use std::io::Read;
-        let mut f = std::fs::File::open(dir.join("v.lbx")).unwrap();
-        f.read_exact(&mut buf).unwrap();
-        buf
-    };
     assert_ne!(
-        header_before, header_after,
-        "panic must overwrite the header (8 KB) with random bytes"
+        header_before,
+        read_first_bytes(&dir.join("v.lbx"), 8192),
+        "panic must overwrite the live header (8 KB) with random bytes"
+    );
+    assert_ne!(
+        header_bak_before,
+        read_first_bytes(&header_bak, 8192),
+        "panic must also overwrite the v3 header mirror; leaving it \
+         intact lets Container::open silently recover the keyslots"
     );
 
-    // Open after panic must fail.
+    // The load-bearing check: a real open (ls/get, unlike info which
+    // reads the header directly) goes through Container::open, which is
+    // exactly the path that recovers from the mirror. It must now fail.
+    let out = run_with(dir, &env, &["ls", "v.lbx"]);
+    assert_err(&out, "ls on panic-destroyed vault must fail (no recovery)");
+    let out = run_with(dir, &env, &["get", "v.lbx", "/secret.txt", "out.txt"]);
+    assert_err(&out, "get on panic-destroyed vault must fail (no recovery)");
+
+    // info reads the header directly (no recovery path) and must also fail.
     let out = run(dir, &["info", "v.lbx"]);
     assert_err(&out, "info on panic-destroyed vault must fail");
 }

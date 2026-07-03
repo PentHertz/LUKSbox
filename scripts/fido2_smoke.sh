@@ -117,10 +117,10 @@ ok "info reports fido2 kind"
 
 echo "wrap-mode payload" > /tmp/wrap.txt
 prompt_touch "fido2 unlock (put)"
-run put v-wrap.lbx /tmp/wrap.txt /payload || fail "put on fido2 vault failed"
+run put v-wrap.lbx --fido2 /tmp/wrap.txt /payload || fail "put on fido2 vault failed"
 
 prompt_touch "fido2 unlock (get)"
-run get v-wrap.lbx /payload "$WORK/wrap.out" || fail "get on fido2 vault failed"
+run get v-wrap.lbx --fido2 /payload "$WORK/wrap.out" || fail "get on fido2 vault failed"
 diff -q /tmp/wrap.txt "$WORK/wrap.out" >/dev/null || fail "fido2 round-trip mismatch"
 ok "fido2 wrap-mode round-trip OK"
 echo
@@ -161,17 +161,17 @@ ok "v-hybrid.lbx + v.kyber + v-hybrid.lbx.hybrid created"
 [[ -f v-hybrid.lbx.hybrid ]] || fail "v-hybrid.lbx.hybrid sidecar not created"
 
 prompt_touch "hybrid-fido unlock (info)"
-run info v-hybrid.lbx --pq-hybrid v.kyber | grep -qi "ml-kem-768" \
+run info v-hybrid.lbx | grep -qi "ml-kem-768" \
     || fail "info should report ML-KEM-768"
 ok "info reports ML-KEM-768"
 
 echo "hybrid-pq-fido2 payload" > /tmp/hyb.txt
 prompt_touch "hybrid-fido unlock (put)"
-run put v-hybrid.lbx --pq-hybrid v.kyber /tmp/hyb.txt /h \
+run put v-hybrid.lbx --fido2 --pq-hybrid v.kyber /tmp/hyb.txt /h \
     || fail "put on hybrid-fido vault failed"
 
 prompt_touch "hybrid-fido unlock (get)"
-run get v-hybrid.lbx --pq-hybrid v.kyber /h "$WORK/hyb.out" \
+run get v-hybrid.lbx --fido2 --pq-hybrid v.kyber /h "$WORK/hyb.out" \
     || fail "get on hybrid-fido vault failed"
 diff -q /tmp/hyb.txt "$WORK/hyb.out" >/dev/null \
     || fail "hybrid-fido round-trip mismatch"
@@ -188,17 +188,17 @@ run create v-hyb1024.lbx --kind hybrid-pq1024-fido2 --pq-hybrid v1024.kyber \
 ok "v-hyb1024.lbx + v1024.kyber created"
 
 prompt_touch "hybrid-fido-1024 unlock (info)"
-run info v-hyb1024.lbx --pq-hybrid v1024.kyber | grep -qi "ml-kem-1024" \
+run info v-hyb1024.lbx | grep -qi "ml-kem-1024" \
     || fail "info should report ML-KEM-1024"
 ok "info reports ML-KEM-1024"
 
 echo "1024 NIST cat 5 payload" > /tmp/hyb1024.txt
 prompt_touch "hybrid-fido-1024 unlock (put)"
-run put v-hyb1024.lbx --pq-hybrid v1024.kyber /tmp/hyb1024.txt /h \
+run put v-hyb1024.lbx --fido2 --pq-hybrid v1024.kyber /tmp/hyb1024.txt /h \
     || fail "put on hybrid-fido-1024 failed"
 
 prompt_touch "hybrid-fido-1024 unlock (get)"
-run get v-hyb1024.lbx --pq-hybrid v1024.kyber /h "$WORK/hyb1024.out" \
+run get v-hyb1024.lbx --fido2 --pq-hybrid v1024.kyber /h "$WORK/hyb1024.out" \
     || fail "get on hybrid-fido-1024 failed"
 diff -q /tmp/hyb1024.txt "$WORK/hyb1024.out" >/dev/null \
     || fail "hybrid-fido-1024 round-trip mismatch"
