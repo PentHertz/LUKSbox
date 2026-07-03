@@ -49,6 +49,23 @@ mount entry points now inherit both protections, including inside the
 forked child on the daemonized FUSE path. Found in an external audit
 pass by Garry Jean-Baptiste (2026-06-19).
 
+### Security: rc.3 follow-up hardening for metadata status and Unix unmount helpers
+
+Two additional rc.3 audit follow-ups landed in the same release:
+
+- VFS metadata budget reporting now projects the compact v3/v4/v5
+  on-disk shape instead of serialising the fully materialised in-memory
+  chunk list. Large spilled files keep millions of chunk refs in memory
+  for normal reads/writes, but only a small `(head, count)` stub in the
+  metadata blob. The old status path could allocate excessive memory
+  during GUI polling and report a bogus "near budget" state for large
+  vaults.
+- Unix unmount paths now canonicalise the mountpoint before passing it
+  to `/usr/bin/fusermount3`, `/bin/fusermount3`, or `/sbin/umount`.
+  This keeps user-controlled relative paths that begin with `-` from
+  being parsed as helper options in explicit unmounts, signal-triggered
+  unmounts, and suspend-triggered unmounts.
+
 ### Security: the GUI panic action now destroys crash-recovery sidecars
 
 `panic` overwrote the vault header but left the `header-bak` and

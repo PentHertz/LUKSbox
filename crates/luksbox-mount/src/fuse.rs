@@ -279,9 +279,16 @@ fn install_signal_handler(mountpoint: &Path) {
         eprintln!("\nreceived interrupt, unmounting cleanly...");
         match resolved_unmount_program() {
             Ok(prog) => {
+                let target = match canonical_unmount_target(&mp) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("warning: cannot resolve mountpoint for signal unmount: {e}");
+                        return;
+                    }
+                };
                 let _ = std::process::Command::new(&prog)
                     .args(unmount_args())
-                    .arg(&mp)
+                    .arg(&target)
                     .status();
             }
             Err(e) => {
@@ -356,6 +363,16 @@ fn unmount_args() -> &'static [&'static str] {
     &[]
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn canonical_unmount_target(mountpoint: &Path) -> std::io::Result<PathBuf> {
+    mountpoint.canonicalize().map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("cannot resolve mountpoint {}: {e}", mountpoint.display()),
+        )
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn spawn_suspend_listener(mountpoint: &Path) {
     let mp = mountpoint.to_path_buf();
@@ -387,9 +404,18 @@ fn listen_for_suspend(mp: &Path) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("luksbox: system suspending, unmounting cleanly...");
             match resolved_unmount_program() {
                 Ok(prog) => {
+                    let target = match canonical_unmount_target(mp) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!(
+                                "luksbox: cannot resolve mountpoint for suspend unmount: {e}"
+                            );
+                            continue;
+                        }
+                    };
                     let _ = std::process::Command::new(&prog)
                         .args(unmount_args())
-                        .arg(mp)
+                        .arg(&target)
                         .status();
                 }
                 Err(e) => {
@@ -403,8 +429,9 @@ fn listen_for_suspend(mp: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 pub fn unmount(mountpoint: &Path) -> std::io::Result<()> {
     let prog = resolved_unmount_program()?;
+    let target = canonical_unmount_target(mountpoint)?;
     let mut cmd = std::process::Command::new(&prog);
-    cmd.args(unmount_args()).arg(mountpoint);
+    cmd.args(unmount_args()).arg(&target);
     let status = cmd.status()?;
     if !status.success() {
         return Err(std::io::Error::other(format!(
@@ -1298,7 +1325,11 @@ impl Filesystem for LuksboxFs {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
-    use super::{UNMOUNT_CANDIDATES, assert_single_threaded_for_fork, resolved_unmount_program};
+    use super::{
+        UNMOUNT_CANDIDATES, assert_single_threaded_for_fork, canonical_unmount_target,
+        resolved_unmount_program,
+    };
+    use std::path::Path;
 
     /// On any Linux/macOS host that has FUSE installed (which is
     /// every CI runner that runs the FUSE integration tests), at
@@ -1328,6 +1359,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn canonical_unmount_target_normalizes_leading_dash_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("-looks-like-option");
+        std::fs::create_dir(&mountpoint).unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let resolved = canonical_unmount_target(Path::new("-looks-like-option"));
+        std::env::set_current_dir(cwd).unwrap();
+
+        let resolved = resolved.unwrap();
+        assert!(
+            resolved.is_absolute(),
+            "must be absolute: {}",
+            resolved.display()
+        );
+        assert_eq!(
+            resolved.file_name().and_then(|s| s.to_str()),
+            Some("-looks-like-option"),
+            "resolved path must still name the mountpoint"
+        );
     }
 
     #[test]
