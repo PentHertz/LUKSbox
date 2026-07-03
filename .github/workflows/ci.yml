@@ -412,10 +412,13 @@ jobs:
   # cargo-audit walks Cargo.lock against the RustSec advisory DB and
   # fails on any non-ignored advisory. The single accepted ignore
   # (RUSTSEC-2025-0026, `registry` unmaintained, transitive via
-  # winfsp_wrs on Windows) is documented in audit.toml at the repo
-  # root and in SECURITY.md "Unmaintained dependencies". A new
-  # advisory landing on a real (non-dev, non-Windows) dep makes
-  # this job fail and the PR red.
+  # winfsp_wrs on Windows) is documented in .cargo/audit.toml (the
+  # only project-local path cargo-audit loads) and in SECURITY.md
+  # "Unmaintained dependencies". The quick-xml advisory pair is
+  # resolved for real via the vendored wayland-scanner patch, see
+  # third_party/wayland-scanner/README.LUKSBOX.md. A new advisory
+  # landing on a real (non-dev, non-Windows) dep makes this job
+  # fail and the PR red.
   audit:
     name: cargo audit
     runs-on: ubuntu-22.04
