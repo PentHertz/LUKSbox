@@ -463,20 +463,28 @@ osxcross, which have clang but no `swiftc` (SEP ops then return
    plain + hybrid-PQ paths land; deferred to keep phase 1 small.
 5. **CLI biometric UX** — likely "unlock via GUI" message; finalize
    when phase 2 starts.
-6. **SEP is not available in deniable mode (current limitation).** The
-   deniable v2 format stores all authenticator material inside a
-   fixed-size, random-looking slot envelope (`DeniableCredential` has
-   passphrase / TPM / FIDO2 / PQ variants but no SEP variant), and
-   deniable vaults fix their slot set at creation time, so there is no
-   path to put a SEP `dataRepresentation` blob in a deniable vault.
-   `Container::enroll_sep` (and every hardware enroll) refuses on a
-   deniable vault via `guard_no_deniable_slot_mutation` with
-   `Error::DeniableSlotMutationUnsupported`. The GUI hides the Secure
-   Enclave factor in deniable mode; the CLI/wizard surface the
-   descriptive error. A future `DeniableCredential::Sep*` family could
-   embed the `SepBlob` in the slot envelope the way the TPM sealed blob
-   already is (§4), but it needs its own deniability review and an
-   envelope-budget check (the SEP blob is larger than a TPM blob).
+6. **SEP in deniable mode: available at CREATE time, never via enroll.**
+   The deniable v2 format stores all authenticator material inside a
+   fixed-size, random-looking slot envelope. `DeniableCredential` now
+   includes the SEP family (`SepPassphrase`, `SepFido2Passphrase`,
+   `HybridPqSepPassphrase`, `HybridPqSepFido2Passphrase`, discriminants
+   9-12 in `deniable.rs`): the opaque `SepBlob` rides AEAD-sealed in the
+   envelope the same way the TPM sealed blob does (§4), inside the
+   envelope budget. So a deniable vault CAN be created with a Secure
+   Enclave factor: the GUI's deniable create path
+   (`create_sep_passphrase_deniable`) and the CLI's
+   `deniable-init --credential {sep, sep-fido2, pq-sep, pq-sep-fido2}`
+   both wire it.
+
+   What stays refused is putting SEP (or any hardware factor) into an
+   *existing* deniable vault: deniable vaults fix their slot set at
+   creation time, so `Container::enroll_sep` (and every hardware enroll,
+   plus the in-place `update_*` / `swap_slots` mutators) refuses on a
+   deniable container via `guard_no_deniable_slot_mutation` with
+   `Error::DeniableSlotMutationUnsupported`. The GUI offers Secure
+   Enclave only in the deniable *create* flow, not the deniable
+   add-keyslot flow; the CLI/wizard enroll surface the descriptive
+   error.
 
 ---
 

@@ -809,6 +809,16 @@ enum EmptyPassphraseTarget {
     CreateVaultSeed,
 }
 
+/// State for the "Forget this vault from history?" modal. The related
+/// file list is scanned once when the modal opens (not every frame);
+/// each entry carries its "delete it too" checkbox state, pre-ticked
+/// for names that match luksbox's own conventions (see
+/// `ops::related_vault_files`).
+struct ForgetRecentState {
+    path: PathBuf,
+    related: Vec<(PathBuf, bool)>,
+}
+
 /// State for the 3-factor "Add hybrid TPM + FIDO2 + ML-KEM" modal.
 /// Adds a FIDO2 PIN field on top of `AddHybridTpm2Form`.
 struct AddHybridTpm2Fido2Form {
@@ -1179,7 +1189,7 @@ pub struct LuksboxApp {
     /// Set when the user clicked the x button on a recent-vault row.
     /// Triggers the confirm-forget modal. The path is the recent
     /// entry to remove; cleared on Cancel or after Forget runs.
-    pending_forget_recent: Option<PathBuf>,
+    pending_forget_recent: Option<ForgetRecentState>,
     /// When true, the next `start_mount_picker` invocation passes
     /// `sync_mode = true` to `luksbox_mount::mount`, restoring the
     /// pre-v0.2.2 eager-flush semantics for this mount session.
@@ -2780,7 +2790,10 @@ impl LuksboxApp {
             // click (so users get visual feedback that the button
             // worked) and lets them back out before any list change
             // or file unlink.
-            self.pending_forget_recent = Some(r.path.clone());
+            self.pending_forget_recent = Some(ForgetRecentState {
+                path: r.path.clone(),
+                related: ops::related_vault_files(&r.path),
+            });
         }
         ui.add_space(4.0);
     }
@@ -11026,20 +11039,17 @@ impl LuksboxApp {
     }
 
     fn draw_forget_recent_modal(&mut self, ctx: &egui::Context) {
-        let Some(path) = self.pending_forget_recent.clone() else {
+        let Some(state) = self.pending_forget_recent.as_mut() else {
             return;
         };
+        let path = state.path.clone();
         let display_name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
         let display_path = path.display().to_string();
         let file_exists = path.is_file();
-        // Companion files luksbox writes next to the vault (crash-recovery
-        // mirrors, hybrid-PQ / SEP sidecars, a stray rotation tempfile).
-        // Deleting only the .lbx used to orphan these; surface them so the
-        // user can clean them up in the same step.
-        let companions = ops::companion_sidecars(&path);
+        let any_related = !state.related.is_empty();
         let mut do_forget = false;
         let mut do_forget_and_delete = false;
         let mut cancel = false;
@@ -11091,47 +11101,57 @@ impl LuksboxApp {
                     }
                 });
                 ui.add_space(4.0);
-                // Let the user know about the companion files luksbox
-                // writes by default so deleting a vault doesn't silently
-                // leave them behind.
-                if !companions.is_empty() {
+                // Files next to the vault that look related: luksbox's
+                // own sidecars (crash-recovery mirrors, .hybrid, ...)
+                // plus same-stem files like the .kyber seed, a .hdr
+                // detached header, or a .anchor. Deleting only the .lbx
+                // used to orphan these; offer them as a per-file
+                // checklist. Name-convention matches start ticked,
+                // other same-stem files start unticked (they might be
+                // unrelated).
+                if any_related {
                     ui.add_space(6.0);
                     let intro = if file_exists {
-                        "Deleting the vault will also remove these companion files \
-                         written next to it:"
+                        "Files next to the vault that look related. Ticked ones \
+                         are deleted together with the .lbx:"
                     } else {
-                        "The .lbx file is already gone, but these companion files \
-                         written next to it are still on disk:"
+                        "The .lbx file is already gone, but these files next to \
+                         it look related. Ticked ones are deleted:"
                     };
                     ui.label(RichText::new(intro).small().color(theme::DIM));
-                    for c in &companions {
-                        let name = c
-                            .file_name()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| c.display().to_string());
-                        ui.label(RichText::new(format!("  • {name}")).small().monospace());
-                    }
+                    egui::ScrollArea::vertical()
+                        .id_salt("forget-related-files")
+                        .max_height(140.0)
+                        .show(ui, |ui| {
+                            for (p, selected) in &mut state.related {
+                                let name = p
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| p.display().to_string());
+                                ui.checkbox(selected, RichText::new(name).small().monospace());
+                            }
+                        });
                     ui.add_space(6.0);
                 }
                 // Destructive option: offer it when the .lbx still exists,
-                // OR when it's already gone but companion files remain
+                // OR when it's already gone but related files remain
                 // (the "clean up leftovers" case). Otherwise there is
                 // nothing to delete.
-                if file_exists || !companions.is_empty() {
+                if file_exists || any_related {
                     let (label, hover) = if file_exists {
                         (
-                            "Forget AND delete the .lbx file + companions (IRREVERSIBLE)",
-                            "Removes from the recent list AND unlinks the .lbx file plus its \
-                             companion files (.header-bak, .meta-bak, .hybrid, ...). There is \
-                             no undo; do this only if you are sure the vault contents are no \
-                             longer needed.",
+                            "Forget AND delete the .lbx file + ticked files (IRREVERSIBLE)",
+                            "Removes from the recent list AND unlinks the .lbx file plus \
+                             every ticked file above (.hybrid, .header-bak, .kyber, ...). \
+                             There is no undo; do this only if you are sure the vault \
+                             contents are no longer needed.",
                         )
                     } else {
                         (
-                            "Forget AND delete the leftover companion files (IRREVERSIBLE)",
+                            "Forget AND delete the ticked leftover files (IRREVERSIBLE)",
                             "The .lbx is already gone. This removes the entry from the recent \
-                             list AND deletes the orphaned companion files listed above. There \
-                             is no undo.",
+                             list AND deletes the ticked files listed above. There is no \
+                             undo.",
                         )
                     };
                     ui.vertical_centered(|ui| {
@@ -11164,19 +11184,25 @@ impl LuksboxApp {
             self.forget_recent_path(&path);
             self.pending_forget_recent = None;
         } else if do_forget_and_delete {
-            // Unlink the .lbx (if it still exists) and every companion
-            // file, THEN forget. If any unlink fails we still forget the
-            // entry from the recent list (the vault is gone from the
-            // user's perspective; the entry would be marked "missing" on
-            // the next render anyway) but surface the failures as a toast
-            // so the user knows something may still be on disk.
+            // Unlink the .lbx (if it still exists) and every TICKED
+            // related file, THEN forget. If any unlink fails we still
+            // forget the entry from the recent list (the vault is gone
+            // from the user's perspective; the entry would be marked
+            // "missing" on the next render anyway) but surface the
+            // failures as a toast so the user knows something may still
+            // be on disk.
+            let related = self
+                .pending_forget_recent
+                .take()
+                .map(|s| s.related)
+                .unwrap_or_default();
             let mut deleted = 0usize;
             let mut errors: Vec<String> = Vec::new();
             let mut targets: Vec<PathBuf> = Vec::new();
             if path.is_file() {
                 targets.push(path.clone());
             }
-            targets.extend(ops::companion_sidecars(&path));
+            targets.extend(related.into_iter().filter(|(_, sel)| *sel).map(|(p, _)| p));
             for t in &targets {
                 match std::fs::remove_file(t) {
                     Ok(()) => deleted += 1,

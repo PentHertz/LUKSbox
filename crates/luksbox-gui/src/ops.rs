@@ -61,6 +61,81 @@ pub fn companion_sidecars(vault: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
+/// Files in the vault's directory that look like they belong to it,
+/// paired with a "confidently luksbox's" flag the GUI uses as the
+/// checkbox default in the delete dialog:
+///
+/// - `true`: the vault name or stem followed by a known luksbox
+///   suffix: the deterministic sidecars (`foo.lbx.hybrid`,
+///   `foo.lbx.header-bak`, ...) plus the user-placed-but-conventional
+///   `foo.kyber` / `foo.hdr` / `foo.anchor` (also matched with the
+///   full name, e.g. `foo.lbx.kyber`). These live at user-chosen
+///   paths, so the name match is a heuristic; the GUI shows them
+///   pre-ticked but user-deselectable.
+/// - `false`: any other file sharing the vault's stem or full name
+///   as a prefix (`foo.pem`, `foo.lbx.notes.txt`). Listed so the user
+///   can opt in, never pre-selected.
+///
+/// Checked entries sort first. Falls back to the deterministic
+/// `companion_sidecars` list when the directory can't be read.
+pub fn related_vault_files(vault: &Path) -> Vec<(PathBuf, bool)> {
+    let Some(vault_name) = vault.file_name().map(|s| s.to_string_lossy().into_owned()) else {
+        return Vec::new();
+    };
+    // "foo.lbx" -> stem prefix "foo."; extension-less names keep the
+    // whole name as the stem.
+    let stem_prefix = match vault_name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => format!("{stem}."),
+        _ => format!("{vault_name}."),
+    };
+    let vault_prefix = format!("{vault_name}.");
+    const KNOWN_SUFFIXES: [&str; 8] = [
+        "header-bak",
+        "meta-bak",
+        "hybrid",
+        "sep",
+        "rotating",
+        "kyber",
+        "hdr",
+        "anchor",
+    ];
+    let dir: PathBuf = match vault.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return companion_sidecars(vault)
+            .into_iter()
+            .map(|p| (p, true))
+            .collect();
+    };
+    let mut out: Vec<(PathBuf, bool)> = Vec::new();
+    for e in entries.flatten() {
+        let p = e.path();
+        if !p.is_file() {
+            continue;
+        }
+        let Some(name) = p.file_name().map(|s| s.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if name == vault_name {
+            continue; // the vault itself is handled separately
+        }
+        // Prefer the longer (full-name) prefix so "foo.lbx.hybrid"
+        // yields "hybrid", not "lbx.hybrid".
+        let rest = name
+            .strip_prefix(&vault_prefix)
+            .or_else(|| name.strip_prefix(&stem_prefix));
+        let Some(rest) = rest else {
+            continue; // unrelated name
+        };
+        let checked = KNOWN_SUFFIXES.contains(&rest.to_ascii_lowercase().as_str());
+        out.push((p, checked));
+    }
+    out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    out
+}
+
 pub fn cipher_label(s: CipherSuite) -> &'static str {
     match s {
         CipherSuite::Aes256Gcm => "AES-256-GCM",
@@ -5101,6 +5176,62 @@ mod companion_sidecars_tests {
         let vault = tmp.path().join("solo.lbx");
         std::fs::write(&vault, b"x").unwrap();
         assert!(companion_sidecars(&vault).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod related_vault_files_tests {
+    use super::related_vault_files;
+
+    fn names(vault: &std::path::Path) -> Vec<(String, bool)> {
+        related_vault_files(vault)
+            .into_iter()
+            .map(|(p, sel)| (p.file_name().unwrap().to_string_lossy().into_owned(), sel))
+            .collect()
+    }
+
+    #[test]
+    fn known_suffixes_ticked_unknown_stem_matches_unticked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("v.lbx");
+        std::fs::write(&vault, b"x").unwrap();
+        // Deterministic sidecars (vault-name-prefixed).
+        std::fs::write(tmp.path().join("v.lbx.hybrid"), b"y").unwrap();
+        std::fs::write(tmp.path().join("v.lbx.header-bak"), b"h").unwrap();
+        // Conventional same-stem companions (user-chosen paths).
+        std::fs::write(tmp.path().join("v.kyber"), b"k").unwrap();
+        std::fs::write(tmp.path().join("v.hdr"), b"d").unwrap();
+        std::fs::write(tmp.path().join("v.anchor"), b"a").unwrap();
+        // Same-stem but unknown extension: listed, unticked.
+        std::fs::write(tmp.path().join("v.pem"), b"p").unwrap();
+        std::fs::write(tmp.path().join("v.lbx.notes.txt"), b"n").unwrap();
+        // Different stem: not listed at all.
+        std::fs::write(tmp.path().join("other.kyber"), b"o").unwrap();
+
+        let got = names(&vault);
+        let find = |n: &str| got.iter().find(|(name, _)| name == n).map(|(_, s)| *s);
+
+        assert_eq!(find("v.lbx.hybrid"), Some(true));
+        assert_eq!(find("v.lbx.header-bak"), Some(true));
+        assert_eq!(find("v.kyber"), Some(true));
+        assert_eq!(find("v.hdr"), Some(true));
+        assert_eq!(find("v.anchor"), Some(true));
+        assert_eq!(find("v.pem"), Some(false));
+        assert_eq!(find("v.lbx.notes.txt"), Some(false));
+        assert_eq!(find("other.kyber"), None);
+        assert_eq!(find("v.lbx"), None, "the vault itself is never listed");
+        // Ticked entries sort before unticked ones.
+        let first_unticked = got.iter().position(|(_, s)| !s).unwrap();
+        assert!(got[..first_unticked].iter().all(|(_, s)| *s));
+    }
+
+    #[test]
+    fn empty_when_nothing_related() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("solo.lbx");
+        std::fs::write(&vault, b"x").unwrap();
+        std::fs::write(tmp.path().join("unrelated.txt"), b"u").unwrap();
+        assert!(related_vault_files(&vault).is_empty());
     }
 }
 

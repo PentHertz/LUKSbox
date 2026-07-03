@@ -2864,6 +2864,12 @@ impl Container {
         kek_from_tpm: &[u8; 32],
         sealed_blob: &[u8],
     ) -> Result<(), Error> {
+        // Complete the deniable-mutation guard sweep: like `enroll_*`
+        // and `revoke_slot`, refuse an in-place slot rewrite on a
+        // deniable container (its slots are fixed at create time).
+        // Unreachable today -- callers bail before a deniable container
+        // -- but fail-closed against a future path (audit addendum C).
+        self.guard_no_deniable_slot_mutation()?;
         let slot = Keyslot::new_tpm2(
             self.header.cipher_suite,
             &self.mvk,
@@ -2930,6 +2936,12 @@ impl Container {
     /// references slot indices (e.g. the `<vault>.lbx.hybrid` sidecar's
     /// `slot_idx` field) and for calling `persist_header()` afterwards.
     pub fn swap_slots(&mut self, a: usize, b: usize) -> Result<(), Error> {
+        // Deniable-mutation guard (audit addendum C). No-op on the only
+        // callers today -- the non-deniable SEP/TPM bootstrap-create
+        // flow, which swaps the hardware slot to index 0 -- since those
+        // containers are never deniable; the deniable create path builds
+        // its envelope directly without swapping.
+        self.guard_no_deniable_slot_mutation()?;
         let max = self.header.keyslots.len();
         if a >= max || b >= max {
             return Err(Error::Io(std::io::Error::other(format!(
@@ -2956,6 +2968,7 @@ impl Container {
         passphrase: &[u8],
         kdf_params: Argon2idParams,
     ) -> Result<(), Error> {
+        self.guard_no_deniable_slot_mutation()?;
         let slot = Keyslot::new_passphrase(
             self.header.cipher_suite,
             &self.mvk,
@@ -2978,6 +2991,7 @@ impl Container {
         hmac_salt: [u8; 32],
         kdf_params: Argon2idParams,
     ) -> Result<(), Error> {
+        self.guard_no_deniable_slot_mutation()?;
         let slot = Keyslot::new_fido2(
             self.header.cipher_suite,
             &self.mvk,

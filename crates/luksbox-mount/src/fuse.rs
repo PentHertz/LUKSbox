@@ -63,28 +63,33 @@ pub fn mount(vfs: Vfs, mountpoint: &Path, daemonize: bool, sync_mode: bool) -> s
     let mut config = Config::default();
     config.mount_options = mount_options;
 
-    // Pre-flight: best-effort mountpoint validation BEFORE forking, so the
-    // user sees common errors (path missing, not a directory) in the
-    // foreground process where stderr still goes to their terminal. Once
-    // we daemonize, fuser's mount errors land in /dev/null.
-    let meta = std::fs::metadata(mountpoint)?;
-    if !meta.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotADirectory,
-            format!("mountpoint {} is not a directory", mountpoint.display()),
-        ));
-    }
+    // Pre-flight: SECURITY hardening BEFORE forking (R12-05 deny-list +
+    // R12-08 inode re-probe), and so the user sees common errors (path
+    // missing, not a directory, symlinked mountpoint) in the foreground
+    // process where stderr still goes to their terminal. Once we
+    // daemonize, fuser's mount errors land in /dev/null.
+    //
+    // This runs in the SHARED backend, so every frontend that calls
+    // `luksbox_mount::mount` -- the CLI subcommands, the TUI wizard, AND
+    // the GUI -- inherits the O_NOFOLLOW probe, the (dev,ino) capture,
+    // and the deny-list. Previously only the CLI's `cmd_mount`
+    // re-implemented this inline, so the wizard and GUI mount paths
+    // reached this point with no probe, no re-probe, and no deny-list.
+    let probe_inode = crate::mountpoint::harden_mountpoint(mountpoint)?;
 
     if daemonize {
         // LuksboxFs::new spawns the deferred-flush timer thread (when
         // sync_mode is off), so it MUST run after the fork or the
         // single-threaded-for-fork() check below trips on our own
         // timer. The parent never builds a LuksboxFs.
-        run_daemonized(vfs, mountpoint, config, sync_mode)
+        run_daemonized(vfs, mountpoint, config, sync_mode, probe_inode)
     } else {
         install_signal_handler(mountpoint);
         spawn_suspend_listener(mountpoint);
         let fs = LuksboxFs::new(vfs, sync_mode);
+        // R12-08: re-verify the mountpoint inode immediately before the
+        // mount syscall to catch a swap in the window since the probe.
+        crate::mountpoint::reverify_mountpoint(mountpoint, probe_inode)?;
         // `mount2` does Session::new + run() in one call. Blocks until
         // the FS is unmounted (kernel signals EOF on /dev/fuse fd).
         fuser::mount2(fs, mountpoint, &config)
@@ -200,6 +205,7 @@ fn run_daemonized(
     mountpoint: &Path,
     config: Config,
     sync_mode: bool,
+    probe_inode: (u64, u64),
 ) -> std::io::Result<()> {
     assert_single_threaded_for_fork()?;
 
@@ -220,6 +226,15 @@ fn run_daemonized(
             install_signal_handler(mountpoint);
             spawn_suspend_listener(mountpoint);
             let fs = LuksboxFs::new(vfs, sync_mode);
+            // R12-08: re-verify in the child, immediately before the
+            // syscall. This is tighter than a parent-side re-probe: the
+            // kernel mount happens here, post-fork, so the window this
+            // closes is the one that actually matters. stdio is already
+            // /dev/null'd, so surface the refusal via exit code.
+            if let Err(e) = crate::mountpoint::reverify_mountpoint(mountpoint, probe_inode) {
+                eprintln!("luksbox: {e}");
+                std::process::exit(1);
+            }
             let res = fuser::mount2(fs, mountpoint, &config);
             std::process::exit(if res.is_ok() { 0 } else { 1 });
         }
