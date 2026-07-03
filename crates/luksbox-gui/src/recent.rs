@@ -87,7 +87,12 @@ pub fn forget(path: &Path) {
     save(&list);
 }
 
-#[cfg(all(test, unix))]
+// Linux-only (not just unix): the single test below relies on
+// XDG_DATA_HOME redirection, which `dirs::data_dir()` honours only on
+// Linux. On macOS it always returns ~/Library/Application Support, so
+// the test would write a dummy entry into the user's REAL recents
+// file and then fail its assertions.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

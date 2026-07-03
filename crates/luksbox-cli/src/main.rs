@@ -499,7 +499,14 @@ enum Command {
         format: VaultFormatArg,
     },
     /// Show container header / keyslot summary (no unlock required).
-    Info { path: PathBuf },
+    Info {
+        path: PathBuf,
+        /// Read the header from a detached-header sidecar (a vault
+        /// created with `create --header <file>` has no header in the
+        /// .lbx itself).
+        #[arg(long)]
+        header: Option<PathBuf>,
+    },
     /// Add a new keyslot. `--kind` selects what kind to enroll (passphrase
     /// or fido2). `--fido2` selects how to authenticate to the existing
     /// vault, useful if you've revoked the original passphrase and only
@@ -1239,7 +1246,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 format,
             )
         }
-        Command::Info { path } => cmd_info(&path),
+        Command::Info { path, header } => cmd_info(&path, header.as_deref()),
         Command::Enroll { path, unlock, kind } => match kind {
             SlotKindArg::Passphrase => cmd_enroll_passphrase(&path, &unlock),
             SlotKindArg::Fido2 => cmd_enroll_fido2(&path, &unlock),
@@ -3313,7 +3320,7 @@ fn sep_fido2_hmac_for_slot(
     eprintln!(
         "{}",
         auth_prompt(&format!(
-            "fused SEP+FIDO2 unlock (slot cred_id len {} B)",
+            "unlock the fused SEP+FIDO2 slot (cred_id len {} B)",
             cred.len()
         ))
     );
@@ -3681,7 +3688,7 @@ fn open_container_hybrid_pq_tpm2_fido2(
         };
         eprintln!(
             "{}",
-            auth_prompt(&format!("3-factor unlock (slot {slot_idx})"))
+            auth_prompt(&format!("perform the 3-factor unlock (slot {slot_idx})"))
         );
         // Declared salt convention first, then (Windows) the opposite,
         // because webauthn.dll's salt transform is opaque.
@@ -4161,7 +4168,10 @@ fn create_hybrid_pq_fido2_with_params(
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
-    eprintln!("{}", auth_prompt("again to derive the keyslot secret"));
+    eprintln!(
+        "{}",
+        auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let (pk, kyber_seed) = keygen_with(params);
@@ -4257,7 +4267,10 @@ fn create_fido2(
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
 
-    eprintln!("{}", auth_prompt("again to derive the keyslot secret"));
+    eprintln!(
+        "{}",
+        auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let cont = Container::create_with_fido2_flags(
@@ -4315,7 +4328,10 @@ fn create_fido2_direct(
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
 
-    eprintln!("{}", auth_prompt("again to derive the keyslot secret"));
+    eprintln!(
+        "{}",
+        auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let cont = Container::create_with_fido2_derived_mvk(
@@ -4338,11 +4354,21 @@ fn create_fido2_direct(
     Err("FIDO2 hardware support not compiled in (rebuild with --features hardware)".into())
 }
 
-fn cmd_info(path: &Path) -> Result<()> {
-    let mut f = File::open(path)?;
+fn cmd_info(path: &Path, header_path: Option<&Path>) -> Result<()> {
+    let header_src = header_path.unwrap_or(path);
+    let mut f = File::open(header_src)?;
     let mut buf = [0u8; HEADER_SIZE];
     f.read_exact(&mut buf)?;
-    let h = Header::from_bytes(&buf)?;
+    let h = Header::from_bytes(&buf).map_err(|e| {
+        if header_path.is_none() {
+            cli_err!(
+                "{e}. If this vault was created with a detached header \
+                 (`create --header <file>`), pass `--header <file>`."
+            )
+        } else {
+            e.into()
+        }
+    })?;
     println!("container: {}", path.display());
     println!("  cipher:        {:?}", h.cipher_suite);
     println!("  chunk size:    {} bytes", h.chunk_size);
@@ -4613,7 +4639,10 @@ fn cmd_enroll_fido2(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
 
-    eprintln!("{}", auth_prompt("again to derive the keyslot secret"));
+    eprintln!(
+        "{}",
+        auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let idx = c.enroll_fido2(None, &hmac_secret, &cred_id, hmac_salt, kdf_params())?;
@@ -4685,7 +4714,10 @@ fn cmd_migrate_fido2_slot(path: &Path, unlock: &UnlockArgs, slot: usize) -> Resu
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
 
-    eprintln!("{}", auth_prompt("again to derive the new keyslot secret"));
+    eprintln!(
+        "{}",
+        auth_prompt("derive the new keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let new_idx = c.enroll_fido2(None, &hmac_secret, &cred_id, hmac_salt, kdf_params())?;
@@ -4917,7 +4949,7 @@ fn cmd_enroll_tpm2_fido2(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     // authenticator for the hmac-secret output for that salt.
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
-    eprintln!("{}", auth_prompt("touch again to derive the FIDO2 half"));
+    eprintln!("{}", auth_prompt("derive the FIDO2 half (second touch)"));
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let blob_bytes = blob.to_bytes();
@@ -5403,7 +5435,7 @@ fn cmd_enroll_sep_fused(
         let cred_id = er.credential.id;
         let mut hmac_salt = [0u8; 32];
         OsRng.fill_bytes(&mut hmac_salt);
-        eprintln!("{}", auth_prompt("touch again to derive the FIDO2 half"));
+        eprintln!("{}", auth_prompt("derive the FIDO2 half (second touch)"));
         let hmac_secret: [u8; 32] =
             *auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
         Some((cred_id, hmac_salt, hmac_secret))
@@ -5628,7 +5660,7 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
 
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
-    eprintln!("{}", auth_prompt("touch again to derive the FIDO2 half"));
+    eprintln!("{}", auth_prompt("derive the FIDO2 half (second touch)"));
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let (pk, seed) = keygen_with(params);
@@ -5886,7 +5918,10 @@ fn update_fido2_at(c: &mut Container, slot: usize) -> Result<()> {
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
 
-    eprintln!("{}", auth_prompt("again to derive the keyslot secret"));
+    eprintln!(
+        "{}",
+        auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     c.update_fido2_at(slot, None, &hmac_secret, &cred_id, hmac_salt, kdf_params())?;
@@ -6588,7 +6623,7 @@ fn parse_cli_den_cred(s: &str) -> Result<CliDenCred> {
         "pq-sep" => Ok(CliDenCred::PqSep),
         "pq-sep-fido2" => Ok(CliDenCred::PqSepFido2),
         _ => Err(cli_err!(
-            "unknown --credential '{}'. Choices: passphrase, fido2, pq-passphrase, pq-fido2, tpm, tpm-fido2, pq-tpm, pq-tpm-fido2",
+            "unknown --credential '{}'. Choices: passphrase, fido2, pq-passphrase, pq-fido2, tpm, tpm-fido2, pq-tpm, pq-tpm-fido2, sep, sep-fido2, pq-sep, pq-sep-fido2",
             s
         )),
     }
@@ -8172,10 +8207,19 @@ fn cmd_rotate_mvk(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     // leak via /proc and shell history) or a config file. Neither
     // is a good default. The wizard prompts slot-by-slot.
     //
-    // We honour the standard `--header` / `--anchor` unlock args so
-    // the user can rotate a vault opened with detached header /
-    // anchor sidecars; the wizard's flow takes the open Container
-    // from us so unlock material is gathered there.
+    // `--header` is honoured (open_container reads the detached
+    // header), but `--anchor` is not threaded through: the rollback
+    // check and anchor-generation update happen in `open_vfs`, which
+    // rotation does not go through. Warn instead of silently skipping
+    // the rollback check and leaving the anchor behind the vault's
+    // new generation.
+    if unlock.anchor.is_some() {
+        eprintln!(
+            "warning: --anchor is ignored by rotate-mvk: rotation neither \
+             checks the anchor for rollback nor advances it. Open the vault \
+             with --anchor afterwards; the next write refreshes the anchor."
+        );
+    }
     let cont = open_container(path, unlock)?;
     let cont =
         wizard::run_rotate_mvk_interactive(&dialoguer::theme::ColorfulTheme::default(), cont)?;

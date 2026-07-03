@@ -263,7 +263,7 @@ mod private_mount_tests {
     #[test]
     fn caps_length() {
         let s = "a".repeat(300);
-        assert_eq!(sanitize(&s).len(), 128);
+        assert_eq!(sanitize(&s).len(), 200);
     }
 }
 

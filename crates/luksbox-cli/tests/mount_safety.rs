@@ -58,8 +58,15 @@ fn mount_rejects_etc() {
         stderr(&out)
     );
     let s = stderr(&out);
+    // Linux: /etc is a real directory, refused by the deny-list
+    // ("system directory"). macOS: /etc is a symlink to /private/etc,
+    // so the O_NOFOLLOW probe refuses it first ("symbolic link"); the
+    // deny-list message appears only if the probe is bypassed. Accept
+    // either explanation as long as the path is named.
+    let explained =
+        s.contains("system") || s.contains("symbolic link") || s.contains("not a directory");
     assert!(
-        s.contains("/etc") && s.contains("system"),
+        s.contains("/etc") && explained,
         "stderr should explain why /etc was rejected; got: {s}"
     );
 }

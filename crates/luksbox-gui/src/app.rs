@@ -7149,7 +7149,10 @@ impl LuksboxApp {
             let msg = "Signaled WinFsp to stop the dispatcher; the mount \
                        thread will exit once all open file handles in \
                        your file manager are closed.";
-            #[cfg(not(target_os = "windows"))]
+            #[cfg(target_os = "macos")]
+            let msg = "Sent umount; the mount thread will exit once all \
+                       open file handles in Finder are closed.";
+            #[cfg(not(any(target_os = "windows", target_os = "macos")))]
             let msg = "Sent fusermount3 -u; the mount thread will exit \
                        once all open file handles in your file manager \
                        are closed.";

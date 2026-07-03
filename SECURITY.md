@@ -330,9 +330,13 @@ current branch (large |t|) until R12-01 fix lands.
   RustCrypto audits and the FIPS-203 test vectors for ML-KEM.
 - Side-channel resistance on real hardware (no `dudect` runs, no
   power-analysis testbed).
-- Multiple FIDO2 brands. Yubico YubiKey 5 is the only model exercised on
-  real hardware. SoloKey, Nitrokey, Token2, OnlyKey, and Google Titan all
-  use libfido2 over USB-HID and *should* work, but are unverified.
+- Multiple FIDO2 brands — partially covered. Verified on real hardware
+  (macOS, 2026-07-03): Yubico YubiKey 5 (cred_id 64 B), SoloKeys Solo
+  4.1.5 (70 B), Nitrokey 3 (158 B), and Google Titan v2 (288 B) all pass
+  enroll + unlock + put/get round-trip; the Titan additionally passed
+  every hybrid-PQ, deniable, SEP-fused, and MVK-rotation combination.
+  Token2 and OnlyKey use the same libfido2 USB-HID path and *should*
+  work, but remain unverified.
 - Multi-device FIDO2 flows.
 - Wrong-PIN paths (would burn the device's PIN retry counter).
 - Windows port end-to-end (winfsp_wrs path is built but not in our CI
@@ -674,13 +678,15 @@ risk first.
    threat: a co-tenant on a shared machine running a cache-timing
    attack against a long-lived `luksbox-gui` process.
 
-4. **Multi-vendor FIDO2 hardware testing.** End-to-end tests
-   currently exercise one Yubico YubiKey 5 NFC. Other CTAP2 devices
-   in the wild (SoloKey 2, Nitrokey FIDO2, Token2 PIN+, OnlyKey)
-   may surface vendor firmware quirks that pure-mock tests can't
-   catch. The round-2 cred_id roundtrip bug is the canonical
-   example of "looked fine in mock, broke on real device."
-   Recommendation: add at least one non-Yubico key to the manual
+4. **Multi-vendor FIDO2 hardware testing.** Largely addressed
+   (2026-07-03): four vendors verified on real hardware — Yubico
+   YubiKey 5, SoloKeys Solo 4.1.5, Nitrokey 3, and Google Titan v2 —
+   spanning cred_id sizes 64-288 B (the Titan's 288 B also exercised
+   the fused SEP+FIDO2 slot budget). Vendor firmware quirks are
+   exactly what pure-mock tests can't catch; the round-2 cred_id
+   roundtrip bug is the canonical example of "looked fine in mock,
+   broke on real device." Remaining gap: Token2 PIN+ and OnlyKey.
+   Recommendation: keep at least one non-Yubico key in the manual
    pre-release smoke checklist.
 
 5. **Long-running fuzz campaigns before each release.**

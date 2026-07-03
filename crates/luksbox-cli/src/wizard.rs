@@ -702,6 +702,7 @@ fn create_den_pq_fido2(
 
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
+    eprintln!("{}", crate::auth_prompt("register a new credential"));
     let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
@@ -711,6 +712,10 @@ fn create_den_pq_fido2(
             .try_fill_bytes(&mut hmac_salt)
             .map_err(|e| format!("OS RNG failure: {e}"))?;
     }
+    eprintln!(
+        "{}",
+        crate::auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let (pk, seed) = keygen_with(params);
@@ -822,6 +827,7 @@ fn create_den_tpm_fido2(
     );
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
+    eprintln!("{}", crate::auth_prompt("register a new credential"));
     let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
@@ -831,6 +837,10 @@ fn create_den_tpm_fido2(
             .try_fill_bytes(&mut hmac_salt)
             .map_err(|e| format!("OS RNG failure: {e}"))?;
     }
+    eprintln!(
+        "{}",
+        crate::auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
     let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
         passphrase: pass.as_bytes(),
@@ -934,6 +944,7 @@ fn create_den_pq_tpm_fido2(
 
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
+    eprintln!("{}", crate::auth_prompt("register a new credential"));
     let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
@@ -943,6 +954,10 @@ fn create_den_pq_tpm_fido2(
             .try_fill_bytes(&mut hmac_salt)
             .map_err(|e| format!("OS RNG failure: {e}"))?;
     }
+    eprintln!(
+        "{}",
+        crate::auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let (pk, seed) = keygen_with(params);
@@ -1508,6 +1523,7 @@ fn wizard_fido2_hmac_from_payload(
         return Err("envelope cred_id is empty for FIDO2 variant".into());
     }
     let mut auth = crate::make_fido2_authenticator();
+    eprintln!("{}", crate::auth_prompt("derive the unlock secret"));
     Ok(auth.hmac_secret(RP_ID, cred_id, salt, prehash_salt, Some(pin))?)
 }
 
@@ -3039,7 +3055,10 @@ fn create_single_slot_tpm_vault(
 
             let mut hmac_salt = [0u8; 32];
             OsRng.fill_bytes(&mut hmac_salt);
-            eprintln!("{}", crate::auth_prompt("again to derive the FIDO2 half"));
+            eprintln!(
+                "{}",
+                crate::auth_prompt("derive the FIDO2 half (second touch)")
+            );
             let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
             Container::create_with_tpm2_fido2(
@@ -3159,7 +3178,10 @@ fn create_single_slot_tpm_vault(
 
             let mut hmac_salt = [0u8; 32];
             OsRng.fill_bytes(&mut hmac_salt);
-            eprintln!("{}", crate::auth_prompt("again to derive the FIDO2 half"));
+            eprintln!(
+                "{}",
+                crate::auth_prompt("derive the FIDO2 half (second touch)")
+            );
             let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
             let (pk, seed) = keygen_with(params);
@@ -3324,7 +3346,7 @@ fn create_fido2_wrap(
         OsRng.fill_bytes(&mut hmac_salt);
         eprintln!(
             "{}",
-            crate::auth_prompt("again to derive the keyslot secret")
+            crate::auth_prompt("derive the keyslot secret (second touch)")
         );
         let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
@@ -3398,7 +3420,7 @@ fn create_fido2_direct(
         let cred_id = er.credential.id;
         let mut hmac_salt = [0u8; 32];
         OsRng.fill_bytes(&mut hmac_salt);
-        eprintln!("{}", crate::auth_prompt("again to derive the MVK"));
+        eprintln!("{}", crate::auth_prompt("derive the MVK (second touch)"));
         let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
         let mut cont = Container::create_with_fido2_derived_mvk(
@@ -3590,7 +3612,7 @@ fn create_hybrid_pq_fido2(
     OsRng.fill_bytes(&mut hmac_salt);
     eprintln!(
         "{}",
-        crate::auth_prompt("again to derive the keyslot secret")
+        crate::auth_prompt("derive the keyslot secret (second touch)")
     );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
@@ -4612,7 +4634,7 @@ fn collect_fido2_credential_for_rotate(
     OsRng.fill_bytes(&mut new_hmac_salt);
     eprintln!(
         "{}",
-        crate::auth_prompt("again to derive the new wrap secret")
+        crate::auth_prompt("derive the new wrap secret (second touch)")
     );
     let new = auth.hmac_secret(RP_ID, &cred_id, &new_hmac_salt, true, Some(&pin))?;
 
@@ -5302,7 +5324,7 @@ fn update_fido2_in(theme: &ColorfulTheme, c: &mut Container, slot_idx: usize) ->
 
     eprintln!(
         "{}",
-        crate::auth_prompt("again to derive the keyslot secret")
+        crate::auth_prompt("derive the keyslot secret (second touch)")
     );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
@@ -5353,7 +5375,7 @@ fn enroll_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
 
     eprintln!(
         "{}",
-        crate::auth_prompt("again to derive the keyslot secret")
+        crate::auth_prompt("derive the keyslot secret (second touch)")
     );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
@@ -5505,10 +5527,15 @@ fn enroll_tpm2_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> 
 
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
+    eprintln!("{}", crate::auth_prompt("register a new credential"));
     let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
+    eprintln!(
+        "{}",
+        crate::auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let cred = luksbox_core::deniable::DeniableCredential::TpmFido2Passphrase {
@@ -5654,10 +5681,15 @@ fn enroll_hybrid_pq_tpm2_fido2_deniable_into(
 
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
+    eprintln!("{}", crate::auth_prompt("register a new credential"));
     let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
+    eprintln!(
+        "{}",
+        crate::auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let (pk, seed) = keygen_with(params);
@@ -6427,7 +6459,10 @@ fn enroll_tpm2_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()
 
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
-    eprintln!("{}", crate::auth_prompt("again to derive the FIDO2 half"));
+    eprintln!(
+        "{}",
+        crate::auth_prompt("derive the FIDO2 half (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let blob_bytes = blob.to_bytes();
@@ -6605,7 +6640,10 @@ fn enroll_hybrid_pq_tpm2_fido2_into(
 
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
-    eprintln!("{}", crate::auth_prompt("again to derive the FIDO2 half"));
+    eprintln!(
+        "{}",
+        crate::auth_prompt("derive the FIDO2 half (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     eprintln!("generating {level_label} keypair...");
@@ -6885,12 +6923,17 @@ fn enroll_hybrid_pq_fido2_into(
 
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
+    eprintln!("{}", crate::auth_prompt("register a new credential"));
     let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     OsRng
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG: {e}"))?;
+    eprintln!(
+        "{}",
+        crate::auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     eprintln!("generating {level_label} keypair...");
@@ -6999,12 +7042,17 @@ fn enroll_hybrid_pq_fido2_deniable_into(
 
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
+    eprintln!("{}", crate::auth_prompt("register a new credential"));
     let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     OsRng
         .try_fill_bytes(&mut hmac_salt)
         .map_err(|e| format!("OS RNG: {e}"))?;
+    eprintln!(
+        "{}",
+        crate::auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     eprintln!("generating {level_label} keypair...");
@@ -7607,7 +7655,7 @@ fn unlock_via_hybrid_pq_tpm2_fido2(
         };
         eprintln!(
             "{}",
-            crate::auth_prompt(&format!("3-factor unlock (slot {slot_idx})"))
+            crate::auth_prompt(&format!("perform the 3-factor unlock (slot {slot_idx})"))
         );
         let hmac_secret = match auth.hmac_secret(
             RP_ID,
