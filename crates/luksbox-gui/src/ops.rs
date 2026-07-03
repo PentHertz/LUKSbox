@@ -5165,6 +5165,80 @@ mod name_escapes_directory_tests {
 }
 
 #[cfg(test)]
+mod panic_destroy_tests {
+    use super::panic_destroy;
+
+    #[test]
+    fn scrubs_header_and_metadata_mirrors_on_full_wipe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("v.lbx");
+        std::fs::write(&vault, vec![0x11u8; 16384]).unwrap();
+        let header_bak = tmp.path().join("v.lbx.header-bak");
+        let meta_bak = tmp.path().join("v.lbx.meta-bak");
+        let hb_before = vec![0xABu8; 4096];
+        let mb_before = vec![0xCDu8; 2048];
+        std::fs::write(&header_bak, &hb_before).unwrap();
+        std::fs::write(&meta_bak, &mb_before).unwrap();
+        let live_before = std::fs::read(&vault).unwrap();
+
+        // Inline header, full data wipe.
+        panic_destroy(&vault, None, true).unwrap();
+
+        // Regression for the audit finding: `panic_destroy` used to
+        // overwrite only the live header/body and leave `header-bak`
+        // intact, so `Container::open` recovered the keyslots from the
+        // mirror and self-healed the live header, making the "panic"
+        // reversible. Both mirrors must now be scrubbed in full.
+        let hb_after = std::fs::read(&header_bak).unwrap();
+        assert_eq!(hb_after.len(), hb_before.len());
+        assert_ne!(
+            hb_after, hb_before,
+            "GUI panic must scrub the header mirror"
+        );
+        let mb_after = std::fs::read(&meta_bak).unwrap();
+        assert_ne!(
+            mb_after, mb_before,
+            "GUI panic --wipe must scrub the metadata mirror"
+        );
+        assert_ne!(std::fs::read(&vault).unwrap(), live_before);
+    }
+
+    #[test]
+    fn scrubs_header_mirror_but_keeps_metadata_mirror_without_wipe() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("v.lbx");
+        std::fs::write(&vault, vec![0x11u8; 16384]).unwrap();
+        let header_bak = tmp.path().join("v.lbx.header-bak");
+        let meta_bak = tmp.path().join("v.lbx.meta-bak");
+        std::fs::write(&header_bak, vec![0xABu8; 4096]).unwrap();
+        std::fs::write(&meta_bak, vec![0xCDu8; 2048]).unwrap();
+
+        panic_destroy(&vault, None, false).unwrap();
+
+        assert_ne!(
+            std::fs::read(&header_bak).unwrap(),
+            vec![0xABu8; 4096],
+            "header mirror must be scrubbed even without --wipe-data"
+        );
+        assert_eq!(
+            std::fs::read(&meta_bak).unwrap(),
+            vec![0xCDu8; 2048],
+            "metadata mirror is left intact when not wiping data"
+        );
+    }
+
+    #[test]
+    fn tolerates_missing_mirrors() {
+        // A v2 vault, or one that never flushed a mirror, has no
+        // sidecars; panic must still succeed.
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path().join("v.lbx");
+        std::fs::write(&vault, vec![0x11u8; 16384]).unwrap();
+        panic_destroy(&vault, None, false).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod companion_sidecars_tests {
     use super::companion_sidecars;
 
@@ -5299,7 +5373,7 @@ pub fn panic_destroy(
     header_path: Option<&Path>,
     wipe_data: bool,
 ) -> Result<(), String> {
-    use luksbox_core::file_util::secure_open_existing_no_follow;
+    use luksbox_core::file_util::{RecoveryMirrors, secure_open_existing_no_follow};
     // No-follow opens for both targets BEFORE any write, closing
     // the TOCTOU window where a symlink swap in the parent dir
     // could redirect the random-bytes overwrite to an arbitrary
@@ -5320,6 +5394,16 @@ pub fn panic_destroy(
     } else {
         None
     };
+    // Crash-recovery mirror sidecars. `panic` MUST destroy the header
+    // mirror too: otherwise `Container::open` recovers the keyslots
+    // from `<header>.header-bak` and self-heals the live header, so the
+    // "unrecoverable" destruction is trivially reversible. Opened
+    // no-follow up front like the header/body handles; the metadata
+    // mirror is only opened (and later scrubbed) under a full data wipe.
+    let mut mirrors =
+        RecoveryMirrors::open_no_follow(vault, header_target, wipe_data).map_err(|e| {
+            format!("refusing to open a crash-recovery mirror for destructive overwrite: {e}")
+        })?;
     let len_hint = std::fs::metadata(vault).map(|m| m.len()).unwrap_or(0);
 
     let mut buf = [0u8; HEADER_SIZE];
@@ -5327,6 +5411,11 @@ pub fn panic_destroy(
     hf.seek(SeekFrom::Start(0)).map_err(estr)?;
     hf.write_all(&buf).map_err(estr)?;
     hf.flush().map_err(estr)?;
+    // Scrub the recovery mirror(s) in full. Load-bearing: leaving the
+    // header mirror intact makes the whole panic reversible.
+    mirrors
+        .scrub()
+        .map_err(|e| format!("failed to overwrite a crash-recovery mirror: {e}"))?;
     if wipe_data {
         let writer: &mut std::fs::File = vf_opt.as_mut().unwrap_or(&mut hf);
         let len = len_hint;

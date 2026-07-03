@@ -1703,7 +1703,7 @@ fn ask_optional_seed_pw(
 /// vault path, optional sidecar header path, and uses the same shred
 /// procedure as `panic_action`.
 fn panic_by_path(theme: &ColorfulTheme) -> Result<()> {
-    use luksbox_core::file_util::secure_open_existing_no_follow;
+    use luksbox_core::file_util::{RecoveryMirrors, secure_open_existing_no_follow};
     use rand_core::{OsRng, RngCore};
     use std::io::{Seek, SeekFrom, Write};
 
@@ -1743,6 +1743,15 @@ fn panic_by_path(theme: &ColorfulTheme) -> Result<()> {
     } else {
         None
     };
+    // Crash-recovery mirror sidecars, opened no-follow up front and held
+    // across the prompt like the header/vault handles. Destroying the
+    // header mirror is load-bearing: otherwise `Container::open` recovers
+    // the keyslots from `<header>.header-bak` and self-heals the live
+    // header, leaving the vault openable.
+    let mut mirrors =
+        RecoveryMirrors::open_no_follow(&vault, &header_target, wipe_data).map_err(|e| {
+            format!("refusing to open a crash-recovery mirror for destructive overwrite: {e}")
+        })?;
     let len_hint = std::fs::metadata(&vault).map(|m| m.len()).unwrap_or(0);
 
     eprintln!(
@@ -1754,6 +1763,18 @@ fn panic_by_path(theme: &ColorfulTheme) -> Result<()> {
         },
         header_target.display(),
     );
+    if let Some(p) = mirrors.header_mirror_path() {
+        eprintln!(
+            "       ALSO destroying the crash-recovery header mirror {}.",
+            p.display()
+        );
+    }
+    if let Some(p) = mirrors.meta_mirror_path() {
+        eprintln!(
+            "       ALSO overwriting the metadata mirror {}.",
+            p.display()
+        );
+    }
     eprintln!("This is IRREVERSIBLE. There is NO undo.");
     let expected = format!("DESTROY {}", vault.display());
     let typed: String = Input::with_theme(theme)
@@ -1769,6 +1790,11 @@ fn panic_by_path(theme: &ColorfulTheme) -> Result<()> {
     hf.seek(SeekFrom::Start(0))?;
     hf.write_all(&buf)?;
     hf.flush()?;
+    // Load-bearing: scrub the recovery mirror(s) so the panic is not
+    // reversible via `<header>.header-bak`.
+    mirrors
+        .scrub()
+        .map_err(|e| format!("failed to overwrite a crash-recovery mirror: {e}"))?;
     eprintln!("OK header at {} overwritten", header_target.display());
 
     if wipe_data {
@@ -4699,7 +4725,7 @@ fn panic_action(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Result<
         .with_prompt("ALSO overwrite the entire vault data area? (slow; recommended on SSD only as last resort, see SECURITY.md)")
         .default(false)
         .interact()?;
-    use luksbox_core::file_util::secure_open_existing_no_follow;
+    use luksbox_core::file_util::{RecoveryMirrors, secure_open_existing_no_follow};
     use rand_core::{OsRng, RngCore};
     use std::io::{Seek, SeekFrom, Write};
 
@@ -4731,8 +4757,28 @@ fn panic_action(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Result<
     } else {
         None
     };
+    // Crash-recovery mirror sidecars, opened no-follow up front and held
+    // across the prompt. Destroying the header mirror is load-bearing:
+    // otherwise `Container::open` recovers the keyslots from
+    // `<header>.header-bak` and self-heals the live header.
+    let mut mirrors =
+        RecoveryMirrors::open_no_follow(vault, &header_target, wipe_data).map_err(|e| {
+            format!("refusing to open a crash-recovery mirror for destructive overwrite: {e}")
+        })?;
     let len = std::fs::metadata(vault).map(|m| m.len()).unwrap_or(0);
 
+    if let Some(p) = mirrors.header_mirror_path() {
+        eprintln!(
+            "       ALSO destroying the crash-recovery header mirror {}.",
+            p.display()
+        );
+    }
+    if let Some(p) = mirrors.meta_mirror_path() {
+        eprintln!(
+            "       ALSO overwriting the metadata mirror {}.",
+            p.display()
+        );
+    }
     eprintln!("This is IRREVERSIBLE. There is NO undo. There is NO recovery.");
     let expected = format!("DESTROY {}", vault.display());
     let typed: String = Input::with_theme(theme)
@@ -4749,6 +4795,11 @@ fn panic_action(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Result<
     hf.seek(SeekFrom::Start(0))?;
     hf.write_all(&buf)?;
     hf.flush()?;
+    // Load-bearing: scrub the recovery mirror(s) so the panic is not
+    // reversible via `<header>.header-bak`.
+    mirrors
+        .scrub()
+        .map_err(|e| format!("failed to overwrite a crash-recovery mirror: {e}"))?;
     eprintln!(
         "OK header at {} overwritten with random",
         header_target.display()

@@ -66,12 +66,19 @@ Two additional rc.3 audit follow-ups landed in the same release:
   being parsed as helper options in explicit unmounts, signal-triggered
   unmounts, and suspend-triggered unmounts.
 
-### Security: the GUI panic action now destroys crash-recovery sidecars
+### Security: every panic action now destroys the crash-recovery sidecars
 
 `panic` overwrote the vault header but left the `header-bak` and
-`meta-bak` crash-recovery sidecars intact, which made the whole
-destruction reversible by anyone who noticed them. The panic path now
-destroys the recovery sidecars along with the header, and removing a
+`meta-bak` crash-recovery mirrors intact, which made the whole
+destruction reversible: `Container::open` detects the randomized live
+header, recovers the keyslots from `header-bak`, and self-heals the
+live header. The panic path now scrubs the recovery mirrors along with
+the header. This is enforced through one shared
+`luksbox_core::file_util::RecoveryMirrors` helper wired into all three
+frontends (the `panic` CLI subcommand, the TUI wizard's panic and
+destroy-by-path actions, and the GUI panic button), so the guarantee
+can no longer drift between them. The metadata mirror is scrubbed only
+under a full data wipe, matching the live metadata region. Removing a
 vault from the GUI also cleans up its side files instead of leaving
 them behind.
 
