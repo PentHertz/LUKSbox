@@ -128,6 +128,15 @@ struct UnlockArgs {
     /// `--fido2` alone (key-bound).
     #[arg(long = "tpm2-fido2")]
     tpm2_fido2: bool,
+    /// Unlock via the local macOS Secure Enclave (SEP). Iterates the
+    /// vault's Secure Enclave keyslots, asks the SEP to unseal each
+    /// blob (prompting for Touch ID on biometric slots), and the
+    /// first one whose KEK unwraps the MVK wins. macOS-only at
+    /// runtime; on other platforms the flag exists but errors
+    /// cleanly. Pair with `--pq-hybrid` to open a hybrid SEP + ML-KEM
+    /// slot.
+    #[arg(long)]
+    sep: bool,
     /// Path to a detached-header sidecar file. If unset, the header is read
     /// from offset 0 of the vault file (inline default). With `--header`
     /// set, the vault file alone is indistinguishable from random, no
@@ -275,6 +284,75 @@ enum SlotKindArg {
     /// ML-KEM-1024 variant of `HybridPqTpm2Fido2`. NIST Cat-5
     /// 3-factor maximum-paranoia.
     HybridPqTpm2Fido21024,
+    /// macOS Secure Enclave keyslot bound to the local machine. The
+    /// wrap key is derived inside the Secure Enclave (SEP); no
+    /// passphrase is involved. Like `tpm2`, the vault becomes
+    /// uncrackable if its file is stolen separately from this Mac,
+    /// but loses portability (won't unlock on any other machine).
+    /// For portability + recovery, enroll a Passphrase or FIDO2 slot
+    /// alongside it. macOS-only at runtime; requires `--features
+    /// hardware`.
+    Sep,
+    /// macOS Secure Enclave keyslot gated by Touch ID / biometry.
+    /// Same as `Sep` (machine-bound, no passphrase) but the SEP
+    /// refuses to unseal without a successful user-presence /
+    /// biometric check at every unlock. Loss of the Mac permanently
+    /// kills this slot - keep a recovery slot.
+    SepBiometric,
+    /// Hybrid Secure Enclave + ML-KEM-768 (post-quantum). Closes the
+    /// quantum gap in plain `sep`: the SEP's wrap is ECC P-256
+    /// (quantum-broken), so a CRQC adversary who stole the vault
+    /// file + the SEP's public key could break the wrap. Adding
+    /// ML-KEM means they also need the Kyber seed file. Requires
+    /// `--pq-hybrid <kyber-secret>` at every unlock.
+    HybridPqSep,
+    /// ML-KEM-1024 variant of `HybridPqSep`. Same 2-factor shape
+    /// (Secure Enclave + Kyber seed) but uses the NIST Cat-5 /
+    /// ~AES-256 PQ parameter set.
+    HybridPqSep1024,
+    /// Fused Secure Enclave + FIDO2 keyslot: unlock requires BOTH the
+    /// local Secure Enclave AND a connected FIDO2 authenticator. Loss
+    /// of either factor permanently kills the slot. macOS-only.
+    SepFido2,
+    /// Fused Secure Enclave + Argon2id passphrase keyslot: unlock
+    /// requires BOTH the local Secure Enclave AND a passphrase. The
+    /// passphrase adds a portable recovery factor on top of the
+    /// machine-bound SEP. macOS-only.
+    SepPassphrase,
+    /// Fused Secure Enclave + FIDO2 + passphrase keyslot: all three
+    /// factors required at every unlock. macOS-only.
+    ///
+    /// Not user-selectable (`#[value(skip)]`): a slot takes FIDO2 OR a
+    /// passphrase as the extra factor, never both (the second is
+    /// redundant). Kept as a variant so vaults already created with
+    /// this kind still open and display.
+    #[value(skip)]
+    SepFido2Passphrase,
+    /// Hybrid Secure Enclave + FIDO2 + ML-KEM-768. Adds the
+    /// post-quantum Kyber seed factor to `sep-fido2`. Requires
+    /// `--pq-hybrid <kyber-secret>` at every unlock. macOS-only.
+    HybridPqSepFido2,
+    /// ML-KEM-1024 variant of `HybridPqSepFido2`. macOS-only.
+    HybridPqSepFido21024,
+    /// Hybrid Secure Enclave + passphrase + ML-KEM-768. Adds the
+    /// post-quantum Kyber seed factor to `sep-passphrase`. Requires
+    /// `--pq-hybrid <kyber-secret>` at every unlock. macOS-only.
+    HybridPqSepPassphrase,
+    /// ML-KEM-1024 variant of `HybridPqSepPassphrase`. macOS-only.
+    HybridPqSepPassphrase1024,
+    /// Hybrid Secure Enclave + FIDO2 + passphrase + ML-KEM-768:
+    /// maximum-paranoia macOS slot, four independent factors required
+    /// at every unlock. Requires `--pq-hybrid <kyber-secret>`.
+    /// macOS-only.
+    ///
+    /// Not user-selectable (`#[value(skip)]`): the FIDO2 + passphrase
+    /// pairing is redundant (pick one). Kept so existing vaults open.
+    #[value(skip)]
+    HybridPqSepFido2Passphrase,
+    /// ML-KEM-1024 variant of `HybridPqSepFido2Passphrase`. macOS-only.
+    /// Not user-selectable (`#[value(skip)]`), same reason. Kept for open.
+    #[value(skip)]
+    HybridPqSepFido2Passphrase1024,
 }
 
 impl SlotKindArg {
@@ -294,6 +372,21 @@ impl SlotKindArg {
             SlotKind::HybridPqKemTpm2Fido2 => Some(Self::HybridPqTpm2Fido2),
             SlotKind::HybridPqKem1024Tpm2 => Some(Self::HybridPqTpm21024),
             SlotKind::HybridPqKem1024Tpm2Fido2 => Some(Self::HybridPqTpm2Fido21024),
+            SlotKind::SepSealed => Some(Self::Sep),
+            SlotKind::SepSealedBiometric => Some(Self::SepBiometric),
+            SlotKind::HybridPqKemSep => Some(Self::HybridPqSep),
+            SlotKind::HybridPqKem1024Sep => Some(Self::HybridPqSep1024),
+            SlotKind::SepFido2 => Some(Self::SepFido2),
+            SlotKind::SepPassphrase => Some(Self::SepPassphrase),
+            SlotKind::SepFido2Passphrase => Some(Self::SepFido2Passphrase),
+            SlotKind::HybridPqKemSepFido2 => Some(Self::HybridPqSepFido2),
+            SlotKind::HybridPqKem1024SepFido2 => Some(Self::HybridPqSepFido21024),
+            SlotKind::HybridPqKemSepPassphrase => Some(Self::HybridPqSepPassphrase),
+            SlotKind::HybridPqKem1024SepPassphrase => Some(Self::HybridPqSepPassphrase1024),
+            SlotKind::HybridPqKemSepFido2Passphrase => Some(Self::HybridPqSepFido2Passphrase),
+            SlotKind::HybridPqKem1024SepFido2Passphrase => {
+                Some(Self::HybridPqSepFido2Passphrase1024)
+            }
             SlotKind::Empty => None,
         }
     }
@@ -406,7 +499,14 @@ enum Command {
         format: VaultFormatArg,
     },
     /// Show container header / keyslot summary (no unlock required).
-    Info { path: PathBuf },
+    Info {
+        path: PathBuf,
+        /// Read the header from a detached-header sidecar (a vault
+        /// created with `create --header <file>` has no header in the
+        /// .lbx itself).
+        #[arg(long)]
+        header: Option<PathBuf>,
+    },
     /// Add a new keyslot. `--kind` selects what kind to enroll (passphrase
     /// or fido2). `--fido2` selects how to authenticate to the existing
     /// vault, useful if you've revoked the original passphrase and only
@@ -745,10 +845,14 @@ enum Command {
         unlock: UnlockArgs,
     },
     /// ANTI-FORENSICS PANIC: irreversibly destroy a vault by overwriting
-    /// its header with random bytes. Without the header (or its backup),
-    /// the vault is mathematically unrecoverable, no keyslots to attack,
-    /// no MVK material left. Optionally also overwrites the entire vault
-    /// file. Requires explicit confirmation. There is NO undo.
+    /// its header AND its v3 crash-recovery mirror (`<header>.header-bak`)
+    /// with random bytes. Destroying both is required: with the mirror
+    /// left intact, `open` silently recovers the keyslots from it (and
+    /// self-heals the live header), so the vault would stay openable.
+    /// Afterwards there are no keyslots to attack and no MVK material
+    /// left. `--wipe-data` additionally overwrites the entire vault file
+    /// and the metadata mirror (`<vault>.meta-bak`). Requires explicit
+    /// confirmation. There is NO undo.
     Panic {
         path: PathBuf,
         /// If the vault uses a detached header sidecar, point at it here
@@ -1022,6 +1126,22 @@ pub(crate) fn auth_prompt(action: &str) -> String {
     }
 }
 
+/// Sentence describing what an EMPTY secret at `prompt` would mean.
+/// The .kyber seed-file prompts get seed-specific wording (the classic
+/// "anyone with this vault file" phrasing is wrong for a seed file);
+/// everything else keeps the vault wording. Shared by the CLI's
+/// `read_passphrase_confirmed` and the wizard's `ask_new_passphrase`.
+pub(crate) fn empty_passphrase_warning(prompt: &str) -> &'static str {
+    if prompt.to_ascii_lowercase().contains("seed-file") {
+        "The seed-file passphrase is EMPTY. ANYONE who gets a copy of the \
+         .kyber seed file can use it as the post-quantum unlock factor \
+         without any secret."
+    } else {
+        "The passphrase is EMPTY. ANYONE with this vault file will be able \
+         to open it."
+    }
+}
+
 #[cfg(feature = "hardware")]
 pub(crate) fn make_fido2_authenticator() -> luksbox_fido2::HidAuthenticator {
     let path = FIDO2_DEVICE_OVERRIDE.lock().ok().and_then(|g| g.clone());
@@ -1126,7 +1246,7 @@ fn dispatch(cli: Cli) -> Result<()> {
                 format,
             )
         }
-        Command::Info { path } => cmd_info(&path),
+        Command::Info { path, header } => cmd_info(&path, header.as_deref()),
         Command::Enroll { path, unlock, kind } => match kind {
             SlotKindArg::Passphrase => cmd_enroll_passphrase(&path, &unlock),
             SlotKindArg::Fido2 => cmd_enroll_fido2(&path, &unlock),
@@ -1138,6 +1258,35 @@ fn dispatch(cli: Cli) -> Result<()> {
             SlotKindArg::HybridPqTpm21024 => cmd_enroll_hybrid_pq_tpm2(&path, &unlock, 1024),
             SlotKindArg::HybridPqTpm2Fido21024 => {
                 cmd_enroll_hybrid_pq_tpm2_fido2(&path, &unlock, 1024)
+            }
+            SlotKindArg::Sep => cmd_enroll_sep(&path, &unlock, false),
+            SlotKindArg::SepBiometric => cmd_enroll_sep(&path, &unlock, true),
+            SlotKindArg::HybridPqSep => cmd_enroll_hybrid_pq_sep(&path, &unlock, 768),
+            SlotKindArg::HybridPqSep1024 => cmd_enroll_hybrid_pq_sep(&path, &unlock, 1024),
+            SlotKindArg::SepFido2 => cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2, None),
+            SlotKindArg::SepPassphrase => {
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Passphrase, None)
+            }
+            SlotKindArg::SepFido2Passphrase => {
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2Passphrase, None)
+            }
+            SlotKindArg::HybridPqSepFido2 => {
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2, Some(768))
+            }
+            SlotKindArg::HybridPqSepFido21024 => {
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2, Some(1024))
+            }
+            SlotKindArg::HybridPqSepPassphrase => {
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Passphrase, Some(768))
+            }
+            SlotKindArg::HybridPqSepPassphrase1024 => {
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Passphrase, Some(1024))
+            }
+            SlotKindArg::HybridPqSepFido2Passphrase => {
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2Passphrase, Some(768))
+            }
+            SlotKindArg::HybridPqSepFido2Passphrase1024 => {
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2Passphrase, Some(1024))
             }
             SlotKindArg::HybridPq => Err(
                 "hybrid-pq slots can only be created at vault creation time \
@@ -2319,10 +2468,7 @@ fn read_passphrase_confirmed(prompt: &str) -> io::Result<Zeroizing<String>> {
             && a.is_empty()
             && std::env::var_os("LUKSBOX_ACCEPT_EMPTY").is_none()
         {
-            eprintln!(
-                "warning: the passphrase is EMPTY. ANYONE with this vault file \
-                 will be able to open it."
-            );
+            eprintln!("warning: {}", empty_passphrase_warning(prompt));
             let proceed = dialoguer::Confirm::new()
                 .with_prompt("Use the empty passphrase anyway?")
                 .default(false)
@@ -2438,19 +2584,36 @@ fn open_container(path: &Path, unlock: &UnlockArgs) -> Result<Container> {
             .keyslots
             .iter()
             .any(|s| s.kind.is_hybrid_pq_passphrase());
-        let has_tpm_hybrid = header
+        let has_tpm_hybrid = header.keyslots.iter().any(|s| {
+            matches!(
+                s.kind,
+                SlotKind::HybridPqKemTpm2 | SlotKind::HybridPqKem1024Tpm2
+            )
+        });
+        let has_tpm_fido_hybrid = header.keyslots.iter().any(|s| {
+            matches!(
+                s.kind,
+                SlotKind::HybridPqKemTpm2Fido2 | SlotKind::HybridPqKem1024Tpm2Fido2
+            )
+        });
+        let has_sep_hybrid = header
             .keyslots
             .iter()
-            .any(|s| s.kind == SlotKind::HybridPqKemTpm2);
-        let has_tpm_fido_hybrid = header
-            .keyslots
-            .iter()
-            .any(|s| s.kind == SlotKind::HybridPqKemTpm2Fido2);
+            .any(|s| s.kind.is_sep() && s.kind.is_hybrid_pq());
 
-        if unlock.tpm2_fido2 && has_tpm_fido_hybrid {
+        if unlock.sep && has_sep_hybrid {
+            open_container_hybrid_pq_sep(path, unlock.header.as_deref(), kp, unlock.fido2)
+        } else if unlock.tpm2_fido2 && has_tpm_fido_hybrid {
             open_container_hybrid_pq_tpm2_fido2(path, unlock.header.as_deref(), kp)
         } else if unlock.tpm2 && has_tpm_hybrid {
             open_container_hybrid_pq_tpm2(path, unlock.header.as_deref(), kp)
+        } else if has_sep_hybrid
+            && !has_tpm_fido_hybrid
+            && !has_fido_hybrid
+            && !has_pp_hybrid
+            && !has_tpm_hybrid
+        {
+            open_container_hybrid_pq_sep(path, unlock.header.as_deref(), kp, unlock.fido2)
         } else if has_tpm_fido_hybrid && !has_fido_hybrid && !has_pp_hybrid && !has_tpm_hybrid {
             open_container_hybrid_pq_tpm2_fido2(path, unlock.header.as_deref(), kp)
         } else if has_tpm_hybrid && !has_fido_hybrid && !has_pp_hybrid {
@@ -2462,6 +2625,8 @@ fn open_container(path: &Path, unlock: &UnlockArgs) -> Result<Container> {
         } else {
             Err("--pq-hybrid given but the vault has no hybrid keyslot".into())
         }
+    } else if unlock.sep {
+        open_container_sep(path, unlock.header.as_deref(), unlock.fido2)
     } else if unlock.tpm2_fido2 {
         open_container_tpm2_fido2(path, unlock.header.as_deref())
     } else if unlock.tpm2 {
@@ -2509,18 +2674,45 @@ fn pick_unlock_suggestion(keyslots: &[luksbox_core::Keyslot]) -> &'static str {
             SlotKind::Fido2HmacSecret | SlotKind::Fido2DerivedMvk
         )
     });
-    let any_tpm2 = keyslots.iter().any(|s| s.kind == SlotKind::Tpm2Sealed);
+    let any_tpm2 = keyslots
+        .iter()
+        .any(|s| matches!(s.kind, SlotKind::Tpm2Sealed | SlotKind::Tpm2SealedPin));
     let any_tpm2_fido = keyslots.iter().any(|s| s.kind == SlotKind::Tpm2Fido2);
+    let any_sep = keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && !s.kind.is_hybrid_pq());
+    let any_sep_fido2 = keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && s.kind.is_sep_fido2() && !s.kind.is_hybrid_pq());
+    let any_sep_hybrid = keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && s.kind.is_hybrid_pq());
+    let any_sep_hybrid_fido2 = keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && s.kind.is_sep_fido2() && s.kind.is_hybrid_pq());
     let any_hybrid = keyslots.iter().any(|s| {
         s.kind.is_hybrid_pq_passphrase()
             || s.kind.is_hybrid_pq_fido2()
-            || s.kind == SlotKind::HybridPqKemTpm2
-            || s.kind == SlotKind::HybridPqKemTpm2Fido2
+            || matches!(
+                s.kind,
+                SlotKind::HybridPqKemTpm2
+                    | SlotKind::HybridPqKem1024Tpm2
+                    | SlotKind::HybridPqKemTpm2Fido2
+                    | SlotKind::HybridPqKem1024Tpm2Fido2
+            )
     });
     if any_tpm2_fido {
         "--tpm2-fido2"
     } else if any_tpm2 {
         "--tpm2"
+    } else if any_sep_hybrid_fido2 {
+        "--sep --fido2 --pq-hybrid <PATH-TO-.kyber>"
+    } else if any_sep_hybrid {
+        "--sep --pq-hybrid <PATH-TO-.kyber>"
+    } else if any_sep_fido2 {
+        "--sep --fido2"
+    } else if any_sep {
+        "--sep"
     } else if any_fido2 {
         "--fido2"
     } else if any_hybrid {
@@ -2932,6 +3124,294 @@ fn open_container_tpm2(_path: &Path, _header_path: Option<&Path>) -> Result<Cont
     )
 }
 
+/// Open a vault sealed with a macOS Secure Enclave keyslot. Mirrors
+/// `open_container_tpm2`: pre-scans the header for any in-scope SEP
+/// slot (plain or biometric), then hands `Container::open` an unseal
+/// closure backed by `SepSealer`. The SEP itself prompts for Touch
+/// ID on biometric slots. The container reads each slot's SEP blob
+/// from the in-header SEP region and feeds it to the closure.
+#[cfg(feature = "hardware")]
+fn open_container_sep(path: &Path, header_path: Option<&Path>, fido2: bool) -> Result<Container> {
+    // Pre-scan the header to detect "no SEP slots" before we open the
+    // Secure Enclave. This covers the NON-hybrid SEP kinds (plain,
+    // biometric, +FIDO2, +passphrase, +FIDO2+passphrase); the hybrid
+    // kinds route through `open_container_hybrid_pq_sep` via
+    // `--pq-hybrid`.
+    let header_src = header_path.unwrap_or(path);
+    let mut f = luksbox_core::file_util::open_existing_read_no_follow_policy(header_src)?;
+    let mut header_bytes = [0u8; HEADER_SIZE];
+    f.read_exact(&mut header_bytes)?;
+    drop(f);
+    let header = Header::from_bytes(&header_bytes)?;
+    let has_plain_slot = header
+        .keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && !s.kind.is_hybrid_pq());
+    if !has_plain_slot {
+        return Err(
+            "vault has no (non-hybrid) Secure Enclave keyslot; enroll one first with \
+             `luksbox enroll <vault> --kind sep[-biometric|-fido2|-passphrase|-fido2-passphrase]`, \
+             or unlock via passphrase / FIDO2 / --pq-hybrid instead."
+                .into(),
+        );
+    }
+    open_sep_common(path, header_path, &header, fido2, None)
+}
+
+/// Shared SEP open loop for both the non-hybrid (`open_container_sep`)
+/// and hybrid (`open_container_hybrid_pq_sep`) paths. Iterates every
+/// SEP keyslot, collects whichever extra factors the slot's kind
+/// requires (FIDO2 hmac-secret derived from the slot's stored cred_id
+/// and salt; passphrase prompted once), and hands `Container::open` an
+/// `UnlockMaterial::Sep` whose factor set matches the slot so the
+/// format dispatcher selects it. `pq_shared_for` supplies the ML-KEM
+/// shared secret per slot index for hybrid kinds (None = no PQ).
+#[cfg(feature = "hardware")]
+fn open_sep_common(
+    path: &Path,
+    header_path: Option<&Path>,
+    header: &Header,
+    fido2: bool,
+    pq_shared_for: Option<&dyn Fn(usize) -> Option<[u8; 32]>>,
+) -> Result<Container> {
+    use luksbox_sep::{SepBlob, SepSealer};
+
+    // Does any in-scope SEP slot need a passphrase? If so, prompt once
+    // up-front and reuse it for every passphrase-bearing slot.
+    let want_pq = pq_shared_for.is_some();
+    let needs_pp = header
+        .keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && s.kind.is_sep_passphrase() && s.kind.is_hybrid_pq() == want_pq);
+    let passphrase = if needs_pp {
+        Some(read_passphrase("slot passphrase: ")?)
+    } else {
+        None
+    };
+
+    // FIDO2: open the authenticator + collect the PIN once if any
+    // in-scope slot is a SEP+FIDO2 kind AND the user asked for it via
+    // --fido2 (FIDO2 slots are skipped otherwise; see the hint below).
+    let any_fido2_slot = header
+        .keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && s.kind.is_sep_fido2() && s.kind.is_hybrid_pq() == want_pq);
+    let collect_fido2 = any_fido2_slot && fido2;
+
+    let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
+    let fido2_pin = if collect_fido2 {
+        Some(read_fido2_pin()?)
+    } else {
+        None
+    };
+    let mut last_err: Option<String> = None;
+
+    for (idx, slot) in header.keyslots.iter().enumerate() {
+        if !slot.kind.is_sep() {
+            continue;
+        }
+        // Only attempt slots whose hybrid-ness matches this path.
+        if slot.kind.is_hybrid_pq() != want_pq {
+            continue;
+        }
+        // Skip FIDO2 slots when the user didn't ask to collect FIDO2.
+        if slot.kind.is_sep_fido2() && !collect_fido2 {
+            continue;
+        }
+        // Biometric slots make the Secure Enclave prompt for Touch ID /
+        // passcode at unseal. This works from an interactive terminal
+        // (the prompt is presented by the system); give a heads-up so
+        // the user knows to authenticate. (A non-interactive / detached
+        // run can't authenticate and will simply fail this slot.)
+        if slot.kind.is_sep_biometric() {
+            eprintln!(
+                "slot {idx}: Secure Enclave biometric keyslot - authenticate \
+                 (Touch ID / passcode) when prompted..."
+            );
+        }
+
+        // PQ shared secret for this slot (hybrid kinds only).
+        let pq = match (want_pq, pq_shared_for) {
+            (true, Some(f)) => match f(idx) {
+                Some(s) => Some(s),
+                None => {
+                    last_err = Some(format!("no ML-KEM shared secret for slot {idx}"));
+                    continue;
+                }
+            },
+            _ => None,
+        };
+
+        // FIDO2 hmac-secret for this slot, derived from the slot's own
+        // stored cred_id + hmac_salt (same as tpm2-fido2). The PIN was
+        // collected once above to front-load the prompt.
+        let hmac_secret = if slot.kind.is_sep_fido2() {
+            let pin = fido2_pin
+                .as_ref()
+                .expect("collect_fido2 implies a collected PIN");
+            match sep_fido2_hmac_for_slot(slot, pin) {
+                Ok(hs) => Some(hs),
+                Err(e) => {
+                    last_err = Some(format!("FIDO2 slot {idx}: {e}"));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let mut unseal = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
+            let sb = SepBlob::from_bytes(blob).map_err(|e| e.to_string())?;
+            let s = sealer.unseal(&sb).map_err(|e| e.to_string())?;
+            let mut out = [0u8; 32];
+            out.copy_from_slice(s.as_slice());
+            Ok(out)
+        };
+
+        match Container::open(
+            path,
+            header_path,
+            UnlockMaterial::Sep {
+                unseal: &mut unseal,
+                hmac_secret: hmac_secret.as_ref(),
+                // Per-slot: only passphrase-bearing kinds get the
+                // passphrase. Feeding it to a plain SEP slot would make
+                // the format layer skip that slot (factor-set mismatch).
+                passphrase: if slot.kind.is_sep_passphrase() {
+                    passphrase.as_ref().map(|p| p.as_bytes())
+                } else {
+                    None
+                },
+                pq_shared: pq.as_ref(),
+            },
+        ) {
+            Ok(c) => return Ok(c),
+            Err(e) => last_err = Some(format!("open slot {idx}: {e}")),
+        }
+    }
+    Err(last_err
+        .unwrap_or_else(|| {
+            if any_fido2_slot && !fido2 {
+                "the matching Secure Enclave keyslots need a FIDO2 authenticator; \
+                 re-run with --fido2"
+                    .into()
+            } else {
+                "no Secure Enclave keyslot matched the supplied factors".into()
+            }
+        })
+        .into())
+}
+
+/// Derive the FIDO2 hmac-secret half for a SEP+FIDO2 slot from the
+/// slot's stored cred_id + hmac_salt. Mirrors the per-slot logic in
+/// `open_container_tpm2_fido2`, including the salt-prehash convention
+/// retry on platforms where the transform is opaque.
+#[cfg(feature = "hardware")]
+fn sep_fido2_hmac_for_slot(
+    slot: &luksbox_core::Keyslot,
+    pin: &str,
+) -> std::result::Result<[u8; 32], String> {
+    use luksbox_fido2::{Fido2Authenticator, RP_ID};
+    let cred = &slot.fido2_cred_id;
+    if cred.is_empty() {
+        return Err("SEP+FIDO2 slot has no stored cred_id".into());
+    }
+    let mut auth = make_fido2_authenticator();
+    eprintln!(
+        "{}",
+        auth_prompt(&format!(
+            "unlock the fused SEP+FIDO2 slot (cred_id len {} B)",
+            cred.len()
+        ))
+    );
+    let mut last: Option<String> = None;
+    for prehash in fido2_salt_conventions(slot.fido2_salt_prehashed()) {
+        match auth.hmac_secret(RP_ID, cred, &slot.fido2_hmac_salt, prehash, Some(pin)) {
+            Ok(hs) => return Ok(*hs),
+            Err(e) => last = Some(format!("FIDO2: {e}")),
+        }
+    }
+    Err(last.unwrap_or_else(|| "FIDO2 hmac-secret derivation failed".into()))
+}
+
+#[cfg(not(feature = "hardware"))]
+fn open_container_sep(
+    _path: &Path,
+    _header_path: Option<&Path>,
+    _fido2: bool,
+) -> Result<Container> {
+    Err(
+        "Secure Enclave support not compiled in (rebuild with --features hardware). \
+         Secure Enclave keyslots only work on macOS hardware with a Secure Enclave."
+            .into(),
+    )
+}
+
+/// Open a vault sealed with a hybrid Secure Enclave + ML-KEM
+/// keyslot. Mirrors `open_container_hybrid_pq_tpm2`: reads the Kyber
+/// seed file + `.lbx.hybrid` sidecar, decapsulates per slot to get
+/// the ML-KEM shared secret, then combines it with the SEP unseal in
+/// `UnlockMaterial::Sep { pq_shared: Some(..) }`.
+#[cfg(feature = "hardware")]
+fn open_container_hybrid_pq_sep(
+    path: &Path,
+    header_path: Option<&Path>,
+    kyber_path: &Path,
+    fido2: bool,
+) -> Result<Container> {
+    use luksbox_format::hybrid_sidecar;
+    use luksbox_pq::seed_file;
+
+    let header_src = header_path.unwrap_or(path);
+    let mut f = luksbox_core::file_util::open_existing_read_no_follow_policy(header_src)?;
+    let mut header_bytes = [0u8; HEADER_SIZE];
+    f.read_exact(&mut header_bytes)?;
+    drop(f);
+    let header = Header::from_bytes(&header_bytes)?;
+
+    if !header
+        .keyslots
+        .iter()
+        .any(|s| s.kind.is_sep() && s.kind.is_hybrid_pq())
+    {
+        return Err(
+            "vault has no hybrid Secure Enclave + ML-KEM keyslot; enroll one with \
+             `luksbox enroll <vault> --kind hybrid-pq-sep[-fido2|-passphrase|...]`."
+                .into(),
+        );
+    }
+
+    let seed_pw = read_passphrase(".kyber seed-file passphrase: ")?;
+    let seed = seed_file::read(kyber_path, seed_pw.as_bytes())
+        .map_err(|e| format!("read kyber seed: {e}"))?;
+    let sidecar_path = hybrid_sidecar::sidecar_path(path);
+    // v3 vault-binding verification (see `read_for_vault` doc).
+    let entries = hybrid_sidecar::read_for_vault(&sidecar_path, path, header_path)
+        .map_err(|e| format!("read hybrid sidecar at {}: {e}", sidecar_path.display()))?;
+
+    // Per-slot ML-KEM decapsulation: look up the slot's sidecar entry,
+    // decapsulate to the shared secret. Memoized into a closure so
+    // open_sep_common can pull the right pq_shared per slot index.
+    let decap = |idx: usize| -> Option<[u8; 32]> {
+        let entry = hybrid_sidecar::find(&entries, idx as u8)?;
+        luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext)
+            .ok()
+            .map(|z| *z)
+    };
+
+    open_sep_common(path, header_path, &header, fido2, Some(&decap))
+}
+
+#[cfg(not(feature = "hardware"))]
+fn open_container_hybrid_pq_sep(
+    _path: &Path,
+    _header_path: Option<&Path>,
+    _kyber_path: &Path,
+    _fido2: bool,
+) -> Result<Container> {
+    Err("hybrid-pq-sep unlock requires --features hardware (macOS Secure Enclave).".into())
+}
+
 /// Open a vault sealed with a fused TPM + FIDO2 keyslot. Iterates
 /// the vault's `Tpm2Fido2` slots, tries each one whose stored
 /// cred_id matches a connected FIDO2 authenticator, and asks both
@@ -3087,7 +3567,10 @@ fn open_container_hybrid_pq_tpm2(
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
     let mut last_err: Option<String> = None;
     for (slot_idx_usize, slot) in header.keyslots.iter().enumerate() {
-        if slot.kind != SlotKind::HybridPqKemTpm2 {
+        if !matches!(
+            slot.kind,
+            SlotKind::HybridPqKemTpm2 | SlotKind::HybridPqKem1024Tpm2
+        ) {
             continue;
         }
         let slot_idx = slot_idx_usize as u8;
@@ -3178,7 +3661,10 @@ fn open_container_hybrid_pq_tpm2_fido2(
     let mut auth = make_fido2_authenticator();
     let mut last_err: Option<String> = None;
     for (slot_idx_usize, slot) in header.keyslots.iter().enumerate() {
-        if slot.kind != SlotKind::HybridPqKemTpm2Fido2 {
+        if !matches!(
+            slot.kind,
+            SlotKind::HybridPqKemTpm2Fido2 | SlotKind::HybridPqKem1024Tpm2Fido2
+        ) {
             continue;
         }
         let slot_idx = slot_idx_usize as u8;
@@ -3202,7 +3688,7 @@ fn open_container_hybrid_pq_tpm2_fido2(
         };
         eprintln!(
             "{}",
-            auth_prompt(&format!("3-factor unlock (slot {slot_idx})"))
+            auth_prompt(&format!("perform the 3-factor unlock (slot {slot_idx})"))
         );
         // Declared salt convention first, then (Windows) the opposite,
         // because webauthn.dll's salt transform is opaque.
@@ -3442,6 +3928,32 @@ fn cmd_create(
                     .into(),
             );
         }
+        SlotKindArg::Sep
+        | SlotKindArg::SepBiometric
+        | SlotKindArg::HybridPqSep
+        | SlotKindArg::HybridPqSep1024
+        | SlotKindArg::SepFido2
+        | SlotKindArg::SepPassphrase
+        | SlotKindArg::SepFido2Passphrase
+        | SlotKindArg::HybridPqSepFido2
+        | SlotKindArg::HybridPqSepFido21024
+        | SlotKindArg::HybridPqSepPassphrase
+        | SlotKindArg::HybridPqSepPassphrase1024
+        | SlotKindArg::HybridPqSepFido2Passphrase
+        | SlotKindArg::HybridPqSepFido2Passphrase1024 => {
+            // Same constraint as the TPM kinds: a Secure Enclave slot
+            // needs an existing MVK to seal under, so it can't be the
+            // first slot. Create with passphrase / FIDO2, then enroll.
+            return Err(
+                "Secure Enclave keyslots cannot be the first slot at create time. \
+                 Create the vault with --kind passphrase (or fido2), then add \
+                 the SEP-bound slot via `luksbox enroll <vault> --kind sep` (or \
+                 `sep-biometric` / `sep-fido2` / `sep-passphrase` / `hybrid-pq-sep*`). \
+                 Keep the original slot as a recovery path - SEP slots die \
+                 permanently if the Mac is lost."
+                    .into(),
+            );
+        }
         SlotKindArg::HybridPq => create_hybrid_pq_with_params(
             path,
             header_path,
@@ -3656,7 +4168,10 @@ fn create_hybrid_pq_fido2_with_params(
     let cred_id = er.credential.id;
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
-    eprintln!("{}", auth_prompt("again to derive the keyslot secret"));
+    eprintln!(
+        "{}",
+        auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let (pk, kyber_seed) = keygen_with(params);
@@ -3752,7 +4267,10 @@ fn create_fido2(
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
 
-    eprintln!("{}", auth_prompt("again to derive the keyslot secret"));
+    eprintln!(
+        "{}",
+        auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let cont = Container::create_with_fido2_flags(
@@ -3810,7 +4328,10 @@ fn create_fido2_direct(
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
 
-    eprintln!("{}", auth_prompt("again to derive the keyslot secret"));
+    eprintln!(
+        "{}",
+        auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let cont = Container::create_with_fido2_derived_mvk(
@@ -3833,11 +4354,21 @@ fn create_fido2_direct(
     Err("FIDO2 hardware support not compiled in (rebuild with --features hardware)".into())
 }
 
-fn cmd_info(path: &Path) -> Result<()> {
-    let mut f = File::open(path)?;
+fn cmd_info(path: &Path, header_path: Option<&Path>) -> Result<()> {
+    let header_src = header_path.unwrap_or(path);
+    let mut f = File::open(header_src)?;
     let mut buf = [0u8; HEADER_SIZE];
     f.read_exact(&mut buf)?;
-    let h = Header::from_bytes(&buf)?;
+    let h = Header::from_bytes(&buf).map_err(|e| {
+        if header_path.is_none() {
+            cli_err!(
+                "{e}. If this vault was created with a detached header \
+                 (`create --header <file>`), pass `--header <file>`."
+            )
+        } else {
+            e.into()
+        }
+    })?;
     println!("container: {}", path.display());
     println!("  cipher:        {:?}", h.cipher_suite);
     println!("  chunk size:    {} bytes", h.chunk_size);
@@ -3996,6 +4527,58 @@ fn cmd_info(path: &Path) -> Result<()> {
                      sealed_blob {blob_len} B; both factors required)"
                 );
             }
+            SlotKind::SepSealed | SlotKind::SepSealedBiometric => {
+                let bio = if s.kind == SlotKind::SepSealedBiometric {
+                    " + biometry"
+                } else {
+                    ""
+                };
+                println!("  {i}: secure-enclave{bio} (macOS; SEP material in-header)");
+            }
+            SlotKind::HybridPqKemSep | SlotKind::HybridPqKem1024Sep => {
+                let level = if s.kind == SlotKind::HybridPqKem1024Sep {
+                    "ML-KEM-1024"
+                } else {
+                    "ML-KEM-768"
+                };
+                println!(
+                    "  {i}: hybrid-pq-sep (macOS Secure Enclave + {level}; \
+                     SEP material in-header, ML-KEM in .lbx.hybrid)"
+                );
+            }
+            SlotKind::SepFido2 => {
+                println!("  {i}: secure-enclave + FIDO2 (macOS; SEP material in-header)")
+            }
+            SlotKind::HybridPqKemSepFido2 => println!(
+                "  {i}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + ML-KEM-768; \
+                 SEP material in-header, ML-KEM in .lbx.hybrid)"
+            ),
+            SlotKind::HybridPqKem1024SepFido2 => println!(
+                "  {i}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + ML-KEM-1024; \
+                 SEP material in-header, ML-KEM in .lbx.hybrid)"
+            ),
+            SlotKind::SepPassphrase => {
+                println!("  {i}: secure-enclave + passphrase (macOS; SEP material in-header)")
+            }
+            SlotKind::HybridPqKemSepPassphrase => println!(
+                "  {i}: hybrid-pq-sep (macOS Secure Enclave + passphrase + ML-KEM-768; \
+                 SEP material in-header, ML-KEM in .lbx.hybrid)"
+            ),
+            SlotKind::HybridPqKem1024SepPassphrase => println!(
+                "  {i}: hybrid-pq-sep (macOS Secure Enclave + passphrase + ML-KEM-1024; \
+                 SEP material in-header, ML-KEM in .lbx.hybrid)"
+            ),
+            SlotKind::SepFido2Passphrase => println!(
+                "  {i}: secure-enclave + FIDO2 + passphrase (macOS; SEP material in-header)"
+            ),
+            SlotKind::HybridPqKemSepFido2Passphrase => println!(
+                "  {i}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + passphrase + ML-KEM-768; \
+                 SEP material in-header, ML-KEM in .lbx.hybrid)"
+            ),
+            SlotKind::HybridPqKem1024SepFido2Passphrase => println!(
+                "  {i}: hybrid-pq-sep (macOS Secure Enclave + FIDO2 + passphrase + ML-KEM-1024; \
+                 SEP material in-header, ML-KEM in .lbx.hybrid)"
+            ),
         }
         // V0.3.0 cross-platform tag for every FIDO2-touching slot.
         // V4 slots open on Linux, macOS, and Windows. V1/V2/V3 slots
@@ -4056,7 +4639,10 @@ fn cmd_enroll_fido2(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
 
-    eprintln!("{}", auth_prompt("again to derive the keyslot secret"));
+    eprintln!(
+        "{}",
+        auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let idx = c.enroll_fido2(None, &hmac_secret, &cred_id, hmac_salt, kdf_params())?;
@@ -4128,7 +4714,10 @@ fn cmd_migrate_fido2_slot(path: &Path, unlock: &UnlockArgs, slot: usize) -> Resu
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
 
-    eprintln!("{}", auth_prompt("again to derive the new keyslot secret"));
+    eprintln!(
+        "{}",
+        auth_prompt("derive the new keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let new_idx = c.enroll_fido2(None, &hmac_secret, &cred_id, hmac_salt, kdf_params())?;
@@ -4233,6 +4822,80 @@ fn cmd_enroll_tpm2(_path: &Path, _unlock: &UnlockArgs) -> Result<()> {
     )
 }
 
+/// Enroll a macOS Secure Enclave keyslot. Mirrors `cmd_enroll_tpm2`,
+/// but the SEP DERIVES the KEK (ECDH shared secret) itself rather
+/// than us generating a random one: `seal()` / `seal_biometric()`
+/// return both the shared secret and the opaque blob to store. With
+/// `biometric` set, the slot requires a Touch ID / user-presence
+/// check at every future unlock.
+#[cfg(feature = "hardware")]
+fn cmd_enroll_sep(path: &Path, unlock: &UnlockArgs, biometric: bool) -> Result<()> {
+    use luksbox_sep::SepSealer;
+
+    let mut c = open_container(path, unlock)?;
+
+    // Refuse on deniable vaults BEFORE touching the Secure Enclave, so
+    // the user doesn't get a Touch ID prompt + enclave seal only to be
+    // told it's unsupported (the backend guard in `enroll_sep` would
+    // otherwise fire after the seal). SEP is not a deniable credential
+    // and deniable slots are fixed at creation time.
+    if c.is_deniable() {
+        return Err(luksbox_format::Error::DeniableSlotMutationUnsupported
+            .to_string()
+            .into());
+    }
+
+    // Open the Secure Enclave BEFORE sealing so an enclave-not-
+    // available error surfaces before we touch the vault.
+    let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
+
+    let (kind, label) = if biometric {
+        (SlotKind::SepSealedBiometric, "Secure Enclave + Touch ID")
+    } else {
+        (SlotKind::SepSealed, "Secure Enclave")
+    };
+
+    eprintln!("sealing KEK under the local Secure Enclave...");
+    let (sep_shared, blob) = if biometric {
+        sealer
+            .seal_biometric()
+            .map_err(|e| format!("SEP seal (biometric): {e}"))?
+    } else {
+        sealer.seal().map_err(|e| format!("SEP seal: {e}"))?
+    };
+    let blob_bytes = blob.to_bytes();
+
+    let idx = c.enroll_sep(
+        kind,
+        &sep_shared,
+        &blob_bytes,
+        None,
+        None,
+        kdf_params(),
+        None,
+        &[],
+        [0u8; 32],
+    )?;
+    c.persist_header()?;
+    println!(
+        "enrolled {label} keyslot in slot {idx} (sealed_blob {} bytes). \
+         Subsequent unlocks: `luksbox <subcommand> --sep {}`.",
+        blob_bytes.len(),
+        path.display(),
+    );
+    // `sep_shared` drops + zeroizes here automatically.
+    Ok(())
+}
+
+#[cfg(not(feature = "hardware"))]
+fn cmd_enroll_sep(_path: &Path, _unlock: &UnlockArgs, _biometric: bool) -> Result<()> {
+    Err(
+        "Secure Enclave support not compiled in (rebuild with --features hardware). \
+         Secure Enclave keyslots only work on macOS hardware with a Secure Enclave."
+            .into(),
+    )
+}
+
 /// Enroll a fused TPM + FIDO2 keyslot. Both factors required at
 /// every subsequent unlock, so this is the strongest single-slot
 /// kind LUKSbox supports, but loss of either the TPM (machine) or
@@ -4286,7 +4949,7 @@ fn cmd_enroll_tpm2_fido2(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     // authenticator for the hmac-secret output for that salt.
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
-    eprintln!("{}", auth_prompt("touch again to derive the FIDO2 half"));
+    eprintln!("{}", auth_prompt("derive the FIDO2 half (second touch)"));
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let blob_bytes = blob.to_bytes();
@@ -4434,7 +5097,7 @@ fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) ->
     // On any failure roll back so the on-disk vault is unchanged.
     let sidecar = hybrid_sidecar::sidecar_path(path);
     let mut entries = if sidecar.exists() {
-        match hybrid_sidecar::read(&sidecar) {
+        match hybrid_sidecar::read_verified(&sidecar, c.header_salt()) {
             Ok(e) => e,
             Err(e) => {
                 let _ = c.revoke_slot(idx);
@@ -4450,7 +5113,7 @@ fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) ->
         pubkey: pk,
         ciphertext: ct,
     });
-    if let Err(e) = hybrid_sidecar::write(&sidecar, &entries) {
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
         let _ = c.revoke_slot(idx);
         return Err(format!("write hybrid sidecar: {e}").into());
     }
@@ -4466,7 +5129,7 @@ fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) ->
         if entries.is_empty() {
             let _ = std::fs::remove_file(&sidecar);
         } else {
-            let _ = hybrid_sidecar::write(&sidecar, &entries);
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
         }
         return Err(format!("write kyber seed: {e}").into());
     }
@@ -4477,7 +5140,7 @@ fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) ->
         if entries.is_empty() {
             let _ = std::fs::remove_file(&sidecar);
         } else {
-            let _ = hybrid_sidecar::write(&sidecar, &entries);
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
         }
         let _ = std::fs::remove_file(kyber_path);
         return Err(format!("persist header: {e}").into());
@@ -4499,6 +5162,447 @@ fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) ->
 #[cfg(not(feature = "hardware"))]
 fn cmd_enroll_hybrid_pq_tpm2(_path: &Path, _unlock: &UnlockArgs, _kem_size: u16) -> Result<()> {
     Err("hybrid-pq-tpm2 enroll requires --features hardware (libtss2-dev).".into())
+}
+
+/// Enroll a hybrid macOS Secure Enclave + ML-KEM keyslot. Mirrors
+/// `cmd_enroll_hybrid_pq_tpm2`: the SEP supplies the (machine-bound)
+/// classical half and ML-KEM supplies the post-quantum half. The
+/// Kyber pubkey + ciphertext go in the `.lbx.hybrid` sidecar; the
+/// passphrase-encrypted Kyber seed is written to `--pq-hybrid`.
+/// `kem_size` is 768 or 1024.
+#[cfg(feature = "hardware")]
+fn cmd_enroll_hybrid_pq_sep(path: &Path, unlock: &UnlockArgs, kem_size: u16) -> Result<()> {
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
+    use luksbox_sep::SepSealer;
+
+    let params = match kem_size {
+        768 => PqParams::Ml768,
+        1024 => PqParams::Ml1024,
+        _ => return Err(format!("unsupported ML-KEM size {kem_size} (use 768 or 1024)").into()),
+    };
+    let (level_label, kind) = match params {
+        PqParams::Ml768 => ("ML-KEM-768", SlotKind::HybridPqKemSep),
+        PqParams::Ml1024 => ("ML-KEM-1024", SlotKind::HybridPqKem1024Sep),
+    };
+
+    let kyber_path = unlock.pq_hybrid.as_deref().ok_or(
+        "hybrid-pq-sep enroll requires --pq-hybrid <path-to-write-kyber-seed>; \
+         this is the file you'll need on subsequent unlocks (keep it on \
+         separate trusted storage like a USB stick)",
+    )?;
+
+    // For the bootstrap open we strip --pq-hybrid so open_container
+    // doesn't try to route through a hybrid-PQ unlock helper. Same
+    // shape as cmd_enroll_hybrid_pq_tpm2: --pq-hybrid here means
+    // "where to WRITE the new seed", not "what seed to read".
+    let mut bootstrap_unlock = unlock.clone();
+    bootstrap_unlock.pq_hybrid = None;
+    let mut c = open_container(path, &bootstrap_unlock)?;
+
+    // Refuse on deniable vaults before any Secure Enclave / ML-KEM work,
+    // mirroring cmd_enroll_sep / cmd_enroll_sep_fused. SEP is not a
+    // deniable credential; deniable slots are fixed at creation time.
+    if c.is_deniable() {
+        return Err(luksbox_format::Error::DeniableSlotMutationUnsupported
+            .to_string()
+            .into());
+    }
+
+    let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
+    let seed_pw = read_passphrase_confirmed(".kyber seed-file passphrase: ")?;
+
+    // SEP half: the enclave derives the shared secret + opaque blob.
+    eprintln!("sealing SEP half under the local Secure Enclave...");
+    let (sep_shared, blob) = sealer.seal().map_err(|e| format!("SEP seal: {e}"))?;
+    let blob_bytes = blob.to_bytes();
+
+    // ML-KEM half: keygen + encapsulate against the chosen parameter set.
+    let (pk, seed) = keygen_with(params);
+    let (ct, pq_shared) =
+        encapsulate_with(params, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
+
+    let idx = c.enroll_sep(
+        kind,
+        &sep_shared,
+        &blob_bytes,
+        None,
+        None,
+        kdf_params(),
+        Some(&pq_shared),
+        &[],
+        [0u8; 32],
+    )?;
+
+    // Atomic-enroll ordering: install slot in memory FIRST (already
+    // done above), write sidecar + .kyber, then persist the header.
+    // On any failure roll back so the on-disk vault is unchanged.
+    let sidecar = hybrid_sidecar::sidecar_path(path);
+    let mut entries = if sidecar.exists() {
+        match hybrid_sidecar::read_verified(&sidecar, c.header_salt()) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = c.revoke_slot(idx);
+                return Err(format!("read existing hybrid sidecar: {e}").into());
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    entries.push(HybridEntry {
+        slot_idx: idx as u8,
+        level: params,
+        pubkey: pk,
+        ciphertext: ct,
+    });
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
+        let _ = c.revoke_slot(idx);
+        return Err(format!("write hybrid sidecar: {e}").into());
+    }
+
+    if let Err(e) = seed_file::write(
+        kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    ) {
+        let _ = c.revoke_slot(idx);
+        entries.pop();
+        if entries.is_empty() {
+            let _ = std::fs::remove_file(&sidecar);
+        } else {
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
+        }
+        return Err(format!("write kyber seed: {e}").into());
+    }
+
+    if let Err(e) = c.persist_header() {
+        let _ = c.revoke_slot(idx);
+        entries.pop();
+        if entries.is_empty() {
+            let _ = std::fs::remove_file(&sidecar);
+        } else {
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
+        }
+        let _ = std::fs::remove_file(kyber_path);
+        return Err(format!("persist header: {e}").into());
+    }
+
+    println!(
+        "enrolled hybrid Secure Enclave + {level_label} keyslot in slot {idx}.\n  \
+         Kyber seed written to {} (passphrase-encrypted).\n  \
+         Move the seed file to separate trusted storage (USB stick, \
+         offline machine) - lose it = lose this slot.\n  \
+         Subsequent unlocks: `luksbox <subcommand> --sep --pq-hybrid {} {}`",
+        kyber_path.display(),
+        kyber_path.display(),
+        path.display(),
+    );
+    Ok(())
+}
+
+#[cfg(not(feature = "hardware"))]
+fn cmd_enroll_hybrid_pq_sep(_path: &Path, _unlock: &UnlockArgs, _kem_size: u16) -> Result<()> {
+    Err("hybrid-pq-sep enroll requires --features hardware (macOS Secure Enclave).".into())
+}
+
+/// Which extra factors a fused Secure Enclave keyslot binds in
+/// addition to the SEP itself. Used by `cmd_enroll_sep_fused` and the
+/// open path to keep the enroll/unlock factor sets in lockstep.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SepFactors {
+    /// SEP + FIDO2 authenticator.
+    Fido2,
+    /// SEP + Argon2id passphrase.
+    Passphrase,
+    /// SEP + FIDO2 + Argon2id passphrase.
+    Fido2Passphrase,
+}
+
+#[cfg_attr(not(feature = "hardware"), allow(dead_code))]
+impl SepFactors {
+    pub(crate) fn has_fido2(self) -> bool {
+        matches!(self, Self::Fido2 | Self::Fido2Passphrase)
+    }
+    pub(crate) fn has_passphrase(self) -> bool {
+        matches!(self, Self::Passphrase | Self::Fido2Passphrase)
+    }
+    /// Resolve to the core `SlotKind` for this factor set + optional
+    /// ML-KEM hybrid size (None = plain SEP, Some(768|1024) = hybrid).
+    pub(crate) fn slot_kind(self, kem_size: Option<u16>) -> Result<SlotKind> {
+        Ok(match (self, kem_size) {
+            (Self::Fido2, None) => SlotKind::SepFido2,
+            (Self::Passphrase, None) => SlotKind::SepPassphrase,
+            (Self::Fido2Passphrase, None) => SlotKind::SepFido2Passphrase,
+            (Self::Fido2, Some(768)) => SlotKind::HybridPqKemSepFido2,
+            (Self::Fido2, Some(1024)) => SlotKind::HybridPqKem1024SepFido2,
+            (Self::Passphrase, Some(768)) => SlotKind::HybridPqKemSepPassphrase,
+            (Self::Passphrase, Some(1024)) => SlotKind::HybridPqKem1024SepPassphrase,
+            (Self::Fido2Passphrase, Some(768)) => SlotKind::HybridPqKemSepFido2Passphrase,
+            (Self::Fido2Passphrase, Some(1024)) => SlotKind::HybridPqKem1024SepFido2Passphrase,
+            (_, Some(n)) => {
+                return Err(format!("unsupported ML-KEM size {n} (use 768 or 1024)").into());
+            }
+        })
+    }
+}
+
+/// Enroll a fused Secure Enclave keyslot. Generalizes the SEP +
+/// FIDO2 / passphrase / hybrid-PQ kinds: the SEP always supplies the
+/// classical machine-bound half (`sealer.seal()`, NOT the biometric
+/// variant), and `factors` + `kem_size` decide which extra secrets
+/// are collected and stored. For hybrid kinds (`kem_size = Some`) a
+/// fresh Kyber keypair is generated, the ciphertext + pubkey written
+/// to the `.lbx.hybrid` sidecar, and the (passphrase-encrypted) seed
+/// written to the `--pq-hybrid` path - same on-disk shape as
+/// `cmd_enroll_hybrid_pq_sep`. All enrolled factors are required at
+/// every subsequent unlock; loss of any one permanently kills the
+/// slot, so keep a recovery slot.
+#[cfg(feature = "hardware")]
+fn cmd_enroll_sep_fused(
+    path: &Path,
+    unlock: &UnlockArgs,
+    factors: SepFactors,
+    kem_size: Option<u16>,
+) -> Result<()> {
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
+    use luksbox_sep::SepSealer;
+
+    let kind = factors.slot_kind(kem_size)?;
+
+    // Resolve the ML-KEM parameter set (hybrid kinds only).
+    let params = match kem_size {
+        None => None,
+        Some(768) => Some(PqParams::Ml768),
+        Some(1024) => Some(PqParams::Ml1024),
+        Some(n) => return Err(format!("unsupported ML-KEM size {n} (use 768 or 1024)").into()),
+    };
+
+    // Hybrid kinds need a destination for the new .kyber seed. Same
+    // semantics as cmd_enroll_hybrid_pq_sep: --pq-hybrid here is the
+    // WRITE path, so we strip it from the bootstrap open below.
+    let kyber_path = if params.is_some() {
+        Some(unlock.pq_hybrid.as_deref().ok_or(
+            "hybrid SEP enroll requires --pq-hybrid <path-to-write-kyber-seed>; \
+             this is the file you'll need on subsequent unlocks (keep it on \
+             separate trusted storage like a USB stick)",
+        )?)
+    } else {
+        None
+    };
+
+    let mut bootstrap_unlock = unlock.clone();
+    bootstrap_unlock.pq_hybrid = None;
+    let mut c = open_container(path, &bootstrap_unlock)?;
+
+    // Refuse on deniable vaults before any Secure Enclave / ML-KEM work
+    // (and any Touch ID prompt), mirroring cmd_enroll_sep. SEP is not a
+    // deniable credential; deniable slots are fixed at creation time.
+    if c.is_deniable() {
+        return Err(luksbox_format::Error::DeniableSlotMutationUnsupported
+            .to_string()
+            .into());
+    }
+
+    // Open the Secure Enclave BEFORE generating any secret material,
+    // so a missing-enclave error surfaces before we touch the vault.
+    let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
+
+    // Collect the passphrase / seed-file passphrase before the SEP /
+    // FIDO2 hardware steps so the user isn't left mid-touch.
+    let seed_pw = if params.is_some() {
+        Some(read_passphrase_confirmed(".kyber seed-file passphrase: ")?)
+    } else {
+        None
+    };
+    let new_pw = if factors.has_passphrase() {
+        Some(read_passphrase_confirmed("new slot passphrase: ")?)
+    } else {
+        None
+    };
+
+    // FIDO2 half: register a fresh credential + derive an hmac_secret,
+    // exactly as cmd_enroll_tpm2_fido2 does.
+    let fido2 = if factors.has_fido2() {
+        use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+        use rand_core::{OsRng, RngCore};
+        let pin = read_fido2_pin()?;
+        let mut auth = make_fido2_authenticator();
+        let user_handle = random_user_handle()?;
+        eprintln!("{}", auth_prompt("register a new FIDO2 credential"));
+        let er = auth.enroll(RP_ID, &user_handle, Some(&pin))?;
+        let cred_id = er.credential.id;
+        let mut hmac_salt = [0u8; 32];
+        OsRng.fill_bytes(&mut hmac_salt);
+        eprintln!("{}", auth_prompt("derive the FIDO2 half (second touch)"));
+        let hmac_secret: [u8; 32] =
+            *auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
+        Some((cred_id, hmac_salt, hmac_secret))
+    } else {
+        None
+    };
+
+    // SEP half: the enclave derives the classical shared secret + blob.
+    eprintln!("sealing SEP half under the local Secure Enclave...");
+    let (sep_shared, blob) = sealer.seal().map_err(|e| format!("SEP seal: {e}"))?;
+    let blob_bytes = blob.to_bytes();
+
+    // ML-KEM half (hybrid kinds only): keygen + encapsulate.
+    let pq = match params {
+        Some(p) => {
+            let (pk, seed) = keygen_with(p);
+            let (ct, pq_shared) =
+                encapsulate_with(p, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
+            Some((p, pk, seed, ct, pq_shared))
+        }
+        None => None,
+    };
+
+    // Map the optional factors into the enroll_sep argument shapes.
+    let hmac_secret_ref = fido2.as_ref().map(|(_, _, hs)| hs);
+    let passphrase_ref = new_pw.as_ref().map(|p| p.as_bytes());
+    let pq_shared_ref = pq.as_ref().map(|(_, _, _, _, s)| &**s);
+    let cred_id_ref: &[u8] = fido2.as_ref().map(|(c, _, _)| c.as_slice()).unwrap_or(&[]);
+    let hmac_salt = fido2.as_ref().map(|(_, s, _)| *s).unwrap_or([0u8; 32]);
+
+    let idx = c.enroll_sep(
+        kind,
+        &sep_shared,
+        &blob_bytes,
+        hmac_secret_ref,
+        passphrase_ref,
+        kdf_params(),
+        pq_shared_ref,
+        cred_id_ref,
+        hmac_salt,
+    )?;
+
+    // For plain (non-hybrid) kinds we're done after persisting.
+    let (params, pk, seed, ct) = match pq {
+        Some((p, pk, seed, ct, _)) => (p, pk, seed, ct),
+        None => {
+            if let Err(e) = c.persist_header() {
+                let _ = c.revoke_slot(idx);
+                return Err(format!("persist header: {e}").into());
+            }
+            print_sep_enroll_summary(path, idx, kind, factors, None);
+            return Ok(());
+        }
+    };
+
+    // Hybrid kinds: atomic-enroll ordering (sidecar -> seed -> header),
+    // rolling back on any failure. Mirrors cmd_enroll_hybrid_pq_sep.
+    let kyber_path = kyber_path.expect("hybrid kind implies a --pq-hybrid path");
+    let seed_pw = seed_pw.expect("hybrid kind implies a collected seed-file passphrase");
+    let sidecar = hybrid_sidecar::sidecar_path(path);
+    let mut entries = if sidecar.exists() {
+        match hybrid_sidecar::read_verified(&sidecar, c.header_salt()) {
+            Ok(e) => e,
+            Err(e) => {
+                let _ = c.revoke_slot(idx);
+                return Err(format!("read existing hybrid sidecar: {e}").into());
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    entries.push(HybridEntry {
+        slot_idx: idx as u8,
+        level: params,
+        pubkey: pk,
+        ciphertext: ct,
+    });
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
+        let _ = c.revoke_slot(idx);
+        return Err(format!("write hybrid sidecar: {e}").into());
+    }
+    if let Err(e) = seed_file::write(
+        kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    ) {
+        let _ = c.revoke_slot(idx);
+        entries.pop();
+        if entries.is_empty() {
+            let _ = std::fs::remove_file(&sidecar);
+        } else {
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
+        }
+        return Err(format!("write kyber seed: {e}").into());
+    }
+    if let Err(e) = c.persist_header() {
+        let _ = c.revoke_slot(idx);
+        entries.pop();
+        if entries.is_empty() {
+            let _ = std::fs::remove_file(&sidecar);
+        } else {
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
+        }
+        let _ = std::fs::remove_file(kyber_path);
+        return Err(format!("persist header: {e}").into());
+    }
+    print_sep_enroll_summary(path, idx, kind, factors, Some(kyber_path));
+    Ok(())
+}
+
+/// Human-readable summary + the exact unlock flag combination for a
+/// freshly-enrolled fused SEP slot.
+#[cfg(feature = "hardware")]
+fn print_sep_enroll_summary(
+    path: &Path,
+    idx: usize,
+    kind: SlotKind,
+    factors: SepFactors,
+    kyber_path: Option<&Path>,
+) {
+    let mut flags = String::from("--sep");
+    if factors.has_fido2() {
+        flags.push_str(" --fido2");
+    }
+    if let Some(kp) = kyber_path {
+        flags.push_str(&format!(" --pq-hybrid {}", kp.display()));
+    }
+    println!(
+        "enrolled {kind:?} keyslot in slot {idx}.\n  \
+         All enrolled factors are required to unlock (Secure Enclave{}{}{}). \
+         Loss of any one permanently kills this slot - keep a recovery slot.\n  \
+         Subsequent unlocks: `luksbox <subcommand> {flags} {}`.",
+        if factors.has_fido2() { " + FIDO2" } else { "" },
+        if factors.has_passphrase() {
+            " + passphrase"
+        } else {
+            ""
+        },
+        if kyber_path.is_some() {
+            " + ML-KEM seed"
+        } else {
+            ""
+        },
+        path.display(),
+    );
+    if let Some(kp) = kyber_path {
+        println!(
+            "  Kyber seed written to {} (passphrase-encrypted). Move it to \
+             separate trusted storage - lose it = lose this slot.",
+            kp.display()
+        );
+    }
+}
+
+#[cfg(not(feature = "hardware"))]
+fn cmd_enroll_sep_fused(
+    _path: &Path,
+    _unlock: &UnlockArgs,
+    _factors: SepFactors,
+    _kem_size: Option<u16>,
+) -> Result<()> {
+    Err(
+        "fused Secure Enclave enroll requires --features hardware (macOS Secure Enclave; \
+         FIDO2 kinds also need libfido2)."
+            .into(),
+    )
 }
 
 /// Enroll the maximum-paranoia hybrid TPM 2.0 + FIDO2 + ML-KEM
@@ -4556,7 +5660,7 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
 
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
-    eprintln!("{}", auth_prompt("touch again to derive the FIDO2 half"));
+    eprintln!("{}", auth_prompt("derive the FIDO2 half (second touch)"));
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     let (pk, seed) = keygen_with(params);
@@ -4585,7 +5689,7 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
 
     let sidecar = hybrid_sidecar::sidecar_path(path);
     let mut entries = if sidecar.exists() {
-        match hybrid_sidecar::read(&sidecar) {
+        match hybrid_sidecar::read_verified(&sidecar, c.header_salt()) {
             Ok(e) => e,
             Err(e) => {
                 let _ = c.revoke_slot(idx);
@@ -4601,7 +5705,7 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
         pubkey: pk,
         ciphertext: ct,
     });
-    if let Err(e) = hybrid_sidecar::write(&sidecar, &entries) {
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
         let _ = c.revoke_slot(idx);
         return Err(format!("write hybrid sidecar: {e}").into());
     }
@@ -4617,7 +5721,7 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
         if entries.is_empty() {
             let _ = std::fs::remove_file(&sidecar);
         } else {
-            let _ = hybrid_sidecar::write(&sidecar, &entries);
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
         }
         return Err(format!("write kyber seed: {e}").into());
     }
@@ -4628,7 +5732,7 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
         if entries.is_empty() {
             let _ = std::fs::remove_file(&sidecar);
         } else {
-            let _ = hybrid_sidecar::write(&sidecar, &entries);
+            let _ = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt());
         }
         let _ = std::fs::remove_file(kyber_path);
         return Err(format!("persist header: {e}").into());
@@ -4666,7 +5770,18 @@ fn cmd_update(
     kind_override: Option<SlotKindArg>,
 ) -> Result<()> {
     let mut c = open_container(path, unlock)?;
-    let existing = SlotKindArg::from_core(c.header.keyslots[slot].kind)
+    let existing_kind = c
+        .header
+        .keyslots
+        .get(slot)
+        .ok_or_else(|| {
+            format!(
+                "slot {slot} is out of range (max {})",
+                luksbox_core::MAX_KEYSLOTS - 1
+            )
+        })?
+        .kind;
+    let existing = SlotKindArg::from_core(existing_kind)
         .ok_or_else(|| format!("slot {slot} is empty; nothing to update"))?;
     let target = kind_override.unwrap_or(existing);
     match target {
@@ -4756,6 +5871,31 @@ fn cmd_update(
                     .into(),
             );
         }
+        SlotKindArg::Sep
+        | SlotKindArg::SepBiometric
+        | SlotKindArg::HybridPqSep
+        | SlotKindArg::HybridPqSep1024
+        | SlotKindArg::SepFido2
+        | SlotKindArg::SepPassphrase
+        | SlotKindArg::SepFido2Passphrase
+        | SlotKindArg::HybridPqSepFido2
+        | SlotKindArg::HybridPqSepFido21024
+        | SlotKindArg::HybridPqSepPassphrase
+        | SlotKindArg::HybridPqSepPassphrase1024
+        | SlotKindArg::HybridPqSepFido2Passphrase
+        | SlotKindArg::HybridPqSepFido2Passphrase1024 => {
+            // In-place update of Secure Enclave keyslots isn't
+            // supported yet (no update_sep_at). Workaround: revoke +
+            // re-enroll, same as the fused / hybrid TPM kinds above.
+            return Err(
+                "in-place update of Secure Enclave keyslots isn't supported yet. \
+                 Workaround: `luksbox revoke <vault> --slot <slot>` then \
+                 `luksbox enroll <vault> --kind sep[-biometric|-fido2|-passphrase|...]` \
+                 (or `--kind hybrid-pq-sep*`). The new slot will take a different \
+                 index but unlocks identically."
+                    .into(),
+            );
+        }
     }
     c.persist_header()?;
     println!("updated slot {slot} ({existing:?} -> {target:?})");
@@ -4778,7 +5918,10 @@ fn update_fido2_at(c: &mut Container, slot: usize) -> Result<()> {
     let mut hmac_salt = [0u8; 32];
     OsRng.fill_bytes(&mut hmac_salt);
 
-    eprintln!("{}", auth_prompt("again to derive the keyslot secret"));
+    eprintln!(
+        "{}",
+        auth_prompt("derive the keyslot secret (second touch)")
+    );
     let hmac_secret = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(&pin))?;
 
     c.update_fido2_at(slot, None, &hmac_secret, &cred_id, hmac_salt, kdf_params())?;
@@ -5459,6 +6602,10 @@ enum CliDenCred {
     TpmFido2,
     PqTpm,
     PqTpmFido2,
+    Sep,
+    SepFido2,
+    PqSep,
+    PqSepFido2,
 }
 
 fn parse_cli_den_cred(s: &str) -> Result<CliDenCred> {
@@ -5471,8 +6618,12 @@ fn parse_cli_den_cred(s: &str) -> Result<CliDenCred> {
         "tpm-fido2" => Ok(CliDenCred::TpmFido2),
         "pq-tpm" => Ok(CliDenCred::PqTpm),
         "pq-tpm-fido2" => Ok(CliDenCred::PqTpmFido2),
+        "sep" => Ok(CliDenCred::Sep),
+        "sep-fido2" => Ok(CliDenCred::SepFido2),
+        "pq-sep" => Ok(CliDenCred::PqSep),
+        "pq-sep-fido2" => Ok(CliDenCred::PqSepFido2),
         _ => Err(cli_err!(
-            "unknown --credential '{}'. Choices: passphrase, fido2, pq-passphrase, pq-fido2, tpm, tpm-fido2, pq-tpm, pq-tpm-fido2",
+            "unknown --credential '{}'. Choices: passphrase, fido2, pq-passphrase, pq-fido2, tpm, tpm-fido2, pq-tpm, pq-tpm-fido2, sep, sep-fido2, pq-sep, pq-sep-fido2",
             s
         )),
     }
@@ -5564,6 +6715,27 @@ fn cmd_deniable_init(
                 "TPM is Linux-only today; Windows TPM is tracked as a follow-up"
             ));
         }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::Sep => cli_create_sep_deniable_v2(path, cipher_suite, argon2_params)?,
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::SepFido2 => {
+            cli_create_sep_fido2_deniable_v2(path, cipher_suite, argon2_params)?
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::PqSep => {
+            let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required for pq-sep"))?;
+            cli_create_pq_sep_deniable_v2(path, cipher_suite, argon2_params, kp, pq_1024)?
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::PqSepFido2 => {
+            let kp =
+                kyber_path.ok_or_else(|| cli_err!("--kyber-path required for pq-sep-fido2"))?;
+            cli_create_pq_sep_fido2_deniable_v2(path, cipher_suite, argon2_params, kp, pq_1024)?
+        }
+        #[cfg(not(all(feature = "hardware", target_os = "macos")))]
+        CliDenCred::Sep | CliDenCred::SepFido2 | CliDenCred::PqSep | CliDenCred::PqSepFido2 => {
+            return Err(cli_err!("Secure Enclave is macOS-only"));
+        }
     };
 
     // Optional anchor bootstrap. `init_anchor` branches on is_deniable()
@@ -5651,7 +6823,7 @@ fn cmd_deniable_mount(
     // post-open inode re-probe protect the residual race between
     // our drop(fd) and the kernel's mount-path lookup.
     #[cfg(not(target_os = "windows"))]
-    let mp_abs: std::path::PathBuf = {
+    let mp_abs: (std::path::PathBuf, Option<(u64, u64)>) = {
         use std::os::unix::fs::OpenOptionsExt as _;
         let probe = std::fs::OpenOptions::new()
             .read(true)
@@ -5667,15 +6839,28 @@ fn cmd_deniable_mount(
                 };
                 cli_err!("mountpoint {} {kind}: {e}", mountpoint.display())
             })?;
+        // Capture the probed (dev, ino) so the post-open re-probe below
+        // (Round 12 fix R12-08) can detect a path-swap immediately
+        // before the mount syscall. `cmd_mount` does the same; the
+        // comment above promised this re-probe but the inode pair was
+        // previously dropped, leaving the residual race uncovered.
+        use std::os::unix::fs::MetadataExt as _;
+        let probe_meta = probe
+            .metadata()
+            .map_err(|e| cli_err!("cannot stat mountpoint {}: {e}", mountpoint.display()))?;
+        let probe_inode_pair = (probe_meta.dev(), probe_meta.ino());
         drop(probe);
         let canonical = mountpoint
             .canonicalize()
             .map_err(|e| cli_err!("cannot resolve {}: {e}", mountpoint.display()))?;
         validate_mountpoint_safety(mountpoint, &canonical)?;
-        canonical
+        (canonical, Some(probe_inode_pair))
     };
     #[cfg(target_os = "windows")]
-    let mp_abs: std::path::PathBuf = mountpoint.to_path_buf();
+    let (mp_abs, _probe_inode): (std::path::PathBuf, Option<(u64, u64)>) =
+        (mountpoint.to_path_buf(), None);
+    #[cfg(not(target_os = "windows"))]
+    let (mp_abs, probe_inode) = mp_abs;
 
     let mut container = cli_open_deniable_v2(path, cipher_suite, argon2_params, cred, kyber_path)?;
 
@@ -5708,6 +6893,43 @@ fn cmd_deniable_mount(
             }
         }
     }
+    // Round 12 fix R12-08 (parity with `cmd_mount`): re-probe the
+    // canonical mountpoint inode IMMEDIATELY before the mount syscall
+    // and refuse if it changed. validate_mountpoint_safety bounds the
+    // blast radius to user-writable paths, but this catches the narrow
+    // window where an attacker on the mountpoint's parent dir renames a
+    // symlink over the canonical entry between our initial probe and the
+    // kernel's mount-path lookup. The lower-level FUSE preflight uses
+    // path-based `metadata()` (follows symlinks), so this fd-based
+    // re-check is the failure-closed guard.
+    #[cfg(unix)]
+    if let Some(expected) = probe_inode {
+        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+        let final_probe = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&mp_abs)
+            .map_err(|e| {
+                cli_err!(
+                    "mountpoint {} could not be re-verified before mount: {e}",
+                    mp_abs.display()
+                )
+            })?;
+        let m = final_probe.metadata().map_err(|e| {
+            cli_err!(
+                "cannot stat mountpoint {} for re-verify: {e}",
+                mp_abs.display()
+            )
+        })?;
+        if (m.dev(), m.ino()) != expected {
+            return Err(cli_err!(
+                "mountpoint {} was swapped between probe and mount; refusing",
+                mp_abs.display()
+            ));
+        }
+        drop(final_probe);
+    }
+
     luksbox_mount::mount(vfs, &mp_abs, !foreground, sync_mode)?;
     Ok(())
 }
@@ -5743,6 +6965,226 @@ fn prompt_pass_twice(p1: &str, p2: &str) -> Result<zeroize::Zeroizing<String>> {
 /// out of the slot envelope after phase 1 trial-decrypt succeeds.
 /// `cred` is the user's choice of variant; if it does not match
 /// what the matched slot actually carries, phase 2 fails opaquely.
+#[cfg(all(feature = "hardware", target_os = "macos"))]
+fn cli_create_sep_deniable_v2(
+    path: &Path,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+) -> Result<luksbox_format::Container> {
+    use luksbox_format::deniable_header::DeniableMaterial;
+    use luksbox_sep::SepSealer;
+    let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
+    let mut sealer = SepSealer::new().map_err(|e| cli_err!("{e}"))?;
+    let (sep_shared, blob) = sealer.seal().map_err(|e| cli_err!("SEP seal: {e}"))?;
+    let cred = luksbox_core::deniable::DeniableCredential::SepPassphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+        sep_shared: &sep_shared,
+    };
+    let material = DeniableMaterial {
+        cred_id: Vec::new(),
+        hmac_salt: None,
+        tpm_blob: blob.to_bytes(),
+    };
+    Ok(
+        luksbox_format::Container::create_with_credential_v2_deniable(
+            path, None, cipher, 0, 0, &cred, &material,
+        )?,
+    )
+}
+
+#[cfg(all(feature = "hardware", target_os = "macos"))]
+fn cli_create_sep_fido2_deniable_v2(
+    path: &Path,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+) -> Result<luksbox_format::Container> {
+    use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::deniable_header::DeniableMaterial;
+    use luksbox_sep::SepSealer;
+    use rand_core::RngCore;
+    let pass = prompt_pass_twice("Envelope passphrase: ", "Confirm:             ")?;
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    let mut auth = make_fido2_authenticator();
+    let user_handle = random_user_handle()?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
+    let cred_id = er.credential.id;
+    let mut hmac_salt = [0u8; 32];
+    rand_core::OsRng
+        .try_fill_bytes(&mut hmac_salt)
+        .map_err(|e| cli_err!("OS RNG: {e}"))?;
+    let hmac = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin.as_str()))?;
+    let mut sealer = SepSealer::new().map_err(|e| cli_err!("{e}"))?;
+    let (sep_shared, blob) = sealer.seal().map_err(|e| cli_err!("SEP seal: {e}"))?;
+    let cred = luksbox_core::deniable::DeniableCredential::SepFido2Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+        sep_shared: &sep_shared,
+        hmac_secret_output: &hmac,
+    };
+    let material = DeniableMaterial {
+        cred_id,
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: blob.to_bytes(),
+    };
+    Ok(
+        luksbox_format::Container::create_with_credential_v2_deniable(
+            path, None, cipher, 0, 0, &cred, &material,
+        )?,
+    )
+}
+
+#[cfg(all(feature = "hardware", target_os = "macos"))]
+fn cli_create_pq_sep_deniable_v2(
+    path: &Path,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+    kyber_path: &Path,
+    pq_1024: bool,
+) -> Result<luksbox_format::Container> {
+    use luksbox_format::deniable_header::DeniableMaterial;
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
+    use luksbox_sep::SepSealer;
+    let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
+    let seed_pw =
+        zeroize::Zeroizing::new(rpassword::prompt_password(".kyber seed-file passphrase: ")?);
+    let params = if pq_1024 {
+        PqParams::Ml1024
+    } else {
+        PqParams::Ml768
+    };
+    let (pk, seed) = keygen_with(params);
+    let (ct, shared) = encapsulate_with(params, &pk)?;
+    let mut sealer = SepSealer::new().map_err(|e| cli_err!("{e}"))?;
+    let (sep_shared, blob) = sealer.seal().map_err(|e| cli_err!("SEP seal: {e}"))?;
+    let cred = luksbox_core::deniable::DeniableCredential::HybridPqSepPassphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+        mlkem_shared: &shared,
+        sep_shared: &sep_shared,
+    };
+    let material = DeniableMaterial {
+        cred_id: Vec::new(),
+        hmac_salt: None,
+        tpm_blob: blob.to_bytes(),
+    };
+    let cont = luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
+    let sidecar = hybrid_sidecar::sidecar_path(path);
+    // Deniable vaults keep the unbound v2 sidecar: the deniable
+    // envelope has no parseable plaintext header for read_for_vault
+    // to peek, deniable readers use `read` (which ignores bindings),
+    // and a binding would hard-link the sidecar to the vault. See
+    // the `hybrid_sidecar::write` docs.
+    hybrid_sidecar::write(
+        &sidecar,
+        &[HybridEntry {
+            slot_idx: 0,
+            level: params,
+            pubkey: pk,
+            ciphertext: ct,
+        }],
+    )?;
+    seed_file::write(
+        kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )?;
+    Ok(cont)
+}
+
+#[cfg(all(feature = "hardware", target_os = "macos"))]
+fn cli_create_pq_sep_fido2_deniable_v2(
+    path: &Path,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+    kyber_path: &Path,
+    pq_1024: bool,
+) -> Result<luksbox_format::Container> {
+    use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
+    use luksbox_format::deniable_header::DeniableMaterial;
+    use luksbox_format::hybrid_sidecar::{self, HybridEntry};
+    use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
+    use luksbox_sep::SepSealer;
+    use rand_core::RngCore;
+    let pass = prompt_pass_twice("Envelope passphrase: ", "Confirm:             ")?;
+    let seed_pw =
+        zeroize::Zeroizing::new(rpassword::prompt_password(".kyber seed-file passphrase: ")?);
+    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    let mut auth = make_fido2_authenticator();
+    let user_handle = random_user_handle()?;
+    let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
+    let cred_id = er.credential.id;
+    let mut hmac_salt = [0u8; 32];
+    rand_core::OsRng
+        .try_fill_bytes(&mut hmac_salt)
+        .map_err(|e| cli_err!("OS RNG: {e}"))?;
+    let hmac = auth.hmac_secret(RP_ID, &cred_id, &hmac_salt, true, Some(pin.as_str()))?;
+    let params = if pq_1024 {
+        PqParams::Ml1024
+    } else {
+        PqParams::Ml768
+    };
+    let (pk, seed) = keygen_with(params);
+    let (ct, shared) = encapsulate_with(params, &pk)?;
+    let mut sealer = SepSealer::new().map_err(|e| cli_err!("{e}"))?;
+    let (sep_shared, blob) = sealer.seal().map_err(|e| cli_err!("SEP seal: {e}"))?;
+    let cred = luksbox_core::deniable::DeniableCredential::HybridPqSepFido2Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+        mlkem_shared: &shared,
+        sep_shared: &sep_shared,
+        hmac_secret_output: &hmac,
+    };
+    let material = DeniableMaterial {
+        cred_id,
+        hmac_salt: Some(hmac_salt),
+        tpm_blob: blob.to_bytes(),
+    };
+    let cont = luksbox_format::Container::create_with_credential_v2_deniable(
+        path, None, cipher, 0, 0, &cred, &material,
+    )?;
+    let sidecar = hybrid_sidecar::sidecar_path(path);
+    // Deniable vaults keep the unbound v2 sidecar: the deniable
+    // envelope has no parseable plaintext header for read_for_vault
+    // to peek, deniable readers use `read` (which ignores bindings),
+    // and a binding would hard-link the sidecar to the vault. See
+    // the `hybrid_sidecar::write` docs.
+    hybrid_sidecar::write(
+        &sidecar,
+        &[HybridEntry {
+            slot_idx: 0,
+            level: params,
+            pubkey: pk,
+            ciphertext: ct,
+        }],
+    )?;
+    seed_file::write(
+        kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )?;
+    Ok(cont)
+}
+
+#[cfg(all(feature = "hardware", target_os = "macos"))]
+fn cli_sep_unseal_from_bytes(blob_bytes: &[u8]) -> Result<[u8; 32]> {
+    use luksbox_sep::{SepBlob, SepSealer};
+    if blob_bytes.is_empty() {
+        return Err(cli_err!(
+            "envelope SEP blob is empty for the Secure Enclave variant"
+        ));
+    }
+    let blob = SepBlob::from_bytes(blob_bytes)?;
+    let mut sealer = SepSealer::new()?;
+    let shared = sealer.unseal(&blob)?;
+    Ok(*shared)
+}
+
 fn cli_open_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
@@ -5767,6 +7209,10 @@ fn cli_open_deniable_v2(
         CliDenCred::TpmFido2 => DeniableKindTag::TpmFido2Passphrase,
         CliDenCred::PqTpm => DeniableKindTag::HybridPqTpmPassphrase,
         CliDenCred::PqTpmFido2 => DeniableKindTag::HybridPqTpmFido2Passphrase,
+        CliDenCred::Sep => DeniableKindTag::SepPassphrase,
+        CliDenCred::SepFido2 => DeniableKindTag::SepFido2Passphrase,
+        CliDenCred::PqSep => DeniableKindTag::HybridPqSepPassphrase,
+        CliDenCred::PqSepFido2 => DeniableKindTag::HybridPqSepFido2Passphrase,
     };
 
     // Phase 1: passphrase-only credential for envelope discovery,
@@ -5996,6 +7442,103 @@ fn cli_open_deniable_v2(
         CliDenCred::Tpm | CliDenCred::TpmFido2 | CliDenCred::PqTpm | CliDenCred::PqTpmFido2 => Err(
             cli_err!("TPM is Linux-only today; Windows TPM is tracked as a follow-up"),
         ),
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::Sep => {
+            let sep_shared = cli_sep_unseal_from_bytes(&payload_tpm_blob)?;
+            let cred = DeniableCredential::SepPassphrase {
+                passphrase: pass_zeroizing.as_bytes(),
+                argon2,
+                sep_shared: &sep_shared,
+            };
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
+            )?)
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::SepFido2 => {
+            let sep_shared = cli_sep_unseal_from_bytes(&payload_tpm_blob)?;
+            let salt = payload_hmac_salt
+                .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
+            let pin = read_fido2_pin()?;
+            let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, true, &pin)?;
+            let cred = DeniableCredential::SepFido2Passphrase {
+                passphrase: pass_zeroizing.as_bytes(),
+                argon2,
+                sep_shared: &sep_shared,
+                hmac_secret_output: &hmac,
+            };
+            match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred) {
+                Ok(c) => Ok(c),
+                Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                    cli_deniable_raw_salt_retry_notice();
+                    let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, false, &pin)?;
+                    let cred = DeniableCredential::SepFido2Passphrase {
+                        passphrase: pass_zeroizing.as_bytes(),
+                        argon2,
+                        sep_shared: &sep_shared,
+                        hmac_secret_output: &hmac,
+                    };
+                    Ok(luksbox_format::Container::complete_open_v2_deniable(
+                        envelope, &cred,
+                    )?)
+                }
+                Err((_, e)) => Err(e.into()),
+            }
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::PqSep => {
+            let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
+            let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
+            let sep_shared = cli_sep_unseal_from_bytes(&payload_tpm_blob)?;
+            let cred = DeniableCredential::HybridPqSepPassphrase {
+                passphrase: pass_zeroizing.as_bytes(),
+                argon2,
+                mlkem_shared: &shared,
+                sep_shared: &sep_shared,
+            };
+            Ok(luksbox_format::Container::complete_open_v2_deniable(
+                envelope, &cred,
+            )?)
+        }
+        #[cfg(all(feature = "hardware", target_os = "macos"))]
+        CliDenCred::PqSepFido2 => {
+            let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
+            let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
+            let sep_shared = cli_sep_unseal_from_bytes(&payload_tpm_blob)?;
+            let salt = payload_hmac_salt
+                .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
+            let pin = read_fido2_pin()?;
+            let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, true, &pin)?;
+            let cred = DeniableCredential::HybridPqSepFido2Passphrase {
+                passphrase: pass_zeroizing.as_bytes(),
+                argon2,
+                mlkem_shared: &shared,
+                sep_shared: &sep_shared,
+                hmac_secret_output: &hmac,
+            };
+            match luksbox_format::Container::complete_open_v2_deniable_reusable(envelope, &cred) {
+                Ok(c) => Ok(c),
+                Err((envelope, luksbox_format::Error::OpaqueUnlockFailed)) => {
+                    cli_deniable_raw_salt_retry_notice();
+                    let hmac = cli_fido2_hmac_from_payload(&payload_cred_id, &salt, false, &pin)?;
+                    let cred = DeniableCredential::HybridPqSepFido2Passphrase {
+                        passphrase: pass_zeroizing.as_bytes(),
+                        argon2,
+                        mlkem_shared: &shared,
+                        sep_shared: &sep_shared,
+                        hmac_secret_output: &hmac,
+                    };
+                    Ok(luksbox_format::Container::complete_open_v2_deniable(
+                        envelope, &cred,
+                    )?)
+                }
+                Err((_, e)) => Err(e.into()),
+            }
+        }
+        #[cfg(not(all(feature = "hardware", target_os = "macos")))]
+        CliDenCred::Sep | CliDenCred::SepFido2 | CliDenCred::PqSep | CliDenCred::PqSepFido2 => {
+            Err(cli_err!("Secure Enclave is macOS-only"))
+        }
     }
 }
 
@@ -6216,6 +7759,11 @@ fn cli_create_pq_passphrase_deniable_v2(
         &cred,
         &DeniableMaterial::passphrase_only(),
     )?;
+    // Deniable vaults keep the unbound v2 sidecar: the deniable
+    // envelope has no parseable plaintext header for read_for_vault
+    // to peek, deniable readers use `read` (which ignores bindings),
+    // and a binding would hard-link the sidecar to the vault. See
+    // the `hybrid_sidecar::write` docs.
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -6288,6 +7836,11 @@ fn cli_create_pq_fido2_deniable_v2(
     let cont = luksbox_format::Container::create_with_credential_v2_deniable(
         path, None, cipher, 0, 0, &cred, &material,
     )?;
+    // Deniable vaults keep the unbound v2 sidecar: the deniable
+    // envelope has no parseable plaintext header for read_for_vault
+    // to peek, deniable readers use `read` (which ignores bindings),
+    // and a binding would hard-link the sidecar to the vault. See
+    // the `hybrid_sidecar::write` docs.
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -6437,6 +7990,11 @@ fn cli_create_pq_tpm_deniable_v2(
     let cont = luksbox_format::Container::create_with_credential_v2_deniable(
         path, None, cipher, 0, 0, &cred, &material,
     )?;
+    // Deniable vaults keep the unbound v2 sidecar: the deniable
+    // envelope has no parseable plaintext header for read_for_vault
+    // to peek, deniable readers use `read` (which ignores bindings),
+    // and a binding would hard-link the sidecar to the vault. See
+    // the `hybrid_sidecar::write` docs.
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -6511,6 +8069,11 @@ fn cli_create_pq_tpm_fido2_deniable_v2(
     let cont = luksbox_format::Container::create_with_credential_v2_deniable(
         path, None, cipher, 0, 0, &cred, &material,
     )?;
+    // Deniable vaults keep the unbound v2 sidecar: the deniable
+    // envelope has no parseable plaintext header for read_for_vault
+    // to peek, deniable readers use `read` (which ignores bindings),
+    // and a binding would hard-link the sidecar to the vault. See
+    // the `hybrid_sidecar::write` docs.
     hybrid_sidecar::write(
         &hybrid_sidecar::sidecar_path(path),
         &[HybridEntry {
@@ -6674,10 +8237,19 @@ fn cmd_rotate_mvk(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     // leak via /proc and shell history) or a config file. Neither
     // is a good default. The wizard prompts slot-by-slot.
     //
-    // We honour the standard `--header` / `--anchor` unlock args so
-    // the user can rotate a vault opened with detached header /
-    // anchor sidecars; the wizard's flow takes the open Container
-    // from us so unlock material is gathered there.
+    // `--header` is honoured (open_container reads the detached
+    // header), but `--anchor` is not threaded through: the rollback
+    // check and anchor-generation update happen in `open_vfs`, which
+    // rotation does not go through. Warn instead of silently skipping
+    // the rollback check and leaving the anchor behind the vault's
+    // new generation.
+    if unlock.anchor.is_some() {
+        eprintln!(
+            "warning: --anchor is ignored by rotate-mvk: rotation neither \
+             checks the anchor for rollback nor advances it. Open the vault \
+             with --anchor afterwards; the next write refreshes the anchor."
+        );
+    }
     let cont = open_container(path, unlock)?;
     let cont =
         wizard::run_rotate_mvk_interactive(&dialoguer::theme::ColorfulTheme::default(), cont)?;
@@ -7038,16 +8610,48 @@ fn cmd_panic(
     };
     let len_hint = std::fs::metadata(vault).map(|m| m.len()).unwrap_or(0);
 
+    // v3 crash-recovery sidecars. `panic` MUST destroy the header
+    // mirror too: without it, `Container::open` detects the randomised
+    // live header, transparently recovers the keyslots from
+    // `<header>.header-bak`, and even rewrites (self-heals) the live
+    // header from the mirror on the next open -- so the vault would
+    // stay fully openable and the "no keyslots to attack" guarantee
+    // would be false. The metadata mirror `<vault>.meta-bak` is a full
+    // copy of the encrypted metadata region; it is cryptographically
+    // dead once the keyslots are gone, so like the main metadata region
+    // it is only scrubbed under `--wipe-data`. Open the handles up-front
+    // with the same no-follow semantics and hold them across the
+    // confirmation prompt (same TOCTOU rationale as the header/vault
+    // handles above). A missing sidecar (v2 vault, or one that never got
+    // a mirror) is fine -- skip it.
+    let mut mirrors =
+        luksbox_core::file_util::RecoveryMirrors::open_no_follow(vault, header_target, wipe_data)
+            .map_err(|e| {
+            format!("refusing to open a crash-recovery mirror for destructive overwrite: {e}")
+        })?;
+
     if !skip_confirm {
         eprintln!(
             "PANIC: about to overwrite the header of {} with random bytes.",
             header_target.display()
         );
+        if let Some(p) = mirrors.header_mirror_path() {
+            eprintln!(
+                "       ALSO destroying the crash-recovery header mirror {}.",
+                p.display()
+            );
+        }
         if wipe_data {
             eprintln!(
                 "       ALSO overwriting the entire vault file ({} bytes).",
                 len_hint
             );
+            if let Some(p) = mirrors.meta_mirror_path() {
+                eprintln!(
+                    "       ALSO overwriting the metadata mirror {}.",
+                    p.display()
+                );
+            }
         }
         eprintln!("   This is IRREVERSIBLE. There is NO undo. There is NO recovery.");
         let expected = format!("DESTROY {}", vault.display());
@@ -7064,6 +8668,13 @@ fn cmd_panic(
     hf.seek(SeekFrom::Start(0))?;
     hf.write_all(&buf)?;
     hf.flush()?;
+    // Scrub the recovery mirror(s) in full. This is the load-bearing
+    // part of the fix: leaving the header mirror intact makes the whole
+    // panic reversible. The metadata mirror is only present (and thus
+    // only scrubbed) under `--wipe-data`.
+    mirrors
+        .scrub()
+        .map_err(|e| format!("failed to overwrite a crash-recovery mirror: {e}"))?;
     if wipe_data {
         // Inline-header case: vf_opt is None, reuse hf for the full
         // wipe. Detached-header case: write through vf_opt which

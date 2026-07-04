@@ -237,7 +237,7 @@ fn chunk_position_swap_within_file_fails_aead() {
     cont.read_at(data_off, &mut s0).unwrap();
     cont.read_at(data_off + CHUNK_SLOT_SIZE, &mut s1).unwrap();
 
-    // Swap on-disk slot 0 ↔ slot 1.
+    // Swap on-disk slots 0 and 1.
     cont.write_at(data_off, &s1).unwrap();
     cont.write_at(data_off + CHUNK_SLOT_SIZE, &s0).unwrap();
     drop(cont);

@@ -59,6 +59,14 @@ itself.
   does NOT bundle WinFsp; for that path users install WinFsp
   separately from https://winfsp.dev/rel/.
 
+- wayland-scanner (build-time only): Copyright (c) 2015 Elinor
+  Berger. MIT licensed. A compile-time proc macro from
+  https://github.com/Smithay/wayland-rs, consumed as a pinned git
+  dependency on our fork (https://github.com/PentHertz/wayland-rs)
+  which carries the 0.31.10 release source with a two-line
+  dependency fix. It generates Wayland protocol bindings
+  during the Linux GUI build and is never part of any shipped binary.
+
 - libfido2 + libcbor + OpenSSL + zlib + hidapi:
   Statically linked into all Windows artifacts (via vcpkg's
   x64-windows-static-md triplet) and into the macOS artifacts (via

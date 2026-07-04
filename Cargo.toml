@@ -11,11 +11,12 @@ members = [
     "crates/luksbox-cli",
     "crates/luksbox-gui",
     "crates/luksbox-tpm",
+    "crates/luksbox-sep",
     "crates/luksbox-ct-bench",
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 # Apache-2.0 is the SPDX identifier; crates.io and `cargo publish`
 # recognise it directly. Each crate's Cargo.toml inherits this via
@@ -67,6 +68,24 @@ bindgen = "0.71"
 ctrlc = "3"
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 ml-kem = { version = "0.3", features = ["zeroize"] }
+
+# wayland-scanner 0.31.10 with its quick-xml requirement bumped to
+# 0.41 to clear RUSTSEC-2026-0194/0195 (both fixed in quick-xml >=
+# 0.41.0, a semver-major jump no published wayland-scanner can
+# reach). The pinned commit on our fork carries the wayland-scanner
+# 0.31.10 release source (upstream commit a3d7927d) with a two-line
+# change: the requirement bump and upstream master's own one-liner
+# (`xml_content()` -> `xml10_content()`, identical semantics). The
+# scanner must stay on release-series source: a master-based scanner
+# generates bindings for unreleased wayland-backend APIs and breaks
+# the released wayland crates that invoke it during their builds.
+# wayland-scanner is a compile-time-only proc macro, so this patch
+# never changes shipped code, it only moves the build off the
+# vulnerable parser. Drop the patch as soon as upstream publishes a
+# release requiring quick-xml >= 0.41:
+#   https://github.com/Smithay/wayland-rs
+[patch.crates-io]
+wayland-scanner = { git = "https://github.com/PentHertz/wayland-rs.git", rev = "89a00d5f8c09e54d6fd72e3f5dbce512453922d0" }
 
 [profile.release]
 lto = "thin"

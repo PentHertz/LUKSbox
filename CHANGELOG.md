@@ -14,6 +14,274 @@ canonical record.
 
 ---
 
+## [v0.4.0] - 2026-07-04
+
+First stable release of the v0.4.0 line. It promotes `v0.4.0-rc.3` to
+stable with no functional code changes since the candidate. This line
+brings macOS Secure Enclave keyslots up to parity with the TPM and
+FIDO2 backends, extends the mount-time symlink and inode guards to every
+frontend, and closes out the late-June audit passes. On-disk formats are
+unchanged from the v0.3 line: existing vaults, sidecars, and headers
+open without migration.
+
+Highlights across the v0.4.0 candidates (rc.1 through rc.3), grouped by
+theme. Full detail lives in the per-candidate entries below.
+
+- macOS Secure Enclave (SEP) keyslots on Apple Silicon and T2 Macs, with
+  13 keyslot kinds (plain, Touch ID, FIDO2 and passphrase fusions, and
+  ML-KEM-768 / ML-KEM-1024 hybrids), no external sidecar, and the SEP
+  material carried in an HMAC-covered in-header region.
+- macOS mount stability: FUSE-T and macFUSE fixes.
+- Mountpoint hardening (the `O_DIRECTORY | O_NOFOLLOW` symlink probe and
+  the pre-syscall inode re-probe) moved below every frontend, so TUI and
+  GUI mounts get the same protection the CLI already had.
+- Hybrid post-quantum sidecars are vault-bound on every non-deniable
+  create, enroll, and unlock path.
+- Every panic action now also destroys the crash-recovery sidecars, so
+  destruction can no longer be reversed from a `header-bak` mirror.
+- Hardened `.kyber` seed-file unlock: fallible KDF allocation and
+  zeroized intermediates.
+- Local-attacker TOCTOU fixes on the panic/destroy and deniable-mount
+  paths, plus canonicalised mountpoints in the Unix unmount helpers.
+- Dependency advisories cleared: the quick-xml pair (RUSTSEC-2026-0194 /
+  RUSTSEC-2026-0195) resolved without an ignore, plus `anyhow` and
+  `memmap2` updates.
+
+## [v0.4.0-rc.3] - 2026-07-03
+
+Third release candidate for the v0.4.0 line, focused on hardening.
+Everything here comes out of the late-June audit passes: sidecar
+binding drift, mountpoint safety in the non-CLI frontends, the GUI
+panic action, the post-quantum seed-file unlock path, and two
+dependency advisories.
+
+### Security: hybrid PQ sidecars are vault-bound on every non-deniable path
+
+The v3 sidecar format (a 32-byte `header_salt` binding, readable by
+every LUKSbox release since v0.1.0) existed, but most production
+writers still emitted unbound v2 sidecars and several readers ignored
+the binding, so swapping a `.kyber` sidecar between vaults surfaced as
+a confusing AEAD failure instead of a clear refusal. All non-deniable
+create and enroll paths (CLI, TUI wizard, GUI) now write the binding,
+enroll-time reads verify it before appending new entries (so an enroll
+against a swapped-in foreign sidecar is refused rather than re-blessed
+under a fresh valid binding), and the last five unlock readers that
+ignored the binding now verify it. Deniable vaults deliberately keep
+the unbound v2 format: the deniable envelope has no parseable
+plaintext header to bind against, and a binding would hard-link the
+sidecar to the vault for anyone holding both files.
+
+### Security: mountpoint hardening now covers the TUI and GUI, not just the CLI
+
+The `O_DIRECTORY | O_NOFOLLOW` symlink probe and the inode re-probe
+immediately before the mount syscall (R12-08) used to live inside the
+CLI's `mount` subcommand, so TUI-wizard mounts and the GUI's
+in-process mounts ran without them. The guard moved into a shared
+`luksbox-mount` module one layer below every frontend, so all Unix
+mount entry points now inherit both protections, including inside the
+forked child on the daemonized FUSE path. Found in an external audit
+pass by Garry Jean-Baptiste (2026-06-19).
+
+### Security: rc.3 follow-up hardening for metadata status and Unix unmount helpers
+
+Two additional rc.3 audit follow-ups landed in the same release:
+
+- VFS metadata budget reporting now projects the compact v3/v4/v5
+  on-disk shape instead of serialising the fully materialised in-memory
+  chunk list. Large spilled files keep millions of chunk refs in memory
+  for normal reads/writes, but only a small `(head, count)` stub in the
+  metadata blob. The old status path could allocate excessive memory
+  during GUI polling and report a bogus "near budget" state for large
+  vaults.
+- Unix unmount paths now canonicalise the mountpoint before passing it
+  to `/usr/bin/fusermount3`, `/bin/fusermount3`, or `/sbin/umount`.
+  This keeps user-controlled relative paths that begin with `-` from
+  being parsed as helper options in explicit unmounts, signal-triggered
+  unmounts, and suspend-triggered unmounts.
+
+### Security: every panic action now destroys the crash-recovery sidecars
+
+`panic` overwrote the vault header but left the `header-bak` and
+`meta-bak` crash-recovery mirrors intact, which made the whole
+destruction reversible: `Container::open` detects the randomized live
+header, recovers the keyslots from `header-bak`, and self-heals the
+live header. The panic path now scrubs the recovery mirrors along with
+the header. This is enforced through one shared
+`luksbox_core::file_util::RecoveryMirrors` helper wired into all three
+frontends (the `panic` CLI subcommand, the TUI wizard's panic and
+destroy-by-path actions, and the GUI panic button), so the guarantee
+can no longer drift between them. The metadata mirror is scrubbed only
+under a full data wipe, matching the live metadata region. Removing a
+vault from the GUI also cleans up its side files instead of leaving
+them behind.
+
+### Security: `.kyber` seed-file unlock hardened (fallible KDF memory, zeroized intermediates)
+
+The seed-file KDF used Argon2's internally allocating API, so a
+memory-starved host (small VM, tight cgroup, QubesOS AppVM) aborted
+the whole process instead of reporting an error, and the unlock path
+left secret intermediates uncleared. The path now mirrors the core
+KDF: the Argon2 block buffer is reserved fallibly with a clean error
+on OOM, the KEK is derived straight into zeroizing storage, working
+memory is zeroized on both success and error paths, and the decrypted
+seed is zeroized after use. Enrollment also refuses an empty seed
+passphrase instead of silently encrypting under one.
+
+### Security: quick-xml advisories eliminated from the dependency graph
+
+`cargo audit` flagged quick-xml 0.39.3 (RUSTSEC-2026-0194,
+RUSTSEC-2026-0195, both DoS-class, fixed in 0.41.0). Its only importer
+is the `wayland-scanner` proc macro, whose latest release pins the
+vulnerable line, so `[patch.crates-io]` redirects wayland-scanner to a
+pinned commit on our fork at
+`https://github.com/PentHertz/wayland-rs`. The fork carries the
+wayland-scanner 0.31.10 release source with a two-line change: the
+quick-xml requirement bump and upstream master's own API rename
+(`xml_content()` to `xml10_content()`, identical semantics). The
+scanner has to stay on release-series source, because a master-based
+scanner generates bindings for unreleased wayland-backend APIs and
+breaks the released wayland crates that call it at build time.
+quick-xml runs at compile time only and is never linked into shipped
+binaries, but the lockfile now carries 0.41.0 and the audit gate
+passes with no quick-xml ignores. Also updated `anyhow`
+(RUSTSEC-2026-0190) and `memmap2` (RUSTSEC-2026-0186), and moved the
+audit ignore file to `.cargo/audit.toml`, where cargo-audit actually
+reads it; the old root-level location was silently unused.
+
+### Fixed: macOS SEP follow-through and GUI polish
+
+Remaining gaps from the rc.1 Secure Enclave work: SEP support fixes
+with updated design notes in `docs/SEP_KEYSLOT_DESIGN.md`, FUSE and
+FUSE-T mount fixes, a clearer FIDO2 touch prompt in the GUI, continued
+TUI/CLI/GUI option alignment, and expanded mount-safety and functional
+test coverage. `SECURITY.md` and `TESTING.md` updated to match.
+
+## [v0.4.0-rc.2] - 2026-06-19
+
+Small alignment release: TUI and CLI option wiring brought in line
+with the GUI, plus formatting. No on-disk format changes.
+
+## [v0.4.0-rc.1] - 2026-06-18
+
+Release candidate for the v0.4.0 line. Headline feature: macOS Secure
+Enclave (SEP) keyslots on Apple Silicon and T2 Macs. See the design
+notes in `docs/SEP_KEYSLOT_DESIGN.md` and the focused security review in
+`docs/SECURITY_AUDIT_ROUND_14.md`.
+
+### Added: macOS Secure Enclave (SEP) keyslots
+
+Bind a keyslot to the machine's Secure Enclave via CryptoKit
+`SecureEnclave.P256.KeyAgreement` (ECDH + HKDF, derive-mode). The
+per-slot SEP material lives in a new in-header region (gated by
+`FLAG_HAS_SEP_REGION`, covered by the header HMAC), so SEP vaults need
+no external sidecar and the header geometry is unchanged. 13 keyslot
+kinds: plain, biometric (Touch ID), fused with FIDO2 and/or a
+passphrase, and ML-KEM-768 / ML-KEM-1024 hybrids. Recovery follows the
+TPM model: keep a backup passphrase slot, since a wiped or replaced
+enclave makes a SEP slot unopenable. Full mechanism in
+`docs/CRYPTO_SPEC.md` section 21 and `docs/SECURITY_ARCHITECTURE.md`.
+
+### Security: SEP+FIDO2 keyslots now bind the FIDO2 hmac_salt into AEAD coverage (audit R14-01)
+
+The Round 14 SEP review found the six SEP+FIDO2 keyslot kinds wrote the
+32-byte `fido2_hmac_salt` to the slot but omitted it from the AEAD AAD,
+because the `salt_len` decision in `build_aead_aad` had drifted from the
+one in `to_bytes` when the SEP kinds were added. The salt stayed covered
+by the MVK-keyed header HMAC, so the realistic impact was a targeted
+slot lockout that already required holding the MVK, not a key-recovery
+or unlock bypass. Fixed by making `SlotKind::has_inline_hmac_salt()` the
+single source of truth that `build_aead_aad`, `to_bytes`, and the
+`from_bytes` parser all share, so the salt-bearing set can never drift
+again on a future keyslot-kind addition. Pinned by a new parity test,
+`aad_covers_hmac_salt_for_every_salt_bearing_kind`. See
+`docs/SECURITY_AUDIT_ROUND_14.md`.
+
+### Security: hardened the CLI panic/destroy and deniable-mount paths against local symlink races (audit R14-02, R14-03)
+
+Two pre-existing local-attacker TOCTOU gaps in the CLI, found in the same
+review cycle and fixed here:
+
+- The TUI wizard's panic/destroy action (`panic_action`) opened its
+  destructive targets with symlink-following `OpenOptions` AFTER the
+  confirmation prompt, so a local attacker with write access to the
+  parent directory could swap in a symlink during the prompt and
+  redirect the random-bytes overwrite to another file (an arbitrary
+  overwrite primitive if LUKSbox runs elevated). It now opens both
+  targets up front with `secure_open_existing_no_follow` and holds the
+  handles across the prompt, matching the already-hardened `cmd_panic`
+  and `panic_by_path`.
+- Deniable-mount (`cmd_deniable_mount`) promised a pre-mount mountpoint
+  inode re-probe in its own comment but never performed one, unlike the
+  normal `mount` command. It now captures the probed `(dev, ino)` and
+  re-checks with `O_DIRECTORY | O_NOFOLLOW` immediately before the mount
+  syscall, refusing if the mountpoint was swapped. The blast radius was
+  already bounded by the mountpoint deny-list.
+
+See `docs/SECURITY_AUDIT_ROUND_14.md`.
+
+### Security: rotation-abort symlink hardening and Windows extract name-confusion (audit R14-04/05/06)
+
+Three pre-existing local-attacker issues reported via coordinated
+disclosure by **Garry Jean-Baptiste** (garry@reyse.ai), found with
+LLM-assisted source review. None is SEP-related; all are fixed here.
+
+- **R14-04 (completes R13-02):** `Container::abort_atomic_rotation`
+  reopened the vault path with a bare `open()` (no `O_NOFOLLOW`, no
+  inode recheck) on a failed key rotation; the subsequent `Drop` ->
+  `persist_header` then wrote 8 KiB at offset 0. Because
+  `begin_atomic_rotation` releases the original lock, a directory-level
+  attacker could swap the path for a symlink during the rotation window
+  and redirect that write. Reachability is narrow (it only fires on a
+  failure in the final `persist_header` step), so it is
+  defense-in-depth. Fixed by capturing the committed `(dev,ino)` at
+  `begin_atomic_rotation` and routing the abort reopen through
+  `reopen_committed_no_follow` (the same helper R13-02 used), so a
+  swapped path fails closed with `PathSubstituted`. Covers both the
+  standard and deniable rotation aborts (they share one function).
+- **R14-05 (Windows, GUI):** the bulk-extract top-level join
+  (`start_get_dir`) did not apply the `name_escapes_directory` guard to
+  the vault-supplied name, so a forged entry like `C:evil` could escape
+  the chosen folder on Windows. The guard is now applied to the
+  top-level name too.
+- **R14-06 (Windows, GUI):** a `:` in a vault entry name
+  (`malware.exe:Zone.Identifier`) could target a Windows alternate data
+  stream on extraction. Rather than reject `:` in `validate_name` (which
+  runs at load time and would break existing POSIX vaults that
+  legitimately contain `:`), the Windows-gated `name_escapes_directory`
+  now rejects any `:`, leaving POSIX behaviour unchanged.
+
+See `docs/SECURITY_AUDIT_ROUND_14.md`.
+
+### Fixed: Secure Enclave in deniable mode is now refused clearly instead of a cryptic error
+
+Selecting any Secure Enclave keyslot for a deniable vault previously
+created the vault, failed at SEP enrollment with the opaque
+`crypto: invalid field value`, and rolled the create back (and the GUI
+showed no envelope-passphrase field, because SEP is passwordless). SEP
+cannot back a deniable vault: deniable slots are fixed at creation time,
+every deniable credential variant requires a passphrase, and the deniable
+slot envelope carries no SEP material. Fixed across all three frontends:
+
+- **Backend:** `guard_no_deniable_slot_mutation` now returns a
+  descriptive `DeniableSlotMutationUnsupported` error (instead of the
+  opaque `InvalidField`), covering every post-create hardware enroll
+  (SEP / TPM / FIDO2) on a deniable vault.
+- **GUI:** hides the Secure Enclave factor in deniable mode (with a
+  short explanatory note), so the combination can't be selected.
+- **CLI:** the SEP/TPM-create surface (`deniable-init`) never offered
+  SEP (its credential set has no SEP variant), and `enroll --kind sep*`
+  on a deniable vault now refuses *before* touching the Secure Enclave
+  (no wasted Touch ID prompt) in `cmd_enroll_sep`,
+  `cmd_enroll_sep_fused`, and `cmd_enroll_hybrid_pq_sep`.
+- **TUI/wizard:** the deniable-create flow never offered SEP; the
+  keyslot manager already refused SEP enroll on deniable vaults before
+  sealing, and the message now states the real reason instead of
+  "not exposed yet".
+
+See `docs/SEP_KEYSLOT_DESIGN.md` section 10.
+
+---
+
 ## [v0.3.1] - 2026-06-17
 
 Hardening and usability fixes, with a focus on running unprivileged on

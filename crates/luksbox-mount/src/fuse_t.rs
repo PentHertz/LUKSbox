@@ -35,6 +35,15 @@ pub fn mount(
     _daemonize: bool,
     sync_mode: bool,
 ) -> Result<(), super::MountError> {
+    // SECURITY (R12-05 + R12-08): O_NOFOLLOW probe + (dev,ino) capture +
+    // deny-list, shared with the libfuse backend so every frontend that
+    // reaches this point inherits it. Previously only the CLI's
+    // `cmd_mount_fuse_t_helper` did the probe + deny-list inline, and it
+    // dropped the R12-08 re-probe; the GUI reaches FUSE-T through that
+    // same hardened helper subprocess, but wiring the guard here closes
+    // the missing re-probe and covers any future direct caller.
+    let probe_inode = crate::mountpoint::harden_mountpoint(mountpoint)?;
+
     // FUSE-T's high-level API blocks the calling thread until unmount,
     // and installs its own SIGINT handler so Ctrl-C unmounts cleanly.
     // We don't fork/daemonize here, the CLI binary does that one
@@ -44,6 +53,9 @@ pub fn mount(
     let mut options = MountOptions::default();
     // Show a friendlier name in Finder than the default "luksbox".
     options.volname = Some("LUKSbox".to_string());
+    // R12-08: re-verify the mountpoint inode immediately before the
+    // mount call to catch a swap in the window since the probe.
+    crate::mountpoint::reverify_mountpoint(mountpoint, probe_inode)?;
     luksbox_fuse_t::mount(fs, mountpoint, &options)
         .map_err(|e| super::MountError::Io(std::io::Error::other(format!("FUSE-T: {e}"))))
 }

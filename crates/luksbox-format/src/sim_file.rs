@@ -156,6 +156,11 @@ impl LbxFile for SimFile {
         self.durable = self.backing.clone();
         Ok(())
     }
+    fn inode_pair(&self) -> io::Result<(u64, u64)> {
+        // In-memory backend: no real inode. Never reached on the
+        // real-filesystem rotation path; a stable sentinel is fine.
+        Ok((0, 0))
+    }
 }
 
 /// Shared handle over a `SimFile`. Lets the test keep a reference to
@@ -268,6 +273,9 @@ impl LbxFile for SharedSimFile {
             .lock()
             .map_err(|_| io::Error::other("SimFile mutex poisoned"))?
             .sync_all()
+    }
+    fn inode_pair(&self) -> io::Result<(u64, u64)> {
+        Ok((0, 0))
     }
 }
 

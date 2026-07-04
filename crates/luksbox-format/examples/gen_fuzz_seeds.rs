@@ -160,6 +160,24 @@ fn main() {
     fs::write(format!("{base}/header_parse/seed_v3_multi"), h_v3_bytes).unwrap();
     fs::write(format!("{base}/header_roundtrip/seed_v3_multi"), h_v3_bytes).unwrap();
 
+    // SEP-region-bearing header (v0.4.0): warms the in-header Secure
+    // Enclave table parser (count / slot_idx / blob_len) inside
+    // header_parse and header_roundtrip. Without a seed the
+    // FLAG_HAS_SEP_REGION bit is almost never set by random mutation, so
+    // the region parser stays cold. One 352 B blob at slot 2 (slot 0
+    // holds the passphrase keyslot), matching the in-tree round-trip test.
+    let mut h_sep = Header::new(
+        CipherSuite::Aes256GcmSiv,
+        KdfId::Argon2id,
+        4096,
+        HEADER_SIZE as u64,
+    );
+    h_sep.install_slot(0, slot_pp.clone()).unwrap();
+    h_sep.set_sep_blob(2, vec![0xc3; 352]).unwrap();
+    let h_sep_bytes = h_sep.to_bytes(&mvk);
+    fs::write(format!("{base}/header_parse/seed_sep"), h_sep_bytes).unwrap();
+    fs::write(format!("{base}/header_roundtrip/seed_sep"), h_sep_bytes).unwrap();
+
     // Valid encrypted metadata region.
     let mut region = vec![0u8; 1024 * 1024];
     write_metadata(
@@ -295,6 +313,38 @@ fn main() {
             &seed,
         )
         .unwrap();
+    }
+
+    // -------------------------------------------------------------
+    // SEP (v0.4.0) seeds for the dedicated targets, written to both
+    // the libfuzzer corpus and the AFL++ seeds directory.
+    // -------------------------------------------------------------
+    for d in ["sep_blob_parse", "sep_region_parse"] {
+        fs::create_dir_all(format!("{base}/{d}")).unwrap();
+        fs::create_dir_all(format!("{afl_base}/{d}")).unwrap();
+    }
+
+    // sep_blob_parse: a minimal valid SepBlob wire form
+    //   [flags=0][sep_data_len=4 LE][sep_data: 4][eph_pub: 65].
+    // Hand-built so this generator stays free of the luksbox-sep dep.
+    {
+        let mut blob = vec![0u8]; // flags: not biometric
+        blob.extend_from_slice(&4u16.to_le_bytes());
+        blob.extend_from_slice(&[0xaa; 4]);
+        blob.extend_from_slice(&[0x04; 65]); // x963 uncompressed-point prefix
+        fs::write(format!("{base}/sep_blob_parse/seed_min"), &blob).unwrap();
+        fs::write(format!("{afl_base}/sep_blob_parse/seed_min"), &blob).unwrap();
+    }
+
+    // sep_region_parse: the harness's own framing
+    //   [count][ idx, len_lo, len_hi, <len bytes> ]. One blob:
+    //   count=1, idx=2, len=8.
+    {
+        let mut seed = vec![1u8, 2u8];
+        seed.extend_from_slice(&8u16.to_le_bytes());
+        seed.extend_from_slice(&[0xc3; 8]);
+        fs::write(format!("{base}/sep_region_parse/seed_one_blob"), &seed).unwrap();
+        fs::write(format!("{afl_base}/sep_region_parse/seed_one_blob"), &seed).unwrap();
     }
 
     println!("seeds written under {base}/ and {afl_base}/");

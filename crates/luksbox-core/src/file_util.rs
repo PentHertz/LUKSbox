@@ -1150,10 +1150,196 @@ pub fn delete_atomic_write_orphans(
     (deleted, errors)
 }
 
+/// Overwrite a file's entire current length with cryptographically
+/// random bytes and fsync. Best-effort anti-forensic scrub used by the
+/// `panic` / destroy actions on the crash-recovery mirror sidecars.
+/// Logical overwrite only: on SSDs and copy-on-write filesystems it
+/// does not guarantee physical destruction of prior contents.
+pub fn scrub_whole_file(f: &mut File) -> io::Result<()> {
+    use rand_core::{OsRng, RngCore};
+    use std::io::{Seek, SeekFrom, Write};
+    let len = f.metadata()?.len();
+    f.seek(SeekFrom::Start(0))?;
+    let mut chunk = vec![0u8; 1 << 20];
+    let mut written = 0u64;
+    while written < len {
+        OsRng.fill_bytes(&mut chunk);
+        let n = ((len - written) as usize).min(chunk.len());
+        f.write_all(&chunk[..n])?;
+        written += n as u64;
+    }
+    f.sync_all()
+}
+
+fn append_ext(path: &Path, ext: &str) -> PathBuf {
+    // Append `.<ext>` to the full filename without replacing the
+    // existing extension, matching luksbox-format's sidecar naming
+    // (`container::append_extension`): `vault.lbx` + `"header-bak"`
+    // => `vault.lbx.header-bak`.
+    let mut s = path.as_os_str().to_owned();
+    s.push(".");
+    s.push(ext);
+    PathBuf::from(s)
+}
+
+fn open_mirror_no_follow(p: &Path) -> io::Result<Option<(PathBuf, File)>> {
+    match secure_open_existing_no_follow(p) {
+        Ok(f) => Ok(Some((p.to_path_buf(), f))),
+        // A missing mirror (v2 vault, or one that never flushed a
+        // mirror) is a clean skip. Any other error, including a
+        // symlink planted where the mirror should be (ELOOP under
+        // no-follow), is propagated so the destruction is never
+        // silently incomplete.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Open handles to a vault's crash-recovery mirror sidecars so a
+/// `panic` / destroy action can scrub them.
+///
+/// A `panic` MUST destroy the header mirror. Without it, `Container::open`
+/// detects the randomised live header, transparently recovers the
+/// keyslots from `<header_target>.header-bak`, and even self-heals the
+/// live header from the mirror, so the vault would stay fully openable
+/// and the "no keyslots left to attack" guarantee would be false. The
+/// metadata mirror `<vault>.meta-bak` is a full copy of the encrypted
+/// metadata region; it is cryptographically dead once the keyslots are
+/// gone, so like the live metadata region it is only scrubbed under a
+/// full data wipe.
+///
+/// The handles are opened with the same no-follow semantics as the live
+/// header/body targets, so open them up front (before any confirmation
+/// prompt) and hold them across the prompt: that pins the inode and
+/// closes the symlink-swap TOCTOU window that a later re-open would
+/// leave. Call [`RecoveryMirrors::scrub`] after confirmation, alongside
+/// the live header/body scrub.
+#[derive(Debug, Default)]
+pub struct RecoveryMirrors {
+    header_bak: Option<(PathBuf, File)>,
+    meta_bak: Option<(PathBuf, File)>,
+}
+
+impl RecoveryMirrors {
+    /// Open `<header_target>.header-bak` (always) and, when `wipe_data`,
+    /// `<vault>.meta-bak`, both with no-follow semantics. `header_target`
+    /// is the vault path for an inline header, or the detached-header
+    /// sidecar path when the vault uses one. A missing mirror is a clean
+    /// skip; a symlink or any other open error is a hard error.
+    pub fn open_no_follow(vault: &Path, header_target: &Path, wipe_data: bool) -> io::Result<Self> {
+        let header_bak = open_mirror_no_follow(&append_ext(header_target, "header-bak"))?;
+        let meta_bak = if wipe_data {
+            open_mirror_no_follow(&append_ext(vault, "meta-bak"))?
+        } else {
+            None
+        };
+        Ok(Self {
+            header_bak,
+            meta_bak,
+        })
+    }
+
+    /// Path of the header mirror that will be scrubbed, if one is
+    /// present. Callers use this to word the confirmation prompt.
+    pub fn header_mirror_path(&self) -> Option<&Path> {
+        self.header_bak.as_ref().map(|(p, _)| p.as_path())
+    }
+
+    /// Path of the metadata mirror that will be scrubbed, if one is
+    /// present (only opened under a full data wipe).
+    pub fn meta_mirror_path(&self) -> Option<&Path> {
+        self.meta_bak.as_ref().map(|(p, _)| p.as_path())
+    }
+
+    /// Overwrite every opened mirror's full length with random bytes and
+    /// fsync. This is the load-bearing part of the `panic` fix: leaving
+    /// the header mirror intact makes the whole destruction reversible.
+    pub fn scrub(&mut self) -> io::Result<()> {
+        if let Some((_, f)) = self.header_bak.as_mut() {
+            scrub_whole_file(f)?;
+        }
+        if let Some((_, f)) = self.meta_bak.as_mut() {
+            scrub_whole_file(f)?;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn recovery_mirrors_scrub_overwrites_present_and_skips_missing() {
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("v.lbx");
+        std::fs::write(&vault, vec![0u8; 8192]).unwrap();
+
+        let header_bak = dir.path().join("v.lbx.header-bak");
+        let meta_bak = dir.path().join("v.lbx.meta-bak");
+        let hb_before = vec![0xABu8; 4096];
+        let mb_before = vec![0xCDu8; 2048];
+        std::fs::write(&header_bak, &hb_before).unwrap();
+        std::fs::write(&meta_bak, &mb_before).unwrap();
+
+        // wipe_data = true so the metadata mirror is opened as well.
+        let mut mirrors = RecoveryMirrors::open_no_follow(&vault, &vault, true).unwrap();
+        assert_eq!(mirrors.header_mirror_path(), Some(header_bak.as_path()));
+        assert_eq!(mirrors.meta_mirror_path(), Some(meta_bak.as_path()));
+        mirrors.scrub().unwrap();
+
+        // Both mirrors overwritten in full, lengths preserved. Leaving
+        // the header mirror intact is exactly what let `Container::open`
+        // recover the keyslots and self-heal the live header, making a
+        // "panic" reversible.
+        let hb_after = std::fs::read(&header_bak).unwrap();
+        let mb_after = std::fs::read(&meta_bak).unwrap();
+        assert_eq!(hb_after.len(), hb_before.len());
+        assert_eq!(mb_after.len(), mb_before.len());
+        assert_ne!(hb_after, hb_before, "header mirror must be scrubbed");
+        assert_ne!(mb_after, mb_before, "metadata mirror must be scrubbed");
+
+        // A vault with no mirrors present: open + scrub is a clean no-op.
+        let bare = dir.path().join("bare.lbx");
+        std::fs::write(&bare, vec![0u8; 8192]).unwrap();
+        let mut none = RecoveryMirrors::open_no_follow(&bare, &bare, true).unwrap();
+        assert!(none.header_mirror_path().is_none());
+        assert!(none.meta_mirror_path().is_none());
+        none.scrub().unwrap();
+
+        // Without a data wipe, the metadata mirror is not opened even if
+        // it exists on disk (it is cryptographically dead once the
+        // keyslots are gone).
+        std::fs::write(&header_bak, &hb_before).unwrap();
+        std::fs::write(&meta_bak, &mb_before).unwrap();
+        let no_wipe = RecoveryMirrors::open_no_follow(&vault, &vault, false).unwrap();
+        assert!(no_wipe.header_mirror_path().is_some());
+        assert!(no_wipe.meta_mirror_path().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_mirrors_refuse_symlinked_header_mirror() {
+        // A symlink planted where the header mirror should be must not be
+        // followed (which would redirect the scrub's overwrite onto the
+        // link target). `open_no_follow` refuses it rather than silently
+        // skipping, so the destruction is never quietly incomplete.
+        let dir = tempdir().unwrap();
+        let vault = dir.path().join("v.lbx");
+        std::fs::write(&vault, vec![0u8; 8192]).unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"do not touch").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("v.lbx.header-bak")).unwrap();
+
+        RecoveryMirrors::open_no_follow(&vault, &vault, false)
+            .expect_err("symlinked header mirror must be refused, not followed");
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"do not touch",
+            "symlink target must be untouched"
+        );
+    }
 
     #[cfg(unix)]
     fn mode_of(path: &Path) -> u32 {

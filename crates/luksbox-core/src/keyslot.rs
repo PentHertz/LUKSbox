@@ -88,6 +88,44 @@ fn derive_hybrid_tpm2_fido2_kek(
     KeyEncryptionKey::from_zeroizing(&out)
 }
 
+/// HKDF info string for the unified macOS Secure Enclave KEK
+/// derivation. Distinct from the TPM info strings so a SEP slot and a
+/// TPM slot with coincidentally-equal factor bytes derive different
+/// KEKs (domain separation).
+const SEP_KEK_INFO: &[u8] = b"lbx:sep-kek/v1";
+
+/// Derive the KEK for ANY macOS Secure Enclave keyslot. The IKM is the
+/// factors actually present, concatenated in a FIXED canonical order:
+///   `sep_shared || [passphrase_kek] || [hmac_secret] || [pq_shared]`
+/// Each present factor is 32 B. Which factors are present is fixed by
+/// the slot kind, so enroll and unlock reconstruct identical IKM.
+/// `sep_shared` is the ECDH shared secret from the enclave;
+/// `passphrase_kek` is the Argon2id output (already stretched).
+fn derive_sep_kek(
+    sep_shared: &[u8; KEY_LEN],
+    passphrase_kek: Option<&[u8; KEY_LEN]>,
+    hmac_secret: Option<&[u8; KEY_LEN]>,
+    pq_shared: Option<&[u8; KEY_LEN]>,
+    header_salt: &[u8; 32],
+) -> KeyEncryptionKey {
+    let mut ikm = Zeroizing::new(Vec::with_capacity(4 * KEY_LEN));
+    ikm.extend_from_slice(sep_shared);
+    if let Some(p) = passphrase_kek {
+        ikm.extend_from_slice(p);
+    }
+    if let Some(h) = hmac_secret {
+        ikm.extend_from_slice(h);
+    }
+    if let Some(q) = pq_shared {
+        ikm.extend_from_slice(q);
+    }
+    let hk = Hkdf::<Sha256>::new(Some(header_salt), ikm.as_slice());
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    hk.expand(SEP_KEK_INFO, out.as_mut_slice())
+        .expect("32 <= 255 * HashLen");
+    KeyEncryptionKey::from_zeroizing(&out)
+}
+
 /// Derive the MVK directly from a YubiKey's hmac-secret response.
 /// `salt` is the slot's `fido2_hmac_salt`; `hmac_secret` is the 32-byte
 /// authenticator output. Used by `SlotKind::Fido2DerivedMvk`.
@@ -335,6 +373,62 @@ pub enum SlotKind {
     HybridPqKem1024Tpm2 = 13,
     /// Same as `HybridPqKemTpm2Fido2` but with ML-KEM-1024.
     HybridPqKem1024Tpm2Fido2 = 14,
+    /// macOS Secure Enclave-bound keyslot, the SEP analog of
+    /// `Tpm2Sealed`. The KEK is the 32-byte ECDH shared secret a
+    /// SEP-resident P-256 key agrees with a host-side ephemeral key
+    /// (derive, not seal - the SEP has no generic seal primitive); it
+    /// then wraps the MVK exactly as a TPM slot does. The SEP private
+    /// half never leaves the enclave. Unlike TPM slots, the inline
+    /// variable region is EMPTY: the SEP material (the opaque
+    /// `dataRepresentation` + ephemeral public key, 353-496 B) does
+    /// not fit the 352 B region and lives in a `.lbx.sep` sidecar.
+    /// macOS-only at runtime; other platforms can read a vault
+    /// containing this kind and unlock via another slot. See
+    /// `docs/SEP_KEYSLOT_DESIGN.md`.
+    SepSealed = 15,
+    /// `SepSealed` with the SEP key gated behind user presence /
+    /// biometry (Touch ID / passcode) - the SEP analog of
+    /// `Tpm2SealedPin`. Wire-shape and KEK derivation are identical to
+    /// `SepSealed`; the gating is enforced inside the enclave at unseal
+    /// time. Requires a signed `.app` bundle to present the
+    /// LocalAuthentication UI (phase 2).
+    SepSealedBiometric = 16,
+    /// Hybrid Secure Enclave + ML-KEM-768 keyslot, the SEP analog of
+    /// `HybridPqKemTpm2`. `KEK = HKDF(salt, sep_shared || pq_shared,
+    /// "lbx:hybrid-tpm-kek/v1")` - same derivation as the TPM hybrid
+    /// (the 32-byte SEP shared secret slots in where `tpm_unsealed`
+    /// goes). Needs BOTH a `.lbx.sep` entry (SEP material) and a
+    /// `.lbx.hybrid` entry (ML-KEM material), each keyed by slot_idx.
+    HybridPqKemSep = 17,
+    /// Same as `HybridPqKemSep` but with ML-KEM-1024.
+    HybridPqKem1024Sep = 18,
+    /// Fused Secure Enclave + FIDO2 (both required), the SEP analog of
+    /// `Tpm2Fido2`. KEK mixes the SEP ECDH shared secret with the
+    /// FIDO2 authenticator's hmac-secret output. The SEP material is
+    /// in the `.lbx.sep` sidecar; the FIDO2 cred_id + hmac_salt use
+    /// the inline slot region (free, since the SEP blob is offloaded).
+    SepFido2 = 19,
+    /// `SepFido2` + ML-KEM-768 (three factors).
+    HybridPqKemSepFido2 = 20,
+    /// `SepFido2` + ML-KEM-1024 (three factors).
+    HybridPqKem1024SepFido2 = 21,
+    /// Fused Secure Enclave + Argon2id passphrase (both required).
+    /// KEK mixes the SEP ECDH shared secret with an Argon2id-stretched
+    /// passphrase ("something you have on this Mac" + "something you
+    /// know"). The Argon2 params + salt use the inline slot fields.
+    SepPassphrase = 22,
+    /// `SepPassphrase` + ML-KEM-768 (three factors).
+    HybridPqKemSepPassphrase = 23,
+    /// `SepPassphrase` + ML-KEM-1024 (three factors).
+    HybridPqKem1024SepPassphrase = 24,
+    /// Fused Secure Enclave + FIDO2 + Argon2id passphrase (all three
+    /// required). The maximum non-PQ SEP combination.
+    SepFido2Passphrase = 25,
+    /// `SepFido2Passphrase` + ML-KEM-768 (four factors).
+    HybridPqKemSepFido2Passphrase = 26,
+    /// `SepFido2Passphrase` + ML-KEM-1024 (four factors; maximum
+    /// paranoia on macOS).
+    HybridPqKem1024SepFido2Passphrase = 27,
 }
 
 impl SlotKind {
@@ -352,11 +446,19 @@ impl SlotKind {
                 | Self::HybridPqKemTpm2Fido2
                 | Self::HybridPqKem1024Tpm2
                 | Self::HybridPqKem1024Tpm2Fido2
+                | Self::HybridPqKemSep
+                | Self::HybridPqKem1024Sep
+                | Self::HybridPqKemSepFido2
+                | Self::HybridPqKem1024SepFido2
+                | Self::HybridPqKemSepPassphrase
+                | Self::HybridPqKem1024SepPassphrase
+                | Self::HybridPqKemSepFido2Passphrase
+                | Self::HybridPqKem1024SepFido2Passphrase
         )
     }
 
     /// True for the ML-KEM-1024 hybrid kinds (passphrase, FIDO2,
-    /// TPM, TPM+FIDO2 variants).
+    /// TPM, TPM+FIDO2, and Secure Enclave variants).
     pub fn is_hybrid_pq_1024(self) -> bool {
         matches!(
             self,
@@ -364,6 +466,10 @@ impl SlotKind {
                 | Self::HybridPqKem1024Fido2
                 | Self::HybridPqKem1024Tpm2
                 | Self::HybridPqKem1024Tpm2Fido2
+                | Self::HybridPqKem1024Sep
+                | Self::HybridPqKem1024SepFido2
+                | Self::HybridPqKem1024SepPassphrase
+                | Self::HybridPqKem1024SepFido2Passphrase
         )
     }
 
@@ -411,6 +517,88 @@ impl SlotKind {
     pub fn is_tpm2_pin(self) -> bool {
         matches!(self, Self::Tpm2SealedPin)
     }
+
+    /// True for any macOS Secure Enclave-backed slot kind. The SEP
+    /// `dataRepresentation` for these always lives in the `.lbx.sep`
+    /// sidecar; other factors (FIDO2 cred_id, Argon2 params, ML-KEM
+    /// material) may additionally use the inline region / `.lbx.hybrid`.
+    pub fn is_sep(self) -> bool {
+        matches!(
+            self,
+            Self::SepSealed
+                | Self::SepSealedBiometric
+                | Self::HybridPqKemSep
+                | Self::HybridPqKem1024Sep
+                | Self::SepFido2
+                | Self::HybridPqKemSepFido2
+                | Self::HybridPqKem1024SepFido2
+                | Self::SepPassphrase
+                | Self::HybridPqKemSepPassphrase
+                | Self::HybridPqKem1024SepPassphrase
+                | Self::SepFido2Passphrase
+                | Self::HybridPqKemSepFido2Passphrase
+                | Self::HybridPqKem1024SepFido2Passphrase
+        )
+    }
+
+    /// True iff this Secure Enclave kind is gated behind user
+    /// presence / biometry (the SEP analog of `is_tpm2_pin`).
+    pub fn is_sep_biometric(self) -> bool {
+        matches!(self, Self::SepSealedBiometric)
+    }
+
+    /// True for SEP kinds that ALSO require a FIDO2 authenticator.
+    /// These store the FIDO2 cred_id + hmac_salt in the inline slot
+    /// region (free because the SEP blob is in the sidecar).
+    pub fn is_sep_fido2(self) -> bool {
+        matches!(
+            self,
+            Self::SepFido2
+                | Self::HybridPqKemSepFido2
+                | Self::HybridPqKem1024SepFido2
+                | Self::SepFido2Passphrase
+                | Self::HybridPqKemSepFido2Passphrase
+                | Self::HybridPqKem1024SepFido2Passphrase
+        )
+    }
+
+    /// True for every keyslot kind that stores a 32-byte FIDO2
+    /// `hmac_salt` in its inline 512-byte slot region. This is the
+    /// SINGLE source of truth for the slot's `salt_len` field: the
+    /// `from_bytes` parser, `to_bytes` (what is written to disk), and
+    /// `build_aead_aad` (what the AEAD authenticates) all delegate
+    /// here. If those sites were allowed to encode the set
+    /// independently they could drift, and a kind that writes a salt
+    /// the AEAD does not cover is born; that happened for the TPM+FIDO2
+    /// kinds (restored 2026-05) and again for SEP+FIDO2 (restored
+    /// 2026-06). Keep this the only definition of the set, pinned by
+    /// `aad_covers_hmac_salt_for_every_salt_bearing_kind`.
+    pub fn has_inline_hmac_salt(self) -> bool {
+        matches!(
+            self,
+            Self::Fido2HmacSecret
+                | Self::Fido2DerivedMvk
+                | Self::HybridPqKemFido2
+                | Self::HybridPqKem1024Fido2
+                | Self::Tpm2Fido2
+                | Self::HybridPqKemTpm2Fido2
+                | Self::HybridPqKem1024Tpm2Fido2
+        ) || self.is_sep_fido2()
+    }
+
+    /// True for SEP kinds that ALSO require an Argon2id passphrase.
+    /// These run Argon2id over the slot's `kdf_salt` / `kdf_params`.
+    pub fn is_sep_passphrase(self) -> bool {
+        matches!(
+            self,
+            Self::SepPassphrase
+                | Self::HybridPqKemSepPassphrase
+                | Self::HybridPqKem1024SepPassphrase
+                | Self::SepFido2Passphrase
+                | Self::HybridPqKemSepFido2Passphrase
+                | Self::HybridPqKem1024SepFido2Passphrase
+        )
+    }
 }
 
 impl SlotKind {
@@ -431,6 +619,19 @@ impl SlotKind {
             12 => Ok(Self::HybridPqKemTpm2Fido2),
             13 => Ok(Self::HybridPqKem1024Tpm2),
             14 => Ok(Self::HybridPqKem1024Tpm2Fido2),
+            15 => Ok(Self::SepSealed),
+            16 => Ok(Self::SepSealedBiometric),
+            17 => Ok(Self::HybridPqKemSep),
+            18 => Ok(Self::HybridPqKem1024Sep),
+            19 => Ok(Self::SepFido2),
+            20 => Ok(Self::HybridPqKemSepFido2),
+            21 => Ok(Self::HybridPqKem1024SepFido2),
+            22 => Ok(Self::SepPassphrase),
+            23 => Ok(Self::HybridPqKemSepPassphrase),
+            24 => Ok(Self::HybridPqKem1024SepPassphrase),
+            25 => Ok(Self::SepFido2Passphrase),
+            26 => Ok(Self::HybridPqKemSepFido2Passphrase),
+            27 => Ok(Self::HybridPqKem1024SepFido2Passphrase),
             _ => Err(Error::UnsupportedSlotKind(v)),
         }
     }
@@ -542,7 +743,7 @@ impl Keyslot {
                 | SlotKind::Tpm2Fido2
                 | SlotKind::HybridPqKemTpm2Fido2
                 | SlotKind::HybridPqKem1024Tpm2Fido2
-        )
+        ) || self.kind.is_sep_fido2()
     }
 
     /// Create a passphrase keyslot wrapping `mvk`.
@@ -730,6 +931,199 @@ impl Keyslot {
         }
         let kek = KeyEncryptionKey::from_array_ref(kek_from_tpm);
         self.unwrap_mvk(suite, &kek, header_salt)
+    }
+
+    /// Build ANY macOS Secure Enclave keyslot. `kind` must satisfy
+    /// `SlotKind::is_sep()`. The factors supplied must exactly match
+    /// what `kind` requires (checked, returning `InvalidField` on
+    /// mismatch):
+    ///   - `sep_shared`: always. The 32-byte ECDH shared secret from
+    ///     `luksbox_sep::SepSealer::seal`. The SEP material itself
+    ///     (`dataRepresentation` + ephemeral pubkey) is the caller's
+    ///     to store in the `.lbx.sep` sidecar - it does NOT live in
+    ///     the slot.
+    ///   - `hmac_secret` + `cred_id` + `hmac_salt`: iff
+    ///     `kind.is_sep_fido2()`. cred_id + hmac_salt occupy the inline
+    ///     region (free, since the SEP blob is offloaded to the sidecar).
+    ///   - `passphrase` + `kdf_params`: iff `kind.is_sep_passphrase()`.
+    ///     Argon2id runs over a freshly-generated `kdf_salt`.
+    ///   - `pq_shared`: iff `kind.is_hybrid_pq()`. The Kyber-decapsulated
+    ///     secret; the pubkey+ciphertext go in the `.lbx.hybrid` sidecar.
+    ///
+    /// KEK derivation is unified across every SEP kind via
+    /// [`derive_sep_kek`]; see its docs for the IKM layout.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_sep(
+        suite: CipherSuite,
+        mvk: &MasterVolumeKey,
+        kind: SlotKind,
+        sep_shared: &[u8; KEY_LEN],
+        hmac_secret: Option<&[u8; KEY_LEN]>,
+        passphrase: Option<&[u8]>,
+        kdf_params: Argon2idParams,
+        pq_shared: Option<&[u8; KEY_LEN]>,
+        cred_id: &[u8],
+        hmac_salt: [u8; 32],
+        header_salt: &[u8; 32],
+    ) -> Result<Self, Error> {
+        Self::check_sep_factors(
+            kind,
+            hmac_secret.is_some(),
+            passphrase.is_some(),
+            pq_shared.is_some(),
+        )?;
+        Self::reject_null_factor(sep_shared)?;
+        if let Some(h) = hmac_secret {
+            Self::reject_null_factor(h)?;
+        }
+        if let Some(q) = pq_shared {
+            Self::reject_null_factor(q)?;
+        }
+        if kind.is_sep_fido2() {
+            if cred_id.is_empty() || cred_id.len() > FIDO2_CRED_ID_MAX {
+                return Err(Error::Fido2CredIdTooLong(cred_id.len()));
+            }
+        } else if !cred_id.is_empty() {
+            return Err(Error::InvalidField);
+        }
+
+        let mut uuid = [0u8; 16];
+        let mut aead_nonce = [0u8; 12];
+        let mut kdf_salt = [0u8; 32];
+        OsRng
+            .try_fill_bytes(&mut uuid)
+            .map_err(|e| Error::OsRng(e.to_string()))?;
+        OsRng
+            .try_fill_bytes(&mut aead_nonce)
+            .map_err(|e| Error::OsRng(e.to_string()))?;
+        OsRng
+            .try_fill_bytes(&mut kdf_salt)
+            .map_err(|e| Error::OsRng(e.to_string()))?;
+
+        // Argon2id passphrase factor (if any) over the fresh salt.
+        let pp_kek = match passphrase {
+            Some(pp) => Some(derive_kek(pp, &kdf_salt, kdf_params)?),
+            None => None,
+        };
+        // Only passphrase-bearing kinds store real Argon2 params; the
+        // rest keep zeroed params (exempt from the on-read sanity
+        // check), with a random kdf_salt for byte-shape uniformity.
+        let stored_params = if passphrase.is_some() {
+            kdf_params
+        } else {
+            Argon2idParams {
+                m_cost_kib: 0,
+                t_cost: 0,
+                p_cost: 0,
+            }
+        };
+
+        let kek = derive_sep_kek(
+            sep_shared,
+            pp_kek.as_ref().map(|k| k.as_bytes()),
+            hmac_secret,
+            pq_shared,
+            header_salt,
+        );
+
+        let mut slot = Self {
+            kind,
+            aad_version: AAD_VERSION_V4,
+            uuid,
+            kdf_params: stored_params,
+            kdf_salt,
+            aead_nonce,
+            wrapped_ct: [0; 32],
+            wrapped_tag: [0; 16],
+            // FIDO2 cred_id only for the SEP+FIDO2 kinds; the SEP
+            // dataRepresentation always lives in the `.lbx.sep` sidecar.
+            fido2_cred_id: if kind.is_sep_fido2() {
+                cred_id.to_vec()
+            } else {
+                Vec::new()
+            },
+            fido2_hmac_salt: if kind.is_sep_fido2() {
+                hmac_salt
+            } else {
+                [0; 32]
+            },
+        };
+        slot.wrap_mvk(suite, &kek, mvk, header_salt)?;
+        Ok(slot)
+    }
+
+    /// Recover the MVK from ANY Secure Enclave keyslot. Supply the same
+    /// factors used at enroll: `sep_shared` (from `SepSealer::unseal`)
+    /// plus `hmac_secret` / `passphrase` / `pq_shared` matching the
+    /// slot kind (the Argon2 params + salt are read from the slot).
+    #[allow(clippy::too_many_arguments)]
+    pub fn unlock_sep(
+        &self,
+        suite: CipherSuite,
+        sep_shared: &[u8; KEY_LEN],
+        hmac_secret: Option<&[u8; KEY_LEN]>,
+        passphrase: Option<&[u8]>,
+        pq_shared: Option<&[u8; KEY_LEN]>,
+        header_salt: &[u8; 32],
+    ) -> Result<MasterVolumeKey, Error> {
+        Self::check_sep_factors(
+            self.kind,
+            hmac_secret.is_some(),
+            passphrase.is_some(),
+            pq_shared.is_some(),
+        )?;
+        Self::reject_null_factor(sep_shared)?;
+        if let Some(h) = hmac_secret {
+            Self::reject_null_factor(h)?;
+        }
+        if let Some(q) = pq_shared {
+            Self::reject_null_factor(q)?;
+        }
+        let pp_kek = match passphrase {
+            Some(pp) => Some(derive_kek(pp, &self.kdf_salt, self.kdf_params)?),
+            None => None,
+        };
+        let kek = derive_sep_kek(
+            sep_shared,
+            pp_kek.as_ref().map(|k| k.as_bytes()),
+            hmac_secret,
+            pq_shared,
+            header_salt,
+        );
+        self.unwrap_mvk(suite, &kek, header_salt)
+    }
+
+    /// Validate that `kind` is a SEP kind and that the supplied factor
+    /// presence flags exactly match what the kind requires.
+    fn check_sep_factors(
+        kind: SlotKind,
+        has_fido2: bool,
+        has_passphrase: bool,
+        has_pq: bool,
+    ) -> Result<(), Error> {
+        if !kind.is_sep()
+            || kind.is_sep_fido2() != has_fido2
+            || kind.is_sep_passphrase() != has_passphrase
+            || kind.is_hybrid_pq() != has_pq
+        {
+            return Err(Error::InvalidField);
+        }
+        Ok(())
+    }
+
+    /// Reject an all-zero 32-byte hardware factor. A real P-256 ECDH
+    /// shared secret (SEP), FIDO2 hmac-secret, or ML-KEM shared secret
+    /// is never all-zero; an all-zero value signals a missing/broken
+    /// source (e.g. the Secure Enclave is unavailable and a caller fed
+    /// zeros) or a degenerate / invalid-curve key agreement. Rejecting
+    /// it here ensures a "null secret" can never feed the KEK
+    /// derivation -- defense in depth on top of the AEAD wrap, which
+    /// already fails to recover the MVK under any wrong KEK.
+    fn reject_null_factor(factor: &[u8; KEY_LEN]) -> Result<(), Error> {
+        if factor.iter().all(|&b| b == 0) {
+            return Err(Error::InvalidField);
+        }
+        Ok(())
     }
 
     /// Accessor for the TPM SealedBlob bytes stored in this slot.
@@ -1642,28 +2036,13 @@ impl Keyslot {
             // byte-identical to what `to_bytes` writes).
             let cred = &self.fido2_cred_id[..self.fido2_cred_id.len().min(cred_max)];
             let cred_len = cred.len() as u16;
-            // SECURITY: this list MUST mirror the equivalent matches!()
-            // in `to_bytes` exactly. Any kind that writes a real
-            // hmac_salt via to_bytes MUST also include it in AAD here,
-            // otherwise the salt bytes are written to disk but excluded
-            // from AEAD coverage; an attacker could then flip the salt
-            // without breaking the wrap, causing the user's FIDO2
-            // authenticator to return a different hmac_secret at unlock
-            // time -> AEAD fails -> denial of service. Not a key
-            // recovery break (HMAC-SHA-256 second-preimage is
-            // infeasible) but a design-invariant break worth pinning
-            // with a test. The three fused TPM+FIDO2 kinds were missed
-            // when they were originally added; restored 2026-05.
-            let salt_len = if matches!(
-                self.kind,
-                SlotKind::Fido2HmacSecret
-                    | SlotKind::Fido2DerivedMvk
-                    | SlotKind::HybridPqKemFido2
-                    | SlotKind::HybridPqKem1024Fido2
-                    | SlotKind::Tpm2Fido2
-                    | SlotKind::HybridPqKemTpm2Fido2
-                    | SlotKind::HybridPqKem1024Tpm2Fido2,
-            ) {
+            // SECURITY: `salt_len` here (what the AAD authenticates)
+            // MUST equal `salt_len` in `to_bytes` (what is written to
+            // disk), or the salt is persisted but excluded from AEAD
+            // coverage. Both delegate to the single
+            // `SlotKind::has_inline_hmac_salt()` source of truth so the
+            // two sites cannot drift; see that method for the history.
+            let salt_len = if self.kind.has_inline_hmac_salt() {
                 FIDO2_HMAC_SALT_LEN as u16
             } else {
                 0
@@ -1742,18 +2121,11 @@ impl Keyslot {
         let cred = &self.fido2_cred_id[..self.fido2_cred_id.len().min(cred_max)];
         let cred_len = cred.len() as u16;
         // `salt_len` is non-zero only when the slot actually
-        // carries a FIDO2 hmac_salt. TPM-sealed slots have no
-        // FIDO2 component so this stays 0.
-        let salt_len = if matches!(
-            self.kind,
-            SlotKind::Fido2HmacSecret
-                | SlotKind::Fido2DerivedMvk
-                | SlotKind::HybridPqKemFido2
-                | SlotKind::HybridPqKem1024Fido2
-                | SlotKind::Tpm2Fido2
-                | SlotKind::HybridPqKemTpm2Fido2
-                | SlotKind::HybridPqKem1024Tpm2Fido2,
-        ) {
+        // carries a FIDO2 hmac_salt. TPM-sealed and plain-SEP slots
+        // have no FIDO2 component so this stays 0. MUST match the AAD
+        // decision in `build_aead_aad`; both delegate to the single
+        // `has_inline_hmac_salt()` source of truth.
+        let salt_len = if self.kind.has_inline_hmac_salt() {
             FIDO2_HMAC_SALT_LEN as u16
         } else {
             0
@@ -1830,7 +2202,7 @@ impl Keyslot {
                 | SlotKind::HybridPqKemFido2
                 | SlotKind::HybridPqKem1024Passphrase
                 | SlotKind::HybridPqKem1024Fido2,
-        );
+        ) || kind.is_sep_passphrase();
         let kdf_params_for_check = Argon2idParams {
             m_cost_kib,
             t_cost,
@@ -1841,16 +2213,7 @@ impl Keyslot {
         }
         let mut fido2_cred_id = Vec::new();
         let mut fido2_hmac_salt = [0u8; 32];
-        if matches!(
-            kind,
-            SlotKind::Fido2HmacSecret
-                | SlotKind::Fido2DerivedMvk
-                | SlotKind::HybridPqKemFido2
-                | SlotKind::HybridPqKem1024Fido2
-                | SlotKind::Tpm2Fido2
-                | SlotKind::HybridPqKemTpm2Fido2
-                | SlotKind::HybridPqKem1024Tpm2Fido2,
-        ) {
+        if kind.has_inline_hmac_salt() {
             if salt_len != FIDO2_HMAC_SALT_LEN {
                 return Err(Error::InvalidField);
             }
@@ -1873,6 +2236,21 @@ impl Keyslot {
             }
             fido2_cred_id.extend_from_slice(&buf[OFF_CRED..OFF_CRED + cred_len]);
             // fido2_hmac_salt stays zero - TPM-only slots don't have one.
+        }
+        // Non-FIDO2 Secure Enclave slots: the SEP material lives in the
+        // `.lbx.sep` sidecar, and these kinds carry no FIDO2 cred_id /
+        // hmac_salt, so the inline region is EMPTY (cred_len == 0,
+        // salt_len == 0). Passphrase-bearing SEP kinds still use the
+        // Argon2 params (validated via kdf_runs_argon2 above) but no
+        // cred/salt. The SEP+FIDO2 kinds are handled by the
+        // salt-bearing arm above. The AAD over bytes[124..512] binds
+        // the (zero) length fields, so a tamper that inflates them
+        // breaks the AEAD tag.
+        if kind.is_sep() && !kind.is_sep_fido2() {
+            if salt_len != 0 || cred_len != 0 {
+                return Err(Error::InvalidField);
+            }
+            // fido2_cred_id stays empty, fido2_hmac_salt stays zero.
         }
 
         Ok(Self {
@@ -1990,6 +2368,65 @@ mod tests {
         assert_eq!(cred_len as usize, FIDO2_CRED_ID_MAX);
         // The companion AAD path must also be panic-safe on the same slot.
         let _ = oversized_external_slot().build_aead_aad(&[0u8; 32]);
+    }
+
+    /// R14-01 regression: every kind that writes a 32-byte FIDO2
+    /// `hmac_salt` to disk via `to_bytes` MUST also bind that salt into
+    /// the AEAD AAD via `build_aead_aad`. If the two `salt_len`
+    /// decisions drift (they did for TPM+FIDO2, then for SEP+FIDO2 on
+    /// the v0.4.0 branch), the salt is persisted but unauthenticated.
+    /// Pin parity by asserting the salt appears in BOTH the on-disk
+    /// bytes and the AAD for every salt-bearing kind.
+    #[test]
+    fn aad_covers_hmac_salt_for_every_salt_bearing_kind() {
+        const SALT: [u8; 32] = [0x42u8; 32];
+        let salt_bearing = [
+            SlotKind::Fido2HmacSecret,
+            SlotKind::Fido2DerivedMvk,
+            SlotKind::HybridPqKemFido2,
+            SlotKind::HybridPqKem1024Fido2,
+            SlotKind::Tpm2Fido2,
+            SlotKind::HybridPqKemTpm2Fido2,
+            SlotKind::HybridPqKem1024Tpm2Fido2,
+            SlotKind::SepFido2,
+            SlotKind::HybridPqKemSepFido2,
+            SlotKind::HybridPqKem1024SepFido2,
+            SlotKind::SepFido2Passphrase,
+            SlotKind::HybridPqKemSepFido2Passphrase,
+            SlotKind::HybridPqKem1024SepFido2Passphrase,
+        ];
+        for kind in salt_bearing {
+            assert!(
+                kind.has_inline_hmac_salt(),
+                "{kind:?} is salt-bearing but has_inline_hmac_salt() is false"
+            );
+            let slot = Keyslot {
+                kind,
+                aad_version: AAD_VERSION_V4,
+                uuid: [0u8; 16],
+                kdf_params: Argon2idParams {
+                    m_cost_kib: 0,
+                    t_cost: 0,
+                    p_cost: 0,
+                },
+                kdf_salt: [0u8; 32],
+                aead_nonce: [0u8; 12],
+                wrapped_ct: [0u8; 32],
+                wrapped_tag: [0u8; 16],
+                fido2_cred_id: vec![0u8; 4],
+                fido2_hmac_salt: SALT,
+            };
+            let on_disk = slot.to_bytes();
+            let aad = slot.build_aead_aad(&[0u8; 32]);
+            assert!(
+                on_disk.windows(32).any(|w| w == SALT),
+                "{kind:?}: to_bytes did not persist the hmac_salt"
+            );
+            assert!(
+                aad.windows(32).any(|w| w == SALT),
+                "{kind:?}: build_aead_aad did NOT cover the hmac_salt (R14-01 regression)"
+            );
+        }
     }
 
     #[test]
@@ -2120,6 +2557,321 @@ mod tests {
         }
     }
 
+    /// Round-trip + unlock for the ENTIRE 13-kind SEP matrix:
+    /// {none, FIDO2, passphrase, FIDO2+passphrase} x {no-PQ, 768, 1024}
+    /// plus the plain biometric kind. One generalized table drives the
+    /// correct factor set per kind.
+    #[test]
+    fn sep_full_matrix_roundtrip_and_unlock() {
+        let suite = CipherSuite::Aes256Gcm;
+        let mvk = MasterVolumeKey::from_bytes([0x5e; 32]);
+        let header_salt = [0x70u8; 32];
+        let sep_shared = [0x42u8; 32];
+        let hmac_secret = [0xB0u8; 32];
+        let pq_shared = [0x99u8; 32];
+        let passphrase: &[u8] = b"correct horse battery staple";
+        let cred_id = b"sep-fido2-cred-id".to_vec();
+        let hmac_salt = [0xAAu8; 32];
+        let params = Argon2idParams::TEST_ONLY;
+
+        // (kind, needs_fido2, needs_pass, needs_pq, is_1024)
+        let matrix = [
+            (SlotKind::SepSealed, false, false, false),
+            (SlotKind::SepSealedBiometric, false, false, false),
+            (SlotKind::HybridPqKemSep, false, false, true),
+            (SlotKind::HybridPqKem1024Sep, false, false, true),
+            (SlotKind::SepFido2, true, false, false),
+            (SlotKind::HybridPqKemSepFido2, true, false, true),
+            (SlotKind::HybridPqKem1024SepFido2, true, false, true),
+            (SlotKind::SepPassphrase, false, true, false),
+            (SlotKind::HybridPqKemSepPassphrase, false, true, true),
+            (SlotKind::HybridPqKem1024SepPassphrase, false, true, true),
+            (SlotKind::SepFido2Passphrase, true, true, false),
+            (SlotKind::HybridPqKemSepFido2Passphrase, true, true, true),
+            (
+                SlotKind::HybridPqKem1024SepFido2Passphrase,
+                true,
+                true,
+                true,
+            ),
+        ];
+
+        for (kind, needs_fido2, needs_pass, needs_pq) in matrix {
+            let fido2 = needs_fido2.then_some(&hmac_secret);
+            let pass = needs_pass.then_some(passphrase);
+            let pq = needs_pq.then_some(&pq_shared);
+            let cred: &[u8] = if needs_fido2 { &cred_id } else { &[] };
+
+            let slot = Keyslot::new_sep(
+                suite,
+                &mvk,
+                kind,
+                &sep_shared,
+                fido2,
+                pass,
+                params,
+                pq,
+                cred,
+                hmac_salt,
+                &header_salt,
+            )
+            .unwrap_or_else(|e| panic!("new_sep({kind:?}) failed: {e:?}"));
+            assert_eq!(slot.kind, kind);
+            assert!(slot.kind.is_sep());
+            assert_eq!(slot.kind.is_sep_fido2(), needs_fido2);
+            assert_eq!(slot.kind.is_sep_passphrase(), needs_pass);
+            assert_eq!(slot.kind.is_hybrid_pq(), needs_pq);
+            assert_eq!(slot.touches_fido2(), needs_fido2);
+
+            let bytes = slot.to_bytes();
+            let restored = Keyslot::from_bytes(&bytes)
+                .unwrap_or_else(|e| panic!("from_bytes({kind:?}) failed: {e:?}"));
+            assert_eq!(restored.kind, kind);
+            if needs_fido2 {
+                assert_eq!(restored.fido2_cred_id, cred_id, "{kind:?} cred_id");
+                assert_eq!(restored.fido2_hmac_salt, hmac_salt, "{kind:?} hmac_salt");
+            } else {
+                assert!(restored.fido2_cred_id.is_empty(), "{kind:?} inline empty");
+            }
+
+            let recovered = restored
+                .unlock_sep(suite, &sep_shared, fido2, pass, pq, &header_salt)
+                .unwrap_or_else(|e| panic!("unlock_sep({kind:?}) failed: {e:?}"));
+            assert_eq!(recovered.as_bytes(), mvk.as_bytes(), "{kind:?} MVK");
+
+            // Wrong SEP secret always fails.
+            assert!(
+                restored
+                    .unlock_sep(suite, &[0u8; 32], fido2, pass, pq, &header_salt)
+                    .is_err(),
+                "{kind:?} wrong sep_shared must fail"
+            );
+            // Each present factor is load-bearing: dropping it fails the check.
+            if needs_pass {
+                assert!(
+                    restored
+                        .unlock_sep(
+                            suite,
+                            &sep_shared,
+                            fido2,
+                            Some(b"wrong-pass"),
+                            pq,
+                            &header_salt
+                        )
+                        .is_err(),
+                    "{kind:?} wrong passphrase must fail"
+                );
+            }
+            if needs_pq {
+                assert!(
+                    restored
+                        .unlock_sep(
+                            suite,
+                            &sep_shared,
+                            fido2,
+                            pass,
+                            Some(&[0u8; 32]),
+                            &header_salt
+                        )
+                        .is_err(),
+                    "{kind:?} wrong pq_shared must fail"
+                );
+            }
+        }
+    }
+
+    /// Factor-presence must match the kind: supplying or omitting a
+    /// factor the kind doesn't expect is rejected up front.
+    #[test]
+    fn sep_factor_mismatch_rejected() {
+        let suite = CipherSuite::Aes256Gcm;
+        let mvk = MasterVolumeKey::from_bytes([0x11; 32]);
+        let hs = [0x70u8; 32];
+        let sep = [0x42u8; 32];
+        let p = Argon2idParams::TEST_ONLY;
+        // Plain SepSealed with a stray FIDO2 factor -> error.
+        assert!(matches!(
+            Keyslot::new_sep(
+                suite,
+                &mvk,
+                SlotKind::SepSealed,
+                &sep,
+                Some(&[1u8; 32]),
+                None,
+                p,
+                None,
+                &[],
+                [0; 32],
+                &hs,
+            ),
+            Err(Error::InvalidField)
+        ));
+        // SepFido2 missing its FIDO2 factor -> error.
+        assert!(matches!(
+            Keyslot::new_sep(
+                suite,
+                &mvk,
+                SlotKind::SepFido2,
+                &sep,
+                None,
+                None,
+                p,
+                None,
+                b"cred",
+                [0; 32],
+                &hs,
+            ),
+            Err(Error::InvalidField)
+        ));
+        // Non-SEP kind -> error.
+        assert!(matches!(
+            Keyslot::new_sep(
+                suite,
+                &mvk,
+                SlotKind::Passphrase,
+                &sep,
+                None,
+                None,
+                p,
+                None,
+                &[],
+                [0; 32],
+                &hs,
+            ),
+            Err(Error::InvalidField)
+        ));
+    }
+
+    /// Security: a null / all-zero hardware factor (the "SEP isn't
+    /// there, caller fed zeros" failure mode) is rejected at both
+    /// enroll and unlock, for every factor position.
+    #[test]
+    fn sep_null_factor_rejected() {
+        let suite = CipherSuite::Aes256Gcm;
+        let mvk = MasterVolumeKey::from_bytes([0x11; 32]);
+        let hs = [0x70u8; 32];
+        let good = [0x42u8; 32];
+        let zero = [0u8; 32];
+        let p = Argon2idParams::TEST_ONLY;
+
+        // Enroll with all-zero SEP shared secret -> rejected.
+        assert!(matches!(
+            Keyslot::new_sep(
+                suite,
+                &mvk,
+                SlotKind::SepSealed,
+                &zero,
+                None,
+                None,
+                p,
+                None,
+                &[],
+                [0; 32],
+                &hs
+            ),
+            Err(Error::InvalidField)
+        ));
+        // Enroll hybrid with all-zero pq factor -> rejected.
+        assert!(matches!(
+            Keyslot::new_sep(
+                suite,
+                &mvk,
+                SlotKind::HybridPqKemSep,
+                &good,
+                None,
+                None,
+                p,
+                Some(&zero),
+                &[],
+                [0; 32],
+                &hs
+            ),
+            Err(Error::InvalidField)
+        ));
+        // Enroll fused with all-zero FIDO2 factor -> rejected.
+        assert!(matches!(
+            Keyslot::new_sep(
+                suite,
+                &mvk,
+                SlotKind::SepFido2,
+                &good,
+                Some(&zero),
+                None,
+                p,
+                None,
+                b"cred",
+                [0xAA; 32],
+                &hs
+            ),
+            Err(Error::InvalidField)
+        ));
+
+        // A valid slot must REFUSE to unlock if a null secret is later
+        // presented (e.g. enclave gone, caller substitutes zeros).
+        let slot = Keyslot::new_sep(
+            suite,
+            &mvk,
+            SlotKind::SepSealed,
+            &good,
+            None,
+            None,
+            p,
+            None,
+            &[],
+            [0; 32],
+            &hs,
+        )
+        .unwrap();
+        assert!(matches!(
+            slot.unlock_sep(suite, &zero, None, None, None, &hs),
+            Err(Error::InvalidField)
+        ));
+    }
+
+    /// Security: a rogue/replaced Secure Enclave that returns
+    /// attacker-chosen (but well-formed, non-zero) bytes still cannot
+    /// unlock a slot enrolled under the genuine secret -- the AEAD wrap
+    /// rejects every wrong KEK. Models `MockSepSealer::force_unsealed_bytes`.
+    #[test]
+    fn sep_rogue_secret_cannot_unlock() {
+        let suite = CipherSuite::Aes256Gcm;
+        let mvk = MasterVolumeKey::from_bytes([0x5e; 32]);
+        let hs = [0x70u8; 32];
+        let genuine = [0x42u8; 32];
+        let attacker = [0x43u8; 32]; // differs by one bit region
+        let p = Argon2idParams::TEST_ONLY;
+
+        let slot = Keyslot::new_sep(
+            suite,
+            &mvk,
+            SlotKind::SepSealed,
+            &genuine,
+            None,
+            None,
+            p,
+            None,
+            &[],
+            [0; 32],
+            &hs,
+        )
+        .unwrap();
+        let bytes = slot.to_bytes();
+        let restored = Keyslot::from_bytes(&bytes).unwrap();
+        // Genuine secret unlocks; attacker secret does not (no null/
+        // partial MVK leaks out -- it's an Err, not a zero key).
+        assert!(
+            restored
+                .unlock_sep(suite, &genuine, None, None, None, &hs)
+                .is_ok()
+        );
+        assert!(
+            restored
+                .unlock_sep(suite, &attacker, None, None, None, &hs)
+                .is_err(),
+            "rogue SEP secret must not unlock"
+        );
+    }
+
     #[test]
     fn slot_tamper_detected() {
         let suite = CipherSuite::Aes256Gcm;
@@ -2207,7 +2959,8 @@ mod tests {
     #[test]
     fn slot_kind_from_u8_recognises_tpm2_kinds() {
         // Hard regression test for the kind-byte allocation. Kinds
-        // 8-14 are now defined; 15 and beyond remain unallocated.
+        // 8-14 (TPM) and 15-18 (Secure Enclave) are now defined; 19
+        // and beyond remain unallocated.
         assert_eq!(SlotKind::from_u8(8).unwrap(), SlotKind::Tpm2Sealed);
         assert_eq!(SlotKind::from_u8(9).unwrap(), SlotKind::Tpm2Fido2);
         assert_eq!(SlotKind::from_u8(10).unwrap(), SlotKind::Tpm2SealedPin);
@@ -2224,9 +2977,40 @@ mod tests {
             SlotKind::from_u8(14).unwrap(),
             SlotKind::HybridPqKem1024Tpm2Fido2
         );
+        assert_eq!(SlotKind::from_u8(15).unwrap(), SlotKind::SepSealed);
+        assert_eq!(SlotKind::from_u8(16).unwrap(), SlotKind::SepSealedBiometric);
+        assert_eq!(SlotKind::from_u8(17).unwrap(), SlotKind::HybridPqKemSep);
+        assert_eq!(SlotKind::from_u8(18).unwrap(), SlotKind::HybridPqKem1024Sep);
+        assert_eq!(SlotKind::from_u8(19).unwrap(), SlotKind::SepFido2);
+        assert_eq!(
+            SlotKind::from_u8(20).unwrap(),
+            SlotKind::HybridPqKemSepFido2
+        );
+        assert_eq!(
+            SlotKind::from_u8(21).unwrap(),
+            SlotKind::HybridPqKem1024SepFido2
+        );
+        assert_eq!(SlotKind::from_u8(22).unwrap(), SlotKind::SepPassphrase);
+        assert_eq!(
+            SlotKind::from_u8(23).unwrap(),
+            SlotKind::HybridPqKemSepPassphrase
+        );
+        assert_eq!(
+            SlotKind::from_u8(24).unwrap(),
+            SlotKind::HybridPqKem1024SepPassphrase
+        );
+        assert_eq!(SlotKind::from_u8(25).unwrap(), SlotKind::SepFido2Passphrase);
+        assert_eq!(
+            SlotKind::from_u8(26).unwrap(),
+            SlotKind::HybridPqKemSepFido2Passphrase
+        );
+        assert_eq!(
+            SlotKind::from_u8(27).unwrap(),
+            SlotKind::HybridPqKem1024SepFido2Passphrase
+        );
         assert!(matches!(
-            SlotKind::from_u8(15),
-            Err(Error::UnsupportedSlotKind(15))
+            SlotKind::from_u8(28),
+            Err(Error::UnsupportedSlotKind(28))
         ));
     }
 

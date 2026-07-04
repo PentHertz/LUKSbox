@@ -33,6 +33,16 @@ mod fuse_t;
 ))]
 mod unix_statvfs;
 
+// Shared mountpoint hardening (O_NOFOLLOW probe + inode re-probe +
+// deny-list), used by both Unix mount adapters so every frontend that
+// reaches `mount()` -- CLI, TUI wizard, GUI -- inherits it. Gated on
+// the same combination as the adapters that call it.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "fuse"),
+    all(target_os = "macos", feature = "fuse-t"),
+))]
+mod mountpoint;
+
 #[cfg(all(target_os = "windows", feature = "winfsp"))]
 mod winfsp;
 
@@ -253,7 +263,7 @@ mod private_mount_tests {
     #[test]
     fn caps_length() {
         let s = "a".repeat(300);
-        assert_eq!(sanitize(&s).len(), 128);
+        assert_eq!(sanitize(&s).len(), 200);
     }
 }
 

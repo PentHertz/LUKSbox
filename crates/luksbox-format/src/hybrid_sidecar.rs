@@ -331,6 +331,24 @@ pub fn read_for_vault(
     Ok(bundle.entries)
 }
 
+/// Like `read_for_vault`, but for call sites that already hold the
+/// vault's `header_salt` (an open `Container`): verify the v3 binding
+/// against it without re-peeking the header from disk. v1/v2 sidecars
+/// (no binding) pass through unchanged.
+///
+/// Use this at enroll time before appending to an existing sidecar:
+/// without the check, an enroll against a swapped-in foreign sidecar
+/// would re-bless the foreign entries under a fresh, valid binding
+/// for this vault.
+pub fn read_verified(
+    path: &Path,
+    expected_salt: &[u8; BINDING_LEN],
+) -> Result<Vec<HybridEntry>, Error> {
+    let bundle = read_bundle(path)?;
+    verify_binding(&bundle, expected_salt)?;
+    Ok(bundle.entries)
+}
+
 /// Read just the 32-byte `header_salt` from a vault file (or its
 /// detached-header sidecar). Used by `read_for_vault` to load the
 /// vault binding without a full `Container::open` (which would
@@ -443,8 +461,19 @@ fn reject_duplicate_slot_idx(entries: &[HybridEntry]) -> Result<(), Error> {
 /// Legacy v2 writer. Prefer `write_with_binding` (v3) in new code:
 /// v2 lacks the vault binding, so an attacker who can swap the
 /// sidecar between two vaults causes a confusing AEAD failure rather
-/// than a clear "wrong sidecar" error. v2 is kept for callers that
-/// don't have the vault salt available (e.g. test harnesses).
+/// than a clear "wrong sidecar" error.
+///
+/// v2 is kept for exactly two caller classes; do not "finish the
+/// migration" past them:
+///
+/// 1. Test harnesses exercising the legacy format.
+/// 2. **Deniable vaults.** The deniable envelope has no parseable
+///    plaintext header, so `read_for_vault`'s salt peek cannot work,
+///    and deniable readers use `read`, which ignores bindings. A v3
+///    binding would also embed the vault's envelope salt in the
+///    sidecar, hard-linking sidecar to vault for anyone who reads
+///    both, which deniable mode has no reason to volunteer. Wrong
+///    sidecars still fail closed downstream at AEAD verification.
 pub fn write(path: &Path, entries: &[HybridEntry]) -> Result<(), Error> {
     validate_entries(entries)?;
     let total: usize = HEADER_LEN
@@ -581,6 +610,34 @@ mod tests {
         let p = temp_dir().join(format!("luksbox-hybrid-test-{name}.hybrid"));
         let _ = fs::remove_file(&p);
         p
+    }
+
+    #[test]
+    fn read_verified_enforces_v3_binding_and_accepts_v2() {
+        // Fix-validation for the "v3 binding not consistently used"
+        // audit finding: enroll paths now call `read_verified` with the
+        // open container's header_salt before appending, so a
+        // swapped-in foreign sidecar is rejected instead of being
+        // re-blessed under a fresh valid binding.
+        let path = tmp("read-verified");
+        let entries = vec![fake_768(1, 0x11, 0x22)];
+        let salt = [0x42u8; BINDING_LEN];
+        write_with_binding(&path, &entries, &salt).unwrap();
+        // Correct salt: passes and returns the entries.
+        let got = read_verified(&path, &salt).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].pubkey, entries[0].pubkey);
+        // Foreign salt (sidecar swapped in from another vault): refused.
+        let wrong = [0x43u8; BINDING_LEN];
+        assert!(
+            read_verified(&path, &wrong).is_err(),
+            "cross-vault sidecar swap must be refused at read_verified"
+        );
+        // Legacy v2 sidecar (no binding): passes through unchanged.
+        let _ = fs::remove_file(&path);
+        write(&path, &entries).unwrap();
+        assert_eq!(read_verified(&path, &wrong).unwrap().len(), 1);
+        let _ = fs::remove_file(&path);
     }
 
     #[test]

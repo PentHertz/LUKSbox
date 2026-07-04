@@ -22,7 +22,7 @@ default = ["hardware", "fuse", "winfsp"]
 # in the GUI. Build with `--no-default-features` to get a software-
 # only build (both hardware paths are then disabled at runtime;
 # luksbox-tpm's stub gracefully no-ops on every platform).
-hardware = ["luksbox-fido2/hardware", "luksbox-tpm/hardware"]
+hardware = ["luksbox-fido2/hardware", "luksbox-tpm/hardware", "luksbox-sep/hardware"]
 # Enables FUSE-backed `mount` on Linux + macOS via the libfuse2 /
 # macFUSE path. Disable on macOS CI builds without macFUSE.
 fuse = ["luksbox-mount/fuse"]
@@ -68,6 +68,7 @@ luksbox-format = { path = "../luksbox-format" }
 luksbox-pq = { path = "../luksbox-pq" }
 luksbox-fido2 = { path = "../luksbox-fido2" }
 luksbox-tpm = { path = "../luksbox-tpm", default-features = false }
+luksbox-sep = { path = "../luksbox-sep", default-features = false }
 luksbox-vfs = { path = "../luksbox-vfs" }
 # default-features = false so `--no-default-features` on the gui also
 # disables luksbox-mount's `winfsp` default. Re-enabled via the

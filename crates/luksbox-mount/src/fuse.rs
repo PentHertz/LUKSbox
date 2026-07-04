@@ -63,28 +63,33 @@ pub fn mount(vfs: Vfs, mountpoint: &Path, daemonize: bool, sync_mode: bool) -> s
     let mut config = Config::default();
     config.mount_options = mount_options;
 
-    // Pre-flight: best-effort mountpoint validation BEFORE forking, so the
-    // user sees common errors (path missing, not a directory) in the
-    // foreground process where stderr still goes to their terminal. Once
-    // we daemonize, fuser's mount errors land in /dev/null.
-    let meta = std::fs::metadata(mountpoint)?;
-    if !meta.is_dir() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotADirectory,
-            format!("mountpoint {} is not a directory", mountpoint.display()),
-        ));
-    }
+    // Pre-flight: SECURITY hardening BEFORE forking (R12-05 deny-list +
+    // R12-08 inode re-probe), and so the user sees common errors (path
+    // missing, not a directory, symlinked mountpoint) in the foreground
+    // process where stderr still goes to their terminal. Once we
+    // daemonize, fuser's mount errors land in /dev/null.
+    //
+    // This runs in the SHARED backend, so every frontend that calls
+    // `luksbox_mount::mount` -- the CLI subcommands, the TUI wizard, AND
+    // the GUI -- inherits the O_NOFOLLOW probe, the (dev,ino) capture,
+    // and the deny-list. Previously only the CLI's `cmd_mount`
+    // re-implemented this inline, so the wizard and GUI mount paths
+    // reached this point with no probe, no re-probe, and no deny-list.
+    let probe_inode = crate::mountpoint::harden_mountpoint(mountpoint)?;
 
     if daemonize {
         // LuksboxFs::new spawns the deferred-flush timer thread (when
         // sync_mode is off), so it MUST run after the fork or the
         // single-threaded-for-fork() check below trips on our own
         // timer. The parent never builds a LuksboxFs.
-        run_daemonized(vfs, mountpoint, config, sync_mode)
+        run_daemonized(vfs, mountpoint, config, sync_mode, probe_inode)
     } else {
         install_signal_handler(mountpoint);
         spawn_suspend_listener(mountpoint);
         let fs = LuksboxFs::new(vfs, sync_mode);
+        // R12-08: re-verify the mountpoint inode immediately before the
+        // mount syscall to catch a swap in the window since the probe.
+        crate::mountpoint::reverify_mountpoint(mountpoint, probe_inode)?;
         // `mount2` does Session::new + run() in one call. Blocks until
         // the FS is unmounted (kernel signals EOF on /dev/fuse fd).
         fuser::mount2(fs, mountpoint, &config)
@@ -200,6 +205,7 @@ fn run_daemonized(
     mountpoint: &Path,
     config: Config,
     sync_mode: bool,
+    probe_inode: (u64, u64),
 ) -> std::io::Result<()> {
     assert_single_threaded_for_fork()?;
 
@@ -220,6 +226,15 @@ fn run_daemonized(
             install_signal_handler(mountpoint);
             spawn_suspend_listener(mountpoint);
             let fs = LuksboxFs::new(vfs, sync_mode);
+            // R12-08: re-verify in the child, immediately before the
+            // syscall. This is tighter than a parent-side re-probe: the
+            // kernel mount happens here, post-fork, so the window this
+            // closes is the one that actually matters. stdio is already
+            // /dev/null'd, so surface the refusal via exit code.
+            if let Err(e) = crate::mountpoint::reverify_mountpoint(mountpoint, probe_inode) {
+                eprintln!("luksbox: {e}");
+                std::process::exit(1);
+            }
             let res = fuser::mount2(fs, mountpoint, &config);
             std::process::exit(if res.is_ok() { 0 } else { 1 });
         }
@@ -264,9 +279,16 @@ fn install_signal_handler(mountpoint: &Path) {
         eprintln!("\nreceived interrupt, unmounting cleanly...");
         match resolved_unmount_program() {
             Ok(prog) => {
+                let target = match canonical_unmount_target(&mp) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("warning: cannot resolve mountpoint for signal unmount: {e}");
+                        return;
+                    }
+                };
                 let _ = std::process::Command::new(&prog)
                     .args(unmount_args())
-                    .arg(&mp)
+                    .arg(&target)
                     .status();
             }
             Err(e) => {
@@ -341,6 +363,16 @@ fn unmount_args() -> &'static [&'static str] {
     &[]
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn canonical_unmount_target(mountpoint: &Path) -> std::io::Result<PathBuf> {
+    mountpoint.canonicalize().map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("cannot resolve mountpoint {}: {e}", mountpoint.display()),
+        )
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn spawn_suspend_listener(mountpoint: &Path) {
     let mp = mountpoint.to_path_buf();
@@ -372,9 +404,18 @@ fn listen_for_suspend(mp: &Path) -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("luksbox: system suspending, unmounting cleanly...");
             match resolved_unmount_program() {
                 Ok(prog) => {
+                    let target = match canonical_unmount_target(mp) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!(
+                                "luksbox: cannot resolve mountpoint for suspend unmount: {e}"
+                            );
+                            continue;
+                        }
+                    };
                     let _ = std::process::Command::new(&prog)
                         .args(unmount_args())
-                        .arg(mp)
+                        .arg(&target)
                         .status();
                 }
                 Err(e) => {
@@ -388,8 +429,9 @@ fn listen_for_suspend(mp: &Path) -> Result<(), Box<dyn std::error::Error>> {
 
 pub fn unmount(mountpoint: &Path) -> std::io::Result<()> {
     let prog = resolved_unmount_program()?;
+    let target = canonical_unmount_target(mountpoint)?;
     let mut cmd = std::process::Command::new(&prog);
-    cmd.args(unmount_args()).arg(mountpoint);
+    cmd.args(unmount_args()).arg(&target);
     let status = cmd.status()?;
     if !status.success() {
         return Err(std::io::Error::other(format!(
@@ -1283,7 +1325,11 @@ impl Filesystem for LuksboxFs {
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
-    use super::{UNMOUNT_CANDIDATES, assert_single_threaded_for_fork, resolved_unmount_program};
+    use super::{
+        UNMOUNT_CANDIDATES, assert_single_threaded_for_fork, canonical_unmount_target,
+        resolved_unmount_program,
+    };
+    use std::path::Path;
 
     /// On any Linux/macOS host that has FUSE installed (which is
     /// every CI runner that runs the FUSE integration tests), at
@@ -1313,6 +1359,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn canonical_unmount_target_normalizes_leading_dash_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let mountpoint = dir.path().join("-looks-like-option");
+        std::fs::create_dir(&mountpoint).unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let resolved = canonical_unmount_target(Path::new("-looks-like-option"));
+        std::env::set_current_dir(cwd).unwrap();
+
+        let resolved = resolved.unwrap();
+        assert!(
+            resolved.is_absolute(),
+            "must be absolute: {}",
+            resolved.display()
+        );
+        assert_eq!(
+            resolved.file_name().and_then(|s| s.to_str()),
+            Some("-looks-like-option"),
+            "resolved path must still name the mountpoint"
+        );
     }
 
     #[test]

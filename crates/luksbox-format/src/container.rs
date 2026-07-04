@@ -69,11 +69,22 @@ pub enum FlushOp {
 /// the std I/O traits -- it's an inherent on `std::fs::File`).
 pub trait LbxFile: std::io::Read + std::io::Write + std::io::Seek + Send {
     fn sync_all(&mut self) -> std::io::Result<()>;
+    /// `(device, inode)` identity of the backing handle. Used to bind a
+    /// later no-follow reopen to the exact file we currently hold, so a
+    /// directory-level attacker cannot redirect a rotation-abort write
+    /// through a symlink swapped in at the path (audit R14-04). Real
+    /// files return their inode key; the in-memory sim backends (which
+    /// never run on the real-filesystem rotation path) return a
+    /// sentinel.
+    fn inode_pair(&self) -> std::io::Result<(u64, u64)>;
 }
 
 impl LbxFile for std::fs::File {
     fn sync_all(&mut self) -> std::io::Result<()> {
         std::fs::File::sync_all(self)
+    }
+    fn inode_pair(&self) -> std::io::Result<(u64, u64)> {
+        inode_of(self)
     }
 }
 
@@ -507,6 +518,26 @@ pub enum UnlockMaterial<'a> {
         hmac_secret: &'a [u8; 32],
         pq_shared: &'a [u8; 32],
     },
+    /// macOS Secure Enclave slot, ANY SEP kind. The `unseal` closure
+    /// receives the slot's opaque `SepBlob` bytes (read from the
+    /// in-header SEP region, NOT a sidecar) and must return the 32-byte
+    /// ECDH shared secret; the caller (CLI/GUI) wraps
+    /// `luksbox_sep::SepSealer::unseal`. This keeps `luksbox-format`
+    /// SEP-agnostic - no CryptoKit / Swift dependency here.
+    ///
+    /// The optional factors must match the targeted slot kind, the
+    /// dispatcher skips SEP slots whose required factors weren't
+    /// supplied: `hmac_secret` for the SEP+FIDO2 kinds, `passphrase`
+    /// for the SEP+passphrase kinds, `pq_shared` for the hybrid SEP
+    /// kinds. Per-slot closure errors (foreign enclave, cancelled
+    /// biometric, SEP unavailable) are tolerated so a vault with SEP
+    /// slots from multiple machines can still find the local one.
+    Sep {
+        unseal: &'a mut dyn FnMut(&[u8]) -> Result<[u8; 32], String>,
+        hmac_secret: Option<&'a [u8; 32]>,
+        passphrase: Option<&'a [u8]>,
+        pq_shared: Option<&'a [u8; 32]>,
+    },
 }
 
 /// Open `.lbx` container backed by a file on disk.
@@ -566,6 +597,12 @@ pub struct Container {
 struct RotationState {
     tmp_data_path: PathBuf,
     committed_data_path: PathBuf,
+    /// `(device, inode)` of the committed vault captured from the held
+    /// handle at `begin_atomic_rotation`. `abort_atomic_rotation` binds
+    /// its no-follow reopen to this so a directory-level attacker who
+    /// swaps `committed_data_path` for a symlink during the rotation
+    /// window cannot redirect the abort/Drop header write (audit R14-04).
+    committed_inode: (u64, u64),
 }
 
 /// Companion state attached to a Container when the vault uses a
@@ -914,6 +951,48 @@ impl Container {
         Self::create_internal(path, header_path, cipher, flags, |mvk, header| {
             Keyslot::new_tpm2(cipher, mvk, kek_from_tpm, sealed_blob, &header.header_salt)
         })
+    }
+
+    /// Create a vault whose ONLY keyslot is a macOS Secure Enclave slot
+    /// (plain `SepSealed` or biometric `SepSealedBiometric`). No
+    /// passphrase, no other recovery path: if the enclave is wiped or
+    /// replaced (or the Mac is lost) the vault is permanently
+    /// unrecoverable, the SEP analog of `create_with_tpm2`. The caller
+    /// has already run `SepSealer::seal` and supplies the 32-byte ECDH
+    /// shared secret for the in-process wrap plus the opaque `SepBlob`
+    /// bytes to store in the in-header SEP region. This constructor is
+    /// platform-independent (it only handles already-sealed material);
+    /// only the sealing itself is macOS-gated.
+    pub fn create_with_sep(
+        path: &Path,
+        header_path: Option<&Path>,
+        cipher: CipherSuite,
+        flags: u32,
+        kind: SlotKind,
+        sep_shared: &[u8; 32],
+        sep_blob: &[u8],
+    ) -> Result<Self, Error> {
+        let mut cont = Self::create_internal(path, header_path, cipher, flags, |mvk, header| {
+            Keyslot::new_sep(
+                cipher,
+                mvk,
+                kind,
+                sep_shared,
+                None,
+                None,
+                Argon2idParams::INTERACTIVE,
+                None,
+                &[],
+                [0u8; 32],
+                &header.header_salt,
+            )
+        })?;
+        // The SepBlob lives in the in-header SEP region, not the
+        // 512-byte keyslot, so set it after create and re-persist.
+        cont.header.set_sep_blob(0, sep_blob.to_vec())?;
+        cont.header_dirty = true;
+        cont.persist_header()?;
+        Ok(cont)
     }
 
     /// PIN-bound variant of `create_with_tpm2`. Same single-slot,
@@ -1660,7 +1739,11 @@ impl Container {
     /// clear error rather than silently writing to the wrong place.
     fn guard_no_deniable_slot_mutation(&self) -> Result<(), Error> {
         if self.is_deniable() {
-            return Err(Error::Crypto(luksbox_core::Error::InvalidField));
+            // Descriptive error (was a bare `InvalidField` that surfaced
+            // to users as the opaque "crypto: invalid field value"). All
+            // hardware enrolls (SEP/TPM/FIDO2) and revoke funnel through
+            // here; deniable slots are fixed at create time.
+            return Err(Error::DeniableSlotMutationUnsupported);
         }
         Ok(())
     }
@@ -2490,6 +2573,59 @@ impl Container {
         Ok(idx)
     }
 
+    /// Add a macOS Secure Enclave keyslot of ANY SEP kind. The caller
+    /// (CLI/GUI) has run `luksbox_sep::SepSealer::seal` to obtain
+    /// `sep_shared` (the 32-byte ECDH shared secret feeding the KEK)
+    /// and `sep_blob` (the opaque `SepBlob` bytes to persist). The
+    /// supplied factors must match `kind`: `hmac_secret` + `cred_id` +
+    /// `hmac_salt` for SEP+FIDO2 kinds, `passphrase` + `kdf_params`
+    /// for SEP+passphrase kinds, `pq_shared` for hybrid kinds
+    /// (the ML-KEM pubkey+ciphertext remain the caller's to store in
+    /// the `.lbx.hybrid` sidecar).
+    ///
+    /// The SEP material goes in the in-header SEP region (no external
+    /// `.lbx.sep` file). Returns `Error::SepRegionFull` if the blob
+    /// would overflow that region.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enroll_sep(
+        &mut self,
+        kind: SlotKind,
+        sep_shared: &[u8; 32],
+        sep_blob: &[u8],
+        hmac_secret: Option<&[u8; 32]>,
+        passphrase: Option<&[u8]>,
+        kdf_params: Argon2idParams,
+        pq_shared: Option<&[u8; 32]>,
+        cred_id: &[u8],
+        hmac_salt: [u8; 32],
+    ) -> Result<usize, Error> {
+        self.guard_no_deniable_slot_mutation()?;
+        let idx = self.header.first_free_slot()?;
+        let slot = Keyslot::new_sep(
+            self.header.cipher_suite,
+            &self.mvk,
+            kind,
+            sep_shared,
+            hmac_secret,
+            passphrase,
+            kdf_params,
+            pq_shared,
+            cred_id,
+            hmac_salt,
+            &self.header.header_salt,
+        )?;
+        self.header.install_slot(idx, slot)?;
+        // Store the opaque SEP material in the in-header SEP region.
+        // On failure (region full) roll the slot back so we don't leave
+        // a SEP keyslot with no recoverable material.
+        if let Err(e) = self.header.set_sep_blob(idx, sep_blob.to_vec()) {
+            self.header.revoke_slot(idx).ok();
+            return Err(e.into());
+        }
+        self.header_dirty = true;
+        Ok(idx)
+    }
+
     /// Add a hybrid TPM 2.0 + ML-KEM-768 keyslot. Caller has
     /// generated a Kyber keypair, encapsulated against it to get
     /// `pq_shared`, and is responsible for storing the matching
@@ -2728,6 +2864,12 @@ impl Container {
         kek_from_tpm: &[u8; 32],
         sealed_blob: &[u8],
     ) -> Result<(), Error> {
+        // Complete the deniable-mutation guard sweep: like `enroll_*`
+        // and `revoke_slot`, refuse an in-place slot rewrite on a
+        // deniable container (its slots are fixed at create time).
+        // Unreachable today -- callers bail before a deniable container
+        // -- but fail-closed against a future path (audit addendum C).
+        self.guard_no_deniable_slot_mutation()?;
         let slot = Keyslot::new_tpm2(
             self.header.cipher_suite,
             &self.mvk,
@@ -2794,6 +2936,12 @@ impl Container {
     /// references slot indices (e.g. the `<vault>.lbx.hybrid` sidecar's
     /// `slot_idx` field) and for calling `persist_header()` afterwards.
     pub fn swap_slots(&mut self, a: usize, b: usize) -> Result<(), Error> {
+        // Deniable-mutation guard (audit addendum C). No-op on the only
+        // callers today -- the non-deniable SEP/TPM bootstrap-create
+        // flow, which swaps the hardware slot to index 0 -- since those
+        // containers are never deniable; the deniable create path builds
+        // its envelope directly without swapping.
+        self.guard_no_deniable_slot_mutation()?;
         let max = self.header.keyslots.len();
         if a >= max || b >= max {
             return Err(Error::Io(std::io::Error::other(format!(
@@ -2802,6 +2950,11 @@ impl Container {
         }
         if a != b {
             self.header.keyslots.swap(a, b);
+            // The in-header Secure Enclave region is indexed by slot,
+            // so the per-slot SEP material must move with its keyslot;
+            // otherwise a SEP slot ends up pointing at the wrong (or no)
+            // blob and `--sep` unlock fails with UnlockFailed.
+            self.header.sep_blobs.swap(a, b);
             self.header_dirty = true;
         }
         Ok(())
@@ -2815,6 +2968,7 @@ impl Container {
         passphrase: &[u8],
         kdf_params: Argon2idParams,
     ) -> Result<(), Error> {
+        self.guard_no_deniable_slot_mutation()?;
         let slot = Keyslot::new_passphrase(
             self.header.cipher_suite,
             &self.mvk,
@@ -2837,6 +2991,7 @@ impl Container {
         hmac_salt: [u8; 32],
         kdf_params: Argon2idParams,
     ) -> Result<(), Error> {
+        self.guard_no_deniable_slot_mutation()?;
         let slot = Keyslot::new_fido2(
             self.header.cipher_suite,
             &self.mvk,
@@ -3417,6 +3572,12 @@ impl Container {
         // Flush any pending writes on the original before we copy.
         self.file.flush()?;
 
+        // R14-04: capture the committed vault's (dev,ino) from the
+        // handle we currently hold (before `self.file` is reassigned to
+        // the temp below). The abort path rebinds to this exact inode
+        // with a no-follow reopen instead of blindly following the path.
+        let committed_inode = self.file.inode_pair()?;
+
         // Round 12 fix R12-10: create the rotation tmp atomically with
         // `O_CREAT|O_EXCL|O_NOFOLLOW` at mode 0600 BEFORE copying
         // content into it. The previous flow did `std::fs::copy` (which
@@ -3471,6 +3632,7 @@ impl Container {
         self.rotation = Some(RotationState {
             tmp_data_path: tmp,
             committed_data_path: original,
+            committed_inode,
         });
         Ok(())
     }
@@ -3550,10 +3712,18 @@ impl Container {
 
         // Reopen original BEFORE dropping the temp handle so we never
         // leave self.file in a half-valid state.
-        let original_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&state.committed_data_path)?;
+        //
+        // R14-04 (completes R13-02): route this through
+        // `reopen_committed_no_follow` bound to the inode captured at
+        // `begin_atomic_rotation`. A bare path open here followed a
+        // symlink an attacker could plant during the rotation window
+        // (the original flock is released at `begin`), and the
+        // subsequent `Drop` -> `persist_header` then wrote HEADER_SIZE
+        // bytes through it. With the no-follow + inode-equality check, a
+        // swapped path now fails closed with `PathSubstituted` and the
+        // header write never reaches a foreign file.
+        let original_file =
+            reopen_committed_no_follow(&state.committed_data_path, state.committed_inode)?;
         self.file = Box::new(original_file);
         self.path = state.committed_data_path;
 
@@ -3811,15 +3981,19 @@ fn try_unlock(
                 if slot.kind != SlotKind::Tpm2Fido2 {
                     continue;
                 }
-                let stored_cred = slot
-                    .tpm2_fido2_cred_id()
-                    .expect("kind == Tpm2Fido2 implies tpm2_fido2_cred_id() is Some");
+                // A hostile or corrupt vault can carry the Tpm2Fido2
+                // kind byte over a payload that doesn't parse as the
+                // [blob_len | blob | cred_id] sub-format. Skip rather
+                // than error (same policy as the Sep arm).
+                let Some(stored_cred) = slot.tpm2_fido2_cred_id() else {
+                    continue;
+                };
                 if stored_cred != *cred_id {
                     continue;
                 }
-                let tpm_blob = slot
-                    .tpm2_fido2_sealed_blob()
-                    .expect("kind == Tpm2Fido2 implies tpm2_fido2_sealed_blob() is Some");
+                let Some(tpm_blob) = slot.tpm2_fido2_sealed_blob() else {
+                    continue;
+                };
                 let tpm_unsealed = match unseal(tpm_blob) {
                     Ok(k) => k,
                     Err(_) => continue,
@@ -3844,9 +4018,11 @@ fn try_unlock(
                 ) {
                     continue;
                 }
-                let blob = slot
-                    .tpm2_sealed_blob()
-                    .expect("hybrid-pq TPM kind implies tpm2_sealed_blob() is Some");
+                // Skip malformed slots (kind byte without a parseable
+                // payload), same policy as the Sep arm.
+                let Some(blob) = slot.tpm2_sealed_blob() else {
+                    continue;
+                };
                 let tpm_kek = match unseal(blob) {
                     Ok(k) => k,
                     Err(_) => continue,
@@ -3872,15 +4048,17 @@ fn try_unlock(
                 ) {
                     continue;
                 }
-                let stored_cred = slot
-                    .tpm2_fido2_cred_id()
-                    .expect("hybrid-pq fused TPM+FIDO2 implies tpm2_fido2_cred_id() is Some");
+                // Skip malformed slots (kind byte without a parseable
+                // payload), same policy as the Sep arm.
+                let Some(stored_cred) = slot.tpm2_fido2_cred_id() else {
+                    continue;
+                };
                 if stored_cred != *cred_id {
                     continue;
                 }
-                let tpm_blob = slot
-                    .tpm2_fido2_sealed_blob()
-                    .expect("hybrid-pq fused TPM+FIDO2 implies tpm2_fido2_sealed_blob() is Some");
+                let Some(tpm_blob) = slot.tpm2_fido2_sealed_blob() else {
+                    continue;
+                };
                 let tpm_unsealed = match unseal(tpm_blob) {
                     Ok(k) => k,
                     Err(_) => continue,
@@ -3927,9 +4105,9 @@ fn try_unlock(
                 if !matches!(slot.kind, SlotKind::Tpm2Sealed | SlotKind::Tpm2SealedPin) {
                     continue;
                 }
-                let blob = slot.tpm2_sealed_blob().expect(
-                    "kind in {Tpm2Sealed, Tpm2SealedPin} implies tpm2_sealed_blob() is Some",
-                );
+                let Some(blob) = slot.tpm2_sealed_blob() else {
+                    continue;
+                };
                 let kek = match unseal(blob) {
                     Ok(k) => k,
                     Err(_) => continue,
@@ -3941,6 +4119,59 @@ fn try_unlock(
                 // successfully. This is the "vault has multiple
                 // TPM slots, the chip unsealed something but it
                 // doesn't unwrap THIS slot" case. Continue.
+            }
+            Err(Error::UnlockFailed)
+        }
+        UnlockMaterial::Sep {
+            unseal,
+            hmac_secret,
+            passphrase,
+            pq_shared,
+        } => {
+            // Iterate every SEP slot. For each, the SEP material is
+            // read from the in-header SEP region (no sidecar); the
+            // caller's closure turns it into the 32-byte ECDH shared
+            // secret, then `unlock_sep` re-derives the KEK from the
+            // shared secret plus whichever fused factors the kind
+            // requires. First success wins. Like the TPM arm we do NOT
+            // iterate to constant time: SEP unseal is a hardware call
+            // (and may prompt for biometric), and which slot index
+            // unsealed is already public (kinds are unencrypted).
+            for (idx, slot) in header.keyslots.iter().enumerate() {
+                if !slot.kind.is_sep() {
+                    continue;
+                }
+                // Skip SEP slots whose required factor set doesn't
+                // match what the caller supplied (e.g. a SEP+FIDO2
+                // slot when no hmac_secret was given).
+                if slot.kind.is_sep_fido2() != hmac_secret.is_some()
+                    || slot.kind.is_sep_passphrase() != passphrase.is_some()
+                    || slot.kind.is_hybrid_pq() != pq_shared.is_some()
+                {
+                    continue;
+                }
+                let blob = match header.sep_blob(idx) {
+                    Some(b) => b,
+                    // SEP slot kind but no in-header material: corrupt
+                    // or partially-written. Skip rather than error.
+                    None => continue,
+                };
+                let sep_shared = match unseal(blob) {
+                    Ok(s) => s,
+                    // Foreign enclave / cancelled biometric / SEP
+                    // unavailable: tolerated, try the next slot.
+                    Err(_) => continue,
+                };
+                if let Ok(mvk) = slot.unlock_sep(
+                    suite,
+                    &sep_shared,
+                    *hmac_secret,
+                    *passphrase,
+                    *pq_shared,
+                    &header.header_salt,
+                ) {
+                    return Ok(mvk);
+                }
             }
             Err(Error::UnlockFailed)
         }
@@ -3997,6 +4228,92 @@ mod tests {
             reopen_committed_no_follow(&hp, committed),
             Err(Error::PathSubstituted { .. })
         ));
+    }
+
+    /// R14-04 regression (audit F1, reported by Garry Jean-Baptiste,
+    /// garry@reyse.ai): a directory-level attacker who swaps the
+    /// committed vault path for a symlink during the rotation window
+    /// must not redirect the abort/Drop header write. The abort reopen
+    /// is bound (O_NOFOLLOW + inode-equality) to the inode captured at
+    /// `begin_atomic_rotation`, so the swap fails closed with
+    /// `PathSubstituted` and the victim file is left untouched.
+    #[cfg(unix)]
+    #[test]
+    fn abort_atomic_rotation_refuses_symlinked_path() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.lbx");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"victim-must-not-be-overwritten").unwrap();
+
+        Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"correct horse",
+        )
+        .unwrap();
+
+        let mut cont =
+            Container::open(&path, None, UnlockMaterial::Passphrase(b"correct horse")).unwrap();
+        assert!(cont.supports_atomic_rotation());
+        cont.begin_atomic_rotation().unwrap();
+
+        // Attacker swaps the committed path for a symlink to the victim
+        // during the rotation window (the original flock was released at
+        // begin; begin already copied the original into <path>.rotating).
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+
+        // Abort must fail closed: the no-follow reopen bound to the
+        // captured inode rejects the symlink.
+        assert!(matches!(
+            cont.abort_atomic_rotation(),
+            Err(Error::PathSubstituted { .. })
+        ));
+
+        // Drop runs persist_header on whatever self.file still is (the
+        // temp, not the victim). Confirm the victim was never overwritten
+        // with header bytes.
+        drop(cont);
+        let after = std::fs::read(&victim).unwrap();
+        assert_eq!(
+            after, b"victim-must-not-be-overwritten",
+            "abort must not redirect the header write through the swapped symlink"
+        );
+    }
+
+    /// `create_with_sep` makes a single SEP keyslot with NO passphrase
+    /// recovery slot (the "skip backup passphrase" SEP-only path,
+    /// mirroring `create_with_tpm2`). The opaque SepBlob round-trips
+    /// through the in-header region. (Open requires the enclave, so this
+    /// only checks the on-disk shape, not a full unlock.)
+    #[test]
+    fn create_with_sep_makes_single_sep_slot_no_passphrase() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sep-only.lbx");
+        let sep_shared = [0x5eu8; 32];
+        let sep_blob = vec![0x9au8; 353];
+        let c = Container::create_with_sep(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            luksbox_core::SlotKind::SepSealed,
+            &sep_shared,
+            &sep_blob,
+        )
+        .unwrap();
+        assert_eq!(c.header.keyslots[0].kind, luksbox_core::SlotKind::SepSealed);
+        assert!(c.header.has_sep_region());
+        assert_eq!(c.header.sep_blob(0), Some(sep_blob.as_slice()));
+        // No passphrase / other recovery slot was created.
+        assert!(
+            c.header.keyslots[1..]
+                .iter()
+                .all(|k| k.kind == luksbox_core::SlotKind::Empty),
+            "create_with_sep must leave slots 1.. empty (no backup passphrase)"
+        );
     }
 
     #[test]
@@ -4369,6 +4686,196 @@ mod tests {
         // If we got here, the MVK was recovered + the metadata
         // blob decrypted, which proves the unwrap worked.
         assert_eq!(cont.header.keyslots[slot_idx].kind, SlotKind::Tpm2Sealed);
+    }
+
+    /// `Container::enroll_sep` + `UnlockMaterial::Sep` round-trip the
+    /// MVK through the IN-HEADER SEP region (no `.lbx.sep` file): the
+    /// SEP blob survives persist + clean re-open, a genuine shared
+    /// secret unlocks, and a rogue/foreign-enclave secret does not.
+    /// Covers both a plain `SepSealed` slot and a hybrid
+    /// `HybridPqKemSep` slot (extra pq factor).
+    #[test]
+    fn sep_enroll_open_roundtrip_mocked() {
+        use std::collections::HashMap;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v.lbx");
+
+        let mut cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            test_params(),
+            b"bootstrap",
+        )
+        .unwrap();
+
+        // Stand-in SEP: "seal" produced this opaque blob for this
+        // shared secret. The format layer treats the blob as opaque,
+        // so a fake byte vector exercises the in-header region exactly.
+        let sep_shared = [0x37u8; 32];
+        let sep_blob = vec![0xA5u8; 349]; // ~plain dataRep+eph envelope size
+        let pq_shared = [0x88u8; 32];
+        let sep_blob_hy = vec![0xB6u8; 349];
+        let mut mock_sep: HashMap<Vec<u8>, [u8; 32]> = HashMap::new();
+        mock_sep.insert(sep_blob.clone(), sep_shared);
+        mock_sep.insert(sep_blob_hy.clone(), sep_shared);
+
+        let plain_idx = cont
+            .enroll_sep(
+                SlotKind::SepSealed,
+                &sep_shared,
+                &sep_blob,
+                None,
+                None,
+                test_params(),
+                None,
+                &[],
+                [0u8; 32],
+            )
+            .unwrap();
+        let hy_idx = cont
+            .enroll_sep(
+                SlotKind::HybridPqKemSep,
+                &sep_shared,
+                &sep_blob_hy,
+                None,
+                None,
+                test_params(),
+                Some(&pq_shared),
+                &[],
+                [0u8; 32],
+            )
+            .unwrap();
+        // Material landed in the in-header region, not a sidecar.
+        assert!(cont.header.sep_blob(plain_idx).is_some());
+        assert!(cont.header.has_sep_region());
+        assert!(
+            !path.with_extension("lbx.sep").exists() && !dir.path().join("v.lbx.sep").exists(),
+            "no external .lbx.sep file must be created"
+        );
+        cont.persist_header().unwrap();
+        drop(cont);
+
+        // Re-open the plain SEP slot via a closure that maps the
+        // in-header blob -> shared secret (the role of SepSealer).
+        let mut unseal = |blob: &[u8]| -> Result<[u8; 32], String> {
+            mock_sep
+                .get(blob)
+                .copied()
+                .ok_or_else(|| "foreign enclave".into())
+        };
+        let cont = Container::open(
+            &path,
+            None,
+            UnlockMaterial::Sep {
+                unseal: &mut unseal,
+                hmac_secret: None,
+                passphrase: None,
+                pq_shared: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(cont.header.keyslots[plain_idx].kind, SlotKind::SepSealed);
+        assert_eq!(cont.header.keyslots[hy_idx].kind, SlotKind::HybridPqKemSep);
+        drop(cont);
+
+        // The hybrid slot opens when the pq factor is also supplied.
+        let mut unseal2 = |blob: &[u8]| -> Result<[u8; 32], String> {
+            mock_sep
+                .get(blob)
+                .copied()
+                .ok_or_else(|| "foreign enclave".into())
+        };
+        Container::open(
+            &path,
+            None,
+            UnlockMaterial::Sep {
+                unseal: &mut unseal2,
+                hmac_secret: None,
+                passphrase: None,
+                pq_shared: Some(&pq_shared),
+            },
+        )
+        .unwrap();
+
+        // Rogue enclave: closure returns a well-formed but WRONG secret
+        // for every blob -> no slot unlocks (AEAD rejects the KEK), and
+        // we get a clean error, never a null/partial MVK.
+        let mut rogue = |_blob: &[u8]| -> Result<[u8; 32], String> { Ok([0x99u8; 32]) };
+        let r = Container::open(
+            &path,
+            None,
+            UnlockMaterial::Sep {
+                unseal: &mut rogue,
+                hmac_secret: None,
+                passphrase: None,
+                pq_shared: None,
+            },
+        );
+        assert!(r.is_err(), "rogue SEP secret must not open the vault");
+    }
+
+    /// Regression: `swap_slots` must move the in-header SEP material
+    /// with its keyslot. The GUI's SEP-bootstrap create enrolls SEP in
+    /// the next free slot then swaps it to slot 0; if the `sep_blobs`
+    /// entry didn't move too, the SEP slot would point at no blob and
+    /// `--sep` unlock would fail with UnlockFailed.
+    #[test]
+    fn sep_swap_slots_moves_in_header_blob() {
+        use std::collections::HashMap;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v.lbx");
+        let mut cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            test_params(),
+            b"bootstrap",
+        )
+        .unwrap();
+        let sep_shared = [0x5eu8; 32];
+        let sep_blob = vec![0xC3u8; 349];
+        let mut mock: HashMap<Vec<u8>, [u8; 32]> = HashMap::new();
+        mock.insert(sep_blob.clone(), sep_shared);
+
+        let idx = cont
+            .enroll_sep(
+                SlotKind::SepSealed,
+                &sep_shared,
+                &sep_blob,
+                None,
+                None,
+                test_params(),
+                None,
+                &[],
+                [0u8; 32],
+            )
+            .unwrap();
+        assert!(idx > 0, "bootstrap passphrase occupies slot 0");
+
+        // Move SEP to slot 0 (the GUI bootstrap behavior).
+        cont.swap_slots(0, idx).unwrap();
+        assert!(cont.header.sep_blob(0).is_some(), "blob moved to slot 0");
+        assert!(cont.header.sep_blob(idx).is_none(), "old index cleared");
+        assert_eq!(cont.header.keyslots[0].kind, SlotKind::SepSealed);
+        cont.persist_header().unwrap();
+        drop(cont);
+
+        // SEP unlock must still work after the swap.
+        let mut unseal = |b: &[u8]| -> std::result::Result<[u8; 32], String> {
+            mock.get(b).copied().ok_or_else(|| "miss".into())
+        };
+        Container::open(
+            &path,
+            None,
+            UnlockMaterial::Sep {
+                unseal: &mut unseal,
+                hmac_secret: None,
+                passphrase: None,
+                pq_shared: None,
+            },
+        )
+        .expect("SEP unlock must succeed after swap_slots");
     }
 
     #[test]
@@ -5143,7 +5650,7 @@ mod tests {
         )
         .unwrap();
         let err = c.enroll_passphrase(b"bob", cheap_argon2()).err().unwrap();
-        assert!(matches!(err, Error::Crypto(_)));
+        assert!(matches!(err, Error::DeniableSlotMutationUnsupported));
     }
 
     #[test]
@@ -5304,6 +5811,56 @@ mod tests {
         assert_eq!(c_open.deniable_unlocked_slot(), Some(2));
     }
 
+    /// SEP (and any hardware) keyslot enrollment on a deniable vault is
+    /// unsupported and must surface the descriptive
+    /// `DeniableSlotMutationUnsupported` error, NOT the opaque
+    /// `crypto: invalid field value` users hit in the GUI. The guard
+    /// fires before any SEP material is touched, so dummy material is
+    /// fine here.
+    #[test]
+    fn enroll_sep_on_deniable_vault_is_refused_clearly() {
+        use crate::deniable_header::DeniableMaterial;
+        use luksbox_core::deniable::DeniableCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let cred = DeniableCredential::Passphrase {
+            passphrase: b"envelope-pass",
+            argon2: cheap_argon2(),
+        };
+        let material = DeniableMaterial {
+            cred_id: Vec::new(),
+            hmac_salt: None,
+            tpm_blob: Vec::new(),
+        };
+        let mut c = Container::create_with_credential_v2_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            2,
+            &cred,
+            &material,
+        )
+        .unwrap();
+        assert!(c.is_deniable());
+
+        let r = c.enroll_sep(
+            SlotKind::SepSealed,
+            &[0u8; 32],
+            &[],
+            None,
+            None,
+            cheap_argon2(),
+            None,
+            &[],
+            [0u8; 32],
+        );
+        assert!(
+            matches!(r, Err(Error::DeniableSlotMutationUnsupported)),
+            "SEP enroll on a deniable vault must return the descriptive error, got {r:?}"
+        );
+    }
+
     #[test]
     fn deniable_container_tpm_round_trip() {
         // v2: TPM + envelope passphrase. The TPM sealed blob is
@@ -5347,6 +5904,133 @@ mod tests {
         )
         .unwrap();
         assert_eq!(env.payload().tpm_blob, blob);
+        let c = Container::complete_open_v2_deniable(env, &cred).unwrap();
+        assert_eq!(c.mvk_clone().as_bytes(), mvk_before.as_bytes());
+    }
+
+    /// SEP + envelope passphrase in deniable mode (the macOS analog of
+    /// the TPM deniable path). The SEP blob rides in the slot envelope's
+    /// hardware-blob field; `sep_shared` is mocked here (no enclave on
+    /// CI) and on macOS comes from the SEP seal/unseal. Proves the crypto
+    /// round-trips and that the SEP factor is load-bearing.
+    #[test]
+    fn deniable_container_sep_passphrase_round_trip() {
+        use crate::deniable_header::DeniableMaterial;
+        use luksbox_core::deniable::DeniableCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let sep_shared = [0x5eu8; 32];
+        let cred = DeniableCredential::SepPassphrase {
+            passphrase: b"vault-pass",
+            argon2: cheap_argon2(),
+            sep_shared: &sep_shared,
+        };
+        // Realistic biometric-sized SEP blob (~496 B), well under the
+        // 4000 B deniable material budget.
+        let blob = vec![0x9au8; 496];
+        let material = DeniableMaterial {
+            cred_id: Vec::new(),
+            hmac_salt: None,
+            tpm_blob: blob.clone(),
+        };
+        let c = Container::create_with_credential_v2_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            5,
+            &cred,
+            &material,
+        )
+        .unwrap();
+        let mvk_before = c.mvk_clone();
+        assert!(c.is_deniable());
+        drop(c);
+
+        let env = Container::try_open_envelope_v2_deniable(
+            &path,
+            None,
+            &cred,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )
+        .unwrap();
+        // SEP blob round-trips so the frontend can re-derive sep_shared
+        // from it before completing the open.
+        assert_eq!(env.payload().tpm_blob, blob);
+        let c = Container::complete_open_v2_deniable(env, &cred).unwrap();
+        assert_eq!(c.mvk_clone().as_bytes(), mvk_before.as_bytes());
+        drop(c); // release the vault lock before the negative re-open
+
+        // Wrong sep_shared: phase 1 still opens on the passphrase
+        // (envelope discovery), but phase 2 must fail to unwrap the MVK.
+        let wrong_shared = [0u8; 32];
+        let wrong = DeniableCredential::SepPassphrase {
+            passphrase: b"vault-pass",
+            argon2: cheap_argon2(),
+            sep_shared: &wrong_shared,
+        };
+        let env2 = Container::try_open_envelope_v2_deniable(
+            &path,
+            None,
+            &wrong,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )
+        .unwrap();
+        assert!(
+            Container::complete_open_v2_deniable(env2, &wrong).is_err(),
+            "wrong sep_shared must not unwrap the MVK"
+        );
+    }
+
+    /// 4-factor SEP + FIDO2 + PQ + passphrase in deniable mode (the
+    /// deepest SEP deniable credential). Mirrors the TPM 4-factor test;
+    /// sep_shared / hmac / mlkem are mocked (no hardware on CI). Proves
+    /// create -> envelope-open -> complete round-trips.
+    #[test]
+    fn deniable_container_hybrid_pq_sep_fido2_round_trip() {
+        use crate::deniable_header::DeniableMaterial;
+        use luksbox_core::deniable::DeniableCredential;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vault.lbx");
+        let mlkem = [0x01u8; 32];
+        let sep_shared = [0x5eu8; 32];
+        let hmac = [0x03u8; 32];
+        let cred = DeniableCredential::HybridPqSepFido2Passphrase {
+            passphrase: b"vault-pass",
+            argon2: cheap_argon2(),
+            mlkem_shared: &mlkem,
+            sep_shared: &sep_shared,
+            hmac_secret_output: &hmac,
+        };
+        let material = DeniableMaterial {
+            cred_id: vec![0x10; 80],
+            hmac_salt: Some([0x20; 32]),
+            // SEP blob rides in the hardware-blob field.
+            tpm_blob: vec![0x9a; 496],
+        };
+        let c = Container::create_with_credential_v2_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            7,
+            &cred,
+            &material,
+        )
+        .unwrap();
+        let mvk_before = c.mvk_clone();
+        drop(c);
+
+        let env = Container::try_open_envelope_v2_deniable(
+            &path,
+            None,
+            &cred,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )
+        .unwrap();
         let c = Container::complete_open_v2_deniable(env, &cred).unwrap();
         assert_eq!(c.mvk_clone().as_bytes(), mvk_before.as_bytes());
     }

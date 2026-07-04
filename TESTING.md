@@ -343,6 +343,22 @@ We do NOT auto-test against real hardware in CI:
 
 Do this **once per release** (or after touching any FIDO2 path).
 
+### Verified device matrix
+
+Devices exercised against real hardware (macOS, 2026-07-03). cred_id
+size matters because fused slots (tpm2-fido2, sep-fido2) share a
+352 B region with the sealed blob:
+
+| Device                  | cred_id | Coverage |
+|-------------------------|---------|----------|
+| Google Titan v2         | 288 B   | full: smoke (4 modes), enroll/revoke, MVK rotation, deniable fido2/sep-fido2/pq-sep-fido2, fused SEP+FIDO2 slot |
+| Nitrokey 3              | 158 B   | create + unlock + put/get round-trip |
+| SoloKeys Solo 4.1.5     | 70 B    | create + unlock + put/get round-trip |
+| Yubico YubiKey 5        | 64 B    | create + unlock + put/get round-trip (+ historical full coverage on Linux) |
+
+Untested but expected to work (same libfido2 USB-HID path): Token2,
+OnlyKey.
+
 ### Pre-requisites
 
 - A FIDO2 authenticator: YubiKey 5+, SoloKey 2, Nitrokey 3, Token2,

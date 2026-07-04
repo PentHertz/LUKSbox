@@ -151,8 +151,21 @@ fn reopen_vfs(vault: &Path) -> Vfs {
     );
 }
 
+/// Cargo runs the tests in this binary on parallel threads by
+/// default, but concurrent macFUSE mount/unmount ops from one
+/// process race each other: an `umount` can land between another
+/// test's mount-registration steps ("not currently mounted" while
+/// the mount table lists it), leaving zombie kernel mounts whose
+/// session thread never exits, observed as
+/// `three_mount_unmount_cycles_in_one_process` hanging forever on
+/// `join()` while 3 dead mounts sat in the mount table. Every test
+/// takes this lock so kernel mount ops never overlap; each test is
+/// only 1-3 s, so the serialization cost is negligible.
+static MOUNT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Skip the test if FUSE isn't available (instead of failing). Keeps
 /// `cargo test` green on machines without FUSE installed.
+/// Also takes the serialization lock (see `MOUNT_SERIAL`).
 macro_rules! require_fuse {
     () => {
         if !fuse_available() {
@@ -164,6 +177,7 @@ macro_rules! require_fuse {
             );
             return;
         }
+        let _serial = MOUNT_SERIAL.lock().unwrap_or_else(|p| p.into_inner());
     };
 }
 

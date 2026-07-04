@@ -25,6 +25,11 @@ luksbox-pq = { path = "../luksbox-pq" }
 # `hardware = ["luksbox-tpm/hardware", "luksbox-fido2/hardware"]`
 # feature wiring.
 luksbox-tpm = { path = "../luksbox-tpm", default-features = false }
+# luksbox-sep: macOS Secure Enclave keyslots. Stub on every non-macOS
+# target (and without `hardware`), so the same CLI build works
+# everywhere; only the SEP enroll/unlock paths error at runtime off a
+# Secure Enclave.
+luksbox-sep = { path = "../luksbox-sep", default-features = false }
 clap = { version = "4", features = ["derive"] }
 rpassword = "7"
 rand_core.workspace = true
@@ -55,7 +60,7 @@ default = ["hardware", "fuse", "winfsp"]
 # to build on systems without the dev headers for either library.
 # luksbox-tpm gracefully no-ops on non-Linux so the same CLI build
 # works on macOS / Windows; only `enroll --tpm2` errors at runtime.
-hardware = ["luksbox-fido2/hardware", "luksbox-tpm/hardware"]
+hardware = ["luksbox-fido2/hardware", "luksbox-tpm/hardware", "luksbox-sep/hardware"]
 # Enables FUSE-backed `mount` on Linux + macOS via the libfuse2 /
 # macFUSE path. Disable on macOS CI builds without macFUSE; mount()
 # then returns Unsupported.

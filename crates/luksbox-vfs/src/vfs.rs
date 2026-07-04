@@ -108,6 +108,19 @@ fn build_borrowed_deniable_credential(
                 unsealed: u,
             }
         }
+        K::SepPassphrase => {
+            // SEP reuses the `unsealed` carrier for its 32-byte ECDH
+            // shared secret (the macOS analog of the TPM unseal output).
+            let s = c.unsealed.as_ref().ok_or_else(bad_kind)?;
+            if c.hmac_secret_output.is_some() || c.mlkem_shared.is_some() {
+                return Err(bad_kind());
+            }
+            DC::SepPassphrase {
+                passphrase: pp,
+                argon2: arg,
+                sep_shared: s,
+            }
+        }
         K::TpmFido2Passphrase => {
             let u = c.unsealed.as_ref().ok_or_else(bad_kind)?;
             let hs = c.hmac_secret_output.as_ref().ok_or_else(bad_kind)?;
@@ -167,6 +180,46 @@ fn build_borrowed_deniable_credential(
                 argon2: arg,
                 mlkem_shared: m,
                 unsealed: u,
+                hmac_secret_output: hs,
+            }
+        }
+        // SEP variants reuse the `unsealed` carrier for the enclave's
+        // 32-byte ECDH secret (the macOS analog of the TPM unseal output).
+        K::SepFido2Passphrase => {
+            let u = c.unsealed.as_ref().ok_or_else(bad_kind)?;
+            let hs = c.hmac_secret_output.as_ref().ok_or_else(bad_kind)?;
+            if c.mlkem_shared.is_some() {
+                return Err(bad_kind());
+            }
+            DC::SepFido2Passphrase {
+                passphrase: pp,
+                argon2: arg,
+                sep_shared: u,
+                hmac_secret_output: hs,
+            }
+        }
+        K::HybridPqSepPassphrase => {
+            let m = c.mlkem_shared.as_ref().ok_or_else(bad_kind)?;
+            let u = c.unsealed.as_ref().ok_or_else(bad_kind)?;
+            if c.hmac_secret_output.is_some() {
+                return Err(bad_kind());
+            }
+            DC::HybridPqSepPassphrase {
+                passphrase: pp,
+                argon2: arg,
+                mlkem_shared: m,
+                sep_shared: u,
+            }
+        }
+        K::HybridPqSepFido2Passphrase => {
+            let m = c.mlkem_shared.as_ref().ok_or_else(bad_kind)?;
+            let u = c.unsealed.as_ref().ok_or_else(bad_kind)?;
+            let hs = c.hmac_secret_output.as_ref().ok_or_else(bad_kind)?;
+            DC::HybridPqSepFido2Passphrase {
+                passphrase: pp,
+                argon2: arg,
+                mlkem_shared: m,
+                sep_shared: u,
                 hmac_secret_output: hs,
             }
         }
@@ -1653,17 +1706,128 @@ impl Vfs {
     pub fn metadata_budget_status(&self) -> MetadataBudgetStatus {
         let budget =
             luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size);
-        // Encode the in-memory tree the same way the next flush
-        // would, modulo the per-format magic prefix (4 B). The
-        // projection in `check_metadata_budget_for_chunks` is for
-        // pre-flighting writes; for status display we just want the
-        // current encoded size, so a plain to_allocvec is enough.
-        let used = postcard::to_allocvec(&self.tree)
-            .map(|v| v.len())
-            .unwrap_or(0);
+        // Encode the same logical on-disk shape the next flush would
+        // write, modulo the per-format magic prefix (4 B). For v3+
+        // this must NOT serialize `self.tree` directly: large files
+        // keep their chunk refs materialized in memory, but flush
+        // spills them into external chunk-list blocks and stores only
+        // a compact `(head, count)` stub in metadata. Directly
+        // serializing the in-memory tree can allocate hundreds of MB
+        // in GUI status polling for large vaults and reports a bogus
+        // "near budget" state.
+        let used = self.projected_metadata_payload_len().unwrap_or(0);
         MetadataBudgetStatus {
             used_bytes: used,
             budget_bytes: budget,
+        }
+    }
+
+    fn projected_metadata_payload_len(&self) -> Result<usize, Error> {
+        match self.format {
+            MetadataFormat::V2 => postcard::to_allocvec(&self.tree)
+                .map(|v| v.len())
+                .map_err(|_| Error::MetadataSerialize),
+            MetadataFormat::V3 => postcard::to_allocvec(&self.project_v3_on_disk_for_status())
+                .map(|v| v.len())
+                .map_err(|_| Error::MetadataSerialize),
+            MetadataFormat::V4 | MetadataFormat::V5 => {
+                postcard::to_allocvec(&self.project_v4_on_disk_for_status())
+                    .map(|v| v.len())
+                    .map_err(|_| Error::MetadataSerialize)
+            }
+        }
+    }
+
+    fn project_v3_on_disk_for_status(&self) -> DirectoryTreeV3OnDisk {
+        let placeholder = ChunkRef {
+            id: u64::MAX,
+            generation: u64::MAX,
+        };
+        let threshold = self.format.inline_chunk_threshold();
+        let inodes = self
+            .tree
+            .inodes
+            .iter()
+            .map(|(&id, inode)| {
+                let renders_external =
+                    inode.kind == InodeKind::File && inode.chunks.len() > threshold;
+                let od = if renders_external {
+                    let head = inode
+                        .external_list_blocks
+                        .first()
+                        .copied()
+                        .unwrap_or(placeholder);
+                    InodeV3OnDisk {
+                        id: inode.id,
+                        parent: inode.parent,
+                        kind: inode.kind,
+                        size: inode.size,
+                        mtime_ns: inode.mtime_ns,
+                        chunks: Vec::new(),
+                        chunks_external: Some((head, inode.chunks.len() as u64)),
+                        children: inode.children.clone(),
+                    }
+                } else {
+                    InodeV3OnDisk {
+                        id: inode.id,
+                        parent: inode.parent,
+                        kind: inode.kind,
+                        size: inode.size,
+                        mtime_ns: inode.mtime_ns,
+                        chunks: inode.chunks.clone(),
+                        chunks_external: None,
+                        children: inode.children.clone(),
+                    }
+                };
+                (id, od)
+            })
+            .collect();
+        DirectoryTreeV3OnDisk {
+            root: self.tree.root,
+            next_file_id: self.tree.next_file_id,
+            next_chunk_id: self.tree.next_chunk_id,
+            next_chunk_gen: self.tree.next_chunk_gen,
+            free_chunks: self.tree.free_chunks.clone(),
+            inodes,
+        }
+    }
+
+    fn project_v4_on_disk_for_status(&self) -> DirectoryTreeV4OnDisk {
+        let v3 = self.project_v3_on_disk_for_status();
+        let inodes = v3
+            .inodes
+            .into_iter()
+            .map(|(id, od)| {
+                let inode = self
+                    .tree
+                    .inodes
+                    .get(&id)
+                    .expect("projected v3 enumerates only in-memory inode ids");
+                (
+                    id,
+                    InodeV4OnDisk {
+                        id: od.id,
+                        parent: od.parent,
+                        kind: od.kind,
+                        size: od.size,
+                        mtime_ns: od.mtime_ns,
+                        chunks: od.chunks,
+                        chunks_external: od.chunks_external,
+                        children: od.children,
+                        mode: inode.mode,
+                        link_count: inode.link_count,
+                        symlink_target: inode.symlink_target.clone(),
+                    },
+                )
+            })
+            .collect();
+        DirectoryTreeV4OnDisk {
+            root: v3.root,
+            next_file_id: v3.next_file_id,
+            next_chunk_id: v3.next_chunk_id,
+            next_chunk_gen: v3.next_chunk_gen,
+            free_chunks: v3.free_chunks,
+            inodes,
         }
     }
 
@@ -5540,6 +5704,46 @@ mod tests {
         assert_eq!(
             MetadataFormat::V5.inline_chunk_threshold(),
             crate::tree::V5_INLINE_CHUNK_THRESHOLD
+        );
+    }
+
+    #[test]
+    fn metadata_budget_status_projects_spilled_v5_shape() {
+        // Status polling must report the compact on-disk metadata
+        // shape, not serialize the materialized in-memory chunks vec.
+        // A large v5 file spills its chunk list into external blocks
+        // on flush, so metadata stores only a small `(head, count)`
+        // stub. The old status path serialized `self.tree` directly,
+        // which re-inlined every ChunkRef and could allocate huge
+        // buffers in the GUI for large vaults.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("status-spill.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        assert!(vfs.uses_v5_metadata());
+        let root = vfs.root_id();
+        let f = vfs.create(root, "large").unwrap();
+
+        let chunk_count = crate::tree::V5_INLINE_CHUNK_THRESHOLD * 80;
+        {
+            let inode = vfs.tree.inodes.get_mut(&f).unwrap();
+            inode.size = (chunk_count as u64) * (CHUNK_PLAINTEXT_SIZE as u64);
+            inode.chunks = (0..chunk_count)
+                .map(|i| ChunkRef {
+                    id: i as u64 + 1,
+                    generation: i as u64 + 1,
+                })
+                .collect();
+        }
+
+        let direct_in_memory_len = postcard::to_allocvec(&vfs.tree).unwrap().len();
+        let status = vfs.metadata_budget_status();
+
+        assert!(
+            status.used_bytes * 10 < direct_in_memory_len,
+            "status must use spilled on-disk projection, not direct in-memory serialization \
+             (status={}, direct={})",
+            status.used_bytes,
+            direct_in_memory_len
         );
     }
 

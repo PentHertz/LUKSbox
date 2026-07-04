@@ -32,6 +32,7 @@ about to click 'Open Vault' - what *exactly* happens to my key?"
 18. [Scenario: mount the vault as a drive](#18-scenario-mount-the-vault-as-a-drive)
 19. [FIDO2 / CTAP2 deep dive: how it works and why it's secure](#19-fido2--ctap2-deep-dive-how-it-works-and-why-its-secure)
 20. [Quick reference: what an attacker would need](#20-quick-reference-what-an-attacker-would-need)
+21. [Secure Enclave (SEP) keyslot deep dive](#21-secure-enclave-sep-keyslot-deep-dive)
 
 ---
 
@@ -48,6 +49,7 @@ about to click 'Open Vault' - what *exactly* happens to my key?"
 | **CTAP2 hmac-secret** (FIDO2 spec) | A FIDO2 authenticator computes `HMAC(device_secret, salt)` and returns it. The device never reveals `device_secret`. | Hardware-bound key derivation for FIDO2 keyslots. |
 | **ML-KEM-768 / ML-KEM-1024** (FIPS 203) | Post-quantum key encapsulation. Lattice-based. Survives quantum attacks. | The PQ half of every hybrid keyslot. |
 | **ECDH P-256** (NIST SP 800-56A) | Classical key agreement. Used inside CTAP2 for the PIN/UV protocol. | Inside the FIDO2 protocol layer (not the LUKSbox-level mixing). |
+| **Secure Enclave P-256** (Apple CryptoKit `SecureEnclave.P256.KeyAgreement`) | A non-extractable P-256 key whose private half never leaves the Secure Enclave; it yields ECDH agreements, never the raw key bytes. | Hardware-bound KEK derivation for macOS SEP keyslots (Apple Silicon / T2). |
 | **OS RNG** (`getrandom(2)` on Linux, `BCryptGenRandom` on Windows, `SecRandomCopyBytes` on macOS) | The only source of randomness in the codebase. | Every salt, nonce, and freshly generated key. |
 | **memfd_secret(2)** (Linux 5.14+) | Memory pages unmappable from any other process; excluded from coredumps and hibernate snapshots. | Holding the Master Volume Key in RAM. |
 
@@ -2241,6 +2243,8 @@ chicken-and-egg constraint that forces the passphrase requirement.
 | Windows Hello (platform `Fido2HmacSecret`) | Vault file + Windows user session [+ passphrase if combined] |
 | Hybrid passphrase + ML-KEM-768 | Vault file + sidecar + `.kyber` seed file + passphrase |
 | Hybrid FIDO2 + ML-KEM-768 | Vault file + sidecar + `.kyber` seed file + security key + PIN [+ passphrase if combined] |
+| SEP-sealed (`SepSealed`) | Vault file + the originating Mac's Secure Enclave [+ Touch ID if biometric] [+ FIDO2 / passphrase if fused] |
+| Hybrid SEP + ML-KEM-768 | Vault file + sidecar + `.kyber` seed file + the originating Mac's enclave [+ extra factors if fused] |
 
 | Defence | What it stops |
 |---|---|
@@ -2263,6 +2267,125 @@ chicken-and-egg constraint that forces the passphrase requirement.
 | User using a weak passphrase | Argon2id raises the bar, doesn't make it infinite |
 | Anchor and vault on the same medium | Attacker rolls both back together |
 | Side-channels on the OS RNG, on Argon2id, on AES-NI | We trust the underlying primitives + hardware |
+
+---
+
+## 21. Secure Enclave (SEP) keyslot deep dive
+
+macOS builds (Apple Silicon and T2 Macs) can bind a keyslot to the
+machine's Secure Enclave. This is the macOS counterpart to a TPM slot,
+but the primitive underneath is different and worth spelling out.
+
+### 21.1 Why SEP is not "TPM with a different name"
+
+A TPM exposes a generic *seal arbitrary bytes -> unseal* primitive. The
+Secure Enclave does not. Its only building block (via CryptoKit's
+`SecureEnclave.P256.KeyAgreement`) is a non-extractable P-256 key whose
+private half never leaves the enclave. You cannot ask it to "store these
+32 bytes"; you can only ask it for an ECDH agreement.
+
+So a SEP slot does not *wrap* the KEK, it *derives* it. This is closer to
+LUKSbox's `Fido2DerivedMvk` than to the TPM. The interface to the format
+layer is kept identical to the TPM (opaque blob in, 32 bytes out), so the
+unlock math is reused unchanged.
+
+### 21.2 Enroll (seal)
+
+```
+sepKey  = SecureEnclave.P256.KeyAgreement.PrivateKey()   // private half stays in the SEP
+eph     = P256.KeyAgreement.PrivateKey()                 // ephemeral, host-side
+shared  = ECDH(eph.priv, sepKey.pub)
+kek     = HKDF-SHA256(shared, salt = slot.kdf_salt, info = "lbx:sep-kek/v1", 32)
+```
+
+The KEK wraps the MVK via the slot's existing `wrapped_ct` /
+`wrapped_tag` / `aead_nonce` fields, exactly like a TPM slot. What gets
+persisted is the enclave's opaque `dataRepresentation` plus the ephemeral
+public key; `eph.priv` is zeroized and never stored.
+
+### 21.3 Unlock (unseal)
+
+```
+sepKey  = SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: stored)
+shared  = ECDH(sepKey.priv, stored eph.pub)
+kek     = HKDF-SHA256(shared, salt = slot.kdf_salt, info = "lbx:sep-kek/v1", 32)
+mvk     = unwrap(kek, slot.wrapped_ct, slot.wrapped_tag)
+```
+
+`init(dataRepresentation:)` succeeds only on the originating enclave. On
+any other machine it errors, the slot is skipped, and LUKSbox moves on to
+the next slot, the same per-slot tolerance the TPM closures already use.
+
+### 21.4 Where the SEP material lives: the in-header region
+
+A realistic SEP blob is at least 353 bytes (496 bytes for biometric).
+That does not fit the 352-byte variable area of the 512-byte keyslot, and
+enlarging the slot would shift the whole header geometry. So the SEP
+material lives in an *in-header Secure Enclave region*: the roughly 3968
+bytes between the keyslot array (ends at offset 4192) and the header HMAC
+(offset 8160), which were previously just RNG padding.
+
+- Gated by `FLAG_HAS_SEP_REGION` (bit 4 of `Header::flags`). Vaults
+  without a SEP slot never set it and stay byte-identical to before.
+- Already inside the HMAC-authenticated range, so tampering with the
+  region or flipping the flag fails `verify_hmac`.
+- No header-size, `metadata_offset`, or `data_offset` change. There is
+  **no** external `.lbx.sep` file. (The ML-KEM material for hybrid SEP
+  kinds still uses the regular `.lbx.hybrid` sidecar.)
+- Holds at least 8 plain or about 7 biometric per-slot blobs; an
+  overflowing enroll is rejected with `SepRegionFull`, never silently
+  truncated.
+
+On-disk table at offset 4192:
+
+```
+count       1 B    number of populated slots
+per slot:
+  slot_idx  1 B
+  blob_len  u16 LE
+  blob      <blob_len> B   (opaque SepBlob: flags | sep_data | eph_pub)
+trailing bytes stay random
+```
+
+### 21.5 Biometric gating
+
+`SepSealedBiometric` builds the SEP key with a user-presence /
+biometric access-control flag, so the enclave itself refuses the ECDH
+agreement until Touch ID (or the device passcode) succeeds. The gate is
+enforced inside the enclave at unseal time, not by LUKSbox. It works from
+any interactive session (CLI, TUI, GUI); only a detached or headless
+process cannot present the authentication UI.
+
+### 21.6 The 13 SEP slot kinds
+
+SEP is available plain, biometric, fused with FIDO2 and/or a passphrase,
+and wrapped in an ML-KEM-768 or ML-KEM-1024 hybrid layer, for 13 honest
+`SlotKind` variants in total (`SepSealed`, `SepSealedBiometric`,
+`HybridPqKemSep`, `HybridPqKem1024Sep`, `SepFido2`, the SEP+passphrase
+and SEP+FIDO2+passphrase forms, and their PQ-768 / PQ-1024 hybrids). They
+are distinct kind bytes (15 through 27), never reused TPM kinds, so a
+pre-SEP binary that does not understand the kind simply refuses the slot.
+
+### 21.7 Security properties and recovery
+
+- **Stolen vault file alone**: useless. The KEK can only be re-derived on
+  the originating enclave; brute force against the AEAD is infeasible.
+- **Stolen vault on a different machine**: useless. The enclave rejects a
+  foreign `dataRepresentation`.
+- **Stolen vault plus the original Mac, no biometric**: opens that slot
+  (the enclave will derive the KEK). This is the SEP analog of the TPM
+  "no-PIN" baseline. Mitigate with `SepSealedBiometric` or a fused FIDO2 /
+  passphrase factor.
+- **Wiped or replaced enclave, OS reinstall**: the SEP slot becomes
+  unopenable. Recovery is the same as the TPM story: keep a backup
+  passphrase slot (slot 0 by default). A SEP-only vault with no backup
+  factor is unrecoverable if the enclave is lost.
+
+Implementation: `crates/luksbox-sep/` (CryptoKit shim + mock),
+`SlotKind::Sep*` in `crates/luksbox-core/src/keyslot.rs`, the in-header
+region in `crates/luksbox-core/src/header.rs`, and `Container::enroll_sep`
+in `crates/luksbox-format/src/container.rs`. Full internal design:
+`docs/SEP_KEYSLOT_DESIGN.md`.
 
 ---
 

@@ -23,6 +23,11 @@ luksbox-vfs = { path = "../crates/luksbox-vfs" }
 # Hardware feature stays off - the classifier is in the unconditionally-
 # compiled module.
 luksbox-fido2 = { path = "../crates/luksbox-fido2" }
+# `SepBlob` decoder + the in-header SEP region parse/serialize. The
+# `hardware` feature stays OFF: the parser types compile on every host
+# (only the CryptoKit FFI ops are cfg-gated to macOS), so the SEP fuzz
+# targets run in ordinary Linux CI.
+luksbox-sep = { path = "../crates/luksbox-sep" }
 tempfile = "3"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
@@ -218,6 +223,31 @@ bench = false
 [[bin]]
 name = "v2_mirror_recovery"
 path = "fuzz_targets/v2_mirror_recovery.rs"
+test = false
+doc = false
+bench = false
+
+# v0.4.0 SEP per-blob decoder: arbitrary bytes through
+# `SepBlob::from_bytes` (the `[flags][sep_data_len][sep_data][eph_pub]`
+# wire form read off disk and across the CryptoKit FFI). Never panic;
+# malformed input is `Err(_)`. Runs on Linux (parser types are not
+# cfg-gated).
+[[bin]]
+name = "sep_blob_parse"
+path = "fuzz_targets/sep_blob_parse.rs"
+test = false
+doc = false
+bench = false
+
+# v0.4.0 in-header SEP region: drives the region table
+# serialize/parse with fuzzer-controlled slot indices, counts, and blob
+# lengths via the public Header API. Never panic; a header we built must
+# re-parse; every accepted blob round-trips byte-identical. Pairs with
+# the curated `seed_sep` corpus entry that warms header_parse's region
+# path.
+[[bin]]
+name = "sep_region_parse"
+path = "fuzz_targets/sep_region_parse.rs"
 test = false
 doc = false
 bench = false
