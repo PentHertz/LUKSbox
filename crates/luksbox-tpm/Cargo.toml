@@ -4,24 +4,34 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Linux TPM 2.0-backed wrap/unwrap of the LUKSbox Master Volume Key"
+description = "Linux + Windows TPM 2.0-backed wrap/unwrap of the LUKSbox Master Volume Key"
 
 [features]
 # Off by default so a default `cargo build` of the workspace doesn't
-# need libtss2-* installed. CI + Linux release builds enable it via
-# `--features hardware`.
+# need libtss2-* installed (Linux) or a vendored tpm2-tss build
+# (Windows). CI + release builds enable the right variant explicitly.
 #
 # `hardware` is a meta-feature: it asks for the real TPM 2.0 backend.
-# It only DOES anything on Linux, because tss-esapi 7.x doesn't
-# support Windows or macOS (build.rs panics with "Compilation target
-# (architecture, OS) tuple is not part of the supported tuples").
-# So tss-esapi is target-gated below; on non-Linux, enabling
-# `hardware` is a no-op and the source code falls back to the same
-# `NotCompiledIn` stub used when the feature is off entirely.
-# Migration to tss-esapi 8.0 (which adds Windows TBS support) is
-# tracked in docs/TPM_FUTURE_IMPROVEMENTS.md section 1.
+# It only DOES anything on Linux (via /dev/tpmrm0) and Windows (via
+# TBS, the in-box TPM Base Services broker - reachable from any
+# user-mode process, no admin, no driver install, no code signing).
+# tss-esapi is target-gated below; on macOS and every other target,
+# enabling `hardware` is a no-op and the source code falls back to
+# the same `NotCompiledIn` stub used when the feature is off
+# entirely.
+#
+# On Linux, `hardware` links the SYSTEM tpm2-tss and needs
+# tpm2-tss >= 4.1.3 installed (Debian 13+, Ubuntu 24.10+, Fedora
+# 40+, Arch). On older distros - and on Windows, where no system
+# tpm2-tss exists - use `bundled-tpm` instead: it compiles a
+# vendored tpm2-tss at build time (autotools on Linux, MSBuild /
+# VS2017+ on Windows; the tss-esapi-sys build script fetches the
+# source via git unless TPM2_TSS_SOURCE_PATH points at a local
+# checkout). See docs/TPM_FUTURE_IMPROVEMENTS.md section 1 for the
+# full decision record.
 default = []
-hardware = ["dep:tss-esapi"]
+hardware = ["dep:tss-esapi", "dep:tss-esapi-sys"]
+bundled-tpm = ["hardware", "tss-esapi/bundled"]
 
 [dependencies]
 zeroize = { workspace = true }
@@ -31,23 +41,46 @@ thiserror = { workspace = true }
 # every platform without tss-esapi.
 rand_core = { workspace = true }
 
-# tss-esapi pinned to ^7.5 (current stable line). v8 is in development
-# and has shape-breaking API changes around handle types AND a
-# tpm2-tss-floor bump from 2.4.6 to 4.1.3 that breaks Debian 12 +
-# Ubuntu 22.04/24.04 LTS + RHEL 9 default builds; pin to the stable
-# major. To take v8 on, the `hardware` feature needs to be split
-# into `fido2-hardware` (low floor, default-on) + `tpm-hardware`
-# (8.0-floor, opt-in) + a `bundled-tpm` variant for users on older
-# distros.
+# tss-esapi 8.0.0-alpha.2: the first line with the Windows TBS TCTI
+# (`TctiNameConf::Tbs`). Method signatures used by real.rs are
+# byte-identical to the 7.7 stable line except one module rename
+# (`interface_types::resource_handles` -> `reserved_handles`); the
+# on-disk TPM2B_PUBLIC/TPM2B_PRIVATE wire bytes are unchanged, so a
+# vault sealed by a 7.x-built luksbox unseals fine under 8.0 (same
+# chip). Pinned exactly: alphas may break shape between releases.
 #
-# Target-gated: tss-esapi 7.x's -sys crate hard-panics in build.rs
-# on every non-Linux target, so we restrict the dep to Linux. The
-# `hardware` cargo feature still references it via `dep:tss-esapi`,
-# but on non-Linux that dep simply doesn't exist for the target --
-# the feature flag stays settable (no error from parents that turn
-# it on unconditionally) but the optional dep is not pulled.
+# tss-esapi-sys is force-pinned to =0.6.0-alpha.2 on purpose. The
+# tss-esapi crate declares `tss-esapi-sys = "^0.6.0-alpha.2"`, and
+# upstream later published a *stable* 0.6.0 cut from the 7.x branch
+# that semver-satisfies that range while LACKING Windows support and
+# the `bundled` feature. Without this direct pin, cargo resolves
+# -sys to 0.6.0 stable and the Windows build breaks with
+# "Compilation target tuple is not part of the supported tuples".
+# Drop the pin when tss-esapi 8.0 stable lands with a -sys
+# requirement that can't be satisfied by the 7.x-line -sys.
+#
+# Target-gated to Linux + Windows; on macOS the dep simply doesn't
+# exist for the target - the `hardware` feature flag stays settable
+# (no error from parents that turn it on unconditionally) but the
+# optional dep is not pulled and the stub compiles instead.
+#
+# Linux gets the pregenerated bindings (x86_64 + aarch64).
 [target.'cfg(target_os = "linux")'.dependencies]
-tss-esapi = { version = "7.5", optional = true }
+tss-esapi = { version = "=8.0.0-alpha.2", optional = true }
+tss-esapi-sys = { version = "=0.6.0-alpha.2", optional = true }
+
+# Windows has NO pregenerated bindings in tss-esapi-sys - its
+# build.rs hard-panics on the (x86_64, windows) tuple unless
+# `generate-bindings` is on. So the Windows flavour of the dep
+# always enables it, which pulls bindgen and therefore needs
+# libclang at build time (set LIBCLANG_PATH, e.g. to an LLVM
+# install's bin dir). Combined with `bundled-tpm`, the build also
+# compiles tpm2-tss itself via MSBuild (VS2017+); without `bundled`,
+# point TPM2_TSS_PATH at an existing tpm2-tss install tree
+# (include/ + lib/ + VERSION).
+[target.'cfg(target_os = "windows")'.dependencies]
+tss-esapi = { version = "=8.0.0-alpha.2", optional = true, features = ["generate-bindings"] }
+tss-esapi-sys = { version = "=0.6.0-alpha.2", optional = true, features = ["generate-bindings"] }
 
 [dev-dependencies]
 # Software TPM emulator integration tests live in tests/swtpm.rs and

@@ -54,13 +54,29 @@ hex = "0.4"
 libc.workspace = true
 
 [features]
-default = ["hardware", "fuse", "winfsp"]
-# Enables the FIDO2 hardware path (libfido2 link) AND the TPM 2.0
-# hardware path (libtss2-* link). Disable with `--no-default-features`
-# to build on systems without the dev headers for either library.
-# luksbox-tpm gracefully no-ops on non-Linux so the same CLI build
-# works on macOS / Windows; only `enroll --tpm2` errors at runtime.
-hardware = ["luksbox-fido2/hardware", "luksbox-tpm/hardware", "luksbox-sep/hardware"]
+default = ["fido2-hardware", "fuse", "winfsp"]
+# FIDO2 hardware alone (libfido2 link on Linux/macOS, webauthn.dll on
+# Windows). This is the DEFAULT hardware level: it has no tpm2-tss
+# version floor, so a plain `cargo build` keeps working on Debian 12,
+# Ubuntu 22.04/24.04 LTS, RHEL 9 and on Windows boxes without a
+# tpm2-tss build. Disable with `--no-default-features` to build on
+# systems without even the libfido2 dev headers.
+fido2-hardware = ["luksbox-fido2/hardware"]
+# Everything: FIDO2 + TPM 2.0 + (on macOS) Secure Enclave. TPM links
+# the SYSTEM tpm2-tss and therefore needs tpm2-tss >= 4.1.3 installed
+# (Debian 13+, Ubuntu 24.10+, Fedora 40+, Arch); on Windows it needs
+# TPM2_TSS_PATH pointing at a tpm2-tss install tree plus libclang for
+# bindgen. If your distro's tpm2-tss is older - or you're on Windows
+# without one - use `bundled-tpm` below instead. luksbox-tpm
+# gracefully no-ops on macOS (no TPM backend there; SEP covers the
+# same threat model), so `--features hardware` is safe to enable on
+# every platform.
+hardware = ["fido2-hardware", "luksbox-tpm/hardware", "luksbox-sep/hardware"]
+# `hardware` with a vendored tpm2-tss compiled at build time
+# (autotools on Linux, MSBuild/VS2017+ and libclang on Windows).
+# This is what the Windows release binaries ship with, and the
+# escape hatch for LTS distros whose system tpm2-tss is < 4.1.3.
+bundled-tpm = ["hardware", "luksbox-tpm/bundled-tpm"]
 # Enables FUSE-backed `mount` on Linux + macOS via the libfuse2 /
 # macFUSE path. Disable on macOS CI builds without macFUSE; mount()
 # then returns Unsupported.

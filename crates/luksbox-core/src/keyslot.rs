@@ -307,10 +307,11 @@ pub enum SlotKind {
     /// kind (the KEK comes from the TPM directly), so the
     /// `kdf_params` fields are zero on disk and exempt from the
     /// usual on-read sanity check.
-    /// Linux-only at runtime: enrollment + unlock require
-    /// `libtss2-esys` and a TPM 2.0 device. Other platforms can
-    /// READ a vault containing this slot kind and use other slots
-    /// to unlock; only TPM-slot operations themselves are gated.
+    /// Linux + Windows at runtime: enrollment + unlock require a
+    /// TPM 2.0 backend (`libtss2-esys` + `/dev/tpmrm0` on Linux,
+    /// TPM Base Services on Windows). Other platforms can READ a
+    /// vault containing this slot kind and use other slots to
+    /// unlock; only TPM-slot operations themselves are gated.
     Tpm2Sealed = 8,
     /// **Fused** TPM 2.0 + FIDO2 keyslot: unlock requires BOTH the
     /// local TPM (to unseal the wrap-key half) AND a connected

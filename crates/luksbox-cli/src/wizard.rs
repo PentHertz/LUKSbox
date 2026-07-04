@@ -52,7 +52,7 @@ struct CreateOptions {
 /// Brand-agnostic by design: works for YubiKey, Nitrokey, SoloKey,
 /// Token2, OnlyKey, Trezor T, Windows Hello (via libfido2's WinHello
 /// bridge on Windows), etc.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 pub(crate) fn select_fido2_device(theme: &ColorfulTheme) -> Option<String> {
     let devices = match luksbox_fido2::HidAuthenticator::detect_all() {
         Ok(d) => d,
@@ -91,7 +91,7 @@ pub(crate) fn select_fido2_device(theme: &ColorfulTheme) -> Option<String> {
     Some(devices[pick].label.clone())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 pub(crate) fn select_fido2_device(_theme: &ColorfulTheme) -> Option<String> {
     None
 }
@@ -173,13 +173,13 @@ enum DenCredKind {
     Fido2,
     HybridPqPassphrase,
     HybridPqFido2,
-    #[cfg(all(feature = "hardware", target_os = "linux"))]
+    #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
     Tpm2,
-    #[cfg(all(feature = "hardware", target_os = "linux"))]
+    #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
     Tpm2Fido2,
-    #[cfg(all(feature = "hardware", target_os = "linux"))]
+    #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
     HybridPqTpm2,
-    #[cfg(all(feature = "hardware", target_os = "linux"))]
+    #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
     HybridPqTpmFido2,
     #[cfg(all(feature = "hardware", target_os = "macos"))]
     Sep,
@@ -198,13 +198,13 @@ impl DenCredKind {
             Self::Fido2 => "FIDO2 authenticator only",
             Self::HybridPqPassphrase => "Hybrid post-quantum (ML-KEM) + passphrase",
             Self::HybridPqFido2 => "Hybrid post-quantum (ML-KEM) + FIDO2",
-            #[cfg(all(feature = "hardware", target_os = "linux"))]
+            #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
             Self::Tpm2 => "TPM 2.0 only (this machine)",
-            #[cfg(all(feature = "hardware", target_os = "linux"))]
+            #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
             Self::Tpm2Fido2 => "TPM 2.0 + FIDO2 (both factors)",
-            #[cfg(all(feature = "hardware", target_os = "linux"))]
+            #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
             Self::HybridPqTpm2 => "Hybrid PQ + TPM 2.0",
-            #[cfg(all(feature = "hardware", target_os = "linux"))]
+            #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
             Self::HybridPqTpmFido2 => "3-factor: PQ + TPM + FIDO2",
             #[cfg(all(feature = "hardware", target_os = "macos"))]
             Self::Sep => "Secure Enclave (this Mac) + passphrase",
@@ -310,7 +310,7 @@ fn available_den_kinds() -> Vec<DenCredKind> {
         DenCredKind::HybridPqPassphrase,
         DenCredKind::HybridPqFido2,
     ];
-    #[cfg(all(feature = "hardware", target_os = "linux"))]
+    #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
     {
         v.push(DenCredKind::Tpm2);
         v.push(DenCredKind::Tpm2Fido2);
@@ -454,15 +454,15 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
             false,
             &mut recovery,
         )?,
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         DenCredKind::Tpm2 => {
             create_den_tpm(theme, &path, cipher_suite, argon2_params, &mut recovery)?
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         DenCredKind::Tpm2Fido2 => {
             create_den_tpm_fido2(theme, &path, cipher_suite, argon2_params, &mut recovery)?
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         DenCredKind::HybridPqTpm2 => create_den_pq_tpm(
             theme,
             &path,
@@ -471,7 +471,7 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
             false,
             &mut recovery,
         )?,
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         DenCredKind::HybridPqTpmFido2 => create_den_pq_tpm_fido2(
             theme,
             &path,
@@ -562,7 +562,7 @@ fn create_den_passphrase_v2(
     Ok(cont)
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn create_den_fido2(
     theme: &ColorfulTheme,
     path: &Path,
@@ -607,7 +607,7 @@ fn create_den_fido2(
     )?;
     Ok(cont)
 }
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn create_den_fido2(
     _theme: &ColorfulTheme,
     _path: &Path,
@@ -678,7 +678,7 @@ fn create_den_pq_passphrase(
     Ok(cont)
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn create_den_pq_fido2(
     theme: &ColorfulTheme,
     path: &Path,
@@ -761,7 +761,7 @@ fn create_den_pq_fido2(
     )?;
     Ok(cont)
 }
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn create_den_pq_fido2(
     _theme: &ColorfulTheme,
     _path: &Path,
@@ -773,7 +773,7 @@ fn create_den_pq_fido2(
     Err("FIDO2 hardware support not compiled in".into())
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn create_den_tpm(
     theme: &ColorfulTheme,
     path: &Path,
@@ -818,7 +818,7 @@ fn create_den_tpm(
     Ok(cont)
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn create_den_tpm_fido2(
     theme: &ColorfulTheme,
     path: &Path,
@@ -869,7 +869,7 @@ fn create_den_tpm_fido2(
     Ok(cont)
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn create_den_pq_tpm(
     theme: &ColorfulTheme,
     path: &Path,
@@ -929,7 +929,7 @@ fn create_den_pq_tpm(
     Ok(cont)
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn create_den_pq_tpm_fido2(
     theme: &ColorfulTheme,
     path: &Path,
@@ -1018,7 +1018,7 @@ fn create_den_pq_tpm_fido2(
 /// TPM-seal a random 32-byte secret and return the blob bytes for
 /// embedding inside the v2 slot envelope. v2 replacement for the
 /// v1 `tpm_seal_blob_sidecar` (which wrote a `.tpm-blob` file).
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn tpm_seal_blob_to_bytes(pin: Option<&[u8]>) -> Result<(zeroize::Zeroizing<[u8; 32]>, Vec<u8>)> {
     use luksbox_tpm::Tpm2Sealer;
     let mut sealer = Tpm2Sealer::new()?;
@@ -1186,13 +1186,13 @@ fn open_deniable_by_kind(
         DenCredKind::Fido2 => DeniableKindTag::Fido2Passphrase,
         DenCredKind::HybridPqPassphrase => DeniableKindTag::HybridPqPassphrase,
         DenCredKind::HybridPqFido2 => DeniableKindTag::HybridPqFido2Passphrase,
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         DenCredKind::Tpm2 => DeniableKindTag::TpmPassphrase,
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         DenCredKind::Tpm2Fido2 => DeniableKindTag::TpmFido2Passphrase,
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         DenCredKind::HybridPqTpm2 => DeniableKindTag::HybridPqTpmPassphrase,
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         DenCredKind::HybridPqTpmFido2 => DeniableKindTag::HybridPqTpmFido2Passphrase,
         #[cfg(all(feature = "hardware", target_os = "macos"))]
         DenCredKind::Sep => DeniableKindTag::SepPassphrase,
@@ -1252,7 +1252,7 @@ fn open_deniable_by_kind(
             )?)
         }
         DenCredKind::Fido2 => {
-            #[cfg(feature = "hardware")]
+            #[cfg(feature = "fido2-hardware")]
             {
                 let salt = salt_opt
                     .ok_or_else(|| "envelope missing hmac_salt for FIDO2 variant".to_string())?;
@@ -1282,7 +1282,7 @@ fn open_deniable_by_kind(
                     Err((_, e)) => Err(e.into()),
                 }
             }
-            #[cfg(not(feature = "hardware"))]
+            #[cfg(not(feature = "fido2-hardware"))]
             Err("FIDO2 hardware support not compiled in".into())
         }
         DenCredKind::HybridPqPassphrase => {
@@ -1297,7 +1297,7 @@ fn open_deniable_by_kind(
             )?)
         }
         DenCredKind::HybridPqFido2 => {
-            #[cfg(feature = "hardware")]
+            #[cfg(feature = "fido2-hardware")]
             {
                 let shared = ask_pq_decap_for_deniable(theme, vault, &pass, matched_slot_idx)?;
                 let salt = salt_opt
@@ -1330,10 +1330,10 @@ fn open_deniable_by_kind(
                     Err((_, e)) => Err(e.into()),
                 }
             }
-            #[cfg(not(feature = "hardware"))]
+            #[cfg(not(feature = "fido2-hardware"))]
             Err("FIDO2 hardware support not compiled in".into())
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         DenCredKind::Tpm2 => {
             let unsealed = wizard_tpm_unseal_from_bytes(&tpm_blob, None)?;
             let cred = DeniableCredential::TpmPassphrase {
@@ -1345,7 +1345,7 @@ fn open_deniable_by_kind(
                 envelope, &cred,
             )?)
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         DenCredKind::Tpm2Fido2 => {
             let unsealed = wizard_tpm_unseal_from_bytes(&tpm_blob, None)?;
             let salt = salt_opt
@@ -1376,7 +1376,7 @@ fn open_deniable_by_kind(
                 Err((_, e)) => Err(e.into()),
             }
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         DenCredKind::HybridPqTpm2 => {
             let shared = ask_pq_decap_for_deniable(theme, vault, &pass, matched_slot_idx)?;
             let unsealed = wizard_tpm_unseal_from_bytes(&tpm_blob, None)?;
@@ -1390,7 +1390,7 @@ fn open_deniable_by_kind(
                 envelope, &cred,
             )?)
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         DenCredKind::HybridPqTpmFido2 => {
             let shared = ask_pq_decap_for_deniable(theme, vault, &pass, matched_slot_idx)?;
             let unsealed = wizard_tpm_unseal_from_bytes(&tpm_blob, None)?;
@@ -1531,7 +1531,7 @@ fn open_deniable_by_kind(
 /// `Container::complete_open_v2_deniable_reusable`. The PIN is
 /// prompted once by the caller so the fallback costs only a second
 /// touch.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn wizard_fido2_hmac_from_payload(
     cred_id: &[u8],
     salt: &[u8; 32],
@@ -1549,7 +1549,7 @@ fn wizard_fido2_hmac_from_payload(
 
 /// Prompt the FIDO2 PIN once for a deniable unlock (shared between
 /// the first probe attempt and the raw-salt fallback).
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn wizard_prompt_fido2_pin(theme: &ColorfulTheme) -> Result<zeroize::Zeroizing<String>> {
     Ok(zeroize::Zeroizing::new(
         Password::with_theme(theme)
@@ -1559,7 +1559,7 @@ fn wizard_prompt_fido2_pin(theme: &ColorfulTheme) -> Result<zeroize::Zeroizing<S
 }
 
 /// User-facing notice for the second probe attempt.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn wizard_deniable_raw_salt_retry_notice() {
     eprintln!(
         "Unlock failed under the v0.3.0 salt convention; retrying \
@@ -1570,7 +1570,7 @@ fn wizard_deniable_raw_salt_retry_notice() {
 
 /// v2 wizard helper: unseal the TPM blob recovered from the slot
 /// envelope (no longer asks the user for a sidecar path).
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn wizard_tpm_unseal_from_bytes(blob_bytes: &[u8], pin: Option<&[u8]>) -> Result<[u8; 32]> {
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
     if blob_bytes.is_empty() {
@@ -2352,8 +2352,8 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
         ),
     }
 
-    // TPM-bound kinds only on Linux. Windows TPM is on the roadmap;
-    // macOS uses Secure Enclave instead. On those platforms the menu
+    // TPM-bound kinds on Linux + Windows (via TBS). macOS uses Secure
+    // Enclave instead. On platforms without a TPM backend the menu
     // hides them rather than offering options that would just error.
     let mut items: Vec<&'static str> = vec![
         "Passphrase (most familiar; can add an authenticator backup later)",
@@ -2364,7 +2364,7 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
         "Hybrid passphrase + ML-KEM-1024 (NIST Category 5, AES-256-equivalent PQ strength; .kyber seed file)",
         "Hybrid FIDO2 + ML-KEM-1024 (NIST Category 5, AES-256-equivalent PQ strength; authenticator + .kyber seed)",
     ];
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         items.extend_from_slice(&[
             "TPM 2.0 (this machine; bootstrap passphrase kept as backup)",
@@ -2381,7 +2381,7 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
         // The fused "SEP + FIDO2 + passphrase" rows (logical indices
         // 13, 18, 19) are intentionally omitted: a slot takes FIDO2 OR
         // a passphrase as the extra factor, never both (the second is
-        // redundant), matching the GUI and the Linux TPM set. The
+        // redundant), matching the GUI and the Linux/Windows TPM set. The
         // display->logical remap right after the Select keeps the
         // dispatch `match kind_choice` numbering stable so its arms
         // never had to be renumbered.
@@ -2420,8 +2420,8 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
     // FIDO2-direct + all four hybrid kinds + all TPM / SEP kinds skip
     // pad/hide-sizes prompts (they have their own follow-on prompts
     // and the size-hardening flags don't apply to keyslot wrapping).
-    // On macOS the SEP block runs to index 19; on Linux the TPM block
-    // ends at 13.
+    // On macOS the SEP block runs to index 19; on Linux/Windows the
+    // TPM block ends at 13.
     let opts = ask_create_options(theme, matches!(kind_choice, 2..=19))?;
 
     match kind_choice {
@@ -2460,7 +2460,7 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
             &opts,
             luksbox_pq::PqParams::Ml1024,
         )?,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         7 => create_with_tpm_bootstrap(
             theme,
             &pb,
@@ -2469,7 +2469,7 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
             &opts,
             TpmBootstrap::Plain,
         )?,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         8 => create_with_tpm_bootstrap(
             theme,
             &pb,
@@ -2478,7 +2478,7 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
             &opts,
             TpmBootstrap::Pin,
         )?,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         9 => create_with_tpm_bootstrap(
             theme,
             &pb,
@@ -2487,7 +2487,7 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
             &opts,
             TpmBootstrap::Fido2,
         )?,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         10 => create_with_tpm_bootstrap(
             theme,
             &pb,
@@ -2496,7 +2496,7 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
             &opts,
             TpmBootstrap::HybridPq(luksbox_pq::PqParams::Ml768),
         )?,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         11 => create_with_tpm_bootstrap(
             theme,
             &pb,
@@ -2505,7 +2505,7 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
             &opts,
             TpmBootstrap::HybridPq(luksbox_pq::PqParams::Ml1024),
         )?,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         12 => create_with_tpm_bootstrap(
             theme,
             &pb,
@@ -2514,7 +2514,7 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
             &opts,
             TpmBootstrap::HybridPqFido2(luksbox_pq::PqParams::Ml768),
         )?,
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         13 => create_with_tpm_bootstrap(
             theme,
             &pb,
@@ -2663,7 +2663,7 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
 /// flows to fail fast before the user has typed PINs / passphrases
 /// that would then bounce off a NoDevices error from inside the
 /// authenticator call several seconds later.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn fido2_preflight() -> Result<()> {
     let devs = luksbox_fido2::HidAuthenticator::detect_all().unwrap_or_default();
     if devs.is_empty() {
@@ -2678,7 +2678,7 @@ fn fido2_preflight() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn fido2_preflight() -> Result<()> {
     Err("FIDO2 hardware support not compiled in".into())
 }
@@ -2734,7 +2734,7 @@ fn create_with_sep_bootstrap(
     // Pre-flight: try to open the Secure Enclave BEFORE creating the
     // vault file, so a no-SEP failure surfaces without leaving a
     // half-built vault on disk.
-    #[cfg(feature = "hardware")]
+    #[cfg(feature = "fido2-hardware")]
     {
         let probe = luksbox_sep::SepSealer::new();
         if let Err(e) = probe {
@@ -2863,9 +2863,9 @@ fn create_with_tpm_bootstrap(
     }
 
     // Pre-flight: try to open a TPM context BEFORE we create the
-    // vault file, so the common "no /dev/tpm0 access" failure mode
+    // vault file, so the common "TPM not reachable" failure mode
     // surfaces cleanly without leaving a half-built vault on disk.
-    #[cfg(feature = "hardware")]
+    #[cfg(feature = "fido2-hardware")]
     {
         let probe = luksbox_tpm::Tpm2Sealer::new();
         if let Err(e) = probe {
@@ -3017,7 +3017,7 @@ fn create_with_tpm_bootstrap(
 /// (single-slot) path for the 3-factor combos. The lost-vault-
 /// if-factor-lost trade-off is accepted by the user via the
 /// confirm prompt in `create_with_tpm_bootstrap`.
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn create_single_slot_tpm_vault(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -3315,7 +3315,7 @@ fn create_single_slot_tpm_vault(
     maybe_mount_now(theme, cont, vault)
 }
 
-#[cfg(not(all(feature = "hardware", target_os = "linux")))]
+#[cfg(not(all(feature = "hardware", any(target_os = "linux", target_os = "windows"))))]
 fn create_single_slot_tpm_vault(
     _theme: &ColorfulTheme,
     _vault: &Path,
@@ -3324,7 +3324,7 @@ fn create_single_slot_tpm_vault(
     _opts: &CreateOptions,
     _kind: TpmBootstrap,
 ) -> Result<()> {
-    Err("TPM 2.0 is Linux-only today; Windows TPM is tracked as a follow-up".into())
+    Err("TPM 2.0 support is not compiled into this build (rebuild with --features hardware, or --features bundled-tpm on Windows; macOS has no TPM - use Secure Enclave keyslots)".into())
 }
 
 fn create_passphrase(
@@ -3365,12 +3365,12 @@ fn create_fido2_wrap(
     cipher: CipherSuite,
     opts: &CreateOptions,
 ) -> Result<()> {
-    #[cfg(not(feature = "hardware"))]
+    #[cfg(not(feature = "fido2-hardware"))]
     {
         let _ = (theme, vault, header, cipher, opts);
         return Err("FIDO2 hardware support not compiled in".into());
     }
-    #[cfg(feature = "hardware")]
+    #[cfg(feature = "fido2-hardware")]
     {
         use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
         use rand_core::{OsRng, RngCore};
@@ -3428,12 +3428,12 @@ fn create_fido2_direct(
     cipher: CipherSuite,
     opts: &CreateOptions,
 ) -> Result<()> {
-    #[cfg(not(feature = "hardware"))]
+    #[cfg(not(feature = "fido2-hardware"))]
     {
         let _ = (theme, vault, header, cipher, opts);
         return Err("FIDO2 hardware support not compiled in".into());
     }
-    #[cfg(feature = "hardware")]
+    #[cfg(feature = "fido2-hardware")]
     {
         use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
         use rand_core::{OsRng, RngCore};
@@ -3604,7 +3604,7 @@ fn create_hybrid_pq(
     maybe_mount_now(theme, cont, vault)
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn create_hybrid_pq_fido2(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -3734,7 +3734,7 @@ fn create_hybrid_pq_fido2(
     maybe_mount_now(theme, cont, vault)
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn create_hybrid_pq_fido2(
     _theme: &ColorfulTheme,
     _vault: &Path,
@@ -3871,10 +3871,11 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
     if has_hybrid_pq_fido2 {
         options.push("Hybrid FIDO2 + ML-KEM (post-quantum)");
     }
-    // TPM unlock options only on Linux. The slot-detection vars above
-    // stay live so the variable-binding compiles on all platforms; on
-    // non-Linux the user just doesn't see the unreachable choices.
-    #[cfg(target_os = "linux")]
+    // TPM unlock options only on Linux + Windows. The slot-detection
+    // vars above stay live so the variable-binding compiles on all
+    // platforms; elsewhere the user just doesn't see the unreachable
+    // choices.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         if has_tpm2 {
             options.push("TPM 2.0 (this machine)");
@@ -3914,7 +3915,7 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
         has_hybrid_pq_sep,
         has_hybrid_pq_sep_fido2,
     );
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     let _ = (
         has_tpm2,
         has_tpm2_fido2,
@@ -4648,7 +4649,7 @@ fn rotate_mvk_deniable_action(theme: &ColorfulTheme, cont: Container) -> Result<
     Ok(cont)
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn collect_fido2_credential_for_rotate(
     theme: &ColorfulTheme,
     cont: &Container,
@@ -4696,7 +4697,7 @@ fn collect_fido2_credential_for_rotate(
     })
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn collect_fido2_credential_for_rotate(
     _theme: &ColorfulTheme,
     _cont: &Container,
@@ -4843,7 +4844,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
         }
         println!();
 
-        // TPM-bound add options only on Linux. The four pure-PQ
+        // TPM-bound add options only on Linux + Windows. The four pure-PQ
         // (passphrase|FIDO2) + ML-KEM-768|1024 options are
         // available on every platform: they need no TPM and the
         // FIDO2 ones go through whichever CTAP2 stack the build
@@ -4859,7 +4860,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             "Add a FIDO2 + ML-KEM-768 keyslot",
             "Add a FIDO2 + ML-KEM-1024 keyslot",
         ];
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
             menu.extend_from_slice(&[
                 "Add a TPM 2.0 keyslot (this machine, no PIN)",
@@ -4904,18 +4905,18 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
 
         // Action-number mapping. Menu choices 0..=5 are always the
         // six "no TPM needed" rows (passphrase, FIDO2, and the four
-        // pure-PQ variants). On Linux choices 6..=12 are the TPM
-        // combos and choices 13..=15 are update/revoke/back. On
-        // non-Linux the TPM block is absent so update/revoke/back
+        // pure-PQ variants). On Linux/Windows choices 6..=12 are the
+        // TPM combos and choices 13..=15 are update/revoke/back. On
+        // TPM-less platforms the block is absent so update/revoke/back
         // come right after the PQ rows (choices 6..=8). Remap to
         // stable action numbers:
         //   0..=1  -> Passphrase / FIDO2
         //   2..=5  -> pure-PQ (passphrase|FIDO2 x 768|1024)
-        //   6..=12 -> TPM combos (linux only)
+        //   6..=12 -> TPM combos (Linux + Windows)
         //   13     -> update
         //   14     -> revoke
         //   15     -> back
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
         let action = match choice {
             0..=12 => choice,
             13..=15 => choice,
@@ -4949,7 +4950,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             18 => 15, // back
             _ => unreachable!(),
         };
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
         let action = match choice {
             0..=5 => choice,
             6 => 13,
@@ -5059,7 +5060,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     enroll_hybrid_pq_fido2_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml1024)
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             6 => {
                 if cont.is_deniable() {
                     enroll_tpm2_deniable_into(theme, &mut cont)
@@ -5067,7 +5068,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     enroll_tpm2_into(theme, &mut cont)
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             7 => {
                 if cont.is_deniable() {
                     // The deniable slot envelope has no separate "TPM
@@ -5085,7 +5086,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     enroll_tpm2_pin_into(theme, &mut cont)
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             8 => {
                 if cont.is_deniable() {
                     enroll_tpm2_fido2_deniable_into(theme, &mut cont)
@@ -5093,7 +5094,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     enroll_tpm2_fido2_into(theme, &mut cont)
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             9 => {
                 let vp = cont.vault_path().to_path_buf();
                 if cont.is_deniable() {
@@ -5107,7 +5108,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     enroll_hybrid_pq_tpm2_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml768)
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             10 => {
                 let vp = cont.vault_path().to_path_buf();
                 if cont.is_deniable() {
@@ -5121,7 +5122,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     enroll_hybrid_pq_tpm2_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml1024)
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             11 => {
                 let vp = cont.vault_path().to_path_buf();
                 if cont.is_deniable() {
@@ -5140,7 +5141,7 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                     )
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             12 => {
                 let vp = cont.vault_path().to_path_buf();
                 if cont.is_deniable() {
@@ -5374,7 +5375,7 @@ fn update_keyslot_action(theme: &ColorfulTheme, cont: &mut Container) -> Result<
     Ok(())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn update_fido2_in(theme: &ColorfulTheme, c: &mut Container, slot_idx: usize) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
     use rand_core::{OsRng, RngCore};
@@ -5412,14 +5413,14 @@ fn update_fido2_in(theme: &ColorfulTheme, c: &mut Container, slot_idx: usize) ->
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn update_fido2_in(_theme: &ColorfulTheme, _c: &mut Container, _slot_idx: usize) -> Result<()> {
     Err("FIDO2 hardware support not compiled in".into())
 }
 
 // ---- FIDO2 helpers ---------------------------------------------------------
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn enroll_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
     use rand_core::{OsRng, RngCore};
@@ -5458,7 +5459,7 @@ fn enroll_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn enroll_fido2_into(_theme: &ColorfulTheme, _c: &mut Container) -> Result<()> {
     Err("FIDO2 hardware support not compiled in".into())
 }
@@ -5487,7 +5488,7 @@ fn enroll_fido2_into(_theme: &ColorfulTheme, _c: &mut Container) -> Result<()> {
 // so the wizard works on a vault opened earlier in the same session
 // (where the create-time params aren't otherwise around to inherit).
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn enroll_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
     use luksbox_format::deniable_header::DeniableMaterial;
@@ -5528,12 +5529,12 @@ fn enroll_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Resul
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn enroll_fido2_deniable_into(_theme: &ColorfulTheme, _c: &mut Container) -> Result<()> {
     Err("FIDO2 hardware support not compiled in".into())
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn enroll_tpm2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     use luksbox_format::deniable_header::DeniableMaterial;
 
@@ -5576,12 +5577,12 @@ fn enroll_tpm2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Result
     Ok(())
 }
 
-#[cfg(not(all(feature = "hardware", target_os = "linux")))]
+#[cfg(not(all(feature = "hardware", any(target_os = "linux", target_os = "windows"))))]
 fn enroll_tpm2_deniable_into(_theme: &ColorfulTheme, _c: &mut Container) -> Result<()> {
-    Err("TPM is Linux-only today; Windows TPM is tracked as a follow-up".into())
+    Err("TPM 2.0 support is not compiled into this build (rebuild with --features hardware, or --features bundled-tpm on Windows; macOS has no TPM - use Secure Enclave keyslots)".into())
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn enroll_tpm2_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
     use luksbox_format::deniable_header::DeniableMaterial;
@@ -5628,12 +5629,12 @@ fn enroll_tpm2_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> 
     Ok(())
 }
 
-#[cfg(not(all(feature = "hardware", target_os = "linux")))]
+#[cfg(not(all(feature = "hardware", any(target_os = "linux", target_os = "windows"))))]
 fn enroll_tpm2_fido2_deniable_into(_theme: &ColorfulTheme, _c: &mut Container) -> Result<()> {
-    Err("TPM is Linux-only today; Windows TPM is tracked as a follow-up".into())
+    Err("TPM 2.0 support is not compiled into this build (rebuild with --features hardware, or --features bundled-tpm on Windows; macOS has no TPM - use Secure Enclave keyslots)".into())
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn enroll_hybrid_pq_tpm2_deniable_into(
     theme: &ColorfulTheme,
     c: &mut Container,
@@ -5717,17 +5718,17 @@ fn enroll_hybrid_pq_tpm2_deniable_into(
     Ok(())
 }
 
-#[cfg(not(all(feature = "hardware", target_os = "linux")))]
+#[cfg(not(all(feature = "hardware", any(target_os = "linux", target_os = "windows"))))]
 fn enroll_hybrid_pq_tpm2_deniable_into(
     _theme: &ColorfulTheme,
     _c: &mut Container,
     _vault_path: &Path,
     _params: luksbox_pq::PqParams,
 ) -> Result<()> {
-    Err("TPM is Linux-only today; Windows TPM is tracked as a follow-up".into())
+    Err("TPM 2.0 support is not compiled into this build (rebuild with --features hardware, or --features bundled-tpm on Windows; macOS has no TPM - use Secure Enclave keyslots)".into())
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn enroll_hybrid_pq_tpm2_fido2_deniable_into(
     theme: &ColorfulTheme,
     c: &mut Container,
@@ -5830,17 +5831,17 @@ fn enroll_hybrid_pq_tpm2_fido2_deniable_into(
     Ok(())
 }
 
-#[cfg(not(all(feature = "hardware", target_os = "linux")))]
+#[cfg(not(all(feature = "hardware", any(target_os = "linux", target_os = "windows"))))]
 fn enroll_hybrid_pq_tpm2_fido2_deniable_into(
     _theme: &ColorfulTheme,
     _c: &mut Container,
     _vault_path: &Path,
     _params: luksbox_pq::PqParams,
 ) -> Result<()> {
-    Err("TPM is Linux-only today; Windows TPM is tracked as a follow-up".into())
+    Err("TPM 2.0 support is not compiled into this build (rebuild with --features hardware, or --features bundled-tpm on Windows; macOS has no TPM - use Secure Enclave keyslots)".into())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn unlock_via_fido2(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -5905,7 +5906,7 @@ fn unlock_via_fido2(
     Err(last_err.unwrap_or_else(|| "FIDO2 unlock failed".into()))
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn unlock_via_fido2(
     _theme: &ColorfulTheme,
     _vault: &Path,
@@ -5974,7 +5975,7 @@ fn unlock_via_hybrid_pq(
         .into())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn unlock_via_hybrid_pq_fido2(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -6064,7 +6065,7 @@ fn unlock_via_hybrid_pq_fido2(
         .into())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn unlock_via_hybrid_pq_fido2(
     _theme: &ColorfulTheme,
     _vault: &Path,
@@ -6116,7 +6117,7 @@ fn ask_new_tpm_pin(theme: &ColorfulTheme) -> Result<zeroize::Zeroizing<String>> 
     }
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn enroll_tpm2_into(_theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     use luksbox_tpm::Tpm2Sealer;
     use rand_core::{OsRng, RngCore};
@@ -6147,7 +6148,7 @@ fn enroll_tpm2_into(_theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn enroll_tpm2_into(_theme: &ColorfulTheme, _c: &mut Container) -> Result<()> {
     Err(
         "TPM 2.0 support not compiled in (rebuild with --features hardware; \
@@ -6159,7 +6160,7 @@ fn enroll_tpm2_into(_theme: &ColorfulTheme, _c: &mut Container) -> Result<()> {
 /// Enroll a macOS Secure Enclave keyslot into an already-open
 /// container. Mirrors `enroll_tpm2_into`; `biometric` gates the slot
 /// behind a Touch ID / user-presence check at every unlock.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 // Call sites are macOS-gated wizard menu arms; dead on other targets
 // but kept compiling there for type-check coverage.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -6205,7 +6206,7 @@ fn enroll_sep_into(_theme: &ColorfulTheme, c: &mut Container, biometric: bool) -
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 // Call sites are macOS-gated wizard menu arms; dead on other targets
 // but kept compiling there for type-check coverage.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -6221,7 +6222,7 @@ fn enroll_sep_into(_theme: &ColorfulTheme, _c: &mut Container, _biometric: bool)
 /// already-open container. Mirrors `enroll_hybrid_pq_tpm2_into`: the
 /// SEP supplies the classical half, ML-KEM the post-quantum half;
 /// writes the .lbx.hybrid sidecar entry + the Kyber seed file.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 // Call sites are macOS-gated wizard menu arms; dead on other targets
 // but kept compiling there for type-check coverage.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -6307,7 +6308,7 @@ fn enroll_hybrid_pq_sep_into(
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 // Call sites are macOS-gated wizard menu arms; dead on other targets
 // but kept compiling there for type-check coverage.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -6327,7 +6328,7 @@ fn enroll_hybrid_pq_sep_into(
 /// biometric), and `factors` + optional `params` decide which extra
 /// secrets are collected. For hybrid kinds the `.lbx.hybrid` sidecar
 /// entry + the (passphrase-encrypted) `.kyber` seed are written.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 // Call sites are macOS-gated wizard menu arms; dead on other targets
 // but kept compiling there for type-check coverage.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -6468,7 +6469,7 @@ fn enroll_sep_fused_into(
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 // Call sites are macOS-gated wizard menu arms; dead on other targets
 // but kept compiling there for type-check coverage.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -6482,7 +6483,7 @@ fn enroll_sep_fused_into(
     Err("fused Secure Enclave enroll requires --features hardware".into())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn enroll_tpm2_pin_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     use luksbox_tpm::Tpm2Sealer;
     use rand_core::{OsRng, RngCore};
@@ -6507,12 +6508,12 @@ fn enroll_tpm2_pin_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> 
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn enroll_tpm2_pin_into(_theme: &ColorfulTheme, _c: &mut Container) -> Result<()> {
     Err("TPM 2.0 + PIN support not compiled in".into())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn enroll_tpm2_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
     use luksbox_tpm::Tpm2Sealer;
@@ -6567,7 +6568,7 @@ fn enroll_tpm2_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn enroll_tpm2_fido2_into(_theme: &ColorfulTheme, _c: &mut Container) -> Result<()> {
     Err("TPM 2.0 + FIDO2 fused enroll requires --features hardware".into())
 }
@@ -6576,7 +6577,7 @@ fn enroll_tpm2_fido2_into(_theme: &ColorfulTheme, _c: &mut Container) -> Result<
 /// container. Generates a fresh Kyber keypair, seals a TPM half, and
 /// appends a sidecar entry. Writes the Kyber seed to a user-chosen
 /// passphrase-protected file.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn enroll_hybrid_pq_tpm2_into(
     theme: &ColorfulTheme,
     c: &mut Container,
@@ -6660,7 +6661,7 @@ fn enroll_hybrid_pq_tpm2_into(
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn enroll_hybrid_pq_tpm2_into(
     _theme: &ColorfulTheme,
     _c: &mut Container,
@@ -6670,7 +6671,7 @@ fn enroll_hybrid_pq_tpm2_into(
     Err("hybrid-pq-tpm2 enroll requires --features hardware".into())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn enroll_hybrid_pq_tpm2_fido2_into(
     theme: &ColorfulTheme,
     c: &mut Container,
@@ -6790,7 +6791,7 @@ fn enroll_hybrid_pq_tpm2_fido2_into(
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn enroll_hybrid_pq_tpm2_fido2_into(
     _theme: &ColorfulTheme,
     _c: &mut Container,
@@ -6972,7 +6973,7 @@ fn enroll_hybrid_pq_passphrase_deniable_into(
     Ok(())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn enroll_hybrid_pq_fido2_into(
     theme: &ColorfulTheme,
     c: &mut Container,
@@ -7097,7 +7098,7 @@ fn enroll_hybrid_pq_fido2_into(
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn enroll_hybrid_pq_fido2_into(
     _theme: &ColorfulTheme,
     _c: &mut Container,
@@ -7107,7 +7108,7 @@ fn enroll_hybrid_pq_fido2_into(
     Err("hybrid-pq-fido2 enroll requires --features hardware".into())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn enroll_hybrid_pq_fido2_deniable_into(
     theme: &ColorfulTheme,
     c: &mut Container,
@@ -7216,7 +7217,7 @@ fn enroll_hybrid_pq_fido2_deniable_into(
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn enroll_hybrid_pq_fido2_deniable_into(
     _theme: &ColorfulTheme,
     _c: &mut Container,
@@ -7228,7 +7229,7 @@ fn enroll_hybrid_pq_fido2_deniable_into(
 
 // ---- TPM 2.0 unlock helpers ------------------------------------------------
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn unlock_via_tpm2(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -7278,7 +7279,7 @@ fn unlock_via_tpm2(
     .map_err(Into::into)
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn unlock_via_tpm2(
     _theme: &ColorfulTheme,
     _vault: &Path,
@@ -7294,7 +7295,7 @@ fn unlock_via_tpm2(
 /// matching extra factors, and hands `Container::open` an
 /// `UnlockMaterial::Sep` whose factor set the core dispatcher uses to
 /// pick the right slot. The wizard analog of `crate::open_sep_common`.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn unlock_via_sep_common(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -7429,7 +7430,7 @@ fn unlock_via_sep_common(
 
 /// Derive the FIDO2 hmac-secret half for a SEP+FIDO2 slot in the
 /// wizard, from the slot's stored cred_id + hmac_salt.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn wizard_sep_fido2_hmac(
     slot: &luksbox_core::Keyslot,
     pin: &str,
@@ -7450,7 +7451,7 @@ fn wizard_sep_fido2_hmac(
     Err("FIDO2 hmac-secret derivation failed".into())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn unlock_via_sep(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -7460,7 +7461,7 @@ fn unlock_via_sep(
     unlock_via_sep_common(theme, vault, header_path, header, false, false)
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn unlock_via_sep_fido2(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -7470,7 +7471,7 @@ fn unlock_via_sep_fido2(
     unlock_via_sep_common(theme, vault, header_path, header, true, false)
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn unlock_via_hybrid_pq_sep(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -7480,7 +7481,7 @@ fn unlock_via_hybrid_pq_sep(
     unlock_via_sep_common(theme, vault, header_path, header, false, true)
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn unlock_via_hybrid_pq_sep_fido2(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -7490,7 +7491,7 @@ fn unlock_via_hybrid_pq_sep_fido2(
     unlock_via_sep_common(theme, vault, header_path, header, true, true)
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn unlock_via_sep(
     _theme: &ColorfulTheme,
     _vault: &Path,
@@ -7500,7 +7501,7 @@ fn unlock_via_sep(
     Err("Secure Enclave support not compiled in".into())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn unlock_via_sep_fido2(
     _theme: &ColorfulTheme,
     _vault: &Path,
@@ -7510,7 +7511,7 @@ fn unlock_via_sep_fido2(
     Err("Secure Enclave support not compiled in".into())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn unlock_via_hybrid_pq_sep(
     _theme: &ColorfulTheme,
     _vault: &Path,
@@ -7520,7 +7521,7 @@ fn unlock_via_hybrid_pq_sep(
     Err("hybrid-pq-sep unlock requires --features hardware".into())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn unlock_via_hybrid_pq_sep_fido2(
     _theme: &ColorfulTheme,
     _vault: &Path,
@@ -7530,7 +7531,7 @@ fn unlock_via_hybrid_pq_sep_fido2(
     Err("hybrid-pq-sep unlock requires --features hardware".into())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn unlock_via_tpm2_fido2(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -7604,7 +7605,7 @@ fn unlock_via_tpm2_fido2(
         .into())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn unlock_via_tpm2_fido2(
     _theme: &ColorfulTheme,
     _vault: &Path,
@@ -7614,7 +7615,7 @@ fn unlock_via_tpm2_fido2(
     Err("TPM 2.0 + FIDO2 unlock requires --features hardware".into())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn unlock_via_hybrid_pq_tpm2(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -7692,7 +7693,7 @@ fn unlock_via_hybrid_pq_tpm2(
         .into())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn unlock_via_hybrid_pq_tpm2(
     _theme: &ColorfulTheme,
     _vault: &Path,
@@ -7702,7 +7703,7 @@ fn unlock_via_hybrid_pq_tpm2(
     Err("hybrid-pq-tpm2 unlock requires --features hardware".into())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn unlock_via_hybrid_pq_tpm2_fido2(
     theme: &ColorfulTheme,
     vault: &Path,
@@ -7810,7 +7811,7 @@ fn unlock_via_hybrid_pq_tpm2_fido2(
         .into())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn unlock_via_hybrid_pq_tpm2_fido2(
     _theme: &ColorfulTheme,
     _vault: &Path,

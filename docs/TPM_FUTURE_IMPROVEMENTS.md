@@ -1,12 +1,16 @@
 # TPM 2.0 future-improvements roadmap
 
-Status: as of 2026-05-05.
+Status: as of 2026-07-04.
 
-Linux TPM 2.0 wrapping (`SlotKind::Tpm2Sealed`, `Tpm2SealedPin`,
-`Tpm2Fido2`, `HybridPqKemTpm2`, `HybridPqKemTpm2Fido2`,
-`HybridPqKem1024Tpm2`, `HybridPqKem1024Tpm2Fido2`) is shipped and
-covered by the swtpm-emulator integration suite plus a real-hardware
-CI matrix entry.
+Linux **and Windows** TPM 2.0 wrapping (`SlotKind::Tpm2Sealed`,
+`Tpm2SealedPin`, `Tpm2Fido2`, `HybridPqKemTpm2`,
+`HybridPqKemTpm2Fido2`, `HybridPqKem1024Tpm2`,
+`HybridPqKem1024Tpm2Fido2`) is shipped. Linux is covered by the
+swtpm-emulator integration suite plus a real-hardware CI matrix
+entry; Windows by the `windows-tpm` CI job (build + mock/wire tests;
+hosted runners expose no TPM) plus a manual live seal/unseal smoke
+on real hardware (`cargo run -p luksbox-tpm --features bundled-tpm
+--example tpm_smoke`).
 
 This file tracks what's NEXT for hardware-bound key isolation. It
 exists so a future contributor can pick up any one item with the
@@ -15,6 +19,56 @@ design constraints already written down.
 ---
 
 ## 1. Windows TPM 2.0 (highest-priority follow-up)
+
+> **SHIPPED 2026-07-04** via Path A (tss-esapi 8.0.0-alpha.2 +
+> `TctiNameConf::Tbs`). Every TPM slot kind now works on Windows with
+> the same on-disk wire bytes as Linux. Implementation notes that
+> differ from the plan below, recorded for the next person:
+>
+> - **tss-esapi-sys must be force-pinned to `=0.6.0-alpha.2`.**
+>   tss-esapi 8.0.0-alpha.2 declares `tss-esapi-sys =
+>   "^0.6.0-alpha.2"`, and upstream later published a *stable*
+>   0.6.0 cut from the 7.x branch that satisfies that range while
+>   lacking Windows support and the `bundled` feature. Without the
+>   direct pin in luksbox-tpm's Cargo.toml, cargo resolves -sys to
+>   0.6.0 stable and the Windows build panics with "Compilation
+>   target tuple is not part of the supported tuples".
+> - **Windows always needs `generate-bindings`** (there are no
+>   pregenerated Windows bindings in the -sys crate, contrary to
+>   what its docs.rs page suggests), so the Windows flavour of the
+>   dep enables it target-specifically and the build needs libclang
+>   (`LIBCLANG_PATH`; VS 2022's own
+>   `VC\Tools\Llvm\x64\bin\libclang.dll` works, as does an LLVM
+>   install).
+> - **The API delta vs 7.7 was slightly bigger than "one import
+>   rename"**: `resource_handles` -> `reserved_handles` as
+>   predicted, plus buffer types (`Private`, `SensitiveData`)
+>   dropped `.value()` for `.as_bytes()`, and `Auth` lost
+>   `TryFrom<&[u8]>` in favour of `Auth::from_bytes()`. Bonus: 8.0
+>   buffers store `Zeroizing<Vec<u8>>`, so the Rust-side PIN/secret
+>   copies are now wiped on drop (7.x only did this for some types).
+> - **The bundled MSBuild build has two sharp edges**: (a) tpm2-tss's
+>   VS solution hardcodes OpenSSL at `C:\OpenSSL-v11-Win64` in
+>   `src\tss2-esys\openssl.props` - the CI steps patch that file to a
+>   real OpenSSL install (runner-preinstalled or the portable
+>   FireDaemon zip); (b) deep source paths make MSBuild's file
+>   tracker throw path-too-long as an inscrutable `MSB6003`, so the
+>   source is staged at a short path via `TPM2_TSS_SOURCE_PATH`
+>   (which also avoids the build script's git-clone fallback).
+> - **Runtime DLL closure to ship**: tss2-esys, tss2-sys, tss2-mu,
+>   tss2-tctildr, tss2-tcti-tbs (dlopen()ed by tctildr - never in an
+>   import table, still required), libcrypto-3-x64. `tbs.dll` itself
+>   is in-box Windows. The portable .zip and the MSI both carry
+>   these plus the tpm2-tss (BSD-2-Clause) and OpenSSL (Apache-2.0)
+>   license texts.
+> - The feature reorg landed as planned, with one naming difference:
+>   the low-floor default feature is `fido2-hardware` (not
+>   `fido2-only`), `hardware` keeps meaning FIDO2 + TPM + SEP, and
+>   `bundled-tpm = hardware + vendored tpm2-tss`. Linux release
+>   lanes: trixie/resolute build `hardware` (system link),
+>   jammy/noble build `bundled-tpm`.
+>
+> The evaluation below is kept for historical context.
 
 Windows ships a TPM 2.0 on every machine since the Windows 11 launch
 floor (firmware TPMs via Intel PTT / AMD fTPM count). It's reachable
@@ -315,13 +369,18 @@ Estimated effort: ~2 hours.
   installs `libtss2-dev swtpm swtpm-tools libtss2-tcti-swtpm0`.
 
 ### Windows
-- Status: not implemented. See section 1 above.
-- Workaround for users: every other LUKSbox keyslot kind works on
-  Windows today (passphrase, FIDO2 wrap/direct, hybrid-PQ x4).
-  Windows Hello via webauthn.dll routes through the platform's
-  TPM-backed authenticator, so a `Fido2HmacSecret` slot enrolled
-  with `--fido2-device windows://hello` is implicitly TPM-anchored
-  even without the explicit `--tpm2` slot kind.
+- Status: **shipped** (2026-07-04). Backend: tss-esapi 8.0.0-alpha.2
+  via `TctiNameConf::Tbs` (TPM Base Services - in-box broker, no
+  admin, no driver, no signing). Build: `--features bundled-tpm`
+  (vendored tpm2-tss via MSBuild + bindgen); see the SHIPPED note in
+  section 1 and BUILDING.md for the exact toolchain requirements.
+- Slot bytes are TCG-standard TPM2B_* structures, byte-identical to
+  the Linux build's, so the same chip unseals a vault regardless of
+  which OS sealed it.
+- Windows Hello via webauthn.dll remains available in parallel: a
+  `Fido2HmacSecret` slot enrolled with `--fido2-device
+  windows://hello` is implicitly TPM-anchored through the platform
+  authenticator, independent of the explicit `--tpm2` slot kinds.
 
 ### macOS
 - Status: not implemented. See section 2 above.
@@ -335,15 +394,18 @@ Estimated effort: ~2 hours.
 
 Based on user impact and implementation cost:
 
-1. **Section 6** (CLI 1024 flags) -- 2 hours, useful for scripted
-   enrollment. Ship anytime.
-2. **Section 1 path A** (Windows TPM via tss-esapi 8.0) -- 1 day,
-   wait for 8.0 stable OR ship now with alpha-pin if there's user
-   demand.
-3. **Section 5** (recovery UX) -- 1 week, improves the safety story
+1. ~~**Section 1 path A** (Windows TPM via tss-esapi 8.0)~~ --
+   SHIPPED 2026-07-04 with the alpha-pin.
+2. **Section 5** (recovery UX) -- 1 week, improves the safety story
    for everyone.
-4. **Section 3** (PCR sealing, opt-in) -- 1 week, advanced users
-   only.
-5. **Section 2** (macOS Secure Enclave) -- 2 weeks, blocked on
-   Apple Developer enrollment.
-6. **Section 4** (attestation) -- 3 weeks, niche threat-model gain.
+3. **Section 3** (PCR sealing, opt-in) -- 1 week, advanced users
+   only. Now applies to Linux AND Windows.
+4. **Section 4** (attestation) -- 3 weeks, niche threat-model gain.
+5. **Follow-up**: swap the tss-esapi `=8.0.0-alpha.2` /
+   tss-esapi-sys `=0.6.0-alpha.2` pins for 8.0 stable when it
+   lands, and drop the -sys pin (see the SHIPPED note in section 1
+   for why the pin exists).
+
+(Section 6, the CLI 1024 flags, and Section 2, macOS Secure
+Enclave, shipped earlier; see `docs/SEP_KEYSLOT_DESIGN.md` for the
+latter.)

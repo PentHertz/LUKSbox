@@ -113,9 +113,10 @@ struct UnlockArgs {
     fido2: bool,
     /// Unlock via the local TPM 2.0 chip. Iterates the vault's
     /// `Tpm2Sealed` keyslots, asks the TPM to unseal each blob, and
-    /// the first one whose KEK unwraps the MVK wins. Linux-only at
-    /// runtime (TPM access via `/dev/tpmrm0` + `libtss2-esys`); on
-    /// other platforms the flag exists but errors cleanly.
+    /// the first one whose KEK unwraps the MVK wins. Works on Linux
+    /// (via `/dev/tpmrm0` + `libtss2-esys`) and Windows (via TPM
+    /// Base Services) in TPM-enabled builds; elsewhere the flag
+    /// exists but errors cleanly.
     #[arg(long)]
     tpm2: bool,
     /// Unlock via a fused TPM 2.0 + FIDO2 keyslot (both factors
@@ -241,9 +242,10 @@ enum SlotKindArg {
     /// vault becomes uncrackable if its file is stolen separately
     /// from this machine, but loses portability (won't unlock on
     /// any other Mac / PC). For portability + recovery, enroll a
-    /// Passphrase or FIDO2 slot alongside it. Linux-only at
-    /// runtime; requires `--features hardware` (default on) and
-    /// `libtss2-esys` at build time.
+    /// Passphrase or FIDO2 slot alongside it. Works on Linux and
+    /// Windows in TPM-enabled builds (`--features hardware`, or
+    /// `bundled-tpm` for a vendored tpm2-tss); errors cleanly
+    /// elsewhere.
     Tpm2,
     /// Fused TPM 2.0 + FIDO2 keyslot: unlock requires BOTH the
     /// local TPM (this machine) AND a connected FIDO2
@@ -1142,7 +1144,7 @@ pub(crate) fn empty_passphrase_warning(prompt: &str) -> &'static str {
     }
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 pub(crate) fn make_fido2_authenticator() -> luksbox_fido2::HidAuthenticator {
     let path = FIDO2_DEVICE_OVERRIDE.lock().ok().and_then(|g| g.clone());
     match path {
@@ -2218,7 +2220,7 @@ fn cmd_extract(
     Ok(())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cmd_list_fido2_devices() -> Result<()> {
     let devices = luksbox_fido2::HidAuthenticator::detect_all()
         .map_err(|e| format!("libfido2 enumeration failed: {e}"))?;
@@ -2275,7 +2277,7 @@ fn cmd_list_fido2_devices() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn cmd_list_fido2_devices() -> Result<()> {
     Err(
         "FIDO2 hardware support not compiled in (rebuild with `cargo build \
@@ -2515,7 +2517,7 @@ fn read_passphrase_confirmed(prompt: &str) -> io::Result<Zeroizing<String>> {
 }
 
 /// Read a FIDO2 PIN. Honors `LUKSBOX_FIDO2_PIN` for scripting/tests.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn read_fido2_pin() -> io::Result<Zeroizing<String>> {
     if let Ok(p) = std::env::var("LUKSBOX_FIDO2_PIN") {
         return Ok(Zeroizing::new(p));
@@ -2541,7 +2543,7 @@ fn read_fido2_pin() -> io::Result<Zeroizing<String>> {
 /// NOT rescue the case where `webauthn.dll` applies the W3C "WebAuthn
 /// PRF" prefix -- neither convention can reproduce a plain-SHA-256
 /// device salt then; that needs a format change, not a fallback.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn fido2_salt_conventions(declared_prehash: bool) -> Vec<bool> {
     #[cfg(target_os = "windows")]
     {
@@ -2727,7 +2729,7 @@ fn pick_unlock_suggestion(keyslots: &[luksbox_core::Keyslot]) -> &'static str {
 /// passphrase), then for each FIDO2-hybrid slot does an hmac-secret
 /// touch with that slot's cred_id + hmac_salt, decapsulates, and tries
 /// the unlock.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn open_container_hybrid_pq_fido2(
     path: &Path,
     header_path: Option<&Path>,
@@ -2817,7 +2819,7 @@ fn open_container_hybrid_pq_fido2(
         .into())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn open_container_hybrid_pq_fido2(
     _path: &Path,
     _header_path: Option<&Path>,
@@ -2927,7 +2929,7 @@ fn open_vfs(path: &Path, unlock: &UnlockArgs) -> Result<Vfs> {
     Ok(vfs)
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn open_container_fido2(path: &Path, header_path: Option<&Path>) -> Result<Container> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID};
 
@@ -3003,7 +3005,7 @@ fn open_container_fido2(path: &Path, header_path: Option<&Path>) -> Result<Conta
     Err(last_err.unwrap_or_else(|| "FIDO2 unlock failed".into()))
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn open_container_fido2(_path: &Path, _header_path: Option<&Path>) -> Result<Container> {
     Err("FIDO2 hardware support not compiled in (rebuild with --features hardware)".into())
 }
@@ -3013,14 +3015,14 @@ fn open_container_fido2(_path: &Path, _header_path: Option<&Path>) -> Result<Con
 /// passed into `UnlockMaterial::Tpm2` parses the slot's stored
 /// SealedBlob bytes via `luksbox_tpm::SealedBlob::from_bytes`,
 /// hands them to a single shared `Tpm2Sealer` (so we only open
-/// `/dev/tpmrm0` once per unlock attempt), and returns the
+/// the TPM once per unlock attempt), and returns the
 /// recovered KEK. First slot whose KEK successfully unwraps the
 /// MVK wins.
 ///
 /// `luksbox-format` itself iterates the slots and tolerates
 /// per-slot closure errors (so a vault enrolled on multiple
 /// machines works even when only one TPM responds).
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn open_container_tpm2(path: &Path, header_path: Option<&Path>) -> Result<Container> {
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
@@ -3114,7 +3116,7 @@ fn open_container_tpm2(path: &Path, header_path: Option<&Path>) -> Result<Contai
     .map_err(Into::into)
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn open_container_tpm2(_path: &Path, _header_path: Option<&Path>) -> Result<Container> {
     Err(
         "TPM 2.0 hardware support not compiled in (rebuild with --features hardware). \
@@ -3130,7 +3132,7 @@ fn open_container_tpm2(_path: &Path, _header_path: Option<&Path>) -> Result<Cont
 /// closure backed by `SepSealer`. The SEP itself prompts for Touch
 /// ID on biometric slots. The container reads each slot's SEP blob
 /// from the in-header SEP region and feeds it to the closure.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn open_container_sep(path: &Path, header_path: Option<&Path>, fido2: bool) -> Result<Container> {
     // Pre-scan the header to detect "no SEP slots" before we open the
     // Secure Enclave. This covers the NON-hybrid SEP kinds (plain,
@@ -3166,7 +3168,7 @@ fn open_container_sep(path: &Path, header_path: Option<&Path>, fido2: bool) -> R
 /// `UnlockMaterial::Sep` whose factor set matches the slot so the
 /// format dispatcher selects it. `pq_shared_for` supplies the ML-KEM
 /// shared secret per slot index for hybrid kinds (None = no PQ).
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn open_sep_common(
     path: &Path,
     header_path: Option<&Path>,
@@ -3306,7 +3308,7 @@ fn open_sep_common(
 /// slot's stored cred_id + hmac_salt. Mirrors the per-slot logic in
 /// `open_container_tpm2_fido2`, including the salt-prehash convention
 /// retry on platforms where the transform is opaque.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn sep_fido2_hmac_for_slot(
     slot: &luksbox_core::Keyslot,
     pin: &str,
@@ -3334,7 +3336,7 @@ fn sep_fido2_hmac_for_slot(
     Err(last.unwrap_or_else(|| "FIDO2 hmac-secret derivation failed".into()))
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn open_container_sep(
     _path: &Path,
     _header_path: Option<&Path>,
@@ -3352,7 +3354,7 @@ fn open_container_sep(
 /// seed file + `.lbx.hybrid` sidecar, decapsulates per slot to get
 /// the ML-KEM shared secret, then combines it with the SEP unseal in
 /// `UnlockMaterial::Sep { pq_shared: Some(..) }`.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn open_container_hybrid_pq_sep(
     path: &Path,
     header_path: Option<&Path>,
@@ -3402,7 +3404,7 @@ fn open_container_hybrid_pq_sep(
     open_sep_common(path, header_path, &header, fido2, Some(&decap))
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn open_container_hybrid_pq_sep(
     _path: &Path,
     _header_path: Option<&Path>,
@@ -3417,7 +3419,7 @@ fn open_container_hybrid_pq_sep(
 /// cred_id matches a connected FIDO2 authenticator, and asks both
 /// the TPM (per slot blob) and the authenticator (touch + PIN) to
 /// produce their halves. Both halves combined derive the KEK.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn open_container_tpm2_fido2(path: &Path, header_path: Option<&Path>) -> Result<Container> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID};
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
@@ -3526,7 +3528,7 @@ fn open_container_tpm2_fido2(path: &Path, header_path: Option<&Path>) -> Result<
     }))
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn open_container_tpm2_fido2(_path: &Path, _header_path: Option<&Path>) -> Result<Container> {
     Err(
         "TPM 2.0 + FIDO2 fused unlock requires --features hardware (libtss2-dev + libfido2-dev)."
@@ -3539,7 +3541,7 @@ fn open_container_tpm2_fido2(_path: &Path, _header_path: Option<&Path>) -> Resul
 /// then for each HybridPqKemTpm2 slot decapsulates the Kyber
 /// ciphertext to obtain `pq_shared` and asks the TPM to unseal the
 /// stored blob; both halves go into UnlockMaterial::HybridPqTpm2.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn open_container_hybrid_pq_tpm2(
     path: &Path,
     header_path: Option<&Path>,
@@ -3620,7 +3622,7 @@ fn open_container_hybrid_pq_tpm2(
         .into())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn open_container_hybrid_pq_tpm2(
     _path: &Path,
     _header_path: Option<&Path>,
@@ -3630,7 +3632,7 @@ fn open_container_hybrid_pq_tpm2(
 }
 
 /// Hybrid TPM 2.0 + FIDO2 + ML-KEM-768 unlock. Three-factor flow.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn open_container_hybrid_pq_tpm2_fido2(
     path: &Path,
     header_path: Option<&Path>,
@@ -3740,7 +3742,7 @@ fn open_container_hybrid_pq_tpm2_fido2(
         .into())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn open_container_hybrid_pq_tpm2_fido2(
     _path: &Path,
     _header_path: Option<&Path>,
@@ -4127,8 +4129,8 @@ fn create_hybrid_pq_with_params(
 /// at rest (defence in depth, this passphrase is NOT a luksbox unlock
 /// factor by itself; the actual unlock is YubiKey + .kyber + this
 /// passphrase together).
-#[cfg(feature = "hardware")]
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn create_hybrid_pq_fido2_with_params(
     path: &Path,
     header_path: Option<&Path>,
@@ -4229,7 +4231,7 @@ fn create_hybrid_pq_fido2_with_params(
     Ok(cont)
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn create_hybrid_pq_fido2_with_params(
     _path: &Path,
     _header_path: Option<&Path>,
@@ -4242,7 +4244,7 @@ fn create_hybrid_pq_fido2_with_params(
     Err("FIDO2 hardware support not compiled in (rebuild with --features hardware)".into())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn create_fido2(
     path: &Path,
     header_path: Option<&Path>,
@@ -4287,7 +4289,7 @@ fn create_fido2(
     Ok(cont)
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn create_fido2(
     _path: &Path,
     _header_path: Option<&Path>,
@@ -4298,7 +4300,7 @@ fn create_fido2(
     Err("FIDO2 hardware support not compiled in (rebuild with --features hardware)".into())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn create_fido2_direct(
     path: &Path,
     header_path: Option<&Path>,
@@ -4345,7 +4347,7 @@ fn create_fido2_direct(
     Ok(cont)
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn create_fido2_direct(
     _path: &Path,
     _header_path: Option<&Path>,
@@ -4622,7 +4624,7 @@ fn cmd_enroll_passphrase(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cmd_enroll_fido2(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
     use rand_core::{OsRng, RngCore};
@@ -4654,7 +4656,7 @@ fn cmd_enroll_fido2(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn cmd_enroll_fido2(_path: &Path, _unlock: &UnlockArgs) -> Result<()> {
     Err("FIDO2 hardware support not compiled in (rebuild with --features hardware)".into())
 }
@@ -4664,7 +4666,7 @@ fn cmd_enroll_fido2(_path: &Path, _unlock: &UnlockArgs) -> Result<()> {
 /// credential under the same authenticator and revoking the old
 /// slot. Idempotent against an already-V4 slot (refuses with a
 /// "nothing to migrate" message instead of double-enrolling).
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cmd_migrate_fido2_slot(path: &Path, unlock: &UnlockArgs, slot: usize) -> Result<()> {
     use luksbox_core::AAD_VERSION_V4;
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
@@ -4748,7 +4750,7 @@ fn cmd_migrate_fido2_slot(path: &Path, unlock: &UnlockArgs, slot: usize) -> Resu
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn cmd_migrate_fido2_slot(_path: &Path, _unlock: &UnlockArgs, _slot: usize) -> Result<()> {
     Err("FIDO2 hardware support not compiled in (rebuild with --features hardware)".into())
 }
@@ -4767,7 +4769,7 @@ fn cmd_migrate_fido2_slot(_path: &Path, _unlock: &UnlockArgs, _slot: usize) -> R
 /// subcommand with `--tpm2`) unlocks the vault on this machine
 /// without a passphrase. The vault file alone is uncrackable
 /// without the original chip.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cmd_enroll_tpm2(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     use luksbox_tpm::Tpm2Sealer;
     use rand_core::{OsRng, RngCore};
@@ -4812,7 +4814,7 @@ fn cmd_enroll_tpm2(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn cmd_enroll_tpm2(_path: &Path, _unlock: &UnlockArgs) -> Result<()> {
     Err(
         "TPM 2.0 hardware support not compiled in (rebuild with --features hardware). \
@@ -4828,7 +4830,7 @@ fn cmd_enroll_tpm2(_path: &Path, _unlock: &UnlockArgs) -> Result<()> {
 /// return both the shared secret and the opaque blob to store. With
 /// `biometric` set, the slot requires a Touch ID / user-presence
 /// check at every future unlock.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cmd_enroll_sep(path: &Path, unlock: &UnlockArgs, biometric: bool) -> Result<()> {
     use luksbox_sep::SepSealer;
 
@@ -4887,7 +4889,7 @@ fn cmd_enroll_sep(path: &Path, unlock: &UnlockArgs, biometric: bool) -> Result<(
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn cmd_enroll_sep(_path: &Path, _unlock: &UnlockArgs, _biometric: bool) -> Result<()> {
     Err(
         "Secure Enclave support not compiled in (rebuild with --features hardware). \
@@ -4902,7 +4904,7 @@ fn cmd_enroll_sep(_path: &Path, _unlock: &UnlockArgs, _biometric: bool) -> Resul
 /// the FIDO2 authenticator permanently kills the slot. Pair with a
 /// recovery slot (passphrase / FIDO2-only / TPM-only) unless you
 /// accept the unrecoverable trade-off.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cmd_enroll_tpm2_fido2(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
     use luksbox_tpm::Tpm2Sealer;
@@ -4972,7 +4974,7 @@ fn cmd_enroll_tpm2_fido2(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn cmd_enroll_tpm2_fido2(_path: &Path, _unlock: &UnlockArgs) -> Result<()> {
     Err(
         "TPM 2.0 + FIDO2 fused enroll requires --features hardware (libtss2-dev + libfido2-dev)."
@@ -4984,7 +4986,7 @@ fn cmd_enroll_tpm2_fido2(_path: &Path, _unlock: &UnlockArgs) -> Result<()> {
 /// `cmd_enroll_tpm2` but seals via `Tpm2Sealer::seal_with_pin` so
 /// the chip refuses to unseal without the matching PIN at every
 /// future unlock.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cmd_enroll_tpm2_pin(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     use luksbox_tpm::Tpm2Sealer;
     use rand_core::{OsRng, RngCore};
@@ -5024,7 +5026,7 @@ fn cmd_enroll_tpm2_pin(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn cmd_enroll_tpm2_pin(_path: &Path, _unlock: &UnlockArgs) -> Result<()> {
     Err("TPM 2.0 + PIN enroll requires --features hardware (libtss2-dev).".into())
 }
@@ -5035,7 +5037,7 @@ fn cmd_enroll_tpm2_pin(_path: &Path, _unlock: &UnlockArgs) -> Result<()> {
 /// entry + .kyber seed file at rest) with a fresh TPM seal of the
 /// wrap-side half of the KEK. Requires `--pq-hybrid <kyber-secret-path>`
 /// to know where to write the seed.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) -> Result<()> {
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
@@ -5159,7 +5161,7 @@ fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) ->
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn cmd_enroll_hybrid_pq_tpm2(_path: &Path, _unlock: &UnlockArgs, _kem_size: u16) -> Result<()> {
     Err("hybrid-pq-tpm2 enroll requires --features hardware (libtss2-dev).".into())
 }
@@ -5170,7 +5172,7 @@ fn cmd_enroll_hybrid_pq_tpm2(_path: &Path, _unlock: &UnlockArgs, _kem_size: u16)
 /// Kyber pubkey + ciphertext go in the `.lbx.hybrid` sidecar; the
 /// passphrase-encrypted Kyber seed is written to `--pq-hybrid`.
 /// `kem_size` is 768 or 1024.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cmd_enroll_hybrid_pq_sep(path: &Path, unlock: &UnlockArgs, kem_size: u16) -> Result<()> {
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
@@ -5301,7 +5303,7 @@ fn cmd_enroll_hybrid_pq_sep(path: &Path, unlock: &UnlockArgs, kem_size: u16) -> 
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn cmd_enroll_hybrid_pq_sep(_path: &Path, _unlock: &UnlockArgs, _kem_size: u16) -> Result<()> {
     Err("hybrid-pq-sep enroll requires --features hardware (macOS Secure Enclave).".into())
 }
@@ -5319,7 +5321,7 @@ pub(crate) enum SepFactors {
     Fido2Passphrase,
 }
 
-#[cfg_attr(not(feature = "hardware"), allow(dead_code))]
+#[cfg_attr(not(feature = "fido2-hardware"), allow(dead_code))]
 impl SepFactors {
     pub(crate) fn has_fido2(self) -> bool {
         matches!(self, Self::Fido2 | Self::Fido2Passphrase)
@@ -5358,7 +5360,7 @@ impl SepFactors {
 /// `cmd_enroll_hybrid_pq_sep`. All enrolled factors are required at
 /// every subsequent unlock; loss of any one permanently kills the
 /// slot, so keep a recovery slot.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cmd_enroll_sep_fused(
     path: &Path,
     unlock: &UnlockArgs,
@@ -5549,7 +5551,7 @@ fn cmd_enroll_sep_fused(
 
 /// Human-readable summary + the exact unlock flag combination for a
 /// freshly-enrolled fused SEP slot.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn print_sep_enroll_summary(
     path: &Path,
     idx: usize,
@@ -5591,7 +5593,7 @@ fn print_sep_enroll_summary(
     }
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn cmd_enroll_sep_fused(
     _path: &Path,
     _unlock: &UnlockArgs,
@@ -5608,7 +5610,7 @@ fn cmd_enroll_sep_fused(
 /// Enroll the maximum-paranoia hybrid TPM 2.0 + FIDO2 + ML-KEM
 /// keyslot. `kem_size` is 768 or 1024. Three independent factors
 /// required at every unlock.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u16) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
@@ -5746,7 +5748,7 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn cmd_enroll_hybrid_pq_tpm2_fido2(
     _path: &Path,
     _unlock: &UnlockArgs,
@@ -5819,7 +5821,7 @@ fn cmd_update(
             );
         }
         SlotKindArg::Tpm2 => {
-            #[cfg(feature = "hardware")]
+            #[cfg(feature = "fido2-hardware")]
             {
                 use luksbox_tpm::Tpm2Sealer;
                 use rand_core::{OsRng, RngCore};
@@ -5845,7 +5847,7 @@ fn cmd_update(
                 })?;
                 c.update_tpm2_at(slot, &kek, &blob.to_bytes())?;
             }
-            #[cfg(not(feature = "hardware"))]
+            #[cfg(not(feature = "fido2-hardware"))]
             {
                 return Err(
                     "TPM 2.0 hardware support not compiled in (rebuild with --features hardware)."
@@ -5902,7 +5904,7 @@ fn cmd_update(
     Ok(())
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn update_fido2_at(c: &mut Container, slot: usize) -> Result<()> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
     use rand_core::{OsRng, RngCore};
@@ -5928,7 +5930,7 @@ fn update_fido2_at(c: &mut Container, slot: usize) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "hardware"))]
+#[cfg(not(feature = "fido2-hardware"))]
 fn update_fido2_at(_c: &mut Container, _slot: usize) -> Result<()> {
     Err("FIDO2 hardware support not compiled in (rebuild with --features hardware)".into())
 }
@@ -6670,11 +6672,11 @@ fn cmd_deniable_init(
             cli_create_passphrase_deniable_v2(path, cipher_suite, argon2_params)?
         }
         CliDenCred::Fido2 => {
-            #[cfg(feature = "hardware")]
+            #[cfg(feature = "fido2-hardware")]
             {
                 cli_create_fido2_deniable_v2(path, cipher_suite, argon2_params)?
             }
-            #[cfg(not(feature = "hardware"))]
+            #[cfg(not(feature = "fido2-hardware"))]
             return Err(cli_err!("FIDO2 hardware support not compiled in"));
         }
         CliDenCred::PqPassphrase => {
@@ -6683,36 +6685,36 @@ fn cmd_deniable_init(
             cli_create_pq_passphrase_deniable_v2(path, cipher_suite, argon2_params, kp, pq_1024)?
         }
         CliDenCred::PqFido2 => {
-            #[cfg(feature = "hardware")]
+            #[cfg(feature = "fido2-hardware")]
             {
                 let kp =
                     kyber_path.ok_or_else(|| cli_err!("--kyber-path required for pq-fido2"))?;
                 cli_create_pq_fido2_deniable_v2(path, cipher_suite, argon2_params, kp, pq_1024)?
             }
-            #[cfg(not(feature = "hardware"))]
+            #[cfg(not(feature = "fido2-hardware"))]
             return Err(cli_err!("FIDO2 hardware support not compiled in"));
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         CliDenCred::Tpm => cli_create_tpm_deniable_v2(path, cipher_suite, argon2_params)?,
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         CliDenCred::TpmFido2 => {
             cli_create_tpm_fido2_deniable_v2(path, cipher_suite, argon2_params)?
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         CliDenCred::PqTpm => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required for pq-tpm"))?;
             cli_create_pq_tpm_deniable_v2(path, cipher_suite, argon2_params, kp, pq_1024)?
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         CliDenCred::PqTpmFido2 => {
             let kp =
                 kyber_path.ok_or_else(|| cli_err!("--kyber-path required for pq-tpm-fido2"))?;
             cli_create_pq_tpm_fido2_deniable_v2(path, cipher_suite, argon2_params, kp, pq_1024)?
         }
-        #[cfg(not(all(feature = "hardware", target_os = "linux")))]
+        #[cfg(not(all(feature = "hardware", any(target_os = "linux", target_os = "windows"))))]
         CliDenCred::Tpm | CliDenCred::TpmFido2 | CliDenCred::PqTpm | CliDenCred::PqTpmFido2 => {
             return Err(cli_err!(
-                "TPM is Linux-only today; Windows TPM is tracked as a follow-up"
+                "TPM 2.0 support is not compiled into this build (rebuild with --features hardware, or --features bundled-tpm on Windows; macOS has no TPM - use Secure Enclave keyslots)"
             ));
         }
         #[cfg(all(feature = "hardware", target_os = "macos"))]
@@ -7262,7 +7264,7 @@ fn cli_open_deniable_v2(
             )?)
         }
         CliDenCred::Fido2 => {
-            #[cfg(feature = "hardware")]
+            #[cfg(feature = "fido2-hardware")]
             {
                 let salt = payload_hmac_salt
                     .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
@@ -7292,7 +7294,7 @@ fn cli_open_deniable_v2(
                     Err((_, e)) => Err(e.into()),
                 }
             }
-            #[cfg(not(feature = "hardware"))]
+            #[cfg(not(feature = "fido2-hardware"))]
             Err(cli_err!("FIDO2 hardware support not compiled in"))
         }
         CliDenCred::PqPassphrase => {
@@ -7308,7 +7310,7 @@ fn cli_open_deniable_v2(
             )?)
         }
         CliDenCred::PqFido2 => {
-            #[cfg(feature = "hardware")]
+            #[cfg(feature = "fido2-hardware")]
             {
                 let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
                 let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
@@ -7342,10 +7344,10 @@ fn cli_open_deniable_v2(
                     Err((_, e)) => Err(e.into()),
                 }
             }
-            #[cfg(not(feature = "hardware"))]
+            #[cfg(not(feature = "fido2-hardware"))]
             Err(cli_err!("FIDO2 hardware support not compiled in"))
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         CliDenCred::Tpm => {
             let unsealed = cli_tpm_unseal_from_bytes(&payload_tpm_blob, None)?;
             let cred = DeniableCredential::TpmPassphrase {
@@ -7357,7 +7359,7 @@ fn cli_open_deniable_v2(
                 envelope, &cred,
             )?)
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         CliDenCred::TpmFido2 => {
             let unsealed = cli_tpm_unseal_from_bytes(&payload_tpm_blob, None)?;
             let salt = payload_hmac_salt
@@ -7388,7 +7390,7 @@ fn cli_open_deniable_v2(
                 Err((_, e)) => Err(e.into()),
             }
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         CliDenCred::PqTpm => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
             let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
@@ -7403,7 +7405,7 @@ fn cli_open_deniable_v2(
                 envelope, &cred,
             )?)
         }
-        #[cfg(all(feature = "hardware", target_os = "linux"))]
+        #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         CliDenCred::PqTpmFido2 => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
             let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
@@ -7438,10 +7440,12 @@ fn cli_open_deniable_v2(
                 Err((_, e)) => Err(e.into()),
             }
         }
-        #[cfg(not(all(feature = "hardware", target_os = "linux")))]
-        CliDenCred::Tpm | CliDenCred::TpmFido2 | CliDenCred::PqTpm | CliDenCred::PqTpmFido2 => Err(
-            cli_err!("TPM is Linux-only today; Windows TPM is tracked as a follow-up"),
-        ),
+        #[cfg(not(all(feature = "hardware", any(target_os = "linux", target_os = "windows"))))]
+        CliDenCred::Tpm | CliDenCred::TpmFido2 | CliDenCred::PqTpm | CliDenCred::PqTpmFido2 => {
+            Err(cli_err!(
+                "TPM 2.0 support is not compiled into this build (rebuild with --features hardware, or --features bundled-tpm on Windows; macOS has no TPM - use Secure Enclave keyslots)"
+            ))
+        }
         #[cfg(all(feature = "hardware", target_os = "macos"))]
         CliDenCred::Sep => {
             let sep_shared = cli_sep_unseal_from_bytes(&payload_tpm_blob)?;
@@ -7545,7 +7549,7 @@ fn cli_open_deniable_v2(
 /// Drive the FIDO2 authenticator using cred_id + hmac_salt taken
 /// from the envelope payload. v2 unlock no longer reads these from
 /// the CLI / env: they were embedded at create time.
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cli_fido2_hmac_from_payload(
     cred_id: &[u8],
     salt: &[u8; 32],
@@ -7572,7 +7576,7 @@ fn cli_fido2_hmac_from_payload(
 
 /// User-facing notice for the second probe attempt (see
 /// `cli_fido2_hmac_from_payload`).
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cli_deniable_raw_salt_retry_notice() {
     eprintln!(
         "{}",
@@ -7585,7 +7589,7 @@ fn cli_deniable_raw_salt_retry_notice() {
 
 /// Drive the TPM to unseal a blob taken from the envelope payload.
 /// v2 unlock no longer needs `--tpm-blob-path`.
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn cli_tpm_unseal_from_bytes(blob_bytes: &[u8], pin: Option<&[u8]>) -> Result<[u8; 32]> {
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
     if blob_bytes.is_empty() {
@@ -7691,7 +7695,7 @@ fn cli_create_passphrase_deniable_v2(
     Ok(cont)
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cli_create_fido2_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
@@ -7782,7 +7786,7 @@ fn cli_create_pq_passphrase_deniable_v2(
     Ok(cont)
 }
 
-#[cfg(feature = "hardware")]
+#[cfg(feature = "fido2-hardware")]
 fn cli_create_pq_fido2_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
@@ -7859,7 +7863,7 @@ fn cli_create_pq_fido2_deniable_v2(
     Ok(cont)
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn cli_tpm_seal_to_bytes(pin: Option<&[u8]>) -> Result<(zeroize::Zeroizing<[u8; 32]>, Vec<u8>)> {
     use luksbox_tpm::Tpm2Sealer;
     use rand_core::RngCore;
@@ -7875,7 +7879,7 @@ fn cli_tpm_seal_to_bytes(pin: Option<&[u8]>) -> Result<(zeroize::Zeroizing<[u8; 
     Ok((secret, blob.to_bytes()))
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn cli_create_tpm_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
@@ -7909,7 +7913,7 @@ fn cli_create_tpm_deniable_v2(
     Ok(cont)
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn cli_create_tpm_fido2_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
@@ -7947,7 +7951,7 @@ fn cli_create_tpm_fido2_deniable_v2(
     Ok(cont)
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn cli_create_pq_tpm_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,
@@ -8013,7 +8017,7 @@ fn cli_create_pq_tpm_deniable_v2(
     Ok(cont)
 }
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn cli_create_pq_tpm_fido2_deniable_v2(
     path: &Path,
     cipher: luksbox_core::CipherSuite,

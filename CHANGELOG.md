@@ -14,6 +14,68 @@ canonical record.
 
 ---
 
+## [Unreleased]
+
+### Added: Windows TPM 2.0 keyslots (full parity with Linux)
+
+Every TPM keyslot kind now works on Windows, reaching the chip
+through TBS (TPM Base Services), the broker built into every
+supported Windows - no driver, no admin rights, no code signing.
+The chip itself is guaranteed on Windows 11 hardware (part of the
+launch floor). Slot bytes are TCG-standard `TPM2B_*` structures,
+byte-identical to the Linux build's: the same physical chip unseals
+a vault regardless of which OS sealed it.
+
+- **Full keyslot matrix on Windows**, in the CLI, the interactive
+  wizard, and the GUI: `tpm2`, `tpm2-pin` (chip-enforced
+  dictionary-attack lockout), fused `tpm2-fido2` (TPM AND
+  authenticator - Windows Hello or a physical key via
+  webauthn.dll), `hybrid-pq-tpm2` / `hybrid-pq-tpm21024`
+  (TPM + ML-KEM seed file), and the 3-factor
+  `hybrid-pq-tpm2-fido2` / `hybrid-pq-tpm2-fido21024`. The wizard's
+  create / unlock / add-keyslot menus and the GUI's create factor,
+  unlock methods, and seven "Add keyslot" TPM buttons all appear on
+  Windows exactly as on Linux, deniable-mode variants included.
+- **Backend**: `tss-esapi` bumped 7.5 -> 8.0.0-alpha.2 (the first
+  line with the Windows TBS TCTI), with `tss-esapi-sys` deliberately
+  pinned to `=0.6.0-alpha.2` - a later stable 0.6.0 satisfies
+  tss-esapi's semver range while lacking Windows support entirely
+  (see `docs/TPM_FUTURE_IMPROVEMENTS.md` section 1 for the full
+  design record). Bonus from 8.x: buffer types (`Auth`, `Private`,
+  `SensitiveData`) now store `Zeroizing<Vec<u8>>`, so Rust-side
+  PIN/secret copies are wiped on drop.
+- **Cargo feature reorg** (build-facing, run `cargo build` as
+  before): the DEFAULT build now enables `fido2-hardware` (FIDO2
+  only - no tpm2-tss version floor, so plain builds keep working on
+  Debian 12 / Ubuntu LTS / RHEL 9 and plain Windows).
+  `--features hardware` keeps meaning FIDO2 + TPM + SEP exactly as
+  before (Linux system link now needs tpm2-tss >= 4.1.3). New
+  `--features bundled-tpm` = `hardware` with a vendored tpm2-tss
+  compiled at build time (autotools on Linux, MSBuild on Windows) -
+  what the Windows release binaries and the jammy/noble Linux
+  release lanes ship with.
+- **Windows packaging**: the portable .zip and the MSI bundle the
+  TPM DLL closure (`tss2-esys`, `tss2-sys`, `tss2-mu`,
+  `tss2-tctildr`, `tss2-tcti-tbs`, `libcrypto-3-x64`) next to the
+  .exe, plus the tpm2-tss (BSD-2-Clause) and OpenSSL (Apache-2.0)
+  license texts.
+- **Platform-aware diagnostics**: TPM-unreachable and
+  operation-failure hints now speak Windows on Windows (`Get-Tpm`,
+  `tpm.msc`, vTPM setup for Hyper-V/VMware/VirtualBox, lockout
+  reset via "Reset TPM lockout" - and an explicit warning that
+  Clear-Tpm would destroy the vault's TPM slots) and keep the
+  existing `/dev/tpmrm0` / `tss`-group guidance on Linux.
+- **CI**: new `windows-tpm` job (real TBS backend build + mock/wire
+  tests on `windows-latest`); the 22.04 hardware lanes moved to
+  `bundled-tpm` (their system tpm2-tss is below the 8.x floor) while
+  the 26.04 lane keeps exercising the system link.
+- **New diagnostic**: `cargo run -p luksbox-tpm --features
+  bundled-tpm --example tpm_smoke` - live seal/unseal round-trip
+  against the local chip (transient objects only; verified on real
+  Windows 11 hardware through TBS as part of this change).
+
+---
+
 ## [v0.4.0] - 2026-07-04
 
 First stable release of the v0.4.0 line. It promotes `v0.4.0-rc.3` to

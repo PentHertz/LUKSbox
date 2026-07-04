@@ -15,14 +15,24 @@ build = "build.rs"
 winresource = "0.1"
 
 [features]
-default = ["hardware", "fuse", "winfsp"]
-# Pulls in libfido2 via luksbox-fido2's `hardware` feature AND
-# libtss2-* via luksbox-tpm's `hardware` feature so FIDO2
-# authenticators + Linux TPM 2.0 chips both work for enroll/unlock
-# in the GUI. Build with `--no-default-features` to get a software-
-# only build (both hardware paths are then disabled at runtime;
-# luksbox-tpm's stub gracefully no-ops on every platform).
-hardware = ["luksbox-fido2/hardware", "luksbox-tpm/hardware", "luksbox-sep/hardware"]
+default = ["fido2-hardware", "fuse", "winfsp"]
+# FIDO2 hardware alone (libfido2 on Linux/macOS, webauthn.dll on
+# Windows). The DEFAULT hardware level: no tpm2-tss version floor,
+# so a plain `cargo build` works on LTS distros and plain Windows.
+# Build with `--no-default-features` for a software-only build.
+fido2-hardware = ["luksbox-fido2/hardware"]
+# Everything: FIDO2 + TPM 2.0 (Linux + Windows) + Secure Enclave
+# (macOS) for enroll/unlock in the GUI. TPM links the SYSTEM
+# tpm2-tss (>= 4.1.3 floor: Debian 13+, Ubuntu 24.10+, Fedora 40+,
+# Arch); on Windows it needs TPM2_TSS_PATH + libclang. Prefer
+# `bundled-tpm` below when no suitable system tpm2-tss exists.
+# luksbox-tpm's stub gracefully no-ops on macOS.
+hardware = ["fido2-hardware", "luksbox-tpm/hardware", "luksbox-sep/hardware"]
+# `hardware` with a vendored tpm2-tss compiled at build time
+# (autotools on Linux, MSBuild/VS2017+ and libclang on Windows).
+# What the Windows release binaries ship with, and the escape hatch
+# for LTS distros whose system tpm2-tss is < 4.1.3.
+bundled-tpm = ["hardware", "luksbox-tpm/bundled-tpm"]
 # Enables FUSE-backed `mount` on Linux + macOS via the libfuse2 /
 # macFUSE path. Disable on macOS CI builds without macFUSE.
 fuse = ["luksbox-mount/fuse"]

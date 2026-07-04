@@ -269,7 +269,56 @@ Linux).
      for the gotchas the WinFsp adapter has hit on Win11 / WinFsp 2.x
      (the file's top-level docstring catalogues them).
 
-6. **Build**:
+6. **TPM 2.0 keyslots (optional, `--features bundled-tpm`)**:
+   the default build ships without the TPM backend; the
+   `bundled-tpm` feature compiles tpm2-tss from source with MSBuild
+   during `cargo build` (Windows has no system tpm2-tss) and talks
+   to the chip through the in-box TBS broker at runtime - no
+   driver, no admin rights. Three things to stage first:
+
+   ```powershell
+   # a. tpm2-tss 4.1.3 source at a SHORT path (deep paths trip
+   #    MSBuild's file tracker with an inscrutable MSB6003; the
+   #    repo snapshot is required - the autotools dist tarball
+   #    omits the VS solution).
+   Invoke-WebRequest -Uri "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/4.1.3.zip" -OutFile "$env:TEMP\t2t.zip"
+   Expand-Archive "$env:TEMP\t2t.zip" -DestinationPath "$env:TEMP\t2t"
+   $env:TPM2_TSS_SOURCE_PATH = "$env:TEMP\t2t\tpm2-tss-4.1.3"
+
+   # b. OpenSSL 3 with an x64 import lib (tss2-esys links
+   #    libcrypto). Any install layout with lib\libcrypto.lib +
+   #    include\openssl works; the portable FireDaemon zip is the
+   #    easiest (https://kb.firedaemon.com/support/solutions/articles/4000121705).
+   #    tpm2-tss's VS solution hardcodes the OpenSSL location, so
+   #    patch it:
+   $props = "$env:TPM2_TSS_SOURCE_PATH\src\tss2-esys\openssl.props"
+   (Get-Content $props -Raw).Replace('C:\OpenSSL-v11-Win64', '<your-openssl-x64-dir>') | Set-Content $props -NoNewline
+
+   # c. libclang for bindgen. LLVM's install works (step 4 above);
+   #    so does the copy inside VS 2022:
+   $env:LIBCLANG_PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin"
+   ```
+
+   Then build with the feature and, before RUNNING the binaries,
+   put the produced DLLs on PATH (the release artifacts bundle
+   them; a local build reads them from the tpm2-tss build output):
+
+   ```powershell
+   cargo build --release -p luksbox-cli --features bundled-tpm
+   $env:PATH = "$env:TPM2_TSS_SOURCE_PATH\x64\Release;<your-openssl-x64-dir>\bin;$env:PATH"
+
+   # Live seal/unseal smoke against the machine's real TPM
+   # (transient objects only - nothing persisted, no lockout risk):
+   cargo run --release -p luksbox-tpm --features bundled-tpm --example tpm_smoke
+   ```
+
+   DLL closure to keep next to the .exe when distributing:
+   `tss2-esys.dll`, `tss2-sys.dll`, `tss2-mu.dll`,
+   `tss2-tctildr.dll`, `tss2-tcti-tbs.dll` (dlopen()ed at runtime,
+   never in an import table, still required), and
+   `libcrypto-3-x64.dll`.
+
+7. **Build**:
    ```powershell
    git clone <repo-url> luksbox
    cd luksbox
@@ -293,8 +342,11 @@ Linux).
    git clone <repo-url> luksbox && cd luksbox
    cargo build --release -p luksbox-cli
    ```
-   The `--features hardware` build works because mingw-w64 has its own
-   libfido2 package. WinFsp is still required separately for `mount`.
+   The `--features fido2-hardware` build works because mingw-w64 has
+   its own libfido2 package. WinFsp is still required separately for
+   `mount`. TPM keyslots (`hardware` / `bundled-tpm`) are NOT
+   available on MinGW: tss-esapi-sys supports only the MSVC targets
+   on Windows - use the MSVC build above for TPM support.
 
 ---
 
@@ -619,6 +671,12 @@ above for the Cargo feature matrix.
   required for the `mount` subcommand. Without it, `mount` returns a
   clear "WinFsp driver not present" error and every other subcommand
   works.
+- **TPM 2.0**: nothing to install. The release artifacts bundle the
+  tpm2-tss DLLs (`tss2-*.dll` + `libcrypto-3-x64.dll`) next to the
+  .exe, and chip access goes through TPM Base Services, the broker
+  built into every supported Windows - no driver, no admin rights.
+  The chip itself is guaranteed on Windows 11 hardware (it's part of
+  the launch floor); on older machines check `Get-Tpm` / `tpm.msc`.
 
 ### Hardware (optional but recommended)
 

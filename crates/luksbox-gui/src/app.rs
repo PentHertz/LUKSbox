@@ -718,10 +718,11 @@ struct AddHybridTpm2Form {
 }
 
 impl AddHybridTpm2Form {
-    // Only called from the Linux-only modal triggers in `update`.
-    // Allow dead_code on non-Linux so the constructor coexists with
-    // the unconditionally-compiled struct definition without warning.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // Only called from the TPM modal triggers in `update` (Linux +
+    // Windows). Allow dead_code elsewhere so the constructor
+    // coexists with the unconditionally-compiled struct definition
+    // without warning.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     fn new(kem_size: u16) -> Self {
         Self {
             kyber_path: String::new(),
@@ -831,8 +832,8 @@ struct AddHybridTpm2Fido2Form {
 }
 
 impl AddHybridTpm2Fido2Form {
-    // Same Linux-only constraint as `AddHybridTpm2Form::new` above.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    // Same Linux/Windows constraint as `AddHybridTpm2Form::new` above.
+    #[cfg_attr(not(any(target_os = "linux", target_os = "windows")), allow(dead_code))]
     fn new(kem_size: u16) -> Self {
         Self {
             kyber_path: String::new(),
@@ -3421,9 +3422,9 @@ impl LuksboxApp {
                 let prev = factor;
                 ui.radio_value(&mut factor, Factor::Passphrase, Factor::Passphrase.label());
                 ui.radio_value(&mut factor, Factor::Fido2, Factor::Fido2.label());
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 ui.radio_value(&mut factor, Factor::Tpm2, Factor::Tpm2.label());
-                // Secure Enclave: macOS only, mirroring the Linux-only
+                // Secure Enclave: macOS only, mirroring the Linux/Windows
                 // TPM radio above. Available in deniable mode too, where
                 // it is created as a SEP + passphrase deniable credential
                 // (the passphrase is the envelope, the enclave the second
@@ -3991,7 +3992,8 @@ impl LuksboxApp {
                         ui.label(
                             RichText::new(
                                 "After the vault is created, the TPM 2.0 keyslot will be added \
-                                 automatically. Linux only; requires /dev/tpmrm0 access.",
+                                 automatically. Uses this machine's TPM 2.0 (Linux: needs \
+                                 /dev/tpmrm0 access; Windows: TPM Base Services, no setup).",
                             )
                             .color(theme::FAINT).size(12.0),
                         );
@@ -5724,7 +5726,7 @@ impl LuksboxApp {
                 UnlockMethod::HybridPqFido2,
                 "Hybrid FIDO2 + ML-KEM (post-quantum, authenticator + .kyber)",
             );
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
                 ui.radio_value(
                     &mut self.unlock.method,
@@ -5753,7 +5755,7 @@ impl LuksboxApp {
                 );
             }
             // Secure Enclave unlock options: macOS only, mirroring the
-            // Linux-only TPM radios above.
+            // Linux/Windows TPM radios above.
             if cfg!(target_os = "macos") {
                 ui.radio_value(
                     &mut self.unlock.method,
@@ -5942,8 +5944,9 @@ impl LuksboxApp {
                     ui.add_space(4.0);
                     ui.label(
                         RichText::new(
-                            "Linux only. Requires /dev/tpmrm0 access (typically \
-                                     via membership in the `tss` group).",
+                            "Bound to this machine's TPM 2.0. Linux needs /dev/tpmrm0 \
+                                     access (typically via the `tss` group); Windows uses \
+                                     TPM Base Services with no extra setup.",
                         )
                         .color(theme::FAINT)
                         .size(11.0),
@@ -7640,11 +7643,11 @@ impl LuksboxApp {
                             Some(AddHybridPqFido2Form::new(1024));
                     }
                 }
-                // TPM-bound "Add keyslot" buttons only on Linux. Each
+                // TPM-bound "Add keyslot" buttons only on Linux + Windows. Each
                 // button pre-flights its hardware before opening the
                 // modal so the user gets the friendly missing-device
                 // toast BEFORE typing PIN / passphrase.
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 if ui
                     .add_sized(
                         [row_w, 32.0],
@@ -7652,7 +7655,7 @@ impl LuksboxApp {
                     )
                     .on_hover_text(
                         "Adds a TPM 2.0-bound keyslot. The wrap key lives inside the local \
-                 TPM chip; no passphrase needed. Linux only. The vault becomes uncrackable \
+                 TPM chip; no passphrase needed. The vault becomes uncrackable \
                  if its file is stolen separately from this machine, but only unlocks on \
                  this machine. Threat-model caveat: with no PIN and no PCR policy, anyone \
                  who can boot this device and reach the TPM can unseal. For stronger \
@@ -7685,7 +7688,7 @@ impl LuksboxApp {
                         }
                     }
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 if ui
                     .add_sized(
                         [row_w, 32.0],
@@ -7706,7 +7709,7 @@ impl LuksboxApp {
                         self.add_tpm2_pin_modal = Some(AddTpm2PinForm::default());
                     }
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 if ui
                     .add_sized(
                         [row_w, 32.0],
@@ -7728,7 +7731,7 @@ impl LuksboxApp {
                         self.add_tpm2_fido2_pin_modal = Some(AddTpm2Fido2Form::default());
                     }
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 if ui
                     .add_sized(
                         [row_w, 32.0],
@@ -7748,7 +7751,7 @@ impl LuksboxApp {
                         self.add_hybrid_tpm2_modal = Some(AddHybridTpm2Form::new(768));
                     }
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 if ui
                     .add_sized(
                         [row_w, 32.0],
@@ -7767,7 +7770,7 @@ impl LuksboxApp {
                         self.add_hybrid_tpm2_modal = Some(AddHybridTpm2Form::new(1024));
                     }
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 if ui
                     .add_sized(
                         [row_w, 32.0],
@@ -7788,7 +7791,7 @@ impl LuksboxApp {
                         self.add_hybrid_tpm2_fido2_modal = Some(AddHybridTpm2Fido2Form::new(768));
                     }
                 }
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
                 if ui
                     .add_sized(
                         [row_w, 32.0],
@@ -9125,7 +9128,10 @@ impl LuksboxApp {
                 std::thread::spawn(move || {
                     let mut v = v;
                     let r = if is_den {
-                        #[cfg(all(feature = "hardware", target_os = "linux"))]
+                        #[cfg(all(
+                            feature = "hardware",
+                            any(target_os = "linux", target_os = "windows")
+                        ))]
                         {
                             ops::enroll_tpm2_fido2_deniable(
                                 &mut v.vfs,
@@ -9135,11 +9141,14 @@ impl LuksboxApp {
                                 extras.kdf.params(),
                             )
                         }
-                        #[cfg(not(all(feature = "hardware", target_os = "linux")))]
+                        #[cfg(not(all(
+                            feature = "hardware",
+                            any(target_os = "linux", target_os = "windows")
+                        )))]
                         {
                             let _ = (&extras, &pin);
                             Err::<usize, String>(
-                                "deniable TPM enrollment requires the Linux hardware build".into(),
+                                "deniable TPM enrollment requires a TPM hardware build (--features hardware / bundled-tpm)".into(),
                             )
                         }
                     } else {
@@ -9236,7 +9245,10 @@ impl LuksboxApp {
                         // attempt -- the exact symptom that earlier
                         // versions of this dispatch produced by
                         // discarding the PIN.
-                        #[cfg(all(feature = "hardware", target_os = "linux"))]
+                        #[cfg(all(
+                            feature = "hardware",
+                            any(target_os = "linux", target_os = "windows")
+                        ))]
                         {
                             ops::enroll_tpm2_deniable(
                                 &mut v.vfs,
@@ -9246,11 +9258,14 @@ impl LuksboxApp {
                                 Some(pin.as_bytes()),
                             )
                         }
-                        #[cfg(not(all(feature = "hardware", target_os = "linux")))]
+                        #[cfg(not(all(
+                            feature = "hardware",
+                            any(target_os = "linux", target_os = "windows")
+                        )))]
                         {
                             let _ = (&extras, &pin);
                             Err::<usize, String>(
-                                "deniable TPM enrollment requires the Linux hardware build".into(),
+                                "deniable TPM enrollment requires a TPM hardware build (--features hardware / bundled-tpm)".into(),
                             )
                         }
                     } else {
@@ -9324,7 +9339,10 @@ impl LuksboxApp {
                     // `Tpm2Pin`); the latter would fail because
                     // the unseal call would supply an auth value
                     // the TPM-side policy rejects.
-                    #[cfg(all(feature = "hardware", target_os = "linux"))]
+                    #[cfg(all(
+                        feature = "hardware",
+                        any(target_os = "linux", target_os = "windows")
+                    ))]
                     let r = ops::enroll_tpm2_deniable(
                         &mut v.vfs,
                         extras.slot_idx,
@@ -9332,11 +9350,14 @@ impl LuksboxApp {
                         extras.kdf.params(),
                         None,
                     );
-                    #[cfg(not(all(feature = "hardware", target_os = "linux")))]
+                    #[cfg(not(all(
+                        feature = "hardware",
+                        any(target_os = "linux", target_os = "windows")
+                    )))]
                     let r = {
                         let _ = (&v.vfs, &extras);
                         Err::<usize, String>(
-                            "deniable TPM enrollment requires the Linux hardware build".into(),
+                            "deniable TPM enrollment requires a TPM hardware build (--features hardware / bundled-tpm)".into(),
                         )
                     };
                     let _ = tx.send((v, r));
@@ -9462,7 +9483,10 @@ impl LuksboxApp {
                 std::thread::spawn(move || {
                     let mut v = v;
                     let r = if is_den {
-                        #[cfg(all(feature = "hardware", target_os = "linux"))]
+                        #[cfg(all(
+                            feature = "hardware",
+                            any(target_os = "linux", target_os = "windows")
+                        ))]
                         {
                             let params = if kem_size == 1024 {
                                 luksbox_pq::PqParams::Ml1024
@@ -9480,7 +9504,10 @@ impl LuksboxApp {
                                 params,
                             )
                         }
-                        #[cfg(not(all(feature = "hardware", target_os = "linux")))]
+                        #[cfg(not(all(
+                            feature = "hardware",
+                            any(target_os = "linux", target_os = "windows")
+                        )))]
                         {
                             let _ = (
                                 &v.vfs,
@@ -9491,7 +9518,7 @@ impl LuksboxApp {
                                 kem_size,
                             );
                             Err::<usize, String>(
-                                "deniable hybrid-PQ + TPM enrollment requires the Linux hardware build"
+                                "deniable hybrid-PQ + TPM enrollment requires a TPM hardware build (--features hardware / bundled-tpm)"
                                     .into(),
                             )
                         }
@@ -9935,7 +9962,10 @@ impl LuksboxApp {
                 std::thread::spawn(move || {
                     let mut v = v;
                     let r = if is_den {
-                        #[cfg(all(feature = "hardware", target_os = "linux"))]
+                        #[cfg(all(
+                            feature = "hardware",
+                            any(target_os = "linux", target_os = "windows")
+                        ))]
                         {
                             let params = if kem_size == 1024 {
                                 luksbox_pq::PqParams::Ml1024
@@ -9954,7 +9984,10 @@ impl LuksboxApp {
                                 params,
                             )
                         }
-                        #[cfg(not(all(feature = "hardware", target_os = "linux")))]
+                        #[cfg(not(all(
+                            feature = "hardware",
+                            any(target_os = "linux", target_os = "windows")
+                        )))]
                         {
                             let _ = (
                                 &v.vfs,
@@ -9966,7 +9999,7 @@ impl LuksboxApp {
                                 kem_size,
                             );
                             Err::<usize, String>(
-                                "deniable hybrid-PQ + TPM + FIDO2 enrollment requires the Linux hardware build"
+                                "deniable hybrid-PQ + TPM + FIDO2 enrollment requires a TPM hardware build (--features hardware / bundled-tpm)"
                                     .into(),
                             )
                         }
@@ -10310,7 +10343,7 @@ impl LuksboxApp {
                 std::thread::spawn(move || {
                     let mut v = v;
                     let r = if is_den {
-                        #[cfg(feature = "hardware")]
+                        #[cfg(feature = "fido2-hardware")]
                         {
                             ops::enroll_hybrid_pq_fido2_deniable(
                                 &mut v.vfs,
@@ -10323,7 +10356,7 @@ impl LuksboxApp {
                                 kem_size,
                             )
                         }
-                        #[cfg(not(feature = "hardware"))]
+                        #[cfg(not(feature = "fido2-hardware"))]
                         {
                             let _ = (
                                 &v.vfs,
@@ -10341,7 +10374,7 @@ impl LuksboxApp {
                             )
                         }
                     } else {
-                        #[cfg(feature = "hardware")]
+                        #[cfg(feature = "fido2-hardware")]
                         {
                             ops::enroll_hybrid_pq_fido2(
                                 &mut v.vfs,
@@ -10353,7 +10386,7 @@ impl LuksboxApp {
                                 kem_size,
                             )
                         }
-                        #[cfg(not(feature = "hardware"))]
+                        #[cfg(not(feature = "fido2-hardware"))]
                         {
                             let _ = (
                                 &v.vfs,
