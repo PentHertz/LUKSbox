@@ -59,9 +59,15 @@ jobs:
           - profile: workspace
             features: ""
             cmd: "cargo test --workspace --exclude luksbox-gui --exclude luksbox-fuzz --exclude luksbox-fuzz-afl"
+          # bundled-tpm, not hardware: this job runs on jammy, whose
+          # system tpm2-tss (3.2) is below the 4.1.3 build floor that
+          # tss-esapi 8.x imposes. bundled-tpm compiles a vendored
+          # tpm2-tss at build time (hence the autotools packages in the
+          # apt list below); the system-link `hardware` flavour is
+          # exercised by the 26.04 lane, whose tpm2-tss is new enough.
           - profile: workspace-hardware
-            features: "luksbox-cli/hardware"
-            cmd: "cargo test --workspace --features luksbox-cli/hardware --exclude luksbox-gui --exclude luksbox-fuzz --exclude luksbox-fuzz-afl"
+            features: "luksbox-cli/bundled-tpm"
+            cmd: "cargo test --workspace --features luksbox-cli/bundled-tpm --exclude luksbox-gui --exclude luksbox-fuzz --exclude luksbox-fuzz-afl"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -74,6 +80,7 @@ jobs:
           packages: |
             pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
             libtss2-dev
+            autoconf automake libtool libltdl-dev autoconf-archive libjson-c-dev uuid-dev
       - name: Run ${{ matrix.profile }} tests
         run: ${{ matrix.cmd }}
 
@@ -271,6 +278,38 @@ jobs:
       - name: AES-NI startup warning (luksbox-cli, round 6 item I)
         run: cargo test -p luksbox-cli --test functional -- aes
 
+  # ---- Windows TPM 2.0 backend (TBS via bundled tpm2-tss) -----------------
+  # Builds the real tss-esapi 8.x TBS backend on windows-latest and runs
+  # the luksbox-tpm suite. Hosted runners expose no TPM device, so the
+  # tests that pass here are the mock/wire ones; the live seal/unseal
+  # smoke stays a manual step on real hardware:
+  #   cargo run -p luksbox-tpm --features bundled-tpm --example tpm_smoke
+  # The tpm2-tss/OpenSSL/libclang staging is the same composite action
+  # release.yml's Windows lane uses, so CI and release can't drift.
+  windows-tpm:
+    name: windows tpm (TBS, bundled tpm2-tss)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-windows-tpm
+      - name: Stage tpm2-tss source + OpenSSL + libclang
+        uses: ./.github/actions/stage-tpm2-tss
+      - name: Build luksbox-tpm (real TBS backend)
+        run: cargo build --release -p luksbox-tpm --features bundled-tpm
+      - name: Test luksbox-tpm (mock + wire tests)
+        shell: pwsh
+        run: |
+          # The test executables import the tss2-*.dll files MSBuild
+          # just produced; cargo puts their directory on PATH via the
+          # build script's link-search path. tss2-esys.dll additionally
+          # imports libcrypto-3-x64.dll, whose staged directory is NOT
+          # a link-search path, so prepend it here.
+          $env:PATH = "C:\ossl\bin;$env:PATH"
+          cargo test --release -p luksbox-tpm --features bundled-tpm
+
   # ---- Workspace builds (no tests, just ensure binaries link) -------------
   build:
     name: build (${{ matrix.target }})
@@ -282,26 +321,36 @@ jobs:
           - target: cli-no-hardware
             cmd: "cargo build --release -p luksbox-cli"
             extra_apt: ""
-          - target: cli-hardware
-            cmd: "cargo build --release -p luksbox-cli --features hardware"
-            extra_apt: ""
+          # bundled-tpm on the two TPM-enabled lanes below, not
+          # `hardware`: this job runs on jammy, whose system tpm2-tss
+          # (3.2) is below the 4.1.3 build floor of tss-esapi 8.x, so
+          # the system link no longer builds here. bundled-tpm compiles
+          # a vendored tpm2-tss 4.1.3 via autotools at build time
+          # (hence the autotools packages in extra_apt); the
+          # system-link `hardware` flavour keeps being exercised by the
+          # test-ubuntu-2604 job. This mirrors the jammy/noble release
+          # lanes in release.yml.
+          - target: cli-bundled-tpm
+            cmd: "cargo build --release -p luksbox-cli --features bundled-tpm"
+            extra_apt: "autoconf automake libtool libltdl-dev autoconf-archive libjson-c-dev uuid-dev"
           - target: gui
             cmd: "cargo build --release -p luksbox-gui"
             extra_apt: ""
-          # luksbox-tpm hardware feature: real link against libtss2-*
-          # for the build, plus `swtpm` (software TPM emulator) at
-          # test time so the integration tests in tests/swtpm_*.rs
-          # exercise actual seal/unseal against a TCG-compliant chip.
-          # Stub-only build is verified by the workspace default
-          # build above; this matrix entry is the only one that
-          # exercises the real tss-esapi-sys link AND the live TPM
-          # round-trip. swtpm comes with swtpm_setup which is what
-          # initialises the EK certificate before swtpm starts.
-          # libtss2-tcti-swtpm0 provides the tcti library for the
-          # `swtpm:path=...` TCTI string the tests use.
-          - target: tpm-hardware
-            cmd: "cargo build --release -p luksbox-tpm --features hardware && cargo test --release -p luksbox-tpm --features hardware"
-            extra_apt: "swtpm swtpm-tools libtss2-tcti-swtpm0"
+          # luksbox-tpm real backend: vendored tpm2-tss for the build,
+          # plus `swtpm` (software TPM emulator) at test time so the
+          # integration tests in tests/swtpm_*.rs exercise actual
+          # seal/unseal against a TCG-compliant chip. Stub-only build
+          # is verified by the workspace default build above; this
+          # matrix entry is the only one that exercises the real
+          # tss-esapi-sys link AND the live TPM round-trip. swtpm comes
+          # with swtpm_setup which is what initialises the EK
+          # certificate before swtpm starts. libtss2-tcti-swtpm0
+          # provides the tcti library for the `swtpm:path=...` TCTI
+          # string the tests use; the vendored tss2-tctildr dlopen()s
+          # it at runtime through the stable TCTI plugin ABI.
+          - target: tpm-bundled
+            cmd: "cargo build --release -p luksbox-tpm --features bundled-tpm && cargo test --release -p luksbox-tpm --features bundled-tpm"
+            extra_apt: "swtpm swtpm-tools libtss2-tcti-swtpm0 autoconf automake libtool libltdl-dev autoconf-archive libjson-c-dev uuid-dev"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

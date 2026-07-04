@@ -1,0 +1,110 @@
+name: stage-tpm2-tss
+description: >-
+  Stage everything the `bundled-tpm` cargo feature needs to compile
+  tpm2-tss from source with MSBuild on a Windows runner: the tpm2-tss
+  source snapshot at a short path, an OpenSSL 3 install normalised to
+  the layout tpm2-tss's VS solution expects, and libclang for bindgen.
+  Exports TPM2_TSS_SOURCE_PATH and LIBCLANG_PATH into $GITHUB_ENV for
+  the subsequent cargo build steps. Mirrors the manual recipe in
+  BUILDING.md "TPM 2.0 keyslots"; the sharp edges (short path against
+  MSB6003, the hardcoded OpenSSL dir in openssl.props) are documented
+  in docs/TPM_FUTURE_IMPROVEMENTS.md section 1.
+inputs:
+  tpm2-tss-version:
+    description: tpm2-tss release tag to build. Must satisfy the
+      tss-esapi-sys minimum (4.1.3).
+    required: false
+    default: "4.1.3"
+runs:
+  using: composite
+  steps:
+    - name: Stage tpm2-tss source, OpenSSL, libclang
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $ver = '${{ inputs.tpm2-tss-version }}'
+
+        # a. tpm2-tss source at a SHORT path. Deep paths trip MSBuild's
+        #    file tracker with an inscrutable MSB6003, and setting
+        #    TPM2_TSS_SOURCE_PATH also keeps the tss-esapi-sys build
+        #    script from git-cloning on its own. The GitHub archive
+        #    snapshot is required: the autotools dist tarball omits the
+        #    VS solution.
+        Invoke-WebRequest -Uri "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/$ver.zip" -OutFile 'C:\t2t.zip'
+        Expand-Archive 'C:\t2t.zip' -DestinationPath 'C:\t2t'
+        $src = "C:\t2t\tpm2-tss-$ver"
+        if (-not (Test-Path "$src\tpm2-tss.sln")) {
+            Write-Error "tpm2-tss.sln not found under $src; the archive layout changed"
+            exit 1
+        }
+
+        # b. OpenSSL 3 with an x64 import lib: tss2-esys compiles with
+        #    $(OpenSslDir)\include and links $(OpenSslDir)\lib\libcrypto.lib.
+        #    Runner images and the ShiningLight choco package lay their
+        #    files out differently, so normalise whatever is present
+        #    into C:\ossl with exactly that shape; install via choco
+        #    only if nothing usable is preinstalled.
+        function Find-Crypto([string[]]$roots) {
+            foreach ($r in $roots) {
+                foreach ($rel in @('lib\libcrypto.lib', 'lib\VC\x64\MD\libcrypto.lib')) {
+                    if (Test-Path "$r\$rel") { return @{ Root = $r; Lib = "$r\$rel" } }
+                }
+            }
+            return $null
+        }
+        $roots = @("$env:ProgramFiles\OpenSSL", "$env:ProgramFiles\OpenSSL-Win64", 'C:\OpenSSL-Win64')
+        $ossl = Find-Crypto $roots
+        if (-not $ossl) {
+            choco install openssl -y --no-progress
+            $ossl = Find-Crypto $roots
+        }
+        if (-not $ossl) {
+            Write-Error "no OpenSSL with an x64 libcrypto.lib found (tried: $($roots -join ', '))"
+            exit 1
+        }
+        $cryptoDll = "$($ossl.Root)\bin\libcrypto-3-x64.dll"
+        if (-not (Test-Path $cryptoDll)) {
+            Write-Error "libcrypto-3-x64.dll not found under $($ossl.Root)\bin; tss2-esys.dll would not load at runtime"
+            exit 1
+        }
+        New-Item -ItemType Directory -Force -Path 'C:\ossl\lib', 'C:\ossl\bin' | Out-Null
+        Copy-Item -Recurse -Force "$($ossl.Root)\include" 'C:\ossl\include'
+        Copy-Item $ossl.Lib 'C:\ossl\lib\libcrypto.lib'
+        Copy-Item $cryptoDll 'C:\ossl\bin\'
+        Write-Host "==> OpenSSL normalised from $($ossl.Root) into C:\ossl"
+
+        # Keep the license texts where the release packaging step can
+        # pick them up: tpm2-tss is BSD-2-Clause (LICENSE in the source
+        # snapshot), OpenSSL 3 is Apache-2.0. If the OpenSSL install
+        # carries no license file, reproduce the Apache-2.0 text from
+        # the repo's own LICENSE (same license) with a provenance line.
+        $lic = @("$($ossl.Root)\license.txt", "$($ossl.Root)\LICENSE.txt", "$($ossl.Root)\LICENSE") |
+            Where-Object { Test-Path $_ } | Select-Object -First 1
+        if ($lic) {
+            Copy-Item $lic 'C:\ossl\LICENSE-OPENSSL.txt'
+        } else {
+            $hdr = "OpenSSL 3 is distributed under the Apache License 2.0, reproduced below.`r`nSource: https://github.com/openssl/openssl`r`n`r`n"
+            Set-Content 'C:\ossl\LICENSE-OPENSSL.txt' ($hdr + (Get-Content LICENSE -Raw))
+        }
+
+        # tpm2-tss's VS solution hardcodes the OpenSSL location in a
+        # props file; point it at the normalised dir.
+        $props = "$src\src\tss2-esys\openssl.props"
+        (Get-Content $props -Raw).Replace('C:\OpenSSL-v11-Win64', 'C:\ossl') | Set-Content $props -NoNewline
+
+        # c. libclang for bindgen: Windows has no pregenerated bindings
+        #    in tss-esapi-sys, so its Windows flavour always runs
+        #    bindgen. The runner's LLVM install works; fall back to
+        #    VS 2022's own copy.
+        $cands = @("$env:ProgramFiles\LLVM\bin") +
+            (Get-ChildItem "$env:ProgramFiles\Microsoft Visual Studio\2022\*\VC\Tools\Llvm\x64\bin" -ErrorAction SilentlyContinue | ForEach-Object FullName)
+        $libclang = $cands | Where-Object { Test-Path "$_\libclang.dll" } | Select-Object -First 1
+        if (-not $libclang) {
+            Write-Error "no libclang.dll found (tried: $($cands -join ', '))"
+            exit 1
+        }
+
+        "TPM2_TSS_SOURCE_PATH=$src" >> $env:GITHUB_ENV
+        "LIBCLANG_PATH=$libclang" >> $env:GITHUB_ENV
+        Write-Host "==> TPM2_TSS_SOURCE_PATH=$src"
+        Write-Host "==> LIBCLANG_PATH=$libclang"

@@ -22,10 +22,45 @@ If you only want to **run** a prebuilt binary, jump to
 - A C toolchain (`cc` / `clang` / MSVC), required by `bindgen` for the
   libfido2 FFI bindings and by some sys crates.
 
-The CLI's default feature set is `["hardware"]`, which links against
-**libfido2** (Yubico's reference C library). If you don't need YubiKey
-support, build with `--no-default-features` and skip every libfido2
-dependency in this guide.
+The CLI's default feature set is `["fido2-hardware", "fuse",
+"winfsp"]`. `fido2-hardware` links against **libfido2** (Yubico's
+reference C library) on Linux and macOS and uses `webauthn.dll` on
+Windows. If you don't need YubiKey support, build with
+`--no-default-features` and skip every libfido2 dependency in this
+guide.
+
+TPM 2.0 keyslots are opt-in on every platform:
+
+- `--features hardware` (FIDO2 + TPM + SEP) links the SYSTEM
+  tpm2-tss and needs tpm2-tss >= 4.1.3 installed (Debian 13+,
+  Ubuntu 24.10+, Fedora 40+, Arch).
+- `--features bundled-tpm` compiles a vendored tpm2-tss 4.1.3
+  during `cargo build` instead. Use it on LTS distros whose system
+  tpm2-tss is older (Ubuntu 22.04 ships 3.2, 24.04 ships 4.0.1) and
+  on Windows, which has no system tpm2-tss at all. On Linux it
+  needs the autotools stack on top of the base dependencies:
+
+  ```bash
+  sudo apt install -y autoconf automake libtool libltdl-dev \
+      autoconf-archive libjson-c-dev uuid-dev
+  ```
+
+  (`libltdl-dev` matters: tpm2-tss's `configure.ac` uses the
+  `LT_LIB_DLLOAD` macro, which Debian and Ubuntu ship in
+  `libltdl-dev`'s `ltdl.m4`, not in the base `libtool` package.
+  Without it, `bootstrap` fails with "possibly undefined macro:
+  LT_LIB_DLLOAD". `uuid-dev` is a plain configure-time requirement
+  of tpm2-tss.)
+
+  The vendored libraries are built static-only, so the resulting
+  binary embeds the tss2 core at 4.1.3 and has no `libtss2-*.so`
+  runtime dependency; at runtime only the small TCTI module (for
+  example `libtss2-tcti-device.so.0` on Linux, from the distro's
+  tpm2-tss packages) is loaded when a TPM slot is actually used.
+  The jammy and noble release lanes and the Windows release
+  binaries are built this way (see
+  `.github/workflows/release.yml`); the Windows specifics are in
+  the Windows section below.
 
 ### Optional, app icons
 

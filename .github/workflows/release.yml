@@ -329,6 +329,23 @@ jobs:
         # time out trying to fetch from ports.ubuntu.com's IPv6
         # addresses, which the runner network can't route to.
         uses: ./.github/actions/apt-install
+        # The autotools stack (autoconf / automake / libtool /
+        # libltdl-dev / autoconf-archive) plus libjson-c-dev and
+        # uuid-dev are for the jammy + noble lanes, whose feature list
+        # below is `bundled-tpm`: the tss-esapi-sys build script
+        # compiles a vendored tpm2-tss 4.1.3 via autotools at build
+        # time because those distros' system tpm2-tss (3.2 / 4.0.1) is
+        # below the 4.1.3 floor tss-esapi 8.x imposes. libltdl-dev is
+        # load-bearing: tpm2-tss's configure.ac uses LT_LIB_DLLOAD,
+        # which Debian/Ubuntu ship in libltdl-dev's ltdl.m4, not in
+        # the base libtool package. The vendored build is static-only
+        # (the autotools crate configures --disable-shared), so those
+        # binaries embed the tss2 core libraries and have NO
+        # libtss2-*.so runtime dependency; only the TCTI module
+        # (libtss2-tcti-device.so.0) is dlopen()ed from the distro
+        # when a TPM slot is actually used. All of this is a harmless
+        # no-op on the trixie / resolute lanes, which system-link
+        # against libtss2-dev instead.
         with:
           packages: |
             pkg-config
@@ -339,6 +356,13 @@ jobs:
             libfuse3-dev
             libgtk-3-dev
             libtss2-dev
+            autoconf
+            automake
+            libtool
+            libltdl-dev
+            autoconf-archive
+            libjson-c-dev
+            uuid-dev
             libclang-dev
             imagemagick
 
@@ -653,17 +677,37 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          # Linux: hardware + fuse (libfido2 + libfuse3 from apt).
-          # winfsp is Windows-only, omit on Linux to avoid cargo
-          # tripping on the target-cfg'd optional dep.
-          echo "LUKSBOX_FEATURES=hardware,fuse" >> "$GITHUB_ENV"
+          # Linux: the TPM backend flavour depends on the lane's system
+          # tpm2-tss. tss-esapi 8.x needs tpm2-tss >= 4.1.3 at BUILD
+          # time; trixie and resolute ship it, so those lanes link the
+          # system libraries (`hardware`). jammy (3.2) and noble (4.0.1)
+          # are below the floor, so they build `bundled-tpm`: a
+          # vendored tpm2-tss 4.1.3 is compiled via autotools during
+          # `cargo build`. The vendored libraries are static-only, so
+          # the binary embeds the tss2 core at 4.1.3 and works
+          # regardless of the distro's older tpm2-tss runtime
+          # packages; only the TCTI module (libtss2-tcti-device.so.0)
+          # is dlopen()ed from the system, through the stable TCTI
+          # plugin ABI, when a TPM slot is actually used. winfsp is
+          # Windows-only, omit on Linux to avoid cargo tripping on the
+          # target-cfg'd optional dep.
+          case "${{ matrix.ubuntu_codename }}" in
+            jammy|noble)
+              echo "LUKSBOX_FEATURES=bundled-tpm,fuse" >> "$GITHUB_ENV" ;;
+            *)
+              echo "LUKSBOX_FEATURES=hardware,fuse" >> "$GITHUB_ENV" ;;
+          esac
 
       - name: Set Windows feature list
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # Windows: hardware + winfsp. Fuse is linux/macos-only.
-          echo "LUKSBOX_FEATURES=hardware,winfsp" >> "$GITHUB_ENV"
+          # Windows: bundled-tpm + winfsp. There is no system tpm2-tss
+          # on Windows at all, so the TPM backend is always the
+          # vendored MSBuild build (staged by the step below); the
+          # resulting tss2-*.dll closure is shipped inside the .zip and
+          # the MSI. Fuse is linux/macos-only.
+          echo "LUKSBOX_FEATURES=bundled-tpm,winfsp" >> "$GITHUB_ENV"
 
       - name: Windows deps (WinFsp)
         if: runner.os == 'Windows'
@@ -698,6 +742,16 @@ jobs:
           if (-not (Get-Command magick -ErrorAction SilentlyContinue)) {
               choco install imagemagick.tool -y --no-progress
           }
+
+      - name: Windows deps (tpm2-tss source + OpenSSL + libclang, for bundled-tpm)
+        # Stages what the `bundled-tpm` feature needs to compile
+        # tpm2-tss with MSBuild during `cargo build`, and exports
+        # TPM2_TSS_SOURCE_PATH + LIBCLANG_PATH. Shared with ci.yml's
+        # windows-tpm job via the composite action so the two can't
+        # drift; the recipe in prose lives in BUILDING.md
+        # "TPM 2.0 keyslots".
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/stage-tpm2-tss
 
       # ---- generated assets ---------------------------------------------------
 
@@ -1622,6 +1676,34 @@ jobs:
               exit 1
           }
 
+          # TPM 2.0 backend DLL closure. The bundled-tpm build linked
+          # luksbox against the tpm2-tss DLLs that MSBuild produced
+          # under TPM2_TSS_SOURCE_PATH; ship them next to the .exe
+          # (the application directory wins the DLL search order),
+          # plus OpenSSL's libcrypto that tss2-esys.dll imports.
+          # tss2-tcti-tbs.dll never appears in an import table
+          # (tss2-tctildr dlopen()s it at runtime) but is required for
+          # actual chip access through TBS. dist/luksbox.wxs references
+          # the same staged files for the MSI, so fail loudly here if
+          # any is missing rather than shipping a TPM-less artifact.
+          $tssBin = "$env:TPM2_TSS_SOURCE_PATH\x64\Release"
+          foreach ($dll in @('tss2-esys.dll', 'tss2-sys.dll', 'tss2-mu.dll',
+                             'tss2-tctildr.dll', 'tss2-tcti-tbs.dll')) {
+              if (-not (Test-Path "$tssBin\$dll")) {
+                  Write-Error "$dll not found in $tssBin; the bundled-tpm MSBuild step did not produce the full TPM DLL closure"
+                  exit 1
+              }
+              Copy-Item "$tssBin\$dll" staging/
+          }
+          if (-not (Test-Path 'C:\ossl\bin\libcrypto-3-x64.dll')) {
+              Write-Error "libcrypto-3-x64.dll missing from the staged OpenSSL dir"
+              exit 1
+          }
+          Copy-Item 'C:\ossl\bin\libcrypto-3-x64.dll' staging/
+          Copy-Item "$env:TPM2_TSS_SOURCE_PATH\LICENSE" 'staging\LICENSE-TPM2-TSS.txt'
+          Copy-Item 'C:\ossl\LICENSE-OPENSSL.txt' 'staging\LICENSE-OPENSSL.txt'
+          Write-Host "==> bundled TPM DLL closure from $tssBin"
+
           # Required files - the MSI hard-references them via the WiX
           # ComponentGroup, so a missing one in the repo would surface
           # as a cryptic WIX0103 several steps later. Fail loudly here
@@ -1676,7 +1758,14 @@ jobs:
             'GPLv3 with a special linking exception that explicitly',
             'permits this kind of bundling alongside non-GPL software.',
             'The full WinFsp license text is in LICENSE-WINFSP.txt;',
-            'source code at https://github.com/winfsp/winfsp.'
+            'source code at https://github.com/winfsp/winfsp.',
+            '',
+            'The tss2-*.dll files (tpm2-tss, BSD-2-Clause, see',
+            'LICENSE-TPM2-TSS.txt) and libcrypto-3-x64.dll (OpenSSL 3,',
+            'Apache-2.0, see LICENSE-OPENSSL.txt) provide the TPM 2.0',
+            'keyslot backend. Chip access goes through TPM Base',
+            'Services, which is built into Windows: nothing else to',
+            'install for TPM keyslots.'
           )
           Set-Content -Path "staging\README-PORTABLE-WINDOWS.txt" -Value $readme
 
@@ -1700,11 +1789,18 @@ jobs:
         shell: pwsh
         run: |
           # FIDO2 access on Windows now goes through webauthn.dll
-          # (a system DLL on every supported Windows), and WinFsp's
-          # winfsp-x64.dll is the only other non-system import. There
-          # are no vcpkg-statically-linked C libraries any more - that
-          # path was only ever used for libfido2, which we replaced
-          # with the WebAuthn API in luksbox-fido2/src/webauthn.rs.
+          # (a system DLL on every supported Windows). The expected
+          # non-system imports are WinFsp's winfsp-x64.dll and the
+          # tss2-*.dll TPM backend (both bundled in staging/ by the
+          # steps above). There are no vcpkg-statically-linked C
+          # libraries any more - that path was only ever used for
+          # libfido2, which we replaced with the WebAuthn API in
+          # luksbox-fido2/src/webauthn.rs.
+          #
+          # libcrypto-3-x64.dll stays on the blocklist on purpose: it
+          # is a transitive import of tss2-esys.dll (shipped for that
+          # reason), but luksbox.exe itself must never import OpenSSL
+          # directly - the Rust side is pure RustCrypto.
           #
           # Blocklist below catches:
           #   1. Stragglers from a pre-webauthn build accidentally
