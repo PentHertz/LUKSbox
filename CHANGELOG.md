@@ -14,6 +14,39 @@ canonical record.
 
 ---
 
+## [v0.4.0] - 2026-07-04
+
+First stable release of the v0.4.0 line. It promotes `v0.4.0-rc.3` to
+stable with no functional code changes since the candidate. This line
+brings macOS Secure Enclave keyslots up to parity with the TPM and
+FIDO2 backends, extends the mount-time symlink and inode guards to every
+frontend, and closes out the late-June audit passes. On-disk formats are
+unchanged from the v0.3 line: existing vaults, sidecars, and headers
+open without migration.
+
+Highlights across the v0.4.0 candidates (rc.1 through rc.3), grouped by
+theme. Full detail lives in the per-candidate entries below.
+
+- macOS Secure Enclave (SEP) keyslots on Apple Silicon and T2 Macs, with
+  13 keyslot kinds (plain, Touch ID, FIDO2 and passphrase fusions, and
+  ML-KEM-768 / ML-KEM-1024 hybrids), no external sidecar, and the SEP
+  material carried in an HMAC-covered in-header region.
+- macOS mount stability: FUSE-T and macFUSE fixes.
+- Mountpoint hardening (the `O_DIRECTORY | O_NOFOLLOW` symlink probe and
+  the pre-syscall inode re-probe) moved below every frontend, so TUI and
+  GUI mounts get the same protection the CLI already had.
+- Hybrid post-quantum sidecars are vault-bound on every non-deniable
+  create, enroll, and unlock path.
+- Every panic action now also destroys the crash-recovery sidecars, so
+  destruction can no longer be reversed from a `header-bak` mirror.
+- Hardened `.kyber` seed-file unlock: fallible KDF allocation and
+  zeroized intermediates.
+- Local-attacker TOCTOU fixes on the panic/destroy and deniable-mount
+  paths, plus canonicalised mountpoints in the Unix unmount helpers.
+- Dependency advisories cleared: the quick-xml pair (RUSTSEC-2026-0194 /
+  RUSTSEC-2026-0195) resolved without an ignore, plus `anyhow` and
+  `memmap2` updates.
+
 ## [v0.4.0-rc.3] - 2026-07-03
 
 Third release candidate for the v0.4.0 line, focused on hardening.
@@ -99,15 +132,21 @@ passphrase instead of silently encrypting under one.
 `cargo audit` flagged quick-xml 0.39.3 (RUSTSEC-2026-0194,
 RUSTSEC-2026-0195, both DoS-class, fixed in 0.41.0). Its only importer
 is the `wayland-scanner` proc macro, whose latest release pins the
-vulnerable line, so the importer is vendored in
-`third_party/wayland-scanner/` with a two-line patch (the quick-xml
-requirement and upstream's own API rename). quick-xml runs at compile
-time only and is never linked into shipped binaries, but the lockfile
-now carries 0.41.0 and the audit gate passes with no quick-xml
-ignores. Also updated `anyhow` (RUSTSEC-2026-0190) and `memmap2`
-(RUSTSEC-2026-0186), and moved the audit ignore file to
-`.cargo/audit.toml`, where cargo-audit actually reads it; the old
-root-level location was silently unused.
+vulnerable line, so `[patch.crates-io]` redirects wayland-scanner to a
+pinned commit on our fork at
+`https://github.com/PentHertz/wayland-rs`. The fork carries the
+wayland-scanner 0.31.10 release source with a two-line change: the
+quick-xml requirement bump and upstream master's own API rename
+(`xml_content()` to `xml10_content()`, identical semantics). The
+scanner has to stay on release-series source, because a master-based
+scanner generates bindings for unreleased wayland-backend APIs and
+breaks the released wayland crates that call it at build time.
+quick-xml runs at compile time only and is never linked into shipped
+binaries, but the lockfile now carries 0.41.0 and the audit gate
+passes with no quick-xml ignores. Also updated `anyhow`
+(RUSTSEC-2026-0190) and `memmap2` (RUSTSEC-2026-0186), and moved the
+audit ignore file to `.cargo/audit.toml`, where cargo-audit actually
+reads it; the old root-level location was silently unused.
 
 ### Fixed: macOS SEP follow-through and GUI polish
 

@@ -415,8 +415,8 @@ jobs:
   # winfsp_wrs on Windows) is documented in .cargo/audit.toml (the
   # only project-local path cargo-audit loads) and in SECURITY.md
   # "Unmaintained dependencies". The quick-xml advisory pair is
-  # resolved for real via the vendored wayland-scanner patch, see
-  # third_party/wayland-scanner/README.LUKSBOX.md. A new advisory
+  # resolved for real by pinning wayland-scanner to a patched fork
+  # commit (see the [patch.crates-io] comment in Cargo.toml). A new advisory
   # landing on a real (non-dev, non-Windows) dep makes this job
   # fail and the PR red.
   audit:
