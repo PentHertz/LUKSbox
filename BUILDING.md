@@ -57,6 +57,10 @@ TPM 2.0 keyslots are opt-in on every platform:
   runtime dependency; at runtime only the small TCTI module (for
   example `libtss2-tcti-device.so.0` on Linux, from the distro's
   tpm2-tss packages) is loaded when a TPM slot is actually used.
+  The repo's `.cargo/config.toml` sets `TSS2_*_STATIC=1` so the
+  probe emits the complete, correctly ordered static link closure
+  (including `-lcrypto`); build from the workspace root so that
+  config applies, or export those variables yourself.
   The jammy and noble release lanes and the Windows release
   binaries are built this way (see
   `.github/workflows/release.yml`); the Windows specifics are in
