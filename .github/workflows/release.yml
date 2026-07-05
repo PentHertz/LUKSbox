@@ -693,7 +693,26 @@ jobs:
           # target-cfg'd optional dep.
           case "${{ matrix.ubuntu_codename }}" in
             jammy|noble)
-              echo "LUKSBOX_FEATURES=bundled-tpm,fuse" >> "$GITHUB_ENV" ;;
+              echo "LUKSBOX_FEATURES=bundled-tpm,fuse" >> "$GITHUB_ENV"
+              # Force the tss-esapi-sys pkg-config probes of the
+              # vendored (static-only) tpm2-tss into STATIC mode.
+              # Dynamic mode never reads Libs.private (missing
+              # -lcrypto) and emits each -ltss2-* alone, which GNU ld
+              # resolves strictly left to right, so the aarch64 lanes
+              # die with "undefined reference to Tss2_Sys_*"; rust-lld
+              # (x86_64) only passes by being order-insensitive.
+              # Static mode expands each probe's full Requires /
+              # Libs.private closure in topological order. Mirrors the
+              # [env] block in .cargo/config.toml; kept here too so
+              # the release lanes never depend on that file being in
+              # sync. Scoped by library name, so nothing else is
+              # affected.
+              {
+                echo "TSS2_SYS_STATIC=1"
+                echo "TSS2_ESYS_STATIC=1"
+                echo "TSS2_MU_STATIC=1"
+                echo "TSS2_TCTILDR_STATIC=1"
+              } >> "$GITHUB_ENV" ;;
             *)
               echo "LUKSBOX_FEATURES=hardware,fuse" >> "$GITHUB_ENV" ;;
           esac
