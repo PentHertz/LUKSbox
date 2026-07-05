@@ -62,11 +62,18 @@ jobs:
     # order. Mirrors the [env] block in .cargo/config.toml; kept here
     # too so CI never depends on that file being in sync. Scoped by
     # library name, so the plain workspace lane is unaffected.
+    #
+    # CFLAGS: compile the vendored tpm2-tss without SM4, matching the
+    # release lanes. Ubuntu's OpenSSL ships SM4 but Fedora/RHEL's is
+    # built without it, so release binaries drop the EVP_sm4_cfb128
+    # dependency; CI builds the same shape so it tests what ships.
+    # LUKSbox only negotiates AES-CFB TPM sessions, nothing is lost.
     env:
       TSS2_SYS_STATIC: "1"
       TSS2_ESYS_STATIC: "1"
       TSS2_MU_STATIC: "1"
       TSS2_TCTILDR_STATIC: "1"
+      CFLAGS: "-DOPENSSL_NO_SM4"
     strategy:
       fail-fast: false
       matrix:
@@ -329,14 +336,16 @@ jobs:
   build:
     name: build (${{ matrix.target }})
     runs-on: ubuntu-22.04
-    # Static-mode pkg-config for the bundled-tpm lanes; see the
-    # comment on the `test` job's env block. Inert on the lanes that
-    # never compile tss-esapi-sys (cli-no-hardware, gui).
+    # Static-mode pkg-config + SM4-less vendored tpm2-tss for the
+    # bundled-tpm lanes; see the comment on the `test` job's env
+    # block. Inert on the lanes that never compile tss-esapi-sys
+    # (cli-no-hardware, gui).
     env:
       TSS2_SYS_STATIC: "1"
       TSS2_ESYS_STATIC: "1"
       TSS2_MU_STATIC: "1"
       TSS2_TCTILDR_STATIC: "1"
+      CFLAGS: "-DOPENSSL_NO_SM4"
     strategy:
       fail-fast: false
       matrix:

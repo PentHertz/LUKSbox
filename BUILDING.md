@@ -66,6 +66,18 @@ TPM 2.0 keyslots are opt-in on every platform:
   `.github/workflows/release.yml`); the Windows specifics are in
   the Windows section below.
 
+  Portability note: the embedded tpm2-tss calls OpenSSL through
+  the build host's `libcrypto`, so it inherits that build's
+  feature set. Ubuntu and Debian compile OpenSSL with SM4;
+  Fedora and RHEL do not, so a `bundled-tpm` binary built on
+  Ubuntu references `EVP_sm4_cfb128` and aborts with a symbol
+  lookup error the moment it starts on Fedora. If the binary
+  must run on Fedora/RHEL (the release lanes do this for the
+  .rpm artifacts), export `CFLAGS=-DOPENSSL_NO_SM4` before
+  building: tpm2-tss guards all SM4 code behind that macro and
+  falls back to "SM4 not implemented" at runtime. LUKSbox only
+  negotiates AES-CFB TPM sessions, so the feature loss is nil.
+
 ### Optional, app icons
 
 The Windows `.exe` icon and the macOS `.app` icon are derived from

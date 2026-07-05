@@ -707,11 +707,23 @@ jobs:
               # the release lanes never depend on that file being in
               # sync. Scoped by library name, so nothing else is
               # affected.
+              # Compile the vendored tpm2-tss without SM4 session
+              # encryption. Ubuntu's OpenSSL ships SM4, Fedora/RHEL's
+              # is built without it, so a bundled-tpm binary compiled
+              # here would carry an EVP_sm4_cfb128 reference that
+              # Fedora's libcrypto.so.3 cannot satisfy ("symbol lookup
+              # error" the moment the .rpm-installed binary starts).
+              # tpm2-tss guards every SM4 path with
+              # !defined(OPENSSL_NO_SM4) and NULLs the callback when
+              # absent; LUKSbox only ever negotiates AES-CFB TPM
+              # sessions, so nothing is lost. The autotools crate
+              # appends $CFLAGS to the vendored configure invocation.
               {
                 echo "TSS2_SYS_STATIC=1"
                 echo "TSS2_ESYS_STATIC=1"
                 echo "TSS2_MU_STATIC=1"
                 echo "TSS2_TCTILDR_STATIC=1"
+                echo "CFLAGS=-DOPENSSL_NO_SM4"
               } >> "$GITHUB_ENV" ;;
             *)
               echo "LUKSBOX_FEATURES=hardware,fuse" >> "$GITHUB_ENV" ;;
