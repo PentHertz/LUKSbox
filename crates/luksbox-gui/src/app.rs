@@ -1557,6 +1557,31 @@ impl Drop for MountBackend {
     }
 }
 
+/// Canonical absolute paths for the GNOME/GIO mount helper. Hard-coded
+/// allow-list, NOT a `$PATH` lookup, to close the PATH-hijack class
+/// flagged by CVE-2024-54187 (VeraCrypt 1.26.18). This is the same
+/// control `resolved_unmount_program`
+/// (`crates/luksbox-mount/src/fuse.rs`) and `resolved_default_app_opener`
+/// apply to their helpers; the `gio` fallback below must not be the one
+/// spawn that reopens the `$PATH` lookup, especially since it runs
+/// routinely (the busy-mount case) and is retried every couple of
+/// seconds by the quit loop, inside the process that holds the unlocked
+/// vault key.
+#[cfg(all(unix, not(target_os = "macos")))]
+const GIO_CANDIDATES: &[&str] = &["/usr/bin/gio", "/bin/gio", "/usr/local/bin/gio"];
+
+/// Resolve `gio` to an absolute path, or `None` when it is not installed
+/// at a standard location. Never falls back to a `$PATH` lookup; the
+/// caller simply reports the direct unmount error instead.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn resolved_gio_program() -> Option<std::path::PathBuf> {
+    GIO_CANDIDATES
+        .iter()
+        .map(std::path::Path::new)
+        .find(|p| p.is_file())
+        .map(|p| p.to_path_buf())
+}
+
 /// Unmount `mp`, working around desktop file managers that hold the
 /// browsed mountpoint busy (issue #25 follow-up).
 ///
@@ -1570,11 +1595,19 @@ impl Drop for MountBackend {
 /// reporting the direct error.
 fn unmount_with_desktop_fallback(mp: &std::path::Path) -> Result<(), String> {
     let direct = luksbox_mount::unmount(mp);
+    // Retry through GIO when the direct unmount is refused, but resolve
+    // `gio` to a vetted absolute path first (a bare `Command::new("gio")`
+    // would go through `$PATH`, the PATH-hijack the rest of the tree
+    // refuses), and canonicalize the mountpoint so a target beginning
+    // with `-` can never reach `gio` in a flag position.
     #[cfg(all(unix, not(target_os = "macos")))]
     if direct.is_err()
-        && let Ok(status) = std::process::Command::new("gio")
-            .args(["mount", "-u"])
-            .arg(mp)
+        && let Some(gio) = resolved_gio_program()
+        && let Ok(target) = mp.canonicalize()
+        && let Ok(status) = std::process::Command::new(&gio)
+            .arg("mount")
+            .arg("-u")
+            .arg(&target)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()

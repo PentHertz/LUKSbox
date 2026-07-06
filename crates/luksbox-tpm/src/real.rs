@@ -31,7 +31,7 @@ use tss_esapi::{
     Context, TctiNameConf,
     attributes::ObjectAttributesBuilder,
     constants::SessionType,
-    handles::{ObjectHandle, SessionHandle},
+    handles::{KeyHandle, ObjectHandle, SessionHandle},
     interface_types::{
         algorithm::{HashingAlgorithm, PublicAlgorithm},
         ecc::EccCurve,
@@ -128,18 +128,29 @@ impl Tpm2Sealer {
         plaintext: &[u8; SEALED_SECRET_LEN],
         pin: Option<&[u8]>,
     ) -> Result<SealedBlob, Error> {
-        // Need an HMAC session for command/response auth; without one
-        // any subsequent `Esys_Create` rejects with TPM_RC_AUTH_MISSING.
-        let session = self.start_hmac_session()?;
-        self.ctx.set_sessions((Some(session), None, None));
+        // Create the SRK FIRST. CreatePrimary authorizes the Owner
+        // hierarchy with the default (empty) password session and
+        // carries no sensitive data across the bus (the SRK is
+        // sensitive_data_origin, so the chip generates the key
+        // internally), so it needs no encrypted session. We need the
+        // SRK handle to SALT the HMAC session below, which is what
+        // makes that session's parameter encryption effective against
+        // a TPM-bus interposer (see `start_hmac_session`).
+        let primary = self.create_srk()?;
 
-        let primary = match self.create_srk(session) {
-            Ok(p) => p,
+        // Salted HMAC session for command/response auth AND parameter
+        // encryption. Without a session any subsequent `Esys_Create`
+        // rejects with TPM_RC_AUTH_MISSING; without the SRK salt the
+        // encryption would be decorative (recoverable on the bus).
+        let session = match self.start_hmac_session(primary.key_handle) {
+            Ok(s) => s,
             Err(e) => {
-                self.flush_session(session);
+                let _ = self.ctx.flush_context(primary.key_handle.into());
                 return Err(e);
             }
         };
+        self.ctx.set_sessions((Some(session), None, None));
+
         let result = self.create_sealed_object(primary.key_handle.into(), plaintext, pin);
 
         // Flush the SRK transient handle and the HMAC session so we
@@ -188,16 +199,19 @@ impl Tpm2Sealer {
         blob: &SealedBlob,
         pin: Option<&[u8]>,
     ) -> Result<Zeroizing<[u8; SEALED_SECRET_LEN]>, Error> {
-        let session = self.start_hmac_session()?;
-        self.ctx.set_sessions((Some(session), None, None));
-
-        let primary = match self.create_srk(session) {
-            Ok(p) => p,
+        // SRK first, then a salted HMAC session (see `seal_with_pin`
+        // and `start_hmac_session` for why the salt is load-bearing:
+        // it protects the unsealed 32-byte secret as it crosses the
+        // bus in the Esys_Unseal response).
+        let primary = self.create_srk()?;
+        let session = match self.start_hmac_session(primary.key_handle) {
+            Ok(s) => s,
             Err(e) => {
-                self.flush_session(session);
+                let _ = self.ctx.flush_context(primary.key_handle.into());
                 return Err(e);
             }
         };
+        self.ctx.set_sessions((Some(session), None, None));
 
         // Everything fallible from here runs inside the closure so
         // the handle flushes below execute on EVERY path. The wrong-
@@ -284,11 +298,28 @@ impl Tpm2Sealer {
         let _ = self.ctx.flush_context(SessionHandle::from(session).into());
     }
 
-    fn start_hmac_session(&mut self) -> Result<AuthSession, Error> {
+    /// Start the per-operation HMAC session, SALTED against the SRK's
+    /// public area (`salt_key`). The salt is what makes this session's
+    /// parameter encryption (`with_encrypt` / `with_decrypt` below)
+    /// actually protect the sealed secret on the TPM bus. It is
+    /// established by ECDH to the SRK's public point, so the derived
+    /// session key depends on the SRK private key that never leaves the
+    /// chip. An unsalted, unbound session (`start_auth_session(None,
+    /// None, ...)`) has an empty session key, so its CFB parameter-
+    /// encryption key derives from the two nonces alone, both of which
+    /// cross the bus in cleartext; a passive LPC/SPI interposer could
+    /// then recompute it and read the 32-byte KEK as it transits in the
+    /// Esys_Create / Esys_Unseal parameter. Salting against the SRK is
+    /// the same protection systemd-cryptenroll uses. The SRK is a
+    /// restricted ECC decryption (storage) key, a valid salt key per
+    /// the TCG spec; the caller must create it first and pass its
+    /// handle here (matters only for a discrete TPM with a physically
+    /// reachable bus; firmware TPMs expose none).
+    fn start_hmac_session(&mut self, salt_key: KeyHandle) -> Result<AuthSession, Error> {
         let session = self
             .ctx
             .start_auth_session(
-                None,
+                Some(salt_key),
                 None,
                 None,
                 SessionType::Hmac,
@@ -311,7 +342,7 @@ impl Tpm2Sealer {
     /// Owner hierarchy. Same template as systemd-cryptenroll uses;
     /// deterministic from the TPM's primary seed, so re-derives
     /// identically on every call.
-    fn create_srk(&mut self, _session: AuthSession) -> Result<CreatePrimaryKeyResult, Error> {
+    fn create_srk(&mut self) -> Result<CreatePrimaryKeyResult, Error> {
         let object_attributes = ObjectAttributesBuilder::new()
             .with_fixed_tpm(true)
             .with_fixed_parent(true)

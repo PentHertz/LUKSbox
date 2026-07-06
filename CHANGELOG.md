@@ -14,6 +14,47 @@ canonical record.
 
 ---
 
+## [v0.5.0-rc.2] - 2026-07-06
+
+Supersedes rc.1 with two fixes from a full-application security review.
+No functional or on-disk-format changes otherwise: everything in the
+rc.1 entry below still applies, and vaults, sidecars, and headers open
+without migration.
+
+### Security: GIO unmount fallback resolves its helper by absolute path
+
+The busy-mount GIO fallback added in rc.1 spawned the helper as a bare
+`gio`, which resolves through `$PATH`. That reopened the PATH-hijack
+class (CVE-2024-54187) that the rest of the codebase deliberately
+closes: the direct unmount helper (`resolved_unmount_program`) and the
+file-manager opener (`resolved_default_app_opener`) both resolve only
+hard-coded absolute paths and refuse a `$PATH` lookup. Because the
+fallback runs routinely (the busy-mount case) and is retried every
+couple of seconds by the quit loop inside the process holding the
+unlocked vault key, a writable directory earlier on `$PATH` could have
+run an attacker's `gio` as the user. The fallback now resolves `gio` to
+a vetted absolute path (`/usr/bin/gio`, `/bin/gio`,
+`/usr/local/bin/gio`) and refuses the `$PATH` fallback, and it
+canonicalizes the mountpoint before passing it so a target beginning
+with `-` can never land in a flag position.
+
+### Security: TPM 2.0 sessions are salted against the SRK
+
+The TPM 2.0 HMAC session (Linux and the new Windows TBS path) was
+started unsalted and unbound, so its parameter encryption gave no real
+confidentiality: for an unsalted session the AES-CFB key derives from
+the two session nonces alone, both of which cross the TPM bus in
+cleartext, letting a passive LPC/SPI bus interposer on a discrete TPM
+recompute it and read the 32-byte wrap key as it transits in
+`Esys_Create` (seal) and `Esys_Unseal`. The session is now salted
+against the SRK's public area (the same protection systemd-cryptenroll
+uses), which ties the session key to the SRK private key that never
+leaves the chip. Firmware TPMs (Intel PTT, AMD fTPM) were never exposed
+to this because they have no external bus; the fix closes the gap for
+discrete-TPM users.
+
+---
+
 ## [v0.5.0-rc.1] - 2026-07-06
 
 First release candidate for the v0.5.0 line. The headline is Windows

@@ -266,6 +266,18 @@ register values (PCR0 = firmware, PCR2 = OS loader, PCR4 = kernel,
 PCR7 = secure-boot policy) to match the values measured at enroll
 time.
 
+**Distinct from TPM bus protection, which already ships.** PCR sealing
+is about *who*, and *in what boot state*, may unseal. It is a separate
+axis from the confidentiality of the wrap key *on the TPM bus*, which
+is already handled: since v0.5.0-rc.2 the per-operation HMAC session is
+salted against the SRK, so a passive LPC/SPI interposer on a discrete
+TPM cannot read the wrap key in transit (see SECURITY.md section 6.x
+and the `start_hmac_session` doc comment in
+`crates/luksbox-tpm/src/real.rs`). The "empty policy" gap this section
+addresses is access control on the sealed object, not bus
+eavesdropping; closing it does not change the bus protection and vice
+versa.
+
 Trade-offs:
 
 - **Pro**: vault refuses to open if the boot chain has been tampered

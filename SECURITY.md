@@ -799,6 +799,28 @@ risk first.
       attempts -> multi-hour lockout, eventually permanent)
       means even a weak passphrase is effectively uncrackable
       on the original hardware.
+    - TPM bus protection via salted sessions (Linux and Windows,
+      shipped in v0.5.0-rc.2). Every TPM command that carries the
+      32-byte wrap key runs inside an HMAC session with parameter
+      encryption turned on, and that session is **salted against the
+      SRK's public area**. Salting is what makes the encryption real:
+      the session key is established by ECDH to the SRK public point,
+      so it depends on the SRK private key that never leaves the chip.
+      A passive LPC/SPI bus interposer on a discrete TPM therefore
+      cannot recover the wrap key from the seal (`Esys_Create`) or
+      unlock (`Esys_Unseal`) traffic, even though both the command
+      and response nonces cross the bus in cleartext. An unsalted,
+      unbound session would derive its parameter-encryption key from
+      those two public nonces alone and provide no bus
+      confidentiality at all (the interposer would just recompute it);
+      this is the gap v0.5.0-rc.2 closes, and it matches the
+      protection systemd-cryptenroll applies. Firmware TPMs (Intel
+      PTT / AMD fTPM) have no external bus and were never exposed;
+      Apple's Secure Enclave is likewise an on-die coprocessor with
+      no interposable bus, so the macOS SEP keyslots do not need (and
+      do not have) an equivalent session, and are not affected by
+      this class of attack. See the `start_hmac_session` doc comment
+      in `crates/luksbox-tpm/src/real.rs` for the implementation.
 
     The right native path on each platform is **hardware-isolated
     key wrapping** (a separate co-processor holds the wrap key; the
