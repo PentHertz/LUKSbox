@@ -120,6 +120,37 @@ rust-lld link, Fedora runtime).
   autoconf-archive, libjson-c-dev, uuid-dev) and the cross-distro
   portability note.
 
+### Fixed: closing the GUI window no longer strands a live mount (#25)
+
+Closing the GUI window while a vault was mounted simply exited: the
+in-process mount thread died with the process, programs browsing the
+mount saw I/O errors, and the mountpoint was left behind in a
+"Transport endpoint is not connected" state until a manual
+`fusermount3 -u` (reported on Debian in issue #25). The window close
+is now intercepted while a mount session is live and a confirmation
+dialog offers "Unmount and quit" (the app closes as soon as the same
+clean teardown the Unmount button uses has finished), "Quit without
+unmounting" (the old behavior, now an explicit choice), and
+"Cancel". Vault integrity was never at risk on default-format vaults
+(the v0.2.1 crash-safety mirrors cover the force-quit-mid-write
+class); the fix removes the data-in-flight loss window and the
+stranded mountpoint. The intercept covers the window close button
+and Ctrl+Q on all three platforms (FUSE, FUSE-T, WinFsp).
+
+Busy mountpoints are handled too. On GNOME desktops (Ubuntu's
+default) the file-manager window browsing the mount holds it open,
+so the direct `fusermount3 -u` is refused with "Device or resource
+busy"; the GUI used to discard that refusal and sit on
+"Unmounting..." forever. A refused attempt is now reported in the
+mounted panel and in the quit dialog with what to do about it, it
+re-enables the Unmount button, and the quit path retries
+automatically every couple of seconds, so closing the file-manager
+window is enough for the app to finish unmounting and leave on its
+own. When the direct unmounter is refused, LUKSbox also retries
+through GIO (`gio mount -u`, the same path as the file manager's
+Eject button, which asks applications to release the mount before
+unmounting).
+
 ---
 
 ## [v0.4.0] - 2026-07-04

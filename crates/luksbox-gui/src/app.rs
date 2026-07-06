@@ -1274,6 +1274,19 @@ pub struct LuksboxApp {
     /// it from `poll_mount` once the mount session has fully torn down, so
     /// the new vault never inherits the old mount's "Vault mounted" panel.
     nav_after_unmount: Option<NavigateAction>,
+    /// Window-close intercept (issue #25). Closing the window while a
+    /// vault was mounted used to just exit: the in-process mount
+    /// thread died with the process, programs browsing the mount got
+    /// I/O errors, and the mountpoint was left in a broken
+    /// "Transport endpoint is not connected" state. `close_confirm`
+    /// shows the confirmation modal after an intercepted close.
+    close_confirm: bool,
+    /// The user picked "Unmount and quit" in the close modal: close
+    /// the window as soon as the mount session ends.
+    quit_after_unmount: bool,
+    /// The user picked "Quit without unmounting": let the next close
+    /// request through unchallenged.
+    force_close: bool,
     /// Active clipboard auto-clear job. `Some` between the moment the
     /// user clicks "Copy to clipboard" and the deadline (default 30 s
     /// later). The per-frame `tick_clipboard_guard` checks expiry and
@@ -1476,6 +1489,19 @@ struct MountStatus {
     mountpoint: PathBuf,
     backend: MountBackend,
     unmount_requested: bool,
+    /// Result channel of the in-flight unmount attempt. `Some` while
+    /// the helper thread is running. Ok means the unmounter accepted
+    /// (the session end then arrives through `backend`); Err re-arms
+    /// the Unmount button and is surfaced in the mounted panel and
+    /// the quit dialog.
+    unmount_rx: Option<std::sync::mpsc::Receiver<Result<(), String>>>,
+    /// Most recent refused unmount attempt (typically "Device or
+    /// resource busy" because a file manager is browsing the
+    /// mountpoint). Cleared when a new attempt starts.
+    unmount_error: Option<String>,
+    /// When the last attempt started; throttles the auto-retry loop
+    /// that runs while "Unmount and quit" is armed.
+    last_unmount_attempt: Option<std::time::Instant>,
 }
 
 /// Backend-specific transport for the running mount session.
@@ -1529,6 +1555,34 @@ impl Drop for MountBackend {
             }
         }
     }
+}
+
+/// Unmount `mp`, working around desktop file managers that hold the
+/// browsed mountpoint busy (issue #25 follow-up).
+///
+/// `luksbox_mount::unmount` runs the platform unmounter directly
+/// (`fusermount3 -u` on Linux), which is refused with "Device or
+/// resource busy" while a file manager is displaying the directory.
+/// GNOME Files' sidebar Eject succeeds in the same situation because
+/// it goes through GIO, which first asks GIO apps to release the
+/// mount and unmounts afterwards. So when the direct call fails and
+/// `gio` is available, retry through that same polite path before
+/// reporting the direct error.
+fn unmount_with_desktop_fallback(mp: &std::path::Path) -> Result<(), String> {
+    let direct = luksbox_mount::unmount(mp);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if direct.is_err()
+        && let Ok(status) = std::process::Command::new("gio")
+            .args(["mount", "-u"])
+            .arg(mp)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+        && status.success()
+    {
+        return Ok(());
+    }
+    direct.map_err(|e| e.to_string())
 }
 
 #[derive(Clone)]
@@ -1590,6 +1644,9 @@ impl LuksboxApp {
             pending_picker: None,
             confirm_lock: None,
             nav_after_unmount: None,
+            close_confirm: false,
+            quit_after_unmount: false,
+            force_close: false,
             clipboard_guard: None,
             prefs: preferences::load(),
             pending_clipboard_warning: None,
@@ -1842,6 +1899,42 @@ impl eframe::App for LuksboxApp {
             && let Some(action) = self.nav_after_unmount.take()
         {
             self.execute_navigate(action);
+        }
+        // Issue #25: closing the window while a vault is mounted used
+        // to just exit. The in-process mount thread died with the
+        // process, so the file manager saw I/O errors and the
+        // mountpoint stayed behind in a "Transport endpoint is not
+        // connected" state (AutoUnmount is deliberately off, see
+        // luksbox-mount/src/fuse.rs). Intercept the close and route
+        // it through the same clean unmount as the Unmount button;
+        // `force_close` is the explicit "Quit without unmounting"
+        // override from the modal.
+        if ctx.input(|i| i.viewport().close_requested())
+            && self.mount_status.is_some()
+            && !self.force_close
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.close_confirm = true;
+        }
+        if self.quit_after_unmount && self.mount_status.is_none() {
+            // The unmount requested from the close modal has finished
+            // (poll_mount cleared the session); leave for real now.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        // While "Unmount and quit" is armed, keep retrying a refused
+        // unmount (mountpoint busy, usually a file-manager window
+        // browsing it) every couple of seconds: the moment the user
+        // closes that window, the next attempt succeeds and the app
+        // leaves on its own instead of waiting for another click.
+        let retry_unmount = self.quit_after_unmount
+            && self.mount_status.as_ref().is_some_and(|ms| {
+                !ms.unmount_requested
+                    && ms
+                        .last_unmount_attempt
+                        .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
+            });
+        if retry_unmount {
+            self.request_unmount();
         }
         self.poll_picker();
         // Clipboard auto-clear runs on every frame because the deadline
@@ -7040,6 +7133,9 @@ impl LuksboxApp {
             mountpoint,
             backend,
             unmount_requested: false,
+            unmount_rx: None,
+            unmount_error: None,
+            last_unmount_attempt: None,
         });
     }
 
@@ -7051,6 +7147,7 @@ impl LuksboxApp {
         };
         let mp = ms.mountpoint.display().to_string();
         let pending_unmount = ms.unmount_requested;
+        let unmount_error = ms.unmount_error.clone();
 
         ui.label(
             RichText::new("Vault mounted")
@@ -7149,17 +7246,34 @@ impl LuksboxApp {
         if pending_unmount {
             ui.add_space(14.0);
             #[cfg(target_os = "windows")]
-            let msg = "Signaled WinFsp to stop the dispatcher; the mount \
-                       thread will exit once all open file handles in \
-                       your file manager are closed.";
+            let msg = "Signaled WinFsp to stop the dispatcher; if a \
+                       program still has files open on the mount the \
+                       attempt is refused and reported here.";
             #[cfg(target_os = "macos")]
-            let msg = "Sent umount; the mount thread will exit once all \
-                       open file handles in Finder are closed.";
+            let msg = "Running umount; if a program still has files \
+                       open on the mount the attempt is refused and \
+                       reported here.";
             #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-            let msg = "Sent fusermount3 -u; the mount thread will exit \
-                       once all open file handles in your file manager \
-                       are closed.";
+            let msg = "Running fusermount3 -u; if a program still has \
+                       the mountpoint open the attempt is refused and \
+                       reported here.";
             ui.label(RichText::new(msg).color(theme::FAINT).size(12.0));
+        } else if let Some(err) = &unmount_error {
+            // A previous attempt was refused (issue #25 follow-up:
+            // this used to be silently discarded, leaving the UI
+            // stuck on "Unmounting..." with no explanation). The
+            // button above is re-enabled for another attempt.
+            ui.add_space(14.0);
+            ui.label(
+                RichText::new(format!(
+                    "Unmount refused: {err}. A program is still using \
+                     the mountpoint, usually the file-manager window \
+                     browsing it. Close that window and click Unmount \
+                     again, or eject the mount from the file manager.",
+                ))
+                .color(theme::DANGER)
+                .size(12.0),
+            );
         }
     }
 
@@ -7171,9 +7285,17 @@ impl LuksboxApp {
             return;
         }
         ms.unmount_requested = true;
+        ms.unmount_error = None;
+        ms.last_unmount_attempt = Some(std::time::Instant::now());
+        // Report the attempt's outcome instead of discarding it: a
+        // refused unmount (mountpoint busy) used to leave the UI
+        // claiming "Unmounting..." forever with no hint why (issue
+        // #25 follow-up). poll_mount() drains this channel.
+        let (tx, rx) = std::sync::mpsc::channel();
+        ms.unmount_rx = Some(rx);
         let mp = ms.mountpoint.clone();
         std::thread::spawn(move || {
-            let _ = luksbox_mount::unmount(&mp);
+            let _ = tx.send(unmount_with_desktop_fallback(&mp));
         });
     }
 
@@ -7192,6 +7314,27 @@ impl LuksboxApp {
         let Some(ms) = self.mount_status.as_mut() else {
             return;
         };
+        // Drive the in-flight unmount attempt, if any. Ok: the
+        // unmounter accepted, the session end arrives through the
+        // backend arm below. Err: surface it and re-arm the Unmount
+        // button (the quit path in `ui()` also auto-retries off it).
+        let unmount_res = ms.unmount_rx.as_ref().map(|rx| rx.try_recv());
+        match unmount_res {
+            Some(Ok(Ok(()))) => {
+                ms.unmount_rx = None;
+            }
+            Some(Ok(Err(e))) => {
+                ms.unmount_rx = None;
+                ms.unmount_requested = false;
+                ms.unmount_error = Some(e);
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                ms.unmount_rx = None;
+                ms.unmount_requested = false;
+                ms.unmount_error = Some("unmount helper thread died".into());
+            }
+            Some(Err(std::sync::mpsc::TryRecvError::Empty)) | None => {}
+        }
         match &mut ms.backend {
             MountBackend::InProcess { rx } => match rx.try_recv() {
                 Ok(Ok(())) => {
@@ -8437,6 +8580,162 @@ impl LuksboxApp {
             None => {}
         }
     }
+
+    /// Issue #25 modal: the user tried to close the window while a
+    /// vault is mounted. Renders only while `close_confirm` is set AND
+    /// a mount session is still live; if the session ends while the
+    /// modal is up, the intercept in `ui()` closes the window (when
+    /// "Unmount and quit" was picked) or the modal simply goes away.
+    fn draw_close_confirm_modal(&mut self, ctx: &egui::Context) {
+        if !self.close_confirm {
+            return;
+        }
+        let Some(ms) = self.mount_status.as_ref() else {
+            self.close_confirm = false;
+            return;
+        };
+        let mp = ms.mountpoint.display().to_string();
+        // "Unmount and quit" was already clicked: freeze the primary
+        // button (the retry loop in `ui()` re-attempts on its own) and
+        // show progress / the refusal reason instead.
+        let unmounting = self.quit_after_unmount;
+        let unmount_error = ms.unmount_error.clone();
+
+        enum Choice {
+            UnmountQuit,
+            ForceQuit,
+            Cancel,
+        }
+        let mut choice: Option<Choice> = None;
+
+        let modal = egui::Modal::new(egui::Id::new("close-confirm-modal"))
+            .frame(
+                Frame::default()
+                    .fill(theme::PANEL)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(20),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(capped_width(ui, 460.0));
+                ui.label(
+                    RichText::new("Unmount before quitting?")
+                        .size(16.0)
+                        .strong(),
+                );
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "The vault mounted at {mp} is still live. Quitting now would \
+                         rip the mount out from under any program using it (your file \
+                         manager would see I/O errors) and leave the mountpoint \
+                         unusable until it is unmounted manually. Unmounting first \
+                         flushes pending writes and tears the mount down cleanly."
+                    ))
+                    .color(theme::DIM)
+                    .size(12.0),
+                );
+                ui.add_space(14.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                if unmounting {
+                    if let Some(err) = &unmount_error {
+                        ui.label(
+                            RichText::new(format!(
+                                "The system refused the unmount ({err}). A program \
+                                 is still using the mountpoint, usually the \
+                                 file-manager window browsing it. Close that window \
+                                 or tab, or use its Eject button; LUKSbox retries \
+                                 every couple of seconds and quits as soon as the \
+                                 unmount succeeds.",
+                            ))
+                            .color(theme::DANGER)
+                            .size(12.0),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(
+                                "Unmounting; the app closes when the mount thread \
+                                 exits.",
+                            )
+                            .color(theme::FAINT)
+                            .size(12.0),
+                        );
+                    }
+                    ui.add_space(6.0);
+                }
+                let primary_label = if unmounting {
+                    "Unmounting..."
+                } else {
+                    "Unmount and quit"
+                };
+                if ui
+                    .add_enabled_ui(!unmounting, |ui| {
+                        ui.add_sized(
+                            [capped_width(ui, 420.0), 30.0],
+                            primary_button(primary_label),
+                        )
+                    })
+                    .inner
+                    .clicked()
+                {
+                    choice = Some(Choice::UnmountQuit);
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_sized(
+                        [capped_width(ui, 420.0), CONTROL_H],
+                        egui::Button::new(
+                            RichText::new("Quit without unmounting").color(theme::DANGER),
+                        ),
+                    )
+                    .clicked()
+                {
+                    choice = Some(Choice::ForceQuit);
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_sized(
+                        [capped_width(ui, 420.0), CONTROL_H],
+                        egui::Button::new("Cancel"),
+                    )
+                    .clicked()
+                {
+                    choice = Some(Choice::Cancel);
+                }
+            });
+
+        if modal.backdrop_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            choice = Some(Choice::Cancel);
+        }
+
+        match choice {
+            Some(Choice::UnmountQuit) => {
+                // Same teardown as the Unmount button (idempotent:
+                // request_unmount no-ops if a teardown is already in
+                // flight); the intercept in `ui()` closes the window
+                // once poll_mount reports the session ended.
+                self.request_unmount();
+                self.quit_after_unmount = true;
+            }
+            Some(Choice::ForceQuit) => {
+                // Explicit override: today's pre-fix behavior, on
+                // purpose. The mountpoint will need a manual unmount
+                // (`fusermount3 -u` / `umount`) afterwards.
+                self.force_close = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(Choice::Cancel) => {
+                // Keep running. If an unmount was already requested it
+                // proceeds (same as cancelling nothing after clicking
+                // Unmount); we only drop the intent to quit.
+                self.close_confirm = false;
+                self.quit_after_unmount = false;
+            }
+            None => {}
+        }
+    }
 }
 
 // ---- panic ---------------------------------------------------------------
@@ -8731,6 +9030,7 @@ impl LuksboxApp {
         self.draw_revoke_confirm_modal(ctx);
         self.draw_rotate_modal(ctx);
         self.draw_confirm_lock_modal(ctx);
+        self.draw_close_confirm_modal(ctx);
         self.draw_empty_passphrase_confirm_modal(ctx);
         self.draw_deniable_modal(ctx);
         self.draw_deniable_recovery_modal(ctx);
