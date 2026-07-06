@@ -3804,6 +3804,13 @@ impl Vfs {
                 // (allocates fresh chunk-list slots). One-time cost
                 // -- rotation is a rare operation.
                 self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+                // Keep an armed rollback anchor in sync with the rotated
+                // vault: rewrite it under the NEW MVK at the current
+                // generation. Rotation installs the new MVK but does not
+                // mark the tree dirty, so the caller's flush no-ops and
+                // would otherwise leave the anchor bound to the OLD MVK.
+                // No-op when no anchor is configured.
+                self.container.write_anchor(self.tree.next_chunk_gen)?;
                 Ok(())
             }
             (true, Err(e)) => {
@@ -3821,6 +3828,9 @@ impl Vfs {
                 // full spill path. Same reasoning as the crash-safe
                 // arm above.
                 self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+                // Advance an armed rollback anchor under the NEW MVK (see
+                // the crash-safe arm above). No-op when none is armed.
+                self.container.write_anchor(self.tree.next_chunk_gen)?;
                 Ok(())
             }
             (false, Err(e)) => Err(e),
@@ -3987,6 +3997,10 @@ impl Vfs {
                 // mark every inode dirty so the next flush takes
                 // the full spill path.
                 self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+                // Advance an armed rollback anchor (deniable AEAD format)
+                // under the NEW MVK + new per-vault salt. No-op when none
+                // is armed. Same reasoning as the standard `rotate_mvk`.
+                self.container.write_anchor(self.tree.next_chunk_gen)?;
                 Ok(())
             }
             (true, Err(e)) => {
@@ -3995,6 +4009,7 @@ impl Vfs {
             }
             (false, Ok(())) => {
                 self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+                self.container.write_anchor(self.tree.next_chunk_gen)?;
                 Ok(())
             }
             (false, Err(e)) => Err(e),
@@ -7087,6 +7102,81 @@ mod tests {
                 String::from_utf8_lossy(pw)
             );
         }
+    }
+
+    #[test]
+    fn rotate_mvk_rebinds_and_advances_anchor() {
+        // Regression for the rotate-mvk --anchor threading (finding 1).
+        // After an MVK rotation with an anchor armed, the anchor sidecar
+        // must still AEAD-verify under the NEW MVK (it is rewritten by the
+        // post-rotation flush) and must not report a rollback. If the
+        // rewrite were missing, the anchor would stay bound to the old MVK
+        // and the next `--anchor` open would fail closed.
+        use luksbox_format::{Container, anchor};
+        use zeroize::Zeroizing;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rot-anchor.lbx");
+        let anchor_path = dir.path().join("rot-anchor.lbx.anchor");
+
+        // Vault with content + an anchor bootstrapped at generation 1.
+        let mut cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        cont.init_anchor(anchor_path.clone(), 1).unwrap();
+        cont.persist_header().unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "blob").unwrap();
+        vfs.write(f, 0, &vec![7u8; 9000]).unwrap();
+        vfs.flush().unwrap(); // advances the anchor to the current gen
+        let _ = vfs.close().unwrap();
+
+        // Re-open, arm the anchor (verifies under the OLD MVK), confirm no
+        // rollback, then rotate + flush (rewrites the anchor under the NEW
+        // MVK). This mirrors what `rotate_mvk_action` does around the
+        // interactive prompts.
+        let mut cont = Container::open(&path, None, UnlockMaterial::Passphrase(b"pw")).unwrap();
+        let pre_gen = cont.set_anchor(Some(anchor_path.clone())).unwrap().unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        assert!(
+            !matches!(
+                anchor::compare(pre_gen, vfs.vault_generation()),
+                anchor::VerificationOutcome::RollbackDetected { .. }
+            ),
+            "no rollback expected before rotation"
+        );
+        vfs.rotate_mvk(
+            vec![SlotCredential::Passphrase {
+                slot_idx: 0,
+                passphrase: Zeroizing::new("pw".to_string()),
+            }],
+            test_params(),
+        )
+        .unwrap();
+        vfs.flush().unwrap();
+        let _ = vfs.close().unwrap();
+
+        // The anchor must re-validate under the NEW MVK. `set_anchor`
+        // returns an Err (AEAD failure) if the anchor were still bound to
+        // the pre-rotation MVK, which is exactly the breakage this guards.
+        let mut cont2 = Container::open(&path, None, UnlockMaterial::Passphrase(b"pw")).unwrap();
+        let post_gen = cont2
+            .set_anchor(Some(anchor_path.clone()))
+            .expect("anchor must re-verify under the rotated MVK")
+            .expect("anchor path was provided");
+        let vfs2 = Vfs::open(cont2).unwrap();
+        assert!(
+            !matches!(
+                anchor::compare(post_gen, vfs2.vault_generation()),
+                anchor::VerificationOutcome::RollbackDetected { .. }
+            ),
+            "rotated vault + rewritten anchor must not report rollback"
+        );
     }
 
     #[test]

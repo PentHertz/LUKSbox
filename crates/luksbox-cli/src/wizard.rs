@@ -4228,7 +4228,19 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
             9 => {
                 vfs.flush()?;
                 let cont = vfs.close()?;
-                let cont = rotate_mvk_action(theme, cont)?;
+                // Offer the same rollback-detection anchor verification the
+                // CLI `--anchor` flag gives: verify before rotating, and the
+                // rotation rewrites the anchor under the new MVK afterward.
+                let anchor = if Confirm::with_theme(theme)
+                    .with_prompt("Verify a rollback-detection anchor sidecar before rotating?")
+                    .default(false)
+                    .interact()?
+                {
+                    Some(ask_path(theme, "Path to the anchor sidecar")?)
+                } else {
+                    None
+                };
+                let cont = rotate_mvk_action(theme, cont, anchor)?;
                 vfs = Vfs::open(cont)?;
                 Ok(())
             }
@@ -4442,18 +4454,23 @@ fn mount_action(theme: &ColorfulTheme, vfs: Vfs, vault: &Path) -> Result<()> {
 pub(crate) fn run_rotate_mvk_interactive(
     theme: &ColorfulTheme,
     cont: Container,
+    anchor: Option<PathBuf>,
 ) -> Result<Container> {
-    rotate_mvk_action(theme, cont)
+    rotate_mvk_action(theme, cont, anchor)
 }
 
-fn rotate_mvk_action(theme: &ColorfulTheme, cont: Container) -> Result<Container> {
+fn rotate_mvk_action(
+    theme: &ColorfulTheme,
+    mut cont: Container,
+    anchor: Option<PathBuf>,
+) -> Result<Container> {
     // Deniable vaults have no enumerable slots in `header.keyslots`
     // (synthetic header with all Empty entries); their slot envelopes
     // live in `self.deniable.bytes` and rotation goes through the
     // deniable-specific path. Dispatch here so the standard-slot
     // walker below doesn't silently no-op on deniable vaults.
     if cont.is_deniable() {
-        return rotate_mvk_deniable_action(theme, cont);
+        return rotate_mvk_deniable_action(theme, cont, anchor);
     }
     for (i, s) in cont.header.keyslots.iter().enumerate() {
         if s.kind == SlotKind::Fido2DerivedMvk {
@@ -4499,6 +4516,20 @@ fn rotate_mvk_action(theme: &ColorfulTheme, cont: Container) -> Result<Container
     {
         return Ok(cont);
     }
+
+    // Verify the rollback-detection anchor (if supplied) BEFORE we
+    // collect credentials or touch any chunk. `set_anchor` confirms the
+    // anchor AEAD-binds to THIS vault under the current MVK and returns
+    // its generation counter; the rollback comparison against the live
+    // vault runs once the Vfs is open below. A wrong-vault or tampered
+    // anchor fails here, before any FIDO2 touch or Argon2 work is spent.
+    // Arming the anchor now also means `rotate_mvk` rewrites it under the
+    // NEW MVK when it installs the rotated key (see `Vfs::rotate_mvk`),
+    // so a rotated vault keeps a valid anchor for the next open.
+    let anchor_gen: Option<u64> = match &anchor {
+        Some(ap) => cont.set_anchor(Some(ap.clone()))?,
+        None => None,
+    };
 
     let mut credentials: Vec<SlotCredential> = Vec::with_capacity(populated.len());
     for (idx, kind) in &populated {
@@ -4569,6 +4600,26 @@ fn rotate_mvk_action(theme: &ColorfulTheme, cont: Container) -> Result<Container
     }
 
     let mut vfs = Vfs::open(cont)?;
+    // Rollback check: refuse to rotate a vault that has been rolled back
+    // past the anchor. Rotating a stale vault and then advancing the
+    // anchor onto it would launder the rollback, so we fail closed here.
+    if let Some(ag) = anchor_gen {
+        match anchor::compare(ag, vfs.vault_generation()) {
+            anchor::VerificationOutcome::Ok | anchor::VerificationOutcome::AnchorStale { .. } => {}
+            anchor::VerificationOutcome::RollbackDetected {
+                anchor_gen,
+                metadata_gen,
+            } => {
+                return Err(format!(
+                    "Rollback detected: anchor at generation {anchor_gen} > vault at \
+                     generation {metadata_gen}. Rotation refused (the vault may be an \
+                     old copy substituted under the anchor). Restore the current vault, \
+                     or re-establish the anchor deliberately, before rotating."
+                )
+                .into());
+            }
+        }
+    }
     eprintln!();
     eprintln!("rotating...");
     vfs.rotate_mvk(credentials, kdf_params())?;
@@ -4577,6 +4628,9 @@ fn rotate_mvk_action(theme: &ColorfulTheme, cont: Container) -> Result<Container
         "OK MVK rotated. {} keyslot(s) rebuilt with fresh salts.",
         populated.len()
     );
+    if anchor_gen.is_some() {
+        println!("OK anchor re-bound to the new MVK and advanced to the current generation.");
+    }
     let cont = vfs.close()?;
     Ok(cont)
 }
@@ -4587,7 +4641,11 @@ fn rotate_mvk_action(theme: &ColorfulTheme, cont: Container) -> Result<Container
 /// Argon2 params they used at create time -- those aren't persisted
 /// anywhere on disk for deniable vaults (the format requires every
 /// byte to look random; storing the KDF params would be a beacon).
-fn rotate_mvk_deniable_action(theme: &ColorfulTheme, cont: Container) -> Result<Container> {
+fn rotate_mvk_deniable_action(
+    theme: &ColorfulTheme,
+    mut cont: Container,
+    anchor: Option<PathBuf>,
+) -> Result<Container> {
     use luksbox_format::deniable_header::DeniableMaterial;
     use luksbox_vfs::{DeniableRotationCredential, Vfs};
 
@@ -4616,6 +4674,17 @@ fn rotate_mvk_deniable_action(theme: &ColorfulTheme, cont: Container) -> Result<
         return Ok(cont);
     }
 
+    // Verify the rollback-detection anchor (deniable AEAD format) before
+    // asking for the passphrase. Same reasoning as the standard path:
+    // `set_anchor` binds to this vault under the current MVK + per-vault
+    // salt and returns the generation for the rollback compare below;
+    // `rotate_mvk_deniable` rewrites it under the NEW MVK + new salt when
+    // it installs the rotated key.
+    let anchor_gen: Option<u64> = match &anchor {
+        Some(ap) => cont.set_anchor(Some(ap.clone()))?,
+        None => None,
+    };
+
     // The Argon2 params + cipher are not persisted; user must remember.
     // The cipher we CAN recover from cont.header.cipher_suite (synthesized
     // from the inner header at open time), but the Argon2 params are
@@ -4641,10 +4710,30 @@ fn rotate_mvk_deniable_action(theme: &ColorfulTheme, cont: Container) -> Result<
     }];
 
     let mut vfs = Vfs::open(cont)?;
+    // Rollback check (same fail-closed policy as the standard path).
+    if let Some(ag) = anchor_gen {
+        match anchor::compare(ag, vfs.vault_generation()) {
+            anchor::VerificationOutcome::Ok | anchor::VerificationOutcome::AnchorStale { .. } => {}
+            anchor::VerificationOutcome::RollbackDetected {
+                anchor_gen,
+                metadata_gen,
+            } => {
+                return Err(format!(
+                    "Rollback detected: anchor at generation {anchor_gen} > vault at \
+                     generation {metadata_gen}. Rotation refused (the vault may be an \
+                     old copy substituted under the anchor)."
+                )
+                .into());
+            }
+        }
+    }
     eprintln!();
     eprintln!("rotating deniable vault...");
     vfs.rotate_mvk_deniable(creds)?;
     println!("OK deniable MVK rotated. Slot envelope at index {slot_idx} rebuilt.");
+    if anchor_gen.is_some() {
+        println!("OK anchor re-bound to the new MVK and advanced to the current generation.");
+    }
     let cont = vfs.close()?;
     Ok(cont)
 }

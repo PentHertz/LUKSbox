@@ -411,6 +411,22 @@ fn map_io_err_to_vault_locked(err: std::io::Error, path: &Path) -> Error {
 ///     lock on any of the supplied handles
 fn lock_handles(handles_and_paths: &[(&File, &Path)]) -> Result<(), Error> {
     if std::env::var_os("LUKSBOX_NO_LOCK").is_some() {
+        // This switch disables the advisory flock that guards against
+        // concurrent writers. It exists for filesystems where flock is
+        // unavailable or unreliable (some NFS exports, 9p/virtfs, certain
+        // FUSE backends), but it must never be inherited silently from a
+        // wrapper script or shell environment: a second process writing
+        // the same vault concurrently can corrupt it. Announce it loudly,
+        // once per process, so an accidentally-inherited value is visible.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "luksbox: WARNING: LUKSBOX_NO_LOCK is set, container locking is \
+                 DISABLED. Another process writing this vault at the same time can \
+                 corrupt it. Unset LUKSBOX_NO_LOCK unless you are deliberately on a \
+                 filesystem where flock does not work."
+            );
+        });
         return Ok(());
     }
     for (file, path) in handles_and_paths {
@@ -421,6 +437,81 @@ fn lock_handles(handles_and_paths: &[(&File, &Path)]) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Read the metadata mirror sidecar (`<vault>.meta-bak`) with the same
+/// no-follow, regular-file, size-checked discipline the primary vault
+/// and hybrid-sidecar paths use (mirrors `hybrid_sidecar::read_sidecar_bytes`).
+/// An attacker with write access to the vault's directory could otherwise
+/// swap the mirror for a symlink (to a device that stalls, or to a file
+/// elsewhere) between the recovery decision and the open; `O_NOFOLLOW`
+/// plus the regular-file check refuse that atomically with the open. The
+/// mirror must be a regular file of exactly `expected_len` bytes; the
+/// content is still AEAD-verified by the caller under the vault MVK, so
+/// this is defense-in-depth on top of that authentication.
+fn read_metadata_mirror_nofollow(path: &Path, expected_len: usize) -> std::io::Result<Vec<u8>> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        let meta = f.metadata()?;
+        if !meta.is_file() {
+            return Err(std::io::Error::other(format!(
+                "metadata mirror {}: not a regular file (refusing FIFO/device/dir)",
+                path.display()
+            )));
+        }
+        if meta.len() != expected_len as u64 {
+            return Err(std::io::Error::other(format!(
+                "metadata mirror {}: {} bytes != expected {}",
+                path.display(),
+                meta.len(),
+                expected_len
+            )));
+        }
+        let mut buf = vec![0u8; expected_len];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+        let mut f = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000)
+            .open(path)?;
+        let meta = f.metadata()?;
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+        if meta.file_attributes() & 0x0000_0400 != 0 {
+            return Err(std::io::Error::other(format!(
+                "metadata mirror {}: is a reparse point (symlink/junction); refused",
+                path.display()
+            )));
+        }
+        if meta.len() != expected_len as u64 {
+            return Err(std::io::Error::other(format!(
+                "metadata mirror {}: {} bytes != expected {}",
+                path.display(),
+                meta.len(),
+                expected_len
+            )));
+        }
+        let mut buf = vec![0u8; expected_len];
+        f.read_exact(&mut buf)?;
+        Ok(buf)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (path, expected_len);
+        Err(std::io::Error::other(
+            "metadata mirror read unsupported on this platform",
+        ))
+    }
 }
 
 /// Where the 8 KB container header lives.
@@ -2249,26 +2340,18 @@ impl Container {
                 if !mirror_path.exists() {
                     return Err(live_err);
                 }
-                // Stat-first bounded read: refuse anything that isn't
-                // exactly the expected region size. Defends against an
-                // attacker-planted symlink at the mirror path pointing
-                // at /dev/zero or a multi-GB file. We never allocate
-                // more than `region_size` bytes regardless of what's
-                // at the mirror path.
-                let mirror_stat = match std::fs::metadata(&mirror_path) {
-                    Ok(s) => s,
+                // No-follow, regular-file, exact-size bounded read.
+                // Refuses a symlink or reparse point planted at the
+                // mirror path (atomically with the open, so no TOCTOU
+                // between the stat and the open), refuses FIFOs / device
+                // nodes / directories, and never allocates more than
+                // `region_size` bytes regardless of what is at the path.
+                // Same discipline as the primary vault and hybrid-sidecar
+                // opens; the content is still AEAD-verified below.
+                let mirror_bytes = match read_metadata_mirror_nofollow(&mirror_path, region_size) {
+                    Ok(b) => b,
                     Err(_) => return Err(live_err),
                 };
-                if mirror_stat.len() != region_size as u64 {
-                    return Err(live_err);
-                }
-                let mut mirror_bytes = vec![0u8; region_size];
-                match std::fs::File::open(&mirror_path)
-                    .and_then(|mut f| f.read_exact(&mut mirror_bytes))
-                {
-                    Ok(()) => {}
-                    Err(_) => return Err(live_err),
-                }
                 match metadata::read_metadata(
                     self.header.cipher_suite,
                     &self.mvk,

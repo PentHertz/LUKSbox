@@ -53,6 +53,39 @@ leaves the chip. Firmware TPMs (Intel PTT, AMD fTPM) were never exposed
 to this because they have no external bus; the fix closes the gap for
 discrete-TPM users.
 
+### Security: `rotate-mvk` now honors `--anchor` (rollback detection)
+
+`rotate-mvk` previously ignored `--anchor` with a warning. It now
+threads the rollback-detection anchor through the rotation: before any
+chunk is re-encrypted, the anchor is verified against the vault and a
+vault that has been rolled back past the anchor is refused (rotating a
+stale vault and then advancing the anchor onto it would launder the
+rollback, so it fails closed). After the new MVK is installed, the
+rotation rewrites the anchor under that new MVK at the current
+generation, so the sidecar stays valid for the next open. Both the
+standard and deniable rotation paths, and the interactive wizard's
+rotate option, are covered.
+
+### Security: hardening follow-ups from the audit
+
+- `LUKSBOX_NO_LOCK` (which disables the advisory lock that guards
+  against concurrent writers, for filesystems where `flock` does not
+  work) now prints a loud once-per-process warning when it is active,
+  so an accidentally-inherited value cannot silently drop the
+  protection.
+- The metadata mirror sidecar (`<vault>.meta-bak`), consulted only when
+  the live metadata fails to verify, is now opened with `O_NOFOLLOW`
+  (and the Windows reparse-point equivalent), a regular-file check, and
+  an exact-size bound, matching the discipline the primary vault and
+  hybrid-sidecar reads already use. The content was already
+  AEAD-verified under the vault key; this refuses a symlink or device
+  swapped in at the mirror path before the read, closing a TOCTOU gap.
+- `cargo audit`: the `paste` unmaintained advisory (RUSTSEC-2024-0436,
+  a compile-time proc-macro pulled in by the alpha `tss-esapi` TPM
+  chain, no code shipped) is now documented and accepted alongside the
+  existing `registry` advisory in `audit.toml`, `scripts/audit.sh`, and
+  SECURITY.md.
+
 ---
 
 ## [v0.5.0-rc.1] - 2026-07-06

@@ -8241,22 +8241,18 @@ fn cmd_rotate_mvk(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     // leak via /proc and shell history) or a config file. Neither
     // is a good default. The wizard prompts slot-by-slot.
     //
-    // `--header` is honoured (open_container reads the detached
-    // header), but `--anchor` is not threaded through: the rollback
-    // check and anchor-generation update happen in `open_vfs`, which
-    // rotation does not go through. Warn instead of silently skipping
-    // the rollback check and leaving the anchor behind the vault's
-    // new generation.
-    if unlock.anchor.is_some() {
-        eprintln!(
-            "warning: --anchor is ignored by rotate-mvk: rotation neither \
-             checks the anchor for rollback nor advances it. Open the vault \
-             with --anchor afterwards; the next write refreshes the anchor."
-        );
-    }
+    // `--header` is honoured (open_container reads the detached header).
+    // `--anchor` is now threaded through the rotation: the anchor is
+    // verified for rollback BEFORE anything is re-encrypted (a vault
+    // rolled back past the anchor is refused rather than silently
+    // re-blessed), and the post-rotation flush rewrites the anchor under
+    // the NEW MVK so it stays valid for the next open.
     let cont = open_container(path, unlock)?;
-    let cont =
-        wizard::run_rotate_mvk_interactive(&dialoguer::theme::ColorfulTheme::default(), cont)?;
+    let cont = wizard::run_rotate_mvk_interactive(
+        &dialoguer::theme::ColorfulTheme::default(),
+        cont,
+        unlock.anchor.clone(),
+    )?;
     drop(cont);
     Ok(())
 }

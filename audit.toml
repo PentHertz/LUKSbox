@@ -1,10 +1,10 @@
 # cargo-audit configuration.
 #
-# Run with `cargo audit` from the workspace root. The single ignore
-# below is documented in SECURITY.md "Unmaintained dependencies"
+# Run with `cargo audit` from the workspace root. The two ignores
+# below are documented in SECURITY.md "Unmaintained dependencies"
 # and reviewed on each release. If a real CVE is later filed against
-# `registry`, we cut a release that pins `winfsp_wrs` to a fixed
-# upstream version (or vendors a fork) within the SECURITY.md
+# either crate, we cut a release that pins the offending chain to a
+# fixed upstream version (or vendors a fork) within the SECURITY.md
 # response SLA.
 #
 # Three earlier ignores (RUSTSEC-2021-0139 ansi_term unmaintained,
@@ -31,4 +31,18 @@ ignore = [
     # link the `registry` crate but no exploitable CVE has been
     # filed against it.
     "RUSTSEC-2025-0026",
+    # `paste 1.0.15` is an unmaintained proc-macro pulled in by
+    # `tss-esapi 8.0.0-alpha.2`, the TPM 2.0 wrapper (Linux + Windows
+    # TPM keyslots). It is a COMPILE-TIME-ONLY dependency: paste
+    # expands token-paste macros at build time and ships zero code in
+    # the binary, so an unmaintained-crate advisory has no runtime
+    # attack surface here. No CVE is filed against it (RUSTSEC-2024-0436
+    # is an "unmaintained" informational advisory). The dependency is a
+    # transitive consequence of pinning tss-esapi to the 8.0 alpha line
+    # (the only release with Windows TBS support, see
+    # crates/luksbox-tpm/Cargo.toml); we drop this ignore when tss-esapi
+    # cuts a stable 8.0 that no longer pulls paste. Non-TPM builds do not
+    # link this chain at all. Tracked upstream at:
+    #   https://github.com/parallaxsecond/rust-tss-esapi
+    "RUSTSEC-2024-0436",
 ]

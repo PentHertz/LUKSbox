@@ -351,16 +351,18 @@ are exploitable today, but each is a forward-looking risk you should weigh.
 
 ### Unmaintained dependencies (`cargo audit` warnings)
 
-`cargo audit` against the workspace currently surfaces **one**
-advisory, accepted and documented in `.cargo/audit.toml` (the only
-project-local config path cargo-audit reads; it lived at the workspace
-root before 0.4.0-rc, silently unused). CI runs `cargo audit` on every push and PR
-(`.github/workflows/ci.yml::audit`) and fails on any non-ignored
-advisory.
+`cargo audit` against the workspace currently surfaces **two**
+`unmaintained` advisories, both accepted and documented in `audit.toml`
+and in the explicit `--ignore` list of `scripts/audit.sh`. Both are
+informational (`unmaintained`, no CVE), so CI's plain `cargo audit`
+(`.github/workflows/ci.yml::audit`) reports them but does not fail on
+them; the job goes red on any advisory that carries a real
+vulnerability.
 
 | Crate | Used by | Advisory | Status |
 |---|---|---|---|
 | `registry 1.3` | `winfsp_wrs_sys` (transitive) -> `luksbox-mount` on Windows | RUSTSEC-2025-0026 (unmaintained) | **Windows runtime only.** Required for the `mount` subcommand on Windows via WinFsp. Non-Windows builds (Linux + macOS) do not link this chain. The `registry` crate is archived; the recommended replacement is `windows-registry`. `winfsp_wrs 0.4.1` (Jan 2026) is the latest published version and has not migrated yet (https://github.com/Scille/winfsp_wrs). When it does we drop this ignore. |
+| `paste 1.0.15` | `tss-esapi 8.0.0-alpha.2` (transitive) -> `luksbox-tpm` | RUSTSEC-2024-0436 (unmaintained) | **Compile-time only, no code shipped.** `paste` is a token-paste proc macro used by `tss-esapi`, the TPM 2.0 wrapper for the Linux and Windows TPM keyslots. It runs at build time and emits nothing into the binary, so an unmaintained-crate advisory has no runtime attack surface. No CVE is filed. The dependency is a transitive consequence of pinning `tss-esapi` to the 8.0 alpha line (the only release with Windows TBS support). We drop this ignore when `tss-esapi` cuts a stable 8.0 without `paste`. Non-TPM builds do not link this chain. |
 
 A near miss worth recording: **quick-xml 0.39** (RUSTSEC-2026-0194 /
 RUSTSEC-2026-0195, DoS pair fixed in >= 0.41.0) is pulled in solely by
