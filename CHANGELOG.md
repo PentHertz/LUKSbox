@@ -14,7 +14,15 @@ canonical record.
 
 ---
 
-## [Unreleased]
+## [v0.5.0-rc.1] - 2026-07-06
+
+First release candidate for the v0.5.0 line. The headline is Windows
+TPM 2.0 support through TBS, which brings the full TPM keyslot matrix
+to all three desktop platforms; the rest of the entry is the build
+and CI work needed to ship a vendored tpm2-tss reliably across
+distros. On-disk formats are unchanged from the v0.4 line: existing
+vaults, sidecars, and headers open without migration, and a vault
+sealed by the Linux build unseals through the same chip on Windows.
 
 ### Added: Windows TPM 2.0 keyslots (full parity with Linux)
 
@@ -73,6 +81,44 @@ a vault regardless of which OS sealed it.
   bundled-tpm --example tpm_smoke` - live seal/unseal round-trip
   against the local chip (transient objects only; verified on real
   Windows 11 hardware through TBS as part of this change).
+
+### Fixed: bundled-tpm binaries link and run on every target distro
+
+Two portability defects in the vendored tpm2-tss build surfaced on
+the release lanes and are fixed in this candidate; both were
+container-validated end to end (Ubuntu 22.04 build, GNU ld and
+rust-lld link, Fedora runtime).
+
+- **Static link closure**: the tss-esapi-sys pkg-config probes of
+  the vendored (static-only) tpm2-tss now run in static mode
+  (`TSS2_SYS/ESYS/MU/TCTILDR_STATIC=1`, set in `.cargo/config.toml`
+  and mirrored in the CI and release workflow env). The dynamic-mode
+  probe never read `Libs.private`, so `-lcrypto` went missing (the
+  test binaries died with "undefined symbol: EVP_MD_fetch"), and it
+  emitted each `-ltss2-*` alone in an order GNU ld cannot resolve
+  ("undefined reference to `Tss2_Sys_*`" on every aarch64 Linux
+  lane; x86_64 only passed because rust-lld resolves archives in
+  any order). Static mode expands each probe's full
+  `Requires`/`Libs.private` chain in topological order. System-link
+  (`hardware`) builds are unaffected: no distro ships `libtss2-*.a`,
+  so those probes keep falling back to dynamic linking.
+- **Fedora/RHEL runtime**: the vendored tpm2-tss is compiled with
+  `-DOPENSSL_NO_SM4`. Ubuntu's OpenSSL ships SM4 and Fedora's does
+  not, so the jammy-built .rpm binary aborted at startup on Fedora
+  with "undefined symbol: EVP_sm4_cfb128". tpm2-tss NULLs its SM4
+  session callbacks under that macro and LUKSbox only negotiates
+  AES-CFB TPM sessions, so the feature loss is nil; every remaining
+  OpenSSL import of the jammy build was cross-checked against
+  Fedora's libcrypto exports to rule out a second gap.
+- **Release lanes wired per distro**: jammy and noble build
+  `bundled-tpm` (their system tpm2-tss is below the 4.1.3 build
+  floor of tss-esapi 8.x), trixie and resolute keep the system link,
+  and Windows builds `bundled-tpm` with a shared composite action
+  that stages the tpm2-tss source, OpenSSL, and libclang for both CI
+  and release. BUILDING.md documents the added Linux build
+  dependencies (autoconf, automake, libtool, libltdl-dev,
+  autoconf-archive, libjson-c-dev, uuid-dev) and the cross-distro
+  portability note.
 
 ---
 
