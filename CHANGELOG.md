@@ -14,6 +14,22 @@ canonical record.
 
 ---
 
+## [Unreleased]
+
+Committed but not yet attached to a tagged release.
+
+### Dependencies
+
+- Bumped `cmov` 0.5.3 -> 0.5.4 (transitive, via the ML-KEM chain
+  `ml-kem` -> `hybrid-array` -> `ctutils` -> `cmov`). 0.5.4 fixes
+  GHSA-3rjw-m598-pq24, where `Cmov` / `CmovEq` could produce wrong
+  results on aarch64 when the high bits of a register are set. This is
+  on the constant-time path the post-quantum keyslots depend on and
+  aarch64 is a shipped target, so the fix is worth taking. Rolls into
+  the next tagged version after rc.2.
+
+---
+
 ## [v0.5.0-rc.2] - 2026-07-06
 
 Supersedes rc.1 with two fixes from a full-application security review.
