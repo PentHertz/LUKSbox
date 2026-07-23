@@ -14,8 +14,6 @@
 name: fuzz-nightly
 
 on:
-  schedule:
-    - cron: '17 3 * * *'   # daily at 03:17 UTC, off-peak for shared runners
   workflow_dispatch:
 
 permissions:
