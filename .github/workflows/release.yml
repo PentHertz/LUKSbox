@@ -37,6 +37,14 @@ permissions:
   # identity is short-lived per run and pinned to the commit SHA.
   id-token: write
   attestations: write
+  # SignPath's official GitHub Action signs an artifact by its GitHub
+  # artifact id, so each file to sign is uploaded as a run artifact
+  # first. Those intermediates are unsigned and must be deleted before
+  # the release job's download-artifact pulls them in; deleting run
+  # artifacts needs `actions: write` (which also covers the read the
+  # SignPath action uses to resolve the artifact). Windows-only in
+  # practice; harmless on the other legs.
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -2032,48 +2040,59 @@ jobs:
           if (Test-Path "${{ matrix.archive }}") { Remove-Item "${{ matrix.archive }}" }
           Compress-Archive -Path staging/* -DestinationPath "${{ matrix.archive }}"
 
-      - name: Code-sign the Windows portable zip via SignPath
-        # SignPath (https://signpath.io) Authenticode-signs the two
-        # LUKSbox exes INSIDE the portable zip and returns the zip. This
-        # is preferred over the WINDOWS_PFX_BASE64 signtool path above:
-        # the private key never leaves SignPath's HSM and every signing
-        # request is provenance-checked against this workflow. It runs
-        # only when SIGNPATH_API_TOKEN is set, so builds without it are
-        # unchanged. If BOTH this and the PFX path are configured, the
-        # zip ends up carrying SignPath's signature (this step runs after
-        # the PFX re-zip). The MSI and Burn bundle are NOT covered here;
-        # they keep going through the signtool step above. Requires the
-        # project's SignPath artifact configuration to sign luksbox.exe +
-        # luksbox-gui.exe inside a <zip-file> (see docs/WINDOWS_SIGNING.md).
+      # ---- SignPath: sign the MSI via the trusted-build-system action --
+      # SignPath's official GitHub Action is the trusted-build-system
+      # path: the file is uploaded as a run artifact and SignPath pulls
+      # it back through the GitHub connection to verify it really came
+      # from this workflow, rather than trusting whoever holds the API
+      # token. GitHub wraps every uploaded artifact in a zip, so the
+      # SignPath artifact configuration MUST wrap the file in a
+      # <zip-file> (see docs/WINDOWS_SIGNING.md). The MSI is signed HERE,
+      # before the Burn bundle build below embeds it, so the installer
+      # chain ships a signed MSI. All SignPath steps run only when
+      # SIGNPATH_API_TOKEN is set, so builds without it are unchanged.
+      # The intermediate `unsigned-*` artifacts are deleted further down
+      # so they never reach the release job.
+      - name: Upload unsigned MSI for SignPath
+        id: upload_unsigned_msi
+        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-msi-${{ matrix.target }}
+          path: ${{ env.MSI_PATH }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign MSI via SignPath
+        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: msi
+          github-artifact-id: ${{ steps.upload_unsigned_msi.outputs.artifact-id }}
+          github-token: ${{ github.token }}
+          wait-for-completion: true
+          output-artifact-directory: ${{ runner.temp }}/signed-msi
+
+      - name: Swap in the SignPath-signed MSI
         if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
         shell: pwsh
-        env:
-          # All four are stored as repository SECRETS. The org id and the
-          # two slugs are not sensitive (secrets vs variables is just
-          # storage), but reading them from `secrets` here matches how
-          # they were added and keeps everything in one place. Mapped
-          # into env so the command reads them as $env:... rather than
-          # expanding inline (also avoids any quoting surprises).
-          SIGNPATH_API_TOKEN:           ${{ secrets.SIGNPATH_API_TOKEN }}
-          SIGNPATH_ORGANIZATION_ID:     ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
-          SIGNPATH_PROJECT_SLUG:        ${{ secrets.SIGNPATH_PROJECT_SLUG }}
-          SIGNPATH_SIGNING_POLICY_SLUG: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
         run: |
-          Install-Module -Name SignPath -Force -Scope CurrentUser
-          $signed = Join-Path $env:RUNNER_TEMP "signed-${{ matrix.archive }}"
-          Submit-SigningRequest `
-            -InputArtifactPath  "${{ matrix.archive }}" `
-            -ApiToken           "$env:SIGNPATH_API_TOKEN" `
-            -OrganizationId     "$env:SIGNPATH_ORGANIZATION_ID" `
-            -ProjectSlug        "$env:SIGNPATH_PROJECT_SLUG" `
-            -SigningPolicySlug  "$env:SIGNPATH_SIGNING_POLICY_SLUG" `
-            -OutputArtifactPath "$signed" `
-            -WaitForCompletion
-          # Overwrite the archive in place so the existing upload step
-          # (and the release job's checksums + Sigstore attestation)
-          # picks up the signed copy with no further changes.
-          Move-Item -Force "$signed" "${{ matrix.archive }}"
-          Write-Host "==> replaced ${{ matrix.archive }} with the SignPath-signed copy"
+          # The action downloads the signed artifact into the output dir;
+          # it may arrive as the signed file directly or inside a zip
+          # (GitHub artifact shape). Handle both, then overwrite MSI_PATH
+          # so the bundle build embeds the signed MSI and the release
+          # upload ships it.
+          $dir = "$env:RUNNER_TEMP\signed-msi"
+          $zip = Get-ChildItem -Path $dir -Recurse -Filter *.zip -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($zip) { Expand-Archive -Path $zip.FullName -DestinationPath $dir -Force }
+          $signed = Get-ChildItem -Path $dir -Recurse -Filter *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $signed) { throw "no signed .msi found under $dir" }
+          Move-Item -Force $signed.FullName "$env:MSI_PATH"
+          Write-Host "==> replaced $env:MSI_PATH with the SignPath-signed MSI"
 
       - name: Fetch + verify pinned WinFsp MSI (for the Burn bundle)
         if: runner.os == 'Windows'
@@ -2210,6 +2229,73 @@ jobs:
               /f $pfx /p $env:WINDOWS_PFX_PASSWORD `
               $env:BUNDLE_PATH
           & $signtool verify /pa /v $env:BUNDLE_PATH
+
+      # ---- SignPath: sign the Burn bundle via the trusted-build-system
+      # action. Signed LAST, because the bundle's Authenticode signature
+      # must cover the embedded (already-signed) MSIs. Artifact
+      # configuration slug `bundle` is a <zip-file><pe-file/> (GitHub zip
+      # wrapper). Verify the signed bundle still installs on first use:
+      # Burn bundles have an engine-signing subtlety the PFX path handles
+      # with insignia, and SignPath is expected to handle Burn bundles.
+      - name: Upload unsigned bundle for SignPath
+        id: upload_unsigned_bundle
+        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-bundle-${{ matrix.target }}
+          path: ${{ env.BUNDLE_PATH }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign bundle via SignPath
+        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: bundle
+          github-artifact-id: ${{ steps.upload_unsigned_bundle.outputs.artifact-id }}
+          github-token: ${{ github.token }}
+          wait-for-completion: true
+          output-artifact-directory: ${{ runner.temp }}/signed-bundle
+
+      - name: Swap in the SignPath-signed bundle
+        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP\signed-bundle"
+          $zip = Get-ChildItem -Path $dir -Recurse -Filter *.zip -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($zip) { Expand-Archive -Path $zip.FullName -DestinationPath $dir -Force }
+          $signed = Get-ChildItem -Path $dir -Recurse -Filter *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $signed) { throw "no signed .exe found under $dir" }
+          Move-Item -Force $signed.FullName "$env:BUNDLE_PATH"
+          Write-Host "==> replaced $env:BUNDLE_PATH with the SignPath-signed bundle"
+
+      - name: Delete intermediate unsigned SignPath artifacts
+        # These were uploaded only so the SignPath action had an id to
+        # sign. They are unsigned and must not reach the release job's
+        # download-artifact (merge-multiple), or they would be published
+        # and could collide with the signed files. Delete them here, in
+        # the build job, before the release job runs. `if: always()` so
+        # cleanup still happens if a signing step above failed. Needs
+        # `actions: write` (declared at the top of the file).
+        if: always() && runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ids = @(
+            "${{ steps.upload_unsigned_msi.outputs.artifact-id }}",
+            "${{ steps.upload_unsigned_bundle.outputs.artifact-id }}"
+          )
+          foreach ($id in $ids) {
+            if ($id) {
+              Write-Host "==> deleting intermediate artifact $id"
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" 2>&1 | Out-Host
+            }
+          }
 
       - name: Upload Windows MSI
         if: runner.os == 'Windows'
