@@ -169,7 +169,16 @@ jobs:
             build_rpm: false
             archive: luksbox-${{ github.ref_name }}-aarch64-linux-resolute.tar.gz
           - target: x86_64-pc-windows-msvc
-            runner: windows-latest
+            # Pinned to windows-2022, NOT windows-latest. The bundled
+            # tpm2-tss VS solution builds its tss2-*.lib under the VS 2022
+            # (v143) toolset, and the stage-tpm2-tss composite action
+            # assumes VS 2022 too. When windows-latest rolled forward to
+            # VS 2026 (v18 / MSVC 14.5x) those libs stopped landing where
+            # tss-esapi-sys links them and the CLI failed to link with
+            # `LNK1181: cannot open input file 'tss2-sys.lib'`. Revisit
+            # when tpm2-tss ships a VS 2026 solution (keep this in lock-
+            # step with the windows-tpm job in ci.yml).
+            runner: windows-2022
             archive: luksbox-${{ github.ref_name }}-x86_64-windows.zip
           # Intel macOS is disabled, the macos-13 runner is being
           # phased out by GitHub and the build was blocking the rest of
@@ -2039,16 +2048,25 @@ jobs:
         if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
         shell: pwsh
         env:
-          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          # All four are stored as repository SECRETS. The org id and the
+          # two slugs are not sensitive (secrets vs variables is just
+          # storage), but reading them from `secrets` here matches how
+          # they were added and keeps everything in one place. Mapped
+          # into env so the command reads them as $env:... rather than
+          # expanding inline (also avoids any quoting surprises).
+          SIGNPATH_API_TOKEN:           ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID:     ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG:        ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_SIGNING_POLICY_SLUG: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
         run: |
           Install-Module -Name SignPath -Force -Scope CurrentUser
           $signed = Join-Path $env:RUNNER_TEMP "signed-${{ matrix.archive }}"
           Submit-SigningRequest `
             -InputArtifactPath  "${{ matrix.archive }}" `
             -ApiToken           "$env:SIGNPATH_API_TOKEN" `
-            -OrganizationId     "${{ vars.SIGNPATH_ORGANIZATION_ID }}" `
-            -ProjectSlug        "${{ vars.SIGNPATH_PROJECT_SLUG }}" `
-            -SigningPolicySlug  "${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}" `
+            -OrganizationId     "$env:SIGNPATH_ORGANIZATION_ID" `
+            -ProjectSlug        "$env:SIGNPATH_PROJECT_SLUG" `
+            -SigningPolicySlug  "$env:SIGNPATH_SIGNING_POLICY_SLUG" `
             -OutputArtifactPath "$signed" `
             -WaitForCompletion
           # Overwrite the archive in place so the existing upload step
