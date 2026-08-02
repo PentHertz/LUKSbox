@@ -310,13 +310,14 @@ jobs:
   # release.yml's Windows lane uses, so CI and release can't drift.
   windows-tpm:
     name: windows tpm (TBS, bundled tpm2-tss)
-    # Pinned to windows-2022, NOT windows-latest: the bundled tpm2-tss VS
-    # solution and the stage-tpm2-tss composite action target the VS 2022
-    # (v143) toolset. windows-latest rolling to VS 2026 (v18) makes the
-    # tss2-*.lib files land where tss-esapi-sys can't link them
-    # (LNK1181 cannot open tss2-sys.lib). Keep in lock-step with the
-    # Windows lane in release.yml.
-    runs-on: windows-2022
+    # Using windows-latest per request. KNOWN RISK: the bundled tpm2-tss
+    # VS solution and the stage-tpm2-tss action target the VS 2022 (v143)
+    # toolset. If the windows-latest image carries VS 2026 (v18), the
+    # tss2-*.lib files do not land where tss-esapi-sys links them
+    # (LNK1181 cannot open tss2-sys.lib); switch to windows-2025 (still
+    # VS 2022) or fix stage-tpm2-tss for the newer toolset. Keep in
+    # lock-step with the Windows lane in release.yml.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

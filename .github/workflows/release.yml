@@ -177,16 +177,17 @@ jobs:
             build_rpm: false
             archive: luksbox-${{ github.ref_name }}-aarch64-linux-resolute.tar.gz
           - target: x86_64-pc-windows-msvc
-            # Pinned to windows-2022, NOT windows-latest. The bundled
-            # tpm2-tss VS solution builds its tss2-*.lib under the VS 2022
-            # (v143) toolset, and the stage-tpm2-tss composite action
-            # assumes VS 2022 too. When windows-latest rolled forward to
-            # VS 2026 (v18 / MSVC 14.5x) those libs stopped landing where
-            # tss-esapi-sys links them and the CLI failed to link with
-            # `LNK1181: cannot open input file 'tss2-sys.lib'`. Revisit
-            # when tpm2-tss ships a VS 2026 solution (keep this in lock-
-            # step with the windows-tpm job in ci.yml).
-            runner: windows-2022
+            # Using windows-latest per request. KNOWN RISK: the bundled
+            # tpm2-tss VS solution and the stage-tpm2-tss action target
+            # the VS 2022 (v143) toolset. If the windows-latest image
+            # carries VS 2026 (v18 / MSVC 14.5x), the tss2-*.lib files do
+            # not land where tss-esapi-sys links them and the CLI fails to
+            # link with `LNK1181: cannot open input file 'tss2-sys.lib'`
+            # BEFORE any signing step runs. If that recurs, switch to
+            # windows-2025 (still VS 2022) or teach stage-tpm2-tss to
+            # build under the newer toolset. Keep in lock-step with the
+            # windows-tpm job in ci.yml.
+            runner: windows-latest
             archive: luksbox-${{ github.ref_name }}-x86_64-windows.zip
           # Intel macOS is disabled, the macos-13 runner is being
           # phased out by GitHub and the build was blocking the rest of
