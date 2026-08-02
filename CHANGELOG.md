@@ -18,6 +18,33 @@ canonical record.
 
 Committed but not yet attached to a tagged release.
 
+### Fixed: file timestamps are preserved instead of showing the Unix epoch (#26)
+
+Every file on a mounted vault reported a modification time of
+1970-01-01 (shown as "December 31, 1969" in some locales), because the
+inode's `mtime_ns` was stored in the on-disk format but never
+populated, and every backend's `setattr` ignored the incoming mtime.
+This broke incremental `rsync -a`: with all destination timestamps at
+the epoch, rsync's quick-check saw a mismatch on every file and
+re-transferred the whole tree instead of just the changed files.
+
+The VFS now stamps a real mtime on create / mkdir / symlink and bumps
+it on every write / truncate (standard POSIX behavior), and a new
+`Vfs::set_mtime` honors an explicit `utimensat(2)` so `rsync -a`,
+`cp -p`, and `touch -d` round-trip and survive a flush plus reopen.
+No on-disk format change was needed: `mtime_ns` predates the LBM4
+mode/link_count fields, so this works on both v3 and v4 vaults, and
+the metadata region is AEAD-encrypted, so stored timestamps leak
+nothing to an offline attacker. Wired through the Linux (FUSE) and
+Windows (WinFsp) mount backends, and through macFUSE on macOS.
+atime/ctime are reported as mtime (not stored separately).
+
+Known follow-up: the macOS FUSE-T backend (the kext-free default on
+macOS) gives newly created and written files a real mtime, but does
+not yet honor an explicit `utimensat` because that needs a new FFI
+trampoline; until then `rsync -a` on a FUSE-T mount does not preserve
+the source mtime (tracked internally). macFUSE on macOS is unaffected.
+
 ### Dependencies
 
 - Bumped `cmov` 0.5.3 -> 0.5.4 (transitive, via the ML-KEM chain

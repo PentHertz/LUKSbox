@@ -301,6 +301,19 @@ fn make_file_info(vfs: &mut Vfs, file_id: FileId) -> Result<FileInfo, NTSTATUS> 
     Ok(info)
 }
 
+/// Convert a Windows FILETIME (100-ns ticks since 1601-01-01 UTC) to
+/// UNIX nanoseconds (luksbox-vfs's `mtime_ns`). Inverse of the
+/// conversion in `make_file_info`. Saturating throughout: a FILETIME
+/// before the 1970 epoch clamps to 0, and the `* 100` clamps at
+/// `u64::MAX` for absurd far-future values. Callers pass a nonzero
+/// FILETIME (0 is Windows' "leave unchanged" sentinel, filtered above).
+fn filetime_to_unix_ns(filetime: u64) -> u64 {
+    const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
+    filetime
+        .saturating_sub(FILETIME_UNIX_EPOCH)
+        .saturating_mul(100)
+}
+
 /// Per-open handle. Cloned (refcount-bumped) on every callback by
 /// `winfsp_wrs`'s `FileContextKind for Arc<T>`.
 pub struct OpenContext {
@@ -759,16 +772,20 @@ impl FileSystemInterface for LuksboxFs {
         make_file_info(&mut vfs, ctx.file_id)
     }
 
-    /// Accept timestamp / attribute updates as a no-op success.
+    /// Persist an explicit modification time; accept the other
+    /// attribute updates as a no-op success.
     ///
-    /// luksbox-vfs doesn't persist Windows-style timestamps or the
-    /// archive/hidden/readonly attribute bits - its model is
-    /// content-addressed encrypted chunks, not POSIX or NTFS metadata.
-    /// We could store these in the inode metadata blob in a future
-    /// version; for now, returning success on every call lets Windows
+    /// luksbox-vfs stores a single `mtime_ns` per inode (issue #26), so
+    /// we honor `mtime` here and report it back on `get_file_info`. It
+    /// does not persist atime/ctime/change_time separately (reported as
+    /// mtime) nor the archive/hidden/readonly attribute bits - its
+    /// model is content-addressed encrypted chunks, not full NTFS
+    /// metadata. Windows passes 0 in a timestamp field to mean "leave
+    /// unchanged". We still return success on every call so Windows can
     /// proceed (Explorer routinely calls this on file open / save /
     /// rename, and a STATUS_INVALID_DEVICE_REQUEST refusal cascades
-    /// into "Z:\ is not accessible" UI errors on some paths).
+    /// into "Z:\ is not accessible" UI errors on some paths); a failed
+    /// mtime write is best-effort and does not fail the call.
     fn set_basic_info(
         &self,
         ctx: Self::FileContext,
@@ -786,6 +803,13 @@ impl FileSystemInterface for LuksboxFs {
             )
         );
         let mut vfs = self.inner.lock().unwrap();
+        // A `mtime` of 0 is Windows' "do not change" sentinel. Convert
+        // the FILETIME (100-ns ticks since 1601) to UNIX nanoseconds and
+        // persist so rsync / robocopy / Explorer's "Date modified" round
+        // -trip. Best-effort: keep returning success for UI compat.
+        if mtime != 0 {
+            let _ = vfs.set_mtime(ctx.file_id, filetime_to_unix_ns(mtime));
+        }
         make_file_info(&mut vfs, ctx.file_id)
     }
 

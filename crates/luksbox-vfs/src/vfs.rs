@@ -2726,7 +2726,7 @@ impl Vfs {
                 parent,
                 kind: InodeKind::Directory,
                 size: 0,
-                mtime_ns: 0,
+                mtime_ns: Self::now_ns(),
                 chunks: Vec::new(),
                 children: Default::default(),
                 cached_real_size: None,
@@ -2783,7 +2783,7 @@ impl Vfs {
                 parent,
                 kind: InodeKind::File,
                 size: 0,
-                mtime_ns: 0,
+                mtime_ns: Self::now_ns(),
                 chunks: Vec::new(),
                 children: Default::default(),
                 cached_real_size: None,
@@ -3002,6 +3002,10 @@ impl Vfs {
         if hide_size {
             inode_mut.cached_real_size = Some(new_real);
         }
+        // POSIX: a successful write updates mtime. Without this a file
+        // copied in without an explicit `utimensat` (touch, editors,
+        // `cp` without -p) would report the Unix epoch (issue #26).
+        inode_mut.mtime_ns = Self::now_ns();
         self.dirty = true;
         // Layer 2: this inode's chunks vec just changed; mark so the
         // next spill_to_v3_on_disk re-encrypts its chunk-list chain
@@ -3074,6 +3078,8 @@ impl Vfs {
         if hide_size {
             inode_mut.cached_real_size = Some(new_size);
         }
+        // POSIX: truncate(2) updates mtime (issue #26).
+        inode_mut.mtime_ns = Self::now_ns();
         self.dirty = true;
         // Layer 2: same reasoning as `write` -- chunks vec mutated.
         self.chunks_dirty.insert(id);
@@ -3189,6 +3195,35 @@ impl Vfs {
         Ok(())
     }
 
+    /// Current wall-clock time as nanoseconds since the Unix epoch.
+    /// Saturates to 0 on a pre-1970 clock and to `u64::MAX` past the
+    /// year 2554 (both only reachable with a badly-wrong system clock).
+    /// Used to stamp mtime on create / write / truncate so freshly
+    /// written content carries a real timestamp even when the caller
+    /// never issues an explicit `utimensat(2)`.
+    pub(crate) fn now_ns() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    }
+
+    /// Set an inode's modification time (nanoseconds since the Unix
+    /// epoch). Backs the FUSE / FUSE-T / WinFsp `setattr`-time paths so
+    /// `utimensat(2)`, and therefore `rsync -a`, `cp -p`, and
+    /// `touch -d`, round-trips instead of every file reporting the Unix
+    /// epoch (GitHub issue #26). `mtime_ns` predates the LBM4
+    /// mode/link_count fields, so this persists on both v3 and v4
+    /// vaults without forcing an upgrade. atime/ctime are not stored
+    /// separately; the mount layer reports them as mtime.
+    pub fn set_mtime(&mut self, id: FileId, mtime_ns: u64) -> Result<(), Error> {
+        self.ensure_writable()?;
+        let inode = self.tree.inodes.get_mut(&id).ok_or(Error::NotFound)?;
+        inode.mtime_ns = mtime_ns;
+        self.dirty = true;
+        Ok(())
+    }
+
     /// Create a symlink at `(parent, name)` whose stored target is
     /// `target`. **Strict target sanitization** -- the target MUST
     /// satisfy `is_safe_symlink_target`:
@@ -3235,7 +3270,7 @@ impl Vfs {
                 parent,
                 kind: InodeKind::Symlink,
                 size: target.len() as u64,
-                mtime_ns: 0,
+                mtime_ns: Self::now_ns(),
                 chunks: Vec::new(),
                 children: Default::default(),
                 cached_real_size: None,
@@ -7177,6 +7212,166 @@ mod tests {
             ),
             "rotated vault + rewritten anchor must not report rollback"
         );
+    }
+
+    /// Wall-clock nanoseconds since the Unix epoch, for test bounds.
+    fn test_now_ns() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    #[test]
+    fn mtime_stamped_on_create_and_bumped_on_write() {
+        // Issue #26: files must not all report the Unix epoch. A newly
+        // created file gets a real mtime, and a write bumps it.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mtime-stamp.lbx");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let before = test_now_ns();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let root = vfs.root_id();
+
+        // create() stamps a real, recent mtime, not epoch 0.
+        let f = vfs.create(root, "photo.jpg").unwrap();
+        let created = vfs.stat(f).unwrap().mtime_ns;
+        assert_ne!(created, 0, "create must not leave mtime at the Unix epoch");
+        assert!(
+            created >= before,
+            "create mtime {created} should be >= pre-create {before}"
+        );
+
+        // mkdir stamps too.
+        let d = vfs.mkdir(root, "album").unwrap();
+        assert_ne!(vfs.stat(d).unwrap().mtime_ns, 0, "mkdir must stamp mtime");
+
+        // write() bumps mtime. Anchor deterministically: set an ancient
+        // mtime, then write, and confirm it moved forward to ~now.
+        vfs.set_mtime(f, 1_000).unwrap();
+        let before_write = test_now_ns();
+        vfs.write(f, 0, b"jpeg-bytes").unwrap();
+        let after_write = vfs.stat(f).unwrap().mtime_ns;
+        assert!(
+            after_write >= before_write && after_write != 1_000,
+            "write must bump mtime to now (was 1000, now {after_write}, floor {before_write})"
+        );
+
+        // truncate() bumps mtime too.
+        vfs.set_mtime(f, 1_000).unwrap();
+        let before_trunc = test_now_ns();
+        vfs.truncate(f, 4).unwrap();
+        let after_trunc = vfs.stat(f).unwrap().mtime_ns;
+        assert!(
+            after_trunc >= before_trunc && after_trunc != 1_000,
+            "truncate must bump mtime to now"
+        );
+    }
+
+    #[test]
+    fn explicit_mtime_survives_write_then_flush_reopen() {
+        // The exact rsync -a scenario from issue #26: rsync writes the
+        // file, then calls utimensat to stamp the SOURCE mtime. That
+        // explicit mtime must (a) win over the write's now-stamp and
+        // (b) survive a flush + reopen, so a second `rsync -a` sees
+        // matching timestamps and SKIPS the file instead of retransfer.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mtime-persist.lbx");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let source_mtime: u64 = 1_700_000_000_123_456_789; // 2023-11-14 UTC
+        {
+            let mut vfs = Vfs::open(cont).unwrap();
+            let root = vfs.root_id();
+            let f = vfs.create(root, "photo.jpg").unwrap();
+            vfs.write(f, 0, b"jpeg-bytes").unwrap();
+            // Kernel may flush the write before the utimensat lands.
+            vfs.flush().unwrap();
+            // utimensat(source_mtime):
+            vfs.set_mtime(f, source_mtime).unwrap();
+            assert_eq!(
+                vfs.stat(f).unwrap().mtime_ns,
+                source_mtime,
+                "explicit mtime must override the write's now-stamp"
+            );
+            vfs.flush().unwrap();
+            let _ = vfs.close().unwrap();
+        }
+        // Reopen from disk: the mtime must have round-tripped through
+        // the encrypted metadata blob.
+        let cont = Container::open(&path, None, UnlockMaterial::Passphrase(b"pw")).unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let f = vfs.lookup_path("/photo.jpg").unwrap();
+        assert_eq!(
+            vfs.stat(f).unwrap().mtime_ns,
+            source_mtime,
+            "mtime must survive flush + reopen (issue #26 rsync incremental)"
+        );
+    }
+
+    #[test]
+    fn mtime_round_trips_on_v3_vault() {
+        // mtime_ns predates the LBM4 mode/link_count fields and lives in
+        // both the v3 and v4 on-disk inode, so the fix works without a
+        // format bump. Exercise a v3-format vault explicitly.
+        use luksbox_format::metadata::set_create_metadata_region_size_override;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mtime-v3.lbx");
+        let cont = {
+            let _g = set_create_metadata_region_size_override(Some(256 * 1024));
+            let _v3 = set_format_v3_override(Some(true));
+            Container::create_with_passphrase(
+                &path,
+                None,
+                CipherSuite::Aes256Gcm,
+                test_params(),
+                b"pw",
+            )
+            .unwrap()
+        };
+        let source_mtime: u64 = 1_600_000_000_000_000_000;
+        {
+            let mut vfs = Vfs::open(cont).unwrap();
+            let root = vfs.root_id();
+            let f = vfs.create(root, "f").unwrap();
+            vfs.write(f, 0, b"x").unwrap();
+            vfs.set_mtime(f, source_mtime).unwrap();
+            vfs.flush().unwrap();
+            let _ = vfs.close().unwrap();
+        }
+        let cont = Container::open(&path, None, UnlockMaterial::Passphrase(b"pw")).unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let f = vfs.lookup_path("/f").unwrap();
+        assert_eq!(vfs.stat(f).unwrap().mtime_ns, source_mtime);
+    }
+
+    #[test]
+    fn set_mtime_rejects_missing_inode() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mtime-enoent.lbx");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        assert!(matches!(vfs.set_mtime(999_999, 1), Err(Error::NotFound)));
     }
 
     #[test]

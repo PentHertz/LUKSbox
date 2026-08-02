@@ -627,6 +627,25 @@ fn name_str(name: &OsStr) -> Option<&str> {
     name.to_str()
 }
 
+/// Convert a `SystemTime` to nanoseconds since the Unix epoch,
+/// saturating to 0 for a pre-1970 time and to `u64::MAX` past the year
+/// 2554 (the stored `mtime_ns` is a `u64`). Both extremes only arise
+/// from a badly-wrong clock or a hostile client.
+fn system_time_to_ns(st: SystemTime) -> u64 {
+    st.duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+/// Resolve a FUSE `TimeOrNow` (from `utimensat`: a specific time, or
+/// `UTIME_NOW`) to nanoseconds since the Unix epoch.
+fn time_or_now_to_ns(t: TimeOrNow) -> u64 {
+    match t {
+        TimeOrNow::Now => system_time_to_ns(SystemTime::now()),
+        TimeOrNow::SpecificTime(st) => system_time_to_ns(st),
+    }
+}
+
 impl Filesystem for LuksboxFs {
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let Some(name) = name_str(name) else {
@@ -665,7 +684,7 @@ impl Filesystem for LuksboxFs {
         _gid: Option<u32>,
         size: Option<u64>,
         _atime: Option<TimeOrNow>,
-        _mtime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
@@ -700,7 +719,19 @@ impl Filesystem for LuksboxFs {
                 return;
             }
         }
-        if (size.is_some() || mode.is_some())
+        // Honor an explicit mtime from `utimensat(2)` (rsync -a, cp -p,
+        // touch -d) so incremental sync works instead of every file
+        // reporting the Unix epoch (issue #26). This runs AFTER the
+        // truncate above so an explicit mtime wins over the "now" stamp
+        // that a size change applies. atime is accepted but not stored
+        // separately (we report it as mtime); ctime is kernel-managed.
+        if let Some(mtime) = mtime
+            && let Err(e) = vfs.set_mtime(ino, time_or_now_to_ns(mtime))
+        {
+            reply.error(errno(&e));
+            return;
+        }
+        if (size.is_some() || mode.is_some() || mtime.is_some())
             && let Err(e) = self.maybe_flush_now(&mut vfs)
         {
             reply.error(errno(&e));
@@ -1327,9 +1358,39 @@ impl Filesystem for LuksboxFs {
 mod tests {
     use super::{
         UNMOUNT_CANDIDATES, assert_single_threaded_for_fork, canonical_unmount_target,
-        resolved_unmount_program,
+        resolved_unmount_program, system_time_to_ns, time_or_now_to_ns,
     };
+    use fuser::TimeOrNow;
     use std::path::Path;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn system_time_to_ns_round_trips_a_specific_mtime() {
+        // The rsync -a case: utimensat carries a specific mtime that
+        // must convert to the identical nanosecond count (issue #26).
+        let ns = 1_700_000_000_123_456_789u64;
+        let t = UNIX_EPOCH + Duration::from_nanos(ns);
+        assert_eq!(system_time_to_ns(t), ns);
+    }
+
+    #[test]
+    fn system_time_to_ns_saturates_pre_1970() {
+        // A pre-epoch clock (or hostile client) clamps to 0 rather than
+        // panicking on the negative duration.
+        let t = UNIX_EPOCH - Duration::from_secs(10);
+        assert_eq!(system_time_to_ns(t), 0);
+    }
+
+    #[test]
+    fn time_or_now_specific_is_exact_and_now_is_recent() {
+        let t = UNIX_EPOCH + Duration::from_nanos(42);
+        assert_eq!(time_or_now_to_ns(TimeOrNow::SpecificTime(t)), 42);
+        let floor = system_time_to_ns(SystemTime::now());
+        assert!(
+            time_or_now_to_ns(TimeOrNow::Now) >= floor,
+            "UTIME_NOW must resolve to a current timestamp"
+        );
+    }
 
     /// On any Linux/macOS host that has FUSE installed (which is
     /// every CI runner that runs the FUSE integration tests), at
