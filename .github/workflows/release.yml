@@ -2023,6 +2023,40 @@ jobs:
           if (Test-Path "${{ matrix.archive }}") { Remove-Item "${{ matrix.archive }}" }
           Compress-Archive -Path staging/* -DestinationPath "${{ matrix.archive }}"
 
+      - name: Code-sign the Windows portable zip via SignPath
+        # SignPath (https://signpath.io) Authenticode-signs the two
+        # LUKSbox exes INSIDE the portable zip and returns the zip. This
+        # is preferred over the WINDOWS_PFX_BASE64 signtool path above:
+        # the private key never leaves SignPath's HSM and every signing
+        # request is provenance-checked against this workflow. It runs
+        # only when SIGNPATH_API_TOKEN is set, so builds without it are
+        # unchanged. If BOTH this and the PFX path are configured, the
+        # zip ends up carrying SignPath's signature (this step runs after
+        # the PFX re-zip). The MSI and Burn bundle are NOT covered here;
+        # they keep going through the signtool step above. Requires the
+        # project's SignPath artifact configuration to sign luksbox.exe +
+        # luksbox-gui.exe inside a <zip-file> (see docs/WINDOWS_SIGNING.md).
+        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        shell: pwsh
+        env:
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+        run: |
+          Install-Module -Name SignPath -Force -Scope CurrentUser
+          $signed = Join-Path $env:RUNNER_TEMP "signed-${{ matrix.archive }}"
+          Submit-SigningRequest `
+            -InputArtifactPath  "${{ matrix.archive }}" `
+            -ApiToken           "$env:SIGNPATH_API_TOKEN" `
+            -OrganizationId     "${{ vars.SIGNPATH_ORGANIZATION_ID }}" `
+            -ProjectSlug        "${{ vars.SIGNPATH_PROJECT_SLUG }}" `
+            -SigningPolicySlug  "${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}" `
+            -OutputArtifactPath "$signed" `
+            -WaitForCompletion
+          # Overwrite the archive in place so the existing upload step
+          # (and the release job's checksums + Sigstore attestation)
+          # picks up the signed copy with no further changes.
+          Move-Item -Force "$signed" "${{ matrix.archive }}"
+          Write-Host "==> replaced ${{ matrix.archive }} with the SignPath-signed copy"
+
       - name: Fetch + verify pinned WinFsp MSI (for the Burn bundle)
         if: runner.os == 'Windows'
         shell: pwsh
