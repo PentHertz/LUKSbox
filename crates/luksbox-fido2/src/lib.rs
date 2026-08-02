@@ -55,7 +55,8 @@ pub mod hid;
 pub mod webauthn;
 
 pub use crate::authenticator::{
-    Credential, EnrollResult, Fido2Authenticator, HmacSecret, RP_ID, webauthn_prf_salt,
+    Credential, EnrollResult, Fido2Authenticator, HmacSecret, HmacSecretRequest, RP_ID,
+    webauthn_prf_salt,
 };
 pub use crate::error::Error;
 pub use crate::mock::MockAuthenticator;

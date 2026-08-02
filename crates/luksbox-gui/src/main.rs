@@ -8,6 +8,7 @@
 
 mod app;
 mod clipboard_guard;
+mod fonts;
 mod ops;
 mod preferences;
 mod recent;
@@ -49,6 +50,9 @@ fn main() -> eframe::Result<()> {
         opts,
         Box::new(|cc| {
             theme::install(&cc.egui_ctx);
+            // System CJK fallback fonts so non-ASCII vault / file names
+            // don't render as boxes (issue #28). Best-effort.
+            fonts::install_unicode_fallbacks(&cc.egui_ctx);
             // egui_extras handles `Image::from_bytes(...)` decoding.
             egui_extras::install_image_loaders(&cc.egui_ctx);
             // Manual zoom override for fractional-DPI displays.

@@ -18,6 +18,47 @@ canonical record.
 
 Committed but not yet attached to a tagged release.
 
+### Fixed: unlock works with ANY enrolled FIDO2 key, not just slot 0's (#28)
+
+A vault with two FIDO2 keyslots (a primary and a backup security key)
+could only ever be unlocked with the key enrolled first: on Windows,
+presenting the backup key got "This security key doesn't look
+familiar", and the backup slot only became usable after revoking the
+primary. Root cause: the unlock flow asserted the keyslots one at a
+time, so each WebAuthn prompt carried an allow-list with a SINGLE
+credential - the slot currently being tried - and Windows rightly
+rejected any other key against it.
+
+`Fido2Authenticator` grew a batched `hmac_secret_multi` that asserts
+against every candidate keyslot at once and reports which credential
+matched. The Windows webauthn.dll backend implements it natively: one
+prompt whose allow-list holds every enrolled credential, each bound to
+its own hmac-secret salt via the API's per-credential salt list, so
+whichever enrolled key the user presents unlocks its keyslot (with a
+graceful per-slot fallback if a webauthn.dll build ever returns no
+hmac output for the batched form). On Linux/macOS the libfido2 path
+keeps sequential per-credential asserts, which were already correct
+there - a CTAP2 device refuses absent credentials without a touch -
+and still cost a single touch. The pure-FIDO2 unlock paths in both
+the GUI and the CLI now batch all their candidate slots this way.
+
+Also gone on Windows: the vestigial "retry with the opposite salt
+convention" second prompt after a failed FIDO2 keyslot unlock
+attempt (all keyslot unlock paths, including the TPM2/SEP/hybrid-PQ
+combos). webauthn.dll applies its salt transform unconditionally, so
+the retry was a byte-identical call that could never succeed where
+the first attempt failed - it only cost the user an extra dialog.
+
+### Fixed: non-ASCII text no longer renders as empty boxes in the GUI (#28)
+
+egui's bundled fonts have no CJK coverage, so Chinese / Japanese /
+Korean vault names, file names, and labels rendered as boxes. The GUI
+now appends system fonts as glyph fallbacks at startup (Microsoft
+YaHei + Malgun Gothic on Windows, PingFang / Hiragino / Apple SD
+Gothic Neo on macOS, Noto Sans CJK or WenQuanYi on Linux). Latin
+rendering is unchanged; loading is best-effort and a missing or
+unreadable system font never blocks startup.
+
 ### Fixed: files on a Windows (WinFsp) mount can be renamed and deleted (#29)
 
 On a mounted vault, deleting a file from Explorer appeared to succeed

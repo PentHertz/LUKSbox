@@ -99,12 +99,17 @@ per-crate `tests/` directories.
 - `tests/seed_file_dos_guard.rs`, **5 regression tests** for the
   seed-file Argon2id-DoS (audit round 1).
 
-### `luksbox-fido2` (9 tests + 11 in `rogue_authenticator`)
+### `luksbox-fido2` (19 tests + 11 in `rogue_authenticator`)
 
 - `src/protocol.rs::tests`, CTAP2 hmac-secret protocol round-trip,
   ECDH agreement, salt-auth tamper detection.
+- `src/webauthn_paths.rs::tests`, the Windows device-path ->
+  attachment-hint classifier (also fuzzed).
 - `src/mock.rs::tests`, `MockAuthenticator` deterministic enroll +
-  hmac_secret behaviour.
+  hmac_secret behaviour, plus the `hmac_secret_multi` batched-assert
+  contract (issue #28: correct candidate index + per-candidate salt
+  when unlocking with any one of several enrolled keys; empty and
+  all-unknown candidate lists fail cleanly).
 - `tests/rogue_authenticator.rs`, **11 regression tests** for
   rogue/MITM FIDO2 device behaviour (audit round 2).
 
@@ -595,12 +600,12 @@ cargo +nightly fuzz run <target-you-touched> fuzz/corpus/<target> -- -max_total_
 | luksbox-core | 15 | 9 (argon2 DoS guard) | 24 |
 | luksbox-format | 10 | 0 | 10 |
 | luksbox-pq | 9 | 22 (FIPS-203, hybrid e2e, seed-file DoS) | 31 |
-| luksbox-fido2 | 9 | 11 (rogue authenticator) | 20 |
+| luksbox-fido2 | 19 | 11 (rogue authenticator) | 30 |
 | luksbox-vfs | 22 | 1 (bincode OOM) | 23 |
 | luksbox-cli | 0 | 25 (5 + 20 functional) | 25 |
 | luksbox-mount | 0 | 6 (winfsp_mount, Windows-only) | 6 |
 | luksbox-gui | 0 | 0 | 0 |
-| **Workspace total** | **65** | **74** | **139** |
+| **Workspace total** | **75** | **74** | **149** |
 
 Plus 6 fuzz harnesses (4 pre-existing + 2 added during the audit) +
 1 auth-then-process harness with a fixed MVK.

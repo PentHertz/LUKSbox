@@ -379,6 +379,24 @@ impl luksbox_fido2::Fido2Authenticator for GuiAuthenticator {
             pin,
         )
     }
+
+    // MUST forward explicitly: the trait's default body would loop over
+    // `self.hmac_secret` and bypass the Windows backend's native
+    // multi-credential override (one WebAuthn prompt for all enrolled
+    // keyslots, issue #28).
+    fn hmac_secret_multi(
+        &mut self,
+        rp_id: &str,
+        requests: &[luksbox_fido2::HmacSecretRequest<'_>],
+        pin: Option<&str>,
+    ) -> Result<(usize, luksbox_fido2::HmacSecret), luksbox_fido2::Error> {
+        if self.enrolled {
+            set_fido2_touch_stage(Some(
+                "Step 2 of 2: authenticate again to derive the keyslot secret",
+            ));
+        }
+        luksbox_fido2::Fido2Authenticator::hmac_secret_multi(&mut self.inner, rp_id, requests, pin)
+    }
 }
 
 #[cfg(feature = "fido2-hardware")]
@@ -3989,26 +4007,20 @@ fn deniable_sep_unseal_from_bytes(blob_bytes: &[u8]) -> Result<[u8; 32], String>
 }
 
 /// Salt-prehash conventions to try, in order, when unlocking a FIDO2
-/// keyslot. On Windows, `webauthn.dll` applies an opaque transform to
-/// the hmac-secret salt that we cannot observe or override, so a slot
-/// enrolled under one convention may need the *other* fed to
-/// `webauthn.dll` to reproduce the device salt the slot was created
-/// with. Try the slot's declared convention first and, if the open
-/// fails, fall back to the opposite, using whichever unlocks (one extra
-/// Windows Hello tap only on the fallback). libfido2 (Linux/macOS) is
-/// deterministic, so the declared convention is always correct there
-/// and we try only it. Mirrors the deniable-envelope probe above and
-/// the CLI's `fido2_salt_conventions`.
+/// keyslot: just the slot's declared convention, on every OS. libfido2
+/// (Linux/macOS) feeds the salt deterministically, so the declared
+/// convention is always the right one. On Windows this used to also
+/// retry the opposite convention, back when webauthn.dll's salt
+/// transform was thought to be observable via `prehash_salt`; the
+/// xplatform_hmac_probe findings (see webauthn.rs) established that
+/// webauthn.dll ignores that flag entirely, which made the retry a
+/// byte-identical second call whose only effect was a duplicate
+/// prompt after every failed attempt. Kept as a function (rather than
+/// inlining the single try) so every combo unlock loop reads the same
+/// as the CLI's `fido2_salt_conventions`.
 #[cfg(feature = "fido2-hardware")]
 fn fido2_salt_conventions(declared_prehash: bool) -> Vec<bool> {
-    #[cfg(target_os = "windows")]
-    {
-        vec![declared_prehash, !declared_prehash]
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        vec![declared_prehash]
-    }
+    vec![declared_prehash]
 }
 
 #[cfg(feature = "fido2-hardware")]
@@ -4026,46 +4038,66 @@ fn unlock_with_fido2(
     drop(f);
     let header = Header::from_bytes(&header_bytes).map_err(estr)?;
     let mut auth = make_fido2_authenticator();
+    // Every FIDO2 slot (wrap + direct) is a candidate in ONE batched
+    // assert. On Windows that is a single WebAuthn prompt whose
+    // allow-list holds every enrolled credential, so a vault with a
+    // primary + backup key unlocks with whichever key the user presents
+    // (issue #28: the old per-slot loop made Windows reject the backup
+    // key with "this security key doesn't look familiar" while it was
+    // asserting slot 0's credential). On libfido2 the batched call
+    // degrades to the same sequential per-slot asserts as before, which
+    // cost no extra touches there. The old Windows both-salt-conventions
+    // retry is gone on purpose: webauthn.dll ignores `prehash_salt`
+    // entirely (see webauthn.rs), so the retry was a byte-identical
+    // call whose only effect was a duplicate prompt.
+    let mut candidates: Vec<&luksbox_core::Keyslot> = header
+        .keyslots
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SlotKind::Fido2HmacSecret | SlotKind::Fido2DerivedMvk
+            )
+        })
+        .collect();
+    if candidates.is_empty() {
+        return Err("no FIDO2 keyslot in this vault".into());
+    }
     let mut last_err: Option<String> = None;
-    for slot in &header.keyslots {
-        if !matches!(
-            slot.kind,
-            SlotKind::Fido2HmacSecret | SlotKind::Fido2DerivedMvk
-        ) {
-            continue;
-        }
-        // Declared salt convention first, then (Windows) the opposite,
-        // since webauthn.dll's salt transform is opaque. Covers both
-        // Fido2HmacSecret (wrap) and Fido2DerivedMvk (direct).
-        for prehash in fido2_salt_conventions(slot.fido2_salt_prehashed()) {
-            let hmac_secret = match auth.hmac_secret(
-                RP_ID,
-                &slot.fido2_cred_id,
-                &slot.fido2_hmac_salt,
-                prehash,
-                Some(pin),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2: {e}"));
-                    continue;
-                }
-            };
-            match Container::open(
-                path,
-                header_path,
-                UnlockMaterial::Fido2 {
-                    passphrase: None,
-                    cred_id: &slot.fido2_cred_id,
-                    hmac_secret: &hmac_secret,
-                },
-            ) {
-                Ok(c) => return Ok(c),
-                Err(e) => last_err = Some(e.to_string()),
+    while !candidates.is_empty() {
+        let requests: Vec<luksbox_fido2::HmacSecretRequest<'_>> = candidates
+            .iter()
+            .map(|s| luksbox_fido2::HmacSecretRequest {
+                cred_id: &s.fido2_cred_id,
+                salt: &s.fido2_hmac_salt,
+                prehash_salt: s.fido2_salt_prehashed(),
+            })
+            .collect();
+        let (idx, hmac_secret) = match auth.hmac_secret_multi(RP_ID, &requests, Some(pin)) {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = Some(format!("FIDO2: {e}"));
+                break;
             }
+        };
+        // The assertion matched this slot's credential. If the open
+        // still fails (e.g. a legacy-convention slot on Windows), drop
+        // the slot from the candidate set and re-assert the rest.
+        let slot = candidates.remove(idx);
+        match Container::open(
+            path,
+            header_path,
+            UnlockMaterial::Fido2 {
+                passphrase: None,
+                cred_id: &slot.fido2_cred_id,
+                hmac_secret: &hmac_secret,
+            },
+        ) {
+            Ok(c) => return Ok(c),
+            Err(e) => last_err = Some(e.to_string()),
         }
     }
-    Err(last_err.unwrap_or_else(|| "no FIDO2 keyslot in this vault".into()))
+    Err(last_err.unwrap_or_else(|| "FIDO2 unlock failed".into()))
 }
 
 #[cfg(not(feature = "fido2-hardware"))]

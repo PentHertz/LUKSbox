@@ -132,6 +132,21 @@ impl AsRef<[u8; 32]> for HmacSecret {
     }
 }
 
+/// One candidate credential for a batched hmac-secret assertion. Each
+/// entry pairs a keyslot's stored credential id with that same slot's
+/// 32-byte hmac salt and declared salt convention. See
+/// [`Fido2Authenticator::hmac_secret_multi`].
+#[derive(Debug, Clone, Copy)]
+pub struct HmacSecretRequest<'a> {
+    /// Credential id stored in the keyslot.
+    pub cred_id: &'a [u8],
+    /// The hmac-secret salt stored in the same keyslot.
+    pub salt: &'a [u8; 32],
+    /// Salt convention for this credential (see
+    /// [`Fido2Authenticator::hmac_secret`]).
+    pub prehash_salt: bool,
+}
+
 /// All operations require user presence (touch). Operations may also require
 /// a PIN if the authenticator was provisioned with one.
 pub trait Fido2Authenticator {
@@ -174,4 +189,43 @@ pub trait Fido2Authenticator {
         prehash_salt: bool,
         pin: Option<&str>,
     ) -> Result<HmacSecret, Error>;
+
+    /// Compute hmac-secret for whichever of `requests` the presented
+    /// authenticator holds, returning the index of the matched request
+    /// plus its 32-byte secret.
+    ///
+    /// This is how a vault with SEVERAL enrolled FIDO2 keyslots (e.g. a
+    /// primary + a backup security key, issue #28) is unlocked: the
+    /// caller lists every slot's (cred_id, salt) and the backend asserts
+    /// against them all, succeeding with whichever credential lives on
+    /// the key the user actually presents.
+    ///
+    /// Backend behaviour:
+    /// - This default implementation attempts each request in order via
+    ///   [`Self::hmac_secret`] and returns the first success. Correct
+    ///   and cheap for libfido2 (Linux/macOS): a CTAP2 device refuses an
+    ///   allow-list credential it does not hold without requiring user
+    ///   presence, so a full pass still costs one touch.
+    /// - webauthn.dll (Windows) overrides this with a single
+    ///   `GetAssertion` whose allow-list carries every credential with
+    ///   its own per-credential salt. Sequential single-credential calls
+    ///   would instead show one modal "this security key doesn't look
+    ///   familiar" dialog per non-matching slot.
+    fn hmac_secret_multi(
+        &mut self,
+        rp_id: &str,
+        requests: &[HmacSecretRequest<'_>],
+        pin: Option<&str>,
+    ) -> Result<(usize, HmacSecret), Error> {
+        let mut last_err: Option<Error> = None;
+        for (idx, req) in requests.iter().enumerate() {
+            match self.hmac_secret(rp_id, req.cred_id, req.salt, req.prehash_salt, pin) {
+                Ok(secret) => return Ok((idx, secret)),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            Error::Other("hmac_secret_multi called with an empty request list".into())
+        }))
+    }
 }

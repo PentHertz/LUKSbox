@@ -740,7 +740,10 @@ impl FileSystemInterface for LuksboxFs {
                 winfsp_trace!(
                     "cleanup",
                     format!("delete path={path:?}"),
-                    format!("skipped: name now resolves to id={target_id}, handle is id={}", ctx.file_id)
+                    format!(
+                        "skipped: name now resolves to id={target_id}, handle is id={}",
+                        ctx.file_id
+                    )
                 );
                 return;
             }
