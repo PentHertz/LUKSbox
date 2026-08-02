@@ -95,6 +95,26 @@
 //! `unmount(mountpoint)` helper handles case (a) via a process-wide
 //! mount registry; case (b) is on the user. Cross-process callers
 //! get a clear error rather than a fake `Ok(())`.
+//!
+//! ### 8. Case-insensitive volume => the kernel UPPERCASES names
+//!
+//! With `CaseSensitiveSearch=false` (which we set to match NTFS,
+//! see gotcha list above), the WinFsp kernel driver hands the
+//! UPPERCASED canonical file name to `cleanup` (delete-on-close)
+//! and to `rename` (the source name) - e.g. a file created as
+//! `doomed.txt` comes back as `\DOOMED.TXT`. Any callback that
+//! resolves an incoming name against the Vfs MUST therefore use
+//! the case-insensitive `lookup_ci` / `lookup_path_ci` and then
+//! operate on the STORED name, because `Vfs::{unlink,rmdir,rename}`
+//! are exact-match. Resolving with exact-match lookups made every
+//! Explorer delete "succeed" (Windows saw STATUS_SUCCESS) while
+//! the in-vault unlink silently failed NotFound, so files
+//! resurrected on the next directory refresh; renames failed
+//! outright. That was GitHub issue #29. Caller-supplied names
+//! (create / open / the rename DESTINATION) arrive with the
+//! caller's original casing, which is why the bug spared create
+//! and open. Regression coverage:
+//! `tests/winfsp_mount.rs::delete_and_rename_via_win32`.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -460,7 +480,12 @@ impl LuksboxFs {
 
     fn lookup_kind(&self, path: &str) -> Result<(FileId, InodeKind), NTSTATUS> {
         let mut vfs = self.inner.lock().unwrap();
-        let id = vfs.lookup_path(path).map_err(|e| vfs_err_to_nt(&e))?;
+        // Case-insensitive resolution throughout: we declare the volume
+        // `CaseSensitiveSearch=false` (NTFS semantics), so Windows is
+        // entitled to look a name up with different casing than it was
+        // stored with - and does (Explorer re-lookups, and the UPPERCASED
+        // canonical names the kernel hands to cleanup/rename; issue #29).
+        let id = vfs.lookup_path_ci(path).map_err(|e| vfs_err_to_nt(&e))?;
         let st = vfs.stat(id).map_err(|e| vfs_err_to_nt(&e))?;
         Ok((id, st.kind))
     }
@@ -593,7 +618,20 @@ impl FileSystemInterface for LuksboxFs {
         let path = from_win_path(file_name)?;
         let (parent_str, name) = split_parent_name(&path)?;
         let mut vfs = self.inner.lock().unwrap();
-        let parent_id = vfs.lookup_path(parent_str).map_err(|e| vfs_err_to_nt(&e))?;
+        let parent_id = vfs
+            .lookup_path_ci(parent_str)
+            .map_err(|e| vfs_err_to_nt(&e))?;
+        // The volume is case-insensitive, so "FOO.TXT" and "foo.txt"
+        // are the same file to Windows. `Vfs::create`/`mkdir` only
+        // reject exact-name duplicates; without this guard a create
+        // with different casing would insert a case-colliding sibling
+        // that Windows can then only ever resolve to one of the two.
+        // (WinFsp normally routes opens of existing files away from
+        // Create via get_security_by_name, but that check races the
+        // 1s metadata cache - be strict here too.)
+        if vfs.lookup_ci(parent_id, name).is_ok() {
+            return Err(STATUS_OBJECT_NAME_COLLISION);
+        }
         let is_dir = create_file_info
             .file_attributes
             .is(FileAttributes::DIRECTORY);
@@ -655,6 +693,16 @@ impl FileSystemInterface for LuksboxFs {
         // `LAZY_FLUSH_INTERVAL_SECS`). With `--sync` every cleanup
         // persists immediately. `Drop::drop` provides the unconditional
         // final safety net for the forced-kill / abandonment case.
+        winfsp_trace!(
+            "cleanup",
+            format!(
+                "file_id={} is_dir={} flags={:?} file_name={:?}",
+                ctx.file_id,
+                ctx.is_dir,
+                flags,
+                file_name.map(|n| n.to_string().unwrap_or_default())
+            )
+        );
         if flags.is(CleanupFlags::DELETE) {
             // Triggered after can_delete + actual delete decision.
             let Some(name) = file_name else { return };
@@ -665,14 +713,47 @@ impl FileSystemInterface for LuksboxFs {
                 return;
             };
             let mut vfs = self.inner.lock().unwrap();
-            let Ok(parent_id) = vfs.lookup_path(parent) else {
+            let Ok(parent_id) = vfs.lookup_path_ci(parent) else {
                 return;
             };
-            let _ = if ctx.is_dir {
-                vfs.rmdir(parent_id, leaf)
-            } else {
-                vfs.unlink(parent_id, leaf)
+            // The kernel hands us the UPPERCASED canonical name here
+            // (case-insensitive volume), so resolve it back to the
+            // stored name before unlinking - `Vfs::unlink`/`rmdir`
+            // are exact-match. This was the issue-#29 delete bug:
+            // unlink("DOOMED.TXT") silently failed against the stored
+            // "doomed.txt" and the file resurfaced on the next
+            // directory refresh.
+            let Ok((target_id, stored)) = vfs.lookup_ci(parent_id, leaf) else {
+                winfsp_trace!(
+                    "cleanup",
+                    format!("delete path={path:?}"),
+                    "Err(leaf not found)"
+                );
+                return;
             };
+            // Sanity guard: only delete the inode this handle was
+            // opened on. A mismatch means the name was reused by a
+            // concurrent rename between disposition and cleanup -
+            // deleting whatever sits there now would hit an innocent
+            // file.
+            if target_id != ctx.file_id {
+                winfsp_trace!(
+                    "cleanup",
+                    format!("delete path={path:?}"),
+                    format!("skipped: name now resolves to id={target_id}, handle is id={}", ctx.file_id)
+                );
+                return;
+            }
+            let res = if ctx.is_dir {
+                vfs.rmdir(parent_id, &stored)
+            } else {
+                vfs.unlink(parent_id, &stored)
+            };
+            winfsp_trace!(
+                "cleanup",
+                format!("delete path={path:?} stored={stored:?}"),
+                format!("{res:?}")
+            );
             self.maybe_flush_now(&mut vfs);
         } else if let Ok(mut vfs) = self.inner.lock() {
             // Non-delete cleanup: a write/truncate/set-size happened
@@ -828,9 +909,31 @@ impl FileSystemInterface for LuksboxFs {
         make_file_info(&mut vfs, ctx.file_id)
     }
 
-    fn can_delete(&self, _ctx: Self::FileContext, _file_name: &U16CStr) -> Result<(), NTSTATUS> {
-        // Always permit; rmdir's NotEmpty check happens in cleanup. A more
-        // strict implementation would pre-check directory emptiness here.
+    fn can_delete(&self, ctx: Self::FileContext, file_name: &U16CStr) -> Result<(), NTSTATUS> {
+        winfsp_trace!(
+            "can_delete",
+            format!(
+                "file_id={} is_dir={} file_name={:?}",
+                ctx.file_id,
+                ctx.is_dir,
+                file_name.to_string().unwrap_or_default()
+            )
+        );
+        // Refuse to mark a non-empty directory for deletion, matching
+        // NTFS. The actual rmdir in `cleanup` is a void callback whose
+        // errors Windows never sees - without this pre-check, deleting
+        // a non-empty directory LOOKS successful in Explorer and the
+        // directory then "resurrects" on refresh (the same ghost
+        // symptom as issue #29). Windows' delete APIs set the delete
+        // disposition through this callback, so failing here surfaces
+        // the proper "directory is not empty" dialog instead.
+        if ctx.is_dir {
+            let vfs = self.inner.lock().unwrap();
+            let entries = vfs.readdir(ctx.file_id).map_err(|e| vfs_err_to_nt(&e))?;
+            if !entries.is_empty() {
+                return Err(STATUS_DIRECTORY_NOT_EMPTY);
+            }
+        }
         Ok(())
     }
 
@@ -843,28 +946,88 @@ impl FileSystemInterface for LuksboxFs {
     ) -> Result<(), NTSTATUS> {
         let old = from_win_path(old_name)?;
         let new = from_win_path(new_name)?;
+        winfsp_trace!(
+            "rename",
+            format!("old={old:?} new={new:?} replace_if_exists={replace_if_exists}")
+        );
         let (op, ol) = split_parent_name(&old)?;
         let (np, nl) = split_parent_name(&new)?;
         let mut vfs = self.inner.lock().unwrap();
-        let from_parent = vfs.lookup_path(op).map_err(|e| vfs_err_to_nt(&e))?;
+        let from_parent = vfs.lookup_path_ci(op).map_err(|e| vfs_err_to_nt(&e))?;
         // Reuse the same id when both paths share a parent so the VFS
         // takes its single-get_mut fast path; otherwise resolve the
         // distinct destination directory.
         let to_parent = if op == np {
             from_parent
         } else {
-            vfs.lookup_path(np).map_err(|e| vfs_err_to_nt(&e))?
+            vfs.lookup_path_ci(np).map_err(|e| vfs_err_to_nt(&e))?
         };
-        // Honor the Win32 `MoveFileEx` semantics: if the caller did NOT
-        // pass MOVEFILE_REPLACE_EXISTING and the target already exists,
-        // surface STATUS_OBJECT_NAME_COLLISION instead of silently
-        // overwriting. The VFS layer's POSIX behavior is replace-on-
-        // conflict, so we enforce the no-replace contract here.
-        if !replace_if_exists && vfs.lookup(to_parent, nl).is_ok() {
-            return Err(STATUS_OBJECT_NAME_COLLISION);
-        }
-        vfs.rename(from_parent, ol, to_parent, nl)
+        // The kernel hands us the UPPERCASED canonical source name
+        // (case-insensitive volume; issue #29) - resolve it to the
+        // stored name, which the exact-match `Vfs::rename` needs.
+        let (src_id, ol_stored) = vfs
+            .lookup_ci(from_parent, ol)
             .map_err(|e| vfs_err_to_nt(&e))?;
+        // Case-insensitive target probe, three-way:
+        //   * target resolves to the SOURCE inode: a case-only rename
+        //     ("foo.txt" -> "FOO.TXT"). Allowed regardless of
+        //     replace_if_exists - the target "existing" is the file
+        //     itself, and a rename is the only way to change casing.
+        //   * target is a different inode without
+        //     MOVEFILE_REPLACE_EXISTING: STATUS_OBJECT_NAME_COLLISION,
+        //     Win32 contract.
+        //   * target is a different inode WITH the replace flag:
+        //     rename onto the target's STORED name so `Vfs::rename`
+        //     sees the collision and runs its POSIX replace path
+        //     (type checks + chunk freeing). Renaming onto the
+        //     caller-cased name instead would slip past the exact-
+        //     match displaced-target check and leave TWO case-variant
+        //     entries. The caller's requested casing is applied by
+        //     the follow-up case-fix rename below.
+        let effective_new = match vfs.lookup_ci(to_parent, nl) {
+            Ok((dst_id, dst_stored)) if dst_id == src_id => {
+                if to_parent == from_parent && dst_stored == ol_stored {
+                    // The "existing target" is this very entry: a
+                    // case-only rename. Honor the requested casing.
+                    nl.to_string()
+                } else {
+                    // Target is a HARDLINK of the source (only
+                    // creatable through the POSIX mounts). Renaming
+                    // onto the stored link name lets `Vfs::rename`
+                    // take its POSIX same-inode no-op path instead of
+                    // planting a case-variant duplicate entry.
+                    dst_stored
+                }
+            }
+            Ok((_, dst_stored)) => {
+                if !replace_if_exists {
+                    return Err(STATUS_OBJECT_NAME_COLLISION);
+                }
+                dst_stored
+            }
+            Err(_) => nl.to_string(),
+        };
+        let res = vfs.rename(from_parent, &ol_stored, to_parent, &effective_new);
+        winfsp_trace!(
+            "rename",
+            format!("apply old={ol_stored:?} new={effective_new:?}"),
+            format!("{res:?}")
+        );
+        res.map_err(|e| vfs_err_to_nt(&e))?;
+        if effective_new != nl {
+            // Replace-with-different-casing: the entry now carries the
+            // displaced target's casing; move it to the caller's
+            // requested casing. Same lock, so the two-step is atomic
+            // to every other WinFsp callback. Best-effort: the rename
+            // itself already succeeded semantically, a case-fix
+            // failure only leaves the old casing behind.
+            let res2 = vfs.rename(to_parent, &effective_new, to_parent, nl);
+            winfsp_trace!(
+                "rename",
+                format!("case-fix {effective_new:?} -> {nl:?}"),
+                format!("{res2:?}")
+            );
+        }
         self.maybe_flush_now(&mut vfs);
         Ok(())
     }

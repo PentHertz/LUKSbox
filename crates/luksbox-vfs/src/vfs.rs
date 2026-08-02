@@ -2711,6 +2711,56 @@ impl Vfs {
         Ok(cur)
     }
 
+    /// Case-insensitive (case-preserving) child lookup. Returns the
+    /// child's id AND its stored name, so callers can hand the
+    /// canonical name to the exact-match mutation APIs (`unlink`,
+    /// `rmdir`, `rename`).
+    ///
+    /// Exists for mount backends that present the tree as a
+    /// case-insensitive volume: WinFsp declares
+    /// `CaseSensitiveSearch=false` to match NTFS semantics, and for
+    /// such volumes the WinFsp kernel driver UPPERCASES the canonical
+    /// file name it hands to `Cleanup` (delete-on-close) and
+    /// `SetInformation(Rename)`. Resolving those names with the
+    /// exact-match `lookup` made every Explorer delete / rename fail
+    /// with NotFound - GitHub issue #29.
+    ///
+    /// Resolution order: exact byte-wise match first (free, and the
+    /// only deterministic answer when two names differ only in case -
+    /// possible in vaults written through the case-sensitive POSIX
+    /// mounts), then a linear scan in `BTreeMap` iteration order so a
+    /// case-colliding directory still resolves deterministically.
+    ///
+    /// Case folding is per-`char` Unicode full uppercase, compared
+    /// pairwise with no length change allowed. This matches NTFS's
+    /// simple-upcase behavior for the overwhelmingly common cases
+    /// (ASCII, accented Latin, Greek, Cyrillic) and deliberately does
+    /// NOT match expanding folds (NTFS treats "ß" and "SS" as
+    /// distinct; so do we).
+    pub fn lookup_ci(&self, parent: FileId, name: &str) -> Result<(FileId, String), Error> {
+        let inode = self.require_dir(parent)?;
+        if let Some((stored, id)) = inode.children.get_key_value(name) {
+            return Ok((*id, stored.clone()));
+        }
+        inode
+            .children
+            .iter()
+            .find(|(stored, _)| names_eq_ci(stored, name))
+            .map(|(stored, id)| (*id, stored.clone()))
+            .ok_or(Error::NotFound)
+    }
+
+    /// `lookup_path` with per-segment case-insensitive resolution.
+    /// Same contract as [`Vfs::lookup_ci`]; used by the WinFsp
+    /// adapter for every path Windows hands it.
+    pub fn lookup_path_ci(&self, path: &str) -> Result<FileId, Error> {
+        let mut cur = self.tree.root;
+        for seg in path.split('/').filter(|s| !s.is_empty()) {
+            cur = self.lookup_ci(cur, seg)?.0;
+        }
+        Ok(cur)
+    }
+
     pub fn mkdir(&mut self, parent: FileId, name: &str) -> Result<FileId, Error> {
         self.ensure_writable()?;
         validate_name(name)?;
@@ -4103,6 +4153,31 @@ fn validate_name(name: &str) -> Result<(), Error> {
     }
 }
 
+/// Case-insensitive name equality for [`Vfs::lookup_ci`].
+///
+/// Per-`char` pairwise comparison where two chars match iff they are
+/// identical or their Unicode full-uppercase expansions are equal.
+/// Because the comparison is pairwise, folds that CHANGE the length
+/// of a name never match ("ß" vs "SS" stays distinct, same as
+/// NTFS's simple $UpCase table). ASCII fast-path first: the exact
+/// compare in `lookup_ci` already handled `a == b`, so this only
+/// runs on candidate names that differ somewhere.
+fn names_eq_ci(a: &str, b: &str) -> bool {
+    let mut ai = a.chars();
+    let mut bi = b.chars();
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) => {
+                if x != y && !x.to_uppercase().eq(y.to_uppercase()) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// Strict symlink-target sanitization. Returns `true` iff `target`
 /// is safe to store in the vault.
 ///
@@ -4841,6 +4916,72 @@ mod tests {
             vfs.rename(root, &at_cap, root, &oversize),
             Err(Error::InvalidPath(_))
         ));
+    }
+
+    /// Unit coverage for the case-insensitive comparison behind
+    /// `lookup_ci` (GitHub issue #29: the WinFsp kernel hands
+    /// UPPERCASED canonical names to cleanup/rename on the
+    /// case-insensitive volume we declare).
+    #[test]
+    fn names_eq_ci_matches_windows_expectations() {
+        // ASCII case folds.
+        assert!(names_eq_ci("doomed.txt", "DOOMED.TXT"));
+        assert!(names_eq_ci("MiXeD.CaSe", "mixed.case"));
+        assert!(names_eq_ci("same", "same"));
+        // Non-ASCII simple folds.
+        assert!(names_eq_ci("café", "CAFÉ"));
+        assert!(names_eq_ci("Ω-report", "ω-report"));
+        assert!(names_eq_ci("Отчёт", "отчёт"));
+        // Different names never match.
+        assert!(!names_eq_ci("a.txt", "b.txt"));
+        assert!(!names_eq_ci("abc", "abcd"));
+        assert!(!names_eq_ci("", "a"));
+        assert!(names_eq_ci("", ""));
+        // Expanding folds stay distinct, like NTFS's simple $UpCase:
+        // "ß".to_uppercase() is "SS" but the names have different
+        // lengths so they must NOT be treated as the same file.
+        assert!(!names_eq_ci("straße", "STRASSE"));
+        assert!(names_eq_ci("straße", "STRAßE"));
+    }
+
+    /// `lookup_ci` / `lookup_path_ci` resolve case-insensitively and
+    /// return the stored (case-preserved) name; exact matches win
+    /// over case-insensitive ones when a directory contains
+    /// case-colliding siblings (creatable via the POSIX mounts).
+    #[test]
+    fn lookup_ci_resolves_and_preserves_stored_case() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let sub = vfs.mkdir(root, "Sub Dir").unwrap();
+        let f = vfs.create(sub, "Doomed.txt").unwrap();
+
+        // Any casing resolves to the same id, and the stored name
+        // comes back case-preserved.
+        for probe in ["Doomed.txt", "DOOMED.TXT", "doomed.txt"] {
+            let (id, stored) = vfs.lookup_ci(sub, probe).unwrap();
+            assert_eq!(id, f, "probe {probe:?}");
+            assert_eq!(stored, "Doomed.txt", "probe {probe:?}");
+        }
+        assert!(matches!(
+            vfs.lookup_ci(sub, "other.txt"),
+            Err(Error::NotFound)
+        ));
+
+        // Path resolution folds every segment.
+        assert_eq!(vfs.lookup_path_ci("/SUB DIR/DOOMED.TXT").unwrap(), f);
+        assert_eq!(vfs.lookup_path_ci("/sub dir/doomed.txt").unwrap(), f);
+        assert!(vfs.lookup_path_ci("/missing/doomed.txt").is_err());
+
+        // Case-colliding siblings: exact match must win, and a
+        // non-exact probe resolves deterministically (BTreeMap order).
+        let upper = vfs.create(sub, "DOOMED.TXT").unwrap();
+        let (id_exact_upper, stored_upper) = vfs.lookup_ci(sub, "DOOMED.TXT").unwrap();
+        assert_eq!(id_exact_upper, upper);
+        assert_eq!(stored_upper, "DOOMED.TXT");
+        let (id_exact_mixed, _) = vfs.lookup_ci(sub, "Doomed.txt").unwrap();
+        assert_eq!(id_exact_mixed, f);
     }
 
     /// Adversarial round-trip: rename a-> b -> c -> a many times, with

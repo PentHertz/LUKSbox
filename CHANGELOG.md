@@ -18,6 +18,44 @@ canonical record.
 
 Committed but not yet attached to a tagged release.
 
+### Fixed: files on a Windows (WinFsp) mount can be renamed and deleted (#29)
+
+On a mounted vault, deleting a file from Explorer appeared to succeed
+but the file came back on the next directory refresh, and renames
+failed outright. Root cause: the volume (correctly) declares NTFS
+semantics - case-insensitive, case-preserving - and for such volumes
+the WinFsp kernel driver hands the file system the UPPERCASED
+canonical name in the delete-on-close `Cleanup` and in the `Rename`
+source (a file created as `report.txt` comes back as `\REPORT.TXT`).
+The adapter resolved those names with the VFS's exact-match lookup,
+so the in-vault unlink/rename failed with NotFound - silently, in
+delete's case, because `Cleanup` is a void callback whose errors
+Windows never sees.
+
+The VFS now offers case-insensitive, case-preserving lookups
+(`lookup_ci` / `lookup_path_ci`, exact match first, then a
+deterministic case-folded scan that keeps expanding folds distinct
+the way NTFS's simple `$UpCase` does), and the WinFsp adapter uses
+them for every name Windows hands it, operating on the stored name
+it resolves. This also makes open/read honor the case-insensitivity
+the volume advertises (opening `README.TXT` finds `readme.txt`),
+guards `create` against planting case-colliding siblings, and
+handles the rename corner cases: case-only renames (`foo.txt` ->
+`FOO.TXT`), rename-over-target with different casing (replaces the
+target instead of leaving two case-variant entries, then applies
+the requested casing), and the Win32 no-replace contract checked
+case-insensitively. Deleting a non-empty directory is now refused
+up front with the proper "directory is not empty" error instead of
+ghost-succeeding in Explorer the same way. The Linux/macOS FUSE
+backends are untouched and stay fully case-sensitive.
+
+New regression coverage: `winfsp_mount.rs::delete_and_rename_via_win32`
+exercises delete, rmdir, same-dir rename, cross-dir move,
+rename-over-target, and different-casing open/delete against a real
+kernel mount, verifying both the live view and the persisted state
+after unmount + reopen. The `LUKSBOX_WINFSP_DEBUG=1` trace now also
+covers `cleanup`, `can_delete`, and `rename`.
+
 ### Fixed: file timestamps are preserved instead of showing the Unix epoch (#26)
 
 Every file on a mounted vault reported a modification time of

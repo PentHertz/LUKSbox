@@ -413,6 +413,156 @@ fn file_written_via_win32_survives_unmount() {
     );
 }
 
+/// Regression test for GitHub issue #29: files on a mounted volume
+/// could not be renamed or deleted from Explorer. Deletes appeared to
+/// succeed (the file vanished from the Explorer view) but the file
+/// was still present on the next directory refresh; renames failed
+/// outright.
+///
+/// Exercises the same Win32 entry points Explorer uses:
+///   * `DeleteFileW` (via `std::fs::remove_file`) - opens the file
+///     with DELETE access, sets the delete disposition
+///     (`can_delete`), and triggers `cleanup` with the DELETE flag on
+///     handle close.
+///   * `RemoveDirectoryW` (via `std::fs::remove_dir`) - same flow for
+///     directories.
+///   * `MoveFileExW` (via `std::fs::rename`) - dispatches the WinFsp
+///     `rename` callback, both same-directory and cross-directory.
+///
+/// Verifies BOTH the live mounted view (after the 1s metadata cache
+/// expires) and the persisted state after unmount + reopen, because
+/// the original bug was precisely "the operation looks fine in the
+/// live view until a refresh proves it never happened".
+#[test]
+fn delete_and_rename_via_win32() {
+    require_winfsp!();
+    let Some(mp) = pick_free_drive_letter() else {
+        eprintln!("[skip] no free drive letter D:-Z:");
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let (vfs, vault) = fresh_vfs(dir.path(), "delren");
+
+    let mp_thr = mp.clone();
+    let mount_join = thread::spawn(move || luksbox_mount::mount(vfs, &mp_thr, false, false));
+    thread::sleep(Duration::from_secs(3));
+
+    let mp_str = mp.to_str().unwrap();
+    let p = |name: &str| PathBuf::from(format!("{mp_str}\\{name}"));
+
+    // --- Setup: a file to delete, a file to rename, a dir to delete,
+    // --- a dir to rename into.
+    std::fs::write(p("doomed.txt"), b"delete me").expect("write doomed.txt");
+    std::fs::write(p("old-name.txt"), b"rename me").expect("write old-name.txt");
+    std::fs::create_dir(p("doomed-dir")).expect("mkdir doomed-dir");
+    std::fs::create_dir(p("dest-dir")).expect("mkdir dest-dir");
+    std::fs::write(p("movable.txt"), b"move me").expect("write movable.txt");
+    std::fs::write(p("replace-target.txt"), b"old content").expect("write replace-target.txt");
+    std::fs::write(p("replacer.txt"), b"new content").expect("write replacer.txt");
+
+    // --- Delete a file (Explorer: Delete key / DeleteFileW).
+    std::fs::remove_file(p("doomed.txt")).expect("DeleteFile on mounted volume");
+
+    // --- Delete an empty directory (RemoveDirectoryW).
+    std::fs::remove_dir(p("doomed-dir")).expect("RemoveDirectory on mounted volume");
+
+    // --- Same-directory rename (Explorer: F2 / MoveFileExW).
+    std::fs::rename(p("old-name.txt"), p("new-name.txt")).expect("same-dir rename");
+
+    // --- Cross-directory move (Explorer: drag into subfolder).
+    std::fs::rename(p("movable.txt"), p("dest-dir\\movable.txt")).expect("cross-dir move");
+
+    // --- Rename over an existing target (ReplaceIfExists). Explorer's
+    // --- "Replace the file in the destination" flow and every
+    // --- atomic-save editor depend on this.
+    std::fs::rename(p("replacer.txt"), p("replace-target.txt")).expect("rename over target");
+
+    // --- Case-insensitive access. The volume declares NTFS semantics
+    // --- (CaseSensitiveSearch=false, case-preserving), so any casing
+    // --- must resolve to the same file - including for open, read,
+    // --- and delete.
+    std::fs::write(p("CaseFile.txt"), b"case data").expect("write CaseFile.txt");
+    assert_eq!(
+        std::fs::read(p("CASEFILE.TXT")).expect("open with different casing"),
+        b"case data",
+        "reading through a different casing must hit the same file"
+    );
+    std::fs::remove_file(p("casefile.TXT")).expect("delete with different casing");
+
+    // --- Live-view checks. Sleep past the 1s FileInfoTimeout /
+    // --- DirInfoTimeout metadata cache so a stale kernel-side cache
+    // --- entry can't mask a broken op (the issue-#29 symptom).
+    thread::sleep(Duration::from_millis(1500));
+    assert!(
+        !p("doomed.txt").exists(),
+        "deleted file still visible on the mounted volume (issue #29)"
+    );
+    assert!(
+        !p("doomed-dir").exists(),
+        "deleted directory still visible on the mounted volume (issue #29)"
+    );
+    assert!(
+        !p("old-name.txt").exists(),
+        "renamed file still visible under its OLD name (issue #29)"
+    );
+    assert!(
+        p("new-name.txt").exists(),
+        "renamed file not visible under its NEW name (issue #29)"
+    );
+    assert!(
+        p("dest-dir\\movable.txt").exists(),
+        "cross-dir moved file not visible at destination (issue #29)"
+    );
+    assert_eq!(
+        std::fs::read(p("replace-target.txt")).expect("read replace-target.txt"),
+        b"new content",
+        "rename-over-existing-target did not replace the content"
+    );
+
+    // --- Tear down and verify against the persisted vault. This is
+    // --- the authoritative check: no kernel caching involved.
+    luksbox_mount::unmount(&mp).expect("unmount");
+    let _ = mount_join.join().expect("mount thread");
+
+    let vfs = reopen_vfs(&vault);
+    assert!(
+        vfs.lookup_path("/doomed.txt").is_err(),
+        "deleted file resurfaced after unmount + reopen (issue #29)"
+    );
+    assert!(
+        vfs.lookup_path("/doomed-dir").is_err(),
+        "deleted directory resurfaced after unmount + reopen (issue #29)"
+    );
+    assert!(
+        vfs.lookup_path("/old-name.txt").is_err(),
+        "renamed file persisted under its OLD name (issue #29)"
+    );
+    assert!(
+        vfs.lookup_path("/new-name.txt").is_ok(),
+        "renamed file did not persist under its NEW name (issue #29)"
+    );
+    assert!(
+        vfs.lookup_path("/movable.txt").is_err(),
+        "cross-dir moved file persisted at its OLD location (issue #29)"
+    );
+    assert!(
+        vfs.lookup_path("/dest-dir/movable.txt").is_ok(),
+        "cross-dir moved file did not persist at its NEW location (issue #29)"
+    );
+    assert!(
+        vfs.lookup_path("/replacer.txt").is_err(),
+        "rename-over-target left the source name behind"
+    );
+    assert!(
+        vfs.lookup_path("/replace-target.txt").is_ok(),
+        "rename-over-target lost the target"
+    );
+    assert!(
+        vfs.lookup_path("/CaseFile.txt").is_err(),
+        "file deleted through a different casing resurfaced after reopen"
+    );
+}
+
 /// Cross-process unmount (the user opening a second terminal and
 /// running `luksbox umount Y:`) must NOT silently succeed - WinFsp
 /// has no out-of-band unmount IPC and pretending we honored the

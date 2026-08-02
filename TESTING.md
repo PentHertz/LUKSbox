@@ -131,9 +131,9 @@ per-crate `tests/` directories.
 rm / mkdir / mv / enroll / revoke flows. Run as subprocess of the
 real binary.
 
-### `luksbox-mount` (4 tests, Windows-only)
+### `luksbox-mount` (6 tests, Windows-only)
 
-`crates/luksbox-mount/tests/winfsp_mount.rs`, **4 integration tests**
+`crates/luksbox-mount/tests/winfsp_mount.rs`, **6 integration tests**
 that mount a real luksbox vault on a free drive letter through the
 WinFsp kernel driver, exercise it, and tear it down. Catches the
 class of bug that motivated writing them: `FileSystem::start`
@@ -143,9 +143,20 @@ unrecognized (the `OVERWRITE_DEFINED=false` regression - see
 top-of-file gotcha #1).
 
 Coverage:
-- `mount_makes_drive_visible_to_win32`, mount -> query via `wmic
-  logicaldisk` -> assert `FileSystem=luksbox` and a non-zero `Size`.
+- `mount_makes_drive_visible_to_win32`, mount -> query via
+  PowerShell `Get-CimInstance Win32_LogicalDisk` -> assert
+  `FileSystem=luksbox` and a non-zero `Size`.
   This is the canary for the WinFsp callback wiring.
+- `file_written_via_win32_survives_unmount`, write a file + nested
+  dir through the mounted drive, unmount, reopen the .lbx directly
+  and assert the data persisted. Regression test for the missing
+  cleanup-flush ("copied a file in Explorer, remounted, file gone").
+- `delete_and_rename_via_win32`, delete / rmdir / same-dir rename /
+  cross-dir move / rename-over-target / different-casing open+delete
+  through the mounted drive, verified in the live view AND after
+  unmount + reopen. Regression test for GitHub issue #29 (the
+  kernel hands UPPERCASED canonical names to cleanup/rename on the
+  case-insensitive volume we declare - see winfsp.rs gotcha #8).
 - `unmount_from_other_thread_wakes_mount_thread`, simulates the GUI
   flow: mount in thread A, `unmount()` from thread B, assert thread
   A returns `Ok(())` within 10 s. Catches path-normalization drift
@@ -587,9 +598,9 @@ cargo +nightly fuzz run <target-you-touched> fuzz/corpus/<target> -- -max_total_
 | luksbox-fido2 | 9 | 11 (rogue authenticator) | 20 |
 | luksbox-vfs | 22 | 1 (bincode OOM) | 23 |
 | luksbox-cli | 0 | 25 (5 + 20 functional) | 25 |
-| luksbox-mount | 0 | 4 (winfsp_mount, Windows-only) | 4 |
+| luksbox-mount | 0 | 6 (winfsp_mount, Windows-only) | 6 |
 | luksbox-gui | 0 | 0 | 0 |
-| **Workspace total** | **65** | **72** | **137** |
+| **Workspace total** | **65** | **74** | **139** |
 
 Plus 6 fuzz harnesses (4 pre-existing + 2 added during the audit) +
 1 auth-then-process harness with a fixed MVK.
