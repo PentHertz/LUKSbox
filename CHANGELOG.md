@@ -14,9 +14,45 @@ canonical record.
 
 ---
 
-## [Unreleased]
+## [v0.5.0-rc.3] - 2026-08-02
 
-Committed but not yet attached to a tagged release.
+### Security: two hardening fixes from the v0.5.0-rc.3 ground-truth audit
+
+A full adversarial re-audit of the codebase (crypto core, on-disk and
+VFS integrity, the FUSE / FUSE-T / WinFsp mount backends, TPM / FIDO2 /
+SEP auth, the container and privileged host-interaction surface, and
+the dependency tree) found no critical or high-severity issue: no
+plaintext-recovery, forgery, memory-safety, or authentication-bypass
+path, and the recent Windows rename/delete (#29) and multi-FIDO2 (#28)
+changes held up. Two low-severity hardening gaps were closed:
+
+- The detached-header recovery reader (`<vault>.lbx.header-bak`) now
+  opens the sidecar with `O_NOFOLLOW` (Unix) or reparse-point refusal
+  (Windows), plus a regular-file and exact-length check, the same
+  discipline the metadata mirror already applied. This closes a
+  symlink-follow and a stat-then-open race on the recovery path, where
+  a local attacker with write access to the vault directory could
+  point the sidecar at another same-length file or swap in a FIFO to
+  stall an already-degraded recovery. The recovered bytes were, and
+  still are, AEAD-verified under the vault key, so this is
+  defense-in-depth on top of that authentication.
+
+- On the Windows multi-FIDO2 unlock path (new in this release), the
+  32-byte hmac-secret is now wrapped in its zeroize-on-drop type at the
+  moment it is copied out of the WebAuthn assertion, before the
+  fallible credential-to-keyslot mapping runs. Previously a rare error
+  branch (an asserted credential matching none of the enrolled
+  keyslots) could drop the raw value without wiping it. This is not a
+  disclosure primitive, but it restores the project's zeroization
+  discipline on that path.
+
+A known design tradeoff surfaced by the audit is documented separately
+in `docs/ROLLBACK_PROTECTION.md`: whole-vault rollback is only detected
+when the optional anchor sidecar is kept on separate trusted storage,
+because the encrypted metadata region binds no monotonic generation
+counter into its AEAD associated data. No code change ships for it in
+rc.3; the note records the current guarantee and the candidate
+mitigation.
 
 ### Fixed: unlock works with ANY enrolled FIDO2 key, not just slot 0's (#28)
 
@@ -131,8 +167,7 @@ the source mtime (tracked internally). macFUSE on macOS is unaffected.
   GHSA-3rjw-m598-pq24, where `Cmov` / `CmovEq` could produce wrong
   results on aarch64 when the high bits of a register are set. This is
   on the constant-time path the post-quantum keyslots depend on and
-  aarch64 is a shipped target, so the fix is worth taking. Rolls into
-  the next tagged version after rc.2.
+  aarch64 is a shipped target, so the fix is worth taking.
 
 ---
 

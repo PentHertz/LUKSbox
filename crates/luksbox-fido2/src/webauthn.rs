@@ -616,7 +616,7 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
         // the id of the credential that produced them out before
         // freeing. `extracted` is None iff the assertion carried no
         // hmac-secret output at all.
-        let extracted: Option<(Option<Vec<u8>>, [u8; 32])> = unsafe {
+        let extracted: Option<(Option<Vec<u8>>, HmacSecret)> = unsafe {
             let assertion = &*assertion_ptr;
             // The hmac-secret derived value lives in `pHmacSecret`
             // (a *mut WEBAUTHN_HMAC_SECRET_SALT, where pbFirst is the
@@ -649,8 +649,20 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
                         "WebAuthn returned hmac-secret with unexpected size ({got} B, expected 32)"
                     )));
                 }
-                let mut secret = [0u8; 32];
-                std::ptr::copy_nonoverlapping(s.pbFirst, secret.as_mut_ptr(), 32);
+                // Copy the 32-byte hmac-secret into a zeroizing temp and
+                // hand it straight to the Zeroize+ZeroizeOnDrop
+                // `HmacSecret` newtype, BEFORE the fallible cred->slot
+                // mapping below. This keeps a bare `[u8; 32]` from
+                // surviving into the error paths: the multi-assert rework
+                // (53f1628) briefly carried the raw array through the
+                // mapping, so the "matches no keyslot" return dropped it
+                // unzeroized. Wrapping here restores the R12-19 discipline
+                // (no bare secret past the point of copy). The `secret_tmp`
+                // deref-copy is wiped on drop; `HmacSecret` owns the value
+                // that travels onward.
+                let mut secret_tmp = zeroize::Zeroizing::new([0u8; 32]);
+                std::ptr::copy_nonoverlapping(s.pbFirst, secret_tmp.as_mut_ptr(), 32);
+                let secret = HmacSecret(*secret_tmp);
                 // Which allow-listed credential produced this secret.
                 // Same defensive bounds as the input side before we
                 // trust the (pointer, length) pair.
@@ -712,10 +724,10 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
             }
         };
 
-        // Round 12 fix R12-19: HmacSecret is now a newtype with
-        // Zeroize+ZeroizeOnDrop; wrap the raw bytes once on the way
-        // out so the consumer's stack copy is wiped on Drop.
-        Ok((idx, HmacSecret(secret)))
+        // `secret` is already the Zeroize+ZeroizeOnDrop `HmacSecret`
+        // (wrapped at the point of copy above), so it hands straight to
+        // the caller and the consumer's copy is wiped on Drop.
+        Ok((idx, secret))
     }
 }
 

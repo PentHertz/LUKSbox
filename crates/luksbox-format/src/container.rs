@@ -3861,35 +3861,31 @@ where
     if !mirror_path.exists() {
         return None;
     }
-    // Defense against attacker who can write to the vault directory:
-    // a symlink at `<vault>.lbx.header-bak` to `/dev/zero` (Linux)
-    // or a multi-GB attacker-staged file would OOM us on
-    // `fs::read`. Stat first and refuse anything that isn't exactly
-    // HEADER_SIZE so we never allocate more than 8 KiB regardless
-    // of what's at the path. `metadata()` follows symlinks; we want
-    // that here so a symlink to /dev/zero (which reports size 0)
-    // would also be rejected by the != HEADER_SIZE branch.
-    let stat = match std::fs::metadata(mirror_path) {
-        Ok(s) => s,
+    // Defense against an attacker who can write to the vault directory.
+    // Read the header-bak sidecar through the same no-follow, regular-
+    // file, exact-length helper as the metadata mirror. `O_NOFOLLOW`
+    // (Unix) / reparse-point refusal (Windows) plus the `is_file()`
+    // check close atomically what a plain `metadata()` + `File::open()`
+    // pair left open: following a symlink to another same-length file,
+    // and the stat-then-open TOCTOU where the target is swapped for a
+    // FIFO/device that stalls `read_exact` (local DoS on the already-
+    // degraded recovery path). The exact HEADER_SIZE check caps the
+    // allocation at 8 KiB regardless of what is at the path. Content is
+    // still AEAD-verified by `try_unlock_and_verify` under the vault
+    // MVK below, so this is defense-in-depth on top of that
+    // authentication and mirrors `read_metadata_mirror_nofollow`.
+    let buf: [u8; HEADER_SIZE] = match read_metadata_mirror_nofollow(mirror_path, HEADER_SIZE) {
+        // `read_metadata_mirror_nofollow` guarantees exactly HEADER_SIZE
+        // bytes on success, so `try_into` cannot fail here; treat any
+        // mismatch as an auth failure rather than panic.
+        Ok(v) => match <[u8; HEADER_SIZE]>::try_from(v) {
+            Ok(arr) => arr,
+            Err(_) => {
+                return Some(Err(Error::Crypto(luksbox_core::Error::HeaderAuthFailed)));
+            }
+        },
         Err(e) => return Some(Err(Error::Io(e))),
     };
-    if stat.len() != HEADER_SIZE as u64 {
-        return Some(Err(Error::Crypto(luksbox_core::Error::HeaderAuthFailed)));
-    }
-    // Bounded read: open the file and pull exactly HEADER_SIZE
-    // bytes. `read_exact` against an 8 KiB buffer caps the
-    // allocation. Use OpenOptions then read_exact rather than
-    // fs::read so we don't touch attacker-controlled length fields.
-    let mut buf = [0u8; HEADER_SIZE];
-    {
-        let mut f = match std::fs::File::open(mirror_path) {
-            Ok(f) => f,
-            Err(e) => return Some(Err(Error::Io(e))),
-        };
-        if let Err(e) = f.read_exact(&mut buf) {
-            return Some(Err(Error::Io(e)));
-        }
-    }
     let header = match Header::from_bytes(&buf) {
         Ok(h) => h,
         Err(e) => return Some(Err(Error::Crypto(e))),
@@ -4364,6 +4360,95 @@ mod tests {
             after, b"victim-must-not-be-overwritten",
             "abort must not redirect the header write through the swapped symlink"
         );
+    }
+
+    /// Audit v0.5.0-rc.3 (task #491): the header-bak recovery reader must
+    /// refuse a symlinked or wrong-length sidecar with the same
+    /// `O_NOFOLLOW` + regular-file + exact-length discipline as the
+    /// metadata mirror, closing the symlink-follow and stat-then-open
+    /// TOCTOU that the old `metadata()` + `File::open()` pair left open.
+    /// A valid regular header-bak of exactly HEADER_SIZE bytes is still
+    /// read and handed to the unlock closure.
+    #[cfg(unix)]
+    #[test]
+    fn header_bak_reader_refuses_symlink_and_bad_length() {
+        use std::io::Read as _;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.lbx");
+        Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"correct horse",
+        )
+        .unwrap();
+
+        // A byte-for-byte valid header: the first HEADER_SIZE bytes of the
+        // freshly created inline vault parse as a Header.
+        let valid_header: [u8; HEADER_SIZE] = {
+            let mut f = std::fs::File::open(&path).unwrap();
+            let mut buf = [0u8; HEADER_SIZE];
+            f.read_exact(&mut buf).unwrap();
+            buf
+        };
+        assert!(Header::from_bytes(&valid_header).is_ok());
+
+        let bak = dir.path().join("vault.lbx.header-bak");
+
+        // Positive control: a real regular file of exactly HEADER_SIZE
+        // bytes is read and the parsed header reaches the unlock closure
+        // (short-circuited with a sentinel error so we need no real MVK).
+        // Reaching the sentinel proves read + parse succeeded.
+        std::fs::write(&bak, valid_header).unwrap();
+        let mut reached = false;
+        let res = try_unlock_via_mirror(&bak, &mut |_h: &Header, _b: &[u8; HEADER_SIZE]| {
+            reached = true;
+            Err(Error::Crypto(luksbox_core::Error::HeaderAuthFailed))
+        });
+        assert!(
+            reached,
+            "regular HEADER_SIZE header-bak must reach the unlock closure"
+        );
+        assert!(matches!(
+            res,
+            Some(Err(Error::Crypto(luksbox_core::Error::HeaderAuthFailed)))
+        ));
+
+        // Symlink swap: point the header-bak at another valid same-length
+        // header. O_NOFOLLOW must refuse it before read/parse; the unlock
+        // closure must NOT run, so a stalling target can't hang recovery
+        // and a foreign same-length file is never followed.
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, valid_header).unwrap();
+        std::fs::remove_file(&bak).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &bak).unwrap();
+        let mut reached_sym = false;
+        let res_sym = try_unlock_via_mirror(&bak, &mut |_h: &Header, _b: &[u8; HEADER_SIZE]| {
+            reached_sym = true;
+            Err(Error::Crypto(luksbox_core::Error::HeaderAuthFailed))
+        });
+        assert!(
+            !reached_sym,
+            "symlinked header-bak must be refused before unlock"
+        );
+        assert!(matches!(res_sym, Some(Err(Error::Io(_)))));
+
+        // Wrong length: a regular file that is not exactly HEADER_SIZE is
+        // refused (bounded-allocation guard) before parse.
+        std::fs::remove_file(&bak).unwrap();
+        std::fs::write(&bak, vec![0u8; HEADER_SIZE - 1]).unwrap();
+        let mut reached_len = false;
+        let res_len = try_unlock_via_mirror(&bak, &mut |_h: &Header, _b: &[u8; HEADER_SIZE]| {
+            reached_len = true;
+            Err(Error::Crypto(luksbox_core::Error::HeaderAuthFailed))
+        });
+        assert!(
+            !reached_len,
+            "wrong-length header-bak must be refused before unlock"
+        );
+        assert!(matches!(res_len, Some(Err(Error::Io(_)))));
     }
 
     /// `create_with_sep` makes a single SEP keyslot with NO passphrase
