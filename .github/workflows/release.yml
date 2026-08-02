@@ -54,6 +54,18 @@ jobs:
   build:
     name: ${{ matrix.target }}${{ matrix.ubuntu_codename && format(' ({0})', matrix.ubuntu_codename) || '' }}
     runs-on: ${{ matrix.runner }}
+    env:
+      # A step's `if:` can only read env defined at the WORKFLOW or JOB
+      # level, never the step's own `env`, and workflow-level env cannot
+      # reference `secrets`. So the SignPath steps below are gated on
+      # this job-level flag. It exposes only true/false to each step's
+      # environment, NOT the token itself: the token stays a secret,
+      # referenced directly via `secrets.*` inside the SignPath steps.
+      # Without this, `env.SIGNPATH_*` in those `if:` gates is always
+      # empty and every SignPath step is silently skipped (the "nothing
+      # happens on SignPath" symptom). False on forks / before the
+      # secret is set, so the gated steps skip cleanly.
+      SIGNPATH_ENABLED: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
     # Per-matrix container: most entries run on the host runner
     # (container is null / unset). The Trixie and 26.04/resolute
     # entries set `container: debian:trixie` / `container: ubuntu:26.04`
@@ -2056,7 +2068,7 @@ jobs:
       # so they never reach the release job.
       - name: Upload unsigned MSI for SignPath
         id: upload_unsigned_msi
-        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: unsigned-msi-${{ matrix.target }}
@@ -2065,7 +2077,7 @@ jobs:
           retention-days: 1
 
       - name: Sign MSI via SignPath
-        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
         uses: signpath/github-action-submit-signing-request@v1
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -2079,7 +2091,7 @@ jobs:
           output-artifact-directory: ${{ runner.temp }}/signed-msi
 
       - name: Swap in the SignPath-signed MSI
-        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
         shell: pwsh
         run: |
           # The action downloads the signed artifact into the output dir;
@@ -2240,7 +2252,7 @@ jobs:
       # with insignia, and SignPath is expected to handle Burn bundles.
       - name: Upload unsigned bundle for SignPath
         id: upload_unsigned_bundle
-        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: unsigned-bundle-${{ matrix.target }}
@@ -2249,7 +2261,7 @@ jobs:
           retention-days: 1
 
       - name: Sign bundle via SignPath
-        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
         uses: signpath/github-action-submit-signing-request@v1
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -2263,7 +2275,7 @@ jobs:
           output-artifact-directory: ${{ runner.temp }}/signed-bundle
 
       - name: Swap in the SignPath-signed bundle
-        if: runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
         shell: pwsh
         run: |
           $dir = "$env:RUNNER_TEMP\signed-bundle"
@@ -2282,7 +2294,7 @@ jobs:
         # the build job, before the release job runs. `if: always()` so
         # cleanup still happens if a signing step above failed. Needs
         # `actions: write` (declared at the top of the file).
-        if: always() && runner.os == 'Windows' && env.SIGNPATH_API_TOKEN != ''
+        if: always() && runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
