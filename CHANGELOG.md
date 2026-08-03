@@ -14,6 +14,43 @@ canonical record.
 
 ---
 
+## [v0.5.1] - 2026-08-03
+
+Patch release on top of v0.5.0. It repairs TPM 2.0 keyslot sealing and
+unsealing on real hardware, which regressed during the v0.5.0 cycle and
+could fail before any command reached the chip. There is no on-disk
+format change: existing vaults and TPM slots are untouched, and a vault
+sealed under v0.5.0 (or earlier) opens unchanged. Anyone using the
+`tpm2`, `tpm2-pin`, `tpm2-fido2`, or `hybrid-pq-tpm2*` keyslots on a
+real TPM should upgrade.
+
+### Fixed
+
+- TPM 2.0 seal and unseal on the real-hardware path. The SRK
+  `CreatePrimary` was being issued with no authorization session while
+  the tss-esapi context sessions were `(None, None, None)`. ESAPI's
+  `check_session_feasibility` rejected the call with
+  `TSS2_ESYS_RC_BAD_VALUE` (0x0007000B) before it ever reached the TPM,
+  so every `tpm2*` keyslot operation failed on hardware. This regressed
+  in v0.5.0 when the interposer-hardening change (SRK-salted HMAC
+  sessions) reordered SRK creation ahead of the session setup, so the
+  SRK was left running session-free; the mock-backed test sealer did
+  not exercise the ESAPI feasibility check, so CI stayed green. The call
+  now authorizes the Owner hierarchy with the built-in empty-password
+  session (the same approach systemd-cryptenroll uses for SRK creation)
+  and clears it afterward, so the context returns to the session-free
+  state the rest of the sealer expects. Affects the real TPM path on
+  every platform; it was surfaced while validating the Windows TBS
+  backend added in v0.5.0. (`crates/luksbox-tpm/src/real.rs`)
+
+### Dependencies
+
+- Bumped `cmov` 0.5.3 -> 0.5.4 in the `fuzz` workspace via Dependabot
+  (#27). This crate is only pulled in by the fuzz harnesses and is not
+  linked into any shipped release binary.
+
+---
+
 ## [v0.5.0] - 2026-08-03
 
 First stable release of the v0.5.0 line. It promotes `v0.5.0-rc.3` to
@@ -60,11 +97,13 @@ theme. Full detail lives in the per-candidate entries below.
   and an hmac-secret zeroization regression on the Windows multi-FIDO2
   error path (#492). The whole-vault rollback tradeoff surfaced by the
   audit is documented in `docs/ROLLBACK_PROTECTION.md`.
-- Distribution: the Windows MSI and setup bundle are now
-  Authenticode-signed in CI through SignPath, over a
-  trusted-build-system flow with provenance verification (see
-  `docs/WINDOWS_SIGNING.md`). This clears the "Unknown Publisher"
-  prompt on the signed installers.
+- Distribution: a SignPath trusted-build-system flow for
+  Authenticode-signing the Windows MSI and setup bundle is wired into
+  CI, with provenance verification (see `docs/WINDOWS_SIGNING.md`), but
+  stays disabled in v0.5.0 pending issuance of the production
+  code-signing certificate. The CI steps engage automatically once the
+  `SIGNPATH_API_TOKEN` secret is configured. v0.5.0 Windows binaries
+  ship unsigned, so SmartScreen still prompts on first launch.
 
 ### Dependencies
 
