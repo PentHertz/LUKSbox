@@ -86,17 +86,16 @@ Cryptomator / BitLocker / FileVault) lives at
 
 This is a **pre-1.0** release. The on-disk format is locked, the
 cryptographic primitives are NIST/RFC standards built on RustCrypto,
-and 9 internal audit rounds have shipped. External paid audit and
+and 14 internal audit rounds have shipped. External paid audit and
 broader real-world deployment are the next milestones. The
 cloud-storage threat model, provider can't read your data even under
 subpoena, is what LUKSbox is built for and what it does today.
 
 | Surface | State |
 |---|---|
-| `cargo test --workspace` | 200+ passing, 0 failing, 0 ignored |
-| `cargo audit` (Linux/macOS) | 0 vulns / 0 unsound / 0 unmaintained |
-| `cargo audit` (Windows) | 1 unmaintained (`registry`, transitive via WinFsp) |
-| Internal audit rounds | 9 documented at <https://luksbox.penthertz.com/docs/security/audit/> (per-round details kept internal) |
+| `cargo test --workspace` | 600+ passing, 0 failing (a few platform-gated tests skip off-platform) |
+| `cargo audit` | 0 vulnerabilities, 0 unsound; 2 allow-listed unmaintained advisories (`paste`, a compile-time-only proc-macro from the TPM stack, and `registry`, Windows/WinFsp-only), both documented in `audit.toml` + `SECURITY.md` |
+| Internal audit rounds | 14 documented at <https://luksbox.penthertz.com/docs/security/audit/> (per-round details kept internal) |
 | Third-party audit | not yet performed; engagement scope package available on request to `security@penthertz.com` |
 | Fuzz iterations across 10 libFuzzer harnesses | 30M+ |
 
@@ -183,12 +182,13 @@ luksbox enroll my-vault.lbx --kind tpm2
 luksbox create my-vault.lbx --kind hybrid-pq \
     --pq-hybrid /media/usb/my.kyber
 
-# v3 format: no per-vault size ceiling (default v2 caps around 10 GiB).
-# Old LUKSbox binaries refuse v3 vaults -- opt in only when you need
-# bigger vaults than the v2 default can hold.
-luksbox create my-vault.lbx --format v3
+# Vaults use the v3 format by default: no per-vault size ceiling, plus
+# crash-safety sidecar mirrors (needs LUKSbox v0.2.1+ to open). Pass
+# --format v2 only to share with a pre-v0.2.0 reader; v2 uses inline
+# chunk lists with a practical ceiling around 10 GiB.
+luksbox create my-vault.lbx --format v2
 
-# Migrate an existing v2 vault to v3 (source untouched)
+# Migrate an existing v2 vault up to the v3 format (source untouched)
 luksbox migrate-to-v3 old-v2.lbx --dst new-v3.lbx
 
 # Interactive walkthrough, no flags to remember
@@ -208,7 +208,7 @@ walkthroughs.
 |---|---|
 | Debian / Ubuntu / Mint | `.deb` from [Releases](https://github.com/penthertz/LUKSbox/releases), `sudo apt install ./luksbox_*_amd64.deb` |
 | Fedora / RHEL / Rocky | `.rpm` from Releases, `sudo dnf install ./luksbox-*.x86_64.rpm` |
-| macOS | `.dmg` from Releases, drag to /Applications, install macFUSE on first run |
+| macOS | `.dmg` from Releases, drag to /Applications; on first run the app installs the kext-free FUSE-T backend (`brew install --cask fuse-t`), with macFUSE kept as a legacy fallback |
 | Windows | `LUKSboxSetup.exe` from Releases (bundles WinFsp); IT admins can use the bare `.msi` and install WinFsp separately |
 | From source | `cargo build --release -p luksbox-cli -p luksbox-gui` after the deps in [`BUILDING.md`](BUILDING.md) |
 

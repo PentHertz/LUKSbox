@@ -14,6 +14,68 @@ canonical record.
 
 ---
 
+## [v0.5.0] - 2026-08-03
+
+First stable release of the v0.5.0 line. It promotes `v0.5.0-rc.3` to
+stable with no functional code changes since the candidate. This line
+brings TPM 2.0 keyslots to Windows through TBS, so the full TPM matrix
+now works identically on Linux, macOS, and Windows; it fixes the
+Windows mount, multi-FIDO2, and timestamp behaviour reported after the
+v0.4 release; and it closes out the late-July / early-August audit
+passes. On-disk formats are unchanged from the v0.4 line: existing
+vaults, sidecars, and headers open without migration, and a vault
+sealed by one platform's TPM unseals through the same chip on another.
+
+Highlights across the v0.5.0 candidates (rc.1 through rc.3), grouped by
+theme. Full detail lives in the per-candidate entries below.
+
+- Windows TPM 2.0 keyslots through TBS (TPM Base Services): the entire
+  keyslot matrix (`tpm2`, `tpm2-pin`, fused `tpm2-fido2`, the
+  `hybrid-pq-tpm2*` seed-file combos, and the 3-factor
+  `hybrid-pq-tpm2-fido2*`) now works in the CLI, wizard, and GUI on
+  Windows exactly as on Linux, with no driver, admin rights, or code
+  signing needed to reach the chip. Slot bytes are byte-identical
+  across platforms, so the same physical chip unseals a vault
+  regardless of which OS sealed it.
+- Reliable `bundled-tpm` builds: a vendored tpm2-tss compiled at build
+  time (autotools on Linux, MSBuild on Windows), with the static-link
+  closure and the SM4 / cross-distro portability defects fixed and
+  validated end to end. This is what the Windows release binaries and
+  the jammy / noble Linux lanes ship.
+- Windows mount usability: files on a WinFsp mount can now be renamed
+  and deleted from Explorer (#29, NTFS case-insensitive lookups), file
+  timestamps are preserved instead of showing the Unix epoch so
+  `rsync -a` stops re-transferring everything (#26), and closing the
+  GUI window while a vault is mounted no longer strands the mount (#25).
+- Multi-FIDO2 unlock: a vault with more than one FIDO2 keyslot unlocks
+  with any enrolled key, not just the one enrolled first (#28), with
+  the Windows webauthn.dll backend asserting every candidate credential
+  in a single prompt.
+- GUI internationalisation: non-ASCII (CJK) vault names, file names,
+  and labels render through system-font fallbacks instead of empty
+  boxes (#28).
+- Audit hardening: the GIO unmount fallback and TPM sessions were
+  hardened in rc.2 (PATH-hijack close, SRK-salted sessions), and rc.3
+  closed the detached-header recovery reader `O_NOFOLLOW` gap (#491)
+  and an hmac-secret zeroization regression on the Windows multi-FIDO2
+  error path (#492). The whole-vault rollback tradeoff surfaced by the
+  audit is documented in `docs/ROLLBACK_PROTECTION.md`.
+- Distribution: the Windows MSI and setup bundle are now
+  Authenticode-signed in CI through SignPath, over a
+  trusted-build-system flow with provenance verification (see
+  `docs/WINDOWS_SIGNING.md`). This clears the "Unknown Publisher"
+  prompt on the signed installers.
+
+### Dependencies
+
+- Bumped `event-listener` 5.4.1 -> 5.4.2 (transitive, via the `zbus`
+  D-Bus stack that `luksbox-mount` and `luksbox-gui` pull in on Linux).
+  5.4.2 fixes RUSTSEC-2026-0221, an unsoundness where `StackSlot`
+  unconditionally implemented `Send`/`Sync` so a `!Send` tag set via
+  `Event::with_tag` could cross a thread boundary. LUKSbox never calls
+  `with_tag`, so it was not reachable here, but the patched line
+  restores a clean `cargo audit` on the linked runtime tree.
+
 ## [v0.5.0-rc.3] - 2026-08-02
 
 ### Security: two hardening fixes from the v0.5.0-rc.3 ground-truth audit
