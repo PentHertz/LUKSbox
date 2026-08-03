@@ -351,16 +351,18 @@ are exploitable today, but each is a forward-looking risk you should weigh.
 
 ### Unmaintained dependencies (`cargo audit` warnings)
 
-`cargo audit` against the workspace currently surfaces **one**
-advisory, accepted and documented in `.cargo/audit.toml` (the only
-project-local config path cargo-audit reads; it lived at the workspace
-root before 0.4.0-rc, silently unused). CI runs `cargo audit` on every push and PR
-(`.github/workflows/ci.yml::audit`) and fails on any non-ignored
-advisory.
+`cargo audit` against the workspace currently surfaces **two**
+`unmaintained` advisories, both accepted and documented in `audit.toml`
+and in the explicit `--ignore` list of `scripts/audit.sh`. Both are
+informational (`unmaintained`, no CVE), so CI's plain `cargo audit`
+(`.github/workflows/ci.yml::audit`) reports them but does not fail on
+them; the job goes red on any advisory that carries a real
+vulnerability.
 
 | Crate | Used by | Advisory | Status |
 |---|---|---|---|
 | `registry 1.3` | `winfsp_wrs_sys` (transitive) -> `luksbox-mount` on Windows | RUSTSEC-2025-0026 (unmaintained) | **Windows runtime only.** Required for the `mount` subcommand on Windows via WinFsp. Non-Windows builds (Linux + macOS) do not link this chain. The `registry` crate is archived; the recommended replacement is `windows-registry`. `winfsp_wrs 0.4.1` (Jan 2026) is the latest published version and has not migrated yet (https://github.com/Scille/winfsp_wrs). When it does we drop this ignore. |
+| `paste 1.0.15` | `tss-esapi 8.0.0-alpha.2` (transitive) -> `luksbox-tpm` | RUSTSEC-2024-0436 (unmaintained) | **Compile-time only, no code shipped.** `paste` is a token-paste proc macro used by `tss-esapi`, the TPM 2.0 wrapper for the Linux and Windows TPM keyslots. It runs at build time and emits nothing into the binary, so an unmaintained-crate advisory has no runtime attack surface. No CVE is filed. The dependency is a transitive consequence of pinning `tss-esapi` to the 8.0 alpha line (the only release with Windows TBS support). We drop this ignore when `tss-esapi` cuts a stable 8.0 without `paste`. Non-TPM builds do not link this chain. |
 
 A near miss worth recording: **quick-xml 0.39** (RUSTSEC-2026-0194 /
 RUSTSEC-2026-0195, DoS pair fixed in >= 0.41.0) is pulled in solely by
@@ -638,9 +640,11 @@ get in touch.
 
 - **No plausible-deniability hidden volumes.** A user under coercion has no
   way to reveal a "duress" passphrase that opens a different (decoy) vault.
-- **No native hardware key (TPM / secure-element) integration on the host
-  machine.** FIDO2 authenticators are supported as a *user*-side token; no
-  host-side TPM-sealing.
+- **No PCR-sealed TPM slots yet.** Host-side hardware wrapping ships on
+  all three platforms (TPM 2.0 on Linux + Windows, Secure Enclave on
+  macOS), but the TPM slots use an empty policy: any caller on the same
+  chip can unseal. Boot-chain-tamper detection via PCR sealing is a
+  tracked opt-in follow-up (`docs/TPM_FUTURE_IMPROVEMENTS.md` section 3).
 - **No cipher rotation.** A vault's cipher suite is fixed at create
   time. Switching between AES-256-GCM-SIV (current default), AES-256-GCM
   (legacy), and ChaCha20-Poly1305 requires a manual decrypt-then-recreate
@@ -766,15 +770,15 @@ risk first.
       available to AV vendors. Not a path open to LUKSbox.
 
     **At-rest protection (wrapped MVK in the .lbx file):**
-    **Linux** now ships with hardware-isolated wrapping via TPM
-    2.0 (`SlotKind::Tpm2Sealed` and the fused
-    `SlotKind::Tpm2Fido2`); the wrap KEK is sealed inside the
-    TPM and only re-emerges on the original machine.
-    **macOS and Windows** remain at the wrap-only-protected-by-
-    Argon2id level for now (Secure Enclave / Windows TPM
-    integrations still on the roadmap below).
+    hardware-isolated wrapping now ships on ALL THREE platforms:
+    **Linux and Windows** via TPM 2.0 (`SlotKind::Tpm2Sealed`, the
+    PIN and fused-FIDO2 variants, and the four hybrid-PQ-TPM
+    kinds - `/dev/tpmrm0` on Linux, TPM Base Services on Windows,
+    same on-disk slot bytes on both), and **macOS** via the Secure
+    Enclave (`docs/SEP_KEYSLOT_DESIGN.md`). The wrap KEK is sealed
+    inside the chip and only re-emerges on the original machine.
 
-    For platforms WITHOUT hardware wrapping the MVK is held only
+    For vaults WITHOUT a hardware-wrapped slot the MVK is held only
     under a passphrase-derived KEK (Argon2id) or a FIDO2-bound
     KEK; a stolen vault file is exposed to:
 
@@ -797,6 +801,28 @@ risk first.
       attempts -> multi-hour lockout, eventually permanent)
       means even a weak passphrase is effectively uncrackable
       on the original hardware.
+    - TPM bus protection via salted sessions (Linux and Windows,
+      shipped in v0.5.0-rc.2). Every TPM command that carries the
+      32-byte wrap key runs inside an HMAC session with parameter
+      encryption turned on, and that session is **salted against the
+      SRK's public area**. Salting is what makes the encryption real:
+      the session key is established by ECDH to the SRK public point,
+      so it depends on the SRK private key that never leaves the chip.
+      A passive LPC/SPI bus interposer on a discrete TPM therefore
+      cannot recover the wrap key from the seal (`Esys_Create`) or
+      unlock (`Esys_Unseal`) traffic, even though both the command
+      and response nonces cross the bus in cleartext. An unsalted,
+      unbound session would derive its parameter-encryption key from
+      those two public nonces alone and provide no bus
+      confidentiality at all (the interposer would just recompute it);
+      this is the gap v0.5.0-rc.2 closes, and it matches the
+      protection systemd-cryptenroll applies. Firmware TPMs (Intel
+      PTT / AMD fTPM) have no external bus and were never exposed;
+      Apple's Secure Enclave is likewise an on-die coprocessor with
+      no interposable bus, so the macOS SEP keyslots do not need (and
+      do not have) an equivalent session, and are not affected by
+      this class of attack. See the `start_hmac_session` doc comment
+      in `crates/luksbox-tpm/src/real.rs` for the implementation.
 
     The right native path on each platform is **hardware-isolated
     key wrapping** (a separate co-processor holds the wrap key; the
@@ -821,26 +847,27 @@ risk first.
       caller on this TPM can unseal). Tracked in
       `docs/TPM_FUTURE_IMPROVEMENTS.md`.
 
-    - **Windows**: not yet shipped, **but reachable today via the
-      `TctiNameConf::Tbs` variant added in `tss-esapi 8.0.0-alpha.2`**.
-      The Linux `Tpm2Sealer` implementation works against `Tcti::Tbs`
-      with a one-line cfg branch + an import rename
-      (`resource_handles` -> `reserved_handles`). On-disk slot bytes
-      are byte-identical between Linux and Windows TPM, so a vault
-      sealed with the same chip would unseal on either OS. Trade-off
-      blocking immediate adoption: tss-esapi 8.0 is alpha (alpha line
-      since 2024, alpha.2 published 2026-02-26) and bumps the
-      `tpm2-tss` floor to 4.1.3, breaking Debian 12, Ubuntu
-      22.04/24.04 LTS, and RHEL 9 unless we also ship a `bundled-tpm`
-      Cargo feature for static linking. Full design + the three
-      implementation paths evaluated (TBS via tss-esapi 8.0, NCrypt
-      direct, raw FFI bypass) live in
-      `docs/TPM_FUTURE_IMPROVEMENTS.md`.
+    - **Windows**: **shipped** via the `TctiNameConf::Tbs` variant
+      of `tss-esapi 8.0.0-alpha.2` (TPM Base Services - the in-box
+      broker; no driver, no admin rights, no code signing). Every
+      slot kind listed for Linux above works identically, from the
+      CLI, wizard, and GUI. On-disk slot bytes are byte-identical
+      between Linux and Windows, so a vault sealed with the same
+      chip unseals on either OS. The tpm2-tss >= 4.1.3 floor that
+      tss-esapi 8.x imposes is handled by the Cargo feature split:
+      default builds carry no TPM link at all (`fido2-hardware`),
+      `--features hardware` links the system tpm2-tss on new-enough
+      distros, and `--features bundled-tpm` vendors it (what the
+      Windows release binaries and the LTS-distro Linux release
+      lanes use). Full design record in
+      `docs/TPM_FUTURE_IMPROVEMENTS.md` section 1.
 
-    - **macOS**: not yet shipped. Different chip (Secure Enclave),
-      different API (`SecKey` / `CryptoKit`), needs Apple Developer
-      enrollment to sign binaries with the keychain entitlement.
-      Tracked in `docs/TPM_FUTURE_IMPROVEMENTS.md` section 2.
+    - **macOS**: **shipped** via the Secure Enclave (13 SEP slot
+      kinds: plain, Touch ID, FIDO2/passphrase fusions, and
+      ML-KEM-768/1024 hybrids). No Apple Developer enrollment or
+      keychain entitlement turned out to be required for the
+      dataRepresentation path actually used. Design + threat model
+      in `docs/SEP_KEYSLOT_DESIGN.md`.
 
     Original cross-platform design notes (preserved as the spec
     for the macOS / Windows ports):
@@ -900,15 +927,12 @@ risk first.
       ship as PCR-unsealed by default with PCR-sealed as an
       opt-in flag.
 
-    Estimated effort: ~2 weeks per platform of design +
-    implementation, plus integration tests. Linux TPM is the
-    fastest to ship (mature OSS toolchain, swtpm in CI, no
-    enrollment gates) and is the recommended starting point.
-    macOS Secure Enclave waits on Apple Developer enrollment
-    completing first. Windows TPM is the same shape as Linux
-    TPM with a different API surface. Tracked here so a
-    contributor has the design constraints written down before
-    starting.
+    Status: all three platforms have since shipped (Linux TPM,
+    then macOS Secure Enclave, then Windows TPM via TBS). The
+    notes above are preserved as the design record; remaining
+    hardware-wrapping work is PCR sealing (Linux + Windows,
+    opt-in) and the recovery-UX items in
+    `docs/TPM_FUTURE_IMPROVEMENTS.md`.
 
 11. **WinFsp `link` / `symlink` parity.** Linux (libfuse3) and
     macOS (FUSE-T) backends ship full POSIX `link(2)` and
@@ -984,8 +1008,8 @@ risk first.
     currently unlocked, since the wrapped form on disk
     requires the TPM chip to re-derive, and the wrap is
     non-portable across machines. Deferred as a marginal-
-    value addition; prioritise TPM-Windows integration
-    first.
+    value addition; TPM-Windows integration (which covers
+    the same threat class better) has since shipped.
 
     Implementation cost if pursued anyway: roughly 3-4 days
     of focused work (the Windows API itself is trivial; the

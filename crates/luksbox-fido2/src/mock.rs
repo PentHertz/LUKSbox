@@ -188,6 +188,70 @@ mod tests {
     }
 
     #[test]
+    fn hmac_secret_multi_returns_matching_index() {
+        // Issue #28 regression (default-impl half): a vault with two
+        // FIDO2 keyslots must unlock with EITHER enrolled credential.
+        // Only the second candidate is known to this authenticator
+        // (models presenting the backup key), so the multi assert must
+        // fall through the first candidate and report index 1 with the
+        // secret the direct single-credential call would produce.
+        use crate::authenticator::HmacSecretRequest;
+        let mut auth = MockAuthenticator::new();
+        let known = auth.enroll("luksbox.local", b"u", None).unwrap();
+        let salt_a = [0x0Au8; 32];
+        let salt_b = [0x0Bu8; 32];
+        let requests = [
+            HmacSecretRequest {
+                cred_id: b"not-on-this-authenticator",
+                salt: &salt_a,
+                prehash_salt: true,
+            },
+            HmacSecretRequest {
+                cred_id: &known.credential.id,
+                salt: &salt_b,
+                prehash_salt: true,
+            },
+        ];
+        let (idx, secret) = auth
+            .hmac_secret_multi("luksbox.local", &requests, None)
+            .unwrap();
+        assert_eq!(idx, 1);
+        let direct = auth
+            .hmac_secret("luksbox.local", &known.credential.id, &salt_b, true, None)
+            .unwrap();
+        assert_eq!(secret, direct);
+
+        // First candidate known -> index 0, and the per-candidate salt
+        // (not the other entry's) must be the one used.
+        let requests_rev = [requests[1], requests[0]];
+        let (idx, secret) = auth
+            .hmac_secret_multi("luksbox.local", &requests_rev, None)
+            .unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(secret, direct);
+    }
+
+    #[test]
+    fn hmac_secret_multi_empty_and_all_unknown_fail() {
+        use crate::authenticator::HmacSecretRequest;
+        let mut auth = MockAuthenticator::new();
+        assert!(
+            auth.hmac_secret_multi("luksbox.local", &[], None).is_err(),
+            "empty candidate list must not panic or succeed"
+        );
+        let salt = [0u8; 32];
+        let requests = [HmacSecretRequest {
+            cred_id: b"unknown",
+            salt: &salt,
+            prehash_salt: true,
+        }];
+        assert!(
+            auth.hmac_secret_multi("luksbox.local", &requests, None)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn prehash_salt_changes_output() {
         // Locks in the V3 -> V4 wire-format divergence: the same
         // (credential, salt) tuple with prehash=true vs prehash=false

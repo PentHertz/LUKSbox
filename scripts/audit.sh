@@ -10,6 +10,12 @@
 #                      luksbox-mount on `target_os = "windows"` only).
 #                      Non-Windows builds are unaffected. Revisit when
 #                      the Rust WinFsp bindings update.
+#   RUSTSEC-2024-0436  paste crate unmaintained, compile-time-only
+#                      proc-macro pulled in by tss-esapi 8.0.0-alpha.2
+#                      (TPM keyslots, Linux + Windows). Ships no code
+#                      in the binary; no CVE. Drop when tss-esapi cuts
+#                      a stable 8.0 without paste. Non-TPM builds are
+#                      unaffected.
 #
 # Historical (no longer ignored, closed):
 #   RUSTSEC-2025-0141  bincode 2.x unmaintained, replaced by postcard
@@ -35,5 +41,6 @@ fi
 # ignore list instead so we know exactly what we're accepting.
 cargo audit \
     --ignore RUSTSEC-2025-0026 \
+    --ignore RUSTSEC-2024-0436 \
     --color=auto \
     "$@"

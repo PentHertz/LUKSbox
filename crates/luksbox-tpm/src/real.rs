@@ -6,8 +6,12 @@
 //! Uses the `tss-esapi` crate (wrapper over libtss2-esys). The flow
 //! follows the systemd-cryptenroll model for LUKS2 TPM enrollment:
 //!
-//! 1. Open a TPM context (TCTI defaults to `device:/dev/tpmrm0` ->
-//!    `device:/dev/tpm0` -> environment `TPM2TOOLS_TCTI`).
+//! 1. Open a TPM context. On Linux the TCTI defaults to
+//!    `device:/dev/tpmrm0` (the kernel resource manager); on Windows
+//!    it is TBS, the in-box TPM Base Services broker every supported
+//!    Windows ships (reachable from any user-mode process - no
+//!    admin, no driver, no code signing). `TCTI_NAME_CONF`
+//!    overrides the default on both platforms.
 //! 2. Build a Storage Root Key under the Owner hierarchy. The SRK is
 //!    deterministically derived from the TPM's persistent
 //!    endorsement seed, so we recreate it identically on every
@@ -27,12 +31,12 @@ use tss_esapi::{
     Context, TctiNameConf,
     attributes::ObjectAttributesBuilder,
     constants::SessionType,
-    handles::{ObjectHandle, SessionHandle},
+    handles::{KeyHandle, ObjectHandle, SessionHandle},
     interface_types::{
         algorithm::{HashingAlgorithm, PublicAlgorithm},
         ecc::EccCurve,
         key_bits::AesKeyBits,
-        resource_handles::Hierarchy,
+        reserved_handles::Hierarchy,
         session_handles::AuthSession,
     },
     structures::{
@@ -41,9 +45,12 @@ use tss_esapi::{
         PublicEccParametersBuilder, PublicKeyedHashParameters, SensitiveData, SymmetricDefinition,
         SymmetricDefinitionObject,
     },
-    tcti_ldr::{DeviceConfig, TctiNameConf as Tcti},
+    tcti_ldr::TctiNameConf as Tcti,
     traits::{Marshall, UnMarshall},
 };
+
+#[cfg(target_os = "linux")]
+use tss_esapi::tcti_ldr::DeviceConfig;
 use zeroize::Zeroizing;
 
 use crate::{Error, SEALED_SECRET_LEN, SealedBlob};
@@ -53,10 +60,15 @@ pub struct Tpm2Sealer {
 }
 
 impl Tpm2Sealer {
-    /// Open a TPM context using the default TCTI: `device:/dev/tpmrm0`
-    /// (the kernel resource manager). Falls back to `device:/dev/tpm0`
-    /// if the resource manager isn't present (older kernel or
-    /// `CONFIG_TCG_TPM2_HMAC` disabled).
+    /// Open a TPM context using the platform default TCTI.
+    ///
+    /// - **Linux**: `device:/dev/tpmrm0` (the kernel resource
+    ///   manager). Falls back to `device:/dev/tpm0` if the resource
+    ///   manager isn't present (older kernel or
+    ///   `CONFIG_TCG_TPM2_HMAC` disabled).
+    /// - **Windows**: TBS (TPM Base Services), the in-box broker
+    ///   that multiplexes the chip between user-mode processes. No
+    ///   device node, no admin rights, no elevation.
     ///
     /// Honors the `TCTI_NAME_CONF` environment variable transparently
     /// (the underlying `tpm2-tss` library reads it before our default
@@ -70,7 +82,12 @@ impl Tpm2Sealer {
             return Self::from_tcti_str(&spec);
         }
         // Try the resource manager first (no exclusive lock).
+        #[cfg(target_os = "linux")]
         let primary = Tcti::Device(DeviceConfig::default());
+        // TBS is itself a resource manager; there is exactly one per
+        // Windows install, so no fallback chain is needed.
+        #[cfg(target_os = "windows")]
+        let primary = Tcti::Tbs;
         let ctx = Context::new(primary)
             .map_err(|e| Error::DeviceNotAvailable(diagnose_device_open_failure(&e.to_string())))?;
         Ok(Self { ctx })
@@ -111,18 +128,29 @@ impl Tpm2Sealer {
         plaintext: &[u8; SEALED_SECRET_LEN],
         pin: Option<&[u8]>,
     ) -> Result<SealedBlob, Error> {
-        // Need an HMAC session for command/response auth; without one
-        // any subsequent `Esys_Create` rejects with TPM_RC_AUTH_MISSING.
-        let session = self.start_hmac_session()?;
-        self.ctx.set_sessions((Some(session), None, None));
+        // Create the SRK FIRST. CreatePrimary authorizes the Owner
+        // hierarchy with the default (empty) password session and
+        // carries no sensitive data across the bus (the SRK is
+        // sensitive_data_origin, so the chip generates the key
+        // internally), so it needs no encrypted session. We need the
+        // SRK handle to SALT the HMAC session below, which is what
+        // makes that session's parameter encryption effective against
+        // a TPM-bus interposer (see `start_hmac_session`).
+        let primary = self.create_srk()?;
 
-        let primary = match self.create_srk(session) {
-            Ok(p) => p,
+        // Salted HMAC session for command/response auth AND parameter
+        // encryption. Without a session any subsequent `Esys_Create`
+        // rejects with TPM_RC_AUTH_MISSING; without the SRK salt the
+        // encryption would be decorative (recoverable on the bus).
+        let session = match self.start_hmac_session(primary.key_handle) {
+            Ok(s) => s,
             Err(e) => {
-                self.flush_session(session);
+                let _ = self.ctx.flush_context(primary.key_handle.into());
                 return Err(e);
             }
         };
+        self.ctx.set_sessions((Some(session), None, None));
+
         let result = self.create_sealed_object(primary.key_handle.into(), plaintext, pin);
 
         // Flush the SRK transient handle and the HMAC session so we
@@ -140,10 +168,10 @@ impl Tpm2Sealer {
             .marshall()
             .map_err(|e| Error::TpmError(format!("marshall TPM2B_PUBLIC: {e}")))?;
         // `Private` is a buffer type, not a marshalled struct - it
-        // exposes its bytes via `value()`. We treat the raw byte
+        // exposes its bytes via `as_bytes()`. We treat the raw byte
         // run as opaque and prefix it with its length when packed
         // into the SealedBlob (see `SealedBlob::to_bytes`).
-        let private_bytes: Vec<u8> = result.out_private.value().to_vec();
+        let private_bytes: Vec<u8> = result.out_private.as_bytes().to_vec();
 
         Ok(SealedBlob {
             public: public_bytes,
@@ -171,16 +199,19 @@ impl Tpm2Sealer {
         blob: &SealedBlob,
         pin: Option<&[u8]>,
     ) -> Result<Zeroizing<[u8; SEALED_SECRET_LEN]>, Error> {
-        let session = self.start_hmac_session()?;
-        self.ctx.set_sessions((Some(session), None, None));
-
-        let primary = match self.create_srk(session) {
-            Ok(p) => p,
+        // SRK first, then a salted HMAC session (see `seal_with_pin`
+        // and `start_hmac_session` for why the salt is load-bearing:
+        // it protects the unsealed 32-byte secret as it crosses the
+        // bus in the Esys_Unseal response).
+        let primary = self.create_srk()?;
+        let session = match self.start_hmac_session(primary.key_handle) {
+            Ok(s) => s,
             Err(e) => {
-                self.flush_session(session);
+                let _ = self.ctx.flush_context(primary.key_handle.into());
                 return Err(e);
             }
         };
+        self.ctx.set_sessions((Some(session), None, None));
 
         // Everything fallible from here runs inside the closure so
         // the handle flushes below execute on EVERY path. The wrong-
@@ -206,22 +237,21 @@ impl Tpm2Sealer {
             // object's auth slot so the next Esys_Unseal carries the
             // correct password session value.
             if let Some(pin_bytes) = pin {
-                // `Auth::try_from(&[u8])` copies the PIN into the Rust-side
-                // `Auth` value. In tss-esapi 7.7.0 that storage is
+                // `Auth::from_bytes(&[u8])` copies the PIN into the
+                // Rust-side `Auth` value. In tss-esapi 8.0 that storage is
                 // `Zeroizing<Vec<u8>>` (see `structures::buffers`), so the
                 // Rust copy is wiped on the implicit `Drop` of `auth` below.
                 //
                 // What is NOT cleaned up: once `tr_set_auth` succeeds, ESAPI
                 // marshals the bytes into the C-side ESYS context's internal
                 // `TPM2B_AUTH` slot for the loaded object. That C-side copy
-                // is upstream-owned and tss-esapi 7.x does not zeroize it
+                // is upstream-owned and tss-esapi does not zeroize it
                 // when the Context drops -- only when the same auth slot is
                 // overwritten or the object is flushed. The flush of the
-                // loaded object after this closure (which now runs on
-                // error paths too, including wrong-PIN) is the best
-                // ESAPI-side mitigation available without bumping past
-                // tss-esapi 7.x.
-                let auth = Auth::try_from(pin_bytes)
+                // loaded object after this closure (which runs on error
+                // paths too, including wrong-PIN) is the best ESAPI-side
+                // mitigation available.
+                let auth = Auth::from_bytes(pin_bytes)
                     .map_err(|e| Error::TpmError(format!("PIN too long: {e}")))?;
                 self.ctx
                     .tr_set_auth(loaded.into(), auth)
@@ -240,9 +270,9 @@ impl Tpm2Sealer {
         self.flush_session(session);
         let unsealed = unseal_result?;
 
-        // `SensitiveData` is a buffer type; `value()` returns the
+        // `SensitiveData` is a buffer type; `as_bytes()` returns the
         // unsealed plaintext bytes.
-        let bytes: &[u8] = unsealed.value();
+        let bytes: &[u8] = unsealed.as_bytes();
         if bytes.len() != SEALED_SECRET_LEN {
             return Err(Error::TpmError(format!(
                 "unsealed length {} != expected {}",
@@ -268,11 +298,28 @@ impl Tpm2Sealer {
         let _ = self.ctx.flush_context(SessionHandle::from(session).into());
     }
 
-    fn start_hmac_session(&mut self) -> Result<AuthSession, Error> {
+    /// Start the per-operation HMAC session, SALTED against the SRK's
+    /// public area (`salt_key`). The salt is what makes this session's
+    /// parameter encryption (`with_encrypt` / `with_decrypt` below)
+    /// actually protect the sealed secret on the TPM bus. It is
+    /// established by ECDH to the SRK's public point, so the derived
+    /// session key depends on the SRK private key that never leaves the
+    /// chip. An unsalted, unbound session (`start_auth_session(None,
+    /// None, ...)`) has an empty session key, so its CFB parameter-
+    /// encryption key derives from the two nonces alone, both of which
+    /// cross the bus in cleartext; a passive LPC/SPI interposer could
+    /// then recompute it and read the 32-byte KEK as it transits in the
+    /// Esys_Create / Esys_Unseal parameter. Salting against the SRK is
+    /// the same protection systemd-cryptenroll uses. The SRK is a
+    /// restricted ECC decryption (storage) key, a valid salt key per
+    /// the TCG spec; the caller must create it first and pass its
+    /// handle here (matters only for a discrete TPM with a physically
+    /// reachable bus; firmware TPMs expose none).
+    fn start_hmac_session(&mut self, salt_key: KeyHandle) -> Result<AuthSession, Error> {
         let session = self
             .ctx
             .start_auth_session(
-                None,
+                Some(salt_key),
                 None,
                 None,
                 SessionType::Hmac,
@@ -295,7 +342,7 @@ impl Tpm2Sealer {
     /// Owner hierarchy. Same template as systemd-cryptenroll uses;
     /// deterministic from the TPM's primary seed, so re-derives
     /// identically on every call.
-    fn create_srk(&mut self, _session: AuthSession) -> Result<CreatePrimaryKeyResult, Error> {
+    fn create_srk(&mut self) -> Result<CreatePrimaryKeyResult, Error> {
         let object_attributes = ObjectAttributesBuilder::new()
             .with_fixed_tpm(true)
             .with_fixed_parent(true)
@@ -380,23 +427,23 @@ impl Tpm2Sealer {
         let sensitive_data = SensitiveData::try_from((*plaintext_vec).clone())
             .map_err(|e| Error::TpmError(format!("SensitiveData: {e}")))?;
 
-        // tss-esapi 7.x's Context::create takes (auth_value,
-        // sensitive_data) as separate Option args (it builds the
-        // TPMS_SENSITIVE_CREATE internally). When auth_value is
-        // Some, the TPM stores it as userAuth; subsequent unseal
-        // operations need it presented via tr_set_auth on the
-        // loaded object handle. Pass None to omit (no PIN required).
+        // Context::create takes (auth_value, sensitive_data) as
+        // separate Option args (it builds the TPMS_SENSITIVE_CREATE
+        // internally). When auth_value is Some, the TPM stores it as
+        // userAuth; subsequent unseal operations need it presented
+        // via tr_set_auth on the loaded object handle. Pass None to
+        // omit (no PIN required).
         let user_auth = match pin {
             // Same reasoning as in `unseal_with_pin`: pass the slice
             // straight in and skip a local unzeroized `Vec` round-trip.
             // The Rust `Auth` value's storage is `Zeroizing<Vec<u8>>`
-            // in tss-esapi 7.7.0, so the Rust copy is wiped on Drop
+            // in tss-esapi 8.0, so the Rust copy is wiped on Drop
             // after `self.ctx.create` consumes it. ESAPI's C-side
             // TPMS_SENSITIVE_CREATE buffer carrying the userAuth into
-            // the kernel is upstream-owned and not zeroized in 7.x;
+            // the kernel is upstream-owned and not zeroized;
             // mitigated only by the Context Drop's resource cleanup.
             Some(pin_bytes) => Some(
-                Auth::try_from(pin_bytes)
+                Auth::from_bytes(pin_bytes)
                     .map_err(|e| Error::TpmError(format!("PIN too long for TPM Auth: {e}")))?,
             ),
             None => None,
@@ -422,6 +469,7 @@ impl Tpm2Sealer {
 /// THAT signal to pick the right remediation - the libtss2 stderr
 /// output that mentions "No such file" / "Permission denied" doesn't
 /// reach the Rust-side error string.
+#[cfg(target_os = "linux")]
 fn diagnose_device_open_failure(raw: &str) -> String {
     use std::path::Path;
     let lower = raw.to_lowercase();
@@ -505,6 +553,7 @@ fn diagnose_device_open_failure(raw: &str) -> String {
     format!("could not open the local TPM 2.0 device: {raw}\n\n{hint}")
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug)]
 enum DeviceKind {
     /// No /dev/tpm* device node present on the system.
@@ -515,6 +564,39 @@ enum DeviceKind {
     Opens,
     /// Other I/O error while trying to open (rare).
     Other,
+}
+
+/// Windows counterpart of the Linux device-open diagnosis. There is
+/// no device node to pre-stat here - the TBS broker either answers
+/// or it doesn't - so the remediation is keyed off the failure
+/// itself. The dominant causes in practice: the firmware TPM is
+/// switched off in UEFI setup, the machine is a VM without a vTPM,
+/// or TBS was disabled by policy.
+#[cfg(target_os = "windows")]
+fn diagnose_device_open_failure(raw: &str) -> String {
+    let hint = "Windows exposes the TPM through TBS (TPM Base Services); opening it\n\
+         needs no admin rights, so a failure here almost always means the\n\
+         chip is absent or disabled rather than a permissions problem.\n\n\
+         Diagnose (PowerShell):\n  \
+             Get-Tpm                      # TpmPresent / TpmReady say it all\n  \
+             tpm.msc                      # management console with status text\n\n\
+         Fixes:\n  \
+         - In the UEFI/BIOS setup, look for \"Trusted Platform Module\",\n    \
+             \"Security Device\", \"Intel PTT\" (firmware TPM on Intel), or\n    \
+             \"AMD fTPM\". Enable it, save, cold-boot.\n  \
+         - Every Windows 11 machine ships a TPM 2.0 (it's part of the\n    \
+             hardware floor); on Windows 10 hardware from before ~2016 the\n    \
+             chip may genuinely be absent or TPM 1.2-only, which LUKSbox\n    \
+             does not support.\n  \
+         - In a VM, the host must expose a virtual TPM: Hyper-V\n    \
+             (Settings > Security > Enable Trusted Platform Module),\n    \
+             VMware (add a vTPM device), VirtualBox 7+ (TPM v2.0 in\n    \
+             System settings).\n  \
+         - If Get-Tpm reports the chip but LUKSbox still can't reach it,\n    \
+             check that the \"TPM Base Services\" functionality hasn't been\n    \
+             disabled by group policy, and fall back to a passphrase /\n    \
+             FIDO2 keyslot in the meantime.";
+    format!("could not open the local TPM 2.0 via TBS: {raw}\n\n{hint}")
 }
 
 /// Map common TPM operation failures (busy, lockout, etc.) into the
@@ -528,32 +610,59 @@ enum DeviceKind {
 /// so the CLI / GUI can prepend hints without re-parsing libtss2
 /// error codes themselves.
 pub fn diagnose_operation_error(raw: &str) -> Option<&'static str> {
+    // Lockout remediation differs per platform: Linux clears it with
+    // tpm2-tools against the owner hierarchy; Windows manages the
+    // anti-hammering counter itself and exposes the reset through
+    // tpm.msc (and deliberately rate-limits it).
+    #[cfg(target_os = "linux")]
+    const LOCKOUT_HINT: &str = "The TPM is in dictionary-attack lockout. The chip refuses further auth\n\
+         attempts for a cooldown period (typically 1-24 hours, configurable per\n\
+         vendor) after too many wrong tries.\n\n\
+         To clear the lockout NOW (requires the TPM owner authorization, which\n\
+         on most systems is empty / not yet set):\n  \
+             tpm2_dictionarylockout --clear-lockout\n\n\
+         If the owner auth has been set (e.g. by systemd-cryptenroll or by an\n\
+         enterprise management tool), you'll need that password.";
+    #[cfg(target_os = "windows")]
+    const LOCKOUT_HINT: &str = "The TPM is in dictionary-attack lockout. The chip refuses further auth\n\
+         attempts for a cooldown period after too many wrong tries; Windows\n\
+         manages this counter itself and normally lets it decay on its own.\n\n\
+         To clear the lockout NOW: open tpm.msc as Administrator and use\n\
+         \"Reset TPM lockout\", or wait out the cooldown (typically a few\n\
+         hours). Do NOT use Clear-Tpm / \"Clear TPM\" - that wipes every\n\
+         TPM-resident key on the machine and permanently destroys this\n\
+         vault's TPM keyslots (BitLocker's too).";
+
+    #[cfg(target_os = "linux")]
+    const INIT_HINT: &str = "The TPM hasn't been initialized for use yet. Run `tpm2_startup -c` to\n\
+         send the Startup(CLEAR) command (the kernel normally does this\n\
+         automatically at boot; if it didn't, the firmware may need a fresh\n\
+         power cycle, NOT just a reboot).";
+    #[cfg(target_os = "windows")]
+    const INIT_HINT: &str = "The TPM hasn't been initialized for use yet. Windows normally does\n\
+         this at boot; check tpm.msc for \"The TPM is ready for use\". If it\n\
+         isn't, run `Initialize-Tpm` from an elevated PowerShell, or\n\
+         cold-boot the machine (a full power cycle, not just a restart).";
+
+    #[cfg(target_os = "linux")]
+    const AUTH_MISSING_HINT: &str = "The operation needed authorization but none was supplied. This usually\n\
+         means a stale handle is in the TPM's transient table from a previous\n\
+         crashed luksbox process. Restart the calling process; if that doesn't\n\
+         help, run `tpm2_flushcontext --transient-object` to clear stale handles.";
+    #[cfg(target_os = "windows")]
+    const AUTH_MISSING_HINT: &str = "The operation needed authorization but none was supplied. This usually\n\
+         means a stale handle is in the TPM's transient table from a previous\n\
+         crashed luksbox process. Restart the calling process; TBS cleans up a\n\
+         crashed process's contexts on its own, so a fresh start normally\n\
+         clears it. If not, reboot to force a full TPM context reset.";
+
     let lower = raw.to_lowercase();
     if lower.contains("lockout") || lower.contains("rc_lockout") {
-        Some(
-            "The TPM is in dictionary-attack lockout. The chip refuses further auth\n\
-             attempts for a cooldown period (typically 1-24 hours, configurable per\n\
-             vendor) after too many wrong tries.\n\n\
-             To clear the lockout NOW (requires the TPM owner authorization, which\n\
-             on most systems is empty / not yet set):\n  \
-                 tpm2_dictionarylockout --clear-lockout\n\n\
-             If the owner auth has been set (e.g. by systemd-cryptenroll or by an\n\
-             enterprise management tool), you'll need that password.",
-        )
+        Some(LOCKOUT_HINT)
     } else if lower.contains("rc_initialize") || lower.contains("not initialized") {
-        Some(
-            "The TPM hasn't been initialized for use yet. Run `tpm2_startup -c` to\n\
-             send the Startup(CLEAR) command (the kernel normally does this\n\
-             automatically at boot; if it didn't, the firmware may need a fresh\n\
-             power cycle, NOT just a reboot).",
-        )
+        Some(INIT_HINT)
     } else if lower.contains("auth") && lower.contains("missing") {
-        Some(
-            "The operation needed authorization but none was supplied. This usually\n\
-             means a stale handle is in the TPM's transient table from a previous\n\
-             crashed luksbox process. Restart the calling process; if that doesn't\n\
-             help, run `tpm2_flushcontext --transient-object` to clear stale handles.",
-        )
+        Some(AUTH_MISSING_HINT)
     } else {
         None
     }

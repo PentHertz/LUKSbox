@@ -96,6 +96,12 @@ ALL_TARGETS=(linux-amd64 linux-arm64 macos-amd64 macos-arm64 windows-amd64)
 SELECTED=("${ALL_TARGETS[@]}")
 PROFILE="release"
 WITH_FIDO2=1
+WITH_TPM=0          # opt-in: TPM 2.0 keyslots via bundled-tpm (vendored
+                    # tpm2-tss; needs autotools on Linux). Linux targets
+                    # only from this script - the Windows target here is
+                    # a MinGW cross-build and tss-esapi-sys supports only
+                    # MSVC on Windows (use release.yml / a native MSVC
+                    # build for Windows TPM, see BUILDING.md).
 WITH_GUI=0
 WITH_WINFSP=0       # see winfsp_for_target() for why this is opt-in
 USE_CROSS=0
@@ -114,6 +120,7 @@ while [[ $# -gt 0 ]]; do
         --targets)        IFS=',' read -r -a SELECTED <<< "$2"; shift 2 ;;
         --profile)        PROFILE="$2"; shift 2 ;;
         --no-fido2)       WITH_FIDO2=0; shift ;;
+        --with-tpm)       WITH_TPM=1; shift ;;
         --gui)            WITH_GUI=1; shift ;;
         --with-winfsp)    WITH_WINFSP=1; shift ;;
         --use-cross)      USE_CROSS=1; shift ;;
@@ -537,9 +544,23 @@ build_one() {
     # --- run cargo / cross --------------------------------------------------
     # Build a comma-separated feature list. We always opt out of defaults
     # so each feature is controlled per-target rather than inherited from
-    # the workspace's default = ["hardware", "fuse", "winfsp"].
+    # the workspace's default = ["fido2-hardware", "fuse", "winfsp"].
+    #
+    # fido2-hardware (not the old `hardware` union): keeps this script's
+    # builds free of the tpm2-tss >= 4.1.3 floor that tss-esapi 8.x
+    # imposes. TPM is opt-in via --with-tpm, which swaps in bundled-tpm
+    # (vendored tpm2-tss; implies fido2-hardware) on Linux targets only -
+    # the windows-amd64 target here is MinGW and tss-esapi-sys has no
+    # windows-gnu support.
     local features=()
-    [[ "$with_fido2_eff"  == "1" ]] && features+=("hardware")
+    if [[ "$WITH_TPM" == "1" && "$logical" == linux-* ]]; then
+        features+=("bundled-tpm")
+    elif [[ "$WITH_TPM" == "1" ]]; then
+        echo "    note: --with-tpm skipped for $logical (Linux targets only in this script)"
+        [[ "$with_fido2_eff" == "1" ]] && features+=("fido2-hardware")
+    else
+        [[ "$with_fido2_eff" == "1" ]] && features+=("fido2-hardware")
+    fi
     [[ "$with_fuse_eff"   == "1" ]] && features+=("fuse")
     [[ "$with_fuse_t_eff" == "1" ]] && features+=("fuse-t")
     [[ "$with_winfsp_eff" == "1" ]] && features+=("winfsp")

@@ -37,6 +37,14 @@ permissions:
   # identity is short-lived per run and pinned to the commit SHA.
   id-token: write
   attestations: write
+  # SignPath's official GitHub Action signs an artifact by its GitHub
+  # artifact id, so each file to sign is uploaded as a run artifact
+  # first. Those intermediates are unsigned and must be deleted before
+  # the release job's download-artifact pulls them in; deleting run
+  # artifacts needs `actions: write` (which also covers the read the
+  # SignPath action uses to resolve the artifact). Windows-only in
+  # practice; harmless on the other legs.
+  actions: write
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,6 +54,18 @@ jobs:
   build:
     name: ${{ matrix.target }}${{ matrix.ubuntu_codename && format(' ({0})', matrix.ubuntu_codename) || '' }}
     runs-on: ${{ matrix.runner }}
+    env:
+      # A step's `if:` can only read env defined at the WORKFLOW or JOB
+      # level, never the step's own `env`, and workflow-level env cannot
+      # reference `secrets`. So the SignPath steps below are gated on
+      # this job-level flag. It exposes only true/false to each step's
+      # environment, NOT the token itself: the token stays a secret,
+      # referenced directly via `secrets.*` inside the SignPath steps.
+      # Without this, `env.SIGNPATH_*` in those `if:` gates is always
+      # empty and every SignPath step is silently skipped (the "nothing
+      # happens on SignPath" symptom). False on forks / before the
+      # secret is set, so the gated steps skip cleanly.
+      SIGNPATH_ENABLED: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
     # Per-matrix container: most entries run on the host runner
     # (container is null / unset). The Trixie and 26.04/resolute
     # entries set `container: debian:trixie` / `container: ubuntu:26.04`
@@ -169,6 +189,16 @@ jobs:
             build_rpm: false
             archive: luksbox-${{ github.ref_name }}-aarch64-linux-resolute.tar.gz
           - target: x86_64-pc-windows-msvc
+            # Using windows-latest per request. KNOWN RISK: the bundled
+            # tpm2-tss VS solution and the stage-tpm2-tss action target
+            # the VS 2022 (v143) toolset. If the windows-latest image
+            # carries VS 2026 (v18 / MSVC 14.5x), the tss2-*.lib files do
+            # not land where tss-esapi-sys links them and the CLI fails to
+            # link with `LNK1181: cannot open input file 'tss2-sys.lib'`
+            # BEFORE any signing step runs. If that recurs, switch to
+            # windows-2025 (still VS 2022) or teach stage-tpm2-tss to
+            # build under the newer toolset. Keep in lock-step with the
+            # windows-tpm job in ci.yml.
             runner: windows-latest
             archive: luksbox-${{ github.ref_name }}-x86_64-windows.zip
           # Intel macOS is disabled, the macos-13 runner is being
@@ -329,6 +359,23 @@ jobs:
         # time out trying to fetch from ports.ubuntu.com's IPv6
         # addresses, which the runner network can't route to.
         uses: ./.github/actions/apt-install
+        # The autotools stack (autoconf / automake / libtool /
+        # libltdl-dev / autoconf-archive) plus libjson-c-dev and
+        # uuid-dev are for the jammy + noble lanes, whose feature list
+        # below is `bundled-tpm`: the tss-esapi-sys build script
+        # compiles a vendored tpm2-tss 4.1.3 via autotools at build
+        # time because those distros' system tpm2-tss (3.2 / 4.0.1) is
+        # below the 4.1.3 floor tss-esapi 8.x imposes. libltdl-dev is
+        # load-bearing: tpm2-tss's configure.ac uses LT_LIB_DLLOAD,
+        # which Debian/Ubuntu ship in libltdl-dev's ltdl.m4, not in
+        # the base libtool package. The vendored build is static-only
+        # (the autotools crate configures --disable-shared), so those
+        # binaries embed the tss2 core libraries and have NO
+        # libtss2-*.so runtime dependency; only the TCTI module
+        # (libtss2-tcti-device.so.0) is dlopen()ed from the distro
+        # when a TPM slot is actually used. All of this is a harmless
+        # no-op on the trixie / resolute lanes, which system-link
+        # against libtss2-dev instead.
         with:
           packages: |
             pkg-config
@@ -339,6 +386,13 @@ jobs:
             libfuse3-dev
             libgtk-3-dev
             libtss2-dev
+            autoconf
+            automake
+            libtool
+            libltdl-dev
+            autoconf-archive
+            libjson-c-dev
+            uuid-dev
             libclang-dev
             imagemagick
 
@@ -653,17 +707,68 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          # Linux: hardware + fuse (libfido2 + libfuse3 from apt).
-          # winfsp is Windows-only, omit on Linux to avoid cargo
-          # tripping on the target-cfg'd optional dep.
-          echo "LUKSBOX_FEATURES=hardware,fuse" >> "$GITHUB_ENV"
+          # Linux: the TPM backend flavour depends on the lane's system
+          # tpm2-tss. tss-esapi 8.x needs tpm2-tss >= 4.1.3 at BUILD
+          # time; trixie and resolute ship it, so those lanes link the
+          # system libraries (`hardware`). jammy (3.2) and noble (4.0.1)
+          # are below the floor, so they build `bundled-tpm`: a
+          # vendored tpm2-tss 4.1.3 is compiled via autotools during
+          # `cargo build`. The vendored libraries are static-only, so
+          # the binary embeds the tss2 core at 4.1.3 and works
+          # regardless of the distro's older tpm2-tss runtime
+          # packages; only the TCTI module (libtss2-tcti-device.so.0)
+          # is dlopen()ed from the system, through the stable TCTI
+          # plugin ABI, when a TPM slot is actually used. winfsp is
+          # Windows-only, omit on Linux to avoid cargo tripping on the
+          # target-cfg'd optional dep.
+          case "${{ matrix.ubuntu_codename }}" in
+            jammy|noble)
+              echo "LUKSBOX_FEATURES=bundled-tpm,fuse" >> "$GITHUB_ENV"
+              # Force the tss-esapi-sys pkg-config probes of the
+              # vendored (static-only) tpm2-tss into STATIC mode.
+              # Dynamic mode never reads Libs.private (missing
+              # -lcrypto) and emits each -ltss2-* alone, which GNU ld
+              # resolves strictly left to right, so the aarch64 lanes
+              # die with "undefined reference to Tss2_Sys_*"; rust-lld
+              # (x86_64) only passes by being order-insensitive.
+              # Static mode expands each probe's full Requires /
+              # Libs.private closure in topological order. Mirrors the
+              # [env] block in .cargo/config.toml; kept here too so
+              # the release lanes never depend on that file being in
+              # sync. Scoped by library name, so nothing else is
+              # affected.
+              # Compile the vendored tpm2-tss without SM4 session
+              # encryption. Ubuntu's OpenSSL ships SM4, Fedora/RHEL's
+              # is built without it, so a bundled-tpm binary compiled
+              # here would carry an EVP_sm4_cfb128 reference that
+              # Fedora's libcrypto.so.3 cannot satisfy ("symbol lookup
+              # error" the moment the .rpm-installed binary starts).
+              # tpm2-tss guards every SM4 path with
+              # !defined(OPENSSL_NO_SM4) and NULLs the callback when
+              # absent; LUKSbox only ever negotiates AES-CFB TPM
+              # sessions, so nothing is lost. The autotools crate
+              # appends $CFLAGS to the vendored configure invocation.
+              {
+                echo "TSS2_SYS_STATIC=1"
+                echo "TSS2_ESYS_STATIC=1"
+                echo "TSS2_MU_STATIC=1"
+                echo "TSS2_TCTILDR_STATIC=1"
+                echo "CFLAGS=-DOPENSSL_NO_SM4"
+              } >> "$GITHUB_ENV" ;;
+            *)
+              echo "LUKSBOX_FEATURES=hardware,fuse" >> "$GITHUB_ENV" ;;
+          esac
 
       - name: Set Windows feature list
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          # Windows: hardware + winfsp. Fuse is linux/macos-only.
-          echo "LUKSBOX_FEATURES=hardware,winfsp" >> "$GITHUB_ENV"
+          # Windows: bundled-tpm + winfsp. There is no system tpm2-tss
+          # on Windows at all, so the TPM backend is always the
+          # vendored MSBuild build (staged by the step below); the
+          # resulting tss2-*.dll closure is shipped inside the .zip and
+          # the MSI. Fuse is linux/macos-only.
+          echo "LUKSBOX_FEATURES=bundled-tpm,winfsp" >> "$GITHUB_ENV"
 
       - name: Windows deps (WinFsp)
         if: runner.os == 'Windows'
@@ -698,6 +803,16 @@ jobs:
           if (-not (Get-Command magick -ErrorAction SilentlyContinue)) {
               choco install imagemagick.tool -y --no-progress
           }
+
+      - name: Windows deps (tpm2-tss source + OpenSSL + libclang, for bundled-tpm)
+        # Stages what the `bundled-tpm` feature needs to compile
+        # tpm2-tss with MSBuild during `cargo build`, and exports
+        # TPM2_TSS_SOURCE_PATH + LIBCLANG_PATH. Shared with ci.yml's
+        # windows-tpm job via the composite action so the two can't
+        # drift; the recipe in prose lives in BUILDING.md
+        # "TPM 2.0 keyslots".
+        if: runner.os == 'Windows'
+        uses: ./.github/actions/stage-tpm2-tss
 
       # ---- generated assets ---------------------------------------------------
 
@@ -1622,6 +1737,34 @@ jobs:
               exit 1
           }
 
+          # TPM 2.0 backend DLL closure. The bundled-tpm build linked
+          # luksbox against the tpm2-tss DLLs that MSBuild produced
+          # under TPM2_TSS_SOURCE_PATH; ship them next to the .exe
+          # (the application directory wins the DLL search order),
+          # plus OpenSSL's libcrypto that tss2-esys.dll imports.
+          # tss2-tcti-tbs.dll never appears in an import table
+          # (tss2-tctildr dlopen()s it at runtime) but is required for
+          # actual chip access through TBS. dist/luksbox.wxs references
+          # the same staged files for the MSI, so fail loudly here if
+          # any is missing rather than shipping a TPM-less artifact.
+          $tssBin = "$env:TPM2_TSS_SOURCE_PATH\x64\Release"
+          foreach ($dll in @('tss2-esys.dll', 'tss2-sys.dll', 'tss2-mu.dll',
+                             'tss2-tctildr.dll', 'tss2-tcti-tbs.dll')) {
+              if (-not (Test-Path "$tssBin\$dll")) {
+                  Write-Error "$dll not found in $tssBin; the bundled-tpm MSBuild step did not produce the full TPM DLL closure"
+                  exit 1
+              }
+              Copy-Item "$tssBin\$dll" staging/
+          }
+          if (-not (Test-Path 'C:\ossl\bin\libcrypto-3-x64.dll')) {
+              Write-Error "libcrypto-3-x64.dll missing from the staged OpenSSL dir"
+              exit 1
+          }
+          Copy-Item 'C:\ossl\bin\libcrypto-3-x64.dll' staging/
+          Copy-Item "$env:TPM2_TSS_SOURCE_PATH\LICENSE" 'staging\LICENSE-TPM2-TSS.txt'
+          Copy-Item 'C:\ossl\LICENSE-OPENSSL.txt' 'staging\LICENSE-OPENSSL.txt'
+          Write-Host "==> bundled TPM DLL closure from $tssBin"
+
           # Required files - the MSI hard-references them via the WiX
           # ComponentGroup, so a missing one in the repo would surface
           # as a cryptic WIX0103 several steps later. Fail loudly here
@@ -1676,7 +1819,14 @@ jobs:
             'GPLv3 with a special linking exception that explicitly',
             'permits this kind of bundling alongside non-GPL software.',
             'The full WinFsp license text is in LICENSE-WINFSP.txt;',
-            'source code at https://github.com/winfsp/winfsp.'
+            'source code at https://github.com/winfsp/winfsp.',
+            '',
+            'The tss2-*.dll files (tpm2-tss, BSD-2-Clause, see',
+            'LICENSE-TPM2-TSS.txt) and libcrypto-3-x64.dll (OpenSSL 3,',
+            'Apache-2.0, see LICENSE-OPENSSL.txt) provide the TPM 2.0',
+            'keyslot backend. Chip access goes through TPM Base',
+            'Services, which is built into Windows: nothing else to',
+            'install for TPM keyslots.'
           )
           Set-Content -Path "staging\README-PORTABLE-WINDOWS.txt" -Value $readme
 
@@ -1700,11 +1850,18 @@ jobs:
         shell: pwsh
         run: |
           # FIDO2 access on Windows now goes through webauthn.dll
-          # (a system DLL on every supported Windows), and WinFsp's
-          # winfsp-x64.dll is the only other non-system import. There
-          # are no vcpkg-statically-linked C libraries any more - that
-          # path was only ever used for libfido2, which we replaced
-          # with the WebAuthn API in luksbox-fido2/src/webauthn.rs.
+          # (a system DLL on every supported Windows). The expected
+          # non-system imports are WinFsp's winfsp-x64.dll and the
+          # tss2-*.dll TPM backend (both bundled in staging/ by the
+          # steps above). There are no vcpkg-statically-linked C
+          # libraries any more - that path was only ever used for
+          # libfido2, which we replaced with the WebAuthn API in
+          # luksbox-fido2/src/webauthn.rs.
+          #
+          # libcrypto-3-x64.dll stays on the blocklist on purpose: it
+          # is a transitive import of tss2-esys.dll (shipped for that
+          # reason), but luksbox.exe itself must never import OpenSSL
+          # directly - the Rust side is pure RustCrypto.
           #
           # Blocklist below catches:
           #   1. Stragglers from a pre-webauthn build accidentally
@@ -1896,6 +2053,60 @@ jobs:
           if (Test-Path "${{ matrix.archive }}") { Remove-Item "${{ matrix.archive }}" }
           Compress-Archive -Path staging/* -DestinationPath "${{ matrix.archive }}"
 
+      # ---- SignPath: sign the MSI via the trusted-build-system action --
+      # SignPath's official GitHub Action is the trusted-build-system
+      # path: the file is uploaded as a run artifact and SignPath pulls
+      # it back through the GitHub connection to verify it really came
+      # from this workflow, rather than trusting whoever holds the API
+      # token. GitHub wraps every uploaded artifact in a zip, so the
+      # SignPath artifact configuration MUST wrap the file in a
+      # <zip-file> (see docs/WINDOWS_SIGNING.md). The MSI is signed HERE,
+      # before the Burn bundle build below embeds it, so the installer
+      # chain ships a signed MSI. All SignPath steps run only when
+      # SIGNPATH_API_TOKEN is set, so builds without it are unchanged.
+      # The intermediate `unsigned-*` artifacts are deleted further down
+      # so they never reach the release job.
+      - name: Upload unsigned MSI for SignPath
+        id: upload_unsigned_msi
+        if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-msi-${{ matrix.target }}
+          path: ${{ env.MSI_PATH }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign MSI via SignPath
+        if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: msi
+          github-artifact-id: ${{ steps.upload_unsigned_msi.outputs.artifact-id }}
+          github-token: ${{ github.token }}
+          wait-for-completion: true
+          output-artifact-directory: ${{ runner.temp }}/signed-msi
+
+      - name: Swap in the SignPath-signed MSI
+        if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          # The action downloads the signed artifact into the output dir;
+          # it may arrive as the signed file directly or inside a zip
+          # (GitHub artifact shape). Handle both, then overwrite MSI_PATH
+          # so the bundle build embeds the signed MSI and the release
+          # upload ships it.
+          $dir = "$env:RUNNER_TEMP\signed-msi"
+          $zip = Get-ChildItem -Path $dir -Recurse -Filter *.zip -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($zip) { Expand-Archive -Path $zip.FullName -DestinationPath $dir -Force }
+          $signed = Get-ChildItem -Path $dir -Recurse -Filter *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $signed) { throw "no signed .msi found under $dir" }
+          Move-Item -Force $signed.FullName "$env:MSI_PATH"
+          Write-Host "==> replaced $env:MSI_PATH with the SignPath-signed MSI"
+
       - name: Fetch + verify pinned WinFsp MSI (for the Burn bundle)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -2031,6 +2242,73 @@ jobs:
               /f $pfx /p $env:WINDOWS_PFX_PASSWORD `
               $env:BUNDLE_PATH
           & $signtool verify /pa /v $env:BUNDLE_PATH
+
+      # ---- SignPath: sign the Burn bundle via the trusted-build-system
+      # action. Signed LAST, because the bundle's Authenticode signature
+      # must cover the embedded (already-signed) MSIs. Artifact
+      # configuration slug `bundle` is a <zip-file><pe-file/> (GitHub zip
+      # wrapper). Verify the signed bundle still installs on first use:
+      # Burn bundles have an engine-signing subtlety the PFX path handles
+      # with insignia, and SignPath is expected to handle Burn bundles.
+      - name: Upload unsigned bundle for SignPath
+        id: upload_unsigned_bundle
+        if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unsigned-bundle-${{ matrix.target }}
+          path: ${{ env.BUNDLE_PATH }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Sign bundle via SignPath
+        if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ secrets.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ secrets.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: bundle
+          github-artifact-id: ${{ steps.upload_unsigned_bundle.outputs.artifact-id }}
+          github-token: ${{ github.token }}
+          wait-for-completion: true
+          output-artifact-directory: ${{ runner.temp }}/signed-bundle
+
+      - name: Swap in the SignPath-signed bundle
+        if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
+        shell: pwsh
+        run: |
+          $dir = "$env:RUNNER_TEMP\signed-bundle"
+          $zip = Get-ChildItem -Path $dir -Recurse -Filter *.zip -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($zip) { Expand-Archive -Path $zip.FullName -DestinationPath $dir -Force }
+          $signed = Get-ChildItem -Path $dir -Recurse -Filter *.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $signed) { throw "no signed .exe found under $dir" }
+          Move-Item -Force $signed.FullName "$env:BUNDLE_PATH"
+          Write-Host "==> replaced $env:BUNDLE_PATH with the SignPath-signed bundle"
+
+      - name: Delete intermediate unsigned SignPath artifacts
+        # These were uploaded only so the SignPath action had an id to
+        # sign. They are unsigned and must not reach the release job's
+        # download-artifact (merge-multiple), or they would be published
+        # and could collide with the signed files. Delete them here, in
+        # the build job, before the release job runs. `if: always()` so
+        # cleanup still happens if a signing step above failed. Needs
+        # `actions: write` (declared at the top of the file).
+        if: always() && runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ids = @(
+            "${{ steps.upload_unsigned_msi.outputs.artifact-id }}",
+            "${{ steps.upload_unsigned_bundle.outputs.artifact-id }}"
+          )
+          foreach ($id in $ids) {
+            if ($id) {
+              Write-Host "==> deleting intermediate artifact $id"
+              gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" 2>&1 | Out-Host
+            }
+          }
 
       - name: Upload Windows MSI
         if: runner.os == 'Windows'

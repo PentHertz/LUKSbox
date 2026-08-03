@@ -22,10 +22,61 @@ If you only want to **run** a prebuilt binary, jump to
 - A C toolchain (`cc` / `clang` / MSVC), required by `bindgen` for the
   libfido2 FFI bindings and by some sys crates.
 
-The CLI's default feature set is `["hardware"]`, which links against
-**libfido2** (Yubico's reference C library). If you don't need YubiKey
-support, build with `--no-default-features` and skip every libfido2
-dependency in this guide.
+The CLI's default feature set is `["fido2-hardware", "fuse",
+"winfsp"]`. `fido2-hardware` links against **libfido2** (Yubico's
+reference C library) on Linux and macOS and uses `webauthn.dll` on
+Windows. If you don't need YubiKey support, build with
+`--no-default-features` and skip every libfido2 dependency in this
+guide.
+
+TPM 2.0 keyslots are opt-in on every platform:
+
+- `--features hardware` (FIDO2 + TPM + SEP) links the SYSTEM
+  tpm2-tss and needs tpm2-tss >= 4.1.3 installed (Debian 13+,
+  Ubuntu 24.10+, Fedora 40+, Arch).
+- `--features bundled-tpm` compiles a vendored tpm2-tss 4.1.3
+  during `cargo build` instead. Use it on LTS distros whose system
+  tpm2-tss is older (Ubuntu 22.04 ships 3.2, 24.04 ships 4.0.1) and
+  on Windows, which has no system tpm2-tss at all. On Linux it
+  needs the autotools stack on top of the base dependencies:
+
+  ```bash
+  sudo apt install -y autoconf automake libtool libltdl-dev \
+      autoconf-archive libjson-c-dev uuid-dev
+  ```
+
+  (`libltdl-dev` matters: tpm2-tss's `configure.ac` uses the
+  `LT_LIB_DLLOAD` macro, which Debian and Ubuntu ship in
+  `libltdl-dev`'s `ltdl.m4`, not in the base `libtool` package.
+  Without it, `bootstrap` fails with "possibly undefined macro:
+  LT_LIB_DLLOAD". `uuid-dev` is a plain configure-time requirement
+  of tpm2-tss.)
+
+  The vendored libraries are built static-only, so the resulting
+  binary embeds the tss2 core at 4.1.3 and has no `libtss2-*.so`
+  runtime dependency; at runtime only the small TCTI module (for
+  example `libtss2-tcti-device.so.0` on Linux, from the distro's
+  tpm2-tss packages) is loaded when a TPM slot is actually used.
+  The repo's `.cargo/config.toml` sets `TSS2_*_STATIC=1` so the
+  probe emits the complete, correctly ordered static link closure
+  (including `-lcrypto`); build from the workspace root so that
+  config applies, or export those variables yourself.
+  The jammy and noble release lanes and the Windows release
+  binaries are built this way (see
+  `.github/workflows/release.yml`); the Windows specifics are in
+  the Windows section below.
+
+  Portability note: the embedded tpm2-tss calls OpenSSL through
+  the build host's `libcrypto`, so it inherits that build's
+  feature set. Ubuntu and Debian compile OpenSSL with SM4;
+  Fedora and RHEL do not, so a `bundled-tpm` binary built on
+  Ubuntu references `EVP_sm4_cfb128` and aborts with a symbol
+  lookup error the moment it starts on Fedora. If the binary
+  must run on Fedora/RHEL (the release lanes do this for the
+  .rpm artifacts), export `CFLAGS=-DOPENSSL_NO_SM4` before
+  building: tpm2-tss guards all SM4 code behind that macro and
+  falls back to "SM4 not implemented" at runtime. LUKSbox only
+  negotiates AES-CFB TPM sessions, so the feature loss is nil.
 
 ### Optional, app icons
 
@@ -269,7 +320,56 @@ Linux).
      for the gotchas the WinFsp adapter has hit on Win11 / WinFsp 2.x
      (the file's top-level docstring catalogues them).
 
-6. **Build**:
+6. **TPM 2.0 keyslots (optional, `--features bundled-tpm`)**:
+   the default build ships without the TPM backend; the
+   `bundled-tpm` feature compiles tpm2-tss from source with MSBuild
+   during `cargo build` (Windows has no system tpm2-tss) and talks
+   to the chip through the in-box TBS broker at runtime - no
+   driver, no admin rights. Three things to stage first:
+
+   ```powershell
+   # a. tpm2-tss 4.1.3 source at a SHORT path (deep paths trip
+   #    MSBuild's file tracker with an inscrutable MSB6003; the
+   #    repo snapshot is required - the autotools dist tarball
+   #    omits the VS solution).
+   Invoke-WebRequest -Uri "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/4.1.3.zip" -OutFile "$env:TEMP\t2t.zip"
+   Expand-Archive "$env:TEMP\t2t.zip" -DestinationPath "$env:TEMP\t2t"
+   $env:TPM2_TSS_SOURCE_PATH = "$env:TEMP\t2t\tpm2-tss-4.1.3"
+
+   # b. OpenSSL 3 with an x64 import lib (tss2-esys links
+   #    libcrypto). Any install layout with lib\libcrypto.lib +
+   #    include\openssl works; the portable FireDaemon zip is the
+   #    easiest (https://kb.firedaemon.com/support/solutions/articles/4000121705).
+   #    tpm2-tss's VS solution hardcodes the OpenSSL location, so
+   #    patch it:
+   $props = "$env:TPM2_TSS_SOURCE_PATH\src\tss2-esys\openssl.props"
+   (Get-Content $props -Raw).Replace('C:\OpenSSL-v11-Win64', '<your-openssl-x64-dir>') | Set-Content $props -NoNewline
+
+   # c. libclang for bindgen. LLVM's install works (step 4 above);
+   #    so does the copy inside VS 2022:
+   $env:LIBCLANG_PATH = "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\Llvm\x64\bin"
+   ```
+
+   Then build with the feature and, before RUNNING the binaries,
+   put the produced DLLs on PATH (the release artifacts bundle
+   them; a local build reads them from the tpm2-tss build output):
+
+   ```powershell
+   cargo build --release -p luksbox-cli --features bundled-tpm
+   $env:PATH = "$env:TPM2_TSS_SOURCE_PATH\x64\Release;<your-openssl-x64-dir>\bin;$env:PATH"
+
+   # Live seal/unseal smoke against the machine's real TPM
+   # (transient objects only - nothing persisted, no lockout risk):
+   cargo run --release -p luksbox-tpm --features bundled-tpm --example tpm_smoke
+   ```
+
+   DLL closure to keep next to the .exe when distributing:
+   `tss2-esys.dll`, `tss2-sys.dll`, `tss2-mu.dll`,
+   `tss2-tctildr.dll`, `tss2-tcti-tbs.dll` (dlopen()ed at runtime,
+   never in an import table, still required), and
+   `libcrypto-3-x64.dll`.
+
+7. **Build**:
    ```powershell
    git clone <repo-url> luksbox
    cd luksbox
@@ -293,8 +393,11 @@ Linux).
    git clone <repo-url> luksbox && cd luksbox
    cargo build --release -p luksbox-cli
    ```
-   The `--features hardware` build works because mingw-w64 has its own
-   libfido2 package. WinFsp is still required separately for `mount`.
+   The `--features fido2-hardware` build works because mingw-w64 has
+   its own libfido2 package. WinFsp is still required separately for
+   `mount`. TPM keyslots (`hardware` / `bundled-tpm`) are NOT
+   available on MinGW: tss-esapi-sys supports only the MSVC targets
+   on Windows - use the MSVC build above for TPM support.
 
 ---
 
@@ -619,6 +722,12 @@ above for the Cargo feature matrix.
   required for the `mount` subcommand. Without it, `mount` returns a
   clear "WinFsp driver not present" error and every other subcommand
   works.
+- **TPM 2.0**: nothing to install. The release artifacts bundle the
+  tpm2-tss DLLs (`tss2-*.dll` + `libcrypto-3-x64.dll`) next to the
+  .exe, and chip access goes through TPM Base Services, the broker
+  built into every supported Windows - no driver, no admin rights.
+  The chip itself is guaranteed on Windows 11 hardware (it's part of
+  the launch floor); on older machines check `Get-Tpm` / `tpm.msc`.
 
 ### Hardware (optional but recommended)
 

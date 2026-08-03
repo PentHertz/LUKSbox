@@ -14,6 +14,376 @@ canonical record.
 
 ---
 
+## [v0.5.0-rc.3] - 2026-08-02
+
+### Security: two hardening fixes from the v0.5.0-rc.3 ground-truth audit
+
+A full adversarial re-audit of the codebase (crypto core, on-disk and
+VFS integrity, the FUSE / FUSE-T / WinFsp mount backends, TPM / FIDO2 /
+SEP auth, the container and privileged host-interaction surface, and
+the dependency tree) found no critical or high-severity issue: no
+plaintext-recovery, forgery, memory-safety, or authentication-bypass
+path, and the recent Windows rename/delete (#29) and multi-FIDO2 (#28)
+changes held up. Two low-severity hardening gaps were closed:
+
+- The detached-header recovery reader (`<vault>.lbx.header-bak`) now
+  opens the sidecar with `O_NOFOLLOW` (Unix) or reparse-point refusal
+  (Windows), plus a regular-file and exact-length check, the same
+  discipline the metadata mirror already applied. This closes a
+  symlink-follow and a stat-then-open race on the recovery path, where
+  a local attacker with write access to the vault directory could
+  point the sidecar at another same-length file or swap in a FIFO to
+  stall an already-degraded recovery. The recovered bytes were, and
+  still are, AEAD-verified under the vault key, so this is
+  defense-in-depth on top of that authentication.
+
+- On the Windows multi-FIDO2 unlock path (new in this release), the
+  32-byte hmac-secret is now wrapped in its zeroize-on-drop type at the
+  moment it is copied out of the WebAuthn assertion, before the
+  fallible credential-to-keyslot mapping runs. Previously a rare error
+  branch (an asserted credential matching none of the enrolled
+  keyslots) could drop the raw value without wiping it. This is not a
+  disclosure primitive, but it restores the project's zeroization
+  discipline on that path.
+
+A known design tradeoff surfaced by the audit is documented separately
+in `docs/ROLLBACK_PROTECTION.md`: whole-vault rollback is only detected
+when the optional anchor sidecar is kept on separate trusted storage,
+because the encrypted metadata region binds no monotonic generation
+counter into its AEAD associated data. No code change ships for it in
+rc.3; the note records the current guarantee and the candidate
+mitigation.
+
+### Fixed: unlock works with ANY enrolled FIDO2 key, not just slot 0's (#28)
+
+A vault with two FIDO2 keyslots (a primary and a backup security key)
+could only ever be unlocked with the key enrolled first: on Windows,
+presenting the backup key got "This security key doesn't look
+familiar", and the backup slot only became usable after revoking the
+primary. Root cause: the unlock flow asserted the keyslots one at a
+time, so each WebAuthn prompt carried an allow-list with a SINGLE
+credential - the slot currently being tried - and Windows rightly
+rejected any other key against it.
+
+`Fido2Authenticator` grew a batched `hmac_secret_multi` that asserts
+against every candidate keyslot at once and reports which credential
+matched. The Windows webauthn.dll backend implements it natively: one
+prompt whose allow-list holds every enrolled credential, each bound to
+its own hmac-secret salt via the API's per-credential salt list, so
+whichever enrolled key the user presents unlocks its keyslot (with a
+graceful per-slot fallback if a webauthn.dll build ever returns no
+hmac output for the batched form). On Linux/macOS the libfido2 path
+keeps sequential per-credential asserts, which were already correct
+there - a CTAP2 device refuses absent credentials without a touch -
+and still cost a single touch. The pure-FIDO2 unlock paths in both
+the GUI and the CLI now batch all their candidate slots this way.
+
+Also gone on Windows: the vestigial "retry with the opposite salt
+convention" second prompt after a failed FIDO2 keyslot unlock
+attempt (all keyslot unlock paths, including the TPM2/SEP/hybrid-PQ
+combos). webauthn.dll applies its salt transform unconditionally, so
+the retry was a byte-identical call that could never succeed where
+the first attempt failed - it only cost the user an extra dialog.
+
+### Fixed: non-ASCII text no longer renders as empty boxes in the GUI (#28)
+
+egui's bundled fonts have no CJK coverage, so Chinese / Japanese /
+Korean vault names, file names, and labels rendered as boxes. The GUI
+now appends system fonts as glyph fallbacks at startup (Microsoft
+YaHei + Malgun Gothic on Windows, PingFang / Hiragino / Apple SD
+Gothic Neo on macOS, Noto Sans CJK or WenQuanYi on Linux). Latin
+rendering is unchanged; loading is best-effort and a missing or
+unreadable system font never blocks startup.
+
+### Fixed: files on a Windows (WinFsp) mount can be renamed and deleted (#29)
+
+On a mounted vault, deleting a file from Explorer appeared to succeed
+but the file came back on the next directory refresh, and renames
+failed outright. Root cause: the volume (correctly) declares NTFS
+semantics - case-insensitive, case-preserving - and for such volumes
+the WinFsp kernel driver hands the file system the UPPERCASED
+canonical name in the delete-on-close `Cleanup` and in the `Rename`
+source (a file created as `report.txt` comes back as `\REPORT.TXT`).
+The adapter resolved those names with the VFS's exact-match lookup,
+so the in-vault unlink/rename failed with NotFound - silently, in
+delete's case, because `Cleanup` is a void callback whose errors
+Windows never sees.
+
+The VFS now offers case-insensitive, case-preserving lookups
+(`lookup_ci` / `lookup_path_ci`, exact match first, then a
+deterministic case-folded scan that keeps expanding folds distinct
+the way NTFS's simple `$UpCase` does), and the WinFsp adapter uses
+them for every name Windows hands it, operating on the stored name
+it resolves. This also makes open/read honor the case-insensitivity
+the volume advertises (opening `README.TXT` finds `readme.txt`),
+guards `create` against planting case-colliding siblings, and
+handles the rename corner cases: case-only renames (`foo.txt` ->
+`FOO.TXT`), rename-over-target with different casing (replaces the
+target instead of leaving two case-variant entries, then applies
+the requested casing), and the Win32 no-replace contract checked
+case-insensitively. Deleting a non-empty directory is now refused
+up front with the proper "directory is not empty" error instead of
+ghost-succeeding in Explorer the same way. The Linux/macOS FUSE
+backends are untouched and stay fully case-sensitive.
+
+New regression coverage: `winfsp_mount.rs::delete_and_rename_via_win32`
+exercises delete, rmdir, same-dir rename, cross-dir move,
+rename-over-target, and different-casing open/delete against a real
+kernel mount, verifying both the live view and the persisted state
+after unmount + reopen. The `LUKSBOX_WINFSP_DEBUG=1` trace now also
+covers `cleanup`, `can_delete`, and `rename`.
+
+### Fixed: file timestamps are preserved instead of showing the Unix epoch (#26)
+
+Every file on a mounted vault reported a modification time of
+1970-01-01 (shown as "December 31, 1969" in some locales), because the
+inode's `mtime_ns` was stored in the on-disk format but never
+populated, and every backend's `setattr` ignored the incoming mtime.
+This broke incremental `rsync -a`: with all destination timestamps at
+the epoch, rsync's quick-check saw a mismatch on every file and
+re-transferred the whole tree instead of just the changed files.
+
+The VFS now stamps a real mtime on create / mkdir / symlink and bumps
+it on every write / truncate (standard POSIX behavior), and a new
+`Vfs::set_mtime` honors an explicit `utimensat(2)` so `rsync -a`,
+`cp -p`, and `touch -d` round-trip and survive a flush plus reopen.
+No on-disk format change was needed: `mtime_ns` predates the LBM4
+mode/link_count fields, so this works on both v3 and v4 vaults, and
+the metadata region is AEAD-encrypted, so stored timestamps leak
+nothing to an offline attacker. Wired through the Linux (FUSE) and
+Windows (WinFsp) mount backends, and through macFUSE on macOS.
+atime/ctime are reported as mtime (not stored separately).
+
+Known follow-up: the macOS FUSE-T backend (the kext-free default on
+macOS) gives newly created and written files a real mtime, but does
+not yet honor an explicit `utimensat` because that needs a new FFI
+trampoline; until then `rsync -a` on a FUSE-T mount does not preserve
+the source mtime (tracked internally). macFUSE on macOS is unaffected.
+
+### Dependencies
+
+- Bumped `cmov` 0.5.3 -> 0.5.4 (transitive, via the ML-KEM chain
+  `ml-kem` -> `hybrid-array` -> `ctutils` -> `cmov`). 0.5.4 fixes
+  GHSA-3rjw-m598-pq24, where `Cmov` / `CmovEq` could produce wrong
+  results on aarch64 when the high bits of a register are set. This is
+  on the constant-time path the post-quantum keyslots depend on and
+  aarch64 is a shipped target, so the fix is worth taking.
+
+---
+
+## [v0.5.0-rc.2] - 2026-07-06
+
+Supersedes rc.1 with two fixes from a full-application security review.
+No functional or on-disk-format changes otherwise: everything in the
+rc.1 entry below still applies, and vaults, sidecars, and headers open
+without migration.
+
+### Security: GIO unmount fallback resolves its helper by absolute path
+
+The busy-mount GIO fallback added in rc.1 spawned the helper as a bare
+`gio`, which resolves through `$PATH`. That reopened the PATH-hijack
+class (CVE-2024-54187) that the rest of the codebase deliberately
+closes: the direct unmount helper (`resolved_unmount_program`) and the
+file-manager opener (`resolved_default_app_opener`) both resolve only
+hard-coded absolute paths and refuse a `$PATH` lookup. Because the
+fallback runs routinely (the busy-mount case) and is retried every
+couple of seconds by the quit loop inside the process holding the
+unlocked vault key, a writable directory earlier on `$PATH` could have
+run an attacker's `gio` as the user. The fallback now resolves `gio` to
+a vetted absolute path (`/usr/bin/gio`, `/bin/gio`,
+`/usr/local/bin/gio`) and refuses the `$PATH` fallback, and it
+canonicalizes the mountpoint before passing it so a target beginning
+with `-` can never land in a flag position.
+
+### Security: TPM 2.0 sessions are salted against the SRK
+
+The TPM 2.0 HMAC session (Linux and the new Windows TBS path) was
+started unsalted and unbound, so its parameter encryption gave no real
+confidentiality: for an unsalted session the AES-CFB key derives from
+the two session nonces alone, both of which cross the TPM bus in
+cleartext, letting a passive LPC/SPI bus interposer on a discrete TPM
+recompute it and read the 32-byte wrap key as it transits in
+`Esys_Create` (seal) and `Esys_Unseal`. The session is now salted
+against the SRK's public area (the same protection systemd-cryptenroll
+uses), which ties the session key to the SRK private key that never
+leaves the chip. Firmware TPMs (Intel PTT, AMD fTPM) were never exposed
+to this because they have no external bus; the fix closes the gap for
+discrete-TPM users.
+
+### Security: `rotate-mvk` now honors `--anchor` (rollback detection)
+
+`rotate-mvk` previously ignored `--anchor` with a warning. It now
+threads the rollback-detection anchor through the rotation: before any
+chunk is re-encrypted, the anchor is verified against the vault and a
+vault that has been rolled back past the anchor is refused (rotating a
+stale vault and then advancing the anchor onto it would launder the
+rollback, so it fails closed). After the new MVK is installed, the
+rotation rewrites the anchor under that new MVK at the current
+generation, so the sidecar stays valid for the next open. Both the
+standard and deniable rotation paths, and the interactive wizard's
+rotate option, are covered.
+
+### Security: hardening follow-ups from the audit
+
+- `LUKSBOX_NO_LOCK` (which disables the advisory lock that guards
+  against concurrent writers, for filesystems where `flock` does not
+  work) now prints a loud once-per-process warning when it is active,
+  so an accidentally-inherited value cannot silently drop the
+  protection.
+- The metadata mirror sidecar (`<vault>.meta-bak`), consulted only when
+  the live metadata fails to verify, is now opened with `O_NOFOLLOW`
+  (and the Windows reparse-point equivalent), a regular-file check, and
+  an exact-size bound, matching the discipline the primary vault and
+  hybrid-sidecar reads already use. The content was already
+  AEAD-verified under the vault key; this refuses a symlink or device
+  swapped in at the mirror path before the read, closing a TOCTOU gap.
+- `cargo audit`: the `paste` unmaintained advisory (RUSTSEC-2024-0436,
+  a compile-time proc-macro pulled in by the alpha `tss-esapi` TPM
+  chain, no code shipped) is now documented and accepted alongside the
+  existing `registry` advisory in `audit.toml`, `scripts/audit.sh`, and
+  SECURITY.md.
+
+---
+
+## [v0.5.0-rc.1] - 2026-07-06
+
+First release candidate for the v0.5.0 line. The headline is Windows
+TPM 2.0 support through TBS, which brings the full TPM keyslot matrix
+to all three desktop platforms; the rest of the entry is the build
+and CI work needed to ship a vendored tpm2-tss reliably across
+distros. On-disk formats are unchanged from the v0.4 line: existing
+vaults, sidecars, and headers open without migration, and a vault
+sealed by the Linux build unseals through the same chip on Windows.
+
+### Added: Windows TPM 2.0 keyslots (full parity with Linux)
+
+Every TPM keyslot kind now works on Windows, reaching the chip
+through TBS (TPM Base Services), the broker built into every
+supported Windows - no driver, no admin rights, no code signing.
+The chip itself is guaranteed on Windows 11 hardware (part of the
+launch floor). Slot bytes are TCG-standard `TPM2B_*` structures,
+byte-identical to the Linux build's: the same physical chip unseals
+a vault regardless of which OS sealed it.
+
+- **Full keyslot matrix on Windows**, in the CLI, the interactive
+  wizard, and the GUI: `tpm2`, `tpm2-pin` (chip-enforced
+  dictionary-attack lockout), fused `tpm2-fido2` (TPM AND
+  authenticator - Windows Hello or a physical key via
+  webauthn.dll), `hybrid-pq-tpm2` / `hybrid-pq-tpm21024`
+  (TPM + ML-KEM seed file), and the 3-factor
+  `hybrid-pq-tpm2-fido2` / `hybrid-pq-tpm2-fido21024`. The wizard's
+  create / unlock / add-keyslot menus and the GUI's create factor,
+  unlock methods, and seven "Add keyslot" TPM buttons all appear on
+  Windows exactly as on Linux, deniable-mode variants included.
+- **Backend**: `tss-esapi` bumped 7.5 -> 8.0.0-alpha.2 (the first
+  line with the Windows TBS TCTI), with `tss-esapi-sys` deliberately
+  pinned to `=0.6.0-alpha.2` - a later stable 0.6.0 satisfies
+  tss-esapi's semver range while lacking Windows support entirely
+  (see `docs/TPM_FUTURE_IMPROVEMENTS.md` section 1 for the full
+  design record). Bonus from 8.x: buffer types (`Auth`, `Private`,
+  `SensitiveData`) now store `Zeroizing<Vec<u8>>`, so Rust-side
+  PIN/secret copies are wiped on drop.
+- **Cargo feature reorg** (build-facing, run `cargo build` as
+  before): the DEFAULT build now enables `fido2-hardware` (FIDO2
+  only - no tpm2-tss version floor, so plain builds keep working on
+  Debian 12 / Ubuntu LTS / RHEL 9 and plain Windows).
+  `--features hardware` keeps meaning FIDO2 + TPM + SEP exactly as
+  before (Linux system link now needs tpm2-tss >= 4.1.3). New
+  `--features bundled-tpm` = `hardware` with a vendored tpm2-tss
+  compiled at build time (autotools on Linux, MSBuild on Windows) -
+  what the Windows release binaries and the jammy/noble Linux
+  release lanes ship with.
+- **Windows packaging**: the portable .zip and the MSI bundle the
+  TPM DLL closure (`tss2-esys`, `tss2-sys`, `tss2-mu`,
+  `tss2-tctildr`, `tss2-tcti-tbs`, `libcrypto-3-x64`) next to the
+  .exe, plus the tpm2-tss (BSD-2-Clause) and OpenSSL (Apache-2.0)
+  license texts.
+- **Platform-aware diagnostics**: TPM-unreachable and
+  operation-failure hints now speak Windows on Windows (`Get-Tpm`,
+  `tpm.msc`, vTPM setup for Hyper-V/VMware/VirtualBox, lockout
+  reset via "Reset TPM lockout" - and an explicit warning that
+  Clear-Tpm would destroy the vault's TPM slots) and keep the
+  existing `/dev/tpmrm0` / `tss`-group guidance on Linux.
+- **CI**: new `windows-tpm` job (real TBS backend build + mock/wire
+  tests on `windows-latest`); the 22.04 hardware lanes moved to
+  `bundled-tpm` (their system tpm2-tss is below the 8.x floor) while
+  the 26.04 lane keeps exercising the system link.
+- **New diagnostic**: `cargo run -p luksbox-tpm --features
+  bundled-tpm --example tpm_smoke` - live seal/unseal round-trip
+  against the local chip (transient objects only; verified on real
+  Windows 11 hardware through TBS as part of this change).
+
+### Fixed: bundled-tpm binaries link and run on every target distro
+
+Two portability defects in the vendored tpm2-tss build surfaced on
+the release lanes and are fixed in this candidate; both were
+container-validated end to end (Ubuntu 22.04 build, GNU ld and
+rust-lld link, Fedora runtime).
+
+- **Static link closure**: the tss-esapi-sys pkg-config probes of
+  the vendored (static-only) tpm2-tss now run in static mode
+  (`TSS2_SYS/ESYS/MU/TCTILDR_STATIC=1`, set in `.cargo/config.toml`
+  and mirrored in the CI and release workflow env). The dynamic-mode
+  probe never read `Libs.private`, so `-lcrypto` went missing (the
+  test binaries died with "undefined symbol: EVP_MD_fetch"), and it
+  emitted each `-ltss2-*` alone in an order GNU ld cannot resolve
+  ("undefined reference to `Tss2_Sys_*`" on every aarch64 Linux
+  lane; x86_64 only passed because rust-lld resolves archives in
+  any order). Static mode expands each probe's full
+  `Requires`/`Libs.private` chain in topological order. System-link
+  (`hardware`) builds are unaffected: no distro ships `libtss2-*.a`,
+  so those probes keep falling back to dynamic linking.
+- **Fedora/RHEL runtime**: the vendored tpm2-tss is compiled with
+  `-DOPENSSL_NO_SM4`. Ubuntu's OpenSSL ships SM4 and Fedora's does
+  not, so the jammy-built .rpm binary aborted at startup on Fedora
+  with "undefined symbol: EVP_sm4_cfb128". tpm2-tss NULLs its SM4
+  session callbacks under that macro and LUKSbox only negotiates
+  AES-CFB TPM sessions, so the feature loss is nil; every remaining
+  OpenSSL import of the jammy build was cross-checked against
+  Fedora's libcrypto exports to rule out a second gap.
+- **Release lanes wired per distro**: jammy and noble build
+  `bundled-tpm` (their system tpm2-tss is below the 4.1.3 build
+  floor of tss-esapi 8.x), trixie and resolute keep the system link,
+  and Windows builds `bundled-tpm` with a shared composite action
+  that stages the tpm2-tss source, OpenSSL, and libclang for both CI
+  and release. BUILDING.md documents the added Linux build
+  dependencies (autoconf, automake, libtool, libltdl-dev,
+  autoconf-archive, libjson-c-dev, uuid-dev) and the cross-distro
+  portability note.
+
+### Fixed: closing the GUI window no longer strands a live mount (#25)
+
+Closing the GUI window while a vault was mounted simply exited: the
+in-process mount thread died with the process, programs browsing the
+mount saw I/O errors, and the mountpoint was left behind in a
+"Transport endpoint is not connected" state until a manual
+`fusermount3 -u` (reported on Debian in issue #25). The window close
+is now intercepted while a mount session is live and a confirmation
+dialog offers "Unmount and quit" (the app closes as soon as the same
+clean teardown the Unmount button uses has finished), "Quit without
+unmounting" (the old behavior, now an explicit choice), and
+"Cancel". Vault integrity was never at risk on default-format vaults
+(the v0.2.1 crash-safety mirrors cover the force-quit-mid-write
+class); the fix removes the data-in-flight loss window and the
+stranded mountpoint. The intercept covers the window close button
+and Ctrl+Q on all three platforms (FUSE, FUSE-T, WinFsp).
+
+Busy mountpoints are handled too. On GNOME desktops (Ubuntu's
+default) the file-manager window browsing the mount holds it open,
+so the direct `fusermount3 -u` is refused with "Device or resource
+busy"; the GUI used to discard that refusal and sit on
+"Unmounting..." forever. A refused attempt is now reported in the
+mounted panel and in the quit dialog with what to do about it, it
+re-enables the Unmount button, and the quit path retries
+automatically every couple of seconds, so closing the file-manager
+window is enough for the app to finish unmounting and leave on its
+own. When the direct unmounter is refused, LUKSbox also retries
+through GIO (`gio mount -u`, the same path as the file manager's
+Eject button, which asks applications to release the mount before
+unmounting).
+
+---
+
 ## [v0.4.0] - 2026-07-04
 
 First stable release of the v0.4.0 line. It promotes `v0.4.0-rc.3` to

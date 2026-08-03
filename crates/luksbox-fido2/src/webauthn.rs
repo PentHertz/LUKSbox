@@ -56,7 +56,9 @@ use windows::Win32::Networking::WindowsWebServices::*;
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 use windows_core::{HSTRING, PCWSTR};
 
-use crate::authenticator::{Credential, EnrollResult, Fido2Authenticator, HmacSecret};
+use crate::authenticator::{
+    Credential, EnrollResult, Fido2Authenticator, HmacSecret, HmacSecretRequest,
+};
 use crate::error::Error;
 use crate::webauthn_paths::{
     AttachmentHint, PATH_ANY, PATH_CROSS_PLATFORM, PATH_PLATFORM, classify_device_path,
@@ -382,8 +384,37 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
         cred_id: &[u8],
         salt: &[u8; 32],
         prehash_salt: bool,
-        _pin: Option<&str>,
+        pin: Option<&str>,
     ) -> Result<HmacSecret, Error> {
+        // Single-credential assert is just the batched path with a
+        // one-entry candidate list; see `hmac_secret_multi` below for
+        // the salt-convention rationale and the FFI details.
+        let req = HmacSecretRequest {
+            cred_id,
+            salt,
+            prehash_salt,
+        };
+        self.hmac_secret_multi(rp_id, &[req], pin)
+            .map(|(_, secret)| secret)
+    }
+
+    fn hmac_secret_multi(
+        &mut self,
+        rp_id: &str,
+        requests: &[HmacSecretRequest<'_>],
+        pin: Option<&str>,
+    ) -> Result<(usize, HmacSecret), Error> {
+        // Multi-credential assert (issue #28): the allow-list carries
+        // EVERY candidate keyslot's credential, each bound to its own
+        // hmac-secret salt via `pCredWithHmacSecretSaltList`. Windows
+        // shows ONE prompt and accepts whichever enrolled authenticator
+        // the user presents; the assertion tells us which credential
+        // matched so the caller can open the corresponding keyslot.
+        // Sequential single-credential calls would instead show a modal
+        // "this security key doesn't look familiar" dialog for every
+        // slot the presented key is NOT enrolled in, which is what made
+        // backup-key unlock effectively impossible.
+        //
         // Salt convention -- the crux of cross-platform FIDO2.
         //
         // EMPIRICAL FACT (confirmed via the xplatform_hmac_probe
@@ -411,10 +442,13 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
         // remain libfido2-only. We always forward the raw salt; for a V4
         // slot that is exactly right, for a legacy slot it will
         // (correctly) fail to match.
-        let _ = prehash_salt;
-
-        // Defence-in-depth on caller-supplied bytes. cred_id comes
-        // from the .lbx vault keyslot; a corrupted or tampered keyslot
+        if requests.is_empty() {
+            return Err(Error::Other(
+                "hmac_secret_multi called with an empty request list".into(),
+            ));
+        }
+        // Defence-in-depth on caller-supplied bytes. cred_ids come
+        // from the .lbx vault keyslots; a corrupted or tampered keyslot
         // could in principle produce a multi-MB cred_id that we'd
         // memcpy then hand to webauthn.dll's u32 length-cast field. Cap
         // before any allocation. Same numbers as the `enroll` path so
@@ -425,40 +459,73 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
                 rp_id.len()
             )));
         }
-        if cred_id.is_empty() {
-            return Err(Error::Other(
-                "cred_id is empty; cannot assert against an unspecified credential".into(),
-            ));
-        }
-        if cred_id.len() > MAX_CRED_ID_INPUT_LEN {
-            return Err(Error::Other(format!(
-                "cred_id is {} B; refusing - CTAP2 caps cred IDs at 1023 B \
-                 and we accept up to {} B for vendor-extension headroom",
-                cred_id.len(),
-                MAX_CRED_ID_INPUT_LEN
-            )));
+        for (idx, req) in requests.iter().enumerate() {
+            if req.cred_id.is_empty() {
+                return Err(Error::Other(format!(
+                    "cred_id for candidate {idx} is empty; cannot assert against an \
+                     unspecified credential"
+                )));
+            }
+            if req.cred_id.len() > MAX_CRED_ID_INPUT_LEN {
+                return Err(Error::Other(format!(
+                    "cred_id for candidate {idx} is {} B; refusing - CTAP2 caps cred IDs \
+                     at 1023 B and we accept up to {} B for vendor-extension headroom",
+                    req.cred_id.len(),
+                    MAX_CRED_ID_INPUT_LEN
+                )));
+            }
         }
 
         let rp_id_w = HSTRING::from(rp_id);
+        let n = requests.len();
 
-        // Allow-list with the single credential we want to assert.
-        let mut cred_id_buf = cred_id.to_vec();
-        let mut credential_ex = WEBAUTHN_CREDENTIAL_EX {
-            dwVersion: WEBAUTHN_CREDENTIAL_EX_CURRENT_VERSION,
-            cbId: cred_id_buf.len() as u32,
-            pbId: cred_id_buf.as_mut_ptr(),
-            pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
-            // Allow every transport - Windows picks the right one
-            // based on attachment hint and what's plugged in.
-            dwTransports: WEBAUTHN_CTAP_TRANSPORT_USB
-                | WEBAUTHN_CTAP_TRANSPORT_NFC
-                | WEBAUTHN_CTAP_TRANSPORT_BLE
-                | WEBAUTHN_CTAP_TRANSPORT_INTERNAL,
-        };
-        let mut credential_ex_ptr: *mut WEBAUTHN_CREDENTIAL_EX = &mut credential_ex;
+        // Owned, stable backing storage for every pointer handed to
+        // webauthn.dll. Each Vec below is fully built before any pointer
+        // into it is taken, so no later push() can reallocate a buffer
+        // out from under an already-taken pointer, and everything stays
+        // alive on this frame until after the FFI call returns.
+        let mut cred_bufs: Vec<Vec<u8>> = requests.iter().map(|r| r.cred_id.to_vec()).collect();
+        let mut salt_bufs: Vec<[u8; 32]> = requests.iter().map(|r| *r.salt).collect();
+
+        let mut salts: Vec<WEBAUTHN_HMAC_SECRET_SALT> = salt_bufs
+            .iter_mut()
+            .map(|s| WEBAUTHN_HMAC_SECRET_SALT {
+                cbFirst: s.len() as u32,
+                pbFirst: s.as_mut_ptr(),
+                cbSecond: 0,
+                pbSecond: ptr::null_mut(),
+            })
+            .collect();
+
+        // Allow-list entries and per-credential salt bindings reference
+        // the same cred-id buffer; take that pointer once per credential.
+        let mut creds_ex: Vec<WEBAUTHN_CREDENTIAL_EX> = Vec::with_capacity(n);
+        let mut cred_salts: Vec<WEBAUTHN_CRED_WITH_HMAC_SECRET_SALT> = Vec::with_capacity(n);
+        for (buf, salt_entry) in cred_bufs.iter_mut().zip(salts.iter_mut()) {
+            let id_ptr = buf.as_mut_ptr();
+            creds_ex.push(WEBAUTHN_CREDENTIAL_EX {
+                dwVersion: WEBAUTHN_CREDENTIAL_EX_CURRENT_VERSION,
+                cbId: buf.len() as u32,
+                pbId: id_ptr,
+                pwszCredentialType: WEBAUTHN_CREDENTIAL_TYPE_PUBLIC_KEY,
+                // Allow every transport - Windows picks the right one
+                // based on attachment hint and what's plugged in.
+                dwTransports: WEBAUTHN_CTAP_TRANSPORT_USB
+                    | WEBAUTHN_CTAP_TRANSPORT_NFC
+                    | WEBAUTHN_CTAP_TRANSPORT_BLE
+                    | WEBAUTHN_CTAP_TRANSPORT_INTERNAL,
+            });
+            cred_salts.push(WEBAUTHN_CRED_WITH_HMAC_SECRET_SALT {
+                cbCredID: buf.len() as u32,
+                pbCredID: id_ptr,
+                pHmacSecretSalt: salt_entry as *mut _,
+            });
+        }
+        let mut cred_ptrs: Vec<*mut WEBAUTHN_CREDENTIAL_EX> =
+            creds_ex.iter_mut().map(|c| c as *mut _).collect();
         let allow_list = WEBAUTHN_CREDENTIAL_LIST {
-            cCredentials: 1,
-            ppCredentials: &mut credential_ex_ptr,
+            cCredentials: n as u32,
+            ppCredentials: cred_ptrs.as_mut_ptr(),
         };
 
         let mut clientdata_buf = ZERO_CLIENTDATA_HASH;
@@ -469,26 +536,28 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
             pwszHashAlgId: WEBAUTHN_HASH_ALGORITHM_SHA_256,
         };
 
-        // hmac-secret salt for getAssertion lives on a dedicated field
+        // hmac-secret salts for getAssertion live on a dedicated field
         // (`pHmacSecretSaltValues`) on the OPTIONS struct, not in the
-        // generic Extensions array. The Global salt applies to every
-        // credential in the allow-list (we have one).
-        // Forward the RAW salt: webauthn.dll applies T(salt) =
-        // SHA-256("WebAuthn PRF"\0 || salt) itself before the device
-        // HMACs it (see the salt-convention note above), so the device
-        // ends up seeing the same bytes the libfido2 path computes
-        // locally via `webauthn_prf_salt`.
-        let mut salt_buf: [u8; 32] = *salt;
-        let mut hmac_salt = WEBAUTHN_HMAC_SECRET_SALT {
-            cbFirst: salt_buf.len() as u32,
-            pbFirst: salt_buf.as_mut_ptr(),
-            cbSecond: 0,
-            pbSecond: ptr::null_mut(),
-        };
-        let mut salt_values = WEBAUTHN_HMAC_SECRET_SALT_VALUES {
-            pGlobalHmacSalt: &mut hmac_salt,
-            cCredWithHmacSecretSaltList: 0,
-            pCredWithHmacSecretSaltList: ptr::null_mut(),
+        // generic Extensions array. With a single candidate we keep the
+        // Global-salt form (bitwise the call this backend has always
+        // made); with several, each salt is bound to its credential via
+        // the per-credential list. In both forms we forward the RAW
+        // salts: webauthn.dll applies T(salt) itself before the device
+        // HMACs (see the salt-convention note above), so the device ends
+        // up seeing the same bytes the libfido2 path computes locally
+        // via `webauthn_prf_salt`.
+        let mut salt_values = if n == 1 {
+            WEBAUTHN_HMAC_SECRET_SALT_VALUES {
+                pGlobalHmacSalt: &mut salts[0],
+                cCredWithHmacSecretSaltList: 0,
+                pCredWithHmacSecretSaltList: ptr::null_mut(),
+            }
+        } else {
+            WEBAUTHN_HMAC_SECRET_SALT_VALUES {
+                pGlobalHmacSalt: ptr::null_mut(),
+                cCredWithHmacSecretSaltList: n as u32,
+                pCredWithHmacSecretSaltList: cred_salts.as_mut_ptr(),
+            }
         };
 
         let options = WEBAUTHN_AUTHENTICATOR_GET_ASSERTION_OPTIONS {
@@ -543,56 +612,122 @@ impl Fido2Authenticator for WebAuthnAuthenticator {
 
         // SAFETY: webauthn.dll just gave us a non-null pointer to a
         // WEBAUTHN_ASSERTION it allocated; valid until we call
-        // WebAuthNFreeAssertion. We copy the 32 hmac-secret bytes
-        // out before freeing.
-        let secret = unsafe {
+        // WebAuthNFreeAssertion. We copy the 32 hmac-secret bytes plus
+        // the id of the credential that produced them out before
+        // freeing. `extracted` is None iff the assertion carried no
+        // hmac-secret output at all.
+        let extracted: Option<(Option<Vec<u8>>, HmacSecret)> = unsafe {
             let assertion = &*assertion_ptr;
             // The hmac-secret derived value lives in `pHmacSecret`
             // (a *mut WEBAUTHN_HMAC_SECRET_SALT, where pbFirst is the
             // 32-byte derived secret). If absent, the authenticator
-            // didn't return one, treat as failure.
-            if assertion.pHmacSecret.is_null() {
-                WebAuthNFreeAssertion(assertion_ptr);
+            // didn't return one.
+            let out = if assertion.pHmacSecret.is_null() {
+                None
+            } else {
+                let s = &*assertion.pHmacSecret;
+                // Validate the FFI contract before trusting either pointer
+                // or length. webauthn.dll's documented behaviour is that
+                // `pbFirst` is a non-null pointer to `cbFirst` bytes for
+                // the duration of the assertion. We additionally enforce
+                // `cbFirst == 32` since hmac-secret per CTAP2 sec.6.5 is a
+                // fixed 32-byte HMAC-SHA256 output.
+                //
+                // FFI trust note: we do not range-check `pbFirst` further
+                // because webauthn.dll is part of Windows itself - same
+                // trust boundary as `kernel32.dll` or `bcrypt.dll`. If
+                // webauthn.dll is compromised the entire process is
+                // already owned. By contrast, the libfido2-on-Linux/macOS
+                // path (hid.rs) defends against compromised USB devices
+                // via libfido2 and adds its own pointer-not-null check
+                // because the trust boundary there is "C library +
+                // attacker-controlled USB peripheral", which is weaker.
+                if s.pbFirst.is_null() || s.cbFirst != 32 {
+                    let got = s.cbFirst;
+                    WebAuthNFreeAssertion(assertion_ptr);
+                    return Err(Error::Other(format!(
+                        "WebAuthn returned hmac-secret with unexpected size ({got} B, expected 32)"
+                    )));
+                }
+                // Copy the 32-byte hmac-secret into a zeroizing temp and
+                // hand it straight to the Zeroize+ZeroizeOnDrop
+                // `HmacSecret` newtype, BEFORE the fallible cred->slot
+                // mapping below. This keeps a bare `[u8; 32]` from
+                // surviving into the error paths: the multi-assert rework
+                // (53f1628) briefly carried the raw array through the
+                // mapping, so the "matches no keyslot" return dropped it
+                // unzeroized. Wrapping here restores the R12-19 discipline
+                // (no bare secret past the point of copy). The `secret_tmp`
+                // deref-copy is wiped on drop; `HmacSecret` owns the value
+                // that travels onward.
+                let mut secret_tmp = zeroize::Zeroizing::new([0u8; 32]);
+                std::ptr::copy_nonoverlapping(s.pbFirst, secret_tmp.as_mut_ptr(), 32);
+                let secret = HmacSecret(*secret_tmp);
+                // Which allow-listed credential produced this secret.
+                // Same defensive bounds as the input side before we
+                // trust the (pointer, length) pair.
+                let cred = &assertion.Credential;
+                let used_id = if cred.pbId.is_null()
+                    || cred.cbId == 0
+                    || cred.cbId as usize > MAX_CRED_ID_INPUT_LEN
+                {
+                    None
+                } else {
+                    Some(std::slice::from_raw_parts(cred.pbId, cred.cbId as usize).to_vec())
+                };
+                Some((used_id, secret))
+            };
+            WebAuthNFreeAssertion(assertion_ptr);
+            out
+        };
+
+        let Some((used_id, secret)) = extracted else {
+            if n == 1 {
                 return Err(Error::Other(
                     "WebAuthn assertion returned no hmac-secret value (extension may not be \
                      supported on this authenticator; for Windows Hello, requires Windows 11 22H2+)"
                         .into(),
                 ));
             }
-            let s = &*assertion.pHmacSecret;
-            // Validate the FFI contract before trusting either pointer
-            // or length. webauthn.dll's documented behaviour is that
-            // `pbFirst` is a non-null pointer to `cbFirst` bytes for
-            // the duration of the assertion. We additionally enforce
-            // `cbFirst == 32` since hmac-secret per CTAP2 sec.6.5 is a
-            // fixed 32-byte HMAC-SHA256 output.
-            //
-            // FFI trust note: we do not range-check `pbFirst` further
-            // because webauthn.dll is part of Windows itself - same
-            // trust boundary as `kernel32.dll` or `bcrypt.dll`. If
-            // webauthn.dll is compromised the entire process is
-            // already owned. By contrast, the libfido2-on-Linux/macOS
-            // path (hid.rs) defends against compromised USB devices
-            // via libfido2 and adds its own pointer-not-null check
-            // because the trust boundary there is "C library +
-            // attacker-controlled USB peripheral", which is weaker.
-            if s.pbFirst.is_null() || s.cbFirst != 32 {
-                WebAuthNFreeAssertion(assertion_ptr);
-                return Err(Error::Other(format!(
-                    "WebAuthn returned hmac-secret with unexpected size ({} B, expected 32)",
-                    s.cbFirst
-                )));
+            // Degraded fallback: the assertion itself succeeded but this
+            // webauthn.dll build returned no hmac output for the
+            // per-credential salt list. Re-run each candidate through
+            // the proven single-credential Global-salt path -- one
+            // prompt per slot, the pre-batching behaviour -- so such
+            // builds still unlock, just less smoothly.
+            let mut last_err: Option<Error> = None;
+            for (idx, req) in requests.iter().enumerate() {
+                match self.hmac_secret(rp_id, req.cred_id, req.salt, req.prehash_salt, pin) {
+                    Ok(secret) => return Ok((idx, secret)),
+                    Err(e) => last_err = Some(e),
+                }
             }
-            let mut out = [0u8; 32];
-            std::ptr::copy_nonoverlapping(s.pbFirst, out.as_mut_ptr(), 32);
-            WebAuthNFreeAssertion(assertion_ptr);
-            out
+            return Err(last_err.expect("requests checked non-empty above"));
         };
 
-        // Round 12 fix R12-19: HmacSecret is now a newtype with
-        // Zeroize+ZeroizeOnDrop; wrap the raw bytes once on the way
-        // out so the consumer's stack copy is wiped on Drop.
-        Ok(HmacSecret(secret))
+        // Map the used credential back to the caller's candidate index.
+        // With one candidate there is nothing to disambiguate.
+        let idx = if n == 1 {
+            0
+        } else {
+            match used_id
+                .as_deref()
+                .and_then(|used| requests.iter().position(|r| r.cred_id == used))
+            {
+                Some(i) => i,
+                None => {
+                    return Err(Error::Other(format!(
+                        "WebAuthn asserted with a credential that matches none of the {n} \
+                         allow-listed keyslot credentials; cannot tell which keyslot to open"
+                    )));
+                }
+            }
+        };
+
+        // `secret` is already the Zeroize+ZeroizeOnDrop `HmacSecret`
+        // (wrapped at the point of copy above), so it hands straight to
+        // the caller and the consumer's copy is wiped on Drop.
+        Ok((idx, secret))
     }
 }
 

@@ -138,6 +138,59 @@
                       Source="$(var.StagingDir)\LICENSE-WINFSP.txt"
                       KeyPath="yes" />
             </Component>
+            <!-- TPM 2.0 backend: tpm2-tss DLLs built by the
+                 bundled-tpm cargo feature (MSBuild, Release config)
+                 plus OpenSSL's libcrypto that tss2-esys links.
+                 Installed into the app directory so the loader finds
+                 them FIRST (before PATH), same rationale as the
+                 winfsp-x64.dll sibling copy above. tss2-tcti-tbs is
+                 never in any import table (tss2-tctildr dlopen()s it
+                 at runtime) but is still required for TPM access via
+                 Windows TBS. The staging workflow step fails loudly
+                 if any of these is missing, so a TPM-less MSI can't
+                 ship silently. -->
+            <Component Id="Tss2Esys">
+                <File Id="Tss2EsysDll"
+                      Source="$(var.StagingDir)\tss2-esys.dll"
+                      KeyPath="yes" />
+            </Component>
+            <Component Id="Tss2Sys">
+                <File Id="Tss2SysDll"
+                      Source="$(var.StagingDir)\tss2-sys.dll"
+                      KeyPath="yes" />
+            </Component>
+            <Component Id="Tss2Mu">
+                <File Id="Tss2MuDll"
+                      Source="$(var.StagingDir)\tss2-mu.dll"
+                      KeyPath="yes" />
+            </Component>
+            <Component Id="Tss2Tctildr">
+                <File Id="Tss2TctildrDll"
+                      Source="$(var.StagingDir)\tss2-tctildr.dll"
+                      KeyPath="yes" />
+            </Component>
+            <Component Id="Tss2TctiTbs">
+                <File Id="Tss2TctiTbsDll"
+                      Source="$(var.StagingDir)\tss2-tcti-tbs.dll"
+                      KeyPath="yes" />
+            </Component>
+            <Component Id="LibCrypto">
+                <File Id="LibCryptoDll"
+                      Source="$(var.StagingDir)\libcrypto-3-x64.dll"
+                      KeyPath="yes" />
+            </Component>
+            <!-- Redistribution licenses for the TPM DLLs above:
+                 tpm2-tss is BSD-2-Clause, OpenSSL 3 is Apache-2.0. -->
+            <Component Id="LicenseTpm2Tss">
+                <File Id="LicenseTpm2TssFile"
+                      Source="$(var.StagingDir)\LICENSE-TPM2-TSS.txt"
+                      KeyPath="yes" />
+            </Component>
+            <Component Id="LicenseOpenSsl">
+                <File Id="LicenseOpenSslFile"
+                      Source="$(var.StagingDir)\LICENSE-OPENSSL.txt"
+                      KeyPath="yes" />
+            </Component>
         </ComponentGroup>
 
         <!-- ===== Start menu shortcut ============================== -->

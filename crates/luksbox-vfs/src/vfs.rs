@@ -2711,6 +2711,56 @@ impl Vfs {
         Ok(cur)
     }
 
+    /// Case-insensitive (case-preserving) child lookup. Returns the
+    /// child's id AND its stored name, so callers can hand the
+    /// canonical name to the exact-match mutation APIs (`unlink`,
+    /// `rmdir`, `rename`).
+    ///
+    /// Exists for mount backends that present the tree as a
+    /// case-insensitive volume: WinFsp declares
+    /// `CaseSensitiveSearch=false` to match NTFS semantics, and for
+    /// such volumes the WinFsp kernel driver UPPERCASES the canonical
+    /// file name it hands to `Cleanup` (delete-on-close) and
+    /// `SetInformation(Rename)`. Resolving those names with the
+    /// exact-match `lookup` made every Explorer delete / rename fail
+    /// with NotFound - GitHub issue #29.
+    ///
+    /// Resolution order: exact byte-wise match first (free, and the
+    /// only deterministic answer when two names differ only in case -
+    /// possible in vaults written through the case-sensitive POSIX
+    /// mounts), then a linear scan in `BTreeMap` iteration order so a
+    /// case-colliding directory still resolves deterministically.
+    ///
+    /// Case folding is per-`char` Unicode full uppercase, compared
+    /// pairwise with no length change allowed. This matches NTFS's
+    /// simple-upcase behavior for the overwhelmingly common cases
+    /// (ASCII, accented Latin, Greek, Cyrillic) and deliberately does
+    /// NOT match expanding folds (NTFS treats "ß" and "SS" as
+    /// distinct; so do we).
+    pub fn lookup_ci(&self, parent: FileId, name: &str) -> Result<(FileId, String), Error> {
+        let inode = self.require_dir(parent)?;
+        if let Some((stored, id)) = inode.children.get_key_value(name) {
+            return Ok((*id, stored.clone()));
+        }
+        inode
+            .children
+            .iter()
+            .find(|(stored, _)| names_eq_ci(stored, name))
+            .map(|(stored, id)| (*id, stored.clone()))
+            .ok_or(Error::NotFound)
+    }
+
+    /// `lookup_path` with per-segment case-insensitive resolution.
+    /// Same contract as [`Vfs::lookup_ci`]; used by the WinFsp
+    /// adapter for every path Windows hands it.
+    pub fn lookup_path_ci(&self, path: &str) -> Result<FileId, Error> {
+        let mut cur = self.tree.root;
+        for seg in path.split('/').filter(|s| !s.is_empty()) {
+            cur = self.lookup_ci(cur, seg)?.0;
+        }
+        Ok(cur)
+    }
+
     pub fn mkdir(&mut self, parent: FileId, name: &str) -> Result<FileId, Error> {
         self.ensure_writable()?;
         validate_name(name)?;
@@ -2726,7 +2776,7 @@ impl Vfs {
                 parent,
                 kind: InodeKind::Directory,
                 size: 0,
-                mtime_ns: 0,
+                mtime_ns: Self::now_ns(),
                 chunks: Vec::new(),
                 children: Default::default(),
                 cached_real_size: None,
@@ -2783,7 +2833,7 @@ impl Vfs {
                 parent,
                 kind: InodeKind::File,
                 size: 0,
-                mtime_ns: 0,
+                mtime_ns: Self::now_ns(),
                 chunks: Vec::new(),
                 children: Default::default(),
                 cached_real_size: None,
@@ -3002,6 +3052,10 @@ impl Vfs {
         if hide_size {
             inode_mut.cached_real_size = Some(new_real);
         }
+        // POSIX: a successful write updates mtime. Without this a file
+        // copied in without an explicit `utimensat` (touch, editors,
+        // `cp` without -p) would report the Unix epoch (issue #26).
+        inode_mut.mtime_ns = Self::now_ns();
         self.dirty = true;
         // Layer 2: this inode's chunks vec just changed; mark so the
         // next spill_to_v3_on_disk re-encrypts its chunk-list chain
@@ -3074,6 +3128,8 @@ impl Vfs {
         if hide_size {
             inode_mut.cached_real_size = Some(new_size);
         }
+        // POSIX: truncate(2) updates mtime (issue #26).
+        inode_mut.mtime_ns = Self::now_ns();
         self.dirty = true;
         // Layer 2: same reasoning as `write` -- chunks vec mutated.
         self.chunks_dirty.insert(id);
@@ -3189,6 +3245,35 @@ impl Vfs {
         Ok(())
     }
 
+    /// Current wall-clock time as nanoseconds since the Unix epoch.
+    /// Saturates to 0 on a pre-1970 clock and to `u64::MAX` past the
+    /// year 2554 (both only reachable with a badly-wrong system clock).
+    /// Used to stamp mtime on create / write / truncate so freshly
+    /// written content carries a real timestamp even when the caller
+    /// never issues an explicit `utimensat(2)`.
+    pub(crate) fn now_ns() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+            .unwrap_or(0)
+    }
+
+    /// Set an inode's modification time (nanoseconds since the Unix
+    /// epoch). Backs the FUSE / FUSE-T / WinFsp `setattr`-time paths so
+    /// `utimensat(2)`, and therefore `rsync -a`, `cp -p`, and
+    /// `touch -d`, round-trips instead of every file reporting the Unix
+    /// epoch (GitHub issue #26). `mtime_ns` predates the LBM4
+    /// mode/link_count fields, so this persists on both v3 and v4
+    /// vaults without forcing an upgrade. atime/ctime are not stored
+    /// separately; the mount layer reports them as mtime.
+    pub fn set_mtime(&mut self, id: FileId, mtime_ns: u64) -> Result<(), Error> {
+        self.ensure_writable()?;
+        let inode = self.tree.inodes.get_mut(&id).ok_or(Error::NotFound)?;
+        inode.mtime_ns = mtime_ns;
+        self.dirty = true;
+        Ok(())
+    }
+
     /// Create a symlink at `(parent, name)` whose stored target is
     /// `target`. **Strict target sanitization** -- the target MUST
     /// satisfy `is_safe_symlink_target`:
@@ -3235,7 +3320,7 @@ impl Vfs {
                 parent,
                 kind: InodeKind::Symlink,
                 size: target.len() as u64,
-                mtime_ns: 0,
+                mtime_ns: Self::now_ns(),
                 chunks: Vec::new(),
                 children: Default::default(),
                 cached_real_size: None,
@@ -3804,6 +3889,13 @@ impl Vfs {
                 // (allocates fresh chunk-list slots). One-time cost
                 // -- rotation is a rare operation.
                 self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+                // Keep an armed rollback anchor in sync with the rotated
+                // vault: rewrite it under the NEW MVK at the current
+                // generation. Rotation installs the new MVK but does not
+                // mark the tree dirty, so the caller's flush no-ops and
+                // would otherwise leave the anchor bound to the OLD MVK.
+                // No-op when no anchor is configured.
+                self.container.write_anchor(self.tree.next_chunk_gen)?;
                 Ok(())
             }
             (true, Err(e)) => {
@@ -3821,6 +3913,9 @@ impl Vfs {
                 // full spill path. Same reasoning as the crash-safe
                 // arm above.
                 self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+                // Advance an armed rollback anchor under the NEW MVK (see
+                // the crash-safe arm above). No-op when none is armed.
+                self.container.write_anchor(self.tree.next_chunk_gen)?;
                 Ok(())
             }
             (false, Err(e)) => Err(e),
@@ -3987,6 +4082,10 @@ impl Vfs {
                 // mark every inode dirty so the next flush takes
                 // the full spill path.
                 self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+                // Advance an armed rollback anchor (deniable AEAD format)
+                // under the NEW MVK + new per-vault salt. No-op when none
+                // is armed. Same reasoning as the standard `rotate_mvk`.
+                self.container.write_anchor(self.tree.next_chunk_gen)?;
                 Ok(())
             }
             (true, Err(e)) => {
@@ -3995,6 +4094,7 @@ impl Vfs {
             }
             (false, Ok(())) => {
                 self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+                self.container.write_anchor(self.tree.next_chunk_gen)?;
                 Ok(())
             }
             (false, Err(e)) => Err(e),
@@ -4050,6 +4150,31 @@ fn validate_name(name: &str) -> Result<(), Error> {
         Err(Error::InvalidPath(name.to_string()))
     } else {
         Ok(())
+    }
+}
+
+/// Case-insensitive name equality for [`Vfs::lookup_ci`].
+///
+/// Per-`char` pairwise comparison where two chars match iff they are
+/// identical or their Unicode full-uppercase expansions are equal.
+/// Because the comparison is pairwise, folds that CHANGE the length
+/// of a name never match ("ß" vs "SS" stays distinct, same as
+/// NTFS's simple $UpCase table). ASCII fast-path first: the exact
+/// compare in `lookup_ci` already handled `a == b`, so this only
+/// runs on candidate names that differ somewhere.
+fn names_eq_ci(a: &str, b: &str) -> bool {
+    let mut ai = a.chars();
+    let mut bi = b.chars();
+    loop {
+        match (ai.next(), bi.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) => {
+                if x != y && !x.to_uppercase().eq(y.to_uppercase()) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
     }
 }
 
@@ -4791,6 +4916,72 @@ mod tests {
             vfs.rename(root, &at_cap, root, &oversize),
             Err(Error::InvalidPath(_))
         ));
+    }
+
+    /// Unit coverage for the case-insensitive comparison behind
+    /// `lookup_ci` (GitHub issue #29: the WinFsp kernel hands
+    /// UPPERCASED canonical names to cleanup/rename on the
+    /// case-insensitive volume we declare).
+    #[test]
+    fn names_eq_ci_matches_windows_expectations() {
+        // ASCII case folds.
+        assert!(names_eq_ci("doomed.txt", "DOOMED.TXT"));
+        assert!(names_eq_ci("MiXeD.CaSe", "mixed.case"));
+        assert!(names_eq_ci("same", "same"));
+        // Non-ASCII simple folds.
+        assert!(names_eq_ci("café", "CAFÉ"));
+        assert!(names_eq_ci("Ω-report", "ω-report"));
+        assert!(names_eq_ci("Отчёт", "отчёт"));
+        // Different names never match.
+        assert!(!names_eq_ci("a.txt", "b.txt"));
+        assert!(!names_eq_ci("abc", "abcd"));
+        assert!(!names_eq_ci("", "a"));
+        assert!(names_eq_ci("", ""));
+        // Expanding folds stay distinct, like NTFS's simple $UpCase:
+        // "ß".to_uppercase() is "SS" but the names have different
+        // lengths so they must NOT be treated as the same file.
+        assert!(!names_eq_ci("straße", "STRASSE"));
+        assert!(names_eq_ci("straße", "STRAßE"));
+    }
+
+    /// `lookup_ci` / `lookup_path_ci` resolve case-insensitively and
+    /// return the stored (case-preserved) name; exact matches win
+    /// over case-insensitive ones when a directory contains
+    /// case-colliding siblings (creatable via the POSIX mounts).
+    #[test]
+    fn lookup_ci_resolves_and_preserves_stored_case() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let sub = vfs.mkdir(root, "Sub Dir").unwrap();
+        let f = vfs.create(sub, "Doomed.txt").unwrap();
+
+        // Any casing resolves to the same id, and the stored name
+        // comes back case-preserved.
+        for probe in ["Doomed.txt", "DOOMED.TXT", "doomed.txt"] {
+            let (id, stored) = vfs.lookup_ci(sub, probe).unwrap();
+            assert_eq!(id, f, "probe {probe:?}");
+            assert_eq!(stored, "Doomed.txt", "probe {probe:?}");
+        }
+        assert!(matches!(
+            vfs.lookup_ci(sub, "other.txt"),
+            Err(Error::NotFound)
+        ));
+
+        // Path resolution folds every segment.
+        assert_eq!(vfs.lookup_path_ci("/SUB DIR/DOOMED.TXT").unwrap(), f);
+        assert_eq!(vfs.lookup_path_ci("/sub dir/doomed.txt").unwrap(), f);
+        assert!(vfs.lookup_path_ci("/missing/doomed.txt").is_err());
+
+        // Case-colliding siblings: exact match must win, and a
+        // non-exact probe resolves deterministically (BTreeMap order).
+        let upper = vfs.create(sub, "DOOMED.TXT").unwrap();
+        let (id_exact_upper, stored_upper) = vfs.lookup_ci(sub, "DOOMED.TXT").unwrap();
+        assert_eq!(id_exact_upper, upper);
+        assert_eq!(stored_upper, "DOOMED.TXT");
+        let (id_exact_mixed, _) = vfs.lookup_ci(sub, "Doomed.txt").unwrap();
+        assert_eq!(id_exact_mixed, f);
     }
 
     /// Adversarial round-trip: rename a-> b -> c -> a many times, with
@@ -7087,6 +7278,241 @@ mod tests {
                 String::from_utf8_lossy(pw)
             );
         }
+    }
+
+    #[test]
+    fn rotate_mvk_rebinds_and_advances_anchor() {
+        // Regression for the rotate-mvk --anchor threading (finding 1).
+        // After an MVK rotation with an anchor armed, the anchor sidecar
+        // must still AEAD-verify under the NEW MVK (it is rewritten by the
+        // post-rotation flush) and must not report a rollback. If the
+        // rewrite were missing, the anchor would stay bound to the old MVK
+        // and the next `--anchor` open would fail closed.
+        use luksbox_format::{Container, anchor};
+        use zeroize::Zeroizing;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("rot-anchor.lbx");
+        let anchor_path = dir.path().join("rot-anchor.lbx.anchor");
+
+        // Vault with content + an anchor bootstrapped at generation 1.
+        let mut cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        cont.init_anchor(anchor_path.clone(), 1).unwrap();
+        cont.persist_header().unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "blob").unwrap();
+        vfs.write(f, 0, &vec![7u8; 9000]).unwrap();
+        vfs.flush().unwrap(); // advances the anchor to the current gen
+        let _ = vfs.close().unwrap();
+
+        // Re-open, arm the anchor (verifies under the OLD MVK), confirm no
+        // rollback, then rotate + flush (rewrites the anchor under the NEW
+        // MVK). This mirrors what `rotate_mvk_action` does around the
+        // interactive prompts.
+        let mut cont = Container::open(&path, None, UnlockMaterial::Passphrase(b"pw")).unwrap();
+        let pre_gen = cont.set_anchor(Some(anchor_path.clone())).unwrap().unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        assert!(
+            !matches!(
+                anchor::compare(pre_gen, vfs.vault_generation()),
+                anchor::VerificationOutcome::RollbackDetected { .. }
+            ),
+            "no rollback expected before rotation"
+        );
+        vfs.rotate_mvk(
+            vec![SlotCredential::Passphrase {
+                slot_idx: 0,
+                passphrase: Zeroizing::new("pw".to_string()),
+            }],
+            test_params(),
+        )
+        .unwrap();
+        vfs.flush().unwrap();
+        let _ = vfs.close().unwrap();
+
+        // The anchor must re-validate under the NEW MVK. `set_anchor`
+        // returns an Err (AEAD failure) if the anchor were still bound to
+        // the pre-rotation MVK, which is exactly the breakage this guards.
+        let mut cont2 = Container::open(&path, None, UnlockMaterial::Passphrase(b"pw")).unwrap();
+        let post_gen = cont2
+            .set_anchor(Some(anchor_path.clone()))
+            .expect("anchor must re-verify under the rotated MVK")
+            .expect("anchor path was provided");
+        let vfs2 = Vfs::open(cont2).unwrap();
+        assert!(
+            !matches!(
+                anchor::compare(post_gen, vfs2.vault_generation()),
+                anchor::VerificationOutcome::RollbackDetected { .. }
+            ),
+            "rotated vault + rewritten anchor must not report rollback"
+        );
+    }
+
+    /// Wall-clock nanoseconds since the Unix epoch, for test bounds.
+    fn test_now_ns() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
+    }
+
+    #[test]
+    fn mtime_stamped_on_create_and_bumped_on_write() {
+        // Issue #26: files must not all report the Unix epoch. A newly
+        // created file gets a real mtime, and a write bumps it.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mtime-stamp.lbx");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let before = test_now_ns();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let root = vfs.root_id();
+
+        // create() stamps a real, recent mtime, not epoch 0.
+        let f = vfs.create(root, "photo.jpg").unwrap();
+        let created = vfs.stat(f).unwrap().mtime_ns;
+        assert_ne!(created, 0, "create must not leave mtime at the Unix epoch");
+        assert!(
+            created >= before,
+            "create mtime {created} should be >= pre-create {before}"
+        );
+
+        // mkdir stamps too.
+        let d = vfs.mkdir(root, "album").unwrap();
+        assert_ne!(vfs.stat(d).unwrap().mtime_ns, 0, "mkdir must stamp mtime");
+
+        // write() bumps mtime. Anchor deterministically: set an ancient
+        // mtime, then write, and confirm it moved forward to ~now.
+        vfs.set_mtime(f, 1_000).unwrap();
+        let before_write = test_now_ns();
+        vfs.write(f, 0, b"jpeg-bytes").unwrap();
+        let after_write = vfs.stat(f).unwrap().mtime_ns;
+        assert!(
+            after_write >= before_write && after_write != 1_000,
+            "write must bump mtime to now (was 1000, now {after_write}, floor {before_write})"
+        );
+
+        // truncate() bumps mtime too.
+        vfs.set_mtime(f, 1_000).unwrap();
+        let before_trunc = test_now_ns();
+        vfs.truncate(f, 4).unwrap();
+        let after_trunc = vfs.stat(f).unwrap().mtime_ns;
+        assert!(
+            after_trunc >= before_trunc && after_trunc != 1_000,
+            "truncate must bump mtime to now"
+        );
+    }
+
+    #[test]
+    fn explicit_mtime_survives_write_then_flush_reopen() {
+        // The exact rsync -a scenario from issue #26: rsync writes the
+        // file, then calls utimensat to stamp the SOURCE mtime. That
+        // explicit mtime must (a) win over the write's now-stamp and
+        // (b) survive a flush + reopen, so a second `rsync -a` sees
+        // matching timestamps and SKIPS the file instead of retransfer.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mtime-persist.lbx");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let source_mtime: u64 = 1_700_000_000_123_456_789; // 2023-11-14 UTC
+        {
+            let mut vfs = Vfs::open(cont).unwrap();
+            let root = vfs.root_id();
+            let f = vfs.create(root, "photo.jpg").unwrap();
+            vfs.write(f, 0, b"jpeg-bytes").unwrap();
+            // Kernel may flush the write before the utimensat lands.
+            vfs.flush().unwrap();
+            // utimensat(source_mtime):
+            vfs.set_mtime(f, source_mtime).unwrap();
+            assert_eq!(
+                vfs.stat(f).unwrap().mtime_ns,
+                source_mtime,
+                "explicit mtime must override the write's now-stamp"
+            );
+            vfs.flush().unwrap();
+            let _ = vfs.close().unwrap();
+        }
+        // Reopen from disk: the mtime must have round-tripped through
+        // the encrypted metadata blob.
+        let cont = Container::open(&path, None, UnlockMaterial::Passphrase(b"pw")).unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let f = vfs.lookup_path("/photo.jpg").unwrap();
+        assert_eq!(
+            vfs.stat(f).unwrap().mtime_ns,
+            source_mtime,
+            "mtime must survive flush + reopen (issue #26 rsync incremental)"
+        );
+    }
+
+    #[test]
+    fn mtime_round_trips_on_v3_vault() {
+        // mtime_ns predates the LBM4 mode/link_count fields and lives in
+        // both the v3 and v4 on-disk inode, so the fix works without a
+        // format bump. Exercise a v3-format vault explicitly.
+        use luksbox_format::metadata::set_create_metadata_region_size_override;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mtime-v3.lbx");
+        let cont = {
+            let _g = set_create_metadata_region_size_override(Some(256 * 1024));
+            let _v3 = set_format_v3_override(Some(true));
+            Container::create_with_passphrase(
+                &path,
+                None,
+                CipherSuite::Aes256Gcm,
+                test_params(),
+                b"pw",
+            )
+            .unwrap()
+        };
+        let source_mtime: u64 = 1_600_000_000_000_000_000;
+        {
+            let mut vfs = Vfs::open(cont).unwrap();
+            let root = vfs.root_id();
+            let f = vfs.create(root, "f").unwrap();
+            vfs.write(f, 0, b"x").unwrap();
+            vfs.set_mtime(f, source_mtime).unwrap();
+            vfs.flush().unwrap();
+            let _ = vfs.close().unwrap();
+        }
+        let cont = Container::open(&path, None, UnlockMaterial::Passphrase(b"pw")).unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let f = vfs.lookup_path("/f").unwrap();
+        assert_eq!(vfs.stat(f).unwrap().mtime_ns, source_mtime);
+    }
+
+    #[test]
+    fn set_mtime_rejects_missing_inode() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mtime-enoent.lbx");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        assert!(matches!(vfs.set_mtime(999_999, 1), Err(Error::NotFound)));
     }
 
     #[test]

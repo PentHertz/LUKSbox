@@ -146,7 +146,7 @@ concurrency / crash-safety pipeline, on-disk footprint), see
 | HKDF-SHA256 with per-purpose `info` strings | Derives every subkey from the MVK; uniqueness verified by regression test | `crates/luksbox-core/src/key.rs` |
 | Argon2id (default 256 MiB / 3 / 4) | Stretches passphrases; cost params bounded by parser to reject DoS attempts | `crates/luksbox-core/src/kdf.rs` |
 | FIDO2 hmac-secret (CTAP2 sec.6.5) | Hardware-backed unlock, wrap mode or direct mode | `crates/luksbox-fido2/` |
-| TPM 2.0 sealed KEK (Linux) | Bind a vault to the local chip; optional PIN; fused TPM+FIDO2 mode | `crates/luksbox-tpm/` |
+| TPM 2.0 sealed KEK (Linux + Windows) | Bind a vault to the local chip; optional PIN; fused TPM+FIDO2 mode | `crates/luksbox-tpm/` |
 | ML-KEM-768 / ML-KEM-1024 (FIPS 203) | Post-quantum half of every hybrid keyslot; classical+PQ mixed via HKDF | `crates/luksbox-pq/` |
 | Per-chunk AAD (`file_id || chunk_index || generation`) | Detects chunk substitution, position swap, and replay of older chunks at the same position | `crates/luksbox-vfs/src/chunk.rs` |
 | Detached header sidecar (`.hdr`) | Vault file alone is opaque random, no magic, no version, no keyslots | `crates/luksbox-format/src/container.rs` |
@@ -176,7 +176,7 @@ luksbox mount my-vault.lbx Z:           # Windows
 # Add a FIDO2 hardware factor
 luksbox enroll my-vault.lbx --kind fido2
 
-# Add a TPM 2.0 keyslot bound to this machine (Linux)
+# Add a TPM 2.0 keyslot bound to this machine (Linux / Windows)
 luksbox enroll my-vault.lbx --kind tpm2
 
 # Hybrid post-quantum: needs a separate `.kyber` seed file
@@ -329,7 +329,7 @@ flowchart LR
     Crates --> Format["luksbox-format<br/>container I/O, anchor, hybrid sidecar"]
     Crates --> Vfs["luksbox-vfs<br/>directory tree atop a Container"]
     Crates --> Fido2["luksbox-fido2<br/>libfido2 + webauthn FFI"]
-    Crates --> Tpm["luksbox-tpm<br/>Linux TPM 2.0 wrap/unwrap"]
+    Crates --> Tpm["luksbox-tpm<br/>Linux/Windows TPM 2.0 wrap/unwrap"]
     Crates --> Pq["luksbox-pq<br/>ML-KEM-768/1024 + .kyber"]
     Crates --> Mount["luksbox-mount<br/>FUSE3, FUSE-T, WinFsp"]
     Crates --> Cli["luksbox-cli<br/>luksbox binary + wizard TUI"]
@@ -370,7 +370,7 @@ In-repo references for contributors:
 - [`docs/HARDWARE_SIDE_CHANNEL_NOTES.md`](docs/HARDWARE_SIDE_CHANNEL_NOTES.md), published side-channel attacks against FIDO2 silicon
 - [`docs/TPM_LINUX_PERMISSIONS.md`](docs/TPM_LINUX_PERMISSIONS.md), end-user playbook for `/dev/tpmrm0` access
 - [`docs/PROJECT_OVERVIEW.md`](docs/PROJECT_OVERVIEW.md), project overview + comparison vs LUKS2 / VeraCrypt
-- [`docs/TPM_FUTURE_IMPROVEMENTS.md`](docs/TPM_FUTURE_IMPROVEMENTS.md), TPM roadmap (Windows TBS, PCR sealing)
+- [`docs/TPM_FUTURE_IMPROVEMENTS.md`](docs/TPM_FUTURE_IMPROVEMENTS.md), TPM roadmap (PCR sealing, attestation) + the shipped Windows TBS design record
 
 ---
 

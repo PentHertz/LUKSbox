@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Penthertz <https://penthertz.com> (https://x.com/PentHertz)
 
-//! Linux TPM 2.0-backed wrap/unwrap of the LUKSbox Master Volume Key.
+//! Linux + Windows TPM 2.0-backed wrap/unwrap of the LUKSbox Master
+//! Volume Key.
 //!
 //! ## Why
 //!
@@ -36,11 +37,18 @@
 //!
 //! Gated on the `hardware` Cargo feature so a default workspace
 //! build doesn't require `libtss2-esys-dev` installed. Linux release
-//! builds enable the feature; non-Linux targets compile a no-op stub
-//! that errors at runtime if anything tries to use the API.
+//! builds enable the feature against the system tpm2-tss; Windows
+//! release builds enable `bundled-tpm` (vendored tpm2-tss, since
+//! Windows has no system copy - the TPM is reached through the
+//! in-box TBS broker instead of a device node). Targets without a
+//! backend (macOS, BSDs) compile a no-op stub that errors at runtime
+//! if anything tries to use the API.
 
 use thiserror::Error;
-#[cfg(any(not(feature = "hardware"), not(target_os = "linux")))]
+#[cfg(any(
+    not(feature = "hardware"),
+    not(any(target_os = "linux", target_os = "windows"))
+))]
 use zeroize::Zeroizing;
 
 /// 32-byte secret container (the MVK). Wrapping/unwrapping this
@@ -98,7 +106,7 @@ impl SealedBlob {
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(
-        "TPM 2.0 support not compiled into this binary (rebuild luksbox-tpm with --features hardware)"
+        "TPM 2.0 support not compiled into this binary (rebuild with --features hardware, or --features bundled-tpm on Windows / older distros)"
     )]
     NotCompiledIn,
     #[error("TPM device not available: {0}")]
@@ -109,16 +117,19 @@ pub enum Error {
     BlobMalformed(&'static str),
 }
 
-// ---------- compiled-out stub (no hardware feature, OR non-Linux) -----
+// ---------- compiled-out stub (no hardware feature, OR no backend) ----
 //
 // Active when EITHER the `hardware` feature is off, OR the target is
-// not Linux. tss-esapi 7.x's -sys crate hard-panics in build.rs on
-// Windows/macOS, so even if a parent crate enables `hardware`
+// neither Linux nor Windows. tss-esapi has no backend for macOS and
+// the BSDs, so even if a parent crate enables `hardware`
 // unconditionally we have to fall through to the stub there. The
 // runtime behaviour is the same: every constructor / op returns
 // `NotCompiledIn`. See Cargo.toml for the matching target-gated dep.
 
-#[cfg(any(not(feature = "hardware"), not(target_os = "linux")))]
+#[cfg(any(
+    not(feature = "hardware"),
+    not(any(target_os = "linux", target_os = "windows"))
+))]
 mod stub {
     use super::*;
 
@@ -157,15 +168,18 @@ mod stub {
     }
 }
 
-#[cfg(any(not(feature = "hardware"), not(target_os = "linux")))]
+#[cfg(any(
+    not(feature = "hardware"),
+    not(any(target_os = "linux", target_os = "windows"))
+))]
 pub use stub::Tpm2Sealer;
 
-// ---------- real TPM 2.0 implementation (hardware feature, Linux) -----
+// ---------- real TPM 2.0 implementation (hardware, Linux/Windows) -----
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 mod real;
 
-#[cfg(all(feature = "hardware", target_os = "linux"))]
+#[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 pub use real::{Tpm2Sealer, diagnose_operation_error};
 
 // ---------- mock TPM for adversary tests (no feature gate) -----------
@@ -180,7 +194,10 @@ pub mod mock;
 
 /// Stub for non-hardware builds. Mirrors the real `diagnose_operation_error`
 /// signature so callers can use the same code path on every platform.
-#[cfg(any(not(feature = "hardware"), not(target_os = "linux")))]
+#[cfg(any(
+    not(feature = "hardware"),
+    not(any(target_os = "linux", target_os = "windows"))
+))]
 pub fn diagnose_operation_error(_raw: &str) -> Option<&'static str> {
     None
 }
@@ -224,9 +241,13 @@ mod tests {
     /// Without `--features hardware`, the API exists but every
     /// constructor / op returns `NotCompiledIn`. Lets downstream
     /// code that conditionally uses TPM compile cleanly without
-    /// the feature. Same path activates on non-Linux even with the
-    /// feature on, because tss-esapi 7.x doesn't build there.
-    #[cfg(any(not(feature = "hardware"), not(target_os = "linux")))]
+    /// the feature. Same path activates on macOS and other
+    /// backend-less targets even with the feature on, because
+    /// tss-esapi doesn't build there.
+    #[cfg(any(
+        not(feature = "hardware"),
+        not(any(target_os = "linux", target_os = "windows"))
+    ))]
     #[test]
     fn stub_returns_not_compiled_in() {
         assert!(matches!(Tpm2Sealer::new(), Err(Error::NotCompiledIn)));
