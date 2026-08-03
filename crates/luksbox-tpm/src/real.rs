@@ -377,9 +377,26 @@ impl Tpm2Sealer {
             .build()
             .map_err(|e| Error::TpmError(format!("PublicBuilder (SRK): {e}")))?;
 
+        // CreatePrimary's session slot 1 is MANDATORY at the ESAPI
+        // layer: a tss-esapi Context starts (and, after our
+        // `flush_session` teardown, returns to) sessions
+        // (None, None, None), which `create_primary` forwards as
+        // ESYS_TR_NONE - ESAPI's check_session_feasibility then
+        // rejects the call with TSS2_ESYS_RC_BAD_VALUE (0x0007000B,
+        // "a parameter has a bad value") before anything reaches the
+        // TPM. Authorize the Owner hierarchy with the built-in
+        // password session (empty owner auth - same as
+        // systemd-cryptenroll's SRK creation), and clear it after so
+        // every caller keeps seeing the session-free context state
+        // it expects.
         self.ctx
+            .set_sessions((Some(AuthSession::Password), None, None));
+        let result = self
+            .ctx
             .create_primary(Hierarchy::Owner, public, None, None, None, None)
-            .map_err(|e| Error::TpmError(format!("Esys_CreatePrimary (SRK): {e}")))
+            .map_err(|e| Error::TpmError(format!("Esys_CreatePrimary (SRK): {e}")));
+        self.ctx.clear_sessions();
+        result
     }
 
     /// Build a sealed data object containing `plaintext` as a child
