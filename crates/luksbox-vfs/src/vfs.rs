@@ -3079,7 +3079,14 @@ impl Vfs {
                 id: cur_ref.id,
                 generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
             };
-            chunk::write_chunk(&mut self.container, &key, id, chunk_idx as u32, new_ref, &pt)?;
+            chunk::write_chunk(
+                &mut self.container,
+                &key,
+                id,
+                chunk_idx as u32,
+                new_ref,
+                &pt,
+            )?;
             if chunk_idx < cur_len {
                 updates.push((chunk_idx, new_ref));
             } else {

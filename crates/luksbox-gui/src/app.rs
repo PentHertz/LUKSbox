@@ -13104,25 +13104,37 @@ mod zoom_shortcut_tests {
     #[test]
     fn ctrl_plus_increases_zoom_without_deadlocking() {
         let z = zoom_after(command_key(egui::Key::Plus), 1.0);
-        assert!((z - 1.1).abs() < 1e-4, "Ctrl+Plus should step zoom to 1.1, got {z}");
+        assert!(
+            (z - 1.1).abs() < 1e-4,
+            "Ctrl+Plus should step zoom to 1.1, got {z}"
+        );
     }
 
     #[test]
     fn ctrl_equals_increases_zoom() {
         let z = zoom_after(command_key(egui::Key::Equals), 1.0);
-        assert!((z - 1.1).abs() < 1e-4, "Ctrl+= should step zoom to 1.1, got {z}");
+        assert!(
+            (z - 1.1).abs() < 1e-4,
+            "Ctrl+= should step zoom to 1.1, got {z}"
+        );
     }
 
     #[test]
     fn ctrl_minus_decreases_zoom() {
         let z = zoom_after(command_key(egui::Key::Minus), 1.0);
-        assert!((z - 0.9).abs() < 1e-4, "Ctrl+- should step zoom to 0.9, got {z}");
+        assert!(
+            (z - 0.9).abs() < 1e-4,
+            "Ctrl+- should step zoom to 0.9, got {z}"
+        );
     }
 
     #[test]
     fn ctrl_zero_resets_zoom() {
         let z = zoom_after(command_key(egui::Key::Num0), 2.0);
-        assert!((z - 1.0).abs() < 1e-4, "Ctrl+0 should reset zoom to 1.0, got {z}");
+        assert!(
+            (z - 1.0).abs() < 1e-4,
+            "Ctrl+0 should reset zoom to 1.0, got {z}"
+        );
     }
 
     #[test]
