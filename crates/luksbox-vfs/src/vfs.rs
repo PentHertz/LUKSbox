@@ -2862,8 +2862,17 @@ impl Vfs {
 
     pub fn read(&mut self, id: FileId, offset: u64, buf: &mut [u8]) -> Result<usize, Error> {
         let real = self.real_size(id)?;
-        let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?.clone();
-        if inode.kind != InodeKind::File {
+        // Validate the inode kind without cloning its chunk-ref vec.
+        // A large file's `chunks` can hold millions of entries (one per
+        // 4 KiB), and cloning the whole inode here (as an earlier
+        // version did) made every read cost O(file_size) -- so random
+        // 4 KiB reads over a multi-gigabyte file (e.g. a VM disk image
+        // on a mounted vault) degraded catastrophically. This hit the
+        // WinFsp backend hardest because Windows dispatches far smaller,
+        // more numerous I/O requests than FUSE's batched reads on
+        // Linux/macOS. See issue #31.
+        let kind = self.tree.inodes.get(&id).ok_or(Error::NotFound)?.kind;
+        if kind != InodeKind::File {
             return Err(Error::NotAFile);
         }
         if offset >= real || buf.is_empty() {
@@ -2880,6 +2889,15 @@ impl Vfs {
         let hide_size = self.container.header.hide_size_header();
         let (first_chunk, _) = file_to_chunk(offset, hide_size)?;
         let (last_chunk, _) = file_to_chunk(read_end - 1, hide_size)?;
+
+        // Copy only the chunk refs this read actually covers -- cost is
+        // O(read length), not O(file length). `ChunkRef` is `Copy`, so
+        // this is a small, bounded allocation (one 16-byte entry per
+        // covered 4 KiB chunk).
+        let covered: Vec<ChunkRef> = {
+            let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?;
+            inode.chunks[first_chunk..=last_chunk].to_vec()
+        };
 
         let key = chunk::file_key(&self.container, id);
         let mut buf_pos = 0usize;
@@ -2906,7 +2924,7 @@ impl Vfs {
                 &key,
                 id,
                 chunk_idx as u32,
-                inode.chunks[chunk_idx],
+                covered[chunk_idx - first_chunk],
             )?;
             buf[buf_pos..buf_pos + len_here]
                 .copy_from_slice(&pt[read_start_in_chunk..read_end_in_chunk]);
@@ -2924,8 +2942,21 @@ impl Vfs {
             return Ok(0);
         }
         let old_real = self.real_size(id)?;
-        let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?.clone();
-        if inode.kind != InodeKind::File {
+        // Read the scalar inode fields we need WITHOUT cloning the
+        // chunk-ref vec. A large file's `chunks` holds one 16-byte entry
+        // per 4 KiB (millions of entries for a multi-GB file); the old
+        // code cloned it *twice* per call (once via the whole `Inode`,
+        // once as the working `chunks`), making every write O(file_size)
+        // and sequential growth O(file_size^2). Small-granularity
+        // writers -- notably WinFsp, which dispatches far smaller and
+        // more numerous I/O than FUSE's batched writes -- collapsed to a
+        // crawl. See issue #31. Below we work on O(write-length) local
+        // buffers instead and mutate the inode only once, on success.
+        let (kind, cur_len) = {
+            let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?;
+            (inode.kind, inode.chunks.len())
+        };
+        if kind != InodeKind::File {
             return Err(Error::NotAFile);
         }
         // Same overflow guard as `read`. Without checked_add, a
@@ -2951,7 +2982,6 @@ impl Vfs {
         let (last_chunk, _) = file_to_chunk(new_end - 1, hide_size)?;
 
         let key = chunk::file_key(&self.container, id);
-        let mut chunks = inode.chunks.clone();
 
         // Pre-flight the metadata budget BEFORE allocating any new
         // chunks. Each new ChunkRef adds two u64s to the on-disk
@@ -2965,27 +2995,46 @@ impl Vfs {
         // loss). Fail here, BEFORE the chunk-allocation loop, so
         // `cp` / `dd` sees ENOSPC at the FUSE layer and exits with
         // a real error.
-        if chunks.len() < target_count {
-            self.check_metadata_budget_for_chunks(id, target_count - chunks.len())?;
+        if cur_len < target_count {
+            self.check_metadata_budget_for_chunks(id, target_count - cur_len)?;
         }
 
         // Allocate any missing chunks up to target_count as zero-filled.
-        // Covers file extension, sparse holes (write past EOF), and
-        // pow2 padding. In hide-size mode, the new chunk 0 (if just
-        // allocated) gets its size header set below.
+        // Covers file extension, sparse holes (write past EOF), and pow2
+        // padding. New refs accumulate in `appended` (bounded by how far
+        // the write extends the file) and are NOT written into the inode
+        // until every disk write below has succeeded, so an error partway
+        // through leaves the inode exactly as it was -- identical
+        // roll-back semantics to the previous clone-then-discard code.
         let zero = vec![0u8; CHUNK_PLAINTEXT_SIZE];
-        while chunks.len() < target_count {
+        let mut appended: Vec<ChunkRef> = Vec::with_capacity(target_count.saturating_sub(cur_len));
+        while cur_len + appended.len() < target_count {
             let cref = ChunkRef {
                 id: self.tree.alloc_chunk_id().ok_or(Error::IdSpaceExhausted)?,
                 generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
             };
-            let chunk_idx = chunks.len() as u32;
+            let chunk_idx = (cur_len + appended.len()) as u32;
             chunk::write_chunk(&mut self.container, &key, id, chunk_idx, cref, &zero)?;
-            chunks.push(cref);
+            appended.push(cref);
         }
 
+        // Copy just the *existing* chunk refs this write covers (again
+        // O(write-length), not O(file-length)). Refs at index >= cur_len
+        // live in `appended`; indices below cur_len come from here.
+        let existing_hi = (last_chunk + 1).min(cur_len);
+        let covered_existing: Vec<ChunkRef> = if first_chunk < existing_hi {
+            let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?;
+            inode.chunks[first_chunk..existing_hi].to_vec()
+        } else {
+            Vec::new()
+        };
+
         // Read-modify-write over the covered range. Each rewrite gets a
-        // fresh generation counter (replay protection).
+        // fresh generation counter (replay protection). The new ref is
+        // recorded only AFTER its write succeeds: updates to existing
+        // chunks go in `updates`, updates to freshly-appended chunks are
+        // applied to `appended` in place.
+        let mut updates: Vec<(usize, ChunkRef)> = Vec::new();
         let mut buf_pos = 0usize;
         for chunk_idx in first_chunk..=last_chunk {
             let (chunk_file_start, chunk_file_end) = chunk_file_range(chunk_idx, hide_size)?;
@@ -3002,53 +3051,76 @@ impl Vfs {
             let pt_start = data_start + in_chunk_offset as usize;
             let pt_end = data_start + in_chunk_end as usize;
 
-            let mut pt = chunk::read_chunk(
-                &mut self.container,
-                &key,
-                id,
-                chunk_idx as u32,
-                chunks[chunk_idx],
-            )?;
+            let cur_ref = if chunk_idx < cur_len {
+                covered_existing[chunk_idx - first_chunk]
+            } else {
+                appended[chunk_idx - cur_len]
+            };
+            let mut pt =
+                chunk::read_chunk(&mut self.container, &key, id, chunk_idx as u32, cur_ref)?;
             pt[pt_start..pt_end].copy_from_slice(&buf[buf_pos..buf_pos + len_here]);
             // If this is chunk 0 in hide-size mode, refresh the size header
             // (the write may have grown the file).
             if hide_size && chunk_idx == 0 {
                 install_size_header(&mut pt, new_real);
             }
-            // Bump generation before re-writing.
-            chunks[chunk_idx].generation =
-                self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?;
-            chunk::write_chunk(
-                &mut self.container,
-                &key,
-                id,
-                chunk_idx as u32,
-                chunks[chunk_idx],
-                &pt,
-            )?;
+            // Fresh generation for the rewrite (same chunk id, new nonce
+            // + new generation for replay protection).
+            let new_ref = ChunkRef {
+                id: cur_ref.id,
+                generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
+            };
+            chunk::write_chunk(&mut self.container, &key, id, chunk_idx as u32, new_ref, &pt)?;
+            if chunk_idx < cur_len {
+                updates.push((chunk_idx, new_ref));
+            } else {
+                appended[chunk_idx - cur_len] = new_ref;
+            }
             buf_pos += len_here;
         }
 
         // If hide-size and chunk 0 wasn't in the rewritten range but the
-        // file grew, refresh chunk 0's size header.
-        if hide_size && new_real != old_real && first_chunk > 0 && !chunks.is_empty() {
-            let mut pt = chunk::read_chunk(&mut self.container, &key, id, 0, chunks[0])?;
+        // file grew, refresh chunk 0's size header. Chunk 0 is an
+        // existing chunk when the file was non-empty, or a just-appended
+        // one when the write started past a hole into a previously-empty
+        // file.
+        if hide_size && new_real != old_real && first_chunk > 0 && target_count > 0 {
+            let cur0 = if cur_len > 0 {
+                self.tree.inodes.get(&id).ok_or(Error::NotFound)?.chunks[0]
+            } else {
+                appended[0]
+            };
+            let mut pt = chunk::read_chunk(&mut self.container, &key, id, 0, cur0)?;
             install_size_header(&mut pt, new_real);
-            chunks[0].generation = self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?;
-            chunk::write_chunk(&mut self.container, &key, id, 0, chunks[0], &pt)?;
+            let new0 = ChunkRef {
+                id: cur0.id,
+                generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
+            };
+            chunk::write_chunk(&mut self.container, &key, id, 0, new0, &pt)?;
+            if cur_len > 0 {
+                updates.push((0, new0));
+            } else {
+                appended[0] = new0;
+            }
         }
 
-        // Persist updated inode metadata. In hide-size mode, inode.size is
-        // padded chunk capacity (not real size); cached_real_size carries
-        // the truth for in-memory stat hits.
-        let inode_size_field = if hide_size {
-            chunks.len() as u64 * CHUNK_PLAINTEXT_SIZE as u64
+        // Every disk write succeeded: commit the ref changes to the inode
+        // in a single pass. Existing-chunk generation bumps first (their
+        // indices are all < cur_len, valid before the extend), then the
+        // freshly-appended tail.
+        let inode_mut = self.tree.inodes.get_mut(&id).unwrap();
+        for (idx, r) in &updates {
+            inode_mut.chunks[*idx] = *r;
+        }
+        inode_mut.chunks.extend_from_slice(&appended);
+        // In hide-size mode, inode.size is padded chunk capacity (not
+        // real size); cached_real_size carries the truth for in-memory
+        // stat hits.
+        inode_mut.size = if hide_size {
+            inode_mut.chunks.len() as u64 * CHUNK_PLAINTEXT_SIZE as u64
         } else {
             new_real
         };
-        let inode_mut = self.tree.inodes.get_mut(&id).unwrap();
-        inode_mut.chunks = chunks;
-        inode_mut.size = inode_size_field;
         if hide_size {
             inode_mut.cached_real_size = Some(new_real);
         }
