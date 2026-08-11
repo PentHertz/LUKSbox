@@ -255,9 +255,55 @@ pub fn try_unwrap_slot(
     if pt.len() != KEY_LEN {
         return None;
     }
-    let mut bytes = [0u8; KEY_LEN];
+    // Hold the plaintext MVK in a `Zeroizing` buffer and construct via
+    // `from_zeroizing` (by-reference, no Copy temporary) so no un-wiped
+    // plaintext-MVK copy is left on the stack when this returns. The
+    // previous `let bytes = [0u8; KEY_LEN]; from_bytes(bytes)` moved a
+    // Copy array whose source binding was never scrubbed.
+    let mut bytes = Zeroizing::new([0u8; KEY_LEN]);
     bytes.copy_from_slice(&pt);
-    Some(MasterVolumeKey::from_bytes(bytes))
+    Some(MasterVolumeKey::from_zeroizing(&bytes))
+}
+
+/// Per-slot AEAD attempt used by the constant-time `trial_decrypt_with_idx`
+/// loop. Returns `(validity, candidate_mvk_bytes)` with the bytes zeroed
+/// on failure, WITHOUT constructing a `MasterVolumeKey`.
+///
+/// This exists so the loop does the same expensive work for every slot.
+/// `MasterVolumeKey::from_*` performs a `memfd_secret`/`mmap` syscall on
+/// Linux; building it per-slot only on the matching slot (as the
+/// `Option`-returning `try_unwrap_slot` does) makes the winning
+/// iteration measurably longer, leaking WHICH slot matched via
+/// wall-clock/syscall timing -- exactly what constant-time invariant #2
+/// promises to hide (a deniability-relevant leak). The single winning
+/// `MasterVolumeKey` is instead built once, after the loop, from the
+/// constant-time-selected bytes.
+fn try_unwrap_slot_bytes(
+    slot: &[u8; DENIABLE_SLOT_SIZE],
+    kek: &KeyEncryptionKey,
+    suite: CipherSuite,
+    per_vault_salt: &[u8; DENIABLE_SALT_SIZE],
+    slot_idx: usize,
+) -> (Choice, Zeroizing<[u8; KEY_LEN]>) {
+    let mut out = Zeroizing::new([0u8; KEY_LEN]);
+    let nonce: [u8; SLOT_NONCE_LEN] = match slot[..SLOT_NONCE_LEN].try_into() {
+        Ok(n) => n,
+        Err(_) => return (Choice::from(0u8), out),
+    };
+    let ct = &slot[SLOT_NONCE_LEN..SLOT_NONCE_LEN + SLOT_CT_AND_TAG_LEN];
+    let aad = slot_aad(per_vault_salt, slot_idx);
+    match aead::open(suite, kek.as_bytes(), &nonce, &aad, ct) {
+        Ok(pt) => {
+            let pt = Zeroizing::new(pt);
+            if pt.len() == KEY_LEN {
+                out.copy_from_slice(&pt);
+                (Choice::from(1u8), out)
+            } else {
+                (Choice::from(0u8), out)
+            }
+        }
+        Err(_) => (Choice::from(0u8), out),
+    }
 }
 
 /// Constant-time trial decryption across every slot.
@@ -301,22 +347,12 @@ pub fn trial_decrypt_with_idx(
     let mut found_idx_u8: u8 = 0;
 
     for slot_idx in 0..DENIABLE_SLOT_COUNT {
-        let attempt = try_unwrap_slot(&slots[slot_idx], kek, suite, per_vault_salt, slot_idx);
-        let valid = Choice::from(attempt.is_some() as u8);
-
-        // Round 12 fix R12-13: wrap the candidate bytes in
-        // `Zeroizing` so the Drop-on-scope-exit path zeroes the
-        // STORAGE rather than a separately-named Copy. The previous
-        // `let mut cand_scrub = cand_bytes; cand_scrub.zeroize()`
-        // wiped a copy and left the original `[u8;32]` (which is
-        // Copy) sitting on the stack until the frame reused the
-        // slot.
-        let cand_bytes: Zeroizing<[u8; KEY_LEN]> = Zeroizing::new(
-            attempt
-                .as_ref()
-                .map(|m| *m.as_bytes())
-                .unwrap_or([0u8; KEY_LEN]),
-        );
+        // Per-slot AEAD attempt WITHOUT building a MasterVolumeKey, so
+        // every iteration does identical work regardless of match (see
+        // `try_unwrap_slot_bytes`). `cand_bytes` is `Zeroizing`, so its
+        // storage is wiped on drop at the end of the iteration.
+        let (valid, cand_bytes) =
+            try_unwrap_slot_bytes(&slots[slot_idx], kek, suite, per_vault_salt, slot_idx);
 
         for i in 0..KEY_LEN {
             mvk_bytes[i] = u8::conditional_select(&mvk_bytes[i], &cand_bytes[i], valid);

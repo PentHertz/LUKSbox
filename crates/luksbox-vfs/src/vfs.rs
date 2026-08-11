@@ -317,11 +317,20 @@ pub const MAX_FILE_SIZE: u64 = 1u64 << 44;
 // to u32 range so raising MAX_FILE_SIZE past 1<<44 fails the build
 // instead of silently truncating index 2^32 to 0 (which would let two
 // chunks of one file share an AAD and defeat the position-binding
-// defense). Hide-size mode adds one chunk (the size header), nudging
-// the theoretical max to exactly 2^32; that single edge stays
-// unreachable because `check_metadata_budget_for_chunks` refuses tens
-// of GB of ChunkRefs long before -- but never widen MAX_FILE_SIZE
-// without re-deriving this bound.
+// defense).
+//
+// Hide-size mode adds one chunk (the size header), nudging the
+// theoretical max index to exactly 2^32. That edge is not reachable by
+// an attacker: on open, `chunk::walk_chunk_list_chain` hard-caps the
+// recovered chunk count at 1<<32, so even MVK-forged metadata cannot
+// present an index past 2^32-1; on write, reaching it needs a genuine
+// ~16 TiB hide-size file, which requires the vault passphrase and 16 TiB
+// of disk (a self-DoS at worst, not an attacker capability). (An earlier
+// version of this comment credited `check_metadata_budget_for_chunks`
+// with the bound, but that check renders an over-threshold file as a
+// fixed-size External stub and does NOT cap its chunk count -- the real
+// bounds are the walk cap and the disk-size reality above.) Never widen
+// MAX_FILE_SIZE without re-deriving this bound.
 const _: () = assert!(
     MAX_FILE_SIZE / (CHUNK_PLAINTEXT_SIZE as u64) - 1 <= u32::MAX as u64,
     "MAX_FILE_SIZE too large: a chunk index would overflow the u32 in the chunk AAD",
@@ -3158,9 +3167,21 @@ impl Vfs {
         let key = chunk::file_key(&self.container, id);
         let mut chunks = inode.chunks.clone();
 
+        // Collect the ids of chunks being dropped, but do NOT return them
+        // to the free-list until every fallible write below has succeeded
+        // and the inode is committed (commit-last discipline, matching
+        // `write`). Freeing eagerly (as an earlier version did) meant a
+        // failure in the hide-size chunk-0 rewrite below would leave those
+        // ids in `free_chunks` while the still-uncommitted `inode.chunks`
+        // continued to reference them; a later allocation could then reuse
+        // an id an existing file still points at -- an AEAD-failing read,
+        // or a free/live collision that `validate_metadata_tree` rejects
+        // at the next open. Fail-safe either way, but the inconsistency is
+        // avoidable.
+        let mut freed_ids: Vec<ChunkId> = Vec::new();
         while chunks.len() > new_chunk_count {
             let cref = chunks.pop().unwrap();
-            self.tree.free_chunk_id(cref.id);
+            freed_ids.push(cref.id);
         }
 
         // Same metadata-budget pre-flight as `write`. Only relevant
@@ -3205,6 +3226,12 @@ impl Vfs {
         self.dirty = true;
         // Layer 2: same reasoning as `write` -- chunks vec mutated.
         self.chunks_dirty.insert(id);
+        // All writes succeeded and the inode no longer references the
+        // dropped chunks: now it is safe to return their ids to the
+        // free-list (see the note at the shrink loop above).
+        for freed in freed_ids {
+            self.tree.free_chunk_id(freed);
+        }
         Ok(())
     }
 

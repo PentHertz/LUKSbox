@@ -14,6 +14,106 @@ canonical record.
 
 ---
 
+## [v0.5.2-rc.1] - 2026-08-11
+
+Release candidate on top of v0.5.1. It removes a large-file I/O
+performance cliff that made mounted vaults crawl on Windows, fixes a
+GUI freeze on the zoom shortcut, and lands a round of security-audit
+hardening. There is no on-disk format change: existing vaults, headers,
+and sidecars open unchanged.
+
+### Performance
+
+- Mounted-volume read/write no longer degrades on large files.
+  `Vfs::read` and `Vfs::write` cloned the entire per-inode
+  chunk-reference vector on every call (`read` once, `write` twice) --
+  one 16-byte entry per 4 KiB of file, so a multi-gigabyte file's vector
+  holds millions of entries. That made every I/O op cost O(file_size)
+  and sequential growth O(file_size^2); a direct measurement puts the
+  clone at ~0.4 us at 8 MiB but ~9.6 ms at 10 GiB, so a single pre-fix
+  write spent ~19 ms just cloning. FUSE on Linux/macOS batches I/O into
+  large requests and mostly hid it, but WinFsp on Windows dispatches
+  many small requests, so a 10 GB copy fell to ~30 MB/s against
+  ~400 MB/s on native NTFS and large VM images on a mounted vault were
+  unusable. Both paths now copy only the chunk refs an operation
+  actually touches (O(request length)), so per-op cost is independent of
+  file size; the encrypted on-disk bytes, per-chunk AEAD binding, and
+  error-path rollback are unchanged. Regression coverage:
+  `crates/luksbox-vfs/tests/rmw_chunk_binding_after_refactor.rs` and
+  `large_file_io_scaling.rs`. (GitHub #31;
+  `crates/luksbox-vfs/src/vfs.rs`)
+
+### Fixed
+
+- The desktop GUI no longer freezes and crashes when you press Ctrl (or
+  Cmd) with `+` / `-` / `0` to change zoom. The shortcut handler read
+  and wrote the egui zoom factor from *inside* a `Context::input_mut`
+  closure, which egui runs while holding the `Context`'s internal lock;
+  both zoom accessors re-acquire that same lock, so the UI thread
+  dead-locked the instant the shortcut was pressed and the window went
+  "not responding" / was force-killed. Reported on Windows but the
+  deadlock is platform-independent (it affects Linux and macOS too). The
+  zoom change is now applied after the input closure releases the lock,
+  and the logic is unit-tested headlessly. (GitHub #32;
+  `crates/luksbox-gui/src/app.rs`)
+
+### Security
+
+An internal audit round reviewed the crypto core, container/sidecar
+parsing, the VFS chunk path, the mount layer, and every `unsafe` / FFI
+site in the workspace. It found **no critical, high, or memory-safety
+defect** reachable from a crafted vault, and `cargo audit` is clean
+(only the two documented, allow-listed unmaintained-crate advisories,
+`paste` and `registry`, neither with a filed CVE). The audit also
+positively confirmed that anchor rollback detection is enforced at every
+open path (CLI, wizard, GUI) and that the read/write performance rewrite
+above preserves the per-chunk AEAD binding, fresh generation per
+rewrite, and fail-safe rollback. The following low-severity hardening
+items were fixed:
+
+- **Deniable trial-decryption is now genuinely constant-time.** The
+  `trial_decrypt` / `trial_decrypt_with_idx` helpers constructed a
+  `MasterVolumeKey` (a `memfd_secret` / `mmap` syscall on Linux) only on
+  the matching slot, so the winning iteration ran measurably longer and
+  leaked *which* slot matched via wall-clock / syscall timing -- a
+  deniability-relevant side channel the module's constant-time invariant
+  promises to close. The per-slot attempt no longer builds a key; the
+  single winning key is constructed once, after the constant-time
+  selection loop. A stack-resident plaintext-MVK copy in
+  `try_unwrap_slot` is now scrubbed via a `Zeroizing` buffer. These
+  helpers are not on the live container-open path (which was already
+  branchless), so there is no behaviour change for users.
+  (`crates/luksbox-core/src/deniable.rs`)
+- **The create-time metadata-region-size override is clamped to the
+  on-disk cap.** A `--metadata-size` above `MAX_METADATA_SIZE` (64 MiB)
+  wrote a header that `Header::from_bytes` rejects at open -- an
+  unreopenable vault -- and could overflow the
+  `metadata_offset + region_size` arithmetic in `create_internal`. The
+  size is now clamped at the single create-time choke point; the 64 MiB
+  default and any in-range override pass through unchanged.
+  (`crates/luksbox-format/src/metadata.rs`)
+- **`Vfs::truncate` now frees chunk ids commit-last.** A truncate-down
+  returned the dropped chunk ids to the free-list *before* the final,
+  fallible hide-size chunk-0 rewrite committed; an I/O fault there left
+  those ids on the free-list while the still-live inode referenced them,
+  so a later allocation could reuse an id an existing file pointed at.
+  It fails safe (an AEAD-failing read, or the next open's validator
+  rejecting the free/live collision), but the window is now closed by
+  deferring the frees until every write has succeeded -- the same
+  commit-last discipline the read/write rewrite uses.
+  (`crates/luksbox-vfs/src/vfs.rs`)
+- Corrected a chunk-index-bound code comment in the VFS whose stated
+  justification was inaccurate (the real bounds are the chunk-list-walk
+  cap and the per-file size cap, not the metadata-budget check), and the
+  `Fido2CredIdTooLong` error message, which named a stale 128-byte cap.
+
+### Dependencies
+
+- No dependency changes. `cargo audit` clean (2 allow-listed
+  unmaintained advisories, documented in `audit.toml` / `SECURITY.md`).
+
+---
+
 ## [v0.5.1] - 2026-08-03
 
 Patch release on top of v0.5.0. It repairs TPM 2.0 keyslot sealing and
