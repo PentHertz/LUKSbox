@@ -57,7 +57,7 @@ pub enum Error {
     #[error("invalid field value")]
     InvalidField,
 
-    #[error("FIDO2 credential id too long ({0} > 128)")]
+    #[error("FIDO2 credential id too long ({0} bytes; exceeds the keyslot format's cap)")]
     Fido2CredIdTooLong(usize),
 
     #[error("OS RNG failure: {0}")]

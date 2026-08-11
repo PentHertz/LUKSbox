@@ -87,14 +87,24 @@ thread_local! {
 }
 
 /// Read the current thread-local metadata-region-size override, or
-/// fall back to `DEFAULT_METADATA_REGION_SIZE`. The on-disk cap
-/// [`luksbox_core::header::MAX_METADATA_SIZE`] (16 MiB today) is also
-/// enforced by the header parser at create time, so callers that set
-/// an absurd override get a clean rejection.
+/// fall back to `DEFAULT_METADATA_REGION_SIZE`, clamped to the on-disk
+/// cap [`luksbox_core::header::MAX_METADATA_SIZE`] (64 MiB).
+///
+/// The clamp is load-bearing: `Header::from_bytes` rejects any
+/// `metadata_size > MAX_METADATA_SIZE` at OPEN time, but the create path
+/// (`Header::to_bytes`) does NOT validate. Without clamping here, a
+/// caller-supplied override above the cap (e.g. `--metadata-size 100M`)
+/// would write a header that can never be re-opened -- an unreopenable
+/// vault -- and could overflow the `metadata_offset + region_size`
+/// arithmetic in `create_internal`. Clamping at this single choke point
+/// keeps every created vault reopenable regardless of what any front-end
+/// passes. Overrides at or below the cap (the common `--metadata-size`
+/// case, and the 64 MiB default) pass through unchanged.
 pub fn resolved_create_metadata_region_size() -> u64 {
-    CREATE_METADATA_SIZE_OVERRIDE
+    let requested = CREATE_METADATA_SIZE_OVERRIDE
         .with(|c| c.get())
-        .unwrap_or(DEFAULT_METADATA_REGION_SIZE)
+        .unwrap_or(DEFAULT_METADATA_REGION_SIZE);
+    requested.min(luksbox_core::header::MAX_METADATA_SIZE)
 }
 
 /// RAII guard returned by [`set_create_metadata_region_size_override`].
@@ -233,6 +243,43 @@ pub fn read_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversize_create_override_is_clamped_to_max() {
+        // A caller-supplied override above the on-disk cap must be
+        // clamped so the created vault stays reopenable (Header::from_bytes
+        // rejects metadata_size > MAX_METADATA_SIZE at open) and the
+        // metadata_offset + region_size math cannot overflow. Security
+        // audit follow-up.
+        let _g = set_create_metadata_region_size_override(Some(
+            luksbox_core::header::MAX_METADATA_SIZE + 100 * 1024 * 1024,
+        ));
+        assert_eq!(
+            resolved_create_metadata_region_size(),
+            luksbox_core::header::MAX_METADATA_SIZE,
+            "override above MAX_METADATA_SIZE must clamp to the cap"
+        );
+    }
+
+    #[test]
+    fn in_range_create_override_passes_through() {
+        // The common case (small demo vault) is untouched by the clamp.
+        let want = 8 * 1024 * 1024;
+        let _g = set_create_metadata_region_size_override(Some(want));
+        assert_eq!(resolved_create_metadata_region_size(), want);
+    }
+
+    #[test]
+    fn default_create_metadata_size_is_unclamped() {
+        // No override: the 64 MiB default equals the cap, so it passes
+        // through unchanged (regression guard against clamping below the
+        // default and breaking every new vault).
+        assert_eq!(
+            resolved_create_metadata_region_size(),
+            DEFAULT_METADATA_REGION_SIZE
+        );
+        assert!(DEFAULT_METADATA_REGION_SIZE <= luksbox_core::header::MAX_METADATA_SIZE);
+    }
 
     #[test]
     fn metadata_roundtrip_empty() {

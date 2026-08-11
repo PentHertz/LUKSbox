@@ -1895,6 +1895,46 @@ impl LuksboxApp {
 
 // ---- update loop ----------------------------------------------------------
 
+/// Apply the live zoom keyboard shortcuts: Ctrl/Cmd with `+`/`=` zooms
+/// in, with `-` zooms out (0.1 steps, clamped to 0.5..=4.0), and with
+/// `0` resets to 1.0.
+///
+/// Extracted from the update loop so the lock-ordering contract is
+/// explicit and unit-testable. `Context::input_mut` runs its closure
+/// while egui holds the `Context`'s internal `RwLock` (write); the zoom
+/// accessors re-acquire that same lock (`zoom_factor` reads it,
+/// `set_zoom_factor` writes it). Calling either from *inside* the
+/// closure is a same-thread re-entrant lock and deadlocks the UI thread
+/// the instant the shortcut is pressed -- the window then shows "not
+/// responding" and gets force-killed (issue #32). So the closure only
+/// consumes the key events from the `InputState`, and the zoom factor is
+/// read/written afterwards, once the lock has been released.
+fn apply_zoom_shortcuts(ctx: &egui::Context) {
+    let mut zoom_delta = 0.0f32;
+    let mut zoom_reset = false;
+    ctx.input_mut(|i| {
+        // `consume_key` already matches on the COMMAND modifier, so it
+        // only fires when Ctrl/Cmd is held; no extra guard needed.
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
+            || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus)
+        {
+            zoom_delta += 0.1;
+        }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus) {
+            zoom_delta -= 0.1;
+        }
+        if i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num0) {
+            zoom_reset = true;
+        }
+    });
+    if zoom_reset {
+        ctx.set_zoom_factor(1.0);
+    } else if zoom_delta != 0.0 {
+        let z = (ctx.zoom_factor() + zoom_delta).clamp(0.5, 4.0);
+        ctx.set_zoom_factor(z);
+    }
+}
+
 impl eframe::App for LuksboxApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -1903,24 +1943,11 @@ impl eframe::App for LuksboxApp {
         // fractional-DPI handhelds (GPD, Steam Deck, Surface Go, etc.)
         // where the OS-reported scale + egui's hit-rect rounding drift
         // produces dead-zones in the bottom-right of long pages.
-        // Persistent override via env var: LUKSBOX_GUI_ZOOM=1.5
-        ctx.input_mut(|i| {
-            let ctrl = i.modifiers.command;
-            if ctrl
-                && (i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals)
-                    || i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus))
-            {
-                let z = (ctx.zoom_factor() + 0.1).min(4.0);
-                ctx.set_zoom_factor(z);
-            }
-            if ctrl && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus) {
-                let z = (ctx.zoom_factor() - 0.1).max(0.5);
-                ctx.set_zoom_factor(z);
-            }
-            if ctrl && i.consume_key(egui::Modifiers::COMMAND, egui::Key::Num0) {
-                ctx.set_zoom_factor(1.0);
-            }
-        });
+        // Persistent override via env var: LUKSBOX_GUI_ZOOM=1.5.
+        // (The zoom factor MUST be set outside the input closure to
+        // avoid a Context lock re-entrancy deadlock; see
+        // `apply_zoom_shortcuts`, issue #32.)
+        apply_zoom_shortcuts(&ctx);
 
         // Drive pending ops; repaint quickly while one is in flight.
         self.poll_pending(&ctx);
@@ -13028,4 +13055,106 @@ fn deniable_verify_worker(
         "header opened. cipher={:?} flags=0x{:08x} chunk_size={} metadata_off={} data_off={}",
         h.cipher_suite, h.flags, h.chunk_size, h.metadata_offset, h.data_offset,
     ))
+}
+
+#[cfg(test)]
+mod zoom_shortcut_tests {
+    //! Regression tests for the Ctrl +/- zoom shortcuts (issue #32).
+    //!
+    //! The bug was a same-thread re-entrant `Context` lock: the pre-fix
+    //! code read/wrote the zoom factor from *inside* the `input_mut`
+    //! closure, which egui runs while holding that lock, deadlocking the
+    //! UI thread. These tests drive `apply_zoom_shortcuts` headlessly
+    //! through a real `egui::Context`. If the deadlock is reintroduced,
+    //! the `Context::run` call below never returns and the test hangs --
+    //! surfacing as a CI timeout rather than a silent regression.
+
+    use super::apply_zoom_shortcuts;
+
+    fn command_key(key: egui::Key) -> egui::RawInput {
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            // `Modifiers::COMMAND` is what the real handler matches on
+            // (Ctrl on Windows/Linux, Cmd on macOS); setting it on the
+            // event makes `consume_key` accept it on every platform.
+            modifiers: egui::Modifiers::COMMAND,
+        });
+        input
+    }
+
+    /// Set `initial`, feed `input` through `apply_zoom_shortcuts`, then
+    /// run one more (empty) pass so the queued zoom factor takes effect
+    /// (`set_zoom_factor` applies at the start of the next pass), and
+    /// return the resulting zoom factor.
+    fn zoom_after(input: egui::RawInput, initial: f32) -> f32 {
+        let ctx = egui::Context::default();
+        ctx.set_zoom_factor(initial);
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {}); // apply `initial`
+        // Runs inside a real Ui pass, exactly like the app's update loop.
+        // Re-entering the Context lock here (the issue-#32 bug) would hang.
+        let _ = ctx.run_ui(input, |ui| apply_zoom_shortcuts(ui.ctx()));
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {}); // apply the change
+        ctx.zoom_factor()
+    }
+
+    #[test]
+    fn ctrl_plus_increases_zoom_without_deadlocking() {
+        let z = zoom_after(command_key(egui::Key::Plus), 1.0);
+        assert!(
+            (z - 1.1).abs() < 1e-4,
+            "Ctrl+Plus should step zoom to 1.1, got {z}"
+        );
+    }
+
+    #[test]
+    fn ctrl_equals_increases_zoom() {
+        let z = zoom_after(command_key(egui::Key::Equals), 1.0);
+        assert!(
+            (z - 1.1).abs() < 1e-4,
+            "Ctrl+= should step zoom to 1.1, got {z}"
+        );
+    }
+
+    #[test]
+    fn ctrl_minus_decreases_zoom() {
+        let z = zoom_after(command_key(egui::Key::Minus), 1.0);
+        assert!(
+            (z - 0.9).abs() < 1e-4,
+            "Ctrl+- should step zoom to 0.9, got {z}"
+        );
+    }
+
+    #[test]
+    fn ctrl_zero_resets_zoom() {
+        let z = zoom_after(command_key(egui::Key::Num0), 2.0);
+        assert!(
+            (z - 1.0).abs() < 1e-4,
+            "Ctrl+0 should reset zoom to 1.0, got {z}"
+        );
+    }
+
+    #[test]
+    fn zoom_out_clamps_at_floor() {
+        let z = zoom_after(command_key(egui::Key::Minus), 0.5);
+        assert!(z >= 0.5 - 1e-6, "zoom must clamp at the 0.5 floor, got {z}");
+    }
+
+    #[test]
+    fn no_modifier_does_not_zoom() {
+        // A bare `+` (no Ctrl/Cmd) must not change zoom.
+        let mut input = egui::RawInput::default();
+        input.events.push(egui::Event::Key {
+            key: egui::Key::Plus,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        let z = zoom_after(input, 1.0);
+        assert!((z - 1.0).abs() < 1e-4, "plain '+' must not zoom, got {z}");
+    }
 }
