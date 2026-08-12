@@ -159,7 +159,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -170,7 +170,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -905,16 +905,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "core-foundation"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
-dependencies = [
- "core-foundation-sys",
- "libc",
-]
-
-[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -927,7 +917,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c07782be35f9e1140080c6b96f0d44b739e2278479f64e02fdab4e32dfd8b081"
 dependencies = [
  "bitflags 1.3.2",
- "core-foundation 0.9.4",
+ "core-foundation",
  "core-graphics-types",
  "foreign-types",
  "libc",
@@ -940,7 +930,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "45390e6114f68f718cc7a830514a96f903cccd70d02a8f6d9f643ac4ba45afaf"
 dependencies = [
  "bitflags 1.3.2",
- "core-foundation 0.9.4",
+ "core-foundation",
  "libc",
 ]
 
@@ -1554,7 +1544,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2547,7 +2537,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "luksbox-cli"
-version = "0.5.2-rc.1"
+version = "0.5.2"
 dependencies = [
  "clap",
  "dialoguer",
@@ -2572,7 +2562,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-core"
-version = "0.5.2-rc.1"
+version = "0.5.2"
 dependencies = [
  "aes-gcm",
  "aes-gcm-siv",
@@ -2594,14 +2584,14 @@ dependencies = [
 
 [[package]]
 name = "luksbox-ct-bench"
-version = "0.5.2-rc.1"
+version = "0.5.2"
 dependencies = [
  "rand",
 ]
 
 [[package]]
 name = "luksbox-fido2"
-version = "0.5.2-rc.1"
+version = "0.5.2"
 dependencies = [
  "aes",
  "bindgen 0.72.1",
@@ -2623,7 +2613,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-format"
-version = "0.5.2-rc.1"
+version = "0.5.2"
 dependencies = [
  "fs2",
  "hmac",
@@ -2641,7 +2631,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-fuse-t"
-version = "0.5.2-rc.1"
+version = "0.5.2"
 dependencies = [
  "bindgen 0.71.1",
  "libc",
@@ -2651,7 +2641,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-gui"
-version = "0.5.2-rc.1"
+version = "0.5.2"
 dependencies = [
  "arboard",
  "dirs",
@@ -2683,7 +2673,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-mount"
-version = "0.5.2-rc.1"
+version = "0.5.2"
 dependencies = [
  "ctrlc",
  "fuser",
@@ -2701,7 +2691,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-pq"
-version = "0.5.2-rc.1"
+version = "0.5.2"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2723,7 +2713,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-sep"
-version = "0.5.2-rc.1"
+version = "0.5.2"
 dependencies = [
  "rand_core 0.6.4",
  "tempfile",
@@ -2733,7 +2723,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-tpm"
-version = "0.5.2-rc.1"
+version = "0.5.2"
 dependencies = [
  "luksbox-core",
  "luksbox-format",
@@ -2747,7 +2737,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-vfs"
-version = "0.5.2-rc.1"
+version = "0.5.2"
 dependencies = [
  "luksbox-core",
  "luksbox-format",
@@ -3926,7 +3916,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4295,7 +4285,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4551,7 +4541,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -4953,15 +4943,15 @@ dependencies = [
 
 [[package]]
 name = "webbrowser"
-version = "1.2.1"
+version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0fc95580916af1e68ff6a7be07446fc5db73ebf71cf092de939bbf5f7e189f72"
+checksum = "ef62a3d5f7b2411119a11b6f62570dbff91d7105e011a20fb83fbf8f5761c40f"
 dependencies = [
- "core-foundation 0.10.1",
  "jni",
  "log",
  "ndk-context",
  "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
  "objc2-foundation 0.3.2",
  "url",
  "web-sys",
@@ -5114,7 +5104,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -5460,7 +5450,7 @@ dependencies = [
  "calloop 0.13.0",
  "cfg_aliases",
  "concurrent-queue",
- "core-foundation 0.9.4",
+ "core-foundation",
  "core-graphics",
  "cursor-icon",
  "dpi",

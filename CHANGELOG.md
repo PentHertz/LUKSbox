@@ -14,6 +14,53 @@ canonical record.
 
 ---
 
+## [v0.5.2] - 2026-08-12
+
+Stable release of the v0.5.2 line. It promotes `v0.5.2-rc.1` to stable
+with no source-code changes since the candidate; the only delta is the
+transitive dependency patch bump noted below. There is no on-disk
+format change: existing vaults, headers, and sidecars open unchanged,
+so this is a drop-in upgrade from v0.5.1 (or any earlier v0.5 release).
+
+Highlights, grouped by theme. Full detail lives in the `v0.5.2-rc.1`
+entry below.
+
+- Large-file I/O on a mounted vault no longer slows to a crawl. Every
+  `Vfs::read` / `Vfs::write` used to clone the whole per-inode
+  chunk-reference vector, making each operation cost grow with the file
+  size and sequential growth cost grow with its square. FUSE on Linux
+  and macOS batched I/O and mostly hid it, but WinFsp on Windows issues
+  many small requests, so a 10 GB copy ran at roughly 30 MB/s and large
+  VM images were unusable on a mounted vault. Both paths now touch only
+  the chunk refs an operation actually needs, so per-operation cost is
+  independent of file size. The encrypted bytes, the per-chunk AEAD
+  binding, and the error-path rollback are unchanged. (GitHub #31)
+- The desktop GUI no longer freezes and gets force-killed when you use
+  the Ctrl/Cmd zoom shortcut (`+` / `-` / `0`). The handler read and
+  wrote the zoom factor from inside egui's input closure, which already
+  holds the context lock the zoom accessors re-acquire, so the UI thread
+  deadlocked on the first press. Reported on Windows, but the deadlock
+  was platform-independent and affected Linux and macOS too. (GitHub #32)
+- A security-audit round found no critical, high, or memory-safety
+  defect reachable from a crafted vault, and closed a set of
+  low-severity hardening items: deniable trial decryption is now
+  genuinely constant-time, the create-time `--metadata-size` override is
+  clamped to the on-disk cap so it can no longer write an unreopenable
+  header, and `Vfs::truncate` frees chunk ids commit-last so an I/O
+  fault mid-truncate can no longer hand a live id back to the free-list.
+
+### Dependencies
+
+- Bumped `webbrowser` 1.2.1 to 1.2.2 (a transitive dependency pulled in
+  only by the desktop GUI, through `eframe` / `egui-winit`, to open a
+  link clicked in the UI). 1.2.2 fixes RUSTSEC-2026-0257, a Unix
+  `$BROWSER` argument-injection issue that requires an attacker who can
+  already set the `BROWSER` environment variable of the user running the
+  GUI; it does not affect the CLI or Windows. The bump also drops a now
+  unused `core-foundation` transitive. With it, `cargo audit` is clean
+  again, carrying only the two documented, allow-listed unmaintained
+  advisories (`paste`, `registry`).
+
 ## [v0.5.2-rc.1] - 2026-08-11
 
 Release candidate on top of v0.5.1. It removes a large-file I/O

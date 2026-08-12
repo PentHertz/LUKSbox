@@ -1113,6 +1113,38 @@ If you're using LUKSbox to protect material information, please:
     environment too, where another tool spawned in the same shell
     inherits it. The pipe form is process-local.
 
+11. **Environment variables that affect security behavior.** LUKSbox
+    reads a number of `LUKSBOX_*` variables for automation, diagnostics,
+    and recovery. The table below is the full set that can change a
+    security property, so you can tell which are safe to set in a script
+    and which relax a guarantee. The one variable that could weaken the
+    key-derivation cost (`LUKSBOX_TEST_FAST_KDF`) is compiled out of
+    release builds and has no effect in a shipped binary.
+
+    | Variable | What it does | In a release build | Security effect |
+    |---|---|---|---|
+    | `LUKSBOX_TEST_FAST_KDF` | Downgrades Argon2id to trivially weak parameters so the test suite runs fast | **No effect**, gated behind `debug_assertions` and returns `false` in release | None in release. In a debug build it makes new keyslots brute-forceable, so never rely on a vault created by a debug build. |
+    | `LUKSBOX_ACCEPT_EMPTY=1` | Skips the empty-passphrase confirmation so automation can create a slot with no passphrase | Honored | Relaxes a confirmation. An empty-passphrase slot is effectively unprotected (its wrap is trivially derivable). Use only for throwaway vaults or when a second factor also gates the slot. |
+    | `LUKSBOX_NO_LOCK=1` | Disables the advisory `flock` open-lock on the vault file | Honored, and documented as dangerous | Reduces a guarantee. A second process can open the same vault concurrently, which the lock normally prevents. Never share a mounted vault. |
+    | `LUKSBOX_FORMAT_V2=1` | Forces the legacy v2 on-disk format and suppresses the auto-upgrade to v3 | Honored | Reduces a guarantee. v2 has no header or metadata crash-recovery mirrors. |
+    | `LUKSBOX_ACCEPT_WEAK=1` | Auto-confirms the "use this weak passphrase anyway?" prompt | Honored | Skips a nag only. The zxcvbn warning still prints and Argon2id still runs at full strength, so it does not weaken the cryptography, only the guardrail. |
+    | `LUKSBOX_TOLERATE_BAD_CHUNK_LISTS=1` | Recovery mode: a file whose chunk-list is corrupt is installed with zero chunks so the rest of the vault still opens | Honored | Recovery only. It silently turns an unreadable file into an empty one. Use it on a copy, mount read-only, and never write. |
+    | `LUKSBOX_PASSPHRASE`, `LUKSBOX_NEW_PASSPHRASE`, `LUKSBOX_FIDO2_PIN` | Supply a secret non-interactively | Honored | Leaks the secret into the process environment, readable via `/proc/<pid>/environ` by the same UID. Prefer the stdin pipe (item 10). |
+    | `LUKSBOX_NO_FOLLOW_SYMLINKS=1` | Refuses to open a vault reached through a symlink | Honored | Hardening opt-in (protective). |
+    | `LUKSBOX_SANDBOX_HELPER=1` | Enables the Linux GUI sandbox helper | Honored | Hardening opt-in (protective). |
+    | `LUKSBOX_FAKE_NO_AES`, `LUKSBOX_SUPPRESS_AES_WARNING` | Force, or hide, the software-AES advisory | Honored | Cosmetic. Neither changes the cipher; the advisory just recommends `--cipher chacha` on CPUs without AES acceleration. |
+    | `LUKSBOX_DEBUG_OPEN`, `LUKSBOX_WINFSP_DEBUG` | Verbose open / WinFsp diagnostics to stderr | Honored | Diagnostic. May print structural (not secret) detail, so avoid it in shared logs. |
+    | `LUKSBOX_GUI_ZOOM`, `LUKSBOX_GUI_SWRAST_RETRY` | GUI render scale and software-rasterizer relaunch | Honored | No security effect. |
+
+    Several of the bypass variables (for example `LUKSBOX_ACCEPT_WEAK`,
+    `LUKSBOX_ACCEPT_EMPTY`, and `LUKSBOX_FAKE_NO_AES`) are checked by
+    presence, so any value, including `0`, enables them. To turn the
+    behavior off, unset the variable rather than setting it to `0`.
+
+    Build-time only: `LUKSBOX_LIBFIDO2_VERSION` stamps the linked
+    libfido2 version string at compile time via `option_env!` and is not
+    read at runtime.
+
 ---
 
 ## 8. Audit history
