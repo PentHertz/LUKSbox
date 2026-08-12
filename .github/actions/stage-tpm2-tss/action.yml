@@ -24,13 +24,44 @@ runs:
         $ErrorActionPreference = 'Stop'
         $ver = '${{ inputs.tpm2-tss-version }}'
 
+        # Retry wrapper for the network fetches below. The GitHub archive
+        # endpoint and the choco mirrors return transient 503s, and a
+        # single blip should not fail the whole Windows TPM build. Mirrors
+        # the retry convention in .github/actions/apt-install. With
+        # $ErrorActionPreference = 'Stop' a non-2xx response (like the 503
+        # seen in CI) is a terminating error, so the catch retries it.
+        function Invoke-WithRetry {
+            param(
+                [Parameter(Mandatory)] [scriptblock] $Action,
+                [string] $What = 'network operation',
+                [int] $Max = 5,
+                [int] $BaseDelaySec = 5
+            )
+            for ($attempt = 1; $attempt -le $Max; $attempt++) {
+                try {
+                    & $Action
+                    return
+                } catch {
+                    if ($attempt -eq $Max) {
+                        Write-Error "$What failed after $Max attempts: $($_.Exception.Message)"
+                        throw
+                    }
+                    $delay = [int]($BaseDelaySec * [math]::Pow(2, $attempt - 1))
+                    Write-Host "==> $What failed (attempt $attempt/$Max): $($_.Exception.Message). Retrying in ${delay}s..."
+                    Start-Sleep -Seconds $delay
+                }
+            }
+        }
+
         # a. tpm2-tss source at a SHORT path. Deep paths trip MSBuild's
         #    file tracker with an inscrutable MSB6003, and setting
         #    TPM2_TSS_SOURCE_PATH also keeps the tss-esapi-sys build
         #    script from git-cloning on its own. The GitHub archive
         #    snapshot is required: the autotools dist tarball omits the
         #    VS solution.
-        Invoke-WebRequest -Uri "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/$ver.zip" -OutFile 'C:\t2t.zip'
+        Invoke-WithRetry -What 'tpm2-tss archive download' -Action {
+            Invoke-WebRequest -Uri "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/$ver.zip" -OutFile 'C:\t2t.zip'
+        }
         Expand-Archive 'C:\t2t.zip' -DestinationPath 'C:\t2t'
         $src = "C:\t2t\tpm2-tss-$ver"
         if (-not (Test-Path "$src\tpm2-tss.sln")) {
@@ -55,7 +86,10 @@ runs:
         $roots = @("$env:ProgramFiles\OpenSSL", "$env:ProgramFiles\OpenSSL-Win64", 'C:\OpenSSL-Win64')
         $ossl = Find-Crypto $roots
         if (-not $ossl) {
-            choco install openssl -y --no-progress
+            Invoke-WithRetry -What 'choco install openssl' -Action {
+                choco install openssl -y --no-progress
+                if ($LASTEXITCODE -ne 0) { throw "choco install openssl exited with $LASTEXITCODE" }
+            }
             $ossl = Find-Crypto $roots
         }
         if (-not $ossl) {
