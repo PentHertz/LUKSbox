@@ -204,7 +204,13 @@ if command -v cargo-audit >/dev/null 2>&1 || cargo audit --version >/dev/null 2>
         green "cargo audit: clean (0 vulns, 0 unsound, 0 unmaintained)"
     else
         # Distinguish vulns (block) from unmaintained warnings (note).
-        if grep -qE '^Crate:.*Title:.*Vulnerability' /tmp/luksbox-audit.log; then
+        # R15-J7: cargo-audit prints `Crate:` / `Title:` / `Severity:` on
+        # separate lines, so the previous single-line regex could never
+        # match and a real vulnerability was waved through as
+        # "unmaintained-warnings only". Re-run without `--deny warnings`:
+        # its exit status is non-zero exactly when a vulnerability (not a
+        # mere warning) was found.
+        if ! cargo audit >/dev/null 2>&1; then
             red "✗ cargo audit reported a vulnerability, fix before pushing"
             EXIT=1
         else

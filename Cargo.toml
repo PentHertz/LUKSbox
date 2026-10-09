@@ -42,11 +42,25 @@ argon2 = { version = "0.5", features = ["zeroize"] }
 hmac = { version = "0.12", features = ["reset"] }
 sha2 = "0.10"
 hkdf = "0.12"
-zeroize = { version = "1.8", features = ["derive"] }
+# `std` adds `impl Zeroize for CString`, used for the FIDO2 PIN copies
+# handed to libfido2 (R15-F2).
+zeroize = { version = "1.8", features = ["derive", "std"] }
 subtle = "2.6"
 rand_core = { version = "0.6", features = ["getrandom"] }
 thiserror = "2.0"
-aes = "0.8"
+# R15: `zeroize` on the block cipher, the universal hashes and the
+# stream cipher underneath our three AEADs, so the key schedule /
+# GHASH key / Poly1305 key inside every `Aes256Gcm`, `Aes256GcmSiv`
+# and `ChaCha20Poly1305` temporary is wiped when it is dropped. The
+# AEAD crates themselves do not forward a `zeroize` feature, so these
+# are declared as direct deps of luksbox-core purely for feature
+# unification (the first 32 bytes of an AES-256 key schedule ARE the
+# key, i.e. the KEK / file key / metadata key).
+aes = { version = "0.8", features = ["zeroize"] }
+ghash = { version = "0.5", features = ["zeroize"] }
+polyval = { version = "0.6", features = ["zeroize"] }
+chacha20 = { version = "0.9", features = ["zeroize"] }
+poly1305 = { version = "0.8", features = ["zeroize"] }
 p256 = { version = "0.13", default-features = false, features = ["ecdh"] }
 serde = { version = "1", features = ["derive"] }
 # Postcard: metadata-blob serializer. Smaller varint encoding than

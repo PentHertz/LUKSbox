@@ -47,6 +47,22 @@ and nothing in the vault itself detects it. This is the residual
 exposure the audit ranked highest, and it is the one behavior that is
 "documented but not mitigated" in the default (no-anchor) configuration.
 
+## Status after Round 15
+
+The metadata half of the gap is closed for anchored vaults: `Vfs::flush`
+now allocates one generation for every persisted state, so two
+snapshots of the vault never share an anchored generation and a
+rollback across `unlink` / `rmdir` / `rename` / `chmod` compares
+`Greater` against a trusted anchor (R15-D1). The header half remains:
+the keyslot table carries no generation, so a pre-revoke header
+restored from a backup (an 8 KiB file whose HMAC is still valid under
+the unchanged MVK) is not visible to the anchor. The planned fix is a
+`header_generation` field inside the HMAC'd header (and the deniable
+inner header), bumped by every `persist_header`, carried in an anchor
+v2 record and compared at open; it needs anchor updates from every
+header-mutating command. Until then, treat `rotate-mvk` as the only
+revocation that survives a restored header.
+
 ## Candidate mitigation
 
 Bind a monotonic metadata generation counter into the metadata AEAD

@@ -16,8 +16,10 @@
 //!     snapshots).
 //!
 //! When the syscall isn't available (kernel < 5.14, `CONFIG_SECRETMEM`
-//! disabled, or non-Linux), we fall back to a `Box<[u8; 32]>` with the
-//! existing `Zeroize`-on-drop behavior. Same external API; the upgrade
+//! disabled, or non-Linux), we fall back to one private, page-aligned
+//! anonymous mapping per secret (`mmap` + `mlock`, or `VirtualAlloc` +
+//! `VirtualLock`), and only if even that fails to a `Box<[u8; 32]>`; all
+//! variants keep the `Zeroize`-on-drop behavior. Same external API; the upgrade
 //! is invisible to callers.
 //!
 //! ## macOS gap (and roadmap)
@@ -130,6 +132,11 @@ use zeroize::Zeroize;
 
 const KEY_LEN: usize = 32;
 
+// `memfd_secret(2)` syscall number. Identical (447) on every Linux
+// architecture that has the call (it post-dates the unified syscall
+// table), so a single constant is correct; kept local rather than
+// `libc::SYS_memfd_secret` because the libc crate only exposes that
+// symbol on a subset of targets.
 #[cfg(target_os = "linux")]
 const SYS_MEMFD_SECRET: libc::c_long = 447;
 
@@ -144,14 +151,28 @@ enum Inner {
         fd: libc::c_int,
         page_size: usize,
     },
-    /// Heap allocation. We lock the page out of swap per-allocation at
-    /// construction and unlock it at drop: `mlock`/`munlock` on Unix,
-    /// `VirtualLock`/`VirtualUnlock` on Windows. This no longer leans on the
-    /// process-wide `mlockall`, which only arms `MCL_FUTURE` when
-    /// `RLIMIT_MEMLOCK` is unlimited and so wouldn't cover this allocation on a
-    /// finite-ceiling host. On Linux this variant is only reached when
-    /// `memfd_secret` was unavailable (kernel < 5.14); on macOS/BSD it is the
-    /// normal backing. The `Box` ownership semantics are unchanged.
+    /// A dedicated, page-aligned anonymous mapping (`mmap` on Unix,
+    /// `VirtualAlloc` on Windows) holding exactly one secret, locked out
+    /// of swap for its whole lifetime (`mlock` / `VirtualLock`) and, on
+    /// Linux, excluded from core dumps (`MADV_DONTDUMP`) and wiped in
+    /// forked children (`MADV_WIPEONFORK`).
+    ///
+    /// One secret per page is the point (R15-04): `munlock` /
+    /// `VirtualUnlock` are page-granular and not reference-counted, so
+    /// the previous `Box<[u8; 32]>` backing (two MVKs, e.g. an original
+    /// and its `clone()`, routinely sharing one 4 KiB heap page) made
+    /// dropping either one unlock the page under the survivor. With a
+    /// private page per secret the unlock at drop affects nobody else.
+    ///
+    /// Reached on Linux only when `memfd_secret` was unavailable (kernel
+    /// < 5.14, `secretmem.enable=0`); on macOS/BSD/Windows it is the
+    /// normal backing.
+    #[cfg(any(unix, windows))]
+    Page { ptr: *mut u8, len: usize },
+    /// Last-resort heap fallback when the page mapping itself fails (or
+    /// on targets with neither `mmap` nor `VirtualAlloc`). Locked
+    /// best-effort at construction, zeroized on drop, and deliberately
+    /// NEVER unlocked at drop so it cannot unlock a neighbour's page.
     Heap(Box<[u8; KEY_LEN]>),
 }
 
@@ -161,9 +182,24 @@ enum Inner {
 // and return `BOOL` (nonzero on success).
 #[cfg(target_os = "windows")]
 unsafe extern "system" {
+    fn VirtualAlloc(
+        addr: *mut core::ffi::c_void,
+        size: usize,
+        alloc_type: u32,
+        protect: u32,
+    ) -> *mut core::ffi::c_void;
+    fn VirtualFree(addr: *mut core::ffi::c_void, size: usize, free_type: u32) -> i32;
     fn VirtualLock(addr: *mut core::ffi::c_void, size: usize) -> i32;
     fn VirtualUnlock(addr: *mut core::ffi::c_void, size: usize) -> i32;
 }
+#[cfg(target_os = "windows")]
+const MEM_COMMIT: u32 = 0x0000_1000;
+#[cfg(target_os = "windows")]
+const MEM_RESERVE: u32 = 0x0000_2000;
+#[cfg(target_os = "windows")]
+const MEM_RELEASE: u32 = 0x0000_8000;
+#[cfg(target_os = "windows")]
+const PAGE_READWRITE: u32 = 0x0000_0004;
 
 // SecretBox holds a raw pointer (memfd-backed) but the underlying memory
 // is owned by this struct alone, no aliasing. Send/Sync are safe.
@@ -180,16 +216,15 @@ impl SecretBox {
                 return b;
             }
         }
+        #[cfg(any(unix, windows))]
+        {
+            if let Some(b) = Self::try_private_page() {
+                return b;
+            }
+        }
+        // Last resort: plain heap. Lock best-effort and never unlock
+        // (see `Inner::Heap`); the zeroize-on-drop wipe still runs.
         let boxed = Box::new([0u8; KEY_LEN]);
-        // On Unix without `memfd_secret` (older Linux kernels, macOS, the
-        // BSDs) this Heap variant is the live secret backing, so lock the page
-        // per-allocation rather than relying solely on the process-wide
-        // `mlockall`. That matters because `mlockall` only arms `MCL_FUTURE`
-        // when `RLIMIT_MEMLOCK` is unlimited (see `secret_mem`); on a finite
-        // ceiling (e.g. a QubesOS AppVM) future allocations are otherwise
-        // swappable. A 32-byte `mlock` fits any sane ceiling. Best-effort:
-        // failure is silent (the `Zeroize`-on-drop wipe stays the realistic
-        // mitigation). Page-granular, like `VirtualLock` below.
         #[cfg(unix)]
         {
             // SAFETY: pointer is to a live Box we just allocated; KEY_LEN is
@@ -198,14 +233,6 @@ impl SecretBox {
                 let _ = libc::mlock(boxed.as_ptr() as *const libc::c_void, KEY_LEN);
             }
         }
-        // On Windows, lock the page so the secret bytes don't end up
-        // in pagefile.sys. Best-effort: failure is silent (the
-        // `Zeroize`-on-drop wipe still runs and is the realistic
-        // mitigation against on-disk leakage; `VirtualLock` is the
-        // belt to the suspenders). `VirtualLock` operates at page
-        // granularity, which means the surrounding heap allocations
-        // sharing the same page get locked too - acceptable for the
-        // 32-byte allocations we make here.
         #[cfg(target_os = "windows")]
         {
             // SAFETY: pointer is to a live Box we just allocated;
@@ -219,9 +246,101 @@ impl SecretBox {
         }
     }
 
-    pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
+    /// Map one private anonymous page and pin it for this secret alone.
+    /// Returns `None` if the mapping cannot be created (the caller then
+    /// falls back to the heap). Locking is best-effort: a finite
+    /// `RLIMIT_MEMLOCK` can refuse, in which case zeroize-on-drop stays
+    /// the realistic mitigation (same posture the heap path always had).
+    #[cfg(unix)]
+    fn try_private_page() -> Option<Self> {
+        // SAFETY: sysconf is signal-safe; _SC_PAGESIZE always succeeds.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return None;
+        }
+        let len = page_size as usize;
+        if len < KEY_LEN {
+            return None;
+        }
+        // SAFETY: anonymous private mapping with sane arguments; the
+        // kernel hands back zero-filled pages or MAP_FAILED.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        // Lock BEFORE any secret is written into the page.
+        // SAFETY: ptr/len describe the mapping we just created.
+        unsafe {
+            let _ = libc::mlock(ptr, len);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Keep the page out of core dumps and wipe it in forked
+            // children (`fork()` precedes every `Command::spawn`). Both
+            // best-effort; both pre-date every kernel we support.
+            // SAFETY: same mapping as above.
+            unsafe {
+                let _ = libc::madvise(ptr, len, libc::MADV_DONTDUMP);
+                let _ = libc::madvise(ptr, len, libc::MADV_WIPEONFORK);
+            }
+        }
+        Some(Self {
+            inner: Inner::Page {
+                ptr: ptr as *mut u8,
+                len,
+            },
+        })
+    }
+
+    /// Windows twin of the Unix `try_private_page`: commit one page from
+    /// a fresh reservation and `VirtualLock` it. `VirtualAlloc` always
+    /// hands back whole, zero-filled pages, so one `KEY_LEN` secret per
+    /// call keeps the lock accounting exact.
+    #[cfg(target_os = "windows")]
+    fn try_private_page() -> Option<Self> {
+        const LEN: usize = 4096;
+        // SAFETY: plain reservation + commit of fresh zero-filled pages.
+        let ptr = unsafe {
+            VirtualAlloc(
+                std::ptr::null_mut(),
+                LEN,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        };
+        if ptr.is_null() {
+            return None;
+        }
+        // SAFETY: ptr/LEN describe the region we just committed.
+        unsafe {
+            let _ = VirtualLock(ptr, LEN);
+        }
+        Some(Self {
+            inner: Inner::Page {
+                ptr: ptr as *mut u8,
+                len: LEN,
+            },
+        })
+    }
+
+    /// Construct from a by-value array. The caller's array is moved into
+    /// this frame and wiped here after the copy, so the callee side at
+    /// least leaves no residue. Prefer `MasterVolumeKey::from_zeroizing`
+    /// / `from_array_ref` in production code: those never materialise the
+    /// by-value temporary in the first place (R12-17 / R13-09).
+    pub fn from_bytes(mut bytes: [u8; KEY_LEN]) -> Self {
         let mut s = Self::zeroed();
         s.as_mut_array().copy_from_slice(&bytes);
+        bytes.zeroize();
         s
     }
 
@@ -245,6 +364,10 @@ impl SecretBox {
         match &self.inner {
             #[cfg(target_os = "linux")]
             Inner::MemfdSecret { ptr, .. } => unsafe { &*((*ptr) as *const [u8; KEY_LEN]) },
+            // SAFETY: `ptr` is the start of a live mapping of at least
+            // KEY_LEN bytes owned exclusively by this struct.
+            #[cfg(any(unix, windows))]
+            Inner::Page { ptr, .. } => unsafe { &*((*ptr) as *const [u8; KEY_LEN]) },
             Inner::Heap(b) => b,
         }
     }
@@ -253,13 +376,26 @@ impl SecretBox {
         match &mut self.inner {
             #[cfg(target_os = "linux")]
             Inner::MemfdSecret { ptr, .. } => unsafe { &mut *((*ptr) as *mut [u8; KEY_LEN]) },
+            // SAFETY: as in `as_array`; `&mut self` guarantees uniqueness.
+            #[cfg(any(unix, windows))]
+            Inner::Page { ptr, .. } => unsafe { &mut *((*ptr) as *mut [u8; KEY_LEN]) },
             Inner::Heap(b) => b,
         }
     }
 
-    /// Whether this allocation is backed by `memfd_secret`. Diagnostic.
+    /// Whether this allocation is backed by `memfd_secret` (the strongest
+    /// mode: unmappable by any other process, excluded from core dumps
+    /// and hibernation images). A private locked page or the heap
+    /// fallback both report `false`. Diagnostic.
     pub fn is_secret_mem(&self) -> bool {
-        !matches!(self.inner, Inner::Heap(_))
+        #[cfg(target_os = "linux")]
+        {
+            matches!(self.inner, Inner::MemfdSecret { .. })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -267,7 +403,14 @@ impl SecretBox {
         // SAFETY: memfd_secret syscall takes a single u32 flags arg; no
         // memory pointers passed in. Failure returns -1 (we check). On
         // success we get a real FD referring to a kernel-side allocation.
-        let fd = unsafe { libc::syscall(SYS_MEMFD_SECRET, 0u32 as libc::c_uint) };
+        //
+        // R15-01: `O_CLOEXEC` is mandatory. The only flag `memfd_secret`
+        // accepts, and the only thing standing between "no other process
+        // can map these pages" and "every child we spawn (xdg-open,
+        // fusermount, the FUSE-T helper, ...) inherits an fd it can
+        // `mmap(MAP_SHARED)` to read the MVK". The earlier `0` flags
+        // handed the live MVK to every child process for its lifetime.
+        let fd = unsafe { libc::syscall(SYS_MEMFD_SECRET, libc::O_CLOEXEC as libc::c_uint) };
         if fd < 0 {
             // ENOSYS (kernel < 5.14), EFAULT, EPERM, etc., give up.
             return None;
@@ -326,34 +469,38 @@ impl Drop for SecretBox {
                 // Zero the secret bytes (defensive, the kernel will
                 // unmap and reclaim the memfd_secret pages on close, but
                 // we wipe anyway in case the mmap is observed mid-drop).
-                std::ptr::write_bytes(*ptr, 0, KEY_LEN);
+                // `zeroize` uses volatile stores the optimiser cannot
+                // drop ahead of the unmap.
+                std::slice::from_raw_parts_mut(*ptr, KEY_LEN).zeroize();
                 libc::munmap(*ptr as *mut libc::c_void, *page_size);
                 libc::close(*fd);
             },
+            #[cfg(any(unix, windows))]
+            Inner::Page { ptr, len } => {
+                // SAFETY: ptr/len describe a mapping this struct owns
+                // exclusively; nothing else shares the page, so the
+                // unlock below cannot expose another secret.
+                unsafe {
+                    std::slice::from_raw_parts_mut(*ptr, KEY_LEN).zeroize();
+                    #[cfg(unix)]
+                    {
+                        let _ = libc::munlock(*ptr as *const libc::c_void, *len);
+                        let _ = libc::munmap(*ptr as *mut libc::c_void, *len);
+                    }
+                    #[cfg(target_os = "windows")]
+                    {
+                        let _ = VirtualUnlock(*ptr as *mut core::ffi::c_void, *len);
+                        let _ = VirtualFree(*ptr as *mut core::ffi::c_void, 0, MEM_RELEASE);
+                    }
+                }
+            }
             Inner::Heap(b) => {
-                // Wipe first, then unlock on Windows so the bytes
-                // are zeroed before the page becomes swappable
-                // again.
+                // Wipe only. Deliberately no munlock/VirtualUnlock here:
+                // those are page-granular and would unlock any other
+                // secret sharing this heap page (R15-04, the reason the
+                // Page variant exists). A handful of stray locked pages
+                // over a process lifetime is the cheaper failure mode.
                 b.zeroize();
-                #[cfg(unix)]
-                {
-                    // SAFETY: same pointer + size we passed to mlock at
-                    // construction. munlock on an unlocked page is harmless;
-                    // we ignore the return value.
-                    unsafe {
-                        let _ = libc::munlock(b.as_ptr() as *const libc::c_void, KEY_LEN);
-                    }
-                }
-                #[cfg(target_os = "windows")]
-                {
-                    // SAFETY: same pointer + size we passed to
-                    // VirtualLock at construction. VirtualUnlock on
-                    // an already-unlocked page returns 0; we ignore
-                    // the return value.
-                    unsafe {
-                        let _ = VirtualUnlock(b.as_ptr() as *mut core::ffi::c_void, KEY_LEN);
-                    }
-                }
             }
         }
     }
@@ -400,6 +547,27 @@ mod tests {
         a.as_mut_array()[0] = 0x99;
         assert_ne!(a.as_array(), b.as_array());
         assert_eq!(b.as_array()[0], 0x11);
+    }
+
+    /// R15-01 regression: the `memfd_secret` fd must be close-on-exec,
+    /// otherwise every spawned child inherits a handle it can
+    /// `mmap(MAP_SHARED)` to read the MVK. Only meaningful when the
+    /// kernel actually gave us secret memory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn memfd_secret_fd_is_close_on_exec() {
+        let s = SecretBox::zeroed();
+        if let Inner::MemfdSecret { fd, .. } = &s.inner {
+            // SAFETY: fd is a valid descriptor owned by `s`.
+            let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
+            assert!(flags >= 0, "F_GETFD failed");
+            assert!(
+                flags & libc::FD_CLOEXEC != 0,
+                "memfd_secret fd must carry FD_CLOEXEC"
+            );
+        } else {
+            eprintln!("memfd_secret unavailable on this kernel; CLOEXEC check skipped");
+        }
     }
 
     #[test]

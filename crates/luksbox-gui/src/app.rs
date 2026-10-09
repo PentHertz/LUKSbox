@@ -6803,7 +6803,9 @@ impl LuksboxApp {
                                         };
                                         ui.label(RichText::new(icon).size(15.0));
                                         ui.label(
-                                            RichText::new(&ent.name).strong().color(theme::TEXT),
+                                            RichText::new(ops::display_name(&ent.name))
+                                                .strong()
+                                                .color(theme::TEXT),
                                         );
                                         ui.with_layout(
                                             Layout::right_to_left(Align::Center),
@@ -7015,10 +7017,14 @@ impl LuksboxApp {
         // associated app even though the bytes are intact. Skip
         // when the chosen path already has an extension (the user
         // explicitly chose to rename to a different type).
+        // R15-I3: the extension comes from the vault entry name; on
+        // Windows a `:` in it would turn the save into an alternate
+        // data stream write (`report.txt:hidden`), the R14-06 class.
         if local.extension().is_none()
             && let Some(ext) = std::path::Path::new(name)
                 .extension()
                 .and_then(|s| s.to_str())
+            && !ops::name_escapes_directory(ext)
         {
             local.set_extension(ext);
         }

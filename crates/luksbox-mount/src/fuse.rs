@@ -365,12 +365,22 @@ fn unmount_args() -> &'static [&'static str] {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) fn canonical_unmount_target(mountpoint: &Path) -> std::io::Result<PathBuf> {
-    mountpoint.canonicalize().map_err(|e| {
-        std::io::Error::new(
-            e.kind(),
-            format!("cannot resolve mountpoint {}: {e}", mountpoint.display()),
-        )
-    })
+    // R15-G5: a FUSE server that died leaves a mountpoint whose
+    // `stat` returns ENOTCONN; on glibc < 2.33 `realpath(3)` lstat()s
+    // every component and fails, so `luksbox umount` could never reach
+    // `fusermount -u` for exactly the zombie it is meant to clear.
+    // `std::path::absolute` touches no filesystem and still yields a
+    // leading-slash path (the leading-dash option-injection guard this
+    // canonicalisation exists for holds either way).
+    match mountpoint.canonicalize() {
+        Ok(p) => Ok(p),
+        Err(_) => std::path::absolute(mountpoint).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("cannot resolve mountpoint {}: {e}", mountpoint.display()),
+            )
+        }),
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -869,6 +869,41 @@ fn invalid_metadata<T>() -> Result<T, Error> {
 /// Validate the authenticated metadata tree before any VFS operation trusts
 /// it. The AEAD says "this came from someone with the MVK"; these checks say
 /// "it is also structurally sane and cannot drive offset/id wraparound."
+/// R15-E1: point every non-root inode's `parent` at a directory that
+/// actually holds an entry for it. Returns the number of inodes fixed.
+/// Trees produced by current code never need this; it heals the stale
+/// pointers that pre-R15 `rename` persisted (see `Vfs::rename`).
+fn repair_stale_parents(tree: &mut DirectoryTree) -> usize {
+    let mut holder: std::collections::BTreeMap<FileId, FileId> = std::collections::BTreeMap::new();
+    for (&dir_id, dir) in &tree.inodes {
+        if dir.kind != InodeKind::Directory {
+            continue;
+        }
+        for &child in dir.children.values() {
+            holder.entry(child).or_insert(dir_id);
+        }
+    }
+    let ids: Vec<FileId> = tree.inodes.keys().copied().collect();
+    let mut fixed = 0;
+    for id in ids {
+        if id == ROOT_ID {
+            continue;
+        }
+        let stale = {
+            let inode = &tree.inodes[&id];
+            !matches!(
+                tree.inodes.get(&inode.parent),
+                Some(p) if p.kind == InodeKind::Directory && p.children.values().any(|&c| c == id)
+            )
+        };
+        if stale && let Some(&h) = holder.get(&id) {
+            tree.inodes.get_mut(&id).unwrap().parent = h;
+            fixed += 1;
+        }
+    }
+    fixed
+}
+
 fn validate_metadata_tree(
     tree: &DirectoryTree,
     data_offset: u64,
@@ -934,7 +969,16 @@ fn validate_metadata_tree(
 
         match inode.kind {
             InodeKind::Directory => {
-                if inode.size != 0 || !inode.chunks.is_empty() {
+                // R15-E4: directories carry no data and therefore no
+                // external chunk-list chain either. A forged chain stub
+                // on a directory used to pass here unseen, then the
+                // spill freed its blocks on the victim's first flush
+                // (a double free -> free/live collision -> every later
+                // open rejected).
+                if inode.size != 0
+                    || !inode.chunks.is_empty()
+                    || !inode.external_list_blocks.is_empty()
+                {
                     return invalid_metadata();
                 }
                 // Directories MUST NOT carry a symlink_target -- same
@@ -1154,6 +1198,10 @@ fn v3_on_disk_to_in_memory(
         let (chunks, external_list_blocks) = match od.chunks_external {
             None => (od.chunks, Vec::new()),
             Some((head, expected_count)) => {
+                // R15-E4: only File inodes may carry an external chain.
+                if od.kind != InodeKind::File {
+                    return Err(Error::MetadataDeserialize);
+                }
                 if !od.chunks.is_empty() {
                     // v3 invariant: chunks_external => inline chunks
                     // vec MUST be empty. A blob that violates this is
@@ -1280,6 +1328,10 @@ fn v4_on_disk_to_in_memory(
         let (chunks, external_list_blocks) = match od.chunks_external {
             None => (od.chunks, Vec::new()),
             Some((head, expected_count)) => {
+                // R15-E4: only File inodes may carry an external chain.
+                if od.kind != InodeKind::File {
+                    return Err(Error::MetadataDeserialize);
+                }
                 if !od.chunks.is_empty() {
                     if debug {
                         eprintln!(
@@ -1435,6 +1487,18 @@ pub struct Vfs {
     ///     byte-identical on disk and the inline-or-external decision
     ///     doesn't change.
     chunks_dirty: std::collections::BTreeSet<FileId>,
+    /// R15-E3: chunk ids freed during this session but NOT yet eligible
+    /// for reuse. The on-disk metadata (live AND mirror) still references
+    /// these slots until the next successful `flush`; handing them
+    /// straight back to `tree.free_chunks` let the very next allocation
+    /// (the re-spill of a chunk-list chain in that same flush, or any
+    /// data write) overwrite a slot the committed metadata still pointed
+    /// at. A crash in that window then left every reader walking into
+    /// AEAD failures: an unopenable vault, or (tolerant mode) a file
+    /// reinstalled with zero chunks. They are serialised as free in the
+    /// NEW metadata (nothing references them there) and moved into
+    /// `tree.free_chunks` only after `write_metadata` has returned.
+    pending_free: Vec<ChunkId>,
 }
 
 /// Vault on-disk size beyond which the runtime emits a one-shot
@@ -1481,7 +1545,7 @@ impl Vfs {
                 Error::MetadataDeserialize
             }
         };
-        let (tree, format) = if blob.is_empty() {
+        let (mut tree, format) = if blob.is_empty() {
             // Fresh vault: pick the format based on the env-var gate.
             // The choice is locked in by the first flush writing the
             // appropriate magic onto disk.
@@ -1615,6 +1679,16 @@ impl Vfs {
             }
         }
         validate_res?;
+        // R15-E1: repair canonical-parent pointers persisted by earlier
+        // versions whose `rename` never updated them. The validator only
+        // requires `parent` to name SOME directory; an inode whose
+        // recorded parent no longer holds an entry for it adopts one
+        // that does. In-memory only: the fix rides along with the next
+        // real flush, so a read-only open never writes.
+        let healed = repair_stale_parents(&mut tree);
+        if debug && healed > 0 {
+            eprintln!("luksbox-debug: repaired {healed} stale parent pointer(s)");
+        }
         // Resolve paths for any tolerated inodes the v4 conversion
         // recorded. Walk the now-built tree from root to find each
         // tolerated id's path. Done here (not inline in the
@@ -1659,6 +1733,7 @@ impl Vfs {
             // chunk-list chain. Mutations after this point will add
             // entries here as they touch chunks.
             chunks_dirty: std::collections::BTreeSet::new(),
+            pending_free: Vec::new(),
         })
     }
 
@@ -1892,6 +1967,15 @@ impl Vfs {
             self.container.data_offset(),
             self.container.header.hide_size_header(),
         )?;
+        // R15-D1: make every persisted state strictly monotonic. The
+        // rollback anchor records `next_chunk_gen`, which only advanced
+        // on chunk writes, so a flush after a metadata-only change
+        // (unlink, rmdir, rename, chmod, mkdir, truncate-shrink) wrote
+        // the SAME generation as the previous flush, and a vault rolled
+        // back to that previous snapshot compared `Equal` against a
+        // trusted anchor: a deleted file silently resurrected. One
+        // generation per flush closes that for the metadata half.
+        self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?;
         // v0.2.1 auto-upgrade: any flush against a LUKSBOX1 vault
         // bumps it to LUKSBOX2 + LBM5. One-way; the next crash gets
         // mirror recovery, but the cost is that pre-v0.3 binaries
@@ -1947,7 +2031,10 @@ impl Vfs {
                 // inside `spill_to_v3_on_disk`. Magic differs so
                 // pre-LBM5 binaries refuse the vault (they'd miss the
                 // sidecar mirror recovery path).
-                let v4 = self.spill_to_v4_on_disk()?;
+                let mut v4 = self.spill_to_v4_on_disk()?;
+                // R15-E3: slots freed this session are free in the NEW
+                // metadata (nothing in it references them any more).
+                v4.free_chunks.extend_from_slice(&self.pending_free);
                 let payload = postcard::to_allocvec(&v4).map_err(|_| Error::MetadataSerialize)?;
                 if payload.len() > METADATA_DECODE_LIMIT_BYTES {
                     return Err(Error::MetadataSerialize);
@@ -1961,7 +2048,8 @@ impl Vfs {
                 // v4: same spill machinery as v3 + per-inode
                 // mode/link_count. spill_to_v4_on_disk reuses
                 // spill_to_v3_on_disk's chunk-list-block handling.
-                let v4 = self.spill_to_v4_on_disk()?;
+                let mut v4 = self.spill_to_v4_on_disk()?;
+                v4.free_chunks.extend_from_slice(&self.pending_free); // R15-E3
                 let payload = postcard::to_allocvec(&v4).map_err(|_| Error::MetadataSerialize)?;
                 if payload.len() > METADATA_DECODE_LIMIT_BYTES {
                     return Err(Error::MetadataSerialize);
@@ -1979,7 +2067,8 @@ impl Vfs {
                 // blocks AND mutates inode.external_list_blocks for
                 // bookkeeping; old external_list_blocks (from a
                 // previous flush) are freed during the spill.
-                let v3 = self.spill_to_v3_on_disk()?;
+                let mut v3 = self.spill_to_v3_on_disk()?;
+                v3.free_chunks.extend_from_slice(&self.pending_free); // R15-E3
                 let payload = postcard::to_allocvec(&v3).map_err(|_| Error::MetadataSerialize)?;
                 if payload.len() > METADATA_DECODE_LIMIT_BYTES {
                     return Err(Error::MetadataSerialize);
@@ -1994,8 +2083,14 @@ impl Vfs {
                 // inline. Inode's mode/link_count fields are
                 // serde-skipped, so the on-disk shape is unchanged
                 // from pre-LBM4 code (preserves backward compat).
+                // R15-E3: serialise the pending frees as free, then put the
+                // in-memory list back the way it was until the write lands.
+                let inline_free_len = self.tree.free_chunks.len();
+                self.tree.free_chunks.extend_from_slice(&self.pending_free);
                 let payload =
-                    postcard::to_allocvec(&self.tree).map_err(|_| Error::MetadataSerialize)?;
+                    postcard::to_allocvec(&self.tree).map_err(|_| Error::MetadataSerialize);
+                self.tree.free_chunks.truncate(inline_free_len);
+                let payload = payload?;
                 if payload.len() > METADATA_DECODE_LIMIT_BYTES {
                     return Err(Error::MetadataSerialize);
                 }
@@ -2047,6 +2142,9 @@ impl Vfs {
             self.container.sync_data_area()?;
         }
         self.container.write_metadata(&bytes)?;
+        // R15-E3: the new metadata is durable and references none of the
+        // slots freed during this session, so they may be reused now.
+        self.tree.free_chunks.append(&mut self.pending_free);
         // The live metadata region has been re-established. Clear the
         // recovery flag so subsequent clean flushes (when the tree is
         // not dirty) take the fast path.
@@ -2286,7 +2384,7 @@ impl Vfs {
                 .drain(..)
                 .collect();
             for cref in &old_externals {
-                self.tree.free_chunk_id(cref.id);
+                self.pending_free.push(cref.id);
             }
             if file_needs_external {
                 // Write the chunk list as a chain of external blocks.
@@ -2772,7 +2870,7 @@ impl Vfs {
 
     pub fn mkdir(&mut self, parent: FileId, name: &str) -> Result<FileId, Error> {
         self.ensure_writable()?;
-        validate_name(name)?;
+        validate_new_name(name)?;
         self.require_dir(parent)?;
         if self.tree.inodes[&parent].children.contains_key(name) {
             return Err(Error::AlreadyExists);
@@ -2829,7 +2927,7 @@ impl Vfs {
         mode: u32,
     ) -> Result<FileId, Error> {
         self.ensure_writable()?;
-        validate_name(name)?;
+        validate_new_name(name)?;
         self.require_dir(parent)?;
         if self.tree.inodes[&parent].children.contains_key(name) {
             return Err(Error::AlreadyExists);
@@ -3016,14 +3114,27 @@ impl Vfs {
         // through leaves the inode exactly as it was -- identical
         // roll-back semantics to the previous clone-then-discard code.
         let zero = vec![0u8; CHUNK_PLAINTEXT_SIZE];
-        let mut appended: Vec<ChunkRef> = Vec::with_capacity(target_count.saturating_sub(cur_len));
+        // R15-E6: no `with_capacity(target_count - cur_len)` here. One
+        // 1-byte write at an offset near MAX_FILE_SIZE made that a 64 GiB
+        // reservation and aborted the process (the whole mount) before a
+        // single chunk was written. Grow incrementally instead.
+        let mut appended: Vec<ChunkRef> = Vec::new();
         while cur_len + appended.len() < target_count {
             let cref = ChunkRef {
                 id: self.tree.alloc_chunk_id().ok_or(Error::IdSpaceExhausted)?,
                 generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
             };
             let chunk_idx = (cur_len + appended.len()) as u32;
-            chunk::write_chunk(&mut self.container, &key, id, chunk_idx, cref, &zero)?;
+            if let Err(e) =
+                chunk::write_chunk(&mut self.container, &key, id, chunk_idx, cref, &zero)
+            {
+                // R15-E6: hand back the slots this call allocated but never
+                // recorded (ENOSPC mid-extension) instead of leaking them
+                // for the life of the vault.
+                self.pending_free.push(cref.id);
+                self.pending_free.extend(appended.iter().map(|c| c.id));
+                return Err(e);
+            }
             appended.push(cref);
         }
 
@@ -3044,6 +3155,43 @@ impl Vfs {
         // chunks go in `updates`, updates to freshly-appended chunks are
         // applied to `appended` in place.
         let mut updates: Vec<(usize, ChunkRef)> = Vec::new();
+
+        // R15-E2: a write past EOF opens a hole [old_real, offset). The
+        // EXISTING chunks covering it (pow2 padding, or what a previous
+        // shrink left in place) may still hold bytes that were truncated
+        // away; POSIX says the hole reads as zeros, and the old code let
+        // the discarded content resurface. Scrub the part of the hole in
+        // chunks BEFORE the write's first chunk here; the first chunk's
+        // share is scrubbed inside the RMW loop below.
+        if offset > old_real && cur_len > 0 {
+            let (gap_first, _) = file_to_chunk(old_real, hide_size)?;
+            let gap_end = first_chunk.min(cur_len);
+            for idx in gap_first..gap_end {
+                let (cfs, cfe) = chunk_file_range(idx, hide_size)?;
+                let zs = old_real.max(cfs).saturating_sub(cfs) as usize;
+                let ze = offset.min(cfe).saturating_sub(cfs) as usize;
+                if zs >= ze {
+                    continue;
+                }
+                let ds = if hide_size && idx == 0 {
+                    SIZE_HEADER_LEN
+                } else {
+                    0
+                };
+                let cur_ref = self.tree.inodes.get(&id).ok_or(Error::NotFound)?.chunks[idx];
+                let mut pt = chunk::read_chunk(&mut self.container, &key, id, idx as u32, cur_ref)?;
+                if pt[ds + zs..ds + ze].iter().all(|&b| b == 0) {
+                    continue;
+                }
+                pt[ds + zs..ds + ze].fill(0);
+                let new_ref = ChunkRef {
+                    id: cur_ref.id,
+                    generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
+                };
+                chunk::write_chunk(&mut self.container, &key, id, idx as u32, new_ref, &pt)?;
+                updates.push((idx, new_ref));
+            }
+        }
         let mut buf_pos = 0usize;
         for chunk_idx in first_chunk..=last_chunk {
             let (chunk_file_start, chunk_file_end) = chunk_file_range(chunk_idx, hide_size)?;
@@ -3067,6 +3215,17 @@ impl Vfs {
             };
             let mut pt =
                 chunk::read_chunk(&mut self.container, &key, id, chunk_idx as u32, cur_ref)?;
+            // R15-E2: this chunk's share of the hole left by a write past
+            // EOF (see above) is scrubbed in the same rewrite.
+            if chunk_idx == first_chunk && chunk_idx < cur_len && offset > old_real {
+                let hole_start = old_real
+                    .max(chunk_file_start)
+                    .saturating_sub(chunk_file_start) as usize;
+                let hole_end = in_chunk_offset as usize;
+                if hole_start < hole_end {
+                    pt[data_start + hole_start..data_start + hole_end].fill(0);
+                }
+            }
             pt[pt_start..pt_end].copy_from_slice(&buf[buf_pos..buf_pos + len_here]);
             // If this is chunk 0 in hide-size mode, refresh the size header
             // (the write may have grown the file).
@@ -3162,6 +3321,7 @@ impl Vfs {
         if new_size > MAX_FILE_SIZE {
             return Err(Error::FileSizeExceedsCap);
         }
+        let old_real = self.real_size(id)?;
         let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?.clone();
         if inode.kind != InodeKind::File {
             return Err(Error::NotAFile);
@@ -3198,14 +3358,33 @@ impl Vfs {
             self.check_metadata_budget_for_chunks(id, new_chunk_count - chunks.len())?;
         }
 
+        // R15-E2: POSIX requires [old_size, new_size) to read as zeros
+        // after an extension. Existing chunks in that range (the partly
+        // used last chunk, pow2 padding, or what an earlier shrink left
+        // in place) still hold discarded bytes; scrub them so truncated
+        // content can never resurface through `truncate` up.
+        if new_size > old_real {
+            self.zero_fill_existing_range(id, &key, &mut chunks, old_real, new_size, hide_size)?;
+        }
+
         let zero = vec![0u8; CHUNK_PLAINTEXT_SIZE];
+        let grow_from = chunks.len();
         while chunks.len() < new_chunk_count {
             let cref = ChunkRef {
                 id: self.tree.alloc_chunk_id().ok_or(Error::IdSpaceExhausted)?,
                 generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
             };
             let chunk_idx = chunks.len() as u32;
-            chunk::write_chunk(&mut self.container, &key, id, chunk_idx, cref, &zero)?;
+            if let Err(e) =
+                chunk::write_chunk(&mut self.container, &key, id, chunk_idx, cref, &zero)
+            {
+                // R15-E6: return the slots allocated by this call to the
+                // deferred free list instead of leaking them.
+                self.pending_free.push(cref.id);
+                self.pending_free
+                    .extend(chunks[grow_from..].iter().map(|c| c.id));
+                return Err(e);
+            }
             chunks.push(cref);
         }
 
@@ -3237,7 +3416,7 @@ impl Vfs {
         // dropped chunks: now it is safe to return their ids to the
         // free-list (see the note at the shrink loop above).
         for freed in freed_ids {
-            self.tree.free_chunk_id(freed);
+            self.pending_free.push(freed);
         }
         Ok(())
     }
@@ -3311,10 +3490,10 @@ impl Vfs {
             let chunks = target_mut.chunks.clone();
             let list_blocks = target_mut.external_list_blocks.clone();
             for cref in chunks {
-                self.tree.free_chunk_id(cref.id);
+                self.pending_free.push(cref.id);
             }
             for cref in list_blocks {
-                self.tree.free_chunk_id(cref.id);
+                self.pending_free.push(cref.id);
             }
             self.tree.inodes.remove(&target_id);
             // Layer 2: inode is gone; drop any pending dirty marker
@@ -3323,7 +3502,111 @@ impl Vfs {
         }
         // If still nonzero, the inode remains and is reachable via
         // its other directory entries; chunks stay allocated.
+        //
+        // R15-E1: if the surviving hardlinked inode's canonical parent
+        // was the directory we just unlinked it from, adopt one of the
+        // directories that still holds an entry for it. Otherwise a
+        // later `rmdir` of this directory breaks every flush (see
+        // `rename`).
+        if !now_zero
+            && self
+                .tree
+                .inodes
+                .get(&target_id)
+                .is_some_and(|t| t.parent == parent)
+            && let Some(survivor) = self.directory_holding(target_id)
+        {
+            self.tree.inodes.get_mut(&target_id).unwrap().parent = survivor;
+        }
         self.dirty = true;
+        Ok(())
+    }
+
+    /// Some directory that currently holds an entry for `id`, if any.
+    /// Linear in the number of directory entries; only used on the
+    /// rare hardlink-unlink path.
+    fn directory_holding(&self, id: FileId) -> Option<FileId> {
+        self.tree
+            .inodes
+            .values()
+            .find(|d| d.kind == InodeKind::Directory && d.children.values().any(|&c| c == id))
+            .map(|d| d.id)
+    }
+
+    /// R15-C3: overwrite every chunk slot below `next_chunk_id` that no
+    /// inode references (free list, pending frees, ids leaked by failed
+    /// writes) with fresh random bytes. Called from both MVK rotation
+    /// paths, which otherwise rekey only live chunks and leave deleted
+    /// or truncated content recoverable with the pre-rotation MVK (the
+    /// AEAD keystream depends only on key + nonce, both on disk).
+    fn scrub_unreferenced_chunk_slots(&mut self) -> Result<(), Error> {
+        use rand_core::{OsRng, RngCore};
+        let mut live: BTreeSet<ChunkId> = BTreeSet::new();
+        for inode in self.tree.inodes.values() {
+            live.extend(inode.chunks.iter().map(|c| c.id));
+            live.extend(inode.external_list_blocks.iter().map(|c| c.id));
+        }
+        let data_offset = self.container.data_offset();
+        let mut buf = vec![0u8; chunk::CHUNK_SLOT_SIZE as usize];
+        for id in 0..self.tree.next_chunk_id {
+            if live.contains(&id) {
+                continue;
+            }
+            OsRng.try_fill_bytes(&mut buf).map_err(|e| {
+                Error::Format(luksbox_format::Error::Crypto(luksbox_core::Error::OsRng(
+                    e.to_string(),
+                )))
+            })?;
+            let off = chunk::slot_offset(data_offset, id)?;
+            self.container.write_at(off, &buf)?;
+        }
+        Ok(())
+    }
+
+    /// R15-E2: zero the bytes of file range `[from, to)` that live in
+    /// chunks ALREADY present in `chunks` (new chunks are allocated
+    /// zero-filled by the caller). Rewritten chunks get a fresh
+    /// generation and their refs are updated in place in `chunks`;
+    /// chunks whose share of the range is already zero are left alone.
+    fn zero_fill_existing_range(
+        &mut self,
+        id: FileId,
+        key: &luksbox_core::SubKey,
+        chunks: &mut [ChunkRef],
+        from: u64,
+        to: u64,
+        hide_size: bool,
+    ) -> Result<(), Error> {
+        if from >= to || chunks.is_empty() {
+            return Ok(());
+        }
+        let (first, _) = file_to_chunk(from, hide_size)?;
+        let (last, _) = file_to_chunk(to - 1, hide_size)?;
+        for idx in first..=last.min(chunks.len() - 1) {
+            let (cfs, cfe) = chunk_file_range(idx, hide_size)?;
+            let zs = from.max(cfs).saturating_sub(cfs) as usize;
+            let ze = to.min(cfe).saturating_sub(cfs) as usize;
+            if zs >= ze {
+                continue;
+            }
+            let ds = if hide_size && idx == 0 {
+                SIZE_HEADER_LEN
+            } else {
+                0
+            };
+            let cur = chunks[idx];
+            let mut pt = chunk::read_chunk(&mut self.container, key, id, idx as u32, cur)?;
+            if pt[ds + zs..ds + ze].iter().all(|&b| b == 0) {
+                continue;
+            }
+            pt[ds + zs..ds + ze].fill(0);
+            let new_ref = ChunkRef {
+                id: cur.id,
+                generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
+            };
+            chunk::write_chunk(&mut self.container, key, id, idx as u32, new_ref, &pt)?;
+            chunks[idx] = new_ref;
+        }
         Ok(())
     }
 
@@ -3410,7 +3693,7 @@ impl Vfs {
     /// an opt-in.
     pub fn symlink(&mut self, parent: FileId, name: &str, target: &str) -> Result<FileId, Error> {
         self.ensure_writable()?;
-        validate_name(name)?;
+        validate_new_name(name)?;
         if !is_safe_symlink_target(target) {
             return Err(Error::InvalidPath(target.to_string()));
         }
@@ -3489,7 +3772,7 @@ impl Vfs {
         new_name: &str,
     ) -> Result<(), Error> {
         self.ensure_writable()?;
-        validate_name(new_name)?;
+        validate_new_name(new_name)?;
 
         // Validate target. Only regular files can be hardlinked
         // -- POSIX forbids dir hardlinks (cycle defense), and our
@@ -3594,7 +3877,7 @@ impl Vfs {
     ) -> Result<(), Error> {
         self.ensure_writable()?;
         validate_name(old_name)?;
-        validate_name(new_name)?;
+        validate_new_name(new_name)?;
 
         // POSIX: rename(x, x) within the same dir is a no-op success.
         // Doing the check up-front also avoids the Phase 2/3 work for
@@ -3694,10 +3977,10 @@ impl Vfs {
                     (dst.chunks.clone(), dst.external_list_blocks.clone())
                 };
                 for cref in chunks {
-                    self.tree.free_chunk_id(cref.id);
+                    self.pending_free.push(cref.id);
                 }
                 for cref in list_blocks {
-                    self.tree.free_chunk_id(cref.id);
+                    self.pending_free.push(cref.id);
                 }
                 self.tree.inodes.remove(&dst_id);
                 // Layer 2: same bookkeeping as `unlink` -- the inode
@@ -3725,6 +4008,15 @@ impl Vfs {
             };
             let new_dir = self.tree.inodes.get_mut(&new_parent).unwrap();
             new_dir.children.insert(new_name.to_string(), id);
+            // R15-E1: the moved inode's canonical parent must follow its
+            // entry. It used to stay at `old_parent`, so a later `rmdir`
+            // of that directory made `validate_metadata_tree` reject the
+            // tree (parent no longer a directory) at EVERY subsequent
+            // flush: nothing written after that point ever reached disk
+            // and the vault reopened at the pre-rename snapshot.
+            if let Some(moved) = self.tree.inodes.get_mut(&id) {
+                moved.parent = new_parent;
+            }
         }
         self.dirty = true;
         Ok(())
@@ -3923,6 +4215,11 @@ impl Vfs {
             }
 
             // Re-encrypt the metadata blob with new_mvk's metadata_key.
+            // R15-C3: slots no inode references (free list, slots freed
+            // this session, leaked ids) were copied verbatim and stayed
+            // decryptable under the OLD MVK after a rotation that the
+            // documentation sells as "true revocation". Scrub them.
+            self.scrub_unreferenced_chunk_slots()?;
             self.container.rekey_metadata(&new_mvk)?;
 
             // Build new keyslots wrapping new_mvk. Each rebuilt slot uses a
@@ -4169,6 +4466,7 @@ impl Vfs {
 
             // 7. Write the metadata blob under the new state. Container's
             //    write_metadata uses the CURRENT (new) mvk + salt.
+            this.scrub_unreferenced_chunk_slots()?; // R15-C3
             this.container.write_metadata(&metadata_plaintext)?;
 
             // 8. Persist the rotated deniable header.
@@ -4243,6 +4541,23 @@ impl Vfs {
 /// containing `\` cannot be added to a vault, which we accept as
 /// a security/portability win.
 const MAX_NAME_LEN_BYTES: usize = 255;
+
+/// R15-E7: `validate_name` plus a control-character ban, applied to
+/// every name that enters the tree through the API (`create`, `mkdir`,
+/// `symlink`, `link`, `rename` target). Names with `\n`, `\r`, ESC,
+/// bidi controls etc. are legal on POSIX but only ever useful for
+/// spoofing listings (terminal escape injection in `luksbox ls`, row
+/// forgery in the GUI browser). Kept separate from `validate_name`,
+/// which also runs at metadata-load time, so an existing vault that
+/// already holds such a name keeps loading; it is sanitised at display
+/// time instead.
+fn validate_new_name(name: &str) -> Result<(), Error> {
+    validate_name(name)?;
+    if name.chars().any(char::is_control) {
+        return Err(Error::InvalidPath(name.to_string()));
+    }
+    Ok(())
+}
 
 fn validate_name(name: &str) -> Result<(), Error> {
     if name.is_empty()
@@ -4491,6 +4806,9 @@ mod tests {
         let chunks_before = vfs.tree.inodes[&f].chunks.len();
         let free_before = vfs.tree.free_chunks.len();
         vfs.truncate(f, 100).unwrap();
+        // R15-E3: slots freed in-session reach `free_chunks` after the flush
+        // that stops referencing them is durable.
+        vfs.flush().unwrap();
         let chunks_after = vfs.tree.inodes[&f].chunks.len();
         let free_after = vfs.tree.free_chunks.len();
         assert!(chunks_after < chunks_before);
@@ -4526,6 +4844,9 @@ mod tests {
         vfs.write(f, 0, &vec![1u8; 8000]).unwrap();
         let next_chunk_id_before = vfs.tree.next_chunk_id;
         vfs.unlink(root, "x").unwrap();
+        // R15-E3: freed slots become reusable only once the metadata
+        // that stopped referencing them is durable.
+        vfs.flush().unwrap();
         // create another file and write 8 KB, should reuse the freed chunks
         let g = vfs.create(root, "y").unwrap();
         vfs.write(g, 0, &vec![2u8; 8000]).unwrap();
@@ -4647,6 +4968,9 @@ mod tests {
         vfs.write(replacement, 0, b"x").unwrap();
 
         vfs.rename(root, "small", root, "big").unwrap();
+        // R15-E3: slots freed in-session reach `free_chunks` after the flush
+        // that stops referencing them is durable.
+        vfs.flush().unwrap();
 
         // The displaced inode is gone from the inode table.
         assert!(
@@ -4821,6 +5145,9 @@ mod tests {
         );
 
         vfs.rename(src_dir, "incoming", dst_dir, "target").unwrap();
+        // R15-E3: slots freed in-session reach `free_chunks` after the flush
+        // that stops referencing them is durable.
+        vfs.flush().unwrap();
 
         assert!(!vfs.tree.inodes.contains_key(&displaced));
         for cref in &displaced_chunks {
@@ -5355,6 +5682,9 @@ mod tests {
         // Now unlink the LAST link. nlink: 1 -> 0. Inode + chunks
         // must finally be freed.
         vfs.unlink(root, "alias").unwrap();
+        // R15-E3: slots freed in-session reach `free_chunks` after the flush
+        // that stops referencing them is durable.
+        vfs.flush().unwrap();
         assert!(!vfs.tree.inodes.contains_key(&f));
         for cref in &orig_chunks {
             assert!(
@@ -6304,6 +6634,9 @@ mod tests {
         assert!(block_count > 0);
         let free_before = vfs.tree.free_chunks.len();
         vfs.unlink(root, "doomed").unwrap();
+        // R15-E3: slots freed in-session reach `free_chunks` after the flush
+        // that stops referencing them is durable.
+        vfs.flush().unwrap();
         assert_eq!(
             vfs.tree.free_chunks.len(),
             free_before + data_chunk_count + block_count,
@@ -6985,6 +7318,9 @@ mod tests {
         let free_before = vfs.tree.free_chunks.len();
 
         vfs.unlink(root, "doomed").unwrap();
+        // R15-E3: slots freed in-session reach `free_chunks` after the flush
+        // that stops referencing them is durable.
+        vfs.flush().unwrap();
         // All data chunks AND all chunk-list blocks must have come
         // back to the free pool.
         assert_eq!(
@@ -8451,5 +8787,182 @@ mod tests {
         assert_eq!(vfs.lookup(root, "b").unwrap(), a);
         assert_eq!(vfs.tree.inodes[&a].link_count, 2);
         vfs.flush().unwrap();
+    }
+
+    /// R15-E1 regression: moving entries out of a directory and then
+    /// removing that directory must leave the tree persistable, and
+    /// everything written afterwards must survive a reopen.
+    #[test]
+    fn rename_out_then_rmdir_old_parent_still_flushes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        {
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            let root = vfs.root_id();
+            let a = vfs.mkdir(root, "a").unwrap();
+            let b = vfs.mkdir(a, "b").unwrap();
+            let f = vfs.create(a, "f").unwrap();
+            vfs.write(f, 0, b"payload").unwrap();
+            vfs.rename(a, "b", root, "b").unwrap();
+            vfs.rename(a, "f", root, "f").unwrap();
+            assert_eq!(vfs.tree.inodes[&b].parent, root);
+            assert_eq!(vfs.tree.inodes[&f].parent, root);
+            vfs.rmdir(root, "a").unwrap();
+            vfs.flush()
+                .expect("flush after rmdir of the old parent must succeed");
+            let g = vfs.create(root, "g").unwrap();
+            vfs.write(g, 0, b"later").unwrap();
+            vfs.close().unwrap();
+        }
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        let root = vfs.root_id();
+        assert!(vfs.lookup(root, "a").is_err());
+        let g = vfs.lookup(root, "g").unwrap();
+        let mut buf = vec![0u8; 5];
+        vfs.read(g, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"later");
+    }
+
+    /// R15-E1 regression, hardlink variant: unlinking the entry that
+    /// was the inode's canonical parent must re-point `parent` at a
+    /// surviving entry's directory, or `rmdir` of that directory breaks
+    /// every later flush.
+    #[test]
+    fn hardlink_unlink_then_rmdir_canonical_parent_still_flushes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let a = vfs.mkdir(root, "a").unwrap();
+        let f = vfs.create(a, "f").unwrap();
+        vfs.write(f, 0, b"shared").unwrap();
+        vfs.link(f, root, "g").unwrap();
+        vfs.unlink(a, "f").unwrap();
+        assert_eq!(vfs.tree.inodes[&f].parent, root);
+        vfs.rmdir(root, "a").unwrap();
+        vfs.flush()
+            .expect("flush must succeed after the canonical parent is gone");
+    }
+
+    /// R15-E1: a vault persisted by an older binary with a stale
+    /// `parent` (rename never updated it) is healed at open.
+    #[test]
+    fn stale_parent_pointer_is_repaired_at_open() {
+        let mut tree = DirectoryTree::new();
+        let a = tree.alloc_file_id().unwrap();
+        let f = tree.alloc_file_id().unwrap();
+        let mk = |id, parent, kind| crate::tree::Inode {
+            id,
+            parent,
+            kind,
+            size: 0,
+            mtime_ns: 0,
+            chunks: Vec::new(),
+            children: std::collections::BTreeMap::new(),
+            cached_real_size: None,
+            external_list_blocks: Vec::new(),
+            mode: if kind == InodeKind::Directory {
+                crate::tree::DEFAULT_DIR_MODE
+            } else {
+                crate::tree::DEFAULT_FILE_MODE
+            },
+            link_count: 1,
+            symlink_target: None,
+        };
+        tree.inodes.insert(a, mk(a, ROOT_ID, InodeKind::Directory));
+        // `f` lives in root but still claims `a` as its parent.
+        tree.inodes.insert(f, mk(f, a, InodeKind::File));
+        tree.inodes
+            .get_mut(&ROOT_ID)
+            .unwrap()
+            .children
+            .insert("a".into(), a);
+        tree.inodes
+            .get_mut(&ROOT_ID)
+            .unwrap()
+            .children
+            .insert("f".into(), f);
+        assert_eq!(repair_stale_parents(&mut tree), 1);
+        assert_eq!(tree.inodes[&f].parent, ROOT_ID);
+        assert_eq!(repair_stale_parents(&mut tree), 0);
+    }
+
+    /// R15-E2 regression: bytes in a hole opened by `truncate` up or by a
+    /// write past EOF must read as zeros, never as content an earlier
+    /// shrink discarded.
+    #[test]
+    fn extension_after_shrink_reads_zeros_not_stale_bytes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+
+        let f = vfs.create(root, "t").unwrap();
+        vfs.write(f, 0, &vec![0xABu8; 4000]).unwrap();
+        vfs.truncate(f, 50).unwrap();
+        vfs.truncate(f, 200).unwrap();
+        let mut buf = vec![0xFFu8; 200];
+        assert_eq!(vfs.read(f, 0, &mut buf).unwrap(), 200);
+        assert!(buf[..50].iter().all(|&b| b == 0xAB));
+        assert!(
+            buf[50..].iter().all(|&b| b == 0),
+            "truncate-up hole must be zero"
+        );
+
+        let g = vfs.create(root, "w").unwrap();
+        vfs.write(g, 0, &vec![0xCDu8; 9000]).unwrap();
+        vfs.truncate(g, 50).unwrap();
+        vfs.write(g, 8500, b"Z").unwrap();
+        let mut buf = vec![0xFFu8; 8501];
+        assert_eq!(vfs.read(g, 0, &mut buf).unwrap(), 8501);
+        assert!(buf[..50].iter().all(|&b| b == 0xCD));
+        assert!(
+            buf[50..8500].iter().all(|&b| b == 0),
+            "write-past-EOF hole must be zero"
+        );
+        assert_eq!(buf[8500], b'Z');
+    }
+
+    /// R15-E4: a directory inode carrying an external chunk-list chain is
+    /// a forgery (directories hold no data) and must be rejected before
+    /// the spill can double-free its blocks.
+    #[test]
+    fn validator_rejects_directory_with_external_chain() {
+        let mut tree = DirectoryTree::new();
+        tree.next_chunk_id = 1;
+        tree.next_chunk_gen = 2;
+        tree.inodes
+            .get_mut(&ROOT_ID)
+            .unwrap()
+            .external_list_blocks
+            .push(ChunkRef {
+                id: 0,
+                generation: 1,
+            });
+        assert!(validate_metadata_tree(&tree, 1 << 20, false).is_err());
+    }
+
+    /// R15-D1: every flush of a dirty tree persists a strictly larger
+    /// generation, even when nothing wrote a chunk, so the rollback
+    /// anchor can tell two metadata-only states apart.
+    #[test]
+    fn metadata_only_change_advances_generation_on_flush() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "x").unwrap();
+        vfs.write(f, 0, b"data").unwrap();
+        vfs.flush().unwrap();
+        let g1 = vfs.vault_generation();
+        vfs.unlink(root, "x").unwrap();
+        vfs.flush().unwrap();
+        let g2 = vfs.vault_generation();
+        assert!(
+            g2 > g1,
+            "unlink + flush must advance the persisted generation"
+        );
+        vfs.flush().unwrap();
+        assert_eq!(vfs.vault_generation(), g2, "a clean flush is a no-op");
     }
 }

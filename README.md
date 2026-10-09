@@ -94,7 +94,7 @@ subpoena, is what LUKSbox is built for and what it does today.
 | Surface | State |
 |---|---|
 | `cargo test --workspace` | 600+ passing, 0 failing (a few platform-gated tests skip off-platform) |
-| `cargo audit` | 0 vulnerabilities, 0 unsound; 2 allow-listed unmaintained advisories (`paste`, a compile-time-only proc-macro from the TPM stack, and `registry`, Windows/WinFsp-only), both documented in `audit.toml` + `SECURITY.md` |
+| `cargo audit` | 0 vulnerabilities, 0 unsound; 2 allow-listed unmaintained advisories (`paste`, a compile-time-only proc-macro from the TPM stack, and `registry`, Windows/WinFsp-only), both documented in `.cargo/audit.toml` + `SECURITY.md` |
 | Internal audit rounds | 14 documented at <https://luksbox.penthertz.com/docs/security/audit/> (per-round details kept internal) |
 | Third-party audit | not yet performed; engagement scope package available on request to `security@penthertz.com` |
 | Fuzz iterations across 10 libFuzzer harnesses | 30M+ |

@@ -62,6 +62,19 @@ runs:
         Invoke-WithRetry -What 'tpm2-tss archive download' -Action {
             Invoke-WebRequest -Uri "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/$ver.zip" -OutFile 'C:\t2t.zip'
         }
+        # R15-J3: hash-pin the archive (keyed by version so a bump must
+        # record a new pin instead of silently accepting whatever the
+        # mutable tag serves that day).
+        $pins = @{ '4.1.3' = '43328bfefcdcdff1b89a45e7f2bba246d4ec6847801e864d696337a956b33f0b' }
+        if (-not $pins.ContainsKey($ver)) {
+            Write-Error "no SHA-256 pin recorded for tpm2-tss $ver; add it to the `$pins table in stage-tpm2-tss/action.yml"
+            exit 1
+        }
+        $h = (Get-FileHash 'C:\t2t.zip' -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($h -ne $pins[$ver]) {
+            Write-Error "tpm2-tss $ver archive SHA-256 mismatch: expected $($pins[$ver]) got $h"
+            exit 1
+        }
         Expand-Archive 'C:\t2t.zip' -DestinationPath 'C:\t2t'
         $src = "C:\t2t\tpm2-tss-$ver"
         if (-not (Test-Path "$src\tpm2-tss.sln")) {

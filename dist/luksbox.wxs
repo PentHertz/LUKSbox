@@ -62,7 +62,15 @@
              WinFsp 1.x and 2.x both write `InstallDir` (REG_SZ) into
              HKLM\SOFTWARE\WOW6432Node\WinFsp. The value ends in a
              backslash, e.g. "C:\Program Files (x86)\WinFsp\". -->
-        <Property Id="WINFSPINSTALLDIR" Secure="yes">
+        <!-- R15-J2: NOT `Secure="yes"`. A secure public property is
+             forwarded from the (non-elevated) client side into the
+             elevated server-side execute sequence, which let any
+             standard user run `msiexec /fa {ProductCode}
+             WINFSPINSTALLDIR=...` and splice their value into the
+             deferred, non-impersonated copy action below. AppSearch
+             re-runs server-side anyway, so the registry-derived value
+             is still available there. -->
+        <Property Id="WINFSPINSTALLDIR">
             <RegistrySearch Id="WinFspRegSearch"
                             Root="HKLM"
                             Key="SOFTWARE\WOW6432Node\WinFsp"
@@ -307,25 +315,33 @@
                 Type="integer"
                 Value="1"
                 KeyPath="yes" />
+            <!-- R15-J2: the sibling copy is removed by the standard
+                 RemoveFiles action (processed before RemoveFolders, so
+                 the INSTALLFOLDER directory-empty check still passes)
+                 instead of a `cmd.exe /C del` custom action. -->
+            <RemoveFile Id="RemoveWinFspDllSibling"
+                        Name="winfsp-x64.dll"
+                        On="uninstall" />
         </Component>
 
-        <!-- Schedule the copy/remove. Deferred so they run with
-             elevated context (INSTALLFOLDER is %ProgramFiles%); the
-             non-elevated immediate-mode would fail on the write. -->
+        <!-- Schedule the copy. Deferred so it runs with elevated
+             context (INSTALLFOLDER is %ProgramFiles%); the non-elevated
+             immediate-mode would fail on the write.
+
+             R15-J2: invoked WITHOUT cmd.exe. The property value is
+             spliced into a command line, and under cmd.exe a `"` in it
+             closed the quote and `&` chained an arbitrary command that
+             ran as LocalSystem. xcopy.exe parses its own arguments and
+             has no command chaining; the worst a hostile value can now
+             do is copy the wrong file, and the property is no longer
+             client-settable in the first place (see WINFSPINSTALLDIR). -->
         <CustomAction
             Id="CopyWinFspDll"
             Directory="INSTALLFOLDER"
             Execute="deferred"
             Impersonate="no"
             Return="check"
-            ExeCommand='"cmd.exe" /D /C copy /Y "[WINFSPINSTALLDIR]bin\winfsp-x64.dll" "[INSTALLFOLDER]winfsp-x64.dll"' />
-        <CustomAction
-            Id="RemoveWinFspDll"
-            Directory="INSTALLFOLDER"
-            Execute="deferred"
-            Impersonate="no"
-            Return="ignore"
-            ExeCommand='"cmd.exe" /D /C del /F /Q "[INSTALLFOLDER]winfsp-x64.dll"' />
+            ExeCommand='"[SystemFolder]xcopy.exe" "[WINFSPINSTALLDIR]bin\winfsp-x64.dll" "[INSTALLFOLDER]" /Y /Q /R' />
 
         <InstallExecuteSequence>
             <!-- Copy after the LUKSbox files land so INSTALLFOLDER
@@ -333,13 +349,6 @@
             <Custom Action="CopyWinFspDll"
                     After="InstallFiles"
                     Condition="NOT REMOVE AND WINFSPINSTALLDIR" />
-            <!-- Remove BEFORE RemoveFiles so MSI's directory-empty
-                 check on INSTALLFOLDER succeeds and the directory
-                 gets cleaned up. Run on uninstall only (REMOVE=ALL
-                 covers full uninstall; an upgrade reinstalls below). -->
-            <Custom Action="RemoveWinFspDll"
-                    Before="RemoveFiles"
-                    Condition="REMOVE=&quot;ALL&quot;" />
         </InstallExecuteSequence>
 
         <!-- ===== .lbx file association =========================== -->

@@ -1058,7 +1058,8 @@ fn info_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
     println!("  data offset:    {}", container.header.data_offset);
     println!("  chunk size:     {}", container.header.chunk_size);
     println!("  is deniable:    {}", container.is_deniable());
-    println!("  unlocked slot:  {:?}", container.deniable_unlocked_slot());
+    // R15-H6: slot index intentionally not shown here (see the CLI's
+    // deniable-info for the rationale).
     Ok(())
 }
 
@@ -1079,8 +1080,9 @@ fn mount_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
         if !mountpoint.is_dir() {
             return Err(format!("mountpoint {} is not a directory", mountpoint.display()).into());
         }
-        mountpoint
-            .canonicalize()
+        // R15-H5: absolute, not canonical, so the mount layer's
+        // no-follow probe can refuse a symlinked mountpoint.
+        std::path::absolute(&mountpoint)
             .map_err(|e| format!("cannot resolve {}: {e}", mountpoint.display()))?
     };
     #[cfg(target_os = "windows")]
@@ -1752,7 +1754,13 @@ fn panic_by_path(theme: &ColorfulTheme) -> Result<()> {
         RecoveryMirrors::open_no_follow(&vault, &header_target, wipe_data).map_err(|e| {
             format!("refusing to open a crash-recovery mirror for destructive overwrite: {e}")
         })?;
-    let len_hint = std::fs::metadata(&vault).map(|m| m.len()).unwrap_or(0);
+    // R15-H4: size the wipe from the pinned handle (see `cmd_panic`).
+    let len_hint = vf_opt
+        .as_ref()
+        .unwrap_or(&hf)
+        .metadata()
+        .map(|m| m.len())
+        .map_err(|e| format!("cannot size {} for the data wipe: {e}", vault.display()))?;
 
     eprintln!(
         "PANIC: about to overwrite the {} of {} with random bytes.",
@@ -2057,7 +2065,9 @@ fn ask_detached_header(theme: &ColorfulTheme, for_create: bool) -> Result<Option
 /// file (detached). Returns the parsed `Header`.
 fn load_header(vault: &Path, sidecar: Option<&Path>) -> Result<Header> {
     let from = sidecar.unwrap_or(vault);
-    let mut f = File::open(from)?;
+    // R15-H5: honour `LUKSBOX_NO_FOLLOW_SYMLINKS` like every other
+    // header prescan (this one drives FIDO2/TPM/SEP prompts).
+    let mut f = luksbox_core::file_util::open_existing_read_no_follow_policy(from)?;
     let mut buf = [0u8; HEADER_SIZE];
     f.read_exact(&mut buf)?;
     Ok(Header::from_bytes(&buf)?)
@@ -4420,8 +4430,12 @@ fn mount_action(theme: &ColorfulTheme, vfs: Vfs, vault: &Path) -> Result<()> {
             .default(true)
             .interact()?
     };
+    // R15-H5: absolute, NOT canonical. `canonicalize` resolved a
+    // symlinked mountpoint before `luksbox_mount::mount`'s
+    // `O_DIRECTORY|O_NOFOLLOW` probe ever saw it, so the probe could
+    // not refuse the link (parity with `cmd_mount`).
     #[cfg(not(target_os = "windows"))]
-    let mp_abs = mp.canonicalize()?;
+    let mp_abs = std::path::absolute(&mp)?;
     #[cfg(target_os = "windows")]
     let mp_abs = mp.clone();
     if !daemonize {
@@ -4855,7 +4869,13 @@ fn panic_action(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Result<
         RecoveryMirrors::open_no_follow(vault, &header_target, wipe_data).map_err(|e| {
             format!("refusing to open a crash-recovery mirror for destructive overwrite: {e}")
         })?;
-    let len = std::fs::metadata(vault).map(|m| m.len()).unwrap_or(0);
+    // R15-H4: size the wipe from the pinned handle (see `cmd_panic`).
+    let len = vf_opt
+        .as_ref()
+        .unwrap_or(&hf)
+        .metadata()
+        .map(|m| m.len())
+        .map_err(|e| format!("cannot size {} for the data wipe: {e}", vault.display()))?;
 
     if let Some(p) = mirrors.header_mirror_path() {
         eprintln!(

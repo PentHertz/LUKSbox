@@ -143,9 +143,28 @@ const LEN_FIELD_LEN: usize = 8;
 const TAG_LEN: usize = 16;
 
 const METADATA_KEY_INFO: &[u8] = b"lbx:metadata-key/v1";
+/// R15-D2: HKDF label of the per-vault key that masks the length field.
+const METADATA_LEN_MASK_INFO: &[u8] = b"lbx:metadata-len-mask/v1";
 
 fn metadata_key(mvk: &MasterVolumeKey, header_salt: &[u8; 32]) -> SubKey {
     mvk.derive_subkey(header_salt, METADATA_KEY_INFO)
+}
+
+/// R15-D2: 8-byte mask for the `ct_len` field, unique per write because
+/// it is bound to the fresh region nonce: `HMAC-SHA256(mask_key, nonce)[..8]`
+/// with `mask_key = HKDF(MVK, header_salt, "lbx:metadata-len-mask/v1")`.
+/// Without the MVK the masked field is indistinguishable from the random
+/// padding around it.
+fn len_mask(mvk: &MasterVolumeKey, header_salt: &[u8; 32], nonce: &[u8; NONCE_LEN]) -> [u8; 8] {
+    use hmac::{Hmac, Mac};
+    let key = mvk.derive_subkey(header_salt, METADATA_LEN_MASK_INFO);
+    let mut mac =
+        <Hmac<sha2::Sha256> as Mac>::new_from_slice(&key[..]).expect("HMAC accepts any key length");
+    mac.update(nonce);
+    let out = mac.finalize().into_bytes();
+    let mut m = [0u8; 8];
+    m.copy_from_slice(&out[..8]);
+    m
 }
 
 /// Serialize an encrypted metadata blob into a fixed-size on-disk region.
@@ -163,6 +182,19 @@ pub fn write_metadata(
     header_salt: &[u8; 32],
     plaintext: &[u8],
     region: &mut [u8],
+) -> Result<(), Error> {
+    write_metadata_opts(suite, mvk, header_salt, plaintext, region, false)
+}
+
+/// `write_metadata` with the R15-D2 length-field masking switch
+/// (`mask_len` = the vault header's `FLAG_MASKED_METADATA_LEN`).
+pub fn write_metadata_opts(
+    suite: CipherSuite,
+    mvk: &MasterVolumeKey,
+    header_salt: &[u8; 32],
+    plaintext: &[u8],
+    region: &mut [u8],
+    mask_len: bool,
 ) -> Result<(), Error> {
     if plaintext.len() + METADATA_OVERHEAD > region.len() {
         return Err(Error::MetadataTooLarge);
@@ -196,7 +228,12 @@ pub fn write_metadata(
         .try_fill_bytes(region)
         .expect("OS RNG failure during metadata padding fill");
     region[..NONCE_LEN].copy_from_slice(&nonce);
-    region[NONCE_LEN..NONCE_LEN + LEN_FIELD_LEN].copy_from_slice(&ct_len.to_le_bytes());
+    let stored_len = if mask_len {
+        ct_len ^ u64::from_le_bytes(len_mask(mvk, header_salt, &nonce))
+    } else {
+        ct_len
+    };
+    region[NONCE_LEN..NONCE_LEN + LEN_FIELD_LEN].copy_from_slice(&stored_len.to_le_bytes());
     region[NONCE_LEN + LEN_FIELD_LEN..NONCE_LEN + LEN_FIELD_LEN + ct.len()].copy_from_slice(&ct);
     Ok(())
 }
@@ -210,16 +247,35 @@ pub fn read_metadata(
     header_salt: &[u8; 32],
     region: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, Error> {
+    read_metadata_opts(suite, mvk, header_salt, region, false)
+}
+
+/// `read_metadata` with the R15-D2 length-field masking switch.
+pub fn read_metadata_opts(
+    suite: CipherSuite,
+    mvk: &MasterVolumeKey,
+    header_salt: &[u8; 32],
+    region: &[u8],
+    mask_len: bool,
+) -> Result<Zeroizing<Vec<u8>>, Error> {
     if region.len() < METADATA_OVERHEAD {
         return Err(Error::MetadataCorrupt);
     }
     let mut nonce = [0u8; NONCE_LEN];
     nonce.copy_from_slice(&region[..NONCE_LEN]);
-    let ct_len = u64::from_le_bytes(
+    let stored_len = u64::from_le_bytes(
         region[NONCE_LEN..NONCE_LEN + LEN_FIELD_LEN]
             .try_into()
             .unwrap(),
-    ) as usize;
+    );
+    let ct_len = if mask_len {
+        stored_len ^ u64::from_le_bytes(len_mask(mvk, header_salt, &nonce))
+    } else {
+        stored_len
+    };
+    // Unmasked or not, `ct_len` is still unauthenticated input here; the
+    // bounds checks below and the AAD binding keep it harmless.
+    let ct_len = usize::try_from(ct_len).map_err(|_| Error::MetadataCorrupt)?;
 
     let body_start = NONCE_LEN + LEN_FIELD_LEN;
     let body_end = match body_start.checked_add(ct_len) {
@@ -243,6 +299,54 @@ pub fn read_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R15-D2: with masking on, the on-disk length field must not be the
+    /// plaintext `u64 LE` length (whose high bytes are zero), the region
+    /// must round-trip, and a reader that does not apply the mask must
+    /// fail cleanly.
+    #[test]
+    fn masked_length_field_is_not_plaintext_and_roundtrips() {
+        let mvk = MasterVolumeKey::random();
+        let salt = [0x5au8; 32];
+        let pt = b"directory tree bytes";
+        let mut region = vec![0u8; 4096];
+        write_metadata_opts(
+            CipherSuite::Aes256GcmSiv,
+            &mvk,
+            &salt,
+            pt,
+            &mut region,
+            true,
+        )
+        .unwrap();
+        let ct_len = (pt.len() + TAG_LEN) as u64;
+        assert_ne!(
+            &region[NONCE_LEN..NONCE_LEN + LEN_FIELD_LEN],
+            &ct_len.to_le_bytes()[..],
+            "masked field must differ from the plaintext length"
+        );
+        assert!(
+            region[NONCE_LEN + 4..NONCE_LEN + 8].iter().any(|&b| b != 0),
+            "masked high bytes must not be the tell-tale zeros"
+        );
+        let back =
+            read_metadata_opts(CipherSuite::Aes256GcmSiv, &mvk, &salt, &region, true).unwrap();
+        assert_eq!(&back[..], pt);
+        assert!(
+            read_metadata_opts(CipherSuite::Aes256GcmSiv, &mvk, &salt, &region, false).is_err()
+        );
+        // Unmasked writes stay byte-compatible with the legacy reader.
+        let mut region2 = vec![0u8; 4096];
+        write_metadata(CipherSuite::Aes256GcmSiv, &mvk, &salt, pt, &mut region2).unwrap();
+        assert_eq!(
+            &region2[NONCE_LEN..NONCE_LEN + LEN_FIELD_LEN],
+            &ct_len.to_le_bytes()[..]
+        );
+        assert_eq!(
+            &read_metadata(CipherSuite::Aes256GcmSiv, &mvk, &salt, &region2).unwrap()[..],
+            pt
+        );
+    }
 
     #[test]
     fn oversize_create_override_is_clamped_to_max() {

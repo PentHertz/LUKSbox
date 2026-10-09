@@ -129,8 +129,16 @@ provenance-pinning property that `SHA256SUMS.txt.asc` would add.
 
 - **Rollback.** Restoring an older snapshot of a vault (e.g. from backup,
   from cloud sync history) is detected if the user is using `.anchor`
-  sidecars on separate trusted storage. Without an anchor, rollback is **not**
-  detected, that's the user's choice and is documented in TUTORIAL.md.
+  sidecars on separate trusted storage. Since Round 15 every flush
+  advances the anchored generation, so a rollback across a metadata-only
+  change (a deleted or renamed file) is detected too, not only one that
+  crossed a chunk write. The anchor does **not** cover header-only
+  changes: a backup taken before `luksbox revoke` can be restored
+  without the anchor noticing (the keyslot table carries no generation
+  yet; see `docs/ROLLBACK_PROTECTION.md`). After revoking a credential
+  whose holder may possess an old copy of the vault, run `rotate-mvk`.
+  Without an anchor, rollback is **not** detected, that's the user's
+  choice and is documented in TUTORIAL.md.
 
 - **Argon2id / Kyber-seed parser DoS.** Hostile on-disk KDF parameters
   (`m_cost = u32::MAX`, etc.) are rejected at the parser layer before any
@@ -352,7 +360,7 @@ are exploitable today, but each is a forward-looking risk you should weigh.
 ### Unmaintained dependencies (`cargo audit` warnings)
 
 `cargo audit` against the workspace currently surfaces **two**
-`unmaintained` advisories, both accepted and documented in `audit.toml`
+`unmaintained` advisories, both accepted and documented in `.cargo/audit.toml`
 and in the explicit `--ignore` list of `scripts/audit.sh`. Both are
 informational (`unmaintained`, no CVE), so CI's plain `cargo audit`
 (`.github/workflows/ci.yml::audit`) reports them but does not fail on
@@ -816,7 +824,13 @@ risk first.
       those two public nonces alone and provide no bus
       confidentiality at all (the interposer would just recompute it);
       this is the gap v0.5.0-rc.2 closes, and it matches the
-      protection systemd-cryptenroll applies. Firmware TPMs (Intel
+      protection systemd-cryptenroll applies. The protection is
+      against a *passive* interposer only: an *active* interposer
+      that rewrites the SRK public area in the `CreatePrimary`
+      response to its own key learns the session salt and can
+      decrypt the unseal traffic, because nothing in the keyslot pins
+      the SRK's identity yet (Round 15, R15-F5; SRK-name pinning is
+      the planned fix). Firmware TPMs (Intel
       PTT / AMD fTPM) have no external bus and were never exposed;
       Apple's Secure Enclave is likewise an on-die coprocessor with
       no interposable bus, so the macOS SEP keyslots do not need (and
@@ -1129,7 +1143,7 @@ If you're using LUKSbox to protect material information, please:
     | `LUKSBOX_FORMAT_V2=1` | Forces the legacy v2 on-disk format and suppresses the auto-upgrade to v3 | Honored | Reduces a guarantee. v2 has no header or metadata crash-recovery mirrors. |
     | `LUKSBOX_ACCEPT_WEAK=1` | Auto-confirms the "use this weak passphrase anyway?" prompt | Honored | Skips a nag only. The zxcvbn warning still prints and Argon2id still runs at full strength, so it does not weaken the cryptography, only the guardrail. |
     | `LUKSBOX_TOLERATE_BAD_CHUNK_LISTS=1` | Recovery mode: a file whose chunk-list is corrupt is installed with zero chunks so the rest of the vault still opens | Honored | Recovery only. It silently turns an unreadable file into an empty one. Use it on a copy, mount read-only, and never write. |
-    | `LUKSBOX_PASSPHRASE`, `LUKSBOX_NEW_PASSPHRASE`, `LUKSBOX_FIDO2_PIN` | Supply a secret non-interactively | Honored | Leaks the secret into the process environment, readable via `/proc/<pid>/environ` by the same UID. Prefer the stdin pipe (item 10). |
+    | `LUKSBOX_PASSPHRASE`, `LUKSBOX_NEW_PASSPHRASE`, `LUKSBOX_FIDO2_PIN` | Supply a secret non-interactively | Honored | Leaks the secret into the process environment, readable via `/proc/<pid>/environ` by the same UID. Prefer the stdin pipe (item 10). Since Round 15 `LUKSBOX_PASSPHRASE` is the *unlock* secret only: `enroll`, `update`, `migrate-to-v3` and the seed-file prompts take their NEW secret from `LUKSBOX_NEW_PASSPHRASE` or the interactive prompt, never from the unlock variable (R15-H1). |
     | `LUKSBOX_NO_FOLLOW_SYMLINKS=1` | Refuses to open a vault reached through a symlink | Honored | Hardening opt-in (protective). |
     | `LUKSBOX_SANDBOX_HELPER=1` | Enables the Linux GUI sandbox helper | Honored | Hardening opt-in (protective). |
     | `LUKSBOX_FAKE_NO_AES`, `LUKSBOX_SUPPRESS_AES_WARNING` | Force, or hide, the software-AES advisory | Honored | Cosmetic. Neither changes the cipher; the advisory just recommends `--cipher chacha` on CPUs without AES acceleration. |
@@ -1162,6 +1176,7 @@ for the full per-round log.
 | 6 | Invariant lockdown across the stack | no new vulns; HKDF info-string uniqueness, header-tamper coverage, slot AEAD AAD field-by-field, cross-file substitution, generation rollback, concurrent-open enforcement (flock), symlink TOCTOU defense, AES-NI startup warning |
 | 11 | Deniable v2 cryptographic sweep | 3 fixes (per-vault salt in inner-header AAD, `Zeroizing` for envelope plaintext, propagated `Zeroizing<[u8;32]>` through `deniable_pq_decap`); 5 new workflow tests + 3 new fuzz targets |
 | 12 | FUSE-T subprocess + deniable v2 timing + filesystem TOCTOU + memory safety | 1 CRITICAL + 5 HIGH + 7 MEDIUM + 6 LOW; **all 19 findings shipped fixes in the same revision** (R12-14 formally superseded by R12-11). Full report + Fix-status table at [docs/SECURITY_AUDIT_ROUND_12.md](docs/SECURITY_AUDIT_ROUND_12.md). Headline fix: R12-01's deniable envelope discovery loop is now constant-time via `subtle::Choice`-driven byte selection + single-shot `SlotPayload::decode` on the chosen slot. New regression coverage: `dudect_deniable_envelope` bench + `deniable_envelope_multi_slot` libFuzzer + AFL++ target + `round12_findings.rs` deterministic regression suite (7 tests, 0 `#[ignore]`d). |
+| 15 | Full-workspace white-box sweep (every crate, GUI, CI/release pipeline, installer) | 0 CRITICAL + 5 HIGH + 14 MEDIUM + 29 LOW; **43 fixed in the same revision, 6 accepted/documented**. Full report at [docs/SECURITY_AUDIT_ROUND_15.md](docs/SECURITY_AUDIT_ROUND_15.md). Headline fixes: an aborted MVK rotation no longer bricks the vault (R15-C1), `rename` + `rmdir` no longer wedges every later flush (R15-E1), the GUI no longer deletes other vaults' files on a failed create (R15-I1), the anchor now sees metadata-only rollbacks (R15-D1), the Apple signing key is no longer exposed to third-party build scripts (R15-J1). |
 | 13 | Local filesystem boundary races + header durability + sidecar DoS + secret-copy hygiene | 0 CRITICAL + 2 HIGH + 5 MEDIUM + 2 LOW + 1 INFO; **all 9 findings shipped fixes in the same revision**. Full report + Fix-status table at [docs/SECURITY_AUDIT_ROUND_13.md](docs/SECURITY_AUDIT_ROUND_13.md). Headline fixes: R13-01 closes the intermediate-directory symlink swap in `secure_create_or_truncate` via `openat(parent_dir_fd, basename, O_NOFOLLOW)`; R13-02 routes `luksbox header restore` through the container's verified handle (`Container::restore_header_bytes`); R13-04 promotes `persist_header` from `flush()` to `sync_all()` + `atomic_secure_write` on detached headers. New regression coverage: 4 test files (14 tests total, 0 `#[ignore]`d). |
 
 **Ad-hoc improvements** since the audit log was last updated:

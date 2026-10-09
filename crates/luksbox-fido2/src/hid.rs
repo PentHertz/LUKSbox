@@ -626,6 +626,22 @@ fn open_device(pinned_path: Option<&CStr>) -> Result<DevHandle, Error> {
                 }
             }
         } else {
+            // R15-F1: never silently pick index 0 when more than one
+            // authenticator is visible. CTAP2 clientPIN sends
+            // `LEFT16(SHA-256(PIN))` (encrypted only to the device's own
+            // ECDH key) to whichever device we talk to BEFORE that device
+            // has proven it holds the credential, so a rogue HID device
+            // that enumerates first (an implant in a dock or hub sorts
+            // by bus topology, not insertion order) harvests the PIN and
+            // the user just sees "PIN incorrect". The wizard already
+            // prompts; the CLI/GUI default must not guess.
+            if found > 1 {
+                return Err(Error::Other(format!(
+                    "{found} FIDO2 authenticators are present; select one explicitly \
+                     (--fido2-device <path> on the CLI, the device picker in the GUI) \
+                     so the PIN is only ever sent to the intended device"
+                )));
+            }
             0
         };
 
@@ -653,8 +669,16 @@ fn open_device(pinned_path: Option<&CStr>) -> Result<DevHandle, Error> {
     }
 }
 
-fn cstring(s: &str) -> Result<CString, Error> {
-    CString::new(s).map_err(|_| Error::Other("string contains nul byte".into()))
+/// R15-F2: every `CString` handed to libfido2 is wrapped in
+/// `Zeroizing`. `CString`'s own `Drop` only writes a NUL into byte 0;
+/// the PIN copy made here otherwise stayed readable in freed heap
+/// memory after every enroll / unlock (the caller's `Zeroizing<String>`
+/// is wiped, this copy was not). Wrapping the non-secret strings too
+/// costs nothing.
+fn cstring(s: &str) -> Result<Zeroizing<CString>, Error> {
+    CString::new(s)
+        .map(Zeroizing::new)
+        .map_err(|_| Error::Other("string contains nul byte".into()))
 }
 
 /// Returns a `*const c_char` pointer suitable for passing to libfido2 FFI
@@ -668,7 +692,7 @@ fn cstring(s: &str) -> Result<CString, Error> {
 /// "make a pin pointer" into a function returning the bare `*const c_char`
 /// would not compile against this signature, which is the intended
 /// guard-rail.
-fn cstr_ptr_or_null(s: &Option<CString>) -> *const std::os::raw::c_char {
+fn cstr_ptr_or_null(s: &Option<Zeroizing<CString>>) -> *const std::os::raw::c_char {
     s.as_ref().map_or(std::ptr::null(), |c| c.as_ptr())
 }
 

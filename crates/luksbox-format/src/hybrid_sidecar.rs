@@ -363,15 +363,47 @@ fn peek_vault_header_salt(
     // refuses symlinks via `O_NOFOLLOW`. Without this an attacker
     // who controls the path between the GUI's preflight and
     // `read_for_vault`'s arrival could divert the salt read.
+    //
+    // R15-D4: the same regular-file / reparse-point discipline as
+    // `read_sidecar_bytes`. `O_NOFOLLOW` alone let a planted FIFO at
+    // the vault path stall the `read_exact` below forever (before
+    // `Container::open`'s own checks ever ran), and the non-Unix
+    // branch followed junctions outright.
     #[cfg(unix)]
     let mut f = {
         use std::os::unix::fs::OpenOptionsExt as _;
-        fs::OpenOptions::new()
+        let f = fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW)
-            .open(src)?
+            .open(src)?;
+        if !f.metadata()?.is_file() {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "vault header source {}: not a regular file; refused",
+                src.display()
+            ))));
+        }
+        f
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    let mut f = {
+        use std::os::windows::fs::MetadataExt as _;
+        use std::os::windows::fs::OpenOptionsExt as _;
+        // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+        let f = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(0x0020_0000)
+            .open(src)?;
+        let meta = f.metadata()?;
+        // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
+        if meta.file_attributes() & 0x0000_0400 != 0 || !meta.is_file() {
+            return Err(Error::Io(std::io::Error::other(format!(
+                "vault header source {}: reparse point or non-regular file; refused",
+                src.display()
+            ))));
+        }
+        f
+    };
+    #[cfg(not(any(unix, windows)))]
     let mut f = fs::File::open(src)?;
     let mut buf = [0u8; HEADER_SIZE];
     f.read_exact(&mut buf)?;

@@ -2351,23 +2351,96 @@ pub(crate) fn kdf_params_for(strength: KdfStrengthArg) -> Argon2idParams {
 /// over `LUKSBOX_PASSPHRASE` env var when both are usable, because
 /// pipe content is not visible in `/proc/<pid>/environ` (env vars
 /// are, to processes running as the same UID).
-fn read_passphrase_from_stdin_pipe() -> io::Result<Zeroizing<String>> {
-    use std::io::BufRead;
-    let mut line = String::new();
-    let stdin = io::stdin();
-    let mut handle = stdin.lock();
-    handle.read_line(&mut line)?;
-    // Strip trailing newline + optional CR (Windows-style line ends
-    // and most "echo / heredoc" pipes append \n; users who genuinely
-    // want a trailing newline in the passphrase can put it before
-    // the LAST char and use a multi-line entry mechanism).
-    if line.ends_with('\n') {
-        line.pop();
-        if line.ends_with('\r') {
-            line.pop();
+/// R15-H2: read from the process's standard input WITHOUT going
+/// through `std::io::stdin()`. That handle is a process-global
+/// `BufReader` with an 8 KiB heap buffer: any secret read through it
+/// (a piped passphrase, the FUSE-T helper's MVK handoff) stayed in that
+/// buffer, un-zeroized and swappable, for the life of the process,
+/// defeating the `Zeroizing` discipline on every copy we DO control.
+fn stdin_read_raw(buf: &mut [u8]) -> io::Result<usize> {
+    use std::io::Read as _;
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::FromRawFd as _;
+        // SAFETY: fd 0 belongs to this process for its whole lifetime;
+        // `ManuallyDrop` keeps the temporary `File` from closing it.
+        let mut f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
+        f.read(buf)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+        let h = io::stdin().as_raw_handle();
+        // SAFETY: the handle is the process's own stdin handle;
+        // `ManuallyDrop` keeps the temporary `File` from closing it.
+        let mut f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_handle(h) });
+        f.read(buf)
+    }
+}
+
+/// `read_exact` on top of `stdin_read_raw` (R15-H2).
+fn stdin_read_exact_raw(mut buf: &mut [u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        match stdin_read_raw(buf) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "stdin closed before the expected bytes arrived",
+                ));
+            }
+            Ok(n) => {
+                let tmp = buf;
+                buf = &mut tmp[n..];
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
         }
     }
-    Ok(Zeroizing::new(line))
+    Ok(())
+}
+
+fn read_passphrase_from_stdin_pipe() -> io::Result<Zeroizing<String>> {
+    // R15-H2: byte-wise raw reads into `Zeroizing` storage (see
+    // `stdin_read_raw`); the previous `BufReader::read_line` left the
+    // passphrase in the global stdin buffer for the process lifetime.
+    const MAX_PIPED_PASSPHRASE: usize = 64 * 1024;
+    let mut bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    let mut b = Zeroizing::new([0u8; 1]);
+    loop {
+        match stdin_read_raw(&mut b[..]) {
+            Ok(0) => break,
+            Ok(_) => {
+                if b[0] == b'\n' {
+                    break;
+                }
+                bytes.push(b[0]);
+                if bytes.len() > MAX_PIPED_PASSPHRASE {
+                    return Err(io::Error::other("piped passphrase exceeds 64 KiB"));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    // Strip an optional CR (Windows-style line ends); the LF itself
+    // terminated the loop above.
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    // Move the buffer into the String without copying; on invalid UTF-8
+    // the bytes come back and are wiped.
+    let raw = std::mem::take(&mut *bytes);
+    match String::from_utf8(raw) {
+        Ok(s) => Ok(Zeroizing::new(s)),
+        Err(e) => {
+            let mut v = e.into_bytes();
+            zeroize::Zeroize::zeroize(&mut v);
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "piped passphrase is not valid UTF-8",
+            ))
+        }
+    }
 }
 
 /// Wrap a freshly-read secret string in `Zeroizing` so the underlying
@@ -2426,7 +2499,24 @@ fn read_passphrase(prompt: &str) -> io::Result<Zeroizing<String>> {
 /// `ask_new_passphrase` warning. Without this an interactive user
 /// who Enter-mashes through both passphrase fields silently creates
 /// a passphrase-less vault.
-fn read_passphrase_confirmed(prompt: &str) -> io::Result<Zeroizing<String>> {
+/// Which secret a `read_passphrase_confirmed` prompt collects (R15-H1).
+/// Decides whether the UNLOCK env var (`LUKSBOX_PASSPHRASE`) may stand
+/// in for the NEW secret: only when there is no pre-existing credential
+/// to confuse it with (vault creation).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewSecretFor {
+    /// A brand-new vault / seed file: `LUKSBOX_PASSPHRASE` is an
+    /// acceptable non-interactive source for its first secret.
+    FreshVault,
+    /// `enroll` / `update` / `migrate-to-v3` / seed files for an
+    /// existing vault: the unlock secret must NOT silently become the
+    /// new one (a user rotating a leaked passphrase with
+    /// `LUKSBOX_PASSPHRASE=old` exported would otherwise re-wrap the
+    /// slot under `old` and be told it was updated).
+    ExistingVault,
+}
+
+fn read_passphrase_confirmed(prompt: &str, purpose: NewSecretFor) -> io::Result<Zeroizing<String>> {
     // Source priority mirrors `read_passphrase`. `LUKSBOX_NEW_PASSPHRASE`
     // takes precedence over `LUKSBOX_PASSPHRASE` when both env vars
     // are set; same ambiguity guard fires when real bytes arrive on
@@ -2452,7 +2542,18 @@ fn read_passphrase_confirmed(prompt: &str) -> io::Result<Zeroizing<String>> {
         return Ok(Zeroizing::new(p));
     }
     if let Ok(p) = std::env::var("LUKSBOX_PASSPHRASE") {
-        return Ok(Zeroizing::new(p));
+        let p = Zeroizing::new(p);
+        match purpose {
+            NewSecretFor::FreshVault => return Ok(p),
+            NewSecretFor::ExistingVault => {
+                drop(p);
+                eprintln!(
+                    "note: LUKSBOX_PASSPHRASE is the UNLOCK secret and is not reused as \
+                     the new secret; set LUKSBOX_NEW_PASSPHRASE for non-interactive use. \
+                     Prompting for the new secret."
+                );
+            }
+        }
     }
     loop {
         let a = Zeroizing::new(rpassword::prompt_password(prompt)?);
@@ -3889,7 +3990,7 @@ fn cmd_create(
     // calibrated via --kdf-target-time, or resolved from --kdf preset).
     let mut cont: Container = match kind {
         SlotKindArg::Passphrase => {
-            let pw = read_passphrase_confirmed("passphrase: ")?;
+            let pw = read_passphrase_confirmed("passphrase: ", NewSecretFor::FreshVault)?;
             Container::create_with_passphrase_flags(
                 path,
                 header_path,
@@ -4076,7 +4177,7 @@ fn create_hybrid_pq_with_params(
         level_label,
         kyber_path.display()
     );
-    let pw = read_passphrase_confirmed("passphrase: ")?;
+    let pw = read_passphrase_confirmed("passphrase: ", NewSecretFor::FreshVault)?;
     let (pk, seed) = keygen_with(params);
     let (ct, shared) =
         encapsulate_with(params, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
@@ -4166,7 +4267,7 @@ fn create_hybrid_pq_fido2_with_params(
     );
     let pin = read_fido2_pin()?;
     eprintln!("Now choose a passphrase that encrypts the .kyber seed file at rest:");
-    let seed_pw = read_passphrase_confirmed("seed-file passphrase: ")?;
+    let seed_pw = read_passphrase_confirmed("seed-file passphrase: ", NewSecretFor::FreshVault)?;
 
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
@@ -4363,7 +4464,9 @@ fn create_fido2_direct(
 
 fn cmd_info(path: &Path, header_path: Option<&Path>) -> Result<()> {
     let header_src = header_path.unwrap_or(path);
-    let mut f = File::open(header_src)?;
+    // R15-H5: same strict-mode (`LUKSBOX_NO_FOLLOW_SYMLINKS`) handling
+    // as every other header prescan.
+    let mut f = luksbox_core::file_util::open_existing_read_no_follow_policy(header_src)?;
     let mut buf = [0u8; HEADER_SIZE];
     f.read_exact(&mut buf)?;
     let h = Header::from_bytes(&buf).map_err(|e| {
@@ -4622,7 +4725,7 @@ fn cmd_info(path: &Path, header_path: Option<&Path>) -> Result<()> {
 
 fn cmd_enroll_passphrase(path: &Path, unlock: &UnlockArgs) -> Result<()> {
     let mut c = open_container(path, unlock)?;
-    let new_pw = read_passphrase_confirmed("new passphrase: ")?;
+    let new_pw = read_passphrase_confirmed("new passphrase: ", NewSecretFor::ExistingVault)?;
     let idx = c.enroll_passphrase(new_pw.as_bytes(), kdf_params())?;
     c.persist_header()?;
     println!("enrolled passphrase in slot {idx}");
@@ -5006,7 +5109,7 @@ fn cmd_enroll_tpm2_pin(path: &Path, unlock: &UnlockArgs) -> Result<()> {
         "TPM PIN: any string up to 64 bytes. Wrong PINs count toward the chip's \
          dictionary-attack lockout, so even short PINs (4-6 digits) are secure."
     );
-    let pin = read_passphrase_confirmed("TPM PIN: ")?;
+    let pin = read_passphrase_confirmed("TPM PIN: ", NewSecretFor::ExistingVault)?;
     if pin.is_empty() {
         return Err("PIN cannot be empty (use --kind tpm2 for the no-PIN variant)".into());
     }
@@ -5076,7 +5179,8 @@ fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) ->
     let mut c = open_container(path, &bootstrap_unlock)?;
 
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
-    let seed_pw = read_passphrase_confirmed(".kyber seed-file passphrase: ")?;
+    let seed_pw =
+        read_passphrase_confirmed(".kyber seed-file passphrase: ", NewSecretFor::ExistingVault)?;
 
     // TPM half: random KEK + seal.
     let mut tpm_kek = Zeroizing::new([0u8; 32]);
@@ -5217,7 +5321,8 @@ fn cmd_enroll_hybrid_pq_sep(path: &Path, unlock: &UnlockArgs, kem_size: u16) -> 
     }
 
     let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
-    let seed_pw = read_passphrase_confirmed(".kyber seed-file passphrase: ")?;
+    let seed_pw =
+        read_passphrase_confirmed(".kyber seed-file passphrase: ", NewSecretFor::ExistingVault)?;
 
     // SEP half: the enclave derives the shared secret + opaque blob.
     eprintln!("sealing SEP half under the local Secure Enclave...");
@@ -5419,12 +5524,18 @@ fn cmd_enroll_sep_fused(
     // Collect the passphrase / seed-file passphrase before the SEP /
     // FIDO2 hardware steps so the user isn't left mid-touch.
     let seed_pw = if params.is_some() {
-        Some(read_passphrase_confirmed(".kyber seed-file passphrase: ")?)
+        Some(read_passphrase_confirmed(
+            ".kyber seed-file passphrase: ",
+            NewSecretFor::ExistingVault,
+        )?)
     } else {
         None
     };
     let new_pw = if factors.has_passphrase() {
-        Some(read_passphrase_confirmed("new slot passphrase: ")?)
+        Some(read_passphrase_confirmed(
+            "new slot passphrase: ",
+            NewSecretFor::ExistingVault,
+        )?)
     } else {
         None
     };
@@ -5647,7 +5758,8 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
 
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
     let pin = read_fido2_pin()?;
-    let seed_pw = read_passphrase_confirmed(".kyber seed-file passphrase: ")?;
+    let seed_pw =
+        read_passphrase_confirmed(".kyber seed-file passphrase: ", NewSecretFor::ExistingVault)?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
 
@@ -5793,7 +5905,8 @@ fn cmd_update(
     let target = kind_override.unwrap_or(existing);
     match target {
         SlotKindArg::Passphrase => {
-            let new_pw = read_passphrase_confirmed("new passphrase: ")?;
+            let new_pw =
+                read_passphrase_confirmed("new passphrase: ", NewSecretFor::ExistingVault)?;
             c.update_passphrase_at(slot, new_pw.as_bytes(), kdf_params())?;
         }
         SlotKindArg::Fido2 => update_fido2_at(&mut c, slot)?,
@@ -5940,6 +6053,16 @@ fn update_fido2_at(_c: &mut Container, _slot: usize) -> Result<()> {
     Err("FIDO2 hardware support not compiled in (rebuild with --features hardware)".into())
 }
 
+/// R15-E7: vault entry names are attacker-controlled (a hostile vault
+/// authored by a former MVK holder). Replace C0/C1 control characters
+/// (newline, carriage return, ESC, ...) before they reach the terminal
+/// so a name cannot rewrite or hide lines of a listing.
+fn sanitize_for_terminal(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
 fn cmd_ls(path: &Path, unlock: &UnlockArgs, inner: &str) -> Result<()> {
     let mut vfs = open_vfs(path, unlock)?;
     let id = vfs.lookup_path(inner)?;
@@ -5956,7 +6079,7 @@ fn cmd_ls(path: &Path, unlock: &UnlockArgs, inner: &str) -> Result<()> {
         } else {
             "-"
         };
-        println!("{} {:>10} {}", kind, s.size, e.name);
+        println!("{} {:>10} {}", kind, s.size, sanitize_for_terminal(&e.name));
     }
     Ok(())
 }
@@ -6315,8 +6438,6 @@ fn cmd_mount(
 /// ownership of the bytes. Brief stack exposure (microseconds)
 /// is the security trade-off documented in `docs/MACOS_FUSE_T.md`.
 fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Path) -> Result<()> {
-    use std::io::Read;
-
     // Stage trace - the parent captures our stderr and surfaces the
     // last lines in its error toast when we exit non-zero. Emitting a
     // line at each stage lets us pinpoint which step failed from the
@@ -6471,13 +6592,11 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
     // read (`?` returns early) does not leak up to 31 MVK bytes on
     // the stack.
     let mut version_byte = [0u8; 1];
-    std::io::stdin()
-        .read_exact(&mut version_byte)
+    stdin_read_exact_raw(&mut version_byte)
         .map_err(|e| format!("could not read protocol version from stdin: {e}"))?;
 
     let mut mvk_bytes: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
-    std::io::stdin()
-        .read_exact(&mut mvk_bytes[..])
+    stdin_read_exact_raw(&mut mvk_bytes[..])
         .map_err(|e| format!("could not read MVK from stdin: {e}"))?;
     // Round 12 fix R12-17: use `from_zeroizing` so the caller's
     // bytes are passed by reference, avoiding the by-value Copy
@@ -6502,17 +6621,14 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
             // Any partial read collapses to the same error wording the
             // parent will surface in its toast.
             let mut salt = [0u8; luksbox_core::deniable::DENIABLE_SALT_SIZE];
-            std::io::stdin()
-                .read_exact(&mut salt)
+            stdin_read_exact_raw(&mut salt)
                 .map_err(|e| format!("could not read per-vault salt from stdin: {e}"))?;
             let mut slot_byte = [0u8; 1];
-            std::io::stdin()
-                .read_exact(&mut slot_byte)
+            stdin_read_exact_raw(&mut slot_byte)
                 .map_err(|e| format!("could not read slot index from stdin: {e}"))?;
             let mut inner_buf =
                 [0u8; luksbox_format::deniable_header::DENIABLE_INNER_HEADER_SERIALIZED_LEN];
-            std::io::stdin()
-                .read_exact(&mut inner_buf)
+            stdin_read_exact_raw(&mut inner_buf)
                 .map_err(|e| format!("could not read inner header from stdin: {e}"))?;
             let inner = luksbox_format::deniable_header::DeniableInnerHeader::parse_from_handoff(
                 &inner_buf,
@@ -6797,7 +6913,10 @@ fn cmd_deniable_info(
     println!("  data offset:    {}", container.header.data_offset);
     println!("  chunk size:     {}", container.header.chunk_size);
     println!("  is deniable:    {}", container.is_deniable());
-    println!("  unlocked slot:  {:?}", container.deniable_unlocked_slot());
+    // R15-H6: the matched slot index is deliberately NOT printed. A
+    // coerced co-user who shows this output reveals that lower-indexed
+    // slots (the creator's) exist; the index is only ever needed by the
+    // admin's own enroll / revoke flows, which print it there.
     Ok(())
 }
 
@@ -7304,7 +7423,12 @@ fn cli_open_deniable_v2(
         }
         CliDenCred::PqPassphrase => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
-            let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
+            let shared = cli_pq_decap_with_fallback(
+                kp,
+                path,
+                Some(pass_zeroizing.as_bytes()),
+                Some(envelope.opened.matched_slot_idx as u8),
+            )?;
             let cred = DeniableCredential::HybridPqPassphrase {
                 passphrase: pass_zeroizing.as_bytes(),
                 argon2,
@@ -7318,7 +7442,12 @@ fn cli_open_deniable_v2(
             #[cfg(feature = "fido2-hardware")]
             {
                 let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
-                let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
+                let shared = cli_pq_decap_with_fallback(
+                    kp,
+                    path,
+                    Some(pass_zeroizing.as_bytes()),
+                    Some(envelope.opened.matched_slot_idx as u8),
+                )?;
                 let salt = payload_hmac_salt
                     .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
                 let pin = read_fido2_pin()?;
@@ -7398,7 +7527,12 @@ fn cli_open_deniable_v2(
         #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         CliDenCred::PqTpm => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
-            let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
+            let shared = cli_pq_decap_with_fallback(
+                kp,
+                path,
+                Some(pass_zeroizing.as_bytes()),
+                Some(envelope.opened.matched_slot_idx as u8),
+            )?;
             let unsealed = cli_tpm_unseal_from_bytes(&payload_tpm_blob, None)?;
             let cred = DeniableCredential::HybridPqTpmPassphrase {
                 passphrase: pass_zeroizing.as_bytes(),
@@ -7413,7 +7547,12 @@ fn cli_open_deniable_v2(
         #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
         CliDenCred::PqTpmFido2 => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
-            let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
+            let shared = cli_pq_decap_with_fallback(
+                kp,
+                path,
+                Some(pass_zeroizing.as_bytes()),
+                Some(envelope.opened.matched_slot_idx as u8),
+            )?;
             let unsealed = cli_tpm_unseal_from_bytes(&payload_tpm_blob, None)?;
             let salt = payload_hmac_salt
                 .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
@@ -7497,7 +7636,12 @@ fn cli_open_deniable_v2(
         #[cfg(all(feature = "hardware", target_os = "macos"))]
         CliDenCred::PqSep => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
-            let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
+            let shared = cli_pq_decap_with_fallback(
+                kp,
+                path,
+                Some(pass_zeroizing.as_bytes()),
+                Some(envelope.opened.matched_slot_idx as u8),
+            )?;
             let sep_shared = cli_sep_unseal_from_bytes(&payload_tpm_blob)?;
             let cred = DeniableCredential::HybridPqSepPassphrase {
                 passphrase: pass_zeroizing.as_bytes(),
@@ -7512,7 +7656,12 @@ fn cli_open_deniable_v2(
         #[cfg(all(feature = "hardware", target_os = "macos"))]
         CliDenCred::PqSepFido2 => {
             let kp = kyber_path.ok_or_else(|| cli_err!("--kyber-path required"))?;
-            let shared = cli_pq_decap_with_fallback(kp, path, Some(pass_zeroizing.as_bytes()))?;
+            let shared = cli_pq_decap_with_fallback(
+                kp,
+                path,
+                Some(pass_zeroizing.as_bytes()),
+                Some(envelope.opened.matched_slot_idx as u8),
+            )?;
             let sep_shared = cli_sep_unseal_from_bytes(&payload_tpm_blob)?;
             let salt = payload_hmac_salt
                 .ok_or_else(|| cli_err!("envelope missing hmac_salt for FIDO2 variant"))?;
@@ -7616,7 +7765,7 @@ fn cli_pq_decap(kyber_path: &Path, vault: &Path) -> Result<[u8; 32]> {
     // re-routed every deniable PQ caller to
     // `cli_pq_decap_with_fallback(.., Some(envelope_pw))` so blank
     // reuses the envelope passphrase.
-    cli_pq_decap_with_fallback(kyber_path, vault, None)
+    cli_pq_decap_with_fallback(kyber_path, vault, None, None)
 }
 
 /// Round 12 fix R12-02: CLI seed-pw fallback. When the deniable
@@ -7636,6 +7785,7 @@ fn cli_pq_decap_with_fallback(
     kyber_path: &Path,
     vault: &Path,
     envelope_pw: Option<&[u8]>,
+    matched_slot_idx: Option<u8>,
 ) -> Result<[u8; 32]> {
     use luksbox_format::hybrid_sidecar;
     use luksbox_pq::seed_file;
@@ -7662,9 +7812,22 @@ fn cli_pq_decap_with_fallback(
     let seed = seed_file::read(kyber_path, &seed_pw_bytes[..])?;
     let sidecar = hybrid_sidecar::sidecar_path(vault);
     let entries = hybrid_sidecar::read(&sidecar)?;
-    let entry = entries
-        .first()
-        .ok_or_else(|| cli_err!("hybrid sidecar is empty"))?;
+    // R15-D5: match the sidecar entry to the deniable slot the envelope
+    // discovery resolved (what the wizard already does). `entries.first()`
+    // silently produced a garbage shared secret via ML-KEM's implicit
+    // rejection whenever the user's seed belonged to a non-first slot,
+    // and the final AEAD then rejected the unlock with no hint why.
+    let entry = match matched_slot_idx {
+        Some(idx) => hybrid_sidecar::find(&entries, idx).ok_or_else(|| {
+            cli_err!(
+                "no .hybrid sidecar entry for slot {idx} (envelope discovery resolved \
+                 this slot but its ML-KEM (pk, ct) pair is missing from the sidecar)"
+            )
+        })?,
+        None => entries
+            .first()
+            .ok_or_else(|| cli_err!("hybrid sidecar is empty"))?,
+    };
     let shared = luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext)?;
     Ok(*shared)
 }
@@ -8153,7 +8316,7 @@ fn cmd_migrate_to_v3(src: &Path, dst: &Path, unlock: &UnlockArgs) -> Result<()> 
         dst.display()
     );
     eprintln!("Pick a passphrase for the new vault (can differ from the source).");
-    let new_pw = read_passphrase_confirmed("new-vault passphrase: ")?;
+    let new_pw = read_passphrase_confirmed("new-vault passphrase: ", NewSecretFor::ExistingVault)?;
 
     // 2. Create the destination as v3. The format override is
     // installed BEFORE Container::create_with_passphrase so the new
@@ -8613,7 +8776,15 @@ fn cmd_panic(
     } else {
         None
     };
-    let len_hint = std::fs::metadata(vault).map(|m| m.len()).unwrap_or(0);
+    // R15-H4: size the wipe from the PINNED handle, not from a path
+    // `stat` (which follows symlinks and can be raced between the open
+    // and here), and fail loudly instead of silently wiping 0 bytes.
+    let len_hint = vf_opt
+        .as_ref()
+        .unwrap_or(&hf)
+        .metadata()
+        .map(|m| m.len())
+        .map_err(|e| format!("cannot size {} for the data wipe: {e}", vault.display()))?;
 
     // v3 crash-recovery sidecars. `panic` MUST destroy the header
     // mirror too: without it, `Container::open` detects the randomised

@@ -881,6 +881,7 @@ pub fn create_vault_tpm2_only(
     opts: CreateOpts,
     pin: Option<Zeroizing<String>>,
 ) -> Result<OpenedVault, String> {
+    refuse_existing_create_targets(&opts, None)?; // R15-I1
     use luksbox_format::Container;
     use luksbox_tpm::Tpm2Sealer;
     use luksbox_vfs::Vfs;
@@ -1039,6 +1040,14 @@ pub fn create_vault_with_tpm_factors_deniable(
     opts: CreateOpts,
     kind: TpmBootstrapKind,
 ) -> Result<OpenedVault, String> {
+    refuse_existing_create_targets(
+        &opts,
+        match &kind {
+            TpmBootstrapKind::HybridPqTpm2 { kyber_path, .. }
+            | TpmBootstrapKind::HybridPqTpm2Fido2 { kyber_path, .. } => Some(kyber_path.as_path()),
+            _ => None,
+        },
+    )?; // R15-I1
     use luksbox_format::Container;
     use luksbox_vfs::Vfs;
 
@@ -1336,6 +1345,14 @@ pub fn create_vault_with_tpm_factors_only(
     opts: CreateOpts,
     kind: TpmBootstrapKind,
 ) -> Result<OpenedVault, String> {
+    refuse_existing_create_targets(
+        &opts,
+        match &kind {
+            TpmBootstrapKind::HybridPqTpm2 { kyber_path, .. }
+            | TpmBootstrapKind::HybridPqTpm2Fido2 { kyber_path, .. } => Some(kyber_path.as_path()),
+            _ => None,
+        },
+    )?; // R15-I1
     use luksbox_format::Container;
     use luksbox_vfs::Vfs;
 
@@ -1622,6 +1639,14 @@ pub fn create_vault_with_tpm_bootstrap(
     opts: CreateOpts,
     kind: TpmBootstrapKind,
 ) -> Result<OpenedVault, String> {
+    refuse_existing_create_targets(
+        &opts,
+        match &kind {
+            TpmBootstrapKind::HybridPqTpm2 { kyber_path, .. }
+            | TpmBootstrapKind::HybridPqTpm2Fido2 { kyber_path, .. } => Some(kyber_path.as_path()),
+            _ => None,
+        },
+    )?; // R15-I1
     // Deniable mode redirect for the 3-factor combos: skip the
     // passphrase-bootstrap shape entirely and create a single-slot
     // deniable vault with the multi-factor DeniableCredential at slot
@@ -1908,6 +1933,14 @@ pub fn create_vault_with_sep_bootstrap(
     opts: CreateOpts,
     kind: SepBootstrapKind,
 ) -> Result<OpenedVault, String> {
+    refuse_existing_create_targets(
+        &opts,
+        match &kind {
+            SepBootstrapKind::HybridPqSep { kyber_path, .. } => Some(kyber_path.as_path()),
+            SepBootstrapKind::SepFused { kyber_path, .. } => kyber_path.as_deref(),
+            _ => None,
+        },
+    )?; // R15-I1
     let vault_path = opts.path.clone();
     let header_path = opts.header_path.clone();
     let anchor_path = opts.anchor_path.clone();
@@ -2034,6 +2067,14 @@ fn create_sep_passphrase_deniable(
     opts: CreateOpts,
     kind: SepBootstrapKind,
 ) -> Result<OpenedVault, String> {
+    refuse_existing_create_targets(
+        &opts,
+        match &kind {
+            SepBootstrapKind::HybridPqSep { kyber_path, .. } => Some(kyber_path.as_path()),
+            SepBootstrapKind::SepFused { kyber_path, .. } => kyber_path.as_deref(),
+            _ => None,
+        },
+    )?; // R15-I1
     use luksbox_format::deniable_header::DeniableMaterial;
     use luksbox_sep::SepSealer;
 
@@ -2322,6 +2363,7 @@ fn create_sep_passphrase_deniable(
 /// enclave is wiped/replaced the vault is permanently unrecoverable.
 #[cfg(all(feature = "hardware", target_os = "macos"))]
 pub fn create_vault_sep_only(opts: CreateOpts, biometric: bool) -> Result<OpenedVault, String> {
+    refuse_existing_create_targets(&opts, None)?; // R15-I1
     use luksbox_core::SlotKind;
     use luksbox_sep::SepSealer;
 
@@ -2396,20 +2438,51 @@ pub fn create_vault_sep_only(_opts: CreateOpts, _biometric: bool) -> Result<Open
     Err("Secure Enclave is macOS-only".into())
 }
 
-pub fn create_vault(opts: CreateOpts) -> Result<OpenedVault, String> {
-    if opts.path.exists() {
+/// R15-I1: refuse up front when ANY file a create would write already
+/// exists. Every hardware create wrapper used to discover this only when
+/// the format layer's `O_EXCL` create (or the hybrid enroll helper's
+/// seed check) failed, and its "rollback" then `remove_file`d the
+/// PRE-EXISTING vault / detached header / anchor / `.kyber` seed, i.e.
+/// another vault's only PQ seed, or another vault's detached header.
+/// `symlink_metadata` so a dangling symlink counts as "exists" too.
+fn refuse_existing_create_targets(opts: &CreateOpts, kyber: Option<&Path>) -> Result<(), String> {
+    let exists = |p: &Path| p.symlink_metadata().is_ok();
+    if exists(&opts.path) {
         return Err(format!("{} already exists", opts.path.display()));
     }
     if let Some(hp) = &opts.header_path
-        && hp.exists()
+        && exists(hp)
     {
         return Err(format!("header file {} already exists", hp.display()));
     }
     if let Some(ap) = &opts.anchor_path
-        && ap.exists()
+        && exists(ap)
     {
         return Err(format!("anchor file {} already exists", ap.display()));
     }
+    if let Some(kp) = kyber.or(opts.hybrid_kyber_path.as_deref())
+        && exists(kp)
+    {
+        return Err(format!(
+            "seed file {} already exists; refusing to overwrite (it may be another vault's \
+             only .kyber seed)",
+            kp.display()
+        ));
+    }
+    Ok(())
+}
+
+/// R15-I4: vault entry names are attacker-controlled (a hostile vault
+/// authored by a former MVK holder). Replace control characters before
+/// a name is rendered so one row cannot masquerade as several.
+pub(crate) fn display_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
+pub fn create_vault(opts: CreateOpts) -> Result<OpenedVault, String> {
+    refuse_existing_create_targets(&opts, None)?;
     // Install the v3 format override for the lifetime of this create
     // call. The Vfs reads the thread-local on first open of the new
     // vault and locks the format choice by writing the matching

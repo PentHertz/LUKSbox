@@ -74,6 +74,15 @@ pub fn save(list: &[RecentVault]) {
 }
 
 pub fn upsert(entry: RecentVault) {
+    // R15-I2: a deniable vault's whole purpose is to be indistinguishable
+    // from random bytes on the device it lives on. Recording its path
+    // and a "(deniable)" cipher label in a LUKSbox-owned state file is a
+    // same-device tell for anyone who images the disk, so deniable
+    // vaults are never persisted here (the CLI/TUI never write this file
+    // at all). The label is the only marker the open paths carry.
+    if entry.cipher.contains("(deniable)") {
+        return;
+    }
     let mut list = load();
     list.retain(|e| e.path != entry.path);
     list.insert(0, entry);

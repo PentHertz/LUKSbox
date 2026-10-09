@@ -33,7 +33,7 @@ use ml_kem::{
     kem::{Decapsulate, Encapsulate, FromSeed, Kem, TryKeyInit},
 };
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 #[derive(Debug, Error)]
 pub enum Error {
@@ -138,28 +138,30 @@ pub fn keygen() -> ([u8; PUBLIC_KEY_LEN_768], Zeroizing<[u8; SEED_LEN]>) {
 
 fn keygen_768() -> (Vec<u8>, Zeroizing<[u8; SEED_LEN]>) {
     let (dk, ek) = MlKem768::generate_keypair();
-    let seed = dk
+    let mut seed = dk
         .to_seed()
         .expect("from_seed always populates the seed field");
-    let mut seed_bytes = [0u8; SEED_LEN];
+    // R15-F3: land the seed (the long-term PQ secret) directly in
+    // `Zeroizing` storage and scrub the library's copy; the previous
+    // plain `[u8; 64]` stayed on the stack after the move.
+    let mut seed_bytes = Zeroizing::new([0u8; SEED_LEN]);
     seed_bytes.copy_from_slice(seed.as_slice());
-    (
-        ek.to_bytes().as_slice().to_vec(),
-        Zeroizing::new(seed_bytes),
-    )
+    seed.as_mut_slice().zeroize();
+    (ek.to_bytes().as_slice().to_vec(), seed_bytes)
 }
 
 fn keygen_1024() -> (Vec<u8>, Zeroizing<[u8; SEED_LEN]>) {
     let (dk, ek) = MlKem1024::generate_keypair();
-    let seed = dk
+    let mut seed = dk
         .to_seed()
         .expect("from_seed always populates the seed field");
-    let mut seed_bytes = [0u8; SEED_LEN];
+    // R15-F3: land the seed (the long-term PQ secret) directly in
+    // `Zeroizing` storage and scrub the library's copy; the previous
+    // plain `[u8; 64]` stayed on the stack after the move.
+    let mut seed_bytes = Zeroizing::new([0u8; SEED_LEN]);
     seed_bytes.copy_from_slice(seed.as_slice());
-    (
-        ek.to_bytes().as_slice().to_vec(),
-        Zeroizing::new(seed_bytes),
-    )
+    seed.as_mut_slice().zeroize();
+    (ek.to_bytes().as_slice().to_vec(), seed_bytes)
 }
 
 /// Encapsulate against a peer's encapsulation key. The pubkey length
@@ -196,10 +198,12 @@ fn encap_768(pk: &[u8]) -> Result<(Vec<u8>, Zeroizing<[u8; SHARED_KEY_LEN]>), Er
         pk.try_into().map_err(|_| Error::InvalidKey)?;
     let ek =
         <EncapsulationKey<MlKem768> as TryKeyInit>::new(ek_ref).map_err(|_| Error::InvalidKey)?;
-    let (ct, shared) = ek.encapsulate();
-    let mut k = [0u8; SHARED_KEY_LEN];
+    let (ct, mut shared) = ek.encapsulate();
+    // R15-F3: same discipline as `decap_*` (see the comment there).
+    let mut k = Zeroizing::new([0u8; SHARED_KEY_LEN]);
     k.copy_from_slice(shared.as_slice());
-    Ok((ct.as_slice().to_vec(), Zeroizing::new(k)))
+    shared.as_mut_slice().zeroize();
+    Ok((ct.as_slice().to_vec(), k))
 }
 
 fn encap_1024(pk: &[u8]) -> Result<(Vec<u8>, Zeroizing<[u8; SHARED_KEY_LEN]>), Error> {
@@ -207,10 +211,12 @@ fn encap_1024(pk: &[u8]) -> Result<(Vec<u8>, Zeroizing<[u8; SHARED_KEY_LEN]>), E
         pk.try_into().map_err(|_| Error::InvalidKey)?;
     let ek =
         <EncapsulationKey<MlKem1024> as TryKeyInit>::new(ek_ref).map_err(|_| Error::InvalidKey)?;
-    let (ct, shared) = ek.encapsulate();
-    let mut k = [0u8; SHARED_KEY_LEN];
+    let (ct, mut shared) = ek.encapsulate();
+    // R15-F3: same discipline as `decap_*` (see the comment there).
+    let mut k = Zeroizing::new([0u8; SHARED_KEY_LEN]);
     k.copy_from_slice(shared.as_slice());
-    Ok((ct.as_slice().to_vec(), Zeroizing::new(k)))
+    shared.as_mut_slice().zeroize();
+    Ok((ct.as_slice().to_vec(), k))
 }
 
 /// Decapsulate using the user's stored seed. ML-KEM has implicit
@@ -243,14 +249,19 @@ pub fn decapsulate(
 }
 
 fn decap_768(seed: &[u8; SEED_LEN], ct: &[u8]) -> Result<Zeroizing<[u8; SHARED_KEY_LEN]>, Error> {
-    let seed_arr: Seed = Array(*seed);
+    // R15-F3: copy the seed into the library's array type without a
+    // by-value `*seed` temporary, and scrub it as soon as the
+    // decapsulation key has been derived from it.
+    let mut seed_arr = Seed::default();
+    seed_arr.as_mut_slice().copy_from_slice(seed);
     let (dk, _ek) = <MlKem768 as FromSeed>::from_seed(&seed_arr);
+    seed_arr.as_mut_slice().zeroize();
     let ct_ref: &Array<u8, <MlKem768 as Kem>::CiphertextSize> =
         ct.try_into().map_err(|_| Error::WrongCiphertextSize {
             got: ct.len(),
             expected: CIPHERTEXT_LEN_768,
         })?;
-    let shared = dk.decapsulate(ct_ref);
+    let mut shared = dk.decapsulate(ct_ref);
     // Allocate the destination as Zeroizing from the start so the
     // copy lands directly in a buffer that scrubs on drop. Building
     // a plain `[u8; N]` first and wrapping in `Zeroizing::new(k)`
@@ -258,20 +269,27 @@ fn decap_768(seed: &[u8; SEED_LEN], ct: &[u8]) -> Result<Zeroizing<[u8; SHARED_K
     // bytes (arrays are Copy and the source slot keeps its contents).
     let mut k = Zeroizing::new([0u8; SHARED_KEY_LEN]);
     k.copy_from_slice(shared.as_slice());
+    shared.as_mut_slice().zeroize();
     Ok(k)
 }
 
 fn decap_1024(seed: &[u8; SEED_LEN], ct: &[u8]) -> Result<Zeroizing<[u8; SHARED_KEY_LEN]>, Error> {
-    let seed_arr: Seed = Array(*seed);
+    // R15-F3: copy the seed into the library's array type without a
+    // by-value `*seed` temporary, and scrub it as soon as the
+    // decapsulation key has been derived from it.
+    let mut seed_arr = Seed::default();
+    seed_arr.as_mut_slice().copy_from_slice(seed);
     let (dk, _ek) = <MlKem1024 as FromSeed>::from_seed(&seed_arr);
+    seed_arr.as_mut_slice().zeroize();
     let ct_ref: &Array<u8, <MlKem1024 as Kem>::CiphertextSize> =
         ct.try_into().map_err(|_| Error::WrongCiphertextSize {
             got: ct.len(),
             expected: CIPHERTEXT_LEN_1024,
         })?;
-    let shared = dk.decapsulate(ct_ref);
+    let mut shared = dk.decapsulate(ct_ref);
     let mut k = Zeroizing::new([0u8; SHARED_KEY_LEN]);
     k.copy_from_slice(shared.as_slice());
+    shared.as_mut_slice().zeroize(); // R15-F3
     Ok(k)
 }
 

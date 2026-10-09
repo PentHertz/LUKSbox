@@ -14,6 +14,59 @@ canonical record.
 
 ---
 
+## [Unreleased]
+
+Security audit Round 15 (full-workspace white-box review): 48 findings,
+43 fixed, 6 accepted and documented. Full report with per-finding
+rationale, reproduction notes and the regression tests at
+[docs/SECURITY_AUDIT_ROUND_15.md](docs/SECURITY_AUDIT_ROUND_15.md).
+No on-disk format change for existing vaults; new deniable vaults set
+one new inner-header flag (see below). Highlights:
+
+- **Data loss.** An aborted `rotate-mvk` could write the never-committed
+  rotated header over the original vault on exit and leave it
+  unopenable (R15-C1); `mv` out of a directory followed by `rmdir` of
+  that directory made every later flush fail silently (R15-E1); the GUI
+  deleted a pre-existing `.kyber` seed / detached header / anchor of
+  ANOTHER vault when a create failed because the path already existed
+  (R15-I1); the vault was unlocked for the whole duration of a rotation
+  (R15-C2); a crash during a chunk-list re-spill could leave the vault
+  unopenable (R15-E3); truncated-away bytes resurfaced on extension
+  (R15-E2).
+- **Rollback anchor.** Every flush now persists a strictly larger
+  generation, so a trusted `.anchor` detects a rollback across
+  metadata-only changes (deleted files). Header-only rollbacks (a
+  restored pre-revoke header) are still outside the anchor's reach; see
+  `docs/ROLLBACK_PROTECTION.md`.
+- **Secret hygiene.** The `memfd_secret` MVK pages are now
+  close-on-exec (child processes could map them before); heap-backed
+  secrets get a private locked page each; the KEK round keys inside the
+  AEAD temporaries, the FIDO2 PIN copy handed to libfido2, the ML-KEM
+  seed/shared-secret copies, the SEP shim's `Data` copy, the deniable
+  unlock's MVK copies and the stdin buffer used for piped passphrases /
+  the FUSE-T MVK handoff are all wiped now.
+- **Deniability.** Deniable vaults no longer carry a plaintext metadata
+  length at a fixed offset (a 2^-32 fingerprint); the GUI no longer
+  records them in `recent.json`; `deniable-info` no longer prints the
+  slot index.
+- **Behaviour change:** `LUKSBOX_PASSPHRASE` is no longer reused as the
+  NEW secret by `enroll`, `update`, `migrate-to-v3` and seed-file
+  prompts; set `LUKSBOX_NEW_PASSPHRASE` for non-interactive use. With
+  more than one FIDO2 authenticator plugged in, the CLI and GUI now
+  refuse to guess and ask for an explicit device (the PIN hash was sent
+  to whichever device enumerated first).
+- **Release pipeline.** Apple signing key imported only right before
+  codesign and deleted afterwards; least-privilege job permissions;
+  every action pinned to a commit SHA; `github.ref_name` validated and
+  passed to shells via the environment; tpm2-tss / WinFsp / choco
+  packages hash- or version-pinned; the MSI's WinFsp copy action no
+  longer runs through `cmd.exe` with a client-settable property.
+- Windows mount: memory-mapped writes no longer extend the file;
+  allocation-size changes no longer grow EOF. FUSE-T: `nlink` no longer
+  wraps. `luksbox umount` can detach a zombie mount on old glibc.
+- `audit.toml` moved to `.cargo/audit.toml` (the only path cargo-audit
+  reads); the pre-push script now really blocks on vulnerabilities.
+
 ## [v0.5.2] - 2026-08-12
 
 Stable release of the v0.5.2 line. It promotes `v0.5.2-rc.1` to stable

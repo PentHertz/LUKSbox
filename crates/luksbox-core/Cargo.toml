@@ -10,6 +10,14 @@ description = "Cryptographic core for the luksbox encrypted-container format"
 aes-gcm.workspace = true
 aes-gcm-siv.workspace = true
 chacha20poly1305.workspace = true
+# Feature-unification-only deps (see the workspace Cargo.toml note):
+# they switch on `zeroize` inside the primitives our AEADs are built
+# from. Not used directly by luksbox-core code.
+aes.workspace = true
+ghash.workspace = true
+polyval.workspace = true
+chacha20.workspace = true
+poly1305.workspace = true
 argon2.workspace = true
 hmac.workspace = true
 sha2.workspace = true

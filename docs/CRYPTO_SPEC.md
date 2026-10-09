@@ -1461,7 +1461,22 @@ while the vault was open) keeps access to all files. To get true
 revocation against an MVK-leak adversary, run `luksbox rotate-mvk`
 which generates a new MVK, re-wraps it under all surviving slots, and
 re-encrypts every file chunk under the new MVK-derived per-file key.
-That operation is O(vault size).
+Since Round 15 it also overwrites every chunk slot that no file
+references any more (free list, slots freed in the session, ids leaked
+by failed writes) with random bytes, so content deleted or truncated
+before the rotation is not left decryptable under the old MVK
+(R15-C3). That operation is O(vault size).
+
+Crash safety: with an inline header the whole rotation happens in a
+`<vault>.lbx.rotating` copy that is renamed over the vault only at
+commit, the vault stays exclusively locked for the whole window, and an
+abort restores the in-memory header and MVK so nothing never-committed
+can be written back (R15-C1/C2). With a **detached** header there is no
+such copy: chunks are re-keyed in place and a crash mid-way leaves data
+under a new MVK that was never persisted. A backup of the header alone
+cannot recover that (it only restores the OLD MVK's keyslots); back up
+the whole vault file **and** the header sidecar before rotating a
+detached-header vault.
 
 ---
 

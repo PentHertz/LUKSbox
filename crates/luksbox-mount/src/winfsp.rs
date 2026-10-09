@@ -806,7 +806,24 @@ impl FileSystemInterface for LuksboxFs {
         // concrete offset every time, so resolve "write to end" by stat-ing.
         let offset = match mode {
             WriteMode::Normal { offset } => offset,
-            WriteMode::ConstrainedIO { offset } => offset,
+            WriteMode::ConstrainedIO { offset } => {
+                // R15-G1: WinFsp's contract for ConstrainedIo (every
+                // paging write, e.g. a dirtied memory-mapped view) is
+                // "must not extend the file". The memory manager hands
+                // us the whole page, so clip to the current size the way
+                // memfs/passthrough do; writing it all grew a 100-byte
+                // mapped file to a zero-padded 4 KiB.
+                let size = vfs.stat(ctx.file_id).map_err(|e| vfs_err_to_nt(&e))?.size;
+                if offset >= size {
+                    let info = make_file_info(&mut vfs, ctx.file_id)?;
+                    return Ok((0, info));
+                }
+                let n = (size - offset).min(buffer.len() as u64) as usize;
+                vfs.write(ctx.file_id, offset, &buffer[..n])
+                    .map_err(|e| vfs_err_to_nt(&e))?;
+                let info = make_file_info(&mut vfs, ctx.file_id)?;
+                return Ok((n, info));
+            }
             WriteMode::WriteToEOF => vfs.stat(ctx.file_id).map_err(|e| vfs_err_to_nt(&e))?.size,
         };
         vfs.write(ctx.file_id, offset, buffer)
@@ -833,13 +850,17 @@ impl FileSystemInterface for LuksboxFs {
         ctx: Self::FileContext,
         _file_attributes: FileAttributes,
         _replace_file_attributes: bool,
-        allocation_size: u64,
+        _allocation_size: u64,
     ) -> Result<FileInfo, NTSTATUS> {
         if ctx.is_dir {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let mut vfs = self.inner.lock().unwrap();
-        vfs.truncate(ctx.file_id, allocation_size)
+        // R15-G2: FILE_OVERWRITE / SUPERSEDE reset the file to EMPTY; the
+        // allocation size is a reservation hint, not an end-of-file.
+        // Truncating to it left an N-byte zero file behind whenever the
+        // writer wrote less than it had pre-allocated.
+        vfs.truncate(ctx.file_id, 0)
             .map_err(|e| vfs_err_to_nt(&e))?;
         make_file_info(&mut vfs, ctx.file_id)
     }
@@ -901,12 +922,22 @@ impl FileSystemInterface for LuksboxFs {
         &self,
         ctx: Self::FileContext,
         new_size: u64,
-        _set_allocation_size: bool,
+        set_allocation_size: bool,
     ) -> Result<FileInfo, NTSTATUS> {
         if ctx.is_dir {
             return Err(STATUS_INVALID_PARAMETER);
         }
         let mut vfs = self.inner.lock().unwrap();
+        // R15-G2: setting the ALLOCATION size only ever shrinks EOF (when
+        // the reservation drops below it); it never grows the file. A
+        // pre-allocating writer (robocopy, torrent clients) otherwise got
+        // a zero-padded file of the reserved size.
+        if set_allocation_size {
+            let cur = vfs.stat(ctx.file_id).map_err(|e| vfs_err_to_nt(&e))?.size;
+            if new_size >= cur {
+                return make_file_info(&mut vfs, ctx.file_id);
+            }
+        }
         vfs.truncate(ctx.file_id, new_size)
             .map_err(|e| vfs_err_to_nt(&e))?;
         make_file_info(&mut vfs, ctx.file_id)

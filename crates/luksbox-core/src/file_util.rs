@@ -432,13 +432,28 @@ pub fn secure_create_or_truncate(path: &Path) -> io::Result<File> {
             )
         })?;
         // openat(2): O_NOFOLLOW refuses a symlinked basename.
+        //
+        // R15-02: open WITHOUT `O_TRUNC` first. The destination is only
+        // truncated after we have confirmed, on the open handle, that it
+        // is a regular file owned by the calling user. `O_NOFOLLOW` says
+        // nothing about a FIFO, a device node or an attacker-owned
+        // regular file pre-planted at the destination: a FIFO turns the
+        // extraction into a stream its planter reads, and (when LUKSbox
+        // runs elevated) a foreign-owned regular file keeps its owner
+        // after the 0600 chmod, so the plaintext stays readable to them.
+        // `O_NONBLOCK` guarantees the open itself cannot hang on a FIFO
+        // with no reader; it is cleared again once the handle is vetted.
         // SAFETY: parent_owned.raw() is a valid open fd; bn_cstr is
         // a valid NUL-terminated C string outliving the call.
         let fd = unsafe {
             libc::openat(
                 parent_owned.raw(),
                 bn_cstr.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
                 SECURE_FILE_MODE as libc::c_uint,
             )
         };
@@ -448,12 +463,49 @@ pub fn secure_create_or_truncate(path: &Path) -> io::Result<File> {
         // SAFETY: openat returned a fresh fd; File takes ownership.
         let f = unsafe { File::from_raw_fd(fd) };
 
+        // Vet the handle (fstat on the fd, not the path: no TOCTOU).
+        let meta = f.metadata()?;
+        if !meta.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "refusing to extract onto a non-regular file (FIFO / device / socket) \
+                 at the destination; remove it first",
+            ));
+        }
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            // SAFETY: geteuid cannot fail.
+            let euid = unsafe { libc::geteuid() };
+            if meta.uid() != euid {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "refusing to extract onto a file owned by another user (uid {}); \
+                         remove it first",
+                        meta.uid()
+                    ),
+                ));
+            }
+        }
+
+        use std::os::unix::io::AsRawFd as _;
+        // Vetted: back to blocking mode, then truncate for the documented
+        // replace semantics (ftruncate on the fd, never the path).
+        // SAFETY: fd is owned by `f`; fcntl on a valid fd.
+        let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        f.set_len(0)?;
+
         // If the file pre-existed with a wider mode, openat's `mode`
         // arg only applies on creation. Force-narrow via fchmod
         // (operates on the open fd, no path traversal, so no TOCTOU
         // window vs. the original `std::fs::set_permissions(path)`).
         // SAFETY: fd is owned by `f`; AsRawFd reads it safely.
-        use std::os::unix::io::AsRawFd as _;
         let rc = unsafe { libc::fchmod(f.as_raw_fd(), SECURE_FILE_MODE as libc::mode_t) };
         if rc != 0 {
             return Err(io::Error::last_os_error());

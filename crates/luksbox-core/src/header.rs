@@ -124,6 +124,19 @@ pub const FLAG_HAS_METADATA_MIRROR: u32 = 1 << 3;
 /// there is no silent-misread hazard. See `docs/SEP_KEYSLOT_DESIGN.md`.
 pub const FLAG_HAS_SEP_REGION: u32 = 1 << 4;
 
+/// Bit 5 of `Header::flags` (R15-D2). When set, the 8-byte ciphertext
+/// length field of the metadata region is stored XOR-masked with a
+/// keystream derived from the MVK and the region nonce, instead of in
+/// the clear. Set at create time for deniable vaults only: their
+/// header is uniform random by construction, which made the plaintext
+/// `u64 LE` length at a fixed offset (four zero bytes + a small value)
+/// the single structural fingerprint of a deniable `.lbx`, and leaked
+/// the serialised directory-tree size on top. Standard vaults keep the
+/// plaintext field (their header is identifiable anyway) so pre-R15
+/// binaries still open them. The real length stays in the AEAD AAD, so
+/// a wrong mask can only fail the tag, never accept a forged length.
+pub const FLAG_MASKED_METADATA_LEN: u32 = 1 << 5;
+
 /// Start of the in-header Secure Enclave region: immediately after the
 /// keyslot array, reusing the bytes that are otherwise RNG padding.
 const OFF_SEP_REGION: usize = OFF_KEYSLOTS + MAX_KEYSLOTS * SLOT_SIZE;
@@ -226,6 +239,12 @@ impl Header {
     /// Whether this header carries an in-header Secure Enclave region.
     pub fn has_sep_region(&self) -> bool {
         (self.flags & FLAG_HAS_SEP_REGION) != 0
+    }
+
+    /// R15-D2: whether the metadata region's length field is masked
+    /// (see `FLAG_MASKED_METADATA_LEN`).
+    pub fn masked_metadata_len(&self) -> bool {
+        (self.flags & FLAG_MASKED_METADATA_LEN) != 0
     }
 
     /// Opaque SEP material for slot `idx`, if any.

@@ -508,13 +508,18 @@ pub fn try_open_envelope_v2(
         // allocator. RustCrypto's AEAD impls don't expose an in-place
         // open API for our wrapper, so we accept the upstream Vec
         // alloc and memcpy out in fixed-size form below.
+        // R15-05: the decrypted envelope (kind tag, cred_id, hmac_salt,
+        // TPM blob, wrapped-MVK ciphertext) is wrapped in `Zeroizing`
+        // immediately so the AEAD's own output Vec is wiped on drop,
+        // not just the fixed-size copy taken below.
         let pt_res = aead::open(
             cipher_suite,
             env_kek.as_bytes(),
             &env_nonce,
             &outer_aad,
             env_ct,
-        );
+        )
+        .map(Zeroizing::new);
 
         // Unconditional fixed-size copy. On AEAD success, source is
         // the returned plaintext; on failure, source is a stack
@@ -636,9 +641,12 @@ pub fn complete_open_v2(
     if mvk_pt.len() != luksbox_core::key::KEY_LEN {
         return Err(Error::OpaqueUnlockFailed);
     }
-    let mut mvk_bytes = [0u8; luksbox_core::key::KEY_LEN];
-    mvk_bytes.copy_from_slice(&mvk_pt);
-    let mvk = MasterVolumeKey::from_bytes(mvk_bytes);
+    // R15-03: build the MVK straight from `Zeroizing` storage. The
+    // previous by-value `[u8; 32]` + `from_bytes` left two un-wiped
+    // stack copies of the plaintext MVK behind (the R12-17 pattern).
+    let mut mvk_bytes = Zeroizing::new([0u8; luksbox_core::key::KEY_LEN]);
+    mvk_bytes.copy_from_slice(&mvk_pt[..]);
+    let mvk = MasterVolumeKey::from_zeroizing(&mvk_bytes);
 
     // Decrypt and parse inner header.
     if opened.inner_header_region.len() < DENIABLE_INNER_SIZE {

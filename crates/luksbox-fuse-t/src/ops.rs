@@ -230,7 +230,10 @@ fn fill_stat(s: &mut sys::stat, a: &FileAttr) {
     s.st_size = i64::try_from(a.size).unwrap_or(i64::MAX) as _;
     s.st_uid = a.uid as _;
     s.st_gid = a.gid as _;
-    s.st_nlink = a.nlink as _;
+    // R15-G4: macOS `st_nlink` is 16-bit; a hostile vault can carry a
+    // 65 536-link file, which `as _` wrapped to 0 ("unlinked" to some
+    // tools). Clamp like the neighbouring conversions.
+    s.st_nlink = u16::try_from(a.nlink).unwrap_or(u16::MAX) as _;
     s.st_blksize = 4096;
     s.st_blocks = i64::try_from(a.size.div_ceil(512)).unwrap_or(i64::MAX) as _;
     let secs_u = a.mtime_ns / 1_000_000_000;

@@ -25,6 +25,19 @@ private let ERR_SEAL: Int32 = -2
 private let ERR_BUFFER: Int32 = -3
 private let ERR_UNSEAL: Int32 = -4
 
+
+/// R15-F4: copy exactly 32 bytes of a CryptoKit `SharedSecret` into a
+/// caller-owned buffer without materialising a `Data` copy (which is not
+/// scrubbed on deallocation, unlike CryptoKit's own SecureBytes).
+/// Returns false if the secret is not 32 bytes long.
+private func copySharedSecret(_ shared: SharedSecret, to out: UnsafeMutablePointer<UInt8>) -> Bool {
+    return shared.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> Bool in
+        guard buf.count == 32, let base = buf.baseAddress else { return false }
+        UnsafeMutableRawPointer(out).copyMemory(from: base, byteCount: 32)
+        return true
+    }
+}
+
 @_cdecl("luksbox_sep_available")
 public func luksbox_sep_available() -> Int32 {
     return SecureEnclave.isAvailable ? 1 : 0
@@ -62,14 +75,17 @@ public func luksbox_sep_seal(
         }
         let eph = P256.KeyAgreement.PrivateKey()
         let shared = try eph.sharedSecretFromKeyAgreement(with: sepKey.publicKey)
-        let sharedBytes = shared.withUnsafeBytes { Data($0) }
         let sepData = sepKey.dataRepresentation
         let ephPub = eph.publicKey.x963Representation
 
-        guard sharedBytes.count == 32, ephPub.count == 65 else { return ERR_SEAL }
+        guard ephPub.count == 65 else { return ERR_SEAL }
         guard sepData.count <= outSepDataCap else { return ERR_BUFFER }
 
-        sharedBytes.copyBytes(to: outShared, count: 32)
+        // R15-F4: copy the shared secret straight out of CryptoKit's
+        // scrubbed SecureBytes into the caller's buffer. Going through a
+        // Foundation `Data` left an unscrubbed heap copy of the ECDH
+        // secret behind until the allocator happened to reuse it.
+        guard copySharedSecret(shared, to: outShared) else { return ERR_SEAL }
         sepData.copyBytes(to: outSepData, count: sepData.count)
         outSepDataLen.pointee = sepData.count
         ephPub.copyBytes(to: outEphPub, count: 65)
@@ -104,9 +120,8 @@ public func luksbox_sep_unseal(
         let ephPubD = Data(bytes: ephPub, count: 65)
         let ephPubKey = try P256.KeyAgreement.PublicKey(x963Representation: ephPubD)
         let shared = try key.sharedSecretFromKeyAgreement(with: ephPubKey)
-        let sharedBytes = shared.withUnsafeBytes { Data($0) }
-        guard sharedBytes.count == 32 else { return ERR_UNSEAL }
-        sharedBytes.copyBytes(to: outShared, count: 32)
+        // R15-F4: see the seal path, no `Data` intermediate.
+        guard copySharedSecret(shared, to: outShared) else { return ERR_UNSEAL }
         return OK
     } catch {
         return ERR_UNSEAL

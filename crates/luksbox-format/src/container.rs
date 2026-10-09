@@ -689,11 +689,57 @@ struct RotationState {
     tmp_data_path: PathBuf,
     committed_data_path: PathBuf,
     /// `(device, inode)` of the committed vault captured from the held
-    /// handle at `begin_atomic_rotation`. `abort_atomic_rotation` binds
-    /// its no-follow reopen to this so a directory-level attacker who
-    /// swaps `committed_data_path` for a symlink during the rotation
-    /// window cannot redirect the abort/Drop header write (audit R14-04).
+    /// handle at `begin_atomic_rotation`. Kept as the binding for the
+    /// no-follow reopen fallback in `abort_atomic_rotation`, used only
+    /// if the retained handle below is ever absent (audit R14-04).
     committed_inode: (u64, u64),
+    /// R15-C2: the ORIGINAL vault handle, still carrying its advisory
+    /// lock, retained for the whole rotation window. Before this, the
+    /// handle (and with it the flock) was dropped at `begin`, so a
+    /// second process could open the vault mid-rotation, write into
+    /// the inode the commit rename was about to unlink, and silently
+    /// lose everything it wrote. Restored verbatim on abort (no
+    /// path-based reopen at all); released at commit once the (also
+    /// locked) temp handle has been renamed over it.
+    committed_file: Option<Box<dyn LbxFile>>,
+    /// R15-C1: snapshot of every in-memory field the rotation mutates
+    /// before commit (`rekey_metadata` swaps the MVK,
+    /// `install_rotated_mvk_*` rewrites the keyslot table and sets
+    /// `header_dirty`, the deniable envelope rotation replaces the
+    /// cached header bytes + salt). `abort_atomic_rotation` restores
+    /// all of it; otherwise `Container::drop` -> `persist_header`
+    /// wrote the never-committed header (whose slots wrap the NEW
+    /// MVK) over the original vault whose metadata and chunks were
+    /// still under the OLD MVK, i.e. an unrecoverable vault.
+    saved_header: Header,
+    saved_mvk: MasterVolumeKey,
+    saved_header_dirty: bool,
+    saved_deniable: Option<DeniableSnapshot>,
+}
+
+/// Pre-rotation copy of `DeniableState`, restored on abort (R15-C1).
+struct DeniableSnapshot {
+    bytes: Box<[u8; luksbox_core::deniable::DENIABLE_HEADER_SIZE]>,
+    salt: [u8; luksbox_core::deniable::DENIABLE_SALT_SIZE],
+    inner: crate::deniable_header::DeniableInnerHeader,
+    unlocked_slot_idx: usize,
+}
+
+/// R15-C4: delete the mirror sidecars that older versions wrote next
+/// to the rotation temp (`<vault>.rotating.meta-bak` /
+/// `.rotating.header-bak`). Current code suppresses mirror writes
+/// while a rotation is in flight (see `is_v2_format`), but commit and
+/// abort still sweep them so a deployment that upgraded mid-life does
+/// not keep a 64 MiB metadata snapshot at a predictable name that
+/// `cleanup-orphans` never touches. `remove_file` unlinks the entry
+/// itself and never follows a symlink.
+fn remove_rotation_tmp_mirrors(tmp_data_path: &Path) {
+    for ext in ["meta-bak", "header-bak"] {
+        let p = append_extension(tmp_data_path, ext);
+        if p.symlink_metadata().is_ok() {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
 }
 
 /// Companion state attached to a Container when the vault uses a
@@ -1390,6 +1436,12 @@ impl Container {
         let metadata_offset = DENIABLE_HEADER_SIZE as u64;
         let data_offset = metadata_offset + metadata_region_size;
 
+        // R15-D2: deniable vaults mask the metadata length field (the
+        // flag rides in the AEAD-sealed inner header, so it is itself
+        // invisible without the credential). Pre-R15 deniable vaults
+        // lack the flag and keep reading their plaintext field.
+        let flags = flags | luksbox_core::FLAG_MASKED_METADATA_LEN;
+
         let inner = DeniableInnerHeader {
             format_version_minor: 0,
             cipher_suite: cipher,
@@ -1417,7 +1469,7 @@ impl Container {
         let mut file = secure_create_new(path)?;
         file.write_all(&header_bytes)?;
         let mut region = vec![0u8; metadata_region_size as usize];
-        metadata::write_metadata(cipher, &mvk, &salt, b"", &mut region)?;
+        metadata::write_metadata_opts(cipher, &mvk, &salt, b"", &mut region, true)?;
         file.write_all(&region)?;
         file.flush()?;
 
@@ -2222,6 +2274,20 @@ impl Container {
             }
         }
         let header = Header::from_bytes(&header_bytes)?;
+        // R15-A1: the parser cannot know whether the header is inline
+        // or detached, so it has to admit `metadata_offset == 0` and
+        // puts no lower bound on `data_offset`. We DO know here. For an
+        // inline header both regions must start past the 8 KiB header,
+        // otherwise a valid-HMAC layout (an MVK holder can produce one)
+        // makes the victim's first flush write AEAD ciphertext over the
+        // keyslot table and destroy the header. Same defence-in-depth
+        // class as the parser's existing (a)/(b) layout checks.
+        if matches!(header_storage, HeaderStorage::Inline)
+            && (header.metadata_offset < HEADER_SIZE as u64
+                || header.data_offset < HEADER_SIZE as u64)
+        {
+            return Err(Error::Crypto(luksbox_core::Error::InvalidField));
+        }
         Ok((file, header_storage, header_bytes, header))
     }
 
@@ -2323,11 +2389,12 @@ impl Container {
         self.file
             .seek(SeekFrom::Start(self.header.metadata_offset))?;
         self.file.read_exact(&mut region)?;
-        match metadata::read_metadata(
+        match metadata::read_metadata_opts(
             self.header.cipher_suite,
             &self.mvk,
             &self.header.header_salt,
             &region,
+            self.header.masked_metadata_len(),
         ) {
             Ok(pt) => Ok(pt),
             Err(live_err) => {
@@ -2352,11 +2419,12 @@ impl Container {
                     Ok(b) => b,
                     Err(_) => return Err(live_err),
                 };
-                match metadata::read_metadata(
+                match metadata::read_metadata_opts(
                     self.header.cipher_suite,
                     &self.mvk,
                     &self.header.header_salt,
                     &mirror_bytes,
+                    self.header.masked_metadata_len(),
                 ) {
                     Ok(pt) => {
                         eprintln!(
@@ -2419,12 +2487,13 @@ impl Container {
             return Err(Error::MetadataTooLarge);
         }
         let mut region = vec![0u8; region_size];
-        metadata::write_metadata(
+        metadata::write_metadata_opts(
             self.header.cipher_suite,
             &self.mvk,
             &self.header.header_salt,
             plaintext,
             &mut region,
+            self.header.masked_metadata_len(),
         )?;
         // v2 vaults: **intended-state mirror protocol**. Commit the
         // mirror to the NEW bytes BEFORE overwriting live. This is
@@ -2514,8 +2583,19 @@ impl Container {
     /// v1 (LUKSBOX1) vaults preserve the v0.2.0 in-place rewrite
     /// behavior to avoid touching disk in any new way until the
     /// auto-upgrade trigger fires in `Vfs::flush`.
+    ///
+    /// R15-C4: also false while an atomic rotation is in flight. During
+    /// that window `self.path` is the `.rotating` temp, so the mirror
+    /// writers would otherwise produce `<vault>.rotating.{meta,header}-bak`
+    /// files that neither commit nor abort removed (a permanent, valid,
+    /// current-MVK metadata snapshot at a predictable name, plus up to
+    /// 64 MiB of dead disk per vault). The `.rotating` copy IS the
+    /// recovery state for that window; commit clears the mirror flags
+    /// so the next persist re-establishes mirrors at the committed path.
     fn is_v2_format(&self) -> bool {
-        self.header.version_major == luksbox_core::VERSION_MAJOR_V2 && self.deniable.is_none()
+        self.header.version_major == luksbox_core::VERSION_MAJOR_V2
+            && self.deniable.is_none()
+            && self.rotation.is_none()
     }
 
     /// Write the metadata mirror to the **intended new bytes** (NOT
@@ -3710,12 +3790,33 @@ impl Container {
         }
         #[cfg(not(unix))]
         let tmp_file = OpenOptions::new().read(true).write(true).open(&tmp)?;
-        self.file = Box::new(tmp_file);
+        // R15-C2: lock the temp exactly like the committed vault, so the
+        // handle that becomes the vault at commit is locked from the
+        // start and stays locked across the rename (the lock follows
+        // the inode). A failure here must not leave the half-written
+        // temp behind.
+        if let Err(e) = lock_handles(&[(&tmp_file, tmp.as_path())]) {
+            drop(tmp_file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+        let saved_deniable = self.deniable.as_ref().map(|d| DeniableSnapshot {
+            bytes: d.bytes.clone(),
+            salt: d.salt,
+            inner: d.inner,
+            unlocked_slot_idx: d.unlocked_slot_idx,
+        });
+        let committed_file = std::mem::replace(&mut self.file, Box::new(tmp_file));
         self.path = tmp.clone();
         self.rotation = Some(RotationState {
             tmp_data_path: tmp,
             committed_data_path: original,
             committed_inode,
+            committed_file: Some(committed_file),
+            saved_header: self.header.clone(),
+            saved_mvk: self.mvk.clone(),
+            saved_header_dirty: self.header_dirty,
+            saved_deniable,
         });
         Ok(())
     }
@@ -3725,7 +3826,7 @@ impl Container {
     /// After this returns, the rotation is durably committed: a crash
     /// after this point leaves the new vault in place.
     pub fn commit_atomic_rotation(&mut self) -> Result<(), Error> {
-        let state = self
+        let mut state = self
             .rotation
             .take()
             .ok_or(Error::Crypto(luksbox_core::Error::InvalidField))?;
@@ -3737,10 +3838,29 @@ impl Container {
         self.file.flush()?;
         self.file.sync_all()?;
 
+        // R15-C2: on POSIX the original handle (and its flock) is held
+        // until the rename has replaced the directory entry, since flock
+        // never blocks a rename. Windows cannot replace a file whose
+        // byte ranges another handle has locked, so release it just
+        // before the rename there (a window of microseconds instead of
+        // the whole rotation).
+        #[cfg(not(unix))]
+        {
+            state.committed_file = None;
+        }
         // Atomic on POSIX (and on Windows when the target is on the same
         // volume, std::fs::rename uses MoveFileExW with REPLACE_EXISTING).
-        std::fs::rename(&state.tmp_data_path, &state.committed_data_path)?;
+        if let Err(e) = std::fs::rename(&state.tmp_data_path, &state.committed_data_path) {
+            // Leave the rotation in flight: the original vault is
+            // untouched (and on POSIX still locked by the retained
+            // handle), the caller or the user can abort / inspect the
+            // `.rotating` file, and `Drop` persists only into the temp.
+            self.rotation = Some(state);
+            return Err(e.into());
+        }
         sync_parent_dir(&state.committed_data_path)?;
+        state.committed_file = None;
+        remove_rotation_tmp_mirrors(&state.tmp_data_path);
 
         // **CRITICAL**: drop the OLD sidecar mirrors that were
         // written under the PRE-rotation MVK + keyslot envelopes.
@@ -3805,19 +3925,42 @@ impl Container {
         // bytes through it. With the no-follow + inode-equality check, a
         // swapped path now fails closed with `PathSubstituted` and the
         // header write never reaches a foreign file.
-        let original_file =
-            reopen_committed_no_follow(&state.committed_data_path, state.committed_inode)?;
-        self.file = Box::new(original_file);
+        //
+        // R15-C1: restore every in-memory field the aborted rotation
+        // mutated FIRST, so the container (and its `Drop`) describe the
+        // original vault again whatever happens below. Without this,
+        // `Drop -> persist_header` wrote the rotated header over the
+        // original vault: slots wrapping the NEW MVK, data still under
+        // the OLD one, vault bricked.
+        self.header = state.saved_header;
+        self.mvk = state.saved_mvk;
+        self.header_dirty = state.saved_header_dirty;
+        if let Some(snap) = state.saved_deniable
+            && let Some(den) = self.deniable.as_mut()
+        {
+            den.bytes = snap.bytes;
+            den.salt = snap.salt;
+            den.inner = snap.inner;
+            den.unlocked_slot_idx = snap.unlocked_slot_idx;
+        }
+        // R15-C2: put the retained ORIGINAL handle back. No path is
+        // consulted, so the R14-04 symlink swap cannot redirect anything;
+        // the no-follow + inode-bound reopen remains as the fallback for
+        // the (never expected) case where the handle is absent.
+        let original_file: Box<dyn LbxFile> = match state.committed_file {
+            Some(f) => f,
+            None => Box::new(reopen_committed_no_follow(
+                &state.committed_data_path,
+                state.committed_inode,
+            )?),
+        };
+        self.file = original_file;
         self.path = state.committed_data_path;
 
-        // Best-effort cleanup of the temp file.
+        // Best-effort cleanup of the temp file and any mirrors written
+        // against it (R15-C4).
         let _ = std::fs::remove_file(&state.tmp_data_path);
-
-        // Mark header as dirty so any in-memory changes get rewritten on
-        // top of the original (in case caller wants to retry rotation).
-        // Actually, we shouldn't trust self.header here either; on abort,
-        // the safest thing is to reload from disk. But that's caller-side:
-        // they should drop the Vfs and reopen.
+        remove_rotation_tmp_mirrors(&state.tmp_data_path);
         Ok(())
     }
 }
@@ -4309,16 +4452,15 @@ mod tests {
         ));
     }
 
-    /// R14-04 regression (audit F1, reported by Garry Jean-Baptiste,
-    /// garry@reyse.ai): a directory-level attacker who swaps the
-    /// committed vault path for a symlink during the rotation window
-    /// must not redirect the abort/Drop header write. The abort reopen
-    /// is bound (O_NOFOLLOW + inode-equality) to the inode captured at
-    /// `begin_atomic_rotation`, so the swap fails closed with
-    /// `PathSubstituted` and the victim file is left untouched.
+    /// Audit R14-04, updated for R15-C2: the committed vault handle is
+    /// now retained (locked) across the whole rotation window, so abort
+    /// never consults the path at all. A symlink swapped in at the path
+    /// during the window is therefore irrelevant: abort succeeds, the
+    /// `Drop` header write lands on the ORIGINAL inode through the
+    /// retained handle, and the symlink's target is never touched.
     #[cfg(unix)]
     #[test]
-    fn abort_atomic_rotation_refuses_symlinked_path() {
+    fn abort_atomic_rotation_ignores_symlinked_path() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("vault.lbx");
         let victim = dir.path().join("victim");
@@ -4338,28 +4480,147 @@ mod tests {
         assert!(cont.supports_atomic_rotation());
         cont.begin_atomic_rotation().unwrap();
 
-        // Attacker swaps the committed path for a symlink to the victim
-        // during the rotation window (the original flock was released at
-        // begin; begin already copied the original into <path>.rotating).
         std::fs::remove_file(&path).unwrap();
         std::os::unix::fs::symlink(&victim, &path).unwrap();
 
-        // Abort must fail closed: the no-follow reopen bound to the
-        // captured inode rejects the symlink.
-        assert!(matches!(
-            cont.abort_atomic_rotation(),
-            Err(Error::PathSubstituted { .. })
-        ));
-
-        // Drop runs persist_header on whatever self.file still is (the
-        // temp, not the victim). Confirm the victim was never overwritten
-        // with header bytes.
+        cont.abort_atomic_rotation()
+            .expect("abort must not depend on the (attacker-controlled) path");
         drop(cont);
         let after = std::fs::read(&victim).unwrap();
         assert_eq!(
             after, b"victim-must-not-be-overwritten",
             "abort must not redirect the header write through the swapped symlink"
         );
+    }
+
+    /// R15-A1 regression: an inline-header vault whose (valid-HMAC-able)
+    /// header claims `metadata_offset == 0` must be refused before any
+    /// unlock runs, otherwise the first flush would write the metadata
+    /// region over the keyslot table.
+    #[test]
+    fn inline_header_rejects_metadata_region_inside_header() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.lbx");
+        Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            test_params(),
+            b"correct horse",
+        )
+        .unwrap();
+        // Zero the on-disk metadata_offset (bytes 56..64). The parser
+        // admits 0 (detached headers legitimately use it); the inline
+        // bound in `load_locked_header` must not.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[56..64].copy_from_slice(&0u64.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let err = Container::open(&path, None, UnlockMaterial::Passphrase(b"correct horse"))
+            .err()
+            .expect("inline header with metadata_offset == 0 must be refused");
+        assert!(
+            matches!(err, Error::Crypto(luksbox_core::Error::InvalidField)),
+            "expected InvalidField before unlock, got {err:?}"
+        );
+    }
+
+    /// R15-C1 regression: aborting a rotation AFTER the new MVK and the
+    /// new keyslot table were installed in memory (the state every
+    /// failure past `rekey_metadata` / `install_rotated_mvk_multi`
+    /// leaves behind) must restore the original header + MVK, so the
+    /// `Drop` persist cannot write a never-committed header over the
+    /// original vault. The vault must still open with the original
+    /// credential and its metadata must still decrypt.
+    #[test]
+    fn abort_after_install_restores_original_header_and_mvk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.lbx");
+        Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            test_params(),
+            b"correct horse",
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        {
+            let mut cont =
+                Container::open(&path, None, UnlockMaterial::Passphrase(b"correct horse")).unwrap();
+            cont.begin_atomic_rotation().unwrap();
+            let new_mvk = MasterVolumeKey::random();
+            let slot = Keyslot::new_passphrase(
+                cont.header.cipher_suite,
+                &new_mvk,
+                b"correct horse",
+                test_params(),
+                &cont.header.header_salt,
+            )
+            .unwrap();
+            cont.rekey_metadata(&new_mvk).unwrap();
+            cont.install_rotated_mvk_multi(new_mvk, vec![(0, slot)])
+                .unwrap();
+            cont.abort_atomic_rotation().unwrap();
+            // `Drop` runs `persist_header` here.
+        }
+        let mut tmp_os = path.as_os_str().to_owned();
+        tmp_os.push(".rotating");
+        assert!(
+            !std::path::Path::new(&tmp_os).exists(),
+            "abort must remove the .rotating temp"
+        );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(
+            after[..HEADER_SIZE],
+            before[..HEADER_SIZE],
+            "abort + Drop must leave the original header bytes untouched"
+        );
+        let mut cont = Container::open(&path, None, UnlockMaterial::Passphrase(b"correct horse"))
+            .expect("original vault must still open with the original credential");
+        cont.read_metadata()
+            .expect("metadata must still decrypt under the original MVK");
+    }
+
+    /// R15-C2 regression: the vault must stay exclusively locked for the
+    /// whole rotation window (begin .. commit/abort) and afterwards, so a
+    /// second opener gets `VaultLocked` instead of writing into an inode
+    /// the commit rename is about to unlink.
+    #[test]
+    fn rotation_window_keeps_vault_locked() {
+        if std::env::var_os("LUKSBOX_NO_LOCK").is_some() {
+            return;
+        }
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("vault.lbx");
+        Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            test_params(),
+            b"correct horse",
+        )
+        .unwrap();
+        let reopen = |p: &std::path::Path| {
+            Container::open(p, None, UnlockMaterial::Passphrase(b"correct horse"))
+        };
+
+        // begin -> abort path.
+        let mut cont = reopen(&path).unwrap();
+        cont.begin_atomic_rotation().unwrap();
+        assert!(matches!(reopen(&path), Err(Error::VaultLocked { .. })));
+        cont.abort_atomic_rotation().unwrap();
+        assert!(matches!(reopen(&path), Err(Error::VaultLocked { .. })));
+        drop(cont);
+        assert!(reopen(&path).is_ok());
+
+        // begin -> commit path: the renamed temp must carry the lock.
+        let mut cont = reopen(&path).unwrap();
+        cont.begin_atomic_rotation().unwrap();
+        assert!(matches!(reopen(&path), Err(Error::VaultLocked { .. })));
+        cont.commit_atomic_rotation().unwrap();
+        assert!(matches!(reopen(&path), Err(Error::VaultLocked { .. })));
+        drop(cont);
+        assert!(reopen(&path).is_ok());
     }
 
     /// Audit v0.5.0-rc.3 (task #491): the header-bak recovery reader must
@@ -6639,7 +6900,7 @@ mod tests {
         assert_eq!(c.header.header_salt, salt_before);
         // And we can still read the (fake) metadata back -- proving
         // the guard didn't touch on-disk state either.
-        let _ = metadata::read_metadata(
+        let _ = metadata::read_metadata_opts(
             c.header.cipher_suite,
             &c.mvk_clone(),
             &c.header.header_salt,
@@ -6653,6 +6914,7 @@ mod tests {
                 c.file.read_exact(&mut region).unwrap();
                 region
             },
+            c.header.masked_metadata_len(), // R15-D2: deniable regions mask the length
         )
         .unwrap();
     }
@@ -6730,11 +6992,29 @@ mod tests {
         use std::io::{Read, Seek, SeekFrom};
         f.seek(SeekFrom::Start(c.header.metadata_offset)).unwrap();
         f.read_exact(&mut metadata).unwrap();
-        let pt = metadata::read_metadata(
+        // R15-D2: a deniable vault masks the length field; the plain
+        // reader must NOT be able to parse the region, the masked one must.
+        assert!(c.header.masked_metadata_len());
+        assert!(
+            metadata::read_metadata(
+                c.header.cipher_suite,
+                &c.mvk,
+                &c.header.header_salt,
+                &metadata
+            )
+            .is_err(),
+            "unmasked reader must fail on a masked deniable region"
+        );
+        assert!(
+            metadata[16..20].iter().any(|&b| b != 0),
+            "deniable region must not carry the plaintext length's zero high bytes"
+        );
+        let pt = metadata::read_metadata_opts(
             c.header.cipher_suite,
             &c.mvk,
             &c.header.header_salt,
             &metadata,
+            true,
         )
         .expect("metadata roundtrip failed; synthetic header carries wrong salt or cipher");
         assert!(

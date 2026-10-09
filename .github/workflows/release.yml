@@ -25,26 +25,13 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# R15-J4: least privilege. Workflow-level default is read-only; each
+# job below requests exactly the scopes it needs. The build job runs
+# ~600 crates' build scripts and proc-macros plus brew/choco packages
+# and third-party actions, so it must never hold a token that can push
+# commits, create releases or mint Sigstore attestations.
 permissions:
-  contents: write       # to create the release + upload assets
-  # The two scopes below enable GitHub Artifact Attestations
-  # (Sigstore-backed). actions/attest-build-provenance asks for an
-  # OIDC token from GitHub (`id-token: write`) so it can prove the
-  # signing call came from this workflow run, then registers the
-  # attestation against the artifact (`attestations: write`).
-  # Anyone can verify with `gh attestation verify <artifact>
-  # --owner penthertz`. No keys to manage on our side; signing
-  # identity is short-lived per run and pinned to the commit SHA.
-  id-token: write
-  attestations: write
-  # SignPath's official GitHub Action signs an artifact by its GitHub
-  # artifact id, so each file to sign is uploaded as a run artifact
-  # first. Those intermediates are unsigned and must be deleted before
-  # the release job's download-artifact pulls them in; deleting run
-  # artifacts needs `actions: write` (which also covers the read the
-  # SignPath action uses to resolve the artifact). Windows-only in
-  # practice; harmless on the other legs.
-  actions: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -54,7 +41,21 @@ jobs:
   build:
     name: ${{ matrix.target }}${{ matrix.ubuntu_codename && format(' ({0})', matrix.ubuntu_codename) || '' }}
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      # SignPath's official GitHub Action signs an artifact by its GitHub
+      # artifact id, so each file to sign is uploaded as a run artifact
+      # first. Those intermediates are unsigned and must be deleted before
+      # the release job's download-artifact pulls them in; deleting run
+      # artifacts needs `actions: write` (which also covers the read the
+      # SignPath action uses to resolve the artifact). Windows-only in
+      # practice; harmless on the other legs.
+      actions: write
     env:
+      # R15-J6: `matrix.archive` embeds `github.ref_name`; expose it to
+      # shell steps through the environment (quoted `"$ARCHIVE"`), never
+      # by splicing `${{ }}` into a `run:` script.
+      ARCHIVE: ${{ matrix.archive }}
       # A step's `if:` can only read env defined at the WORKFLOW or JOB
       # level, never the step's own `env`, and workflow-level env cannot
       # reference `secrets`. So the SignPath steps below are gated on
@@ -252,14 +253,30 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends \
             git ca-certificates curl build-essential
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate ref name
+        shell: bash
+        run: |
+          # R15-J6: `github.ref_name` reaches shell commands (archive
+          # names, version derivation). Allow only the characters a
+          # version tag / branch legitimately needs, so a crafted tag
+          # pushed by a collaborator cannot carry shell metacharacters
+          # into any `run:` step of a release build.
+          if [[ ! "$GITHUB_REF_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
+              echo "::error::refusing to build ref '$GITHUB_REF_NAME': unexpected characters"
+              exit 1
+          fi
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           # Include fuse_backend so the two macOS variants (fuset /
           # macfuse) don't share a cache slot -- they link different
@@ -564,145 +581,6 @@ jobs:
             echo "LUKSBOX_FUSE_BACKEND=$FUSE_BACKEND"
           } >> "$GITHUB_ENV"
 
-      - name: Import Developer ID certificate (macOS)
-        # Only fires when the .p12 secret is present. PR builds and
-        # forks without the secret fall through to unsigned artifacts
-        # (the codesign step below also gates on the same secret).
-        if: runner.os == 'macOS' && env.APPLE_DEVELOPER_ID_CERT_P12_B64 != ''
-        env:
-          APPLE_DEVELOPER_ID_CERT_P12_B64:  ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_B64 }}
-          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
-          MACOS_CI_KEYCHAIN_PASSWORD:       ${{ secrets.MACOS_CI_KEYCHAIN_PASSWORD }}
-        run: |
-          set -euo pipefail
-          # Decode the base64-armored .p12 into a temp file. The .p12
-          # holds the Developer ID Application certificate + its private
-          # key, exported from Keychain Access (or assembled with
-          # openssl pkcs12). Lives only for the duration of this CI
-          # run, then the runner cleans up.
-          #
-          # `tr -d '\n\r '` defensively strips any line-wrapping or
-          # stray whitespace that may survive the GitHub-secrets
-          # round-trip (`base64 -i foo` on macOS line-wraps at 76
-          # columns by default; `printf '%s'` preserves that, then
-          # `base64 --decode` on some BSD-base64 builds chokes on
-          # multi-line input). Single-line input is universally
-          # accepted.
-          P12_PATH="$RUNNER_TEMP/devid.p12"
-          printf '%s' "$APPLE_DEVELOPER_ID_CERT_P12_B64" \
-            | tr -d '\n\r ' \
-            | base64 --decode > "$P12_PATH"
-          # Sanity-check the decoded bytes look like a PKCS12 envelope
-          # before handing to `security`. PKCS12 starts with the
-          # ASN.1 SEQUENCE tag 0x30 followed by a length descriptor;
-          # a corrupted base64 transport typically yields random
-          # bytes here. The `file` magic check is cheap and turns a
-          # cryptic `MAC verification failed` later into a clear
-          # `decoded blob is not a PKCS12 envelope` here.
-          DECODED_HEAD=$(xxd -l 8 "$P12_PATH" | head -1 | awk '{print $2$3$4$5}')
-          if ! [[ "$DECODED_HEAD" =~ ^30[0-9a-f]{2,4} ]]; then
-              echo "::error::APPLE_DEVELOPER_ID_CERT_P12_B64 decoded to non-PKCS12 bytes."
-              echo "         First 8 decoded bytes: $DECODED_HEAD (expected 30xx... ASN.1 SEQUENCE)."
-              echo "         Likely cause: the secret was pasted with line-wrapping or"
-              echo "         truncated. Re-encode locally with a single-line form:"
-              echo "             openssl base64 -A -in devid.p12 | pbcopy"
-              echo "         and replace the secret value."
-              exit 1
-          fi
-
-          # Create a brand-new keychain dedicated to this build. We
-          # do NOT touch the runner's login keychain because:
-          #   1. concurrent jobs on the same runner would race on it
-          #   2. the runner's login keychain is destroyed at job end
-          #      anyway, but a fresh keychain makes ownership obvious
-          #   3. set-key-partition-list on the login keychain would
-          #      prompt for the runner's interactive password
-          KEYCHAIN_PATH="$RUNNER_TEMP/luksbox-build.keychain-db"
-          security create-keychain -p "$MACOS_CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
-          security unlock-keychain    -p "$MACOS_CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          # Pre-verify the .p12 with OpenSSL BEFORE handing to
-          # `security import`. macOS's `security import` only accepts
-          # PKCS12 envelopes encrypted with the legacy PBES1 algorithm
-          # set (3DES); modern OpenSSL 3.x defaults to PBES2 (AES-256)
-          # which `security` rejects with a generic "MAC verification
-          # failed" that is identical to the wrong-password error.
-          # OpenSSL accepts both, so a successful OpenSSL verify here
-          # combined with a `security import` failure proves the
-          # .p12 is in the wrong format (re-export with `-legacy`).
-          # Also surfaces the password length so a hidden trailing
-          # newline / quote becomes visible without leaking the value.
-          PW_LEN=${#APPLE_DEVELOPER_ID_CERT_PASSWORD}
-          P12_SHA=$(shasum -a 256 "$P12_PATH" | awk '{print $1}')
-          echo "==> .p12 sha256: $P12_SHA"
-          echo "==> APPLE_DEVELOPER_ID_CERT_PASSWORD length: $PW_LEN chars"
-          if openssl pkcs12 -in "$P12_PATH" \
-              -password "pass:$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
-              -nokeys -noout 2>/dev/null
-          then
-              echo "==> OpenSSL pre-verify: .p12 + password OK"
-          else
-              echo "::error::OpenSSL pre-verify FAILED. The .p12 password"
-              echo "         does not match the .p12 file. Either:"
-              echo "           1. The APPLE_DEVELOPER_ID_CERT_PASSWORD secret"
-              echo "              contains hidden characters (trailing newline,"
-              echo "              quotes, leading whitespace), OR"
-              echo "           2. The .p12 was re-exported with a different"
-              echo "              password and the new one wasn't pushed to"
-              echo "              the GitHub secret yet."
-              echo "         Re-export locally and verify before re-uploading:"
-              echo "             openssl pkcs12 -export -legacy -out devid.p12 \\"
-              echo "                 -inkey devid.key -in devid.pem"
-              echo "             openssl pkcs12 -in devid.p12 \\"
-              echo "                 -password \"pass:THE_PASSWORD\" -nokeys -noout"
-              exit 1
-          fi
-
-          # Import .p12 into the new keychain. -A allows any tool to
-          # use the key (codesign needs this); -t cert + -f pkcs12
-          # tells security how to parse the input.
-          if ! security import "$P12_PATH" \
-              -P "$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
-              -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          then
-              echo "::error::OpenSSL accepted the .p12 + password, but macOS"
-              echo "         'security import' rejected it. This is the"
-              echo "         classic symptom of a PBES2 (AES-encrypted)"
-              echo "         PKCS12, which OpenSSL accepts but pre-Sonoma-14.4"
-              echo "         'security import' does not. Re-export the .p12"
-              echo "         with the legacy PBES1 algorithms:"
-              echo "             openssl pkcs12 -export -legacy \\"
-              echo "                 -out devid.p12 \\"
-              echo "                 -inkey devid.key -in devid.pem \\"
-              echo "                 -name 'Developer ID Application'"
-              echo "         Then re-encode + replace the secret:"
-              echo "             openssl base64 -A -in devid.p12 | pbcopy"
-              exit 1
-          fi
-
-          # Without this, codesign prompts the user (impossible on a
-          # CI runner) for permission to use the private key. The
-          # partition list grants programmatic access keyed to the
-          # keychain password we just set.
-          security set-key-partition-list \
-            -S apple-tool:,apple:,codesign: \
-            -s -k "$MACOS_CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          # Add to the search list so codesign and notarytool find the
-          # identity. Preserves whatever was already there (the runner's
-          # login keychain etc.) by appending rather than replacing.
-          security list-keychains -d user -s "$KEYCHAIN_PATH" \
-            $(security list-keychains -d user | tr -d '" ' | tr '\n' ' ')
-
-          # Sanity: print the resolved signing identity. Should match
-          # "Developer ID Application: Sebastien Dudek (XXXXXXXXXX)".
-          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
-
-          # Surface the keychain path for downstream codesign steps.
-          echo "MACOS_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
-          rm -f "$P12_PATH"
-
       - name: Set Linux feature list
         if: runner.os == 'Linux'
         shell: bash
@@ -787,7 +665,7 @@ jobs:
           # that this drops. Fall back to a direct MSI download if
           # choco's package gets delisted or the install fails.
           $ErrorActionPreference = 'Continue'
-          choco install winfsp -y --no-progress
+          choco install winfsp --version=2.0.23075 -y --no-progress  # R15-J3: pinned
           if (-not (Test-Path "C:\Program Files (x86)\WinFsp\inc\winfsp\winfsp.h") -and
               -not (Test-Path "C:\Program Files\WinFsp\inc\winfsp\winfsp.h")) {
               Write-Host "==> choco install didn't drop WinFsp SDK, falling back to direct MSI"
@@ -828,6 +706,27 @@ jobs:
           bash scripts/build_icons.sh
 
       # ---- build --------------------------------------------------------------
+
+      - name: Stage pinned tpm2-tss source (Linux bundled-tpm lanes)
+        if: runner.os == 'Linux' && contains(env.LUKSBOX_FEATURES, 'bundled-tpm')
+        shell: bash
+        env:
+          TPM2_TSS_VERSION: "4.1.3"
+          TPM2_TSS_TARBALL_SHA256: "8a389bda64690910e7af7deaf64703a3faed416dc538c9c3e4f893f24893524d"
+        run: |
+          set -euo pipefail
+          # R15-J3: without TPM2_TSS_SOURCE_PATH, tss-esapi-sys runs
+          # `git clone --depth 1 --branch 4.1.3` at build time (a mutable
+          # tag, no hash) and statically links the result into the
+          # shipped binary. Fetch the release archive once, verify it,
+          # and point the build script at the unpacked tree instead.
+          tarball="$RUNNER_TEMP/tpm2-tss-$TPM2_TSS_VERSION.tar.gz"
+          curl -fsSL --retry 3 -o "$tarball" \
+            "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/$TPM2_TSS_VERSION.tar.gz"
+          echo "$TPM2_TSS_TARBALL_SHA256  $tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/tpm2-tss-src"
+          tar -xzf "$tarball" -C "$RUNNER_TEMP/tpm2-tss-src"
+          echo "TPM2_TSS_SOURCE_PATH=$RUNNER_TEMP/tpm2-tss-src/tpm2-tss-$TPM2_TSS_VERSION" >> "$GITHUB_ENV"
 
       - name: Build CLI
         shell: bash
@@ -932,8 +831,8 @@ jobs:
           done
           cp dist/install.sh staging/install.sh
           chmod +x staging/install.sh
-          tar -C staging -czf "${{ matrix.archive }}" .
-          ls -lh "${{ matrix.archive }}"
+          tar -C staging -czf "$ARCHIVE" .
+          ls -lh "$ARCHIVE"
 
       # ---- Linux native packages (deb + rpm) -------------------------------
       #
@@ -1179,7 +1078,7 @@ jobs:
 
       - name: Upload Linux .deb
         if: runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           # Includes ubuntu_codename so jammy + noble entries on the
           # same target architecture don't collide. The release job's
@@ -1192,7 +1091,7 @@ jobs:
 
       - name: Upload Linux .rpm
         if: runner.os == 'Linux' && matrix.build_rpm
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           # Only the jammy entries produce an .rpm; noble entries
           # skip this step entirely. RPM is distro-portable so one
@@ -1301,10 +1200,10 @@ jobs:
               # for system frameworks (e.g. SwiftUI), never for our
               # third-party deps.
               UNSAFE_RPATH="$(otool -L "$bin" \
-                  | grep -E '^[[:space:]]+@rpath/(libfuse|libfido|libcbor|libcrypto|libssl|libtss)' \
+                  | grep -E '^[[:space:]]+(@rpath/|/usr/local/|/opt/homebrew/).*(libfuse|libfido|libcbor|libcrypto|libssl|libtss)' \
                   || true)"
               if [ -n "$UNSAFE_RPATH" ]; then
-                  echo "::error::$bin still has @rpath references to third-party dylibs after dylibbundler. dylibbundler should have rewritten these to @executable_path/../Frameworks/<lib>. Refusing to ship a binary vulnerable to DYLD search-path injection."
+                  echo "::error::$bin still has @rpath or Homebrew-prefix references to third-party dylibs after dylibbundler (R15-J10: an absolute /opt/homebrew or /usr/local path is a user-writable location, i.e. the same injection as @rpath). dylibbundler should have rewritten these to @executable_path/../Frameworks/<lib>. Refusing to ship a binary vulnerable to DYLD search-path injection."
                   echo "$UNSAFE_RPATH" | sed 's/^/    /'
                   exit 1
               fi
@@ -1368,6 +1267,152 @@ jobs:
           </dict>
           </plist>
           EOF
+
+      - name: Import Developer ID certificate (macOS)
+        # R15-J1: this step runs AFTER `cargo build` (hundreds of
+        # third-party build scripts / proc-macros) and after dylibbundler
+        # and create-dmg, immediately before the first codesign call. It
+        # used to run before the build, leaving an unlocked keychain with
+        # an ACL-open Developer ID private key available to every build
+        # script for the whole job. The matching cleanup step at the end
+        # of the job deletes the keychain unconditionally.
+        # Only fires when the .p12 secret is present. PR builds and
+        # forks without the secret fall through to unsigned artifacts
+        # (the codesign step below also gates on the same secret).
+        if: runner.os == 'macOS' && env.APPLE_DEVELOPER_ID_CERT_P12_B64 != ''
+        env:
+          APPLE_DEVELOPER_ID_CERT_P12_B64:  ${{ secrets.APPLE_DEVELOPER_ID_CERT_P12_B64 }}
+          APPLE_DEVELOPER_ID_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERT_PASSWORD }}
+          MACOS_CI_KEYCHAIN_PASSWORD:       ${{ secrets.MACOS_CI_KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          # Decode the base64-armored .p12 into a temp file. The .p12
+          # holds the Developer ID Application certificate + its private
+          # key, exported from Keychain Access (or assembled with
+          # openssl pkcs12). Lives only for the duration of this CI
+          # run, then the runner cleans up.
+          #
+          # `tr -d '\n\r '` defensively strips any line-wrapping or
+          # stray whitespace that may survive the GitHub-secrets
+          # round-trip (`base64 -i foo` on macOS line-wraps at 76
+          # columns by default; `printf '%s'` preserves that, then
+          # `base64 --decode` on some BSD-base64 builds chokes on
+          # multi-line input). Single-line input is universally
+          # accepted.
+          P12_PATH="$RUNNER_TEMP/devid.p12"
+          printf '%s' "$APPLE_DEVELOPER_ID_CERT_P12_B64" \
+            | tr -d '\n\r ' \
+            | base64 --decode > "$P12_PATH"
+          # Sanity-check the decoded bytes look like a PKCS12 envelope
+          # before handing to `security`. PKCS12 starts with the
+          # ASN.1 SEQUENCE tag 0x30 followed by a length descriptor;
+          # a corrupted base64 transport typically yields random
+          # bytes here. The `file` magic check is cheap and turns a
+          # cryptic `MAC verification failed` later into a clear
+          # `decoded blob is not a PKCS12 envelope` here.
+          DECODED_HEAD=$(xxd -l 8 "$P12_PATH" | head -1 | awk '{print $2$3$4$5}')
+          if ! [[ "$DECODED_HEAD" =~ ^30[0-9a-f]{2,4} ]]; then
+              echo "::error::APPLE_DEVELOPER_ID_CERT_P12_B64 decoded to non-PKCS12 bytes."
+              echo "         First 8 decoded bytes: $DECODED_HEAD (expected 30xx... ASN.1 SEQUENCE)."
+              echo "         Likely cause: the secret was pasted with line-wrapping or"
+              echo "         truncated. Re-encode locally with a single-line form:"
+              echo "             openssl base64 -A -in devid.p12 | pbcopy"
+              echo "         and replace the secret value."
+              exit 1
+          fi
+
+          # Create a brand-new keychain dedicated to this build. We
+          # do NOT touch the runner's login keychain because:
+          #   1. concurrent jobs on the same runner would race on it
+          #   2. the runner's login keychain is destroyed at job end
+          #      anyway, but a fresh keychain makes ownership obvious
+          #   3. set-key-partition-list on the login keychain would
+          #      prompt for the runner's interactive password
+          KEYCHAIN_PATH="$RUNNER_TEMP/luksbox-build.keychain-db"
+          security create-keychain -p "$MACOS_CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain    -p "$MACOS_CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Pre-verify the .p12 with OpenSSL BEFORE handing to
+          # `security import`. macOS's `security import` only accepts
+          # PKCS12 envelopes encrypted with the legacy PBES1 algorithm
+          # set (3DES); modern OpenSSL 3.x defaults to PBES2 (AES-256)
+          # which `security` rejects with a generic "MAC verification
+          # failed" that is identical to the wrong-password error.
+          # OpenSSL accepts both, so a successful OpenSSL verify here
+          # combined with a `security import` failure proves the
+          # .p12 is in the wrong format (re-export with `-legacy`).
+          # Also surfaces the password length so a hidden trailing
+          # newline / quote becomes visible without leaking the value.
+          PW_LEN=${#APPLE_DEVELOPER_ID_CERT_PASSWORD}
+          P12_SHA=$(shasum -a 256 "$P12_PATH" | awk '{print $1}')
+          echo "==> .p12 sha256: $P12_SHA"
+          echo "==> APPLE_DEVELOPER_ID_CERT_PASSWORD length: $PW_LEN chars"
+          if openssl pkcs12 -in "$P12_PATH" \
+              -password "pass:$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
+              -nokeys -noout 2>/dev/null
+          then
+              echo "==> OpenSSL pre-verify: .p12 + password OK"
+          else
+              echo "::error::OpenSSL pre-verify FAILED. The .p12 password"
+              echo "         does not match the .p12 file. Either:"
+              echo "           1. The APPLE_DEVELOPER_ID_CERT_PASSWORD secret"
+              echo "              contains hidden characters (trailing newline,"
+              echo "              quotes, leading whitespace), OR"
+              echo "           2. The .p12 was re-exported with a different"
+              echo "              password and the new one wasn't pushed to"
+              echo "              the GitHub secret yet."
+              echo "         Re-export locally and verify before re-uploading:"
+              echo "             openssl pkcs12 -export -legacy -out devid.p12 \\"
+              echo "                 -inkey devid.key -in devid.pem"
+              echo "             openssl pkcs12 -in devid.p12 \\"
+              echo "                 -password \"pass:THE_PASSWORD\" -nokeys -noout"
+              exit 1
+          fi
+
+          # Import .p12 into the new keychain. -A allows any tool to
+          # use the key (codesign needs this); -t cert + -f pkcs12
+          # tells security how to parse the input.
+          if ! security import "$P12_PATH" \
+              -P "$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
+              -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          then
+              echo "::error::OpenSSL accepted the .p12 + password, but macOS"
+              echo "         'security import' rejected it. This is the"
+              echo "         classic symptom of a PBES2 (AES-encrypted)"
+              echo "         PKCS12, which OpenSSL accepts but pre-Sonoma-14.4"
+              echo "         'security import' does not. Re-export the .p12"
+              echo "         with the legacy PBES1 algorithms:"
+              echo "             openssl pkcs12 -export -legacy \\"
+              echo "                 -out devid.p12 \\"
+              echo "                 -inkey devid.key -in devid.pem \\"
+              echo "                 -name 'Developer ID Application'"
+              echo "         Then re-encode + replace the secret:"
+              echo "             openssl base64 -A -in devid.p12 | pbcopy"
+              exit 1
+          fi
+
+          # Without this, codesign prompts the user (impossible on a
+          # CI runner) for permission to use the private key. The
+          # partition list grants programmatic access keyed to the
+          # keychain password we just set.
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$MACOS_CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Add to the search list so codesign and notarytool find the
+          # identity. Preserves whatever was already there (the runner's
+          # login keychain etc.) by appending rather than replacing.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" \
+            $(security list-keychains -d user | tr -d '" ' | tr '\n' ' ')
+
+          # Sanity: print the resolved signing identity. Should match
+          # "Developer ID Application: Sebastien Dudek (XXXXXXXXXX)".
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+          # Surface the keychain path for downstream codesign steps.
+          echo "MACOS_KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          rm -f "$P12_PATH"
 
       - name: Code-sign macOS .app (only if Apple cert was imported)
         # Gates on `MACOS_KEYCHAIN_PATH`, which the earlier
@@ -1630,7 +1675,7 @@ jobs:
             --hide-extension "LUKSbox.app" \
             --app-drop-link 450 150 \
             --no-internet-enable \
-            "${{ matrix.archive }}" \
+            "$ARCHIVE" \
             "dmg-root/" || {
               # create-dmg occasionally fails on CI runners with osascript
               # AppleEvent timeouts; fall back to a plain hdiutil .dmg
@@ -1640,9 +1685,9 @@ jobs:
               hdiutil create -volname "LUKSbox v${LUKSBOX_VERSION}" \
                 -srcfolder dmg-root \
                 -ov -format UDZO \
-                "${{ matrix.archive }}"
+                "$ARCHIVE"
             }
-          ls -lh "${{ matrix.archive }}"
+          ls -lh "$ARCHIVE"
 
       - name: Code-sign macOS .dmg (only if Apple cert was imported)
         # The .dmg itself must be signed for notarytool to accept it.
@@ -1666,8 +1711,8 @@ jobs:
           codesign --force --timestamp \
               --keychain "$MACOS_KEYCHAIN_PATH" \
               --sign "$IDENTITY" \
-              "${{ matrix.archive }}"
-          codesign --verify --verbose=2 "${{ matrix.archive }}"
+              "$ARCHIVE"
+          codesign --verify --verbose=2 "$ARCHIVE"
 
       - name: Notarize macOS .dmg (only if Apple secrets present)
         if: runner.os == 'macOS' && env.APPLE_NOTARY_USER != ''
@@ -1680,13 +1725,13 @@ jobs:
           # Submit + wait for Apple's verdict (usually <5 min). On
           # success, staple the ticket so the .dmg works offline (no
           # round-trip to Apple at first launch).
-          xcrun notarytool submit "${{ matrix.archive }}" \
+          xcrun notarytool submit "$ARCHIVE" \
             --apple-id "$APPLE_NOTARY_USER" \
             --password "$APPLE_NOTARY_PASSWORD" \
             --team-id "$APPLE_NOTARY_TEAM_ID" \
             --wait
-          xcrun stapler staple "${{ matrix.archive }}"
-          xcrun stapler validate "${{ matrix.archive }}"
+          xcrun stapler staple "$ARCHIVE"
+          xcrun stapler validate "$ARCHIVE"
 
       - name: Stage (Windows)
         if: runner.os == 'Windows'
@@ -1830,8 +1875,8 @@ jobs:
           )
           Set-Content -Path "staging\README-PORTABLE-WINDOWS.txt" -Value $readme
 
-          Compress-Archive -Path staging/* -DestinationPath "${{ matrix.archive }}"
-          Get-Item "${{ matrix.archive }}" | Format-List
+          Compress-Archive -Path staging/* -DestinationPath "$env:ARCHIVE"
+          Get-Item "$env:ARCHIVE" | Format-List
 
       - name: Set up MSVC dev environment (for dumpbin)
         # rustc finds link.exe via a baked-in MSVC search path so the
@@ -1841,7 +1886,7 @@ jobs:
         # vcvars64.bat and forwards the resulting PATH/INCLUDE/LIB into
         # subsequent steps via $GITHUB_ENV.
         if: runner.os == 'Windows'
-        uses: ilammy/msvc-dev-cmd@v1
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
         with:
           arch: x64
 
@@ -2049,9 +2094,10 @@ jobs:
                   $f
               & $signtool verify /pa /v $f
           }
+          Remove-Item -Force $pfx  # R15-J8: the decoded signing key must not outlive the step
           # Re-zip the .zip artifact since the .exe inside changed.
-          if (Test-Path "${{ matrix.archive }}") { Remove-Item "${{ matrix.archive }}" }
-          Compress-Archive -Path staging/* -DestinationPath "${{ matrix.archive }}"
+          if (Test-Path "$env:ARCHIVE") { Remove-Item "$env:ARCHIVE" }
+          Compress-Archive -Path staging/* -DestinationPath "$env:ARCHIVE"
 
       # ---- SignPath: sign the MSI via the trusted-build-system action --
       # SignPath's official GitHub Action is the trusted-build-system
@@ -2069,7 +2115,7 @@ jobs:
       - name: Upload unsigned MSI for SignPath
         id: upload_unsigned_msi
         if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unsigned-msi-${{ matrix.target }}
           path: ${{ env.MSI_PATH }}
@@ -2078,7 +2124,7 @@ jobs:
 
       - name: Sign MSI via SignPath
         if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
-        uses: signpath/github-action-submit-signing-request@v1
+        uses: signpath/github-action-submit-signing-request@ced31329c0317e779dad2eec2a7c3bb46ea1343e # v1
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
@@ -2125,7 +2171,9 @@ jobs:
           #      defense-in-depth against a compromised
           #      Authenticode chain. Empty = signature check only.
           WINFSP_VERSION:      "2.0.23075"
-          WINFSP_MSI_SHA256:   ""
+          # R15-J3: pin recorded from the upstream release asset
+          # (sha256 of winfsp-2.0.23075.msi).
+          WINFSP_MSI_SHA256:   "6324dc81194a6a08f97b6aeca303cf5c2325c53ede153bae9fc4378f0838c101"
         run: |
           $msi = "$env:RUNNER_TEMP\winfsp-bundled.msi"
           $url = "https://github.com/winfsp/winfsp/releases/download/v2.0/winfsp-$env:WINFSP_VERSION.msi"
@@ -2151,7 +2199,9 @@ jobs:
           # cert. CN-only match is fine, the cert is also EV-checked
           # implicitly via the Authenticode status above (a self-signed
           # cert with the same CN would have Status != Valid).
-          if ($subj -notmatch 'NAVIMATICS|Zissimopoulos|WinFsp') {
+          # R15-J3: anchor on the CN so "contains WinFsp somewhere in the
+          # subject" can no longer satisfy the check.
+          if ($subj -notmatch '(^|, )CN=(NAVIMATICS LLC|Bill Zissimopoulos|WinFsp)(,|$)') {
               throw "WinFsp MSI signed by unexpected party: $subj"
           }
 
@@ -2242,6 +2292,7 @@ jobs:
               /f $pfx /p $env:WINDOWS_PFX_PASSWORD `
               $env:BUNDLE_PATH
           & $signtool verify /pa /v $env:BUNDLE_PATH
+          Remove-Item -Force $pfx  # R15-J8
 
       # ---- SignPath: sign the Burn bundle via the trusted-build-system
       # action. Signed LAST, because the bundle's Authenticode signature
@@ -2253,7 +2304,7 @@ jobs:
       - name: Upload unsigned bundle for SignPath
         id: upload_unsigned_bundle
         if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unsigned-bundle-${{ matrix.target }}
           path: ${{ env.BUNDLE_PATH }}
@@ -2262,7 +2313,7 @@ jobs:
 
       - name: Sign bundle via SignPath
         if: runner.os == 'Windows' && env.SIGNPATH_ENABLED == 'true'
-        uses: signpath/github-action-submit-signing-request@v1
+        uses: signpath/github-action-submit-signing-request@ced31329c0317e779dad2eec2a7c3bb46ea1343e # v1
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
           organization-id: ${{ secrets.SIGNPATH_ORGANIZATION_ID }}
@@ -2312,7 +2363,7 @@ jobs:
 
       - name: Upload Windows MSI
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           # Distinct artifact name so it doesn't collide with the .zip
           # uploaded under matrix.target below. The release job's
@@ -2325,7 +2376,7 @@ jobs:
 
       - name: Upload Windows Burn bundle
         if: runner.os == 'Windows'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           # Separate artifact so the release job can list both
           # .msi (admin path) and -setup.exe (default user path).
@@ -2336,7 +2387,7 @@ jobs:
 
       - name: Upload macOS portable tarball
         if: runner.os == 'macOS'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           # Distinct artifact name so it doesn't collide with the .dmg
           # uploaded under the generic step below. The release job's
@@ -2351,7 +2402,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           # The artifact NAME is the transport key the release job
           # de-duplicates on (download-artifact merge-multiple keeps a
@@ -2368,15 +2419,38 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Delete CI signing keychain (macOS)
+        if: always() && runner.os == 'macOS' && env.MACOS_KEYCHAIN_PATH != ''
+        shell: bash
+        run: |
+          # R15-J1: the Developer ID key lives only in this throwaway
+          # keychain; make sure it is gone before the runner is reused by
+          # any later step or job, on success and on failure alike.
+          security delete-keychain "$MACOS_KEYCHAIN_PATH" || true
+
   release:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write       # to create the release + upload assets
+      # The two scopes below enable GitHub Artifact Attestations
+      # (Sigstore-backed). actions/attest-build-provenance asks for an
+      # OIDC token from GitHub (`id-token: write`) so it can prove the
+      # signing call came from this workflow run, then registers the
+      # attestation against the artifact (`attestations: write`).
+      # Anyone can verify with `gh attestation verify <artifact>
+      # --owner penthertz`. No keys to manage on our side; signing
+      # identity is short-lived per run and pinned to the commit SHA.
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           merge-multiple: true
@@ -2427,7 +2501,7 @@ jobs:
         # We attest both the binary artifacts and SHA256SUMS.txt so a
         # user who only downloads the manifest still has a signed
         # provenance chain.
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
         with:
           subject-path: 'artifacts/*'
 
@@ -2443,7 +2517,7 @@ jobs:
         # run page) are still produced for testing and ARE downloadable
         # by maintainers from the run page.
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: artifacts/*
           generate_release_notes: true

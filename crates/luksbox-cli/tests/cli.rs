@@ -16,6 +16,9 @@ fn run(dir: &Path, args: &[&str]) -> Output {
         .current_dir(dir)
         .env("LUKSBOX_TEST_FAST_KDF", "1")
         .env("LUKSBOX_PASSPHRASE", "pw")
+        // R15-H1: the unlock variable is no longer reused as the NEW secret
+        // by `enroll` / `update`; tests that add slots supply it explicitly.
+        .env("LUKSBOX_NEW_PASSPHRASE", "pw")
         .output()
         .expect("spawn binary")
 }
