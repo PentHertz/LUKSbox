@@ -120,7 +120,10 @@ Follow-up fixes for two items the Round 15 report had left tracked:
   way as a Cancel. The GUI now detects it, says what failed, and offers a
   "type the path" box for mounting, adding and extracting files.
   `LUKSBOX_GUI_TYPED_PATHS=1` skips the system dialog altogether, and
-  the dialog library's errors now reach stderr.
+  the dialog library's errors now reach stderr. The `.deb` and `.rpm`
+  now list `zenity` as a recommended package, so a standard install has
+  the fallback dialog (installing it is what fixed the reporter's
+  machine).
 - **GUI vault browser.** Folder and file icons; folders listed first.
   Drag files or whole folders from the system file manager onto the
   browser to encrypt them into the current folder (Windows, macOS and

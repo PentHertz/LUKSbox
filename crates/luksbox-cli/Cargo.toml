@@ -199,7 +199,12 @@ depends = "$auto"
 # back in for the new group to take effect. We do NOT do this
 # automatically (Debian convention: no silent privileged-group
 # membership changes in a postinst).
-recommends = "fuse3, tpm-udev, tpm2-tools"
+# zenity: luksbox-gui's fallback file dialog when the XDG desktop
+# portal file chooser fails (issue #35: on GNOME the portal chooser is
+# Nautilus-backed and, without zenity, a portal failure left Browse /
+# Mount / Download doing nothing). Recommends, not Depends, so CLI-only
+# installs can skip it with --no-install-recommends.
+recommends = "fuse3, tpm-udev, tpm2-tools, zenity"
 assets = [
     # Binaries. The literal `target/release/` prefix is a cargo-deb
     # sentinel: it auto-rewrites to `target/<triple>/<profile>/<bin>`
@@ -282,7 +287,10 @@ vendor = "Penthertz"
 # error - the "string or integer" refers to the version-constraint
 # *value* inside the expected map, not the field itself. `"*"` means
 # "no version constraint" (any version satisfies).
-recommends = { tpm2-tss = "*", tpm2-tools = "*" }
+# zenity: luksbox-gui's fallback file dialog when the XDG desktop
+# portal file chooser fails (issue #35). Weak dependency, so
+# `dnf install --setopt=install_weak_deps=False` skips it.
+recommends = { tpm2-tss = "*", tpm2-tools = "*", zenity = "*" }
 assets = [
     # Same sentinel convention as cargo-deb above: cargo-generate-rpm
     # rewrites `target/release/<bin>` to the real `target/<triple>/<profile>/<bin>`
