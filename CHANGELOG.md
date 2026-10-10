@@ -121,6 +121,27 @@ Follow-up fixes for two items the Round 15 report had left tracked:
   "type the path" box for mounting, adding and extracting files.
   `LUKSBOX_GUI_TYPED_PATHS=1` skips the system dialog altogether, and
   the dialog library's errors now reach stderr.
+- **GUI vault browser.** Folder and file icons; folders listed first.
+  Drag files or whole folders from the system file manager onto the
+  browser to encrypt them into the current folder (Windows, macOS and
+  X11; winit does not deliver file drops to native Wayland windows).
+  Folders are imported recursively, symlinks are skipped and reported
+  rather than followed, and a name that already exists stops the import
+  instead of being merged or overwritten. Drag a row onto a folder, or
+  onto "parent dir", to move it. Rename happens in place (right-click >
+  Rename, or F2 on the selected row; Enter applies, Esc cancels), with
+  the extension left out of the initial selection. Right-click on a row
+  also offers Move to parent folder; right-click on the empty area
+  offers New folder, Add file and Refresh. Enter opens the selected
+  folder.
+- GUI: renaming an entry, or moving one into a folder, onto the name of
+  an existing file silently replaced that file (POSIX `rename`
+  semantics). Both are now refused with an "already exists" error.
+- GUI recent list: right-clicking a vault now offers "Delete vault..."
+  next to "Forget from history...", opening the confirm dialog worded
+  for deleting (the X button's dialog already had the delete option).
+  The dialog no longer offers to delete the vault that is currently
+  open, mounted or busy in LUKSbox; it asks you to lock it first.
 - **macOS FUSE-T: `luksbox mount` now daemonizes**, as `--help` always
   said and as the libfuse backend does. It used to stay in the
   foreground and hold the caller's stdout open until unmount, hanging

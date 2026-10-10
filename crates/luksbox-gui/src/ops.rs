@@ -5056,20 +5056,142 @@ pub fn put_file(vfs: &mut Vfs, local: &Path, inner: &str) -> Result<u64, String>
     if vfs.lookup(parent, &name).is_ok() {
         return Err(format!("{inner} already exists"));
     }
-    let f = vfs.create(parent, &name).map_err(estr)?;
-    let mut src = File::open(local).map_err(estr)?;
+    let n = copy_file_in(vfs, parent, &name, local)?;
+    vfs.flush().map_err(estr)?;
+    Ok(n)
+}
+
+/// Encrypt `local` into a new file `name` under `parent`. On a read or
+/// write error the half-written vault file is removed again, so a
+/// failed import never leaves a truncated copy behind. Does not flush.
+fn copy_file_in(
+    vfs: &mut Vfs,
+    parent: luksbox_vfs::FileId,
+    name: &str,
+    local: &Path,
+) -> Result<u64, String> {
+    let mut src = File::open(local).map_err(|e| format!("{}: {e}", local.display()))?;
+    let f = vfs.create(parent, name).map_err(estr)?;
     let mut buf = vec![0u8; 64 * 1024];
     let mut offset = 0u64;
-    loop {
-        let n = src.read(&mut buf).map_err(estr)?;
-        if n == 0 {
-            break;
+    let copied = (|| {
+        loop {
+            let n = src
+                .read(&mut buf)
+                .map_err(|e| format!("{}: {e}", local.display()))?;
+            if n == 0 {
+                return Ok(offset);
+            }
+            vfs.write(f, offset, &buf[..n]).map_err(estr)?;
+            offset += n as u64;
         }
-        vfs.write(f, offset, &buf[..n]).map_err(estr)?;
-        offset += n as u64;
+    })();
+    if copied.is_err() {
+        let _ = vfs.unlink(parent, name);
     }
-    vfs.flush().map_err(estr)?;
-    Ok(offset)
+    copied
+}
+
+/// Result of [`put_paths`]. `error` is the failure that stopped the
+/// import, if any; everything counted before it is in the vault.
+#[derive(Debug, Default)]
+pub struct PutSummary {
+    pub files: u64,
+    pub dirs: u64,
+    pub bytes: u64,
+    /// Local entries left out: symlinks (never followed, so a link
+    /// cannot pull in files from outside the dropped tree or loop),
+    /// sockets, FIFOs and device nodes.
+    pub skipped: Vec<PathBuf>,
+    pub error: Option<String>,
+}
+
+/// Import local files and folders (e.g. dropped onto the browser)
+/// into the vault directory `inner_dir`. Folders are copied
+/// recursively. A name that already exists in the vault stops the
+/// import rather than being merged or overwritten. The vault is
+/// flushed once at the end, also after an error, so what the summary
+/// reports as imported is what is on disk.
+pub fn put_paths(vfs: &mut Vfs, locals: &[PathBuf], inner_dir: &str) -> PutSummary {
+    let mut sum = PutSummary::default();
+    let r = vfs.lookup_path(inner_dir).map_err(estr).and_then(|parent| {
+        locals
+            .iter()
+            .try_for_each(|local| put_tree(vfs, parent, local, &mut sum))
+    });
+    let flushed = vfs.flush().map_err(estr);
+    sum.error = r.and(flushed).err();
+    sum
+}
+
+fn put_tree(
+    vfs: &mut Vfs,
+    parent: luksbox_vfs::FileId,
+    local: &Path,
+    sum: &mut PutSummary,
+) -> Result<(), String> {
+    let name = local
+        .file_name()
+        .ok_or_else(|| format!("{}: no file name", local.display()))?
+        .to_string_lossy()
+        .into_owned();
+    let ft = std::fs::symlink_metadata(local)
+        .map_err(|e| format!("{}: {e}", local.display()))?
+        .file_type();
+    if !ft.is_dir() && !ft.is_file() {
+        sum.skipped.push(local.to_path_buf());
+        return Ok(());
+    }
+    if vfs.lookup(parent, &name).is_ok() {
+        return Err(format!("{name} already exists in the vault folder"));
+    }
+    if ft.is_file() {
+        sum.bytes += copy_file_in(vfs, parent, &name, local)?;
+        sum.files += 1;
+        return Ok(());
+    }
+    let dir = vfs.mkdir(parent, &name).map_err(estr)?;
+    sum.dirs += 1;
+    let mut children = std::fs::read_dir(local)
+        .and_then(|rd| {
+            rd.map(|e| e.map(|e| e.path()))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .map_err(|e| format!("{}: {e}", local.display()))?;
+    children.sort();
+    children
+        .iter()
+        .try_for_each(|child| put_tree(vfs, dir, child, sum))
+}
+
+/// Move `name` from the vault directory `from_dir` into `to_dir`,
+/// keeping its name. Refuses to replace an entry of the same name in
+/// the destination (`Vfs::rename` would, POSIX-style).
+pub fn move_entry(vfs: &mut Vfs, from_dir: &str, name: &str, to_dir: &str) -> Result<(), String> {
+    let from = vfs.lookup_path(from_dir).map_err(estr)?;
+    let to = vfs.lookup_path(to_dir).map_err(estr)?;
+    if from == to {
+        return Ok(());
+    }
+    if vfs.lookup(to, name).is_ok() {
+        return Err(format!("{name} already exists in {to_dir}"));
+    }
+    vfs.rename(from, name, to, name).map_err(estr)?;
+    vfs.flush().map_err(estr)
+}
+
+/// Rename `old` to `new` inside the vault directory `dir`. Refuses to
+/// replace an existing entry called `new`.
+pub fn rename_entry(vfs: &mut Vfs, dir: &str, old: &str, new: &str) -> Result<(), String> {
+    let parent = vfs.lookup_path(dir).map_err(estr)?;
+    if old == new {
+        return Ok(());
+    }
+    if vfs.lookup(parent, new).is_ok() {
+        return Err(format!("{new} already exists"));
+    }
+    vfs.rename(parent, old, parent, new).map_err(estr)?;
+    vfs.flush().map_err(estr)
 }
 
 /// Recursively extract `inner` (must be a directory) into `local`. Creates
@@ -7594,4 +7716,138 @@ pub fn enroll_hybrid_pq_fido2_deniable(
     _kem_size: u16,
 ) -> Result<usize, String> {
     Err("deniable FIDO2 + ML-KEM enroll requires --features hardware".into())
+}
+
+#[cfg(test)]
+mod browser_ops_tests {
+    use super::{copy_file_in, move_entry, put_paths, rename_entry};
+    use luksbox_core::{Argon2idParams, CipherSuite};
+    use luksbox_format::{Container, UnlockMaterial};
+    use luksbox_vfs::Vfs;
+    use std::path::Path;
+
+    const PASS: &[u8] = b"browser ops test";
+    const KDF: Argon2idParams = Argon2idParams {
+        m_cost_kib: 8,
+        t_cost: 1,
+        p_cost: 1,
+    };
+
+    fn new_vfs(dir: &Path) -> Vfs {
+        let cont = Container::create_with_passphrase_flags(
+            &dir.join("v.lbx"),
+            None,
+            CipherSuite::Aes256Gcm,
+            KDF,
+            0,
+            PASS,
+        )
+        .unwrap();
+        Vfs::open(cont).unwrap()
+    }
+
+    fn read_all(vfs: &mut Vfs, path: &str) -> Vec<u8> {
+        let id = vfs.lookup_path(path).unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = vfs.read(id, 0, &mut buf).unwrap();
+        buf.truncate(n);
+        buf
+    }
+
+    #[test]
+    fn put_paths_imports_files_and_folders_recursively() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        std::fs::create_dir_all(src.join("photos/2026")).unwrap();
+        std::fs::write(src.join("photos/a.jpg"), b"aaa").unwrap();
+        std::fs::write(src.join("photos/2026/b.jpg"), b"bbbb").unwrap();
+        std::fs::write(src.join("notes.txt"), b"hello").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("/etc/passwd", src.join("photos/link")).unwrap();
+
+        let mut vfs = new_vfs(tmp.path());
+        let sum = put_paths(&mut vfs, &[src.join("photos"), src.join("notes.txt")], "/");
+        assert!(sum.error.is_none(), "{:?}", sum.error);
+        assert_eq!((sum.files, sum.dirs, sum.bytes), (3, 2, 12));
+        assert_eq!(read_all(&mut vfs, "/photos/2026/b.jpg"), b"bbbb");
+        assert_eq!(read_all(&mut vfs, "/notes.txt"), b"hello");
+        #[cfg(unix)]
+        {
+            // The symlink is reported, not followed.
+            assert_eq!(sum.skipped, vec![src.join("photos/link")]);
+            assert!(vfs.lookup_path("/photos/link").is_err());
+        }
+    }
+
+    #[test]
+    fn put_paths_stops_on_existing_name_and_keeps_earlier_imports() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = tmp.path().join("a.txt");
+        let b = tmp.path().join("b.txt");
+        std::fs::write(&a, b"new a").unwrap();
+        std::fs::write(&b, b"new b").unwrap();
+        let mut vfs = new_vfs(tmp.path());
+        let root = vfs.lookup_path("/").unwrap();
+        let id = vfs.create(root, "b.txt").unwrap();
+        vfs.write(id, 0, b"old b").unwrap();
+
+        let sum = put_paths(&mut vfs, &[a.clone(), b.clone()], "/");
+        assert!(sum.error.unwrap().contains("b.txt already exists"));
+        assert_eq!(sum.files, 1);
+        // The clash neither overwrote nor merged the existing file.
+        assert_eq!(read_all(&mut vfs, "/b.txt"), b"old b");
+        drop(vfs);
+
+        // a.txt was flushed despite the error.
+        let cont = Container::open(
+            &tmp.path().join("v.lbx"),
+            None,
+            UnlockMaterial::Passphrase(PASS),
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        assert_eq!(read_all(&mut vfs, "/a.txt"), b"new a");
+    }
+
+    #[test]
+    fn failed_copy_leaves_no_partial_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vfs = new_vfs(tmp.path());
+        let root = vfs.lookup_path("/").unwrap();
+        // Reading a directory as a file fails (EISDIR on Unix, the open
+        // itself on Windows).
+        assert!(copy_file_in(&mut vfs, root, "x", tmp.path()).is_err());
+        assert!(vfs.lookup(root, "x").is_err());
+    }
+
+    #[test]
+    fn move_and_rename_refuse_to_replace_existing_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vfs = new_vfs(tmp.path());
+        let root = vfs.lookup_path("/").unwrap();
+        let docs = vfs.mkdir(root, "docs").unwrap();
+        for (parent, name, body) in [
+            (root, "a.txt", &b"root a"[..]),
+            (root, "b.txt", b"root b"),
+            (docs, "a.txt", b"docs a"),
+        ] {
+            let id = vfs.create(parent, name).unwrap();
+            vfs.write(id, 0, body).unwrap();
+        }
+
+        assert!(move_entry(&mut vfs, "/", "a.txt", "/docs").is_err());
+        assert!(rename_entry(&mut vfs, "/", "a.txt", "b.txt").is_err());
+        assert_eq!(read_all(&mut vfs, "/docs/a.txt"), b"docs a");
+        assert_eq!(read_all(&mut vfs, "/b.txt"), b"root b");
+
+        move_entry(&mut vfs, "/", "b.txt", "/docs").unwrap();
+        assert_eq!(read_all(&mut vfs, "/docs/b.txt"), b"root b");
+        rename_entry(&mut vfs, "/docs", "b.txt", "c.txt").unwrap();
+        assert_eq!(read_all(&mut vfs, "/docs/c.txt"), b"root b");
+        // A folder cannot be moved into itself or a descendant.
+        vfs.mkdir(docs, "sub").unwrap();
+        assert!(move_entry(&mut vfs, "/", "docs", "/docs").is_err());
+        assert!(move_entry(&mut vfs, "/", "docs", "/docs/sub").is_err());
+        assert!(vfs.lookup_path("/docs/c.txt").is_ok());
+    }
 }

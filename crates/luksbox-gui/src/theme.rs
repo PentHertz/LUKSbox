@@ -17,6 +17,9 @@ pub const ACCENT: Color32 = Color32::from_rgb(0x6a, 0xa3, 0xff);
 pub const OK: Color32 = Color32::from_rgb(0x56, 0xd3, 0x97);
 pub const WARN: Color32 = Color32::from_rgb(0xff, 0xb4, 0x54);
 pub const DANGER: Color32 = Color32::from_rgb(0xff, 0x6f, 0x6f);
+/// Folder icon in the vault browser (body and tab).
+pub const FOLDER: Color32 = Color32::from_rgb(0x5a, 0x8f, 0xe6);
+pub const FOLDER_TAB: Color32 = Color32::from_rgb(0x3f, 0x6a, 0xb8);
 
 pub fn install(ctx: &egui::Context) {
     // Force LUKSbox to use the dark theme slot regardless of the OS

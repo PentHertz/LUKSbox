@@ -823,6 +823,9 @@ enum EmptyPassphraseTarget {
 struct ForgetRecentState {
     path: PathBuf,
     related: Vec<(PathBuf, bool)>,
+    /// Opened from "Delete vault..." rather than the X / "Forget": same
+    /// choices, worded and ordered for deleting.
+    delete: bool,
 }
 
 /// State for the 3-factor "Add hybrid TPM + FIDO2 + ML-KEM" modal.
@@ -953,6 +956,11 @@ enum Pending {
         rx: Receiver<VaultRet<u64>>,
         name: String,
     },
+    /// Files / folders dropped onto the browser, imported into `dest`.
+    PutPaths {
+        rx: Receiver<(OpenedVault, ops::PutSummary)>,
+        dest: String,
+    },
     GetFile {
         rx: Receiver<VaultRet<u64>>,
     },
@@ -1054,6 +1062,7 @@ impl Pending {
                 ..
             } => format!("creating vault + sealing under the local {slot_label}..."),
             Pending::PutFile { .. } => "encrypting file...".to_string(),
+            Pending::PutPaths { .. } => "encrypting the dropped files...".to_string(),
             Pending::GetFile { .. } => "decrypting...".to_string(),
             Pending::EnrollPassphrase { .. } => {
                 "stretching passphrase with Argon2id...".to_string()
@@ -1201,6 +1210,10 @@ pub struct LuksboxApp {
     /// Triggers the confirm-forget modal. The path is the recent
     /// entry to remove; cleared on Cancel or after Forget runs.
     pending_forget_recent: Option<ForgetRecentState>,
+    /// Path of the vault this window has open, kept while a worker
+    /// thread or the mount holds it (`vault` is `None` then). The
+    /// recent list refuses to delete that file.
+    active_vault_path: Option<PathBuf>,
     /// When true, the next `start_mount_picker` invocation passes
     /// `sync_mode = true` to `luksbox_mount::mount`, restoring the
     /// pre-v0.2.2 eager-flush semantics for this mount session.
@@ -1268,6 +1281,8 @@ pub struct LuksboxApp {
     rotate_modal: Option<RotateForm>,
     mkdir_input: Option<String>,
     rename_target: Option<RenameTarget>,
+    /// Highlighted row of the vault browser (entry name in `cwd`).
+    browser_selected: Option<String>,
     mount_status: Option<MountStatus>,
     /// A file/folder picker running on a background thread. Some rfd
     /// dialogs (notably `save_file()` on Wayland with broken
@@ -1501,13 +1516,44 @@ enum PickerTarget {
     AddHybridKyber,
 }
 
-/// In-flight rename. The user picked a row; we keep the original name
-/// (so we can call `vfs.rename(parent, old, parent, new)` -- same-dir
-/// rename only from this entry point) and a buffer the modal binds to.
+/// In-flight inline rename of a browser row. We keep the original name
+/// (same-dir rename only from this entry point) and the buffer the
+/// row's text field binds to.
 struct RenameTarget {
     old_name: String,
     buf: String,
-    is_dir: bool,
+    /// Set until the text field has been focused once, with the first
+    /// `select_end` characters (the name minus its extension, or a
+    /// whole folder name) pre-selected.
+    focus_pending: bool,
+    select_end: usize,
+}
+
+/// Drag-and-drop payload of a browser row being dragged onto a folder.
+struct DragEntry {
+    from_dir: String,
+    name: String,
+    kind: InodeKind,
+}
+
+/// What a browser row (or the empty area below them) asked for this
+/// frame. Applied after the list is drawn so `self.listing` is never
+/// mutated while it is being iterated.
+enum BrowserAction {
+    Select(Option<String>),
+    Open(String),
+    Download(String),
+    DownloadDir(String),
+    Rename(String),
+    Delete(String, bool),
+    Move {
+        from_dir: String,
+        name: String,
+        to_dir: String,
+    },
+    NewFolder,
+    AddFile,
+    Refresh,
 }
 
 /// Live FUSE/WinFsp mount. While present, the Vfs has been moved
@@ -1686,6 +1732,7 @@ impl LuksboxApp {
             tested_size_advisory_shown: false,
             recovery_report: None,
             pending_forget_recent: None,
+            active_vault_path: None,
             mount_sync_mode: false,
             passgen_dialog: None,
             add_passphrase_modal: None,
@@ -1703,6 +1750,7 @@ impl LuksboxApp {
             rotate_modal: None,
             mkdir_input: None,
             rename_target: None,
+            browser_selected: None,
             mount_status: None,
             pending_picker: None,
             confirm_lock: None,
@@ -1898,6 +1946,15 @@ impl LuksboxApp {
     }
 
     fn refresh_listing(&mut self) {
+        self.load_listing();
+        if let Some(sel) = &self.browser_selected
+            && !self.listing.iter().any(|e| &e.name == sel)
+        {
+            self.browser_selected = None;
+        }
+    }
+
+    fn load_listing(&mut self) {
         self.listing.clear();
         self.listing_err = None;
         let Some(v) = self.vault.as_mut() else {
@@ -1906,7 +1963,12 @@ impl LuksboxApp {
         match v.vfs.lookup_path(&self.cwd) {
             Ok(id) => match v.vfs.readdir(id) {
                 Ok(mut entries) => {
-                    entries.sort_by(|a, b| a.name.cmp(&b.name));
+                    // Folders first, then by name, like file managers.
+                    entries.sort_by(|a, b| {
+                        (a.kind != InodeKind::Directory)
+                            .cmp(&(b.kind != InodeKind::Directory))
+                            .then_with(|| a.name.cmp(&b.name))
+                    });
                     for ent in entries {
                         let st = match v.vfs.stat(ent.id) {
                             Ok(s) => s,
@@ -2033,6 +2095,13 @@ impl eframe::App for LuksboxApp {
             self.request_unmount();
         }
         self.poll_picker();
+        if let Some(v) = &self.vault {
+            if self.active_vault_path.as_deref() != Some(v.vault_path.as_path()) {
+                self.active_vault_path = Some(v.vault_path.clone());
+            }
+        } else if self.pending.is_none() && self.mount_status.is_none() {
+            self.active_vault_path = None;
+        }
         // Clipboard auto-clear runs on every frame because the deadline
         // can elapse between paints. `tick_clipboard_guard` is a no-op
         // when no guard is active.
@@ -2291,6 +2360,41 @@ impl LuksboxApp {
                     self.pending = Some(Pending::PutFile { rx, name });
                 }
                 Err(_) => self.toast_err("put task crashed"),
+            },
+            Pending::PutPaths { rx, dest } => match rx.try_recv() {
+                Ok((vault, sum)) => {
+                    self.vault = Some(vault);
+                    let mut done = format!(
+                        "added {} file{} ({})",
+                        sum.files,
+                        if sum.files == 1 { "" } else { "s" },
+                        format_size(sum.bytes)
+                    );
+                    if sum.dirs > 0 {
+                        done.push_str(&format!(
+                            " in {} folder{}",
+                            sum.dirs,
+                            if sum.dirs == 1 { "" } else { "s" }
+                        ));
+                    }
+                    let dest = ops::display_name(&dest);
+                    match sum.error {
+                        Some(e) => self.toast_err(format!("{e}; {done} to {dest} before that")),
+                        None => self.toast_ok(format!("{done} to {dest}")),
+                    }
+                    if !sum.skipped.is_empty() {
+                        self.toast_warn(format!(
+                            "skipped {} symlink(s) or special file(s) (not followed), e.g. {}",
+                            sum.skipped.len(),
+                            sum.skipped[0].display()
+                        ));
+                    }
+                    self.refresh_listing();
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Pending::PutPaths { rx, dest });
+                }
+                Err(_) => self.toast_err("import task crashed"),
             },
             Pending::GetFile { rx } => match rx.try_recv() {
                 Ok((vault, result)) => {
@@ -2794,6 +2898,7 @@ impl LuksboxApp {
         // recent entry per repaint, only about 20 entries max, so OK.
         let missing = !r.path.is_file();
         let mut want_forget = false;
+        let mut want_delete = false;
         let mut want_open = false;
 
         // Layout for the row, plus the dual click handling:
@@ -2957,10 +3062,21 @@ impl LuksboxApp {
             want_open = true;
         }
 
-        // Right-click anywhere on the row opens the forget modal.
+        // Right-click anywhere on the row: forget, or delete the files.
+        // Both open the confirm modal below.
         bg_resp.context_menu(|ui| {
-            if ui.button("Forget this vault from history...").clicked() {
+            if ui.button("Forget from history...").clicked() {
                 want_forget = true;
+                ui.close();
+            }
+            if ui
+                .button(RichText::new("Delete vault...").color(theme::DANGER))
+                .on_hover_text(
+                    "Delete the .lbx file (and, if you tick them, its related files) from disk",
+                )
+                .clicked()
+            {
+                want_delete = true;
                 ui.close();
             }
         });
@@ -2978,7 +3094,7 @@ impl LuksboxApp {
         // first below so the open path doesn't double-fire. Clicking
         // a missing entry surfaces a toast explaining the situation
         // rather than a cryptic Container::open failure later.
-        if want_open && !want_forget {
+        if want_open && !want_forget && !want_delete {
             if missing {
                 self.toast_warn(format!(
                     "{} no longer exists, click x to forget it.",
@@ -2988,7 +3104,7 @@ impl LuksboxApp {
                 self.request_navigate(NavigateAction::OpenRecent(r.clone()));
             }
         }
-        if want_forget {
+        if want_forget || want_delete {
             // Route through the confirm-forget modal instead of
             // forgetting immediately. The modal both confirms the
             // click (so users get visual feedback that the button
@@ -2997,6 +3113,7 @@ impl LuksboxApp {
             self.pending_forget_recent = Some(ForgetRecentState {
                 path: r.path.clone(),
                 related: ops::related_vault_files(&r.path),
+                delete: want_delete,
             });
         }
         ui.add_space(4.0);
@@ -7053,154 +7170,300 @@ impl LuksboxApp {
             ui.colored_label(theme::DANGER, e);
         }
 
-        // Breadcrumb / parent-up
-        if self.cwd != "/" {
-            if ui
-                .button(RichText::new("< parent dir").color(theme::DIM))
-                .clicked()
-            {
-                let parent = parent_path(&self.cwd);
-                self.cwd = parent;
-                self.refresh_listing();
+        // Files and folders dragged in from the system file manager are
+        // imported into the current folder. winit delivers OS drops on
+        // Windows, macOS and X11 (not to native Wayland windows).
+        let (os_drag_hover, dropped) = ui.ctx().input(|i| {
+            (
+                !i.raw.hovered_files.is_empty(),
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+        });
+        if !dropped.is_empty() {
+            self.import_paths(dropped);
+        }
+
+        let cwd = self.cwd.clone();
+        let mut actions: Vec<BrowserAction> = Vec::new();
+
+        // Parent-up. Also a drop target: dropping a dragged row on it
+        // moves that entry one level up.
+        if cwd != "/" {
+            let parent = parent_path(&cwd);
+            let resp = ui.button(RichText::new("< parent dir").color(theme::DIM));
+            if resp.dnd_hover_payload::<DragEntry>().is_some() {
+                ui.painter().rect_stroke(
+                    resp.rect.expand(2.0),
+                    CornerRadius::same(6),
+                    Stroke::new(1.5_f32, theme::ACCENT),
+                    egui::StrokeKind::Outside,
+                );
+            }
+            if let Some(p) = resp.dnd_release_payload::<DragEntry>() {
+                actions.push(BrowserAction::Move {
+                    from_dir: p.from_dir.clone(),
+                    name: p.name.clone(),
+                    to_dir: parent,
+                });
+            } else if resp.clicked() {
+                actions.push(BrowserAction::Open(parent));
             }
             ui.add_space(8.0);
         }
 
-        Frame::new()
+        let entries = self.listing.clone();
+        let selected = self.browser_selected.clone();
+        let show_empty_hint = entries.is_empty() && self.listing_err.is_none();
+        let mut rename = self.rename_target.take();
+        let mut rename_row_seen = false;
+        // Some(true): apply the inline rename; Some(false): Esc.
+        let mut rename_done: Option<bool> = None;
+        let panel = Frame::new()
             .fill(theme::PANEL)
-            .stroke(Stroke::new(1.0, theme::BORDER))
+            .stroke(Stroke::new(1.0_f32, theme::BORDER))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(0)
             .show(ui, |ui| {
-                if self.listing.is_empty() && self.listing_err.is_none() {
-                    ui.add_space(40.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("Empty directory").color(theme::FAINT));
-                    });
-                    ui.add_space(40.0);
-                    return;
-                }
-                let entries = self.listing.clone();
-                let mut nav_into: Option<String> = None;
-                let mut do_download: Option<String> = None;
-                let mut do_download_dir: Option<String> = None;
-                let mut do_rename: Option<(String, bool)> = None;
-                let mut do_delete: Option<(String, bool)> = None;
                 ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
                         for ent in &entries {
-                            let resp = Frame::new()
-                                .inner_margin(Margin::symmetric(16, 8))
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        let icon = if ent.kind == InodeKind::Directory {
-                                            "[D]"
-                                        } else {
-                                            "[ ]"
-                                        };
-                                        ui.label(RichText::new(icon).size(15.0));
-                                        ui.label(
-                                            RichText::new(ops::display_name(&ent.name))
-                                                .strong()
-                                                .color(theme::TEXT),
-                                        );
-                                        ui.with_layout(
-                                            Layout::right_to_left(Align::Center),
-                                            |ui| {
-                                                if ent.kind == InodeKind::File {
-                                                    ui.label(
-                                                        RichText::new(format_size(ent.size))
-                                                            .color(theme::FAINT)
-                                                            .small(),
-                                                    );
-                                                }
-                                            },
-                                        );
-                                    });
-                                })
-                                .response
-                                .interact(egui::Sense::click());
-
-                            // Right-click context menu, replaces the per-row buttons.
-                            resp.context_menu(|ui| {
-                                match ent.kind {
-                                    InodeKind::Directory => {
-                                        if ui.button("Open").clicked() {
-                                            nav_into = Some(ent.name.clone());
-                                            ui.close();
-                                        }
-                                        if ui
-                                            .button("Download (recursive)...")
-                                            .on_hover_text(
-                                                "Recursively extract this folder \
-                                             and everything inside it to disk.",
-                                            )
-                                            .clicked()
-                                        {
-                                            do_download_dir = Some(ent.name.clone());
-                                            ui.close();
-                                        }
-                                    }
-                                    InodeKind::File => {
-                                        if ui.button("Download...").clicked() {
-                                            do_download = Some(ent.name.clone());
-                                            ui.close();
-                                        }
-                                    }
-                                    InodeKind::Symlink => {
-                                        // Symlinks: no extract action
-                                        // (the target is a vault-
-                                        // internal path, not file
-                                        // bytes). Rename + delete
-                                        // still appear below.
-                                    }
-                                }
-                                if ui.button("Rename...").clicked() {
-                                    do_rename =
-                                        Some((ent.name.clone(), ent.kind == InodeKind::Directory));
-                                    ui.close();
-                                }
-                                ui.separator();
-                                if ui
-                                    .button(RichText::new("Delete").color(theme::DANGER))
-                                    .clicked()
-                                {
-                                    do_delete =
-                                        Some((ent.name.clone(), ent.kind == InodeKind::Directory));
-                                    ui.close();
-                                }
-                            });
-
-                            // Double-click to open dirs (left-click). Standard
-                            // file-manager pattern; right-click also offers Open.
-                            if ent.kind == InodeKind::Directory && resp.double_clicked() {
-                                nav_into = Some(ent.name.clone());
+                            let row_rename = rename.as_mut().filter(|rt| rt.old_name == ent.name);
+                            rename_row_seen |= row_rename.is_some();
+                            let is_selected = selected.as_deref() == Some(ent.name.as_str());
+                            if let Some(done) = draw_browser_row(
+                                ui,
+                                &cwd,
+                                ent,
+                                is_selected,
+                                row_rename,
+                                &mut actions,
+                            ) {
+                                rename_done = Some(done);
+                            }
+                        }
+                        // The empty area below the rows: clears the
+                        // selection on click, offers the folder-level
+                        // actions on right-click.
+                        let h =
+                            ui.available_height()
+                                .max(if show_empty_hint { 160.0 } else { 48.0 });
+                        let (rect, bg) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), h),
+                            egui::Sense::click(),
+                        );
+                        if show_empty_hint {
+                            ui.painter().text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                "Empty folder. Drop files here, or right-click for actions.",
+                                egui::FontId::proportional(14.0),
+                                theme::FAINT,
+                            );
+                        }
+                        if bg.clicked() {
+                            actions.push(BrowserAction::Select(None));
+                        }
+                        bg.context_menu(|ui| {
+                            if ui.button("New folder...").clicked() {
+                                actions.push(BrowserAction::NewFolder);
+                                ui.close();
+                            }
+                            if ui.button("Add file...").clicked() {
+                                actions.push(BrowserAction::AddFile);
+                                ui.close();
                             }
                             ui.separator();
-                        }
+                            if ui.button("Refresh").clicked() {
+                                actions.push(BrowserAction::Refresh);
+                                ui.close();
+                            }
+                        });
                         add_scroll_edge_padding(ui);
                     });
-
-                // Dispatch the row action picked above (after the loop so
-                // we don't mutate self.listing while iterating it).
-                if let Some(name) = nav_into {
-                    self.cwd = join_path(&self.cwd, &name);
-                    self.refresh_listing();
-                } else if let Some(name) = do_download {
-                    self.start_get_file(&name);
-                } else if let Some(name) = do_download_dir {
-                    self.start_get_dir(&name);
-                } else if let Some((name, is_dir)) = do_rename {
-                    self.rename_target = Some(RenameTarget {
-                        old_name: name.clone(),
-                        buf: name,
-                        is_dir,
-                    });
-                } else if let Some((name, is_dir)) = do_delete {
-                    self.delete_entry(&name, is_dir);
-                }
             });
+
+        if os_drag_hover {
+            let r = panel.response.rect;
+            let painter = ui.painter();
+            painter.rect_filled(r, CornerRadius::same(10), theme::BG.gamma_multiply(0.8));
+            painter.rect_stroke(
+                r,
+                CornerRadius::same(10),
+                Stroke::new(2.0_f32, theme::ACCENT),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                r.center(),
+                egui::Align2::CENTER_CENTER,
+                format!("Drop to encrypt into {}", ops::display_name(&cwd)),
+                egui::FontId::proportional(16.0),
+                theme::TEXT,
+            );
+        }
+
+        // The row being dragged follows the pointer.
+        if let Some(p) = egui::DragAndDrop::payload::<DragEntry>(ui.ctx())
+            && let Some(pos) = ui.ctx().pointer_latest_pos()
+        {
+            egui::Area::new(egui::Id::new("browser-drag-ghost"))
+                .order(egui::Order::Tooltip)
+                .fixed_pos(pos + egui::vec2(14.0, 10.0))
+                .interactable(false)
+                .show(ui.ctx(), |ui| {
+                    Frame::popup(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            let (r, _) = ui
+                                .allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+                            paint_entry_icon(ui.painter(), r, p.kind);
+                            ui.add(egui::Label::new(ops::display_name(&p.name)).selectable(false));
+                        });
+                    });
+                });
+        }
+
+        // Keyboard: F2 renames the selected row, Enter opens a selected
+        // folder. Only while no text field has the keyboard.
+        if rename.is_none()
+            && let Some(sel) = &selected
+            && ui.ctx().memory(|m| m.focused().is_none())
+        {
+            let (f2, enter) = ui.input(|i| {
+                (
+                    i.key_pressed(egui::Key::F2),
+                    i.key_pressed(egui::Key::Enter),
+                )
+            });
+            if f2 {
+                actions.push(BrowserAction::Rename(sel.clone()));
+            } else if enter
+                && entries
+                    .iter()
+                    .any(|e| &e.name == sel && e.kind == InodeKind::Directory)
+            {
+                actions.push(BrowserAction::Open(join_path(&cwd, sel)));
+            }
+        }
+
+        // Finish the inline rename before applying row actions (an Open
+        // would change `cwd` under it). A rename whose row is gone
+        // (listing changed) is dropped.
+        match (rename_done, rename) {
+            (Some(true), Some(rt)) => self.commit_rename(rt),
+            (None, Some(rt)) if rename_row_seen => self.rename_target = Some(rt),
+            _ => {}
+        }
+
+        for action in actions {
+            match action {
+                BrowserAction::Select(s) => self.browser_selected = s,
+                BrowserAction::Open(path) => self.open_browser_dir(path),
+                BrowserAction::Download(name) => self.start_get_file(&name),
+                BrowserAction::DownloadDir(name) => self.start_get_dir(&name),
+                BrowserAction::Rename(name) => self.begin_rename(name),
+                BrowserAction::Delete(name, is_dir) => self.delete_entry(&name, is_dir),
+                BrowserAction::Move {
+                    from_dir,
+                    name,
+                    to_dir,
+                } => self.move_browser_entry(&from_dir, &name, &to_dir),
+                BrowserAction::NewFolder => self.mkdir_input = Some(String::new()),
+                BrowserAction::AddFile => self.add_file_picker(),
+                BrowserAction::Refresh => self.refresh_listing(),
+            }
+        }
+    }
+
+    fn open_browser_dir(&mut self, path: String) {
+        self.cwd = path;
+        self.browser_selected = None;
+        self.rename_target = None;
+        self.refresh_listing();
+    }
+
+    fn begin_rename(&mut self, name: String) {
+        let is_dir = self
+            .listing
+            .iter()
+            .any(|e| e.name == name && e.kind == InodeKind::Directory);
+        let select_end = if is_dir {
+            name.chars().count()
+        } else {
+            rename_selection_end(&name)
+        };
+        self.browser_selected = Some(name.clone());
+        self.rename_target = Some(RenameTarget {
+            old_name: name.clone(),
+            buf: name,
+            focus_pending: true,
+            select_end,
+        });
+    }
+
+    fn commit_rename(&mut self, rt: RenameTarget) {
+        let new_name = rt.buf.trim().to_string();
+        if new_name.is_empty() || new_name == rt.old_name {
+            return;
+        }
+        if new_name.contains('/') {
+            self.toast_err("name can't contain '/'");
+            return;
+        }
+        let cwd = self.cwd.clone();
+        let Some(v) = self.vault.as_mut() else {
+            return;
+        };
+        match ops::rename_entry(&mut v.vfs, &cwd, &rt.old_name, &new_name) {
+            Ok(()) => {
+                self.toast_ok(format!("renamed to {}", ops::display_name(&new_name)));
+                self.browser_selected = Some(new_name);
+                self.refresh_listing();
+            }
+            Err(e) => self.toast_err(e),
+        }
+    }
+
+    fn move_browser_entry(&mut self, from_dir: &str, name: &str, to_dir: &str) {
+        let Some(v) = self.vault.as_mut() else {
+            return;
+        };
+        match ops::move_entry(&mut v.vfs, from_dir, name, to_dir) {
+            Ok(()) => {
+                self.toast_ok(format!(
+                    "moved {} to {}",
+                    ops::display_name(name),
+                    ops::display_name(to_dir)
+                ));
+                self.refresh_listing();
+            }
+            Err(e) => self.toast_err(e),
+        }
+    }
+
+    /// Import local files / folders (dropped onto the browser) into the
+    /// current vault folder on a worker thread.
+    fn import_paths(&mut self, paths: Vec<PathBuf>) {
+        if self.pending.is_some() || self.vault.is_none() {
+            self.toast_err("busy: wait for the current operation to finish, then drop again");
+            return;
+        }
+        let Some(v) = self.vault.take() else {
+            return;
+        };
+        let dest = self.cwd.clone();
+        let inner = dest.clone();
+        let (tx, rx) = std::sync::mpsc::channel::<(OpenedVault, ops::PutSummary)>();
+        std::thread::spawn(move || {
+            let mut v = v;
+            let sum = ops::put_paths(&mut v.vfs, &paths, &inner);
+            let _ = tx.send((v, sum));
+        });
+        self.pending = Some(Pending::PutPaths { rx, dest });
     }
 
     fn add_file_picker(&mut self) {
@@ -11159,83 +11422,6 @@ impl LuksboxApp {
         } else if close_mk {
             self.mkdir_input = None;
         }
-
-        // Rename modal
-        let mut close_rn = false;
-        let mut submit_rn = false;
-        if let Some(rt) = self.rename_target.as_mut() {
-            egui::Modal::new(egui::Id::new("rename-modal"))
-                .frame(
-                    Frame::default()
-                        .fill(theme::PANEL)
-                        .stroke(Stroke::new(1.0, theme::BORDER))
-                        .corner_radius(CornerRadius::same(10))
-                        .inner_margin(20),
-                )
-                .show(ctx, |ui| {
-                    ui.set_min_width(capped_width(ui, 360.0));
-                    ui.label(
-                        RichText::new(if rt.is_dir {
-                            "Rename folder"
-                        } else {
-                            "Rename file"
-                        })
-                        .size(15.0)
-                        .strong(),
-                    );
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(format!("currently: {}", rt.old_name))
-                            .color(theme::FAINT)
-                            .small(),
-                    );
-                    ui.add_space(6.0);
-                    let resp = ui.add_sized(
-                        [capped_width(ui, 320.0), CONTROL_H],
-                        egui::TextEdit::singleline(&mut rt.buf).hint_text("new name"),
-                    );
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        submit_rn = true;
-                    }
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("Rename").clicked() {
-                            submit_rn = true;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            close_rn = true;
-                        }
-                    });
-                });
-            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                close_rn = true;
-            }
-        }
-        if submit_rn {
-            if let Some(rt) = self.rename_target.take() {
-                let new_name = rt.buf.trim().to_string();
-                if new_name.is_empty() || new_name == rt.old_name {
-                    // No-op cases, just close.
-                } else if new_name.contains('/') {
-                    self.toast_err("name can't contain '/'");
-                } else if let Some(v) = self.vault.as_mut() {
-                    let cwd = self.cwd.clone();
-                    match v.vfs.lookup_path(&cwd) {
-                        Ok(parent) => match v.vfs.rename(parent, &rt.old_name, parent, &new_name) {
-                            Ok(()) => {
-                                let _ = v.vfs.flush();
-                                self.toast_ok(format!("renamed to {new_name}"));
-                                self.refresh_listing();
-                            }
-                            Err(e) => self.toast_err(e.to_string()),
-                        },
-                        Err(e) => self.toast_err(e.to_string()),
-                    }
-                }
-            }
-        } else if close_rn {
-            self.rename_target = None;
-        }
     }
 
     fn draw_passgen_dialog(&mut self, ctx: &egui::Context) {
@@ -11778,7 +11964,24 @@ impl LuksboxApp {
         }
     }
 
+    /// Whether `path` is the vault this window has open (also while it
+    /// is mounted or a background operation holds it).
+    fn vault_in_use(&self, path: &std::path::Path) -> bool {
+        let Some(active) = self.active_vault_path.as_deref() else {
+            return false;
+        };
+        active == path
+            || matches!(
+                (active.canonicalize(), path.canonicalize()),
+                (Ok(a), Ok(b)) if a == b
+            )
+    }
+
     fn draw_forget_recent_modal(&mut self, ctx: &egui::Context) {
+        let in_use = self
+            .pending_forget_recent
+            .as_ref()
+            .is_some_and(|s| self.vault_in_use(&s.path));
         let Some(state) = self.pending_forget_recent.as_mut() else {
             return;
         };
@@ -11790,6 +11993,11 @@ impl LuksboxApp {
         let display_path = path.display().to_string();
         let file_exists = path.is_file();
         let any_related = !state.related.is_empty();
+        let delete_mode = state.delete;
+        // Destructive option: offered when the .lbx still exists, OR
+        // when it's already gone but related files remain (the "clean
+        // up leftovers" case), and never for the vault that is open.
+        let can_delete = (file_exists || any_related) && !in_use;
         let mut do_forget = false;
         let mut do_forget_and_delete = false;
         let mut cancel = false;
@@ -11797,16 +12005,20 @@ impl LuksboxApp {
             .frame(
                 Frame::default()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(20),
             )
             .show(ctx, |ui| {
                 ui.set_min_width(capped_width(ui, 460.0));
                 ui.label(
-                    RichText::new("Forget this vault from history?")
-                        .size(15.0)
-                        .strong(),
+                    RichText::new(if delete_mode {
+                        "Delete this vault?"
+                    } else {
+                        "Forget this vault from history?"
+                    })
+                    .size(15.0)
+                    .strong(),
                 );
                 ui.add_space(10.0);
                 ui.label(RichText::new(&display_name).strong().monospace().size(13.0));
@@ -11817,11 +12029,35 @@ impl LuksboxApp {
                         .color(theme::DIM),
                 );
                 ui.add_space(10.0);
-                ui.label(
-                    "Forgetting only removes the vault from the recent list. \
-                     The .lbx file on disk stays where it is. You can re-add \
-                     it later via Open existing... and pick the same path.",
-                );
+                if in_use {
+                    ui.label(
+                        RichText::new(
+                            "This vault is open in LUKSbox. Lock it (and unmount it, \
+                             if mounted) before deleting its files.",
+                        )
+                        .color(theme::WARN),
+                    );
+                } else if delete_mode && !can_delete {
+                    ui.label(
+                        "Nothing left to delete: the .lbx file is gone and no related \
+                         files were found next to it. You can still forget the entry.",
+                    );
+                } else if delete_mode {
+                    ui.label(
+                        RichText::new(
+                            "Deleting removes the .lbx file from disk, together with the \
+                             related files ticked below, and forgets the vault. Its \
+                             contents cannot be recovered.",
+                        )
+                        .color(theme::DANGER),
+                    );
+                } else {
+                    ui.label(
+                        "Forgetting only removes the vault from the recent list. \
+                         The .lbx file on disk stays where it is. You can re-add \
+                         it later via Open existing... and pick the same path.",
+                    );
+                }
                 ui.add_space(14.0);
                 ui.separator();
                 ui.add_space(10.0);
@@ -11832,15 +12068,22 @@ impl LuksboxApp {
                 // on the modal's centerline regardless of available
                 // width.
                 let btn_w = capped_width(ui, 420.0);
-                ui.vertical_centered(|ui| {
-                    if ui
-                        .add_sized([btn_w, CONTROL_H], egui::Button::new("Forget from history"))
-                        .clicked()
-                    {
-                        do_forget = true;
-                    }
-                });
-                ui.add_space(4.0);
+                let forget_label = if delete_mode {
+                    "Only forget from history (keep the files)"
+                } else {
+                    "Forget from history"
+                };
+                if !delete_mode {
+                    ui.vertical_centered(|ui| {
+                        if ui
+                            .add_sized([btn_w, CONTROL_H], egui::Button::new(forget_label))
+                            .clicked()
+                        {
+                            do_forget = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
                 // Files next to the vault that look related: luksbox's
                 // own sidecars (crash-recovery mirrors, .hybrid, ...)
                 // plus same-stem files like the .kyber seed, a .hdr
@@ -11849,7 +12092,7 @@ impl LuksboxApp {
                 // checklist. Name-convention matches start ticked,
                 // other same-stem files start unticked (they might be
                 // unrelated).
-                if any_related {
+                if any_related && can_delete {
                     ui.add_space(6.0);
                     let intro = if file_exists {
                         "Files next to the vault that look related. Ticked ones \
@@ -11873,11 +12116,7 @@ impl LuksboxApp {
                         });
                     ui.add_space(6.0);
                 }
-                // Destructive option: offer it when the .lbx still exists,
-                // OR when it's already gone but related files remain
-                // (the "clean up leftovers" case). Otherwise there is
-                // nothing to delete.
-                if file_exists || any_related {
+                if can_delete {
                     let (label, hover) = if file_exists {
                         (
                             "Forget AND delete the .lbx file + ticked files (IRREVERSIBLE)",
@@ -11904,6 +12143,17 @@ impl LuksboxApp {
                             .clicked()
                         {
                             do_forget_and_delete = true;
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+                if delete_mode {
+                    ui.vertical_centered(|ui| {
+                        if ui
+                            .add_sized([btn_w, CONTROL_H], egui::Button::new(forget_label))
+                            .clicked()
+                        {
+                            do_forget = true;
                         }
                     });
                     ui.add_space(4.0);
@@ -12148,6 +12398,252 @@ mod path_hints {
 const FORM_FIELD_MAX_W: f32 = 600.0;
 const FORM_FIELD_MIN_W: f32 = 120.0;
 const CONTROL_H: f32 = 28.0;
+
+const BROWSER_ROW_H: f32 = 36.0;
+
+/// One row of the vault browser: icon, name (or the inline rename
+/// field) and size, with click / double-click / right-click / drag
+/// handling. Returns `Some(apply)` when the inline rename on this row
+/// finished this frame (`false` = cancelled with Esc).
+fn draw_browser_row(
+    ui: &mut egui::Ui,
+    cwd: &str,
+    ent: &DirEntry,
+    selected: bool,
+    rename: Option<&mut RenameTarget>,
+    actions: &mut Vec<BrowserAction>,
+) -> Option<bool> {
+    let is_dir = ent.kind == InodeKind::Directory;
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), BROWSER_ROW_H),
+        egui::Sense::click_and_drag(),
+    );
+    let renaming = rename.is_some();
+    if !renaming && resp.drag_started() {
+        egui::DragAndDrop::set_payload(
+            ui.ctx(),
+            DragEntry {
+                from_dir: cwd.to_owned(),
+                name: ent.name.clone(),
+                kind: ent.kind,
+            },
+        );
+    }
+    // Folders accept rows dragged onto them (moves into the folder).
+    let drop_hover = is_dir
+        && resp
+            .dnd_hover_payload::<DragEntry>()
+            .is_some_and(|p| p.name != ent.name);
+    if is_dir
+        && let Some(p) = resp.dnd_release_payload::<DragEntry>()
+        && p.name != ent.name
+    {
+        actions.push(BrowserAction::Move {
+            from_dir: p.from_dir.clone(),
+            name: p.name.clone(),
+            to_dir: join_path(cwd, &ent.name),
+        });
+    }
+
+    if drop_hover {
+        ui.painter().rect_filled(
+            rect,
+            CornerRadius::same(4),
+            theme::ACCENT.gamma_multiply(0.18),
+        );
+        ui.painter().rect_stroke(
+            rect.shrink(1.0),
+            CornerRadius::same(4),
+            Stroke::new(1.5_f32, theme::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    } else if selected {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, theme::ACCENT.gamma_multiply(0.14));
+    } else if resp.hovered() {
+        ui.painter()
+            .rect_filled(rect, CornerRadius::ZERO, theme::PANEL2);
+    }
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom() - 0.5,
+        Stroke::new(1.0_f32, theme::BORDER),
+    );
+
+    let mut rename_done = None;
+    let mut row = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(rect.shrink2(egui::vec2(16.0, 0.0)))
+            .layout(Layout::left_to_right(Align::Center)),
+    );
+    let (icon_rect, _) = row.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+    paint_entry_icon(row.painter(), icon_rect, ent.kind);
+    row.add_space(10.0);
+    row.with_layout(Layout::right_to_left(Align::Center), |ui| {
+        let size = match ent.kind {
+            InodeKind::File => format_size(ent.size),
+            InodeKind::Directory => String::new(),
+            InodeKind::Symlink => "link".to_owned(),
+        };
+        ui.add(egui::Label::new(RichText::new(size).color(theme::FAINT).small()).selectable(false));
+        ui.add_space(12.0);
+        ui.with_layout(Layout::left_to_right(Align::Center), |ui| match rename {
+            Some(rt) => rename_done = rename_field(ui, rt),
+            None => {
+                let mut text = RichText::new(ops::display_name(&ent.name)).color(theme::TEXT);
+                if is_dir {
+                    text = text.strong();
+                }
+                ui.add(egui::Label::new(text).selectable(false).truncate());
+            }
+        });
+    });
+
+    if resp.clicked() || resp.secondary_clicked() {
+        actions.push(BrowserAction::Select(Some(ent.name.clone())));
+    }
+    if is_dir && resp.double_clicked() {
+        actions.push(BrowserAction::Open(join_path(cwd, &ent.name)));
+    }
+    resp.context_menu(|ui| {
+        match ent.kind {
+            InodeKind::Directory => {
+                if ui.button("Open").clicked() {
+                    actions.push(BrowserAction::Open(join_path(cwd, &ent.name)));
+                    ui.close();
+                }
+                if ui
+                    .button("Download (recursive)...")
+                    .on_hover_text(
+                        "Recursively extract this folder and everything inside it to disk.",
+                    )
+                    .clicked()
+                {
+                    actions.push(BrowserAction::DownloadDir(ent.name.clone()));
+                    ui.close();
+                }
+            }
+            InodeKind::File => {
+                if ui.button("Download...").clicked() {
+                    actions.push(BrowserAction::Download(ent.name.clone()));
+                    ui.close();
+                }
+            }
+            // Symlinks: no extract action (the target is a vault-
+            // internal path, not file bytes). Rename, move and delete
+            // still apply.
+            InodeKind::Symlink => {}
+        }
+        if ui
+            .add(egui::Button::new("Rename").shortcut_text("F2"))
+            .clicked()
+        {
+            actions.push(BrowserAction::Rename(ent.name.clone()));
+            ui.close();
+        }
+        if cwd != "/" && ui.button("Move to parent folder").clicked() {
+            actions.push(BrowserAction::Move {
+                from_dir: cwd.to_owned(),
+                name: ent.name.clone(),
+                to_dir: parent_path(cwd),
+            });
+            ui.close();
+        }
+        ui.separator();
+        if ui
+            .button(RichText::new("Delete").color(theme::DANGER))
+            .clicked()
+        {
+            actions.push(BrowserAction::Delete(ent.name.clone(), is_dir));
+            ui.close();
+        }
+    });
+    rename_done
+}
+
+/// The inline rename field. Returns `Some(true)` once the user
+/// confirms (Enter, or clicking anywhere else), `Some(false)` on Esc.
+fn rename_field(ui: &mut egui::Ui, rt: &mut RenameTarget) -> Option<bool> {
+    let mut out = egui::TextEdit::singleline(&mut rt.buf)
+        .id(egui::Id::new("browser-inline-rename"))
+        .desired_width(ui.available_width())
+        .show(ui);
+    if rt.focus_pending {
+        rt.focus_pending = false;
+        out.response.request_focus();
+        out.state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(rt.select_end),
+            )));
+        out.state.store(ui.ctx(), out.response.id);
+        return None;
+    }
+    if out.response.lost_focus() {
+        // egui drops keyboard focus on Esc, so Esc arrives here too.
+        return Some(!ui.input(|i| i.key_pressed(egui::Key::Escape)));
+    }
+    None
+}
+
+/// Characters of a file name to pre-select for renaming: everything
+/// before the last `.`, so the extension stays (a leading dot, as in
+/// `.bashrc`, is part of the name, not an extension).
+fn rename_selection_end(name: &str) -> usize {
+    match name.rfind('.') {
+        Some(i) if i > 0 => name[..i].chars().count(),
+        _ => name.chars().count(),
+    }
+}
+
+/// Generic browser icons, painted as shapes so they look the same on
+/// every platform (no emoji or icon-font dependency).
+fn paint_entry_icon(painter: &egui::Painter, rect: egui::Rect, kind: InodeKind) {
+    use egui::{Shape, pos2, vec2};
+    let c = rect.center();
+    if kind == InodeKind::Directory {
+        let body = egui::Rect::from_center_size(c + vec2(0.0, 1.5), vec2(18.0, 13.0));
+        let tab = egui::Rect::from_min_size(body.min - vec2(0.0, 3.0), vec2(8.0, 5.0));
+        painter.rect_filled(tab, CornerRadius::same(2), theme::FOLDER_TAB);
+        painter.rect_filled(body, CornerRadius::same(2), theme::FOLDER);
+        return;
+    }
+    let page = egui::Rect::from_center_size(c, vec2(13.0, 17.0));
+    let fold = 4.5;
+    let stroke = Stroke::new(1.3_f32, theme::DIM);
+    let corner = pos2(page.right() - fold, page.top());
+    let corner_low = pos2(page.right(), page.top() + fold);
+    painter.add(Shape::convex_polygon(
+        vec![
+            page.left_top(),
+            corner,
+            corner_low,
+            page.right_bottom(),
+            page.left_bottom(),
+        ],
+        theme::PANEL2,
+        stroke,
+    ));
+    painter.add(Shape::line(
+        vec![corner, pos2(corner.x, corner_low.y), corner_low],
+        stroke,
+    ));
+    for i in 0..3 {
+        let y = page.top() + 8.0 + i as f32 * 3.0;
+        painter.line_segment(
+            [pos2(page.left() + 3.0, y), pos2(page.right() - 3.0, y)],
+            Stroke::new(1.0_f32, theme::FAINT),
+        );
+    }
+    if kind == InodeKind::Symlink {
+        painter.arrow(
+            pos2(page.left() - 1.0, page.bottom() - 1.0),
+            vec2(6.0, -6.0),
+            Stroke::new(1.6_f32, theme::ACCENT),
+        );
+    }
+}
 const SCROLL_EDGE_PAD: f32 = 64.0;
 
 fn sidebar_content_width(ui: &egui::Ui) -> f32 {
@@ -13506,5 +14002,204 @@ mod zoom_shortcut_tests {
         });
         let z = zoom_after(input, 1.0);
         assert!((z - 1.0).abs() < 1e-4, "plain '+' must not zoom, got {z}");
+    }
+}
+
+#[cfg(test)]
+mod browser_row_tests {
+    //! Headless checks of the vault browser rows: mouse and keyboard
+    //! input is fed through a real `egui::Context`, as in the zoom tests.
+
+    use super::{
+        BROWSER_ROW_H, BrowserAction, DirEntry, RenameTarget, draw_browser_row,
+        rename_selection_end,
+    };
+    use luksbox_vfs::InodeKind;
+
+    fn entries() -> Vec<DirEntry> {
+        vec![
+            DirEntry {
+                name: "docs".into(),
+                kind: InodeKind::Directory,
+                size: 0,
+            },
+            DirEntry {
+                name: "a.txt".into(),
+                kind: InodeKind::File,
+                size: 5,
+            },
+        ]
+    }
+
+    struct Pass {
+        actions: Vec<BrowserAction>,
+        rename_done: Option<bool>,
+        /// Centre of each row, in `entries()` order.
+        centers: Vec<egui::Pos2>,
+    }
+
+    fn pass(
+        ctx: &egui::Context,
+        events: Vec<egui::Event>,
+        mut rename: Option<&mut RenameTarget>,
+    ) -> Pass {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 400.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut out = Pass {
+            actions: Vec::new(),
+            rename_done: None,
+            centers: Vec::new(),
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for ent in &entries() {
+                let top_left = ui.cursor().min;
+                out.centers
+                    .push(top_left + egui::vec2(ui.available_width() / 2.0, BROWSER_ROW_H / 2.0));
+                let r = rename.as_deref_mut().filter(|rt| rt.old_name == ent.name);
+                if let Some(done) = draw_browser_row(ui, "/", ent, false, r, &mut out.actions) {
+                    out.rename_done = Some(done);
+                }
+            }
+        });
+        out
+    }
+
+    fn button(pos: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn key(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn selected(actions: &[BrowserAction]) -> Option<String> {
+        actions.iter().find_map(|a| match a {
+            BrowserAction::Select(s) => s.clone(),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn click_selects_and_right_click_selects_too() {
+        let ctx = egui::Context::default();
+        let file = pass(&ctx, vec![], None).centers[1];
+        pass(&ctx, vec![egui::Event::PointerMoved(file)], None);
+        pass(
+            &ctx,
+            vec![button(file, egui::PointerButton::Primary, true)],
+            None,
+        );
+        let up = pass(
+            &ctx,
+            vec![button(file, egui::PointerButton::Primary, false)],
+            None,
+        );
+        assert_eq!(selected(&up.actions).as_deref(), Some("a.txt"));
+
+        let dir = up.centers[0];
+        pass(&ctx, vec![egui::Event::PointerMoved(dir)], None);
+        pass(
+            &ctx,
+            vec![button(dir, egui::PointerButton::Secondary, true)],
+            None,
+        );
+        let up = pass(
+            &ctx,
+            vec![button(dir, egui::PointerButton::Secondary, false)],
+            None,
+        );
+        assert_eq!(selected(&up.actions).as_deref(), Some("docs"));
+    }
+
+    #[test]
+    fn dragging_a_file_onto_a_folder_moves_it() {
+        let ctx = egui::Context::default();
+        let c = pass(&ctx, vec![], None).centers;
+        let (folder, file) = (c[0], c[1]);
+        pass(&ctx, vec![egui::Event::PointerMoved(file)], None);
+        pass(
+            &ctx,
+            vec![button(file, egui::PointerButton::Primary, true)],
+            None,
+        );
+        // Past the click-distance threshold, then over the folder row.
+        pass(
+            &ctx,
+            vec![egui::Event::PointerMoved(file + egui::vec2(0.0, -12.0))],
+            None,
+        );
+        pass(&ctx, vec![egui::Event::PointerMoved(folder)], None);
+        let up = pass(
+            &ctx,
+            vec![button(folder, egui::PointerButton::Primary, false)],
+            None,
+        );
+        let moved = up.actions.iter().any(|a| {
+            matches!(a, BrowserAction::Move { from_dir, name, to_dir }
+                if from_dir == "/" && name == "a.txt" && to_dir == "/docs")
+        });
+        assert!(moved, "expected a move of a.txt into /docs");
+        // A plain drag is not a click: nothing got selected.
+        assert!(selected(&up.actions).is_none());
+    }
+
+    fn rename_target(name: &str, select_end: usize) -> RenameTarget {
+        RenameTarget {
+            old_name: name.into(),
+            buf: name.into(),
+            focus_pending: true,
+            select_end,
+        }
+    }
+
+    #[test]
+    fn inline_rename_replaces_the_stem_and_applies_on_enter() {
+        let ctx = egui::Context::default();
+        let mut rt = rename_target("a.txt", rename_selection_end("a.txt"));
+        assert!(pass(&ctx, vec![], Some(&mut rt)).rename_done.is_none());
+        pass(
+            &ctx,
+            vec![egui::Event::Text("report".into())],
+            Some(&mut rt),
+        );
+        let done = pass(&ctx, vec![key(egui::Key::Enter)], Some(&mut rt)).rename_done;
+        assert_eq!(done, Some(true));
+        assert_eq!(rt.buf, "report.txt");
+    }
+
+    #[test]
+    fn inline_rename_escape_cancels() {
+        let ctx = egui::Context::default();
+        let mut rt = rename_target("docs", 4);
+        pass(&ctx, vec![], Some(&mut rt));
+        pass(&ctx, vec![egui::Event::Text("x".into())], Some(&mut rt));
+        let done = pass(&ctx, vec![key(egui::Key::Escape)], Some(&mut rt)).rename_done;
+        assert_eq!(done, Some(false));
+    }
+
+    #[test]
+    fn rename_preselects_the_name_without_its_extension() {
+        assert_eq!(rename_selection_end("report.final.pdf"), 12);
+        assert_eq!(rename_selection_end("noext"), 5);
+        assert_eq!(rename_selection_end(".bashrc"), 7);
+        assert_eq!(rename_selection_end("été.txt"), 3);
     }
 }
