@@ -190,11 +190,19 @@ impl SealedBlob {
     }
 }
 
+/// `Error::NotCompiledIn` text. A Mac has no TPM 2.0 at all, so a
+/// rebuild hint would only mislead there.
+const NOT_COMPILED_IN_MSG: &str = if cfg!(target_os = "macos") {
+    "macOS has no TPM 2.0; TPM keyslots open only on the Linux / Windows machine that \
+     sealed them (on a Mac use Secure Enclave keyslots)"
+} else {
+    "TPM 2.0 support not compiled into this binary (rebuild with --features hardware, or \
+     --features bundled-tpm on Windows / older distros)"
+};
+
 #[derive(Debug, Error)]
 pub enum Error {
-    #[error(
-        "TPM 2.0 support not compiled into this binary (rebuild with --features hardware, or --features bundled-tpm on Windows / older distros)"
-    )]
+    #[error("{}", NOT_COMPILED_IN_MSG)]
     NotCompiledIn,
     #[error("TPM device not available: {0}")]
     DeviceNotAvailable(String),
@@ -272,6 +280,15 @@ mod stub {
 pub use stub::Tpm2Sealer;
 
 // ---------- real TPM 2.0 implementation (hardware, Linux/Windows) -----
+
+/// True when this build talks to a real TPM 2.0 (`hardware` feature on
+/// Linux / Windows); otherwise `Tpm2Sealer::new` is a stub that always
+/// fails. Front ends use it to hide TPM options the build cannot honour
+/// instead of failing after the user typed every other factor.
+pub const BACKEND_COMPILED: bool = cfg!(all(
+    feature = "hardware",
+    any(target_os = "linux", target_os = "windows")
+));
 
 #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 mod real;

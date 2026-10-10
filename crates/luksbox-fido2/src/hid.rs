@@ -736,7 +736,7 @@ fn map_err_at(call: &'static str, rc: c_int) -> Error {
              (e.g. ykman fido access change-pin), then retry"
                 .into(),
         ),
-        FIDO_ERR_PIN_BLOCKED => Error::Other("FIDO2 PIN is blocked, reset the FIDO app".into()),
+        FIDO_ERR_PIN_BLOCKED => Error::PinBlocked,
         FIDO_ERR_USER_ACTION_TIMEOUT | FIDO_ERR_TIMEOUT => Error::TouchTimeout,
         FIDO_ERR_USER_PRESENCE_REQUIRED => Error::TouchTimeout,
         FIDO_ERR_INVALID_CREDENTIAL => Error::Other("invalid credential id".into()),
@@ -858,6 +858,20 @@ mod tests {
             }
             other => panic!("PIN_NOT_SET maps to unexpected variant: {other:?}"),
         }
+    }
+
+    /// Callers stop walking keyslots on these instead of spending the
+    /// next PIN retry on the same wrong PIN.
+    #[test]
+    fn wrong_and_blocked_pin_are_pin_failures() {
+        for code in [
+            FIDO_ERR_PIN_INVALID,
+            FIDO_ERR_PIN_AUTH_INVALID,
+            FIDO_ERR_PIN_BLOCKED,
+        ] {
+            assert!(map_err_at("test", code).is_pin_failure(), "code {code:#x}");
+        }
+        assert!(!map_err_at("test", FIDO_ERR_USER_PRESENCE_REQUIRED).is_pin_failure());
     }
 
     #[test]

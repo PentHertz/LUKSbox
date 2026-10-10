@@ -197,6 +197,20 @@ pub struct Header {
 }
 
 impl Header {
+    /// Whether `blob` is the sealed object of a `Tpm2SealedPin` slot.
+    ///
+    /// The unseal closure of `UnlockMaterial::Tpm2` is handed only the
+    /// blob bytes, for plain and PIN-bound TPM slots alike. It must
+    /// present the PIN to exactly the PIN-bound ones: a PIN offered to a
+    /// plain object, or no PIN to a PIN-bound one, fails with
+    /// `TPM_RC_AUTH_FAIL` and counts toward the chip's dictionary-attack
+    /// lockout (the objects are not created `noDA`).
+    pub fn tpm2_blob_needs_pin(&self, blob: &[u8]) -> bool {
+        self.keyslots.iter().any(|s| {
+            s.kind == crate::keyslot::SlotKind::Tpm2SealedPin && s.tpm2_sealed_blob() == Some(blob)
+        })
+    }
+
     /// Construct a new header with a fresh random `header_salt`.
     /// Returns `Err` only on OS RNG failure (extremely rare; system is
     /// broken if it happens). Production paths should use this; tests
@@ -663,6 +677,23 @@ mod tests {
     use super::*;
     use crate::kdf::Argon2idParams;
     use crate::keyslot::Keyslot;
+
+    #[test]
+    fn tpm2_blob_needs_pin_only_for_pin_bound_slots() {
+        let suite = CipherSuite::Aes256Gcm;
+        let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
+        let mut header = Header::new(suite, KdfId::Argon2id, 4096, HEADER_SIZE as u64);
+        let kek = [7u8; 32];
+        let plain =
+            Keyslot::new_tpm2(suite, &mvk, &kek, b"plain-blob", &header.header_salt).unwrap();
+        let pin =
+            Keyslot::new_tpm2_pin(suite, &mvk, &kek, b"pin-blob", &header.header_salt).unwrap();
+        header.install_slot(0, plain).unwrap();
+        header.install_slot(1, pin).unwrap();
+        assert!(!header.tpm2_blob_needs_pin(b"plain-blob"));
+        assert!(header.tpm2_blob_needs_pin(b"pin-blob"));
+        assert!(!header.tpm2_blob_needs_pin(b"unknown"));
+    }
 
     #[test]
     fn header_roundtrip_and_unlock() {

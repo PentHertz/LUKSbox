@@ -17,6 +17,9 @@ pub enum Error {
     #[error("PIN incorrect")]
     PinIncorrect,
 
+    #[error("FIDO2 PIN is blocked, reset the FIDO app")]
+    PinBlocked,
+
     #[error("user touch timeout")]
     TouchTimeout,
 
@@ -34,4 +37,14 @@ pub enum Error {
 
     #[error("authenticator error: {0}")]
     Other(String),
+}
+
+impl Error {
+    /// The PIN was rejected or is blocked. A caller walking several
+    /// keyslots must stop instead of presenting the same PIN to the
+    /// next credential: every wrong-PIN attempt uses up one of the
+    /// authenticator's PIN retries (8, then the PIN is blocked).
+    pub fn is_pin_failure(&self) -> bool {
+        matches!(self, Self::PinIncorrect | Self::PinBlocked)
+    }
 }

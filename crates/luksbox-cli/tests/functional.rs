@@ -321,6 +321,59 @@ fn hybrid_pq_wrong_kyber_seed_fails() {
 
 // ---- KDF strength variants ---------------------------------------------
 
+/// A hybrid passphrase slot whose `.kyber` seed is encrypted under a
+/// different passphrase than the slot itself (what the wizard's and the
+/// GUI's "add passphrase + ML-KEM" produce) opens once the seed-file
+/// passphrase is supplied. The CLI used to try only the slot passphrase
+/// on the seed, so such a slot could not be opened from it.
+#[test]
+fn hybrid_pq_distinct_seed_passphrase_opens() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    assert_ok(
+        &run(
+            dir,
+            &[
+                "create",
+                "v.lbx",
+                "--kind",
+                "hybrid-pq",
+                "--pq-hybrid",
+                "v.kyber",
+            ],
+        ),
+        "create hybrid-pq",
+    );
+    // Re-encrypt the seed under its own passphrase.
+    let seed = luksbox_pq::seed_file::read(&dir.join("v.kyber"), b"pw").unwrap();
+    let fast = luksbox_pq::seed_file::KdfParams {
+        m_cost_kib: 8,
+        t_cost: 1,
+        p_cost: 1,
+    };
+    luksbox_pq::seed_file::write(&dir.join("other.kyber"), &seed, b"seed-secret", fast).unwrap();
+
+    let ls = |seed_pw: &'static str| {
+        let mut env = test_env();
+        env.insert("LUKSBOX_SEED_PASSPHRASE", seed_pw);
+        run_with(
+            dir,
+            &env,
+            &["ls", "v.lbx", "--pq-hybrid", "other.kyber", "/"],
+        )
+    };
+    assert_err(&ls("wrong"), "ls with a wrong seed-file passphrase");
+    assert_ok(
+        &ls("seed-secret"),
+        "ls with the distinct seed-file passphrase",
+    );
+    // The usual same-passphrase seed never asks for a second one.
+    assert_ok(
+        &run(dir, &["ls", "v.lbx", "--pq-hybrid", "v.kyber", "/"]),
+        "ls with the shared passphrase",
+    );
+}
+
 #[test]
 fn kdf_strength_recorded_in_slot() {
     let tmp = tempdir().unwrap();

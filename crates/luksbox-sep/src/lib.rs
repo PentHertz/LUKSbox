@@ -159,6 +159,12 @@ pub use stub::SepSealer;
 
 // ---------- real Secure Enclave implementation (hardware, macOS) -----
 
+/// True when this build talks to the real Secure Enclave (macOS with the
+/// `hardware` feature and a Swift toolchain at build time); otherwise
+/// `SepSealer::new` is a stub that always fails. Front ends use it to
+/// hide Secure Enclave options the build cannot honour.
+pub const BACKEND_COMPILED: bool = cfg!(sep_real);
+
 #[cfg(sep_real)]
 mod real;
 

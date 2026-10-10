@@ -221,11 +221,161 @@ pub trait Fido2Authenticator {
         for (idx, req) in requests.iter().enumerate() {
             match self.hmac_secret(rp_id, req.cred_id, req.salt, req.prehash_salt, pin) {
                 Ok(secret) => return Ok((idx, secret)),
+                // The next credential would spend another PIN retry.
+                Err(e) if e.is_pin_failure() => return Err(e),
                 Err(e) => last_err = Some(e),
             }
         }
         Err(last_err.unwrap_or_else(|| {
             Error::Other("hmac_secret_multi called with an empty request list".into())
         }))
+    }
+}
+
+/// Unlock through whichever of `requests` the presented authenticator
+/// holds, for keyslots that combine FIDO2 with another factor (TPM,
+/// ML-KEM). Every credential goes into one assertion, so on Windows the
+/// user sees a single prompt that accepts any enrolled key (issue #28:
+/// one prompt per slot made Windows reject a backup key with "this
+/// security key doesn't look familiar"). The matched request index and
+/// its secret go to `try_open`; when that slot still does not open (a
+/// TPM from another machine, a wrong `.kyber`), its credential is
+/// dropped and the rest asserted again. An assertion error, a PIN
+/// failure included, ends the attempt.
+pub fn open_with_any_credential<A, T>(
+    auth: &mut A,
+    rp_id: &str,
+    requests: &[HmacSecretRequest<'_>],
+    pin: Option<&str>,
+    mut try_open: impl FnMut(usize, &HmacSecret) -> Result<T, String>,
+) -> Result<T, String>
+where
+    A: Fido2Authenticator + ?Sized,
+{
+    let mut remaining: Vec<usize> = (0..requests.len()).collect();
+    let mut last_err: Option<String> = None;
+    while !remaining.is_empty() {
+        let batch: Vec<HmacSecretRequest<'_>> = remaining.iter().map(|&i| requests[i]).collect();
+        match auth.hmac_secret_multi(rp_id, &batch, pin) {
+            Ok((pos, secret)) => {
+                let idx = remaining.remove(pos);
+                match try_open(idx, &secret) {
+                    Ok(v) => return Ok(v),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Err(e) => {
+                return Err(match last_err {
+                    Some(prev) => format!("{prev}; FIDO2: {e}"),
+                    None => format!("FIDO2: {e}"),
+                });
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "no FIDO2 keyslot to try".into()))
+}
+
+#[cfg(test)]
+mod open_with_any_credential_tests {
+    use super::*;
+    use crate::MockAuthenticator;
+
+    fn enrolled(auth: &mut MockAuthenticator, n: usize) -> Vec<Vec<u8>> {
+        (0..n)
+            .map(|_| auth.enroll(RP_ID, b"user", None).unwrap().credential.id)
+            .collect()
+    }
+
+    #[test]
+    fn falls_through_to_the_next_credential_when_a_slot_does_not_open() {
+        let mut auth = MockAuthenticator::new();
+        let creds = enrolled(&mut auth, 3);
+        let salt = [1u8; 32];
+        let reqs: Vec<HmacSecretRequest<'_>> = creds
+            .iter()
+            .map(|c| HmacSecretRequest {
+                cred_id: c,
+                salt: &salt,
+                prehash_salt: true,
+            })
+            .collect();
+        let mut tried = Vec::new();
+        let r = open_with_any_credential(&mut auth, RP_ID, &reqs, Some("1234"), |i, _| {
+            tried.push(i);
+            if i == 1 {
+                Ok("slot 1")
+            } else {
+                Err(format!("slot {i} did not open"))
+            }
+        });
+        assert_eq!(r, Ok("slot 1"));
+        assert_eq!(tried, vec![0, 1]);
+    }
+
+    #[test]
+    fn credentials_not_on_the_key_are_skipped_and_failures_reported() {
+        let mut auth = MockAuthenticator::new();
+        let creds = enrolled(&mut auth, 1);
+        let salt = [2u8; 32];
+        let foreign = vec![9u8; 64];
+        let reqs = [
+            HmacSecretRequest {
+                cred_id: &foreign,
+                salt: &salt,
+                prehash_salt: true,
+            },
+            HmacSecretRequest {
+                cred_id: &creds[0],
+                salt: &salt,
+                prehash_salt: true,
+            },
+        ];
+        let r: Result<(), String> =
+            open_with_any_credential(&mut auth, RP_ID, &reqs, None, |i, _| {
+                Err(format!("slot {i} wrong TPM"))
+            });
+        let e = r.unwrap_err();
+        assert!(e.starts_with("slot 1 wrong TPM; FIDO2: "), "{e}");
+    }
+
+    /// Authenticator that rejects every PIN, counting the attempts.
+    struct WrongPin(usize);
+    impl Fido2Authenticator for WrongPin {
+        fn enroll(&mut self, _: &str, _: &[u8], _: Option<&str>) -> Result<EnrollResult, Error> {
+            unreachable!()
+        }
+        fn hmac_secret(
+            &mut self,
+            _: &str,
+            _: &[u8],
+            _: &[u8; 32],
+            _: bool,
+            _: Option<&str>,
+        ) -> Result<HmacSecret, Error> {
+            self.0 += 1;
+            Err(Error::PinIncorrect)
+        }
+    }
+
+    #[test]
+    fn a_wrong_pin_is_presented_once_not_once_per_slot() {
+        let salt = [3u8; 32];
+        let ids = [vec![1u8; 64], vec![2u8; 64], vec![3u8; 64]];
+        let reqs: Vec<HmacSecretRequest<'_>> = ids
+            .iter()
+            .map(|c| HmacSecretRequest {
+                cred_id: c,
+                salt: &salt,
+                prehash_salt: true,
+            })
+            .collect();
+        let mut auth = WrongPin(0);
+        let r: Result<(), String> =
+            open_with_any_credential(&mut auth, RP_ID, &reqs, Some("0000"), |_, _| Ok(()));
+        assert!(r.unwrap_err().contains("PIN incorrect"));
+        assert_eq!(
+            auth.0, 1,
+            "the wrong PIN reached the authenticator more than once"
+        );
     }
 }

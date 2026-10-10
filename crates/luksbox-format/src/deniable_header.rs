@@ -605,6 +605,64 @@ pub struct OpenedDeniableEnvelope {
     pub slot_table_digest: [u8; 32],
 }
 
+/// Every envelope the passphrase in `credential` opens, as (slot
+/// index, credential kind) in slot order. Lets a front end tell the
+/// user which unlock method a deniable vault's envelope needs before
+/// the second factor is involved (the kinds are encrypted, so nothing
+/// can be shown without the passphrase). The trial decrypt is the same
+/// uniform sweep as [`try_open_envelope_v2`]: every slot is opened and
+/// its kind byte selected without branching on the outcome; the list is
+/// assembled only after the loop.
+pub fn envelope_kinds_v2(
+    header_bytes: &[u8],
+    credential: &luksbox_core::deniable::DeniableCredential,
+    cipher_suite: CipherSuite,
+) -> Result<Vec<(usize, luksbox_core::deniable::DeniableKindTag)>, Error> {
+    use luksbox_core::deniable::{DENIABLE_SLOT_COUNT, DeniableKindTag};
+    const PT_LEN: usize = luksbox_core::deniable::slot_payload::PAYLOAD_PLAINTEXT_LEN;
+
+    if header_bytes.len() < DENIABLE_HEADER_SIZE {
+        return Err(Error::OpaqueUnlockFailed);
+    }
+    let header: &[u8; DENIABLE_HEADER_SIZE] =
+        header_bytes[..DENIABLE_HEADER_SIZE].try_into().unwrap();
+    let mut per_vault_salt = [0u8; DENIABLE_SALT_SIZE];
+    per_vault_salt.copy_from_slice(&header[..DENIABLE_SALT_SIZE]);
+    let env_kek = credential
+        .derive_envelope_kek(&per_vault_salt)
+        .map_err(|_| Error::OpaqueUnlockFailed)?;
+
+    let mut kinds = [0u8; DENIABLE_SLOT_COUNT];
+    for (slot_idx, kind) in kinds.iter_mut().enumerate() {
+        let off = DENIABLE_SLOT_TABLE_OFFSET + slot_idx * DENIABLE_SLOT_SIZE;
+        let slot = &header[off..off + DENIABLE_SLOT_SIZE];
+        let env_nonce: [u8; SLOT_NONCE_LEN] = slot[..SLOT_NONCE_LEN].try_into().unwrap();
+        let outer_aad = deniable::slot_aad(&per_vault_salt, slot_idx);
+        let pt = aead::open(
+            cipher_suite,
+            env_kek.as_bytes(),
+            &env_nonce,
+            &outer_aad,
+            &slot[SLOT_NONCE_LEN..],
+        )
+        .map(Zeroizing::new);
+        let (ok, byte) = match &pt {
+            Ok(v) if v.len() == PT_LEN => (Choice::from(1u8), v[0]),
+            _ => (Choice::from(0u8), 0u8),
+        };
+        *kind = u8::conditional_select(&0u8, &byte, ok);
+    }
+    let found: Vec<(usize, DeniableKindTag)> = kinds
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &k)| DeniableKindTag::from_u8(k).map(|t| (i, t)))
+        .collect();
+    if found.is_empty() {
+        return Err(Error::OpaqueUnlockFailed);
+    }
+    Ok(found)
+}
+
 /// Phase 1 of v2 open: derive `KEK_envelope` from the passphrase,
 /// constant-time trial-decrypt the 8 slot envelopes, return the
 /// matched slot's payload (which exposes the slot kind +
@@ -1266,6 +1324,44 @@ mod tests {
             .err()
             .unwrap();
         assert!(matches!(err, Error::OpaqueUnlockFailed));
+    }
+
+    /// The listing names the credential kind of the envelope a
+    /// passphrase opens, including a FIDO2 one, and nothing for a
+    /// wrong passphrase.
+    #[test]
+    fn envelope_kinds_lists_what_the_passphrase_opens() {
+        use luksbox_core::deniable::{DeniableCredential, DeniableKindTag};
+        let hmac_out = [7u8; 32];
+        let cred = DeniableCredential::Fido2Passphrase {
+            passphrase: b"hunter2",
+            argon2: cheap_test_params(),
+            hmac_secret_output: &hmac_out,
+        };
+        let material = DeniableMaterial {
+            cred_id: vec![1u8; 48],
+            hmac_salt: Some([2u8; 32]),
+            ..DeniableMaterial::passphrase_only()
+        };
+        let (header, _) =
+            create_with_credential_v2(&cred, &material, 5, CipherSuite::Aes256GcmSiv, sane_inner())
+                .unwrap();
+        let discover = DeniableCredential::Passphrase {
+            passphrase: b"hunter2",
+            argon2: cheap_test_params(),
+        };
+        assert_eq!(
+            envelope_kinds_v2(&header, &discover, CipherSuite::Aes256GcmSiv).unwrap(),
+            vec![(5, DeniableKindTag::Fido2Passphrase)]
+        );
+        let wrong = DeniableCredential::Passphrase {
+            passphrase: b"nope",
+            argon2: cheap_test_params(),
+        };
+        assert!(matches!(
+            envelope_kinds_v2(&header, &wrong, CipherSuite::Aes256GcmSiv),
+            Err(Error::OpaqueUnlockFailed)
+        ));
     }
 
     #[test]

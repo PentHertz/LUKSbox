@@ -3211,7 +3211,15 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
         // present a Passphrase-AEAD-OK slot with a mismatched
         // stored kind byte.
         if envelope.payload().kind != expected {
-            return Err("credential kind mismatch (vault expects a different variant)".into());
+            let actual = envelope.payload().kind;
+            return Err(format!(
+                "this passphrase opens a {} envelope (slot {}), not the one the \"{}\" method \
+                 expects: choose \"{}\"",
+                deniable_kind_label(actual),
+                envelope.opened.matched_slot_idx,
+                unlock_method_label(opts.method),
+                unlock_method_label(deniable_kind_method(actual)),
+            ));
         }
 
         let payload_cred_id = envelope.payload().cred_id.clone();
@@ -3686,7 +3694,21 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
                 .hybrid_kyber_path
                 .as_ref()
                 .ok_or("hybrid-pq-fido2 needs the .kyber seed file path")?;
-            unlock_with_hybrid_pq_fido2(&opts.path, opts.header_path.as_deref(), seed_pw, pin, kp)?
+            // Optional extra slot passphrase (the wizard can bind one
+            // into this kind); blank means none.
+            let slot_pw = opts
+                .hybrid_seed_pw
+                .as_ref()
+                .filter(|p| !p.is_empty())
+                .map(|p| p.as_str());
+            unlock_with_hybrid_pq_fido2(
+                &opts.path,
+                opts.header_path.as_deref(),
+                seed_pw,
+                pin,
+                kp,
+                slot_pw,
+            )?
         }
         UnlockMethod::Sep => {
             // Fused SEP slots (FIDO2 / passphrase) also flow through
@@ -4208,6 +4230,17 @@ fn unlock_with_tpm2(path: &Path, header_path: Option<&Path>) -> Result<Container
         .iter()
         .any(|s| s.kind == SlotKind::Tpm2Sealed)
     {
+        if header
+            .keyslots
+            .iter()
+            .any(|s| s.kind == SlotKind::Tpm2SealedPin)
+        {
+            return Err(
+                "this vault's TPM 2.0 keyslot is PIN-protected: use the \"TPM 2.0 + PIN\" \
+                 method."
+                    .into(),
+            );
+        }
         return Err(
             "this vault has no TPM 2.0 keyslot. Open with another method, then \
              enroll one via Manage Keyslots -> Add TPM 2.0 keyslot."
@@ -4217,7 +4250,13 @@ fn unlock_with_tpm2(path: &Path, header_path: Option<&Path>) -> Result<Container
 
     let mut sealer =
         Tpm2Sealer::new().map_err(|e| format!("could not open local TPM 2.0 device: {e}"))?;
-    let mut unseal = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
+    let mut unseal_inner = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
+        // The format layer also hands over PIN-bound slots; unsealing
+        // one without its PIN would only count toward the TPM's
+        // dictionary-attack lockout.
+        if header.tpm2_blob_needs_pin(blob) {
+            return Err("PIN-protected TPM slot (TPM 2.0 + PIN method)".into());
+        }
         let parsed = SealedBlob::from_bytes(blob)
             .map_err(|e| format!("malformed TPM SealedBlob in keyslot: {e}"))?;
         let kek = sealer
@@ -4227,6 +4266,9 @@ fn unlock_with_tpm2(path: &Path, header_path: Option<&Path>) -> Result<Container
         out.copy_from_slice(kek.as_slice());
         Ok(out)
     };
+    // `Container::open` reports only UnlockFailed; keep the reason.
+    let mut unseal_errs = luksbox_format::UnsealErrors::default();
+    let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
 
     Container::open(
         path,
@@ -4235,7 +4277,7 @@ fn unlock_with_tpm2(path: &Path, header_path: Option<&Path>) -> Result<Container
             unseal: &mut unseal,
         },
     )
-    .map_err(estr)
+    .map_err(|e| unseal_errs.explain(e))
 }
 
 #[cfg(not(feature = "fido2-hardware"))]
@@ -4287,6 +4329,40 @@ fn unlock_via_sep(
     Err("Secure Enclave support not compiled in (rebuild with --features hardware)".into())
 }
 
+/// Whether `open_sep_common` has a Secure Enclave slot to try with the
+/// factors supplied (`has_pin`, `has_pp`), among the slots whose
+/// hybrid-ness is `want_pq`. `Ok(collect_fido2)`, or the error naming
+/// the missing factor when none is openable.
+#[cfg(any(test, feature = "fido2-hardware"))]
+fn sep_attempt_plan(
+    kinds: impl Iterator<Item = SlotKind> + Clone,
+    want_pq: bool,
+    has_pin: bool,
+    has_pp: bool,
+) -> Result<bool, String> {
+    let in_scope = |k: &SlotKind| k.is_sep() && k.is_hybrid_pq() == want_pq;
+    let usable = |k: &SlotKind| {
+        in_scope(k) && (has_pin || !k.is_sep_fido2()) && (has_pp || !k.is_sep_passphrase())
+    };
+    if !kinds.clone().any(|k| usable(&k)) {
+        let needs_pin = !has_pin && kinds.clone().any(|k| in_scope(&k) && k.is_sep_fido2());
+        let needs_pp = !has_pp && kinds.clone().any(|k| in_scope(&k) && k.is_sep_passphrase());
+        return Err(match (needs_pin, needs_pp) {
+            (true, true) => "this vault's Secure Enclave keyslots also need the FIDO2 PIN and the \
+                             slot passphrase; enter them to unlock."
+                .into(),
+            (true, false) => "this vault's Secure Enclave keyslot also needs a FIDO2 \
+                              authenticator; enter the FIDO2 PIN to unlock."
+                .into(),
+            (false, true) => "this vault's Secure Enclave keyslot also needs its slot \
+                              passphrase; enter it to unlock."
+                .into(),
+            (false, false) => "no Secure Enclave keyslot of this kind in this vault".into(),
+        });
+    }
+    Ok(has_pin && kinds.clone().any(|k| in_scope(&k) && k.is_sep_fido2()))
+}
+
 /// Shared SEP open loop for both the non-hybrid (`unlock_via_sep`) and
 /// hybrid (`unlock_via_hybrid_pq_sep`) paths. Mirrors the CLI's
 /// `open_sep_common`: iterates every SEP keyslot whose hybrid-ness
@@ -4309,31 +4385,26 @@ fn open_sep_common(
     use luksbox_sep::{SepBlob, SepSealer};
 
     let want_pq = pq_shared_for.is_some();
+    // Empty fields mean "not supplied".
+    let pin = pin.filter(|p| !p.is_empty());
+    let passphrase = passphrase.filter(|p| !p.is_empty());
 
-    // Does any in-scope slot need a passphrase / FIDO2?
-    let needs_pp = header
-        .keyslots
-        .iter()
-        .any(|s| s.kind.is_sep() && s.kind.is_sep_passphrase() && s.kind.is_hybrid_pq() == want_pq);
-    let any_fido2_slot = header
-        .keyslots
-        .iter()
-        .any(|s| s.kind.is_sep() && s.kind.is_sep_fido2() && s.kind.is_hybrid_pq() == want_pq);
-
-    if needs_pp && passphrase.map(|p| p.is_empty()).unwrap_or(true) {
-        return Err(
-            "this vault has a Secure Enclave + passphrase keyslot; enter the slot passphrase to \
-             unlock."
-                .into(),
-        );
-    }
-    let collect_fido2 = any_fido2_slot && pin.map(|p| !p.is_empty()).unwrap_or(false);
-    if any_fido2_slot && !collect_fido2 {
-        return Err(
-            "this vault has a Secure Enclave + FIDO2 keyslot; enter the FIDO2 PIN to unlock."
-                .into(),
-        );
-    }
+    // In-scope slots this attempt can open: FIDO2-bound ones need the
+    // PIN, passphrase-bound ones the slot passphrase. A vault mixing
+    // e.g. a plain SEP slot with a SEP+FIDO2 one opens through the
+    // plain slot when no PIN was typed.
+    let in_scope = |s: &luksbox_core::Keyslot| s.kind.is_sep() && s.kind.is_hybrid_pq() == want_pq;
+    let usable = |s: &luksbox_core::Keyslot| {
+        in_scope(s)
+            && (pin.is_some() || !s.kind.is_sep_fido2())
+            && (passphrase.is_some() || !s.kind.is_sep_passphrase())
+    };
+    let collect_fido2 = sep_attempt_plan(
+        header.keyslots.iter().map(|s| s.kind),
+        want_pq,
+        pin.is_some(),
+        passphrase.is_some(),
+    )?;
 
     let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
     let mut auth = if collect_fido2 {
@@ -4342,18 +4413,23 @@ fn open_sep_common(
         None
     };
     let mut last_err: Option<String> = None;
+    // `Container::open` tries every SEP slot whose factor set matches
+    // what it is given. Non-hybrid slots without FIDO2 get no per-slot
+    // input, so one call per (passphrase or not) shape covers them all;
+    // repeating it per slot would re-prompt Touch ID for each biometric
+    // slot. (Hybrid slots each carry their own ML-KEM secret.)
+    let mut tried_shapes: Vec<bool> = Vec::new();
 
     for (idx, slot) in header.keyslots.iter().enumerate() {
-        if !slot.kind.is_sep() {
+        if !usable(slot) {
             continue;
         }
-        // Only attempt slots whose hybrid-ness matches this path.
-        if slot.kind.is_hybrid_pq() != want_pq {
-            continue;
-        }
-        // Skip FIDO2 slots when we didn't collect a PIN.
-        if slot.kind.is_sep_fido2() && !collect_fido2 {
-            continue;
+        if !want_pq && !slot.kind.is_sep_fido2() {
+            let shape = slot.kind.is_sep_passphrase();
+            if tried_shapes.contains(&shape) {
+                continue;
+            }
+            tried_shapes.push(shape);
         }
 
         // PQ shared secret for this slot (hybrid kinds only).
@@ -4393,6 +4469,8 @@ fn open_sep_common(
                         hs = Some(*s);
                         break;
                     }
+                    // Every further slot would spend another PIN retry.
+                    Err(e) if e.is_pin_failure() => return Err(format!("FIDO2: {e}")),
                     Err(e) => last_err = Some(format!("FIDO2 slot {idx}: {e}")),
                 }
             }
@@ -4404,13 +4482,16 @@ fn open_sep_common(
             None
         };
 
-        let mut unseal = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
+        let mut unseal_inner = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
             let sb = SepBlob::from_bytes(blob).map_err(|e| e.to_string())?;
             let s = sealer.unseal(&sb).map_err(|e| e.to_string())?;
             let mut out = [0u8; 32];
             out.copy_from_slice(s.as_slice());
             Ok(out)
         };
+        // `Container::open` reports only UnlockFailed; keep the reason.
+        let mut unseal_errs = luksbox_format::UnsealErrors::default();
+        let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
 
         match Container::open(
             path,
@@ -4427,7 +4508,7 @@ fn open_sep_common(
             },
         ) {
             Ok(c) => return Ok(c),
-            Err(e) => last_err = Some(format!("open slot {idx}: {e}")),
+            Err(e) => last_err = Some(format!("open slot {idx}: {}", unseal_errs.explain(e))),
         }
     }
     Err(last_err.unwrap_or_else(|| "no Secure Enclave keyslot matched the supplied factors".into()))
@@ -4507,7 +4588,7 @@ fn unlock_with_tpm2_fido2(
     header_path: Option<&Path>,
     pin: &str,
 ) -> Result<Container, String> {
-    use luksbox_fido2::{Fido2Authenticator, RP_ID};
+    use luksbox_fido2::RP_ID;
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
     let header_src = header_path.unwrap_or(path);
@@ -4532,32 +4613,30 @@ fn unlock_with_tpm2_fido2(
     let mut sealer =
         Tpm2Sealer::new().map_err(|e| format!("could not open local TPM 2.0 device: {e}"))?;
     let mut auth = make_fido2_authenticator();
-    let mut last_err: Option<String> = None;
-    for slot in &header.keyslots {
-        if slot.kind != SlotKind::Tpm2Fido2 {
-            continue;
-        }
-        let stored_cred = match slot.tpm2_fido2_cred_id() {
-            Some(c) => c.to_vec(),
-            None => continue,
-        };
-        // Declared salt convention first, then (Windows) the opposite,
-        // because webauthn.dll's salt transform is opaque.
-        for prehash in fido2_salt_conventions(slot.fido2_salt_prehashed()) {
-            let hmac_secret = match auth.hmac_secret(
-                RP_ID,
-                &stored_cred,
-                &slot.fido2_hmac_salt,
-                prehash,
-                Some(pin),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2 hmac-secret: {e}"));
-                    continue;
-                }
-            };
-            let mut unseal = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
+    // One assertion over every TPM + FIDO2 slot's credential: one prompt
+    // on Windows that accepts whichever enrolled key is presented.
+    let slots: Vec<(&luksbox_core::Keyslot, &[u8])> = header
+        .keyslots
+        .iter()
+        .filter(|s| s.kind == SlotKind::Tpm2Fido2)
+        .filter_map(|s| s.tpm2_fido2_cred_id().map(|c| (s, c)))
+        .collect();
+    let requests: Vec<luksbox_fido2::HmacSecretRequest<'_>> = slots
+        .iter()
+        .map(|&(s, cred_id)| luksbox_fido2::HmacSecretRequest {
+            cred_id,
+            salt: &s.fido2_hmac_salt,
+            prehash_salt: s.fido2_salt_prehashed(),
+        })
+        .collect();
+    luksbox_fido2::open_with_any_credential(
+        &mut auth,
+        RP_ID,
+        &requests,
+        Some(pin),
+        |i, hmac_secret| {
+            let stored_cred = slots[i].1;
+            let mut unseal_inner = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
                 let parsed = SealedBlob::from_bytes(blob)
                     .map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
                 let kek = sealer
@@ -4567,23 +4646,21 @@ fn unlock_with_tpm2_fido2(
                 out.copy_from_slice(kek.as_slice());
                 Ok(out)
             };
-            match Container::open(
+            // `Container::open` reports only UnlockFailed; keep the reason.
+            let mut unseal_errs = luksbox_format::UnsealErrors::default();
+            let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
+            Container::open(
                 path,
                 header_path,
                 UnlockMaterial::Tpm2Fido2 {
                     unseal: &mut unseal,
-                    cred_id: &stored_cred,
-                    hmac_secret: &hmac_secret,
+                    cred_id: stored_cred,
+                    hmac_secret,
                 },
-            ) {
-                Ok(cont) => return Ok(cont),
-                Err(e) => last_err = Some(e.to_string()),
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| {
-        "no Tpm2Fido2 slot matched the connected authenticator + local TPM".into()
-    }))
+            )
+            .map_err(|e| unseal_errs.explain(e))
+        },
+    )
 }
 
 #[cfg(not(feature = "fido2-hardware"))]
@@ -4668,7 +4745,7 @@ fn unlock_with_hybrid_pq_tpm2(
                 continue;
             }
         };
-        let mut unseal = |blob: &[u8]| -> Result<[u8; 32], String> {
+        let mut unseal_inner = |blob: &[u8]| -> Result<[u8; 32], String> {
             let parsed = SealedBlob::from_bytes(blob)
                 .map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
             let kek = sealer
@@ -4678,6 +4755,9 @@ fn unlock_with_hybrid_pq_tpm2(
             out.copy_from_slice(kek.as_slice());
             Ok(out)
         };
+        // `Container::open` reports only UnlockFailed; keep the reason.
+        let mut unseal_errs = luksbox_format::UnsealErrors::default();
+        let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
         match Container::open(
             path,
             header_path,
@@ -4687,7 +4767,7 @@ fn unlock_with_hybrid_pq_tpm2(
             },
         ) {
             Ok(c) => return Ok(c),
-            Err(e) => last_err = Some(e.to_string()),
+            Err(e) => last_err = Some(unseal_errs.explain(e)),
         }
     }
     Err(last_err.unwrap_or_else(|| "no hybrid-pq-tpm2 slot matched the local TPM".into()))
@@ -4712,7 +4792,7 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
     pin: &str,
     kyber_path: &Path,
 ) -> Result<Container, String> {
-    use luksbox_fido2::{Fido2Authenticator, RP_ID};
+    use luksbox_fido2::RP_ID;
     use luksbox_format::hybrid_sidecar;
     use luksbox_pq::seed_file;
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
@@ -4745,7 +4825,11 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
     let mut sealer =
         Tpm2Sealer::new().map_err(|e| format!("could not open local TPM 2.0 device: {e}"))?;
     let mut auth = make_fido2_authenticator();
-    let mut last_err: Option<String> = None;
+    // Decapsulate every hybrid TPM + FIDO2 slot's ML-KEM half first, so
+    // one assertion covers all their credentials (one prompt on Windows
+    // that accepts whichever enrolled key is presented).
+    let mut prep_err: Option<String> = None;
+    let mut slots = Vec::new();
     for (slot_idx_usize, slot) in header.keyslots.iter().enumerate() {
         if !matches!(
             slot.kind,
@@ -4754,41 +4838,39 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
             continue;
         }
         let slot_idx = slot_idx_usize as u8;
-        let stored_cred = match slot.tpm2_fido2_cred_id() {
-            Some(c) => c.to_vec(),
-            None => continue,
+        let Some(stored_cred) = slot.tpm2_fido2_cred_id() else {
+            continue;
         };
-        let entry = match hybrid_sidecar::find(&entries, slot_idx) {
-            Some(e) => e,
-            None => {
-                last_err = Some(format!("no sidecar entry for slot {slot_idx}"));
-                continue;
-            }
+        let Some(entry) = hybrid_sidecar::find(&entries, slot_idx) else {
+            prep_err = Some(format!("no sidecar entry for slot {slot_idx}"));
+            continue;
         };
-        let pq_shared = match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(format!("decap slot {slot_idx}: {e}"));
-                continue;
-            }
-        };
-        // Declared salt convention first, then (Windows) the opposite,
-        // because webauthn.dll's salt transform is opaque.
-        for prehash in fido2_salt_conventions(slot.fido2_salt_prehashed()) {
-            let hmac_secret = match auth.hmac_secret(
-                RP_ID,
-                &stored_cred,
-                &slot.fido2_hmac_salt,
-                prehash,
-                Some(pin),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2: {e}"));
-                    continue;
-                }
-            };
-            let mut unseal = |blob: &[u8]| -> Result<[u8; 32], String> {
+        match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
+            Ok(pq_shared) => slots.push((slot, stored_cred, pq_shared)),
+            Err(e) => prep_err = Some(format!("decap slot {slot_idx}: {e}")),
+        }
+    }
+    if slots.is_empty() {
+        return Err(
+            prep_err.unwrap_or_else(|| "no hybrid-pq-tpm2-fido2 slot matched all 3 factors".into())
+        );
+    }
+    let requests: Vec<luksbox_fido2::HmacSecretRequest<'_>> = slots
+        .iter()
+        .map(|(s, cred_id, _)| luksbox_fido2::HmacSecretRequest {
+            cred_id,
+            salt: &s.fido2_hmac_salt,
+            prehash_salt: s.fido2_salt_prehashed(),
+        })
+        .collect();
+    luksbox_fido2::open_with_any_credential(
+        &mut auth,
+        RP_ID,
+        &requests,
+        Some(pin),
+        |i, hmac_secret| {
+            let (_, stored_cred, pq_shared) = &slots[i];
+            let mut unseal_inner = |blob: &[u8]| -> Result<[u8; 32], String> {
                 let parsed = SealedBlob::from_bytes(blob)
                     .map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
                 let kek = sealer
@@ -4798,22 +4880,26 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
                 out.copy_from_slice(kek.as_slice());
                 Ok(out)
             };
-            match Container::open(
+            // `Container::open` reports only UnlockFailed; keep the reason.
+            let mut unseal_errs = luksbox_format::UnsealErrors::default();
+            let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
+            Container::open(
                 path,
                 header_path,
                 UnlockMaterial::HybridPqTpm2Fido2 {
                     unseal: &mut unseal,
-                    cred_id: &stored_cred,
-                    hmac_secret: &hmac_secret,
-                    pq_shared: &pq_shared,
+                    cred_id: stored_cred,
+                    hmac_secret,
+                    pq_shared,
                 },
-            ) {
-                Ok(c) => return Ok(c),
-                Err(e) => last_err = Some(e.to_string()),
-            }
-        }
-    }
-    Err(last_err.unwrap_or_else(|| "no hybrid-pq-tpm2-fido2 slot matched all 3 factors".into()))
+            )
+            .map_err(|e| unseal_errs.explain(e))
+        },
+    )
+    .map_err(|e| match prep_err {
+        Some(p) => format!("{e}; {p}"),
+        None => e,
+    })
 }
 
 #[cfg(not(feature = "fido2-hardware"))]
@@ -4853,27 +4939,197 @@ pub fn header_has_tpm(h: &Header) -> bool {
 /// method, so they know which factors are enrolled. Best-effort:
 /// returns Err with a friendly message on missing/corrupt headers,
 /// the caller falls back to "(unknown)".
-pub fn inspect_slot_kinds(vault: &Path, header_path: Option<&Path>) -> Result<Vec<String>, String> {
-    use luksbox_core::{HEADER_SIZE, keyslot::SlotKind};
-    use std::fs::File;
-    use std::io::Read;
+pub fn inspect_slots(
+    vault: &Path,
+    header_path: Option<&Path>,
+) -> Result<Vec<(usize, SlotKind)>, String> {
     let src = header_path.unwrap_or(vault);
     let mut f = File::open(src).map_err(|e| format!("open {}: {e}", src.display()))?;
     let mut bytes = [0u8; HEADER_SIZE];
     f.read_exact(&mut bytes)
         .map_err(|e| format!("read header: {e}"))?;
     let header = Header::from_bytes(&bytes).map_err(|e| format!("parse header: {e}"))?;
-    let labels: Vec<String> = header
+    Ok(header
         .keyslots
         .iter()
         .enumerate()
         .filter(|(_, s)| s.kind != SlotKind::Empty)
-        .map(|(i, s)| format!("slot {i}: {}", slot_kind_label(s.kind)))
-        .collect();
-    Ok(labels)
+        .map(|(i, s)| (i, s.kind))
+        .collect())
 }
 
-fn slot_kind_label(k: luksbox_core::keyslot::SlotKind) -> &'static str {
+/// The standard-mode unlock method that opens a keyslot of `kind`
+/// (`None` for an empty slot). Every fused / hybrid Secure Enclave
+/// kind goes through `Sep` or `HybridPqSep`, which collect the extra
+/// factors each slot binds (FIDO2 PIN, slot passphrase); the
+/// `SepFido2` / `HybridPqSepFido2` methods are deniable-only. No
+/// wildcard arm: a new slot kind must be mapped here.
+pub fn unlock_method_for_kind(kind: SlotKind) -> Option<UnlockMethod> {
+    use SlotKind as K;
+    Some(match kind {
+        K::Empty => return None,
+        K::Passphrase => UnlockMethod::Passphrase,
+        K::Fido2HmacSecret | K::Fido2DerivedMvk => UnlockMethod::Fido2,
+        K::HybridPqKemPassphrase | K::HybridPqKem1024Passphrase => UnlockMethod::HybridPq,
+        K::HybridPqKemFido2 | K::HybridPqKem1024Fido2 => UnlockMethod::HybridPqFido2,
+        K::Tpm2Sealed => UnlockMethod::Tpm2,
+        K::Tpm2SealedPin => UnlockMethod::Tpm2Pin,
+        K::Tpm2Fido2 => UnlockMethod::Tpm2Fido2,
+        K::HybridPqKemTpm2 | K::HybridPqKem1024Tpm2 => UnlockMethod::HybridPqTpm2,
+        K::HybridPqKemTpm2Fido2 | K::HybridPqKem1024Tpm2Fido2 => UnlockMethod::HybridPqTpm2Fido2,
+        K::SepSealed
+        | K::SepSealedBiometric
+        | K::SepFido2
+        | K::SepPassphrase
+        | K::SepFido2Passphrase => UnlockMethod::Sep,
+        K::HybridPqKemSep
+        | K::HybridPqKem1024Sep
+        | K::HybridPqKemSepFido2
+        | K::HybridPqKem1024SepFido2
+        | K::HybridPqKemSepPassphrase
+        | K::HybridPqKem1024SepPassphrase
+        | K::HybridPqKemSepFido2Passphrase
+        | K::HybridPqKem1024SepFido2Passphrase => UnlockMethod::HybridPqSep,
+    })
+}
+
+impl UnlockMethod {
+    /// Whether this build can perform the method: TPM 2.0 needs the
+    /// real TPM backend (Linux / Windows with `hardware`), the Secure
+    /// Enclave the real enclave backend (macOS with `hardware`), FIDO2
+    /// the `fido2-hardware` feature. Unavailable methods are not
+    /// offered, rather than failing after the user typed every factor.
+    pub fn available_here(self) -> bool {
+        let fido2 = cfg!(feature = "fido2-hardware");
+        match self {
+            Self::Tpm2
+            | Self::Tpm2Pin
+            | Self::Tpm2Fido2
+            | Self::HybridPqTpm2
+            | Self::HybridPqTpm2Fido2 => fido2 && luksbox_tpm::BACKEND_COMPILED,
+            Self::Sep | Self::HybridPqSep | Self::SepFido2 | Self::HybridPqSepFido2 => {
+                fido2 && luksbox_sep::BACKEND_COMPILED
+            }
+            Self::Fido2 | Self::HybridPqFido2 => fido2,
+            Self::Passphrase | Self::HybridPq => true,
+        }
+    }
+}
+
+/// Text of the unlock-method radio buttons; the keyslot panel and the
+/// mismatch hint quote it, so the method names always match.
+pub fn unlock_method_label(m: UnlockMethod) -> &'static str {
+    match m {
+        UnlockMethod::Passphrase => "Passphrase",
+        UnlockMethod::Fido2 => "FIDO2 security key",
+        UnlockMethod::HybridPq => "Hybrid passphrase + ML-KEM (post-quantum)",
+        UnlockMethod::HybridPqFido2 => {
+            "Hybrid FIDO2 + ML-KEM (post-quantum, authenticator + .kyber)"
+        }
+        UnlockMethod::Tpm2 => "TPM 2.0 (this machine)",
+        UnlockMethod::Tpm2Pin => "TPM 2.0 + PIN (this machine + memorised PIN)",
+        UnlockMethod::Tpm2Fido2 => "TPM 2.0 + FIDO2 (this machine AND this authenticator)",
+        UnlockMethod::HybridPqTpm2 => "Hybrid TPM 2.0 + ML-KEM (PQ + machine-bound)",
+        UnlockMethod::HybridPqTpm2Fido2 => "Hybrid TPM 2.0 + FIDO2 + ML-KEM (3 factors)",
+        UnlockMethod::Sep => {
+            "Secure Enclave (this Mac; also its Touch ID, + FIDO2 and + passphrase slots)"
+        }
+        UnlockMethod::HybridPqSep => {
+            "Hybrid Secure Enclave + ML-KEM (also its + FIDO2 and + passphrase slots)"
+        }
+        UnlockMethod::SepFido2 => "Secure Enclave + FIDO2 (deniable)",
+        UnlockMethod::HybridPqSepFido2 => "Hybrid Secure Enclave + FIDO2 + ML-KEM (deniable)",
+    }
+}
+
+/// The unlock method for a deniable envelope of kind `tag` (the
+/// envelope passphrase is collected by every method in deniable mode).
+/// A TPM envelope sealed with a PIN uses `Tpm2Pin` instead of `Tpm2`;
+/// the kind does not record which.
+pub fn deniable_kind_method(tag: luksbox_core::deniable::DeniableKindTag) -> UnlockMethod {
+    use luksbox_core::deniable::DeniableKindTag as T;
+    match tag {
+        T::Passphrase => UnlockMethod::Passphrase,
+        T::Fido2Passphrase => UnlockMethod::Fido2,
+        T::TpmPassphrase => UnlockMethod::Tpm2,
+        T::TpmFido2Passphrase => UnlockMethod::Tpm2Fido2,
+        T::HybridPqPassphrase => UnlockMethod::HybridPq,
+        T::HybridPqFido2Passphrase => UnlockMethod::HybridPqFido2,
+        T::HybridPqTpmPassphrase => UnlockMethod::HybridPqTpm2,
+        T::HybridPqTpmFido2Passphrase => UnlockMethod::HybridPqTpm2Fido2,
+        T::SepPassphrase => UnlockMethod::Sep,
+        T::SepFido2Passphrase => UnlockMethod::SepFido2,
+        T::HybridPqSepPassphrase => UnlockMethod::HybridPqSep,
+        T::HybridPqSepFido2Passphrase => UnlockMethod::HybridPqSepFido2,
+    }
+}
+
+/// Short description of a deniable envelope's credential.
+pub fn deniable_kind_label(tag: luksbox_core::deniable::DeniableKindTag) -> &'static str {
+    use luksbox_core::deniable::DeniableKindTag as T;
+    match tag {
+        T::Passphrase => "passphrase",
+        T::Fido2Passphrase => "passphrase + FIDO2",
+        T::TpmPassphrase => "passphrase + TPM 2.0 (optional TPM PIN)",
+        T::TpmFido2Passphrase => "passphrase + TPM 2.0 + FIDO2",
+        T::HybridPqPassphrase => "passphrase + ML-KEM",
+        T::HybridPqFido2Passphrase => "passphrase + FIDO2 + ML-KEM",
+        T::HybridPqTpmPassphrase => "passphrase + TPM 2.0 + ML-KEM",
+        T::HybridPqTpmFido2Passphrase => "passphrase + TPM 2.0 + FIDO2 + ML-KEM",
+        T::SepPassphrase => "passphrase + Secure Enclave",
+        T::SepFido2Passphrase => "passphrase + Secure Enclave + FIDO2",
+        T::HybridPqSepPassphrase => "passphrase + Secure Enclave + ML-KEM",
+        T::HybridPqSepFido2Passphrase => "passphrase + Secure Enclave + FIDO2 + ML-KEM",
+    }
+}
+
+/// The deniable envelopes `passphrase` opens (slot index, kind), for
+/// the unlock view: the slot table is encrypted, so this is the only
+/// way to tell which method a deniable vault needs. Costs one Argon2id
+/// derivation with the chosen parameters; reads the header only.
+pub fn identify_deniable_slots(
+    path: &Path,
+    passphrase: &str,
+    cipher: CipherSuite,
+    kdf: KdfStrength,
+) -> Result<Vec<(usize, luksbox_core::deniable::DeniableKindTag)>, String> {
+    let cred = luksbox_core::deniable::DeniableCredential::Passphrase {
+        passphrase: passphrase.as_bytes(),
+        argon2: kdf.params(),
+    };
+    Container::deniable_envelope_kinds_v2(path, &cred, cipher).map_err(|e| match e {
+        luksbox_format::Error::OpaqueUnlockFailed => "no envelope opens with this passphrase, \
+             cipher and KDF strength (or the file is not a deniable vault)"
+            .into(),
+        other => estr(other),
+    })
+}
+
+/// Whether `method` can open at least one of `slots`.
+pub fn method_opens_any(method: UnlockMethod, slots: &[(usize, SlotKind)]) -> bool {
+    slots
+        .iter()
+        .any(|&(_, k)| unlock_method_for_kind(k) == Some(method))
+}
+
+/// The unlock method to preselect for a vault with these keyslots:
+/// `preferred` when it opens one of them, otherwise the method of the
+/// lowest-numbered slot that this OS can open. `None` when no slot is
+/// openable here (e.g. a TPM-only vault on macOS).
+pub fn suggest_unlock_method(
+    slots: &[(usize, SlotKind)],
+    preferred: UnlockMethod,
+) -> Option<UnlockMethod> {
+    if method_opens_any(preferred, slots) {
+        return Some(preferred);
+    }
+    slots
+        .iter()
+        .filter_map(|&(_, k)| unlock_method_for_kind(k))
+        .find(|m| m.available_here())
+}
+
+pub(crate) fn slot_kind_label(k: luksbox_core::keyslot::SlotKind) -> &'static str {
     use luksbox_core::keyslot::SlotKind;
     match k {
         SlotKind::Empty => "empty",
@@ -4918,8 +5174,9 @@ fn unlock_with_hybrid_pq_fido2(
     seed_passphrase: &str,
     pin: &str,
     kyber_path: &Path,
+    slot_passphrase: Option<&str>,
 ) -> Result<Container, String> {
-    use luksbox_fido2::{Fido2Authenticator, RP_ID};
+    use luksbox_fido2::RP_ID;
     use luksbox_format::hybrid_sidecar;
     use luksbox_pq::seed_file;
 
@@ -4936,58 +5193,62 @@ fn unlock_with_hybrid_pq_fido2(
     let entries = hybrid_sidecar::read_for_vault(&sidecar, path, header_path).map_err(estr)?;
 
     let mut auth = make_fido2_authenticator();
-    let mut last_err: Option<String> = None;
+    // Decapsulate every hybrid FIDO2 slot's ML-KEM half first, so one
+    // assertion covers all their credentials (one prompt on Windows that
+    // accepts whichever enrolled key is presented).
+    let mut prep_err: Option<String> = None;
+    let mut slots = Vec::new();
     for (slot_idx_usize, slot) in header.keyslots.iter().enumerate() {
         if !slot.kind.is_hybrid_pq_fido2() {
             continue;
         }
         let slot_idx = slot_idx_usize as u8;
-        let entry = match hybrid_sidecar::find(&entries, slot_idx) {
-            Some(e) => e,
-            None => {
-                last_err = Some(format!("no sidecar entry for slot {slot_idx}"));
-                continue;
-            }
+        let Some(entry) = hybrid_sidecar::find(&entries, slot_idx) else {
+            prep_err = Some(format!("no sidecar entry for slot {slot_idx}"));
+            continue;
         };
-        let pq_shared = match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
-            Ok(s) => s,
+        match luksbox_pq::decapsulate_with(entry.level, &seed, &entry.ciphertext) {
+            Ok(pq_shared) => slots.push((slot_idx, slot, pq_shared)),
             Err(e) => {
-                last_err = Some(format!("decap slot {slot_idx} ({:?}): {e}", entry.level));
-                continue;
-            }
-        };
-        // Declared salt convention first, then (Windows) the opposite,
-        // because webauthn.dll's salt transform is opaque.
-        for prehash in fido2_salt_conventions(slot.fido2_salt_prehashed()) {
-            let hmac_secret = match auth.hmac_secret(
-                RP_ID,
-                &slot.fido2_cred_id,
-                &slot.fido2_hmac_salt,
-                prehash,
-                Some(pin),
-            ) {
-                Ok(s) => s,
-                Err(e) => {
-                    last_err = Some(format!("FIDO2: {e}"));
-                    continue;
-                }
-            };
-            match Container::open(
-                path,
-                header_path,
-                UnlockMaterial::HybridPqFido2 {
-                    passphrase: None,
-                    cred_id: &slot.fido2_cred_id,
-                    hmac_secret: &hmac_secret,
-                    pq_shared: &pq_shared,
-                },
-            ) {
-                Ok(c) => return Ok(c),
-                Err(e) => last_err = Some(format!("open slot {slot_idx}: {e}")),
+                prep_err = Some(format!("decap slot {slot_idx} ({:?}): {e}", entry.level));
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| "hybrid-fido2 unlock failed".into()))
+    if slots.is_empty() {
+        return Err(prep_err.unwrap_or_else(|| "this vault has no hybrid FIDO2 keyslot".into()));
+    }
+    let requests: Vec<luksbox_fido2::HmacSecretRequest<'_>> = slots
+        .iter()
+        .map(|(_, s, _)| luksbox_fido2::HmacSecretRequest {
+            cred_id: &s.fido2_cred_id,
+            salt: &s.fido2_hmac_salt,
+            prehash_salt: s.fido2_salt_prehashed(),
+        })
+        .collect();
+    luksbox_fido2::open_with_any_credential(
+        &mut auth,
+        RP_ID,
+        &requests,
+        Some(pin),
+        |i, hmac_secret| {
+            let (slot_idx, slot, pq_shared) = &slots[i];
+            Container::open(
+                path,
+                header_path,
+                UnlockMaterial::HybridPqFido2 {
+                    passphrase: slot_passphrase.map(str::as_bytes),
+                    cred_id: &slot.fido2_cred_id,
+                    hmac_secret,
+                    pq_shared,
+                },
+            )
+            .map_err(|e| format!("open slot {slot_idx}: {e}"))
+        },
+    )
+    .map_err(|e| match prep_err {
+        Some(p) => format!("{e}; {p}"),
+        None => e,
+    })
 }
 
 #[cfg(not(feature = "fido2-hardware"))]
@@ -4997,6 +5258,7 @@ fn unlock_with_hybrid_pq_fido2(
     _seed_passphrase: &str,
     _pin: &str,
     _kyber_path: &Path,
+    _slot_passphrase: Option<&str>,
 ) -> Result<Container, String> {
     Err("FIDO2 hardware support not compiled in".into())
 }
@@ -6143,11 +6405,6 @@ pub fn enroll_hybrid_pq_tpm2_fido2_deniable(
     Ok(idx)
 }
 
-/// Enroll a TPM 2.0-bound keyslot in the open vault. Generates a
-/// random 32-byte KEK, asks the local TPM 2.0 to seal it, and
-/// installs a `Tpm2Sealed` slot wrapping the MVK under that KEK.
-/// No passphrase, no FIDO2 - subsequent unlocks via TPM only.
-#[cfg(feature = "fido2-hardware")]
 /// R15-D1: apply the create form's "header format v3" choice to a vault
 /// a create path just produced (every create path funnels through this,
 /// so the individual creators stay untouched). An attached anchor is
@@ -6170,6 +6427,11 @@ pub fn upgrade_header_v3(vfs: &mut Vfs) -> Result<bool, String> {
     vfs.upgrade_header_to_v3().map_err(estr)
 }
 
+/// Enroll a TPM 2.0-bound keyslot in the open vault. Generates a
+/// random 32-byte KEK, asks the local TPM 2.0 to seal it, and
+/// installs a `Tpm2Sealed` slot wrapping the MVK under that KEK.
+/// No passphrase, no FIDO2 - subsequent unlocks via TPM only.
+#[cfg(feature = "fido2-hardware")]
 pub fn enroll_tpm2(vfs: &mut Vfs) -> Result<usize, String> {
     use luksbox_tpm::Tpm2Sealer;
     use zeroize::Zeroizing;
@@ -6401,6 +6663,9 @@ pub fn enroll_hybrid_pq_sep(
     } else {
         Vec::new()
     };
+    // Drop a stale entry for this index (revoke + re-enroll): the
+    // sidecar refuses duplicate slot indices.
+    entries.retain(|e| usize::from(e.slot_idx) != idx);
     entries.push(HybridEntry {
         slot_idx: idx as u8,
         level: params,
@@ -6593,6 +6858,9 @@ pub fn enroll_sep_fused(
     } else {
         Vec::new()
     };
+    // Drop a stale entry for this index (revoke + re-enroll): the
+    // sidecar refuses duplicate slot indices.
+    entries.retain(|e| usize::from(e.slot_idx) != idx);
     entries.push(HybridEntry {
         slot_idx: idx as u8,
         level: params,
@@ -6725,6 +6993,9 @@ pub fn enroll_hybrid_pq_tpm2(
     } else {
         Vec::new()
     };
+    // Drop a stale entry for this index (revoke + re-enroll): the
+    // sidecar refuses duplicate slot indices.
+    entries.retain(|e| usize::from(e.slot_idx) != idx);
     entries.push(HybridEntry {
         slot_idx: idx as u8,
         level: params,
@@ -6879,6 +7150,9 @@ pub fn enroll_hybrid_pq_tpm2_fido2(
     } else {
         Vec::new()
     };
+    // Drop a stale entry for this index (revoke + re-enroll): the
+    // sidecar refuses duplicate slot indices.
+    entries.retain(|e| usize::from(e.slot_idx) != idx);
     entries.push(HybridEntry {
         slot_idx: idx as u8,
         level: params,
@@ -6965,8 +7239,13 @@ fn unlock_with_tpm2_pin(
 
     let mut sealer =
         Tpm2Sealer::new().map_err(|e| format!("could not open local TPM 2.0 device: {e}"))?;
-    let pin_bytes = pin.as_bytes().to_vec();
-    let mut unseal = move |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
+    let pin_bytes = Zeroizing::new(pin.as_bytes().to_vec());
+    let mut unseal_inner = |blob: &[u8]| -> std::result::Result<[u8; 32], String> {
+        // Plain TPM slots are handed over too; presenting a PIN to one
+        // fails and counts toward the TPM's dictionary-attack lockout.
+        if !header.tpm2_blob_needs_pin(blob) {
+            return Err("TPM slot without a PIN (TPM 2.0 method)".into());
+        }
         let parsed =
             SealedBlob::from_bytes(blob).map_err(|e| format!("malformed TPM SealedBlob: {e}"))?;
         let kek = sealer
@@ -6976,6 +7255,9 @@ fn unlock_with_tpm2_pin(
         out.copy_from_slice(kek.as_slice());
         Ok(out)
     };
+    // `Container::open` reports only UnlockFailed; keep the reason.
+    let mut unseal_errs = luksbox_format::UnsealErrors::default();
+    let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
     Container::open(
         path,
         header_path,
@@ -6983,7 +7265,7 @@ fn unlock_with_tpm2_pin(
             unseal: &mut unseal,
         },
     )
-    .map_err(estr)
+    .map_err(|e| unseal_errs.explain(e))
 }
 
 #[cfg(not(feature = "fido2-hardware"))]
@@ -6993,6 +7275,46 @@ fn unlock_with_tpm2_pin(
     _pin: &str,
 ) -> Result<Container, String> {
     Err("TPM 2.0 + PIN unlock requires --features hardware".into())
+}
+
+/// Revoke a deniable slot: overwrite it with random bytes, so whatever
+/// credential it held stops opening the vault. Deniable slots cannot be
+/// listed (an unused slot is random bytes too), so the caller names the
+/// index, typically one found with [`find_deniable_slots`] or the one
+/// picked at enroll time. Refuses the slot this session was unlocked
+/// with, which would lock the user out.
+pub fn revoke_deniable_slot(vfs: &mut Vfs, slot: usize) -> Result<(), String> {
+    let cont = vfs.container_mut();
+    if cont.deniable_unlocked_slot() == Some(slot) {
+        return Err(format!(
+            "slot {slot} holds the credential this session was unlocked with; revoking it \
+             would lock you out (unlock with another credential first)"
+        ));
+    }
+    cont.clear_deniable_slot(slot).map_err(estr)?;
+    cont.persist_header().map_err(estr)
+}
+
+/// The deniable slots `passphrase` opens, from
+/// `Container::deniable_header_snapshot` (one Argon2id derivation, so
+/// callers run it off the UI thread). Also finds slots whose second
+/// factor (FIDO2, TPM, Secure Enclave) is not present.
+pub fn find_deniable_slots(
+    snapshot: (Vec<u8>, CipherSuite),
+    passphrase: &str,
+    kdf: KdfStrength,
+) -> Result<Vec<(usize, luksbox_core::deniable::DeniableKindTag)>, String> {
+    let (bytes, cipher) = snapshot;
+    let cred = luksbox_core::deniable::DeniableCredential::Passphrase {
+        passphrase: passphrase.as_bytes(),
+        argon2: kdf.params(),
+    };
+    luksbox_format::deniable_header::envelope_kinds_v2(&bytes, &cred, cipher).map_err(|e| match e {
+        luksbox_format::Error::OpaqueUnlockFailed => {
+            "no slot opens with this passphrase at this KDF strength".into()
+        }
+        other => estr(other),
+    })
 }
 
 pub fn revoke_keyslot(vfs: &mut Vfs, slot: usize) -> Result<(), String> {
@@ -7261,6 +7583,9 @@ pub fn enroll_hybrid_pq_passphrase(
     } else {
         Vec::new()
     };
+    // Drop a stale entry for this index (revoke + re-enroll): the
+    // sidecar refuses duplicate slot indices.
+    entries.retain(|e| usize::from(e.slot_idx) != idx);
     entries.push(HybridEntry {
         slot_idx: idx as u8,
         level: params,
@@ -7390,6 +7715,9 @@ pub fn enroll_hybrid_pq_fido2(
     } else {
         Vec::new()
     };
+    // Drop a stale entry for this index (revoke + re-enroll): the
+    // sidecar refuses duplicate slot indices.
+    entries.retain(|e| usize::from(e.slot_idx) != idx);
     entries.push(HybridEntry {
         slot_idx: idx as u8,
         level: params,
@@ -7849,5 +8177,439 @@ mod browser_ops_tests {
         assert!(move_entry(&mut vfs, "/", "docs", "/docs").is_err());
         assert!(move_entry(&mut vfs, "/", "docs", "/docs/sub").is_err());
         assert!(vfs.lookup_path("/docs/c.txt").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod unlock_method_tests {
+    use super::{UnlockMethod, method_opens_any, suggest_unlock_method, unlock_method_for_kind};
+    use luksbox_core::SlotKind;
+
+    #[test]
+    fn fused_and_hybrid_sep_kinds_map_to_the_two_sep_methods() {
+        for k in [
+            SlotKind::SepSealed,
+            SlotKind::SepSealedBiometric,
+            SlotKind::SepFido2,
+            SlotKind::SepPassphrase,
+            SlotKind::SepFido2Passphrase,
+        ] {
+            assert_eq!(unlock_method_for_kind(k), Some(UnlockMethod::Sep), "{k:?}");
+        }
+        for k in [
+            SlotKind::HybridPqKemSep,
+            SlotKind::HybridPqKem1024Sep,
+            SlotKind::HybridPqKemSepFido2,
+            SlotKind::HybridPqKem1024SepFido2,
+            SlotKind::HybridPqKemSepPassphrase,
+            SlotKind::HybridPqKem1024SepPassphrase,
+            SlotKind::HybridPqKemSepFido2Passphrase,
+            SlotKind::HybridPqKem1024SepFido2Passphrase,
+        ] {
+            assert_eq!(
+                unlock_method_for_kind(k),
+                Some(UnlockMethod::HybridPqSep),
+                "{k:?}"
+            );
+        }
+        assert_eq!(unlock_method_for_kind(SlotKind::Empty), None);
+    }
+
+    /// The reported case: a vault whose only slot is Secure Enclave +
+    /// FIDO2 + ML-KEM-1024, opened with the (FIDO2-device) guess.
+    #[test]
+    fn sep_fido2_kem_vault_suggests_hybrid_sep_where_available() {
+        let slots = [(0, SlotKind::HybridPqKem1024SepFido2)];
+        assert!(!method_opens_any(UnlockMethod::HybridPqFido2, &slots));
+        assert!(!method_opens_any(UnlockMethod::Fido2, &slots));
+        let s = suggest_unlock_method(&slots, UnlockMethod::HybridPqFido2);
+        if UnlockMethod::HybridPqSep.available_here() {
+            assert_eq!(s, Some(UnlockMethod::HybridPqSep));
+        } else {
+            assert_eq!(s, None);
+        }
+    }
+
+    #[test]
+    fn a_matching_preferred_method_is_kept() {
+        let slots = [(0, SlotKind::Passphrase), (1, SlotKind::Fido2HmacSecret)];
+        assert_eq!(
+            suggest_unlock_method(&slots, UnlockMethod::Fido2),
+            Some(UnlockMethod::Fido2)
+        );
+        // Otherwise the lowest slot's method wins.
+        assert_eq!(
+            suggest_unlock_method(&slots, UnlockMethod::HybridPq),
+            Some(UnlockMethod::Passphrase)
+        );
+    }
+
+    #[test]
+    fn deniable_only_methods_never_match_a_standard_slot() {
+        let slots = [(0, SlotKind::SepFido2), (1, SlotKind::HybridPqKemSepFido2)];
+        assert!(!method_opens_any(UnlockMethod::SepFido2, &slots));
+        assert!(!method_opens_any(UnlockMethod::HybridPqSepFido2, &slots));
+    }
+}
+
+#[cfg(test)]
+mod sep_attempt_plan_tests {
+    use super::sep_attempt_plan;
+    use luksbox_core::SlotKind::{self, *};
+
+    fn plan(kinds: &[SlotKind], want_pq: bool, pin: bool, pp: bool) -> Result<bool, String> {
+        sep_attempt_plan(kinds.iter().copied(), want_pq, pin, pp)
+    }
+
+    /// Mixed vaults open through whichever slot the typed factors reach.
+    #[test]
+    fn a_plain_slot_opens_without_the_factors_other_slots_need() {
+        assert_eq!(plan(&[SepSealed, SepFido2], false, false, false), Ok(false));
+        assert_eq!(
+            plan(&[SepSealed, SepPassphrase], false, false, false),
+            Ok(false)
+        );
+        assert_eq!(plan(&[SepSealed, SepFido2], false, true, false), Ok(true));
+        assert_eq!(
+            plan(&[HybridPqKemSep, HybridPqKemSepFido2], true, false, false),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn missing_factors_are_named() {
+        let e = plan(&[SepFido2], false, false, false).unwrap_err();
+        assert!(e.contains("FIDO2 PIN") && !e.contains("passphrase"), "{e}");
+        let e = plan(&[SepPassphrase], false, false, false).unwrap_err();
+        assert!(e.contains("passphrase") && !e.contains("FIDO2"), "{e}");
+        let e = plan(&[SepFido2Passphrase], false, false, false).unwrap_err();
+        assert!(e.contains("FIDO2 PIN") && e.contains("passphrase"), "{e}");
+        // The only slot is hybrid but the non-hybrid method was picked.
+        let e = plan(&[HybridPqKem1024SepFido2], false, true, true).unwrap_err();
+        assert!(e.contains("no Secure Enclave keyslot"), "{e}");
+    }
+}
+
+/// Real Secure Enclave runs of the GUI's unlock paths. Opt-in: run on a
+/// Mac with `--ignored` and `LUKSBOX_REAL_SEP_DIR` pointing at a vault
+/// made by the CLI (`v.lbx` with a SEP + passphrase slot, a hybrid SEP
+/// slot whose seed is `h.kyber` and a hybrid SEP + passphrase slot whose
+/// seed is `h2.kyber`); see the PR notes for the script.
+#[cfg(all(test, target_os = "macos", feature = "hardware"))]
+mod real_sep_tests {
+    use super::*;
+
+    fn opts(dir: &Path, method: UnlockMethod) -> UnlockOpts {
+        UnlockOpts {
+            path: dir.join("v.lbx"),
+            header_path: None,
+            anchor_path: None,
+            method,
+            passphrase: None,
+            pin: None,
+            hybrid_kyber_path: None,
+            hybrid_seed_pw: None,
+            use_deniable: false,
+            deniable_cipher: CipherSuite::Aes256GcmSiv,
+            deniable_kdf: KdfStrength::Interactive,
+            recovery_mode: false,
+        }
+    }
+
+    fn secret(s: &str) -> Option<Zeroizing<String>> {
+        Some(Zeroizing::new(s.to_owned()))
+    }
+
+    #[test]
+    #[ignore = "needs the Secure Enclave and LUKSBOX_REAL_SEP_DIR"]
+    fn gui_unlock_paths_against_the_real_secure_enclave() {
+        let Some(dir) = std::env::var_os("LUKSBOX_REAL_SEP_DIR").map(PathBuf::from) else {
+            eprintln!("LUKSBOX_REAL_SEP_DIR not set; skipping");
+            return;
+        };
+        let slot_pw = std::env::var("LUKSBOX_REAL_SEP_SLOT_PW").unwrap();
+        let seed_pw = std::env::var("LUKSBOX_REAL_SEP_SEED_PW").unwrap();
+
+        // Slot 0 is the passphrase the vault was made with, so that is the
+        // suggestion; every Secure Enclave slot maps to an offered method.
+        let slots = inspect_slots(&dir.join("v.lbx"), None).unwrap();
+        assert_eq!(
+            suggest_unlock_method(&slots, UnlockMethod::Fido2),
+            Some(UnlockMethod::Passphrase)
+        );
+        for &(i, k) in slots.iter().filter(|(_, k)| k.is_sep()) {
+            let m = unlock_method_for_kind(k).unwrap();
+            assert!(
+                matches!(m, UnlockMethod::Sep | UnlockMethod::HybridPqSep) && m.available_here(),
+                "slot {i}: {k:?} -> {m:?}"
+            );
+        }
+
+        // SEP + passphrase slot: the passphrase is required and opens it.
+        let e = unlock_vault(opts(&dir, UnlockMethod::Sep)).err().unwrap();
+        assert!(e.contains("slot passphrase"), "{e}");
+        let mut o = opts(&dir, UnlockMethod::Sep);
+        o.passphrase = secret(&slot_pw);
+        unlock_vault(o).expect("SEP + passphrase via the Secure Enclave method");
+
+        // Hybrid SEP slot (seed h.kyber).
+        let mut o = opts(&dir, UnlockMethod::HybridPqSep);
+        o.passphrase = secret(&seed_pw);
+        o.hybrid_kyber_path = Some(dir.join("h.kyber"));
+        unlock_vault(o).expect("hybrid SEP + ML-KEM");
+
+        // Hybrid SEP + passphrase slot (seed h2.kyber, same passphrase).
+        let mut o = opts(&dir, UnlockMethod::HybridPqSep);
+        o.passphrase = secret(&slot_pw);
+        o.hybrid_seed_pw = secret(&slot_pw);
+        o.hybrid_kyber_path = Some(dir.join("h2.kyber"));
+        unlock_vault(o).expect("hybrid SEP + passphrase + ML-KEM-1024");
+
+        // A wrong slot passphrase names the reason instead of a bare failure.
+        let mut o = opts(&dir, UnlockMethod::Sep);
+        o.passphrase = secret("wrong");
+        let e = unlock_vault(o).err().unwrap();
+        assert!(!e.is_empty(), "{e}");
+
+        // The FIDO2 method cannot open any of these slots.
+        let mut o = opts(&dir, UnlockMethod::Fido2);
+        o.pin = secret("0000");
+        assert!(unlock_vault(o).is_err());
+    }
+}
+
+/// Real-TPM runs of the GUI's TPM unlock paths against `swtpm`. Opt-in:
+/// `--ignored` with `TCTI_NAME_CONF=swtpm:path=...` (and `tpm2-tools`
+/// on PATH to read the lockout counter).
+#[cfg(all(
+    test,
+    feature = "hardware",
+    any(target_os = "linux", target_os = "windows")
+))]
+mod real_tpm_tests {
+    use super::*;
+
+    fn lockout_counter() -> Option<u32> {
+        let out = std::process::Command::new("tpm2_getcap")
+            .arg("properties-variable")
+            .output()
+            .ok()?;
+        // `TPM2_PT_LOCKOUT_COUNTER: 0x1`
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let value = text
+            .lines()
+            .find(|l| l.trim_start().starts_with("TPM2_PT_LOCKOUT_COUNTER"))?
+            .split(':')
+            .nth(1)?
+            .trim()
+            .trim_start_matches("0x")
+            .to_owned();
+        u32::from_str_radix(&value, 16).ok()
+    }
+
+    fn opts(path: &Path, method: UnlockMethod, pin: Option<&str>) -> UnlockOpts {
+        UnlockOpts {
+            path: path.to_path_buf(),
+            header_path: None,
+            anchor_path: None,
+            method,
+            passphrase: None,
+            pin: pin.map(|p| Zeroizing::new(p.to_owned())),
+            hybrid_kyber_path: None,
+            hybrid_seed_pw: None,
+            use_deniable: false,
+            deniable_cipher: CipherSuite::Aes256GcmSiv,
+            deniable_kdf: KdfStrength::Interactive,
+            recovery_mode: false,
+        }
+    }
+
+    #[test]
+    #[ignore = "needs swtpm via TCTI_NAME_CONF"]
+    fn gui_tpm_unlock_paths_against_swtpm() {
+        if std::env::var_os("TCTI_NAME_CONF").is_none() {
+            eprintln!("TCTI_NAME_CONF not set; skipping");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v.lbx");
+        let kdf = Argon2idParams {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let cont = Container::create_with_passphrase_flags(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            kdf,
+            0,
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        enroll_tpm2(&mut vfs).unwrap();
+        enroll_tpm2_pin(&mut vfs, "1357").unwrap();
+        drop(vfs);
+        let start = lockout_counter().expect("read the TPM lockout counter (tpm2-tools)");
+
+        unlock_vault(opts(&path, UnlockMethod::Tpm2, None)).expect("plain TPM slot");
+        unlock_vault(opts(&path, UnlockMethod::Tpm2Pin, Some("1357"))).expect("TPM + PIN slot");
+        // Neither method presented the wrong authorization to the other
+        // kind's slot, so the dictionary-attack counter did not move.
+        assert_eq!(
+            lockout_counter(),
+            Some(start),
+            "a correct unlock counted as a TPM auth failure"
+        );
+
+        let e = unlock_vault(opts(&path, UnlockMethod::Tpm2Pin, Some("0000")))
+            .err()
+            .unwrap();
+        assert!(
+            e.contains("TPM unseal (with PIN)"),
+            "the TPM's reason is surfaced: {e}"
+        );
+        assert_eq!(
+            lockout_counter(),
+            Some(start + 1),
+            "one wrong PIN, one failure"
+        );
+    }
+}
+
+#[cfg(test)]
+mod identify_deniable_tests {
+    use super::*;
+
+    /// The unlock view's "Identify keyslot" names the envelope a
+    /// passphrase opens in a real deniable vault file, and says so
+    /// plainly for a wrong passphrase.
+    #[test]
+    fn identifies_the_envelope_of_a_deniable_vault() {
+        use luksbox_core::deniable::{DeniableCredential, DeniableKindTag};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("d.lbx");
+        let cred = DeniableCredential::Passphrase {
+            passphrase: b"envelope pass",
+            argon2: KdfStrength::Interactive.params(),
+        };
+        Container::create_with_credential_v2_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            2,
+            &cred,
+            &luksbox_format::deniable_header::DeniableMaterial::passphrase_only(),
+        )
+        .unwrap();
+        let found = identify_deniable_slots(
+            &path,
+            "envelope pass",
+            CipherSuite::Aes256GcmSiv,
+            KdfStrength::Interactive,
+        )
+        .unwrap();
+        assert_eq!(found, vec![(2, DeniableKindTag::Passphrase)]);
+        assert_eq!(
+            deniable_kind_method(DeniableKindTag::Passphrase),
+            UnlockMethod::Passphrase
+        );
+        let e = identify_deniable_slots(
+            &path,
+            "wrong",
+            CipherSuite::Aes256GcmSiv,
+            KdfStrength::Interactive,
+        )
+        .unwrap_err();
+        assert!(e.contains("no envelope opens"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod deniable_keyslots_tests {
+    use super::*;
+    use luksbox_core::deniable::{DeniableCredential, DeniableKindTag};
+
+    fn cheap() -> Argon2idParams {
+        Argon2idParams {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        }
+    }
+
+    fn open(path: &Path, pw: &[u8]) -> Result<Container, luksbox_format::Error> {
+        let cred = DeniableCredential::Passphrase {
+            passphrase: pw,
+            argon2: cheap(),
+        };
+        let env = Container::try_open_envelope_v2_deniable(
+            path,
+            None,
+            &cred,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )?;
+        Container::complete_open_v2_deniable(env, &cred)
+    }
+
+    /// The Keyslots view's deniable section: find a second credential's
+    /// slot by its passphrase, refuse to revoke the session's own slot,
+    /// revoke the other one for good.
+    #[test]
+    fn find_and_revoke_a_deniable_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("d.lbx");
+        let admin = DeniableCredential::Passphrase {
+            passphrase: b"admin",
+            argon2: cheap(),
+        };
+        let mut c = Container::create_with_credential_v2_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            0,
+            &admin,
+            &luksbox_format::deniable_header::DeniableMaterial::passphrase_only(),
+        )
+        .unwrap();
+        c.enroll_passphrase_deniable(4, b"weak", cheap()).unwrap();
+        c.persist_header().unwrap();
+        drop(c);
+
+        let mut vfs = Vfs::open(open(&path, b"admin").unwrap()).unwrap();
+        let kdf_for_test = |pw: &str| {
+            let (bytes, cipher) = vfs.container().deniable_header_snapshot().unwrap();
+            let cred = DeniableCredential::Passphrase {
+                passphrase: pw.as_bytes(),
+                argon2: cheap(),
+            };
+            luksbox_format::deniable_header::envelope_kinds_v2(&bytes, &cred, cipher)
+        };
+        assert_eq!(
+            kdf_for_test("weak").unwrap(),
+            vec![(4, DeniableKindTag::Passphrase)]
+        );
+
+        let e = revoke_deniable_slot(&mut vfs, 0).unwrap_err();
+        assert!(e.contains("lock you out"), "{e}");
+        revoke_deniable_slot(&mut vfs, 4).unwrap();
+        drop(vfs);
+
+        assert!(
+            open(&path, b"weak").is_err(),
+            "the revoked credential still opens"
+        );
+        assert!(open(&path, b"admin").is_ok());
+        // The finder's own error wording for a passphrase nothing opens.
+        let snapshot = open(&path, b"admin")
+            .unwrap()
+            .deniable_header_snapshot()
+            .unwrap();
+        let e = find_deniable_slots(snapshot, "weak", KdfStrength::Interactive).unwrap_err();
+        assert!(e.contains("no slot opens"), "{e}");
     }
 }

@@ -137,6 +137,114 @@ Follow-up fixes for two items the Round 15 report had left tracked:
 - GUI: renaming an entry, or moving one into a folder, onto the name of
   an existing file silently replaced that file (POSIX `rename`
   semantics). Both are now refused with an "already exists" error.
+- **Secure Enclave + FIDO2 (+ ML-KEM) vaults: the GUI pre-selected an
+  unlock method that cannot open them.** The method was guessed from
+  coarse "has FIDO2 / has hybrid" flags, so a vault whose slot is
+  Secure Enclave + FIDO2 + ML-KEM landed on the FIDO2 method and failed
+  with "FIDO2 unlock failed"; the method that opens it ("Hybrid Secure
+  Enclave + ML-KEM", which also collects the FIDO2 PIN) never mentioned
+  FIDO2. The unlock view now reads the keyslot kinds for whatever vault
+  path is in the form (recent entry, Browse or typed), switches to a
+  method that opens one of them, shows "unlock with: ..." under every
+  slot, and warns when the selected method opens none. The two Secure
+  Enclave methods now say they cover the + FIDO2 / + passphrase slots.
+- **Every keyslot combination, in every front end.** An audit of the 27
+  standard keyslot kinds and the 12 deniable credentials across the CLI,
+  the TUI and the GUI fixed these:
+  - **TPM + PIN slots cost a dictionary-attack strike per unlock.** The
+    CLI and TUI tried a PIN-less unseal first; the GUI's "TPM 2.0" and
+    "TPM 2.0 + PIN" methods presented the wrong authorization to the
+    other kind's slots. Each mismatch counts toward the TPM's lockout.
+    The PIN now goes to exactly the PIN-protected slots; with both kinds
+    present it can be left empty to use the plain ones. The CLI reads it
+    from `LUKSBOX_TPM_PIN` or the terminal, never from the passphrase
+    pipe or `LUKSBOX_PASSPHRASE`.
+  - **Deniable TPM vaults created with the optional TPM PIN** could not
+    be opened from the CLI or the TUI; both now ask for it.
+  - **Hybrid passphrase + ML-KEM slots whose `.kyber` seed has its own
+    passphrase** (as the TUI's and GUI's "add" flows allow) could not be
+    opened from the CLI or the TUI. Both now ask for the seed-file
+    passphrase when the slot passphrase does not decrypt the seed (CLI:
+    `LUKSBOX_SEED_PASSPHRASE`).
+  - **Hybrid FIDO2 + ML-KEM slots enrolled from the TUI with its optional
+    extra passphrase** could not be opened anywhere. The CLI and TUI ask
+    for it when the slot does not open without one (no extra touch;
+    CLI: `LUKSBOX_SLOT_PASSPHRASE`); the GUI has an "extra slot
+    passphrase" field.
+  - **A wrong FIDO2 PIN moved on to the next keyslot**, spending another
+    of the authenticator's 8 PIN retries per slot (and the TUI sent it
+    twice per Secure Enclave + FIDO2 slot). Unlock now stops at the
+    first PIN rejection.
+  - **Mixed Secure Enclave vaults** (a plain slot next to a + FIDO2 or
+    + passphrase one) opened in the GUI only once every factor was
+    typed; they now open through whichever slot the typed factors
+    reach. In the CLI and TUI the slot passphrase can be left empty to
+    use the other slots, and a failed attempt no longer repeats Touch ID
+    prompts.
+  - **Re-enrolling a hybrid kind in the slot of a revoked one** left an
+    unopenable slot (the stale ML-KEM sidecar entry made the write
+    fail) in the TUI's, the GUI's and the CLI's TPM / Secure Enclave
+    hybrid enrolls. The stale entry is now replaced.
+  - CLI: `enroll` of a hybrid TPM / Secure Enclave kind on a vault whose
+    only slots are hybrid can unlock with the new
+    `--unlock-pq-hybrid PATH` (there `--pq-hybrid` names the new seed).
+  - Deniable Secure Enclave + ML-KEM create (CLI, TUI): a blank seed
+    passphrase now means "reuse the envelope passphrase", which is how
+    every unlock path reads a blank answer (a blank one was unusable);
+    a distinct one is asked twice.
+  - TPM and Secure Enclave options are offered only by builds that
+    contain the real backend (TUI menu, GUI methods), and the messages
+    on the wrong OS no longer suggest a rebuild ("macOS has no TPM
+    2.0"). CLI unlock hints only name flags this OS can use.
+  - GUI: the deniable Secure Enclave forms had the envelope and seed
+    passphrase fields mislabelled.
+  - **GUI: a vault created in deniable mode was added to the
+    recent-vaults list** (the create path bypassed the R15-I2 filter),
+    recording its path on disk. It no longer is. If you created deniable
+    vaults with an earlier GUI, remove them from the list (right-click >
+    Forget from history).
+  - The GUI builds again without default features (no hardware).
+  - **The reason a TPM or Secure Enclave unseal failed is no longer
+    lost.** The format layer treats an unseal error as "try the next
+    slot" and reported only "unlock failed"; the CLI, the TUI and the
+    GUI now append the reasons (TPM lockout, SRK mismatch, cancelled
+    Touch ID, wrong TPM PIN, PIN slot skipped).
+  - **One prompt for every FIDO2 slot of the combined kinds** (TPM +
+    FIDO2, hybrid FIDO2, hybrid TPM + FIDO2), as the plain FIDO2 unlock
+    already did: all the slots' credentials go into one assertion, so on
+    Windows the prompt accepts whichever enrolled key is presented
+    (issue #28's "this security key doesn't look familiar" for a backup
+    key, one prompt per slot). The sequential libfido2 path also stops
+    at the first wrong PIN now.
+  - **Deniable vaults in the GUI unlock view.** The keyslot panel used
+    to show a red "could not inspect slots" for every deniable vault. It
+    now explains that the slot table is encrypted and offers "Identify
+    keyslot": with the envelope passphrase (and cipher / KDF strength)
+    it lists the envelopes that passphrase opens and their credential
+    type, and switches to the matching method. Nothing is unlocked or
+    written. In all three front ends a credential-type mismatch now
+    names the type the envelope actually has (CLI: the `--credential`
+    value to rerun with) instead of "credential kind mismatch".
+  - **Deniable vaults in the GUI Keyslots view.** It showed eight
+    placeholder "empty" slots and could revoke none of the real ones.
+    A deniable section now says which slot the session was unlocked
+    with, finds the slot(s) a credential uses from its envelope
+    passphrase and Argon2id strength (its FIDO2 key / TPM / Secure
+    Enclave is not needed for that), and revokes a slot by number, with
+    a confirmation; the session's own slot is refused. The slots
+    themselves still cannot be listed: an unused slot is random bytes
+    and each used one is sealed under its own passphrase, which is the
+    point of a deniable vault. A credential whose slot is unknown is
+    shut out by rotating the master key.
+- CLI: `--pq-hybrid` / `--sep` no longer refuse a vault whose only
+  matching Secure Enclave slots need FIDO2 when `--fido2` is missing;
+  they collect the authenticator, as there is no other way in.
+  `--fido2` on a vault without plain FIDO2 slots now names the flags
+  that do open it.
+- TUI: with a Secure Enclave + FIDO2 and a Secure Enclave + FIDO2 +
+  passphrase slot side by side, the first could not be opened from the
+  wizard (the slot passphrase was offered to every slot, and the
+  format layer skips a slot whose factors don't match).
 - GUI recent list: right-clicking a vault now offers "Delete vault..."
   next to "Forget from history...", opening the confirm dialog worded
   for deleting (the X button's dialog already had the delete option).

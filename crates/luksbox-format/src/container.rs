@@ -1521,6 +1521,23 @@ impl Container {
         })
     }
 
+    /// Every envelope the passphrase in `credential` opens in the
+    /// deniable vault at `path`, as (slot index, credential kind).
+    /// Read-only: tells the user which unlock method the envelope needs
+    /// (see `deniable_header::envelope_kinds_v2`).
+    pub fn deniable_envelope_kinds_v2(
+        path: &Path,
+        credential: &luksbox_core::deniable::DeniableCredential,
+        cipher: CipherSuite,
+    ) -> Result<Vec<(usize, luksbox_core::deniable::DeniableKindTag)>, Error> {
+        use luksbox_core::deniable::DENIABLE_HEADER_SIZE;
+        let mut file = luksbox_core::file_util::open_existing_read_no_follow_policy(path)?;
+        let mut header_buf = vec![0u8; DENIABLE_HEADER_SIZE];
+        file.read_exact(&mut header_buf)
+            .map_err(|_| Error::OpaqueUnlockFailed)?;
+        crate::deniable_header::envelope_kinds_v2(&header_buf, credential, cipher)
+    }
+
     /// v2 deniable open, phase 1. Returns the matched slot's payload
     /// (kind tag + `cred_id` + `hmac_salt` + `tpm_blob`) plus the
     /// envelope KEK that the caller needs to pass back into
@@ -1890,6 +1907,17 @@ impl Container {
         crate::deniable_header::clear_slot(&mut den.bytes, slot_idx)?;
         self.header_dirty = true;
         Ok(())
+    }
+
+    /// The deniable header as it stands in memory (with any slot change
+    /// not yet persisted) and the vault's cipher, for finding which slot
+    /// a passphrase opens (`deniable_header::envelope_kinds_v2`) off the
+    /// UI thread. The bytes are the encrypted on-disk header; `None` for
+    /// a standard vault.
+    pub fn deniable_header_snapshot(&self) -> Option<(Vec<u8>, CipherSuite)> {
+        self.deniable
+            .as_ref()
+            .map(|d| (d.bytes.to_vec(), d.inner.cipher_suite))
     }
 
     /// Returns true if this Container was opened from a deniable-mode
@@ -8107,6 +8135,38 @@ mod tests {
         drop(c);
         let c = open_deniable(&path, &admin).unwrap();
         assert_eq!(c.header_generation(), Some(3));
+    }
+
+    /// The snapshot finds the slot a passphrase opens, before and after
+    /// a revoke that has not been persisted yet.
+    #[test]
+    fn deniable_snapshot_finds_slots_by_passphrase() {
+        use luksbox_core::deniable::{DeniableCredential, DeniableKindTag};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("d.lbx");
+        let admin = DeniableCredential::Passphrase {
+            passphrase: b"admin",
+            argon2: cheap_argon2(),
+        };
+        let user = DeniableCredential::Passphrase {
+            passphrase: b"user",
+            argon2: cheap_argon2(),
+        };
+        deniable_v3_vault(&path, &admin);
+        let mut c = open_deniable(&path, &admin).unwrap();
+        c.enroll_passphrase_deniable(6, b"user", cheap_argon2())
+            .unwrap();
+        let find = |c: &Container, cred: &DeniableCredential| {
+            let (bytes, cipher) = c.deniable_header_snapshot().unwrap();
+            crate::deniable_header::envelope_kinds_v2(&bytes, cred, cipher)
+        };
+        assert_eq!(
+            find(&c, &user).unwrap(),
+            vec![(6, DeniableKindTag::Passphrase)]
+        );
+        c.clear_deniable_slot(6).unwrap();
+        assert!(matches!(find(&c, &user), Err(Error::OpaqueUnlockFailed)));
+        assert_eq!(find(&c, &admin).unwrap().len(), 1);
     }
 
     /// Splicing a cleared slot's old envelope back into the current

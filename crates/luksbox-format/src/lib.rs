@@ -18,10 +18,12 @@ pub mod hybrid_sidecar;
 pub mod metadata;
 #[cfg(feature = "test-injection")]
 pub mod sim_file;
+pub mod unseal_errors;
 
 pub use crate::container::{Container, LbxFile, UnlockMaterial};
 pub use crate::error::Error;
 pub use crate::metadata::{DEFAULT_METADATA_REGION_SIZE, METADATA_OVERHEAD};
+pub use crate::unseal_errors::UnsealErrors;
 
 // Test-injection surface (feature-gated). Compiled out of release
 // builds entirely; only callers that opt in via [dev-dependencies]

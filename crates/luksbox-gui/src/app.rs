@@ -497,12 +497,18 @@ struct UnlockForm {
     /// passphrases at create time (e.g. via the HybridPq+TPM
     /// bootstrap which has its own `seed_pw` field).
     hybrid_seed_pw: Zeroizing<String>,
-    /// One-shot snapshot of the vault's keyslot composition, read
-    /// from the unencrypted on-disk header when the user picks a
-    /// vault from the recent list. Some(Ok) = labels to show, Some(Err)
-    /// = error message to surface, None = not loaded yet (e.g. the
-    /// user typed a path manually instead of clicking a recent).
-    slot_inspection: Option<Result<Vec<String>, String>>,
+    /// The vault's keyslot kinds, read from the unencrypted on-disk
+    /// header for the path in the form (re-read whenever the vault or
+    /// detached-header path changes, see `refresh_unlock_inspection`).
+    /// Some(Ok) = (slot index, kind) pairs, Some(Err) = error message
+    /// to surface, None = no existing file in the path field yet.
+    slot_inspection: Option<Result<Vec<(usize, SlotKind)>, String>>,
+    /// (vault path, detached header path) that `slot_inspection` was
+    /// read for.
+    inspected_for: Option<(String, String)>,
+    /// Deniable mode: the envelopes the typed passphrase opens (slot
+    /// index, credential kind), from the "Identify keyslot" action.
+    deniable_slots: Option<Result<Vec<(usize, luksbox_core::deniable::DeniableKindTag)>, String>>,
     /// Deniable-mode unlock: when set, the open flow routes through
     /// `Container::open_with_credential_deniable` with the
     /// user-supplied `deniable_cipher` + `deniable_kdf` + the
@@ -533,6 +539,8 @@ impl Default for UnlockForm {
             hybrid_kyber_path: String::new(),
             hybrid_seed_pw: Zeroizing::default(),
             slot_inspection: None,
+            inspected_for: None,
+            deniable_slots: None,
             use_deniable: false,
             deniable_cipher: CipherChoice::AesSiv,
             deniable_kdf: KdfStrength::Interactive,
@@ -956,6 +964,15 @@ enum Pending {
         rx: Receiver<VaultRet<u64>>,
         name: String,
     },
+    /// Keyslots view of an open deniable vault: finding the slots a
+    /// passphrase opens.
+    FindDeniableSlots {
+        rx: Receiver<Result<Vec<(usize, luksbox_core::deniable::DeniableKindTag)>, String>>,
+    },
+    /// Deniable unlock view: listing the envelopes the passphrase opens.
+    IdentifyDeniable {
+        rx: Receiver<Result<Vec<(usize, luksbox_core::deniable::DeniableKindTag)>, String>>,
+    },
     /// Files / folders dropped onto the browser, imported into `dest`.
     PutPaths {
         rx: Receiver<(OpenedVault, ops::PutSummary)>,
@@ -1063,6 +1080,12 @@ impl Pending {
             } => format!("creating vault + sealing under the local {slot_label}..."),
             Pending::PutFile { .. } => "encrypting file...".to_string(),
             Pending::PutPaths { .. } => "encrypting the dropped files...".to_string(),
+            Pending::FindDeniableSlots { .. } => {
+                "deriving the key from that passphrase (Argon2id) to find its slot...".to_string()
+            }
+            Pending::IdentifyDeniable { .. } => {
+                "deriving the envelope key (Argon2id) to identify the keyslot...".to_string()
+            }
             Pending::GetFile { .. } => "decrypting...".to_string(),
             Pending::EnrollPassphrase { .. } => {
                 "stretching passphrase with Argon2id...".to_string()
@@ -1283,6 +1306,8 @@ pub struct LuksboxApp {
     rename_target: Option<RenameTarget>,
     /// Highlighted row of the vault browser (entry name in `cwd`).
     browser_selected: Option<String>,
+    /// Keyslots view state for a deniable vault.
+    deniable_keyslots: DeniableKeyslotsUi,
     mount_status: Option<MountStatus>,
     /// A file/folder picker running on a background thread. Some rfd
     /// dialogs (notably `save_file()` on Wayland with broken
@@ -1529,6 +1554,29 @@ struct RenameTarget {
     select_end: usize,
 }
 
+/// Keyslots view state for a deniable vault: the "find a slot by its
+/// passphrase" form, its result and the revoke confirmation.
+struct DeniableKeyslotsUi {
+    find_pw: Zeroizing<String>,
+    find_kdf: KdfStrength,
+    found: Option<Result<Vec<(usize, luksbox_core::deniable::DeniableKindTag)>, String>>,
+    revoke_idx: usize,
+    /// Slot awaiting the revoke confirmation.
+    confirm: Option<usize>,
+}
+
+impl Default for DeniableKeyslotsUi {
+    fn default() -> Self {
+        Self {
+            find_pw: Zeroizing::default(),
+            find_kdf: KdfStrength::Interactive,
+            found: None,
+            revoke_idx: 1,
+            confirm: None,
+        }
+    }
+}
+
 /// Drag-and-drop payload of a browser row being dragged onto a folder.
 struct DragEntry {
     from_dir: String,
@@ -1751,6 +1799,7 @@ impl LuksboxApp {
             mkdir_input: None,
             rename_target: None,
             browser_selected: None,
+            deniable_keyslots: DeniableKeyslotsUi::default(),
             mount_status: None,
             pending_picker: None,
             confirm_lock: None,
@@ -2207,7 +2256,14 @@ impl LuksboxApp {
             },
             Pending::Create { rx, needs_touch } => match rx.try_recv() {
                 Ok(Ok(opened)) => {
-                    let cipher = opened.cipher_label.clone();
+                    // R15-I2: `recent::upsert` never records a deniable
+                    // vault; the create paths label it with the plain
+                    // cipher name, so mark it here from the container.
+                    let cipher = if opened.vfs.container().is_deniable() {
+                        format!("{} (deniable)", opened.cipher_label)
+                    } else {
+                        opened.cipher_label.clone()
+                    };
                     let path = opened.vault_path.clone();
                     let header_path = opened.header_path.clone();
                     let anchor_path = opened.anchor_path.clone();
@@ -2259,7 +2315,14 @@ impl LuksboxApp {
                 slot_label,
             } => match rx.try_recv() {
                 Ok(Ok(opened)) => {
-                    let cipher = opened.cipher_label.clone();
+                    // R15-I2: `recent::upsert` never records a deniable
+                    // vault; the create paths label it with the plain
+                    // cipher name, so mark it here from the container.
+                    let cipher = if opened.vfs.container().is_deniable() {
+                        format!("{} (deniable)", opened.cipher_label)
+                    } else {
+                        opened.cipher_label.clone()
+                    };
                     let path = opened.vault_path.clone();
                     let header_path = opened.header_path.clone();
                     let anchor_path = opened.anchor_path.clone();
@@ -2304,7 +2367,14 @@ impl LuksboxApp {
             },
             Pending::Unlock { rx, needs_touch } => match rx.try_recv() {
                 Ok(Ok(opened)) => {
-                    let cipher = opened.cipher_label.clone();
+                    // R15-I2: `recent::upsert` never records a deniable
+                    // vault; the create paths label it with the plain
+                    // cipher name, so mark it here from the container.
+                    let cipher = if opened.vfs.container().is_deniable() {
+                        format!("{} (deniable)", opened.cipher_label)
+                    } else {
+                        opened.cipher_label.clone()
+                    };
                     let path = opened.vault_path.clone();
                     let header_path = opened.header_path.clone();
                     let anchor_path = opened.anchor_path.clone();
@@ -2360,6 +2430,31 @@ impl LuksboxApp {
                     self.pending = Some(Pending::PutFile { rx, name });
                 }
                 Err(_) => self.toast_err("put task crashed"),
+            },
+            Pending::FindDeniableSlots { rx } => match rx.try_recv() {
+                Ok(r) => self.deniable_keyslots.found = Some(r),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Pending::FindDeniableSlots { rx });
+                }
+                Err(_) => self.toast_err("slot search crashed"),
+            },
+            Pending::IdentifyDeniable { rx } => match rx.try_recv() {
+                Ok(r) => {
+                    // Switch to the method the (first) envelope needs.
+                    if let Ok(list) = &r
+                        && let Some(&(_, tag)) = list.first()
+                    {
+                        let m = ops::deniable_kind_method(tag);
+                        if m.available_here() {
+                            self.unlock.method = m;
+                        }
+                    }
+                    self.unlock.deniable_slots = Some(r);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Pending::IdentifyDeniable { rx });
+                }
+                Err(_) => self.toast_err("keyslot identification crashed"),
             },
             Pending::PutPaths { rx, dest } => match rx.try_recv() {
                 Ok((vault, sum)) => {
@@ -3194,11 +3289,9 @@ impl LuksboxApp {
             (false, true) => UnlockMethod::Fido2,
             (false, false) => UnlockMethod::Passphrase,
         };
-        // One-shot header read so the unlock view can show the vault's
-        // keyslot composition before the user picks an unlock method.
-        // Header is unencrypted (no auth needed); a few-KB read +
-        // parse, fast enough to do synchronously.
-        let slot_inspection = Some(ops::inspect_slot_kinds(&r.path, r.header_path.as_deref()));
+        // The keyslot list (and a method correction when this guess
+        // opens none of the slots) comes from the header read in
+        // `refresh_unlock_inspection` on the first unlock-view frame.
         // Pre-populate the deniable cipher dropdown from the recent
         // entry's recorded cipher when present. Deniable vaults have
         // no on-disk magic, so the user MUST tell the open path which
@@ -3234,7 +3327,9 @@ impl LuksboxApp {
             pin: Zeroizing::default(),
             hybrid_kyber_path: String::new(),
             hybrid_seed_pw: Zeroizing::default(),
-            slot_inspection,
+            slot_inspection: None,
+            inspected_for: None,
+            deniable_slots: None,
             use_deniable: false,
             deniable_cipher,
             deniable_kdf: KdfStrength::Interactive,
@@ -5939,7 +6034,50 @@ impl LuksboxApp {
 // ---- unlock ---------------------------------------------------------------
 
 impl LuksboxApp {
+    /// Re-read the keyslot kinds when the vault or detached-header path
+    /// in the form changed, and switch to a method that can open one of
+    /// the slots when the selected one opens none (e.g. the FIDO2
+    /// guess for a Secure Enclave + FIDO2 + ML-KEM slot). The header is
+    /// unencrypted and 8 KiB, so the synchronous read is cheap; it only
+    /// runs on a path change.
+    fn refresh_unlock_inspection(&mut self) {
+        let key = (
+            self.unlock.path.trim().to_owned(),
+            if self.unlock.use_detached {
+                self.unlock.header_path.trim().to_owned()
+            } else {
+                String::new()
+            },
+        );
+        if self.unlock.inspected_for.as_ref() == Some(&key) {
+            return;
+        }
+        self.unlock.deniable_slots = None;
+        let vault = PathBuf::from(&key.0);
+        let header = (!key.1.is_empty()).then(|| PathBuf::from(&key.1));
+        self.unlock.slot_inspection = (!key.0.is_empty() && vault.is_file())
+            .then(|| ops::inspect_slots(&vault, header.as_deref()));
+        self.unlock.inspected_for = Some(key);
+        if !self.unlock.use_deniable
+            && let Some(Ok(slots)) = &self.unlock.slot_inspection
+            && let Some(m) = ops::suggest_unlock_method(slots, self.unlock.method)
+        {
+            self.unlock.method = m;
+        }
+    }
+
     fn draw_unlock(&mut self, ui: &mut egui::Ui) {
+        self.refresh_unlock_inspection();
+        // The dedicated SEP + FIDO2 methods are deniable-only; after
+        // unticking deniable, fall back to the standard method that
+        // covers those slots.
+        if !self.unlock.use_deniable {
+            match self.unlock.method {
+                UnlockMethod::SepFido2 => self.unlock.method = UnlockMethod::Sep,
+                UnlockMethod::HybridPqSepFido2 => self.unlock.method = UnlockMethod::HybridPqSep,
+                _ => {}
+            }
+        }
         let can_submit = self.pending.is_none();
         let mut submit = false;
         let mut go_back = false;
@@ -6055,7 +6193,109 @@ impl LuksboxApp {
     /// background + accent-colored border + accent-colored title so
     /// the user reads it as informational context rather than as a
     /// required input.
+    /// Deniable mode's keyslot panel. The slot table is encrypted, so
+    /// nothing about it shows without the envelope passphrase; with it,
+    /// "Identify keyslot" lists the envelopes it opens and switches to
+    /// the matching method.
+    fn draw_deniable_slot_panel(&mut self, ui: &mut egui::Ui) {
+        let frame = Frame::new()
+            .fill(theme::PANEL2)
+            .stroke(Stroke::new(1.0_f32, theme::ACCENT.linear_multiply(0.4)))
+            .corner_radius(CornerRadius::same(10))
+            .inner_margin(18);
+        let can_identify = self.pending.is_none()
+            && !self.unlock.passphrase.is_empty()
+            && !self.unlock.path.trim().is_empty();
+        let mut identify = false;
+        let mut use_method: Option<UnlockMethod> = None;
+        frame.show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
+            ui.label(
+                RichText::new("KEYSLOTS IN THIS VAULT")
+                    .color(theme::ACCENT)
+                    .small()
+                    .strong(),
+            );
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "Deniable vault: the keyslot table is encrypted, so nothing about it \
+                     can be read without the envelope passphrase. Enter it (with the \
+                     cipher and KDF strength), then identify the envelope it opens to see \
+                     which method to use.",
+                )
+                .color(theme::DIM)
+                .size(12.0),
+            );
+            ui.add_space(8.0);
+            if ui
+                .add_enabled(can_identify, ghost_button("Identify keyslot"))
+                .on_hover_text(
+                    "Derives the envelope key from the passphrase (Argon2id, a few seconds) \
+                     and lists the envelopes it opens. Nothing is unlocked or written.",
+                )
+                .clicked()
+            {
+                identify = true;
+            }
+            match &self.unlock.deniable_slots {
+                None => {}
+                Some(Err(e)) => {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(e).color(theme::DANGER).size(12.0));
+                }
+                Some(Ok(list)) => {
+                    ui.add_space(6.0);
+                    for &(i, tag) in list {
+                        ui.label(
+                            RichText::new(format!("slot {i}: {}", ops::deniable_kind_label(tag)))
+                                .monospace()
+                                .size(12.0)
+                                .color(theme::TEXT),
+                        );
+                        let m = ops::deniable_kind_method(tag);
+                        if m.available_here() {
+                            let mut hint = format!("unlock with: {}", ops::unlock_method_label(m));
+                            if m == UnlockMethod::Tpm2 {
+                                hint.push_str(" (or TPM 2.0 + PIN if a PIN was set at creation)");
+                            }
+                            ui.label(RichText::new(hint).color(theme::DIM).size(11.0));
+                            if list.len() > 1
+                                && self.unlock.method != m
+                                && ui.add(ghost_button("Use this one")).clicked()
+                            {
+                                use_method = Some(m);
+                            }
+                        } else {
+                            ui.label(
+                                RichText::new("cannot be opened with this build or on this OS")
+                                    .color(theme::WARN)
+                                    .size(11.0),
+                            );
+                        }
+                        ui.add_space(2.0);
+                    }
+                }
+            }
+        });
+        if let Some(m) = use_method {
+            self.unlock.method = m;
+        }
+        if identify {
+            let path = PathBuf::from(self.unlock.path.trim());
+            let pw = Zeroizing::new((*self.unlock.passphrase).clone());
+            let cipher = deniable_cipher_suite(&self.unlock.deniable_cipher);
+            let kdf = self.unlock.deniable_kdf;
+            let rx = ops::spawn(move || ops::identify_deniable_slots(&path, &pw, cipher, kdf));
+            self.pending = Some(Pending::IdentifyDeniable { rx });
+        }
+    }
+
     fn draw_unlock_slot_panel(&mut self, ui: &mut egui::Ui) {
+        if self.unlock.use_deniable {
+            self.draw_deniable_slot_panel(ui);
+            return;
+        }
         let Some(inspection) = self.unlock.slot_inspection.as_ref() else {
             return;
         };
@@ -6082,13 +6322,22 @@ impl LuksboxApp {
                     );
                 }
                 Ok(slots) => {
-                    for line in slots {
+                    for &(i, kind) in slots {
                         ui.label(
-                            RichText::new(line)
+                            RichText::new(format!("slot {i}: {}", ops::slot_kind_label(kind)))
                                 .monospace()
                                 .size(12.0)
                                 .color(theme::TEXT),
                         );
+                        let hint = match ops::unlock_method_for_kind(kind) {
+                            Some(m) if m.available_here() => {
+                                format!("unlock with: {}", ops::unlock_method_label(m))
+                            }
+                            Some(_) => "cannot be opened on this operating system".to_owned(),
+                            None => String::new(),
+                        };
+                        ui.label(RichText::new(hint).color(theme::DIM).size(11.0));
+                        ui.add_space(2.0);
                     }
                     ui.add_space(8.0);
                     ui.label(
@@ -6273,83 +6522,71 @@ impl LuksboxApp {
             }
         });
 
-        section(ui, "Method", |ui| {
-            ui.radio_value(
-                &mut self.unlock.method,
-                UnlockMethod::Passphrase,
-                "Passphrase",
-            );
-            ui.radio_value(
-                &mut self.unlock.method,
-                UnlockMethod::Fido2,
-                "FIDO2 authenticator (passphrase backup)",
-            );
-            ui.radio_value(
-                &mut self.unlock.method,
-                UnlockMethod::HybridPq,
-                "Hybrid passphrase + ML-KEM (post-quantum)",
-            );
-            ui.radio_value(
-                &mut self.unlock.method,
-                UnlockMethod::HybridPqFido2,
-                "Hybrid FIDO2 + ML-KEM (post-quantum, authenticator + .kyber)",
-            );
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+        // Computed before the section borrows `self` mutably: the
+        // method that does open one of this vault's slots, when the
+        // selected one opens none of them.
+        let mismatch = match &self.unlock.slot_inspection {
+            Some(Ok(slots))
+                if !self.unlock.use_deniable
+                    && !slots.is_empty()
+                    && !ops::method_opens_any(self.unlock.method, slots) =>
             {
-                ui.radio_value(
-                    &mut self.unlock.method,
-                    UnlockMethod::Tpm2,
-                    "TPM 2.0 (this machine, no passphrase)",
-                );
-                ui.radio_value(
-                    &mut self.unlock.method,
-                    UnlockMethod::Tpm2Pin,
-                    "TPM 2.0 + PIN (this machine + memorised PIN)",
-                );
-                ui.radio_value(
-                    &mut self.unlock.method,
-                    UnlockMethod::Tpm2Fido2,
-                    "TPM 2.0 + FIDO2 (this machine AND this authenticator)",
-                );
-                ui.radio_value(
-                    &mut self.unlock.method,
-                    UnlockMethod::HybridPqTpm2,
-                    "Hybrid TPM 2.0 + ML-KEM (PQ + machine-bound)",
-                );
-                ui.radio_value(
-                    &mut self.unlock.method,
-                    UnlockMethod::HybridPqTpm2Fido2,
-                    "Hybrid TPM 2.0 + FIDO2 + ML-KEM (3 factors)",
-                );
+                Some(ops::suggest_unlock_method(slots, self.unlock.method))
             }
-            // Secure Enclave unlock options: macOS only, mirroring the
-            // Linux/Windows TPM radios above.
-            if cfg!(target_os = "macos") {
-                ui.radio_value(
-                    &mut self.unlock.method,
-                    UnlockMethod::Sep,
-                    "Secure Enclave (this Mac; Touch ID prompt for biometric slots)",
-                );
-                ui.radio_value(
-                    &mut self.unlock.method,
-                    UnlockMethod::HybridPqSep,
-                    "Hybrid Secure Enclave + ML-KEM (PQ + Mac-bound)",
-                );
-                // Fused SEP+FIDO2 variants exist only as deniable
-                // credentials (standard fused SEP slots open via the
-                // plain "Secure Enclave" method, which collects every
-                // factor per slot).
-                if self.unlock.use_deniable {
-                    ui.radio_value(
-                        &mut self.unlock.method,
-                        UnlockMethod::SepFido2,
-                        "Secure Enclave + FIDO2 (deniable)",
-                    );
-                    ui.radio_value(
-                        &mut self.unlock.method,
-                        UnlockMethod::HybridPqSepFido2,
-                        "Hybrid Secure Enclave + FIDO2 + ML-KEM (deniable)",
-                    );
+            _ => None,
+        };
+        section(ui, "Method", |ui| {
+            let mut methods = vec![
+                UnlockMethod::Passphrase,
+                UnlockMethod::Fido2,
+                UnlockMethod::HybridPq,
+                UnlockMethod::HybridPqFido2,
+                UnlockMethod::Tpm2,
+                UnlockMethod::Tpm2Pin,
+                UnlockMethod::Tpm2Fido2,
+                UnlockMethod::HybridPqTpm2,
+                UnlockMethod::HybridPqTpm2Fido2,
+                // Secure Enclave: one method per hybrid-ness; each
+                // collects the factors its slots bind (Touch ID, FIDO2
+                // PIN, slot passphrase).
+                UnlockMethod::Sep,
+                UnlockMethod::HybridPqSep,
+            ];
+            // The dedicated SEP + FIDO2 methods exist only for deniable
+            // credentials.
+            if self.unlock.use_deniable {
+                methods.extend([UnlockMethod::SepFido2, UnlockMethod::HybridPqSepFido2]);
+            }
+            for m in methods.into_iter().filter(|m| m.available_here()) {
+                ui.radio_value(&mut self.unlock.method, m, ops::unlock_method_label(m));
+            }
+            if let Some(suggestion) = mismatch {
+                ui.add_space(6.0);
+                match suggestion {
+                    Some(m) => {
+                        ui.label(
+                            RichText::new(format!(
+                                "None of this vault's keyslots opens with this method; \
+                                 use \"{}\".",
+                                ops::unlock_method_label(m)
+                            ))
+                            .color(theme::WARN)
+                            .size(12.0),
+                        );
+                        if ui.add(ghost_button("Switch to it")).clicked() {
+                            self.unlock.method = m;
+                        }
+                    }
+                    None => {
+                        ui.label(
+                            RichText::new(
+                                "None of this vault's keyslots can be opened on this \
+                                 operating system (see the keyslot list).",
+                            )
+                            .color(theme::WARN)
+                            .size(12.0),
+                        );
+                    }
                 }
             }
             if matches!(
@@ -6772,6 +7009,20 @@ impl LuksboxApp {
                         let te =
                             egui::TextEdit::singleline(&mut *self.unlock.passphrase).password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
+                        ui.add_space(8.0);
+                        // `luksbox wizard` can bind an optional extra
+                        // passphrase into this slot kind.
+                        ui.label(
+                            RichText::new(
+                                "Extra slot passphrase (only if one was set when the slot \
+                                 was added; usually blank)",
+                            )
+                            .color(theme::DIM)
+                            .size(12.0),
+                        );
+                        let te = egui::TextEdit::singleline(&mut *self.unlock.hybrid_seed_pw)
+                            .password(true);
+                        ui.add_sized([form_width(ui), CONTROL_H], te);
                     }
                     ui.add_space(8.0);
                     ui.label(
@@ -6802,6 +7053,25 @@ impl LuksboxApp {
                         )
                         .color(theme::FAINT)
                         .size(12.0),
+                    );
+                });
+            }
+            UnlockMethod::Sep if self.unlock.use_deniable => {
+                section(ui, "Secure Enclave (deniable)", |ui| {
+                    ui.label(
+                        RichText::new("Envelope passphrase (deniable - required)")
+                            .color(theme::WARN)
+                            .size(12.0),
+                    );
+                    ui.add_sized(
+                        [form_width(ui), CONTROL_H],
+                        egui::TextEdit::singleline(&mut *self.unlock.passphrase).password(true),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("This Mac's Secure Enclave unseals the rest.")
+                            .color(theme::FAINT)
+                            .size(11.0),
                     );
                 });
             }
@@ -6844,6 +7114,55 @@ impl LuksboxApp {
                             .color(theme::FAINT)
                             .size(11.0),
                     );
+                });
+            }
+            UnlockMethod::HybridPqSep if self.unlock.use_deniable => {
+                section(ui, "Hybrid Secure Enclave + ML-KEM (deniable)", |ui| {
+                    ui.label(
+                        RichText::new("Envelope passphrase (deniable - required)")
+                            .color(theme::WARN)
+                            .size(12.0),
+                    );
+                    ui.add_sized(
+                        [form_width(ui), CONTROL_H],
+                        egui::TextEdit::singleline(&mut *self.unlock.passphrase).password(true),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(
+                            ".kyber seed-file passphrase (leave blank to reuse the envelope \
+                             passphrase)",
+                        )
+                        .color(theme::DIM)
+                        .size(12.0),
+                    );
+                    ui.add_sized(
+                        [form_width(ui), CONTROL_H],
+                        egui::TextEdit::singleline(&mut *self.unlock.hybrid_seed_pw).password(true),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Path to the .kyber seed file")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    ui.horizontal(|ui| {
+                        let (field_w, browse_w) = trailing_button_row_widths(ui, 400.0, 90.0);
+                        ui.add_sized(
+                            [field_w, CONTROL_H],
+                            egui::TextEdit::singleline(&mut self.unlock.hybrid_kyber_path)
+                                .hint_text(path_hints::usb("vault.kyber")),
+                        );
+                        if ui
+                            .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
+                            .clicked()
+                        {
+                            self.start_open_picker(
+                                "Kyber seed file",
+                                PickerTarget::UnlockHybridKyber,
+                            );
+                        }
+                    });
                 });
             }
             UnlockMethod::HybridPqSep => {
@@ -8070,6 +8389,199 @@ impl LuksboxApp {
 // ---- keyslots -------------------------------------------------------------
 
 impl LuksboxApp {
+    /// Keyslots section of an open deniable vault. Its slots cannot be
+    /// listed: an unused slot is random bytes, and each used one is
+    /// encrypted under its own passphrase, so not even the master key
+    /// tells them apart. The section shows the slot this session was
+    /// unlocked with, finds the slot(s) a passphrase opens, and revokes a
+    /// slot by number.
+    fn draw_deniable_keyslots(&mut self, ui: &mut egui::Ui, unlocked: Option<usize>) {
+        let slots = luksbox_core::deniable::DENIABLE_SLOT_COUNT;
+        let busy = self.pending.is_some();
+        let mut find = false;
+        let mut revoke: Option<usize> = None;
+        let ui_state = &mut self.deniable_keyslots;
+        Frame::new()
+            .fill(theme::PANEL)
+            .stroke(Stroke::new(1.0_f32, theme::BORDER))
+            .corner_radius(CornerRadius::same(8))
+            .inner_margin(14)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.label(
+                    RichText::new("Deniable keyslots")
+                        .strong()
+                        .color(theme::TEXT),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "This vault has {slots} slots that all look like random bytes; \
+                         which ones hold a credential cannot be listed, by design. \
+                         This session was unlocked with slot {}.",
+                        unlocked.map_or("?".to_string(), |i| i.to_string())
+                    ))
+                    .color(theme::DIM)
+                    .size(12.0),
+                );
+                ui.add_space(10.0);
+                ui.label(
+                    RichText::new(
+                        "Find the slot a credential uses: enter its envelope passphrase \
+                         and the Argon2id strength it was created with (its FIDO2 key, \
+                         TPM or Secure Enclave is not needed for this).",
+                    )
+                    .color(theme::DIM)
+                    .size(12.0),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut *ui_state.find_pw)
+                            .password(true)
+                            .hint_text("envelope passphrase")
+                            .desired_width(220.0),
+                    );
+                    egui::ComboBox::from_id_salt("deniable-find-kdf")
+                        .selected_text(ui_state.find_kdf.label())
+                        .show_ui(ui, |ui| {
+                            for k in [
+                                KdfStrength::Interactive,
+                                KdfStrength::Moderate,
+                                KdfStrength::Sensitive,
+                            ] {
+                                ui.selectable_value(&mut ui_state.find_kdf, k, k.label());
+                            }
+                        });
+                    if ui
+                        .add_enabled(
+                            !busy && !ui_state.find_pw.is_empty(),
+                            ghost_button("Find slot"),
+                        )
+                        .clicked()
+                    {
+                        find = true;
+                    }
+                });
+                match &ui_state.found {
+                    None => {}
+                    Some(Err(e)) => {
+                        ui.label(RichText::new(e).color(theme::WARN).size(12.0));
+                    }
+                    Some(Ok(list)) => {
+                        for &(i, tag) in list {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "slot {i}: {}{}",
+                                        ops::deniable_kind_label(tag),
+                                        if unlocked == Some(i) {
+                                            " (this session)"
+                                        } else {
+                                            ""
+                                        }
+                                    ))
+                                    .monospace()
+                                    .size(12.0),
+                                );
+                                if unlocked != Some(i)
+                                    && ui.add(ghost_button("Revoke...")).clicked()
+                                {
+                                    ui_state.confirm = Some(i);
+                                }
+                            });
+                        }
+                    }
+                }
+                ui.add_space(10.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(
+                        RichText::new(
+                            "Revoke a slot by number (the one picked when it was added):",
+                        )
+                        .color(theme::DIM)
+                        .size(12.0),
+                    );
+                    egui::ComboBox::from_id_salt("deniable-revoke-idx")
+                        .selected_text(format!("slot {}", ui_state.revoke_idx))
+                        .show_ui(ui, |ui| {
+                            for i in (0..slots).filter(|&i| Some(i) != unlocked) {
+                                ui.selectable_value(
+                                    &mut ui_state.revoke_idx,
+                                    i,
+                                    format!("slot {i}"),
+                                );
+                            }
+                        });
+                    if ui
+                        .add_enabled(
+                            !busy && Some(ui_state.revoke_idx) != unlocked,
+                            ghost_button("Revoke..."),
+                        )
+                        .clicked()
+                    {
+                        ui_state.confirm = Some(ui_state.revoke_idx);
+                    }
+                });
+                if let Some(i) = ui_state.confirm {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Revoke slot {i}? It is overwritten with random bytes: the \
+                             credential stored there, if any, stops opening the vault. \
+                             This cannot be undone. A credential whose slot you do not \
+                             know is shut out by rotating the master key instead."
+                        ))
+                        .color(theme::DANGER)
+                        .size(12.0),
+                    );
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(egui::Button::new(
+                                RichText::new(format!("Revoke slot {i}")).color(theme::DANGER),
+                            ))
+                            .clicked()
+                        {
+                            revoke = Some(i);
+                        }
+                        if ui.button("Cancel").clicked() {
+                            ui_state.confirm = None;
+                        }
+                    });
+                }
+            });
+        ui.add_space(10.0);
+
+        if find
+            && let Some(snapshot) = self
+                .vault
+                .as_ref()
+                .and_then(|v| v.vfs.container().deniable_header_snapshot())
+        {
+            let pw = Zeroizing::new((*self.deniable_keyslots.find_pw).clone());
+            let kdf = self.deniable_keyslots.find_kdf;
+            self.deniable_keyslots.found = None;
+            let rx = ops::spawn(move || ops::find_deniable_slots(snapshot, &pw, kdf));
+            self.pending = Some(Pending::FindDeniableSlots { rx });
+        }
+        if let Some(i) = revoke {
+            self.deniable_keyslots.confirm = None;
+            let r = match self.vault.as_mut() {
+                Some(v) => ops::revoke_deniable_slot(&mut v.vfs, i),
+                None => Err("no vault open".into()),
+            };
+            match r {
+                Ok(()) => {
+                    // A listed result for that slot no longer holds.
+                    if let Some(Ok(list)) = &mut self.deniable_keyslots.found {
+                        list.retain(|&(s, _)| s != i);
+                    }
+                    self.toast_ok(format!("slot {i} revoked"));
+                }
+                Err(e) => self.toast_err(e),
+            }
+        }
+    }
+
     fn draw_keyslots(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui
@@ -8123,10 +8635,24 @@ impl LuksboxApp {
 
         // Wrap the slot list + add buttons in a ScrollArea so a short
         // window can still reach the bottom Add buttons.
+        // A deniable vault's `header.keyslots` is a synthetic all-empty
+        // table; its real slots get their own section.
+        let deniable_unlocked = self.vault.as_ref().and_then(|v| {
+            let c = v.vfs.container();
+            c.is_deniable().then(|| c.deniable_unlocked_slot())
+        });
+        let table: &[luksbox_core::Keyslot] = if deniable_unlocked.is_some() {
+            &[]
+        } else {
+            &header.keyslots
+        };
         ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(ui, |ui| {
-                for (i, slot) in header.keyslots.iter().enumerate() {
+                if let Some(unlocked) = deniable_unlocked {
+                    self.draw_deniable_keyslots(ui, unlocked);
+                }
+                for (i, slot) in table.iter().enumerate() {
                     Frame::new()
                         .fill(theme::PANEL)
                         .stroke(Stroke::new(1.0, theme::BORDER))
@@ -12398,6 +12924,15 @@ mod path_hints {
 const FORM_FIELD_MAX_W: f32 = 600.0;
 const FORM_FIELD_MIN_W: f32 = 120.0;
 const CONTROL_H: f32 = 28.0;
+
+/// The cipher a deniable unlock form selects.
+fn deniable_cipher_suite(c: &CipherChoice) -> luksbox_core::CipherSuite {
+    match c {
+        CipherChoice::AesSiv => luksbox_core::CipherSuite::Aes256GcmSiv,
+        CipherChoice::Aes => luksbox_core::CipherSuite::Aes256Gcm,
+        CipherChoice::Chacha => luksbox_core::CipherSuite::ChaCha20Poly1305,
+    }
+}
 
 const BROWSER_ROW_H: f32 = 36.0;
 
