@@ -430,7 +430,11 @@ jobs:
           HOMEBREW_NO_INSTALL_FROM_API: "1"
         run: |
           brew update
-          # imagemagick : scripts/build_icons.sh
+          # (no imagemagick: scripts/build_icons.sh uses the OS's own
+          #               sips + iconutil for icon.icns on macOS, and
+          #               Homebrew no longer bottles for macOS 14, so
+          #               imagemagick would compile its whole dependency
+          #               tree from source here and x265 fails to build)
           # iconutil    : ships with Xcode, no install needed
           # dylibbundler: rewrites @rpath/dylib references inside the
           #               .app so end users don't need `brew install
@@ -444,8 +448,8 @@ jobs:
           # `--formula` is belt-and-suspenders alongside the env var
           # above: forces resolution against the formula tap only and
           # skips any chance of touching the cask API code path. All
-          # five names here are formulas (no casks).
-          brew install --formula libfido2 pkg-config imagemagick dylibbundler create-dmg
+          # four names here are formulas (no casks).
+          brew install --formula libfido2 pkg-config dylibbundler create-dmg
           # FUSE backend selection: deterministic per matrix entry.
           # The matrix exposes `fuse_backend: fuset|macfuse`; this step
           # installs ONLY that backend (no fallback) and fails the

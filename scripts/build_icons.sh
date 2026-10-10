@@ -45,19 +45,47 @@ if [[ ! -f "${SRC_PNG}" ]]; then
     exit 1
 fi
 
+ON_MACOS=0
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    ON_MACOS=1
+fi
+
 # Pick whichever ImageMagick binary is available. v7 ships `magick`,
 # Debian/Ubuntu's older v6 only has `convert`/`identify`.
+#
+# On macOS the only output the build consumes is icon.icns, and the OS
+# ships everything needed to produce it (`sips` to resize, `iconutil`
+# to pack), so ImageMagick is optional there: the Windows and Linux
+# outputs are written when it happens to be installed and skipped
+# otherwise. (Homebrew stopped bottling for older macOS releases, so a
+# `brew install imagemagick` on the release runner means compiling
+# its whole dependency tree from source.) Everywhere else ImageMagick
+# is required.
+HAVE_IM=0
 if command -v magick >/dev/null 2>&1; then
-    IM=(magick)
+    IM=(magick); HAVE_IM=1
 elif command -v convert >/dev/null 2>&1; then
-    IM=(convert)
+    IM=(convert); HAVE_IM=1
+elif (( ON_MACOS )) && command -v sips >/dev/null 2>&1 && command -v iconutil >/dev/null 2>&1; then
+    log "ImageMagick not found; writing icon.icns with sips + iconutil only"
 else
     log "ImageMagick not found, install with one of:"
     log "  apt install imagemagick      # Debian/Ubuntu"
-    log "  brew install imagemagick     # macOS"
+    log "  brew install imagemagick     # macOS (optional there, sips + iconutil suffice for .icns)"
     log "  choco install imagemagick    # Windows"
     exit 1
 fi
+
+# resize_png <size> <out>: square resize of the source PNG. Prefers
+# Apple's own resampler on macOS (what iconutil expects), ImageMagick
+# elsewhere.
+resize_png() {
+    if (( ON_MACOS )) && command -v sips >/dev/null 2>&1; then
+        sips -z "$1" "$1" "${SRC_PNG}" --out "$2" >/dev/null
+    else
+        "${IM[@]}" "${SRC_PNG}" -resize "$1x$1" "$2"
+    fi
+}
 
 # ---- Windows .ico --------------------------------------------------------
 #
@@ -65,10 +93,14 @@ fi
 # .ico's embedded sizes at runtime. The classic set is 16/32/48/256;
 # Win10+ also asks for 24/64/128 in places. We give it everything
 # under 256 so HiDPI title bars look crisp.
-log "writing ${OUT_ICO}"
-"${IM[@]}" "${SRC_PNG}" \
-    -define icon:auto-resize=256,128,64,48,32,24,16 \
-    "${OUT_ICO}"
+if (( HAVE_IM )); then
+    log "writing ${OUT_ICO}"
+    "${IM[@]}" "${SRC_PNG}" \
+        -define icon:auto-resize=256,128,64,48,32,24,16 \
+        "${OUT_ICO}"
+else
+    log "skipping ${OUT_ICO} (needs ImageMagick; only consumed by the Windows build)"
+fi
 
 # ---- macOS .icns ---------------------------------------------------------
 #
@@ -83,26 +115,29 @@ if [[ "$(uname -s)" == "Darwin" ]] && command -v iconutil >/dev/null 2>&1; then
     mkdir -p "${ICONSET_DIR}"
     # The size+@scale naming is mandated by iconutil; deviation = silent
     # rejection of that size from the resulting .icns.
-    "${IM[@]}" "${SRC_PNG}" -resize 16x16     "${ICONSET_DIR}/icon_16x16.png"
-    "${IM[@]}" "${SRC_PNG}" -resize 32x32     "${ICONSET_DIR}/icon_16x16@2x.png"
-    "${IM[@]}" "${SRC_PNG}" -resize 32x32     "${ICONSET_DIR}/icon_32x32.png"
-    "${IM[@]}" "${SRC_PNG}" -resize 64x64     "${ICONSET_DIR}/icon_32x32@2x.png"
-    "${IM[@]}" "${SRC_PNG}" -resize 128x128   "${ICONSET_DIR}/icon_128x128.png"
-    "${IM[@]}" "${SRC_PNG}" -resize 256x256   "${ICONSET_DIR}/icon_128x128@2x.png"
-    "${IM[@]}" "${SRC_PNG}" -resize 256x256   "${ICONSET_DIR}/icon_256x256.png"
-    "${IM[@]}" "${SRC_PNG}" -resize 512x512   "${ICONSET_DIR}/icon_256x256@2x.png"
-    "${IM[@]}" "${SRC_PNG}" -resize 512x512   "${ICONSET_DIR}/icon_512x512.png"
+    resize_png 16   "${ICONSET_DIR}/icon_16x16.png"
+    resize_png 32   "${ICONSET_DIR}/icon_16x16@2x.png"
+    resize_png 32   "${ICONSET_DIR}/icon_32x32.png"
+    resize_png 64   "${ICONSET_DIR}/icon_32x32@2x.png"
+    resize_png 128  "${ICONSET_DIR}/icon_128x128.png"
+    resize_png 256  "${ICONSET_DIR}/icon_128x128@2x.png"
+    resize_png 256  "${ICONSET_DIR}/icon_256x256.png"
+    resize_png 512  "${ICONSET_DIR}/icon_256x256@2x.png"
+    resize_png 512  "${ICONSET_DIR}/icon_512x512.png"
     # icon_512x512@2x would be 1024x1024, bigger than our source (512),
-    # so we let ImageMagick upscale it. Fine in practice, the @2x slot
-    # is rarely hit on consumer Macs.
-    "${IM[@]}" "${SRC_PNG}" -resize 1024x1024 "${ICONSET_DIR}/icon_512x512@2x.png"
+    # so we let the resampler upscale it. Fine in practice, the @2x
+    # slot is rarely hit on consumer Macs.
+    resize_png 1024 "${ICONSET_DIR}/icon_512x512@2x.png"
     iconutil -c icns -o "${OUT_ICNS}" "${ICONSET_DIR}"
     rm -rf "$(dirname "${ICONSET_DIR}")"
-else
+elif (( HAVE_IM )); then
     log "writing ${OUT_ICNS} via ImageMagick (iconutil unavailable)"
     "${IM[@]}" "${SRC_PNG}" \
         -define icns:formats=ic09,ic08,ic07,ic13,ic12,ic11 \
         "${OUT_ICNS}"
+else
+    log "cannot write ${OUT_ICNS}: neither iconutil nor ImageMagick available"
+    exit 1
 fi
 
 # ---- Windows Burn bundle sidebar PNG -------------------------------------
@@ -133,15 +168,19 @@ fi
 # `-alpha remove -alpha off` flattens any source alpha onto white
 # so the output is opaque RGB.
 OUT_SIDE_PNG="${ASSETS_DIR}/icon-bundle-side.png"
-log "writing ${OUT_SIDE_PNG} (Burn sidebar, 151x324 portrait)"
-"${IM[@]}" "${SRC_PNG}" \
-    -resize 110x110 \
-    -background white \
-    -gravity center \
-    -extent 151x324 \
-    -alpha remove \
-    -alpha off \
-    "${OUT_SIDE_PNG}"
+if (( HAVE_IM )); then
+    log "writing ${OUT_SIDE_PNG} (Burn sidebar, 151x324 portrait)"
+    "${IM[@]}" "${SRC_PNG}" \
+        -resize 110x110 \
+        -background white \
+        -gravity center \
+        -extent 151x324 \
+        -alpha remove \
+        -alpha off \
+        "${OUT_SIDE_PNG}"
+else
+    log "skipping ${OUT_SIDE_PNG} (needs ImageMagick; only consumed by the Windows installer)"
+fi
 
 # ---- Linux hicolor PNGs --------------------------------------------------
 #
@@ -151,16 +190,27 @@ log "writing ${OUT_SIDE_PNG} (Burn sidebar, 151x324 portrait)"
 # fly, blurry on HiDPI. We pre-render the canonical set once and let the
 # install.sh drop each into its matching size directory.
 LINUX_DIR="${ASSETS_DIR}/icons-linux"
-log "writing per-size Linux PNGs to ${LINUX_DIR}"
-rm -rf "${LINUX_DIR}"
-mkdir -p "${LINUX_DIR}"
-for size in 16 24 32 48 64 128 256 512; do
-    "${IM[@]}" "${SRC_PNG}" -resize "${size}x${size}" \
-        "${LINUX_DIR}/${size}x${size}.png"
-done
+if (( HAVE_IM )); then
+    log "writing per-size Linux PNGs to ${LINUX_DIR}"
+    rm -rf "${LINUX_DIR}"
+    mkdir -p "${LINUX_DIR}"
+    for size in 16 24 32 48 64 128 256 512; do
+        "${IM[@]}" "${SRC_PNG}" -resize "${size}x${size}" \
+            "${LINUX_DIR}/${size}x${size}.png"
+    done
+else
+    log "skipping ${LINUX_DIR} (needs ImageMagick; only consumed by the Linux packages)"
+fi
 
+size_of() {
+    if [[ -f "$1" ]]; then
+        stat -c '%s bytes' "$1" 2>/dev/null || stat -f '%z bytes' "$1"
+    else
+        echo "skipped"
+    fi
+}
 log "done"
-log "  ico         : $(stat -c '%s bytes' "${OUT_ICO}" 2>/dev/null || stat -f '%z bytes' "${OUT_ICO}")"
-log "  icns        : $(stat -c '%s bytes' "${OUT_ICNS}" 2>/dev/null || stat -f '%z bytes' "${OUT_ICNS}")"
-log "  bundle-side : $(stat -c '%s bytes' "${OUT_SIDE_PNG}" 2>/dev/null || stat -f '%z bytes' "${OUT_SIDE_PNG}")"
-log "  linux pngs  : ${LINUX_DIR}/{16,24,32,48,64,128,256,512}x*.png"
+log "  ico         : $(size_of "${OUT_ICO}")"
+log "  icns        : $(size_of "${OUT_ICNS}")"
+log "  bundle-side : $(size_of "${OUT_SIDE_PNG}")"
+log "  linux pngs  : ${LINUX_DIR}/{16,24,32,48,64,128,256,512}x*.png ($( (( HAVE_IM )) && echo written || echo skipped ))"
