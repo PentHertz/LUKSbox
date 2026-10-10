@@ -32,7 +32,7 @@ use crate::unix_statvfs::host_fs_statvfs;
 pub fn mount(
     vfs: Vfs,
     mountpoint: &Path,
-    _daemonize: bool,
+    daemonize: bool,
     sync_mode: bool,
 ) -> Result<(), super::MountError> {
     // SECURITY (R12-05 + R12-08): O_NOFOLLOW probe + (dev,ino) capture +
@@ -46,9 +46,23 @@ pub fn mount(
 
     // FUSE-T's high-level API blocks the calling thread until unmount,
     // and installs its own SIGINT handler so Ctrl-C unmounts cleanly.
-    // We don't fork/daemonize here, the CLI binary does that one
-    // level up if needed (mirroring the structure in fuse.rs but
-    // moving the fork to the caller, which is cleaner anyway).
+    // `luksbox mount` daemonizes by default, as on the libfuse backend:
+    // nothing one level up forks for FUSE-T, so before this the CLI's
+    // documented default silently ran in the foreground (and held a
+    // caller's stdout pipe open until unmount).
+    if daemonize {
+        return run_daemonized(vfs, mountpoint, sync_mode, probe_inode);
+    }
+    mount_foreground(vfs, mountpoint, sync_mode, probe_inode)
+}
+
+/// The blocking FUSE-T session (foreground mode, and the daemon child).
+fn mount_foreground(
+    vfs: Vfs,
+    mountpoint: &Path,
+    sync_mode: bool,
+    probe_inode: (u64, u64),
+) -> Result<(), super::MountError> {
     let fs = LuksboxFuseTFs::new(vfs, sync_mode);
     let mut options = MountOptions::default();
     // Show a friendlier name in Finder than the default "luksbox".
@@ -58,6 +72,92 @@ pub fn mount(
     crate::mountpoint::reverify_mountpoint(mountpoint, probe_inode)?;
     luksbox_fuse_t::mount(fs, mountpoint, &options)
         .map_err(|e| super::MountError::Io(std::io::Error::other(format!("FUSE-T: {e}"))))
+}
+
+/// Fork the FUSE-T session into the background. Same contract as
+/// `fuse.rs::run_daemonized`: the fork happens BEFORE `LuksboxFuseTFs`
+/// exists (its constructor spawns the deferred-flush timer thread) and
+/// is refused from a multithreaded process.
+///
+/// Unlike the libfuse path, the parent does not exit at once: it waits
+/// (up to `DAEMON_READY_TIMEOUT`) until the mountpoint is actually
+/// mounted, or the child has exited, so `luksbox mount` returns with
+/// the filesystem usable and a failed mount is reported with a non-zero
+/// exit instead of vanishing into the daemon's `/dev/null` stderr.
+fn run_daemonized(
+    vfs: Vfs,
+    mountpoint: &Path,
+    sync_mode: bool,
+    probe_inode: (u64, u64),
+) -> Result<(), super::MountError> {
+    crate::daemon::assert_single_threaded_for_fork()?;
+    // SAFETY: single-threadedness was verified just above, so the child
+    // gets a consistent copy of the address space (no lock held by a
+    // thread that does not exist on the other side of the fork).
+    let pid = unsafe { libc::fork() };
+    match pid {
+        -1 => Err(std::io::Error::last_os_error().into()),
+        0 => {
+            // Child: new session, stdio on /dev/null, then the blocking
+            // session. Errors can only be reported through the exit
+            // status, which the parent below is waiting for.
+            if unsafe { crate::daemon::detach_from_terminal() }.is_err() {
+                std::process::exit(1);
+            }
+            let res = mount_foreground(vfs, mountpoint, sync_mode, probe_inode);
+            std::process::exit(if res.is_ok() { 0 } else { 1 });
+        }
+        child => {
+            // The Vfs (and with it the vault's flock'd file handle) now
+            // lives in the child; the parent's copy must not run any
+            // Drop logic such as a header persist or a final flush.
+            std::mem::forget(vfs);
+            wait_for_daemon_mount(child, mountpoint, probe_inode.0)
+        }
+    }
+}
+
+/// How long the parent waits for the daemonized FUSE-T mount to appear.
+const DAEMON_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+fn wait_for_daemon_mount(
+    child: libc::pid_t,
+    mountpoint: &Path,
+    unmounted_dev: u64,
+) -> Result<(), super::MountError> {
+    use std::os::unix::fs::MetadataExt as _;
+    let deadline = std::time::Instant::now() + DAEMON_READY_TIMEOUT;
+    loop {
+        let mut status: libc::c_int = 0;
+        let r = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+        if r == child {
+            return Err(super::MountError::Io(std::io::Error::other(format!(
+                "FUSE-T mount failed in the background (exit status {}); re-run with \
+                 --foreground to see the error",
+                if libc::WIFEXITED(status) {
+                    libc::WEXITSTATUS(status)
+                } else {
+                    -1
+                }
+            ))));
+        }
+        // Mounted once the mountpoint's device differs from the plain
+        // directory's (FUSE-T serves it from its own NFS mount).
+        if std::fs::metadata(mountpoint).is_ok_and(|m| m.dev() != unmounted_dev) {
+            eprintln!("mounted {} (pid {child})", mountpoint.display());
+            eprintln!("  unmount: luksbox umount {}", mountpoint.display());
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "mounting {} in the background (pid {child}); not visible yet",
+                mountpoint.display()
+            );
+            eprintln!("  unmount: luksbox umount {}", mountpoint.display());
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 pub fn unmount(mountpoint: &Path) -> Result<(), super::MountError> {

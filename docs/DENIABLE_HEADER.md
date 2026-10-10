@@ -227,6 +227,43 @@ in plaintext are visible only after a valid MVK has decrypted the
 inner header. A forensic analyst without the MVK sees uniform random
 bytes.
 
+### Header format v3 (default for new vaults since v0.6.0)
+
+The slot envelopes and the inner header are independent AEADs, so a
+plain counter in the inner header could be spliced around: an old slot
+envelope (a credential that has since been cleared) pasted back into
+the current slot table, next to the current inner header. Header format
+v3 closes that and gives the anchor a header generation (R15-D1):
+
+```
+inner_plaintext, header v3 additions (after the 38 bytes above):
+  [u64 header_generation]    bumped by every header write
+  [32 B slot_table_digest]   SHA-256("luksbox-deniable-v3/slot-table" || slot table)
+
+AEAD AAD = b"luksbox-deniable-v3/inner-header-aad" || per_vault_salt
+```
+
+- `slot_table_digest` covers all 8 slots, empty ones included (they
+  are random bytes), so re-filling a cleared slot with an old envelope
+  changes it. Open recomputes it and refuses a mismatch with the usual
+  opaque unlock failure, whichever credential is used.
+- `header_generation` is carried by the deniable anchor (behind the
+  `"LBXDAHG2"` marker inside its AEAD), so restoring a whole, consistent
+  older 36 KiB header is detected when the anchor is attached.
+- The distinct AAD label is deliberate: a pre-v3 binary fails the inner
+  header AEAD (opaque unlock failure) instead of opening the vault and
+  changing slots without re-sealing the digest, which would make the
+  next v3 open refuse the vault. Open tries the v3 label first, then
+  the v2 one.
+- `Container::persist_header` re-seals the inner header (next
+  generation, digest of the slot table being written) before every
+  write, so enroll, clear and rotation share one code path.
+
+New deniable vaults get it by default (`luksbox deniable-init`, the
+wizard, the GUI); `--header-v2` keeps the pre-v3 inner header. Existing
+vaults: `luksbox deniable-upgrade-header` (one-way), the wizard or the
+GUI. Nothing about a v3 header is visible without the MVK.
+
 ## Per-credential KEK derivation
 
 All KEKs are 32 bytes. All derivations use explicit domain-separation

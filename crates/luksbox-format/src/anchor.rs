@@ -38,13 +38,28 @@
 //! On its own, with anchor + vault on the same medium, this is just
 //! integrity-checking the user's own write history.
 //!
-//! ## File format (48 bytes)
+//! ## File format v1 (48 bytes)
 //!
 //! ```text
 //!   0..8    magic = b"LBXANCH1"
 //!   8..16   vault_generation u64 LE  (== tree.next_chunk_gen at write)
 //!  16..48   HMAC-SHA256(anchor_key, bytes[0..16])
 //! ```
+//!
+//! ## File format v2 (56 bytes, header format v3 vaults only)
+//!
+//! ```text
+//!   0..8    magic = b"LBXANCH2"
+//!   8..16   vault_generation u64 LE   (metadata, as in v1)
+//!  16..24   header_generation u64 LE  (Header::header_generation)
+//!  24..56   HMAC-SHA256(anchor_key, bytes[0..24])
+//! ```
+//!
+//! v2 adds the header half of rollback detection (R15-D1): restoring a
+//! pre-revoke header from a backup leaves the metadata current, so only
+//! a generation carried BY the header can tell. Written only for
+//! LUKSBOX3 vaults, which pre-v3 binaries refuse anyway; v1 anchors of
+//! older vaults stay v1 so those binaries keep reading them.
 //!
 //! `anchor_key = HKDF(MVK, header_salt, "lbx:anchor-mac/v1")`. Without
 //! the MVK an attacker can't forge a fresh anchor with arbitrary
@@ -112,12 +127,20 @@ fn open_anchor_for_read(path: &Path) -> std::io::Result<File> {
 }
 
 const MAGIC: [u8; 8] = *b"LBXANCH1";
+const MAGIC_V2: [u8; 8] = *b"LBXANCH2";
 const ANCHOR_INFO: &[u8] = b"lbx:anchor-mac/v1";
 pub const ANCHOR_SIZE: usize = 48;
+/// Size of a v2 (header-generation-carrying) anchor.
+pub const ANCHOR_V2_SIZE: usize = 56;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AnchorContents {
+    /// Trusted metadata generation (`tree.next_chunk_gen`).
     pub generation: u64,
+    /// Trusted header generation, present in v2 anchors (standard) and
+    /// marked deniable anchors written for header-v3 vaults. `None` for
+    /// anchors written by pre-v3 code or for pre-v3 vaults.
+    pub header_generation: Option<u64>,
 }
 
 fn anchor_key(mvk: &MasterVolumeKey, header_salt: &[u8; 32]) -> SubKey {
@@ -145,35 +168,50 @@ pub fn read_and_verify(
     mvk: &MasterVolumeKey,
     header_salt: &[u8; 32],
 ) -> Result<AnchorContents, Error> {
-    let mut f = open_anchor_for_read(path)?;
-    let mut buf = [0u8; ANCHOR_SIZE];
-    f.read_exact(&mut buf)?;
-    if buf[..8] != MAGIC {
-        return Err(Error::AnchorCorrupt);
-    }
+    let f = open_anchor_for_read(path)?;
+    // Bounded read: one byte past the largest format so an oversized
+    // file is rejected instead of being truncated into a valid prefix.
+    let mut buf = Vec::with_capacity(ANCHOR_V2_SIZE + 1);
+    f.take(ANCHOR_V2_SIZE as u64 + 1).read_to_end(&mut buf)?;
+    let body_len = match (buf.get(..8), buf.len()) {
+        (Some(m), ANCHOR_SIZE) if m == MAGIC => 16,
+        (Some(m), ANCHOR_V2_SIZE) if m == MAGIC_V2 => 24,
+        _ => return Err(Error::AnchorCorrupt),
+    };
     let key = anchor_key(mvk, header_salt);
-    let expected = compute_mac(&key, &buf[..16]);
-    if expected.ct_eq(&buf[16..48]).unwrap_u8() == 0 {
+    let expected = compute_mac(&key, &buf[..body_len]);
+    if expected.ct_eq(&buf[body_len..]).unwrap_u8() == 0 {
         return Err(Error::AnchorAuthFailed);
     }
-    let mut gen_bytes = [0u8; 8];
-    gen_bytes.copy_from_slice(&buf[8..16]);
+    let read_u64 = |off: usize| u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
     Ok(AnchorContents {
-        generation: u64::from_le_bytes(gen_bytes),
+        generation: read_u64(8),
+        header_generation: (body_len == 24).then(|| read_u64(16)),
     })
 }
 
+/// v1 layout when `header_generation` is `None`, v2 otherwise.
 fn build_anchor_buf(
     generation: u64,
+    header_generation: Option<u64>,
     mvk: &MasterVolumeKey,
     header_salt: &[u8; 32],
-) -> [u8; ANCHOR_SIZE] {
-    let mut buf = [0u8; ANCHOR_SIZE];
-    buf[..8].copy_from_slice(&MAGIC);
-    buf[8..16].copy_from_slice(&generation.to_le_bytes());
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(ANCHOR_V2_SIZE);
+    match header_generation {
+        None => {
+            buf.extend_from_slice(&MAGIC);
+            buf.extend_from_slice(&generation.to_le_bytes());
+        }
+        Some(hg) => {
+            buf.extend_from_slice(&MAGIC_V2);
+            buf.extend_from_slice(&generation.to_le_bytes());
+            buf.extend_from_slice(&hg.to_le_bytes());
+        }
+    }
     let key = anchor_key(mvk, header_salt);
-    let tag = compute_mac(&key, &buf[..16]);
-    buf[16..48].copy_from_slice(&tag);
+    let tag = compute_mac(&key, &buf);
+    buf.extend_from_slice(&tag);
     buf
 }
 
@@ -188,10 +226,11 @@ fn build_anchor_buf(
 pub fn write(
     path: &Path,
     generation: u64,
+    header_generation: Option<u64>,
     mvk: &MasterVolumeKey,
     header_salt: &[u8; 32],
 ) -> Result<(), Error> {
-    let buf = build_anchor_buf(generation, mvk, header_salt);
+    let buf = build_anchor_buf(generation, header_generation, mvk, header_salt);
     atomic_secure_write(path, &buf)?;
     Ok(())
 }
@@ -204,10 +243,11 @@ pub fn write(
 pub fn write_initial(
     path: &Path,
     generation: u64,
+    header_generation: Option<u64>,
     mvk: &MasterVolumeKey,
     header_salt: &[u8; 32],
 ) -> Result<(), Error> {
-    let buf = build_anchor_buf(generation, mvk, header_salt);
+    let buf = build_anchor_buf(generation, header_generation, mvk, header_salt);
     atomic_secure_create_new(path, &buf)?;
     Ok(())
 }
@@ -260,6 +300,14 @@ pub fn compare(anchor_gen: u64, metadata_gen: u64) -> VerificationOutcome {
 //   [  0..  8]   u64 generation (little-endian)
 //   [  8..212]   random padding (204 B from OsRng)
 //
+// Header-v3 deniable vaults (R15-D1) additionally carry the header
+// generation, behind a marker so the random padding of an older anchor
+// can never be read as a generation:
+//   [  8.. 16]   marker b"LBXDAHG2"
+//   [ 16.. 24]   u64 header_generation (little-endian)
+//   [ 24..212]   random padding
+// The marker is inside the AEAD, so the file stays uniformly random.
+//
 // Key derivation:
 //   `anchor_key = HKDF(per_vault_salt, MVK, info="luksbox-deniable-v1/anchor")`
 //
@@ -285,6 +333,8 @@ const DENIABLE_ANCHOR_CT_LEN: usize = DENIABLE_ANCHOR_PLAINTEXT_LEN + DENIABLE_A
 const DENIABLE_ANCHOR_TRAILING_PAD: usize = 16;
 const DENIABLE_ANCHOR_AAD_LABEL: &[u8] = b"luksbox-deniable-v1/anchor";
 const DENIABLE_ANCHOR_INFO: &[u8] = b"luksbox-deniable-v1/anchor";
+/// In-plaintext marker announcing a header generation at [16..24].
+const DENIABLE_ANCHOR_HG_MARKER: &[u8; 8] = b"LBXDAHG2";
 
 // Compile-time layout check.
 const _: () = assert!(
@@ -309,6 +359,7 @@ fn deniable_anchor_aad(per_vault_salt: &[u8; 32]) -> Vec<u8> {
 
 fn build_deniable_anchor_buf(
     generation: u64,
+    header_generation: Option<u64>,
     mvk: &MasterVolumeKey,
     per_vault_salt: &[u8; 32],
     cipher_suite: CipherSuite,
@@ -318,6 +369,10 @@ fn build_deniable_anchor_buf(
     let mut plaintext = Zeroizing::new([0u8; DENIABLE_ANCHOR_PLAINTEXT_LEN]);
     plaintext[..8].copy_from_slice(&generation.to_le_bytes());
     fill_random(&mut plaintext[8..]).map_err(Error::Crypto)?;
+    if let Some(hg) = header_generation {
+        plaintext[8..16].copy_from_slice(DENIABLE_ANCHOR_HG_MARKER);
+        plaintext[16..24].copy_from_slice(&hg.to_le_bytes());
+    }
 
     let mut nonce = [0u8; DENIABLE_ANCHOR_NONCE_LEN];
     fill_random(&mut nonce).map_err(Error::Crypto)?;
@@ -345,11 +400,18 @@ fn build_deniable_anchor_buf(
 pub fn deniable_write(
     path: &Path,
     generation: u64,
+    header_generation: Option<u64>,
     mvk: &MasterVolumeKey,
     per_vault_salt: &[u8; 32],
     cipher_suite: CipherSuite,
 ) -> Result<(), Error> {
-    let buf = build_deniable_anchor_buf(generation, mvk, per_vault_salt, cipher_suite)?;
+    let buf = build_deniable_anchor_buf(
+        generation,
+        header_generation,
+        mvk,
+        per_vault_salt,
+        cipher_suite,
+    )?;
     atomic_secure_write(path, &buf)?;
     Ok(())
 }
@@ -359,11 +421,18 @@ pub fn deniable_write(
 pub fn deniable_write_initial(
     path: &Path,
     generation: u64,
+    header_generation: Option<u64>,
     mvk: &MasterVolumeKey,
     per_vault_salt: &[u8; 32],
     cipher_suite: CipherSuite,
 ) -> Result<(), Error> {
-    let buf = build_deniable_anchor_buf(generation, mvk, per_vault_salt, cipher_suite)?;
+    let buf = build_deniable_anchor_buf(
+        generation,
+        header_generation,
+        mvk,
+        per_vault_salt,
+        cipher_suite,
+    )?;
     atomic_secure_create_new(path, &buf)?;
     Ok(())
 }
@@ -411,10 +480,13 @@ pub fn deniable_read_and_verify(
     if pt.len() != DENIABLE_ANCHOR_PLAINTEXT_LEN {
         return Err(Error::OpaqueUnlockFailed);
     }
-    let mut gen_bytes = [0u8; 8];
-    gen_bytes.copy_from_slice(&pt[..8]);
+    let read_u64 = |off: usize| u64::from_le_bytes(pt[off..off + 8].try_into().unwrap());
+    // The marker match is not secret-dependent beyond what the AEAD
+    // already authenticated, so a plain compare is fine here.
+    let header_generation = (&pt[8..16] == DENIABLE_ANCHOR_HG_MARKER).then(|| read_u64(16));
     Ok(AnchorContents {
-        generation: u64::from_le_bytes(gen_bytes),
+        generation: read_u64(0),
+        header_generation,
     })
 }
 
@@ -429,7 +501,7 @@ mod tests {
         let path = dir.path().join("a.anchor");
         let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
         let salt = [0x77u8; 32];
-        write(&path, 12345, &mvk, &salt).unwrap();
+        write(&path, 12345, None, &mvk, &salt).unwrap();
         let r = read_and_verify(&path, &mvk, &salt).unwrap();
         assert_eq!(r.generation, 12345);
     }
@@ -440,7 +512,7 @@ mod tests {
         let path = dir.path().join("a.anchor");
         let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
         let salt = [0x77u8; 32];
-        write(&path, 5, &mvk, &salt).unwrap();
+        write(&path, 5, None, &mvk, &salt).unwrap();
         let other = MasterVolumeKey::from_bytes([0x99; 32]);
         assert!(matches!(
             read_and_verify(&path, &other, &salt),
@@ -454,7 +526,7 @@ mod tests {
         let path = dir.path().join("a.anchor");
         let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
         let salt = [0x77u8; 32];
-        write(&path, 5, &mvk, &salt).unwrap();
+        write(&path, 5, None, &mvk, &salt).unwrap();
         // Bit-flip the generation field.
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[8] ^= 1;
@@ -490,7 +562,7 @@ mod tests {
         let path = dir.path().join("opaque.dat");
         let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
         let salt = [0x77u8; 32];
-        deniable_write(&path, 12345, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
+        deniable_write(&path, 12345, None, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
         let r = deniable_read_and_verify(&path, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
         assert_eq!(r.generation, 12345);
     }
@@ -506,7 +578,7 @@ mod tests {
         let salt = [0x77u8; 32];
         for g in [0u64, 1, u32::MAX as u64, u64::MAX] {
             let path = dir.path().join(format!("a-{g}.dat"));
-            deniable_write(&path, g, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
+            deniable_write(&path, g, None, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
             let sz = std::fs::metadata(&path).unwrap().len();
             assert_eq!(sz, DENIABLE_ANCHOR_SIZE as u64);
         }
@@ -518,7 +590,7 @@ mod tests {
         let path = dir.path().join("opaque.dat");
         let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
         let salt = [0x77u8; 32];
-        deniable_write(&path, 5, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
+        deniable_write(&path, 5, None, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
         let other = MasterVolumeKey::from_bytes([0x99; 32]);
         assert!(matches!(
             deniable_read_and_verify(&path, &other, &salt, CipherSuite::Aes256GcmSiv),
@@ -534,7 +606,7 @@ mod tests {
         let salt_a = [0x77u8; 32];
         let mut salt_b = salt_a;
         salt_b[0] ^= 0xff;
-        deniable_write(&path, 5, &mvk, &salt_a, CipherSuite::Aes256GcmSiv).unwrap();
+        deniable_write(&path, 5, None, &mvk, &salt_a, CipherSuite::Aes256GcmSiv).unwrap();
         assert!(matches!(
             deniable_read_and_verify(&path, &mvk, &salt_b, CipherSuite::Aes256GcmSiv),
             Err(Error::OpaqueUnlockFailed),
@@ -547,7 +619,7 @@ mod tests {
         let path = dir.path().join("opaque.dat");
         let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
         let salt = [0x77u8; 32];
-        deniable_write(&path, 5, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
+        deniable_write(&path, 5, None, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
         assert!(matches!(
             deniable_read_and_verify(&path, &mvk, &salt, CipherSuite::ChaCha20Poly1305),
             Err(Error::OpaqueUnlockFailed),
@@ -560,7 +632,7 @@ mod tests {
         let path = dir.path().join("opaque.dat");
         let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
         let salt = [0x77u8; 32];
-        deniable_write(&path, 5, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
+        deniable_write(&path, 5, None, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
         // Flip a bit anywhere in the AEAD ciphertext range.
         let mut bytes = std::fs::read(&path).unwrap();
         bytes[100] ^= 1;
@@ -577,7 +649,7 @@ mod tests {
         let path = dir.path().join("opaque.dat");
         let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
         let salt = [0x77u8; 32];
-        deniable_write(&path, 5, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
+        deniable_write(&path, 5, None, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
         // Truncate to half the expected size.
         let bytes = std::fs::read(&path).unwrap();
         std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
@@ -597,7 +669,7 @@ mod tests {
         let path = dir.path().join("opaque.dat");
         let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
         let salt = [0x77u8; 32];
-        deniable_write(&path, 42, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
+        deniable_write(&path, 42, None, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let mut counts = [0u64; 256];
         for &b in &bytes {
@@ -632,13 +704,103 @@ mod tests {
         let p2 = dir.path().join("a2.dat");
         let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
         let salt = [0x77u8; 32];
-        deniable_write(&p1, 7, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
-        deniable_write(&p2, 7, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
+        deniable_write(&p1, 7, None, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
+        deniable_write(&p2, 7, None, &mvk, &salt, CipherSuite::Aes256GcmSiv).unwrap();
         let b1 = std::fs::read(&p1).unwrap();
         let b2 = std::fs::read(&p2).unwrap();
         assert_ne!(
             b1, b2,
             "identical-input writes should produce distinct bytes via fresh nonces"
         );
+    }
+
+    // ============================================================
+    // v2 anchors: header generation (R15-D1, header half)
+    // ============================================================
+
+    #[test]
+    fn v2_anchor_round_trips_both_generations() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.anchor");
+        let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
+        let salt = [0x77u8; 32];
+        write(&path, 12, Some(5), &mvk, &salt).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            ANCHOR_V2_SIZE as u64
+        );
+        let r = read_and_verify(&path, &mvk, &salt).unwrap();
+        assert_eq!((r.generation, r.header_generation), (12, Some(5)));
+        // v1 stays v1 and reads back without a header generation.
+        write(&path, 12, None, &mvk, &salt).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), ANCHOR_SIZE as u64);
+        let r = read_and_verify(&path, &mvk, &salt).unwrap();
+        assert_eq!((r.generation, r.header_generation), (12, None));
+    }
+
+    #[test]
+    fn v2_anchor_header_generation_is_authenticated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.anchor");
+        let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
+        let salt = [0x77u8; 32];
+        write(&path, 12, Some(5), &mvk, &salt).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[16] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            read_and_verify(&path, &mvk, &salt),
+            Err(Error::AnchorAuthFailed)
+        ));
+    }
+
+    /// A v2 body under a v1 magic (or v1 body under v2) is a length /
+    /// magic mismatch, never a downgrade to "no header generation".
+    #[test]
+    fn anchor_magic_length_mismatch_is_corrupt() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("a.anchor");
+        let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
+        let salt = [0x77u8; 32];
+        write(&path, 12, Some(5), &mvk, &salt).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[..8].copy_from_slice(b"LBXANCH1");
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            read_and_verify(&path, &mvk, &salt),
+            Err(Error::AnchorCorrupt)
+        ));
+        // Oversized file with a valid v2 prefix.
+        write(&path, 12, Some(5), &mvk, &salt).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(0);
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            read_and_verify(&path, &mvk, &salt),
+            Err(Error::AnchorCorrupt)
+        ));
+    }
+
+    #[test]
+    fn deniable_anchor_carries_header_generation_behind_marker() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("opaque.dat");
+        let mvk = MasterVolumeKey::from_bytes([0x42; 32]);
+        let salt = [0x77u8; 32];
+        let suite = CipherSuite::Aes256GcmSiv;
+        deniable_write(&path, 9, Some(4), &mvk, &salt, suite).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().len(),
+            DENIABLE_ANCHOR_SIZE as u64
+        );
+        let r = deniable_read_and_verify(&path, &mvk, &salt, suite).unwrap();
+        assert_eq!((r.generation, r.header_generation), (9, Some(4)));
+        // Unmarked (pre-v3) anchors never yield a header generation, no
+        // matter what the random padding holds.
+        for _ in 0..16 {
+            deniable_write(&path, 9, None, &mvk, &salt, suite).unwrap();
+            let r = deniable_read_and_verify(&path, &mvk, &salt, suite).unwrap();
+            assert_eq!(r.header_generation, None);
+        }
     }
 }

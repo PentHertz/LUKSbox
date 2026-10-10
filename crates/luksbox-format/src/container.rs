@@ -30,6 +30,15 @@ use luksbox_core::{
 /// `vault.lbx.meta-bak`. Uses `OsString::push` so it works on Linux
 /// (raw bytes), macOS (UTF-8), and Windows (WTF-16 code units)
 /// without lossy conversion.
+/// Next header generation (R15-D1). A u64 counter bumped once per header
+/// write does not overflow in practice; refuse rather than wrap if it
+/// ever did, since a wrapped counter would read as a rollback.
+fn next_header_generation(current: u64) -> Result<u64, Error> {
+    current
+        .checked_add(1)
+        .ok_or(Error::Crypto(luksbox_core::Error::InvalidField))
+}
+
 fn append_extension(path: &Path, ext: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".");
@@ -668,6 +677,13 @@ pub struct Container {
     /// re-establishing the live region from the recovered bytes so
     /// the next crash has a current live + previous mirror again.
     metadata_recovered_from_mirror: bool,
+    /// Metadata generation last read from / written to the attached
+    /// anchor. `persist_header` re-writes the anchor with it when a
+    /// header-v3 write bumps the header generation (R15-D1): a revoke
+    /// or enroll must advance the anchor's header generation even when
+    /// no metadata flush follows. Lags the vault at worst, which the
+    /// anchor tolerates (`AnchorStale`).
+    anchored_metadata_gen: Option<u64>,
     // Locks are held intrinsically by `file` (and by the `File`
     // inside `header_storage` when detached). When the Container is
     // dropped, those handles are dropped, which releases their
@@ -722,6 +738,7 @@ struct DeniableSnapshot {
     bytes: Box<[u8; luksbox_core::deniable::DENIABLE_HEADER_SIZE]>,
     salt: [u8; luksbox_core::deniable::DENIABLE_SALT_SIZE],
     inner: crate::deniable_header::DeniableInnerHeader,
+    v3: Option<crate::deniable_header::DeniableHeaderV3>,
     unlocked_slot_idx: usize,
 }
 
@@ -790,6 +807,10 @@ struct DeniableState {
     /// own slot when adding a new user. Set at create / open time;
     /// updated when ops complete.
     unlocked_slot_idx: usize,
+    /// Header-format-v3 fields (R15-D1) as last sealed into `bytes`;
+    /// `None` for pre-v3 deniable vaults. `persist_header` re-seals the
+    /// inner header with the next generation before every write.
+    v3: Option<crate::deniable_header::DeniableHeaderV3>,
 }
 
 impl Container {
@@ -1013,6 +1034,7 @@ impl Container {
             rotation: None,
             deniable: None,
             metadata_recovered_from_mirror: false,
+            anchored_metadata_gen: None,
         })
     }
 
@@ -1492,8 +1514,10 @@ impl Container {
                 salt,
                 inner,
                 unlocked_slot_idx: slot_idx,
+                v3: None,
             }),
             metadata_recovered_from_mirror: false,
+            anchored_metadata_gen: None,
         })
     }
 
@@ -1632,8 +1656,10 @@ impl Container {
                 salt: result.per_vault_salt,
                 inner: result.inner,
                 unlocked_slot_idx: result.matched_slot_idx,
+                v3: result.v3,
             }),
             metadata_recovered_from_mirror: false,
+            anchored_metadata_gen: None,
         })
     }
 
@@ -1971,6 +1997,7 @@ impl Container {
             rotation: None,
             deniable: None,
             metadata_recovered_from_mirror: false,
+            anchored_metadata_gen: None,
         })
     }
 
@@ -2004,6 +2031,7 @@ impl Container {
             rotation: None,
             deniable: None,
             metadata_recovered_from_mirror: false,
+            anchored_metadata_gen: None,
         })
     }
 
@@ -2058,6 +2086,7 @@ impl Container {
             rotation: None,
             deniable: None,
             metadata_recovered_from_mirror: false,
+            anchored_metadata_gen: None,
         })
     }
 
@@ -2142,6 +2171,19 @@ impl Container {
             return Err(Error::OpaqueUnlockFailed);
         }
 
+        // R15-D1: decrypt the on-disk inner header with the handed-over
+        // MVK instead of trusting the handoff copy. The handoff wire
+        // carries only the 38 pre-v3 bytes, so the header-v3 generation
+        // and slot digest exist nowhere else; without them the helper
+        // would write anchors with no (i.e. a regressed) header
+        // generation. The disk copy is authenticated under the MVK, and
+        // a v3 one is checked against the slot table here as well.
+        let (disk_inner, v3) =
+            crate::deniable_header::open_inner_with_mvk(&header_buf, &mvk, inner.cipher_suite)?;
+        if disk_inner != inner {
+            return Err(Error::OpaqueUnlockFailed);
+        }
+
         // Synthesize the standard Header struct the same way
         // `complete_open_v2_deniable` does, so downstream code that
         // reads `self.header.*` sees consistent values for the
@@ -2171,8 +2213,10 @@ impl Container {
                 salt: per_vault_salt,
                 inner,
                 unlocked_slot_idx,
+                v3,
             }),
             metadata_recovered_from_mirror: false,
+            anchored_metadata_gen: None,
         })
     }
 
@@ -2593,7 +2637,8 @@ impl Container {
     /// recovery state for that window; commit clears the mirror flags
     /// so the next persist re-establishes mirrors at the committed path.
     fn is_v2_format(&self) -> bool {
-        self.header.version_major == luksbox_core::VERSION_MAJOR_V2
+        // v3 (LUKSBOX3) is a superset of v2: mirrors included.
+        self.header.version_major >= luksbox_core::VERSION_MAJOR_V2
             && self.deniable.is_none()
             && self.rotation.is_none()
     }
@@ -3351,6 +3396,13 @@ impl Container {
     ///     renames over the sidecar, then fsyncs the parent directory.
     ///     This replaces the prior in-place rewrite path, which could
     ///     leave the sidecar half-overwritten on crash.
+    ///
+    /// R15-D1: on a header-v3 vault every write is a new header state:
+    /// the generation is bumped first (and the deniable inner header
+    /// re-sealed over the slot table being written), then an attached
+    /// anchor is advanced to it. The in-memory generation only moves
+    /// once the write succeeded, so an anchor can never record a
+    /// generation that is not on disk.
     pub fn persist_header(&mut self) -> Result<(), Error> {
         if !self.header_dirty {
             return Ok(());
@@ -3366,12 +3418,58 @@ impl Container {
             // no observable LUKSbox-shaped artifacts. The deniable
             // header itself is duplicated at multiple offsets within
             // the 36 KiB region for its own redundancy.
+            let mut bytes = deniable.bytes.clone();
+            let new_v3 = match deniable.v3 {
+                Some(v3) => Some(crate::deniable_header::reseal_inner_v3(
+                    &mut bytes,
+                    &deniable.inner,
+                    next_header_generation(v3.header_generation)?,
+                    &self.mvk,
+                    &deniable.salt,
+                    self.header.cipher_suite,
+                )?),
+                None => None,
+            };
             self.file.seek(SeekFrom::Start(0))?;
-            self.file.write_all(&deniable.bytes[..])?;
+            self.file.write_all(&bytes[..])?;
             self.file.sync_all()?;
+            let deniable = self.deniable.as_mut().expect("checked above");
+            deniable.bytes = bytes;
+            deniable.v3 = new_v3;
             self.header_dirty = false;
+            return self.refresh_anchor_after_header_write();
+        }
+        let prev_generation = self.header.header_generation;
+        if self.header.has_header_generation() {
+            self.header.header_generation = next_header_generation(prev_generation)?;
+        }
+        if let Err(e) = self.write_standard_header() {
+            self.header.header_generation = prev_generation;
+            return Err(e);
+        }
+        self.header_dirty = false;
+        self.refresh_anchor_after_header_write()
+    }
+
+    /// R15-D1: after a header-v3 write, carry the new header generation
+    /// into the attached anchor (with the last anchored metadata
+    /// generation). Skipped while a rotation is in flight: the header
+    /// is being written into the `.rotating` copy under the NEW MVK, an
+    /// anchor MAC'd under that key would not verify if the rotation
+    /// aborts, and the post-commit flush writes the anchor anyway.
+    fn refresh_anchor_after_header_write(&mut self) -> Result<(), Error> {
+        if self.rotation.is_some() || self.header_generation().is_none() {
             return Ok(());
         }
+        match (&self.anchor_path, self.anchored_metadata_gen) {
+            (Some(_), Some(metadata_gen)) => self.write_anchor(metadata_gen),
+            _ => Ok(()),
+        }
+    }
+
+    /// Serialise `self.header` and write it (mirror first on v2+), the
+    /// standard-mode half of `persist_header`.
+    fn write_standard_header(&mut self) -> Result<(), Error> {
         // v2 vaults: **intended-state mirror protocol**. Commit the
         // mirror to the NEW header bytes BEFORE we overwrite live.
         // See the long-form comment in `write_metadata` for the
@@ -3429,8 +3527,65 @@ impl Container {
                 }
             }
         }
-        self.header_dirty = false;
         Ok(())
+    }
+
+    /// Header generation of a header-v3 vault (standard: the LUKSBOX3
+    /// `header_generation`; deniable: the v3 inner header's), `None`
+    /// for pre-v3 vaults. Monotonic across persisted header states.
+    pub fn header_generation(&self) -> Option<u64> {
+        match &self.deniable {
+            Some(d) => d.v3.map(|v| v.header_generation),
+            None => self
+                .header
+                .has_header_generation()
+                .then_some(self.header.header_generation),
+        }
+    }
+
+    /// Opt this vault into header format v3 (R15-D1, header half): a
+    /// header generation counter bumped by every header write and
+    /// recorded by the anchor, so a restored older keyslot table (e.g.
+    /// a backup taken before a revoke) is detected at open.
+    ///
+    /// Standard vaults move from LUKSBOX2 to LUKSBOX3; LUKSBOX1 vaults
+    /// must be upgraded to LUKSBOX2 first (`Vfs::upgrade_header_to_v3`
+    /// does both). Deniable vaults switch their inner header to the v3
+    /// label with a slot-table digest. Pre-v3 binaries can no longer
+    /// open the vault afterwards; there is no way back.
+    ///
+    /// Only marks the header dirty; the next `persist_header` (explicit
+    /// or on drop) writes generation 1. Returns `Ok(false)` when the
+    /// vault already uses header v3.
+    pub fn upgrade_header_to_v3(&mut self) -> Result<bool, Error> {
+        if self.rotation.is_some() {
+            return Err(Error::HeaderUpgradeUnsupported(
+                "an MVK rotation is in flight",
+            ));
+        }
+        if self.header_generation().is_some() {
+            return Ok(false);
+        }
+        match self.deniable.as_mut() {
+            Some(den) => {
+                den.v3 = Some(crate::deniable_header::DeniableHeaderV3 {
+                    header_generation: 0,
+                    slot_table_digest: [0; 32],
+                });
+            }
+            None => {
+                if self.header.version_major < luksbox_core::VERSION_MAJOR_V2 {
+                    return Err(Error::HeaderUpgradeUnsupported(
+                        "LUKSBOX1 vault: upgrade it to LUKSBOX2 first (open and \
+                         write it once with a v0.2.1+ binary, LUKSBOX_FORMAT_V2 unset)",
+                    ));
+                }
+                self.header.version_major = luksbox_core::VERSION_MAJOR_V3;
+                self.header.header_generation = 0;
+            }
+        }
+        self.header_dirty = true;
+        Ok(true)
     }
 
     /// Write the header mirror to the **intended new bytes** via
@@ -3501,6 +3656,34 @@ impl Container {
         // the stale in-memory copy back on top of the restored bytes.
         self.header_dirty = false;
         Ok(())
+    }
+
+    /// Install `header` (a backup the caller already HMAC-verified under
+    /// this vault's MVK) as the vault's NEW header state. On a header-v3
+    /// vault, or for a v3 backup, the header is re-sealed as LUKSBOX3
+    /// with a generation above both the current one and the backup's,
+    /// and an attached anchor is advanced to it (R15-D1): a deliberate,
+    /// unlocked `header restore` is not a rollback, whereas putting the
+    /// backup's bytes back verbatim would be indistinguishable from
+    /// one. Pre-v3 vaults restoring a pre-v3 backup get its exact bytes.
+    pub fn restore_header_as_new_state(&mut self, mut header: Header) -> Result<(), Error> {
+        if self.is_deniable() {
+            return Err(Error::Crypto(luksbox_core::Error::InvalidField));
+        }
+        if self.header_generation().is_some() || header.has_header_generation() {
+            if header.version_major < luksbox_core::VERSION_MAJOR_V3 {
+                header.version_major = luksbox_core::VERSION_MAJOR_V3;
+            }
+            let floor = self
+                .header_generation()
+                .unwrap_or(0)
+                .max(header.header_generation);
+            header.header_generation = next_header_generation(floor)?;
+        }
+        let bytes = header.to_bytes(&self.mvk);
+        self.restore_header_bytes(&bytes)?;
+        self.header = header;
+        self.refresh_anchor_after_header_write()
     }
 
     /// Inspect keyslots without exposing the MVK.
@@ -3610,7 +3793,23 @@ impl Container {
                 } else {
                     crate::anchor::read_and_verify(&p, &self.mvk, &self.header.header_salt)?
                 };
+                // R15-D1, header half: a header generation BELOW the one
+                // the trusted anchor recorded means the keyslot table was
+                // replaced by an older copy. A pre-v3 header against an
+                // anchor that recorded one counts as generation 0 (a
+                // restore from before the v3 upgrade). The metadata half
+                // is compared by the caller, who holds the Vfs.
+                if let Some(anchor_hg) = a.header_generation {
+                    let hg = self.header_generation().unwrap_or(0);
+                    if anchor_hg > hg {
+                        return Err(Error::HeaderRollbackDetected {
+                            anchor_header_gen: anchor_hg,
+                            header_gen: hg,
+                        });
+                    }
+                }
                 self.anchor_path = Some(p);
+                self.anchored_metadata_gen = Some(a.generation);
                 Ok(Some(a.generation))
             }
         }
@@ -3629,11 +3828,13 @@ impl Container {
         // (`write_anchor`, called on every vfs flush) use the rename-
         // replace path, which is safe because the path was validated
         // at unlock time and `self.anchor_path` is bound to it.
+        let header_generation = self.header_generation();
         if self.is_deniable() {
             let den = self.deniable.as_ref().expect("is_deniable() implies Some");
             crate::anchor::deniable_write_initial(
                 &anchor_path,
                 generation,
+                header_generation,
                 &self.mvk,
                 &den.salt,
                 self.header.cipher_suite,
@@ -3642,36 +3843,57 @@ impl Container {
             crate::anchor::write_initial(
                 &anchor_path,
                 generation,
+                header_generation,
                 &self.mvk,
                 &self.header.header_salt,
             )?;
         }
         self.anchor_path = Some(anchor_path);
+        self.anchored_metadata_gen = Some(generation);
         Ok(())
     }
 
     /// Update the anchor file (if one is set) to the given generation.
-    /// Called by `Vfs::flush` after every metadata-blob write.
-    pub fn write_anchor(&self, generation: u64) -> Result<(), Error> {
+    /// Called by `Vfs::flush` after every metadata-blob write. A
+    /// header-v3 vault also records its current header generation
+    /// (v2 anchor format).
+    pub fn write_anchor(&mut self, generation: u64) -> Result<(), Error> {
+        let header_generation = self.header_generation();
         if let Some(p) = &self.anchor_path {
             if self.is_deniable() {
                 let den = self.deniable.as_ref().expect("is_deniable() implies Some");
                 crate::anchor::deniable_write(
                     p,
                     generation,
+                    header_generation,
                     &self.mvk,
                     &den.salt,
                     self.header.cipher_suite,
                 )?;
             } else {
-                crate::anchor::write(p, generation, &self.mvk, &self.header.header_salt)?;
+                crate::anchor::write(
+                    p,
+                    generation,
+                    header_generation,
+                    &self.mvk,
+                    &self.header.header_salt,
+                )?;
             }
+            self.anchored_metadata_gen = Some(generation);
         }
         Ok(())
     }
 
     pub fn anchor_path(&self) -> Option<&Path> {
         self.anchor_path.as_deref()
+    }
+
+    /// Metadata generation the attached anchor vouched for at
+    /// `set_anchor` / `init_anchor` time (or last wrote), for the
+    /// caller's `anchor::compare` against `Vfs::vault_generation`.
+    /// `None` without an anchor.
+    pub fn anchored_metadata_generation(&self) -> Option<u64> {
+        self.anchor_path.as_ref().and(self.anchored_metadata_gen)
     }
 
     /// Path of the underlying vault file (the `.lbx`).
@@ -3804,6 +4026,7 @@ impl Container {
             bytes: d.bytes.clone(),
             salt: d.salt,
             inner: d.inner,
+            v3: d.v3,
             unlocked_slot_idx: d.unlocked_slot_idx,
         });
         let committed_file = std::mem::replace(&mut self.file, Box::new(tmp_file));
@@ -3941,6 +4164,7 @@ impl Container {
             den.bytes = snap.bytes;
             den.salt = snap.salt;
             den.inner = snap.inner;
+            den.v3 = snap.v3;
             den.unlocked_slot_idx = snap.unlocked_slot_idx;
         }
         // R15-C2: put the retained ORIGINAL handle back. No path is
@@ -7624,5 +7848,401 @@ mod tests {
         // Live also has "second" (the intended state).
         let live = c.read_metadata().unwrap();
         assert_eq!(&**live, b"second");
+    }
+
+    // ================================================================
+    // Header format v3: header generation + anchor v2 (R15-D1)
+    // ================================================================
+
+    /// LUKSBOX2 passphrase vault (the v0.2.1+ default shape).
+    fn v2_vault(path: &Path, pw: &[u8]) -> Container {
+        let mut c = Container::create_with_passphrase(
+            path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            test_params(),
+            pw,
+        )
+        .unwrap();
+        c.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+        c.mark_header_dirty();
+        c.persist_header().unwrap();
+        c
+    }
+
+    fn read_header_region(path: &Path) -> Vec<u8> {
+        std::fs::read(path).unwrap()[..HEADER_SIZE].to_vec()
+    }
+
+    fn write_at_offset(path: &Path, off: u64, bytes: &[u8]) {
+        let mut f = OpenOptions::new().write(true).open(path).unwrap();
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.write_all(bytes).unwrap();
+    }
+
+    fn write_header_region(path: &Path, bytes: &[u8]) {
+        write_at_offset(path, 0, bytes);
+    }
+
+    #[test]
+    fn header_v3_upgrade_and_every_persist_bumps_the_generation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v.lbx");
+        let mut c = v2_vault(&path, b"pw");
+        assert_eq!(c.header_generation(), None);
+        assert!(c.upgrade_header_to_v3().unwrap());
+        assert!(!c.upgrade_header_to_v3().unwrap(), "idempotent");
+        c.persist_header().unwrap();
+        assert_eq!(c.header_generation(), Some(1));
+        assert_eq!(&read_header_region(&path)[..8], b"LUKSBOX3");
+        c.enroll_passphrase(b"second", test_params()).unwrap();
+        c.persist_header().unwrap();
+        assert_eq!(c.header_generation(), Some(2));
+        // A clean persist is not a new state.
+        c.persist_header().unwrap();
+        assert_eq!(c.header_generation(), Some(2));
+        drop(c);
+        let c = Container::open(&path, None, UnlockMaterial::Passphrase(b"second")).unwrap();
+        assert_eq!(c.header_generation(), Some(2));
+    }
+
+    #[test]
+    fn header_v3_upgrade_refuses_luksbox1() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v.lbx");
+        let mut c = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        assert_eq!(c.header.version_major, luksbox_core::VERSION_MAJOR_V1);
+        assert!(matches!(
+            c.upgrade_header_to_v3(),
+            Err(Error::HeaderUpgradeUnsupported(_))
+        ));
+    }
+
+    /// The finding itself: revoke a credential with the anchor attached,
+    /// then restore the pre-revoke header from a backup. The restored
+    /// header has a valid HMAC (same MVK) and the revoked passphrase
+    /// still unwraps it, but the anchor now catches the older keyslot
+    /// table.
+    #[test]
+    fn header_v3_anchor_detects_restored_pre_revoke_header() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v.lbx");
+        let anchor = dir.path().join("v.anchor");
+        let mut c = v2_vault(&path, b"admin");
+        c.upgrade_header_to_v3().unwrap();
+        c.enroll_passphrase(b"revoked-user", test_params()).unwrap();
+        c.persist_header().unwrap();
+        c.write_metadata(b"tree").unwrap();
+        c.init_anchor(anchor.clone(), 1).unwrap();
+        let backup = read_header_region(&path);
+        // Revoke with the anchor attached: persist_header advances the
+        // anchor's header generation even though no metadata flush runs.
+        c.revoke_slot(1).unwrap();
+        c.persist_header().unwrap();
+        let hg_after_revoke = c.header_generation().unwrap();
+        let a = crate::anchor::read_and_verify(&anchor, &c.mvk, &c.header.header_salt).unwrap();
+        assert_eq!(a.header_generation, Some(hg_after_revoke));
+        drop(c);
+
+        // Sanity: the current vault + anchor verify.
+        let mut c = Container::open(&path, None, UnlockMaterial::Passphrase(b"admin")).unwrap();
+        assert_eq!(c.set_anchor(Some(anchor.clone())).unwrap(), Some(1));
+        drop(c);
+
+        // The attack: put the pre-revoke header back.
+        write_header_region(&path, &backup);
+        let mut c =
+            Container::open(&path, None, UnlockMaterial::Passphrase(b"revoked-user")).unwrap();
+        match c.set_anchor(Some(anchor.clone())) {
+            Err(Error::HeaderRollbackDetected {
+                anchor_header_gen,
+                header_gen,
+            }) => {
+                assert_eq!(anchor_header_gen, hg_after_revoke);
+                assert!(header_gen < hg_after_revoke);
+            }
+            other => panic!("expected HeaderRollbackDetected, got {other:?}"),
+        }
+    }
+
+    /// Restoring a backup from BEFORE the v3 upgrade (a LUKSBOX2 header)
+    /// against an anchor that recorded a header generation is also a
+    /// rollback: there is no legitimate v3 -> v2 path.
+    #[test]
+    fn header_v3_anchor_detects_restored_pre_upgrade_header() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v.lbx");
+        let anchor = dir.path().join("v.anchor");
+        let mut c = v2_vault(&path, b"admin");
+        let pre_upgrade = read_header_region(&path);
+        c.upgrade_header_to_v3().unwrap();
+        c.persist_header().unwrap();
+        c.init_anchor(anchor.clone(), 1).unwrap();
+        drop(c);
+        write_header_region(&path, &pre_upgrade);
+        let mut c = Container::open(&path, None, UnlockMaterial::Passphrase(b"admin")).unwrap();
+        assert!(matches!(
+            c.set_anchor(Some(anchor)),
+            Err(Error::HeaderRollbackDetected { header_gen: 0, .. })
+        ));
+    }
+
+    /// A header change made without the anchor attached leaves the anchor
+    /// behind (stale), which is accepted; the next anchored write
+    /// catches it up. Pre-v3 vaults keep writing v1 anchors.
+    #[test]
+    fn header_v3_stale_anchor_is_accepted_and_v2_vaults_keep_v1_anchors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v.lbx");
+        let anchor = dir.path().join("v.anchor");
+        let mut c = v2_vault(&path, b"admin");
+        c.init_anchor(anchor.clone(), 1).unwrap();
+        assert_eq!(
+            std::fs::metadata(&anchor).unwrap().len(),
+            crate::anchor::ANCHOR_SIZE as u64
+        );
+        drop(c);
+
+        let mut c = Container::open(&path, None, UnlockMaterial::Passphrase(b"admin")).unwrap();
+        c.upgrade_header_to_v3().unwrap();
+        c.persist_header().unwrap();
+        c.enroll_passphrase(b"second", test_params()).unwrap();
+        c.persist_header().unwrap();
+        drop(c);
+
+        // v1 anchor (no header generation) against a v3 vault: accepted.
+        let mut c = Container::open(&path, None, UnlockMaterial::Passphrase(b"admin")).unwrap();
+        assert_eq!(c.set_anchor(Some(anchor.clone())).unwrap(), Some(1));
+        c.write_anchor(2).unwrap();
+        let a = crate::anchor::read_and_verify(&anchor, &c.mvk, &c.header.header_salt).unwrap();
+        assert_eq!(a.header_generation, c.header_generation());
+        assert_eq!(
+            std::fs::metadata(&anchor).unwrap().len(),
+            crate::anchor::ANCHOR_V2_SIZE as u64
+        );
+    }
+
+    /// A failed header write must not advance the in-memory generation,
+    /// or the next anchor write would record a generation that never
+    /// reached disk (a false rollback alarm at the next open).
+    #[test]
+    fn header_v3_failed_persist_does_not_advance_generation() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v.lbx");
+        let mut c = v2_vault(&path, b"pw");
+        c.upgrade_header_to_v3().unwrap();
+        c.persist_header().unwrap();
+        assert_eq!(c.header_generation(), Some(1));
+        // Make the mirror write fail: a directory where the
+        // `.header-bak` temp file would be committed.
+        let mirror = path.with_file_name("v.lbx.header-bak");
+        std::fs::remove_file(&mirror).ok();
+        std::fs::create_dir(&mirror).unwrap();
+        c.enroll_passphrase(b"second", test_params()).unwrap();
+        assert!(c.persist_header().is_err());
+        assert_eq!(c.header_generation(), Some(1));
+        std::fs::remove_dir(&mirror).unwrap();
+        c.persist_header().unwrap();
+        assert_eq!(c.header_generation(), Some(2));
+    }
+
+    // ---- deniable header v3 -----------------------------------------
+
+    fn deniable_v3_vault(path: &Path, cred: &luksbox_core::deniable::DeniableCredential) {
+        use crate::deniable_header::DeniableMaterial;
+        let mut c = Container::create_with_credential_v2_deniable(
+            path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            0,
+            0,
+            cred,
+            &DeniableMaterial::passphrase_only(),
+        )
+        .unwrap();
+        assert!(c.upgrade_header_to_v3().unwrap());
+        c.persist_header().unwrap();
+        assert_eq!(c.header_generation(), Some(1));
+    }
+
+    fn open_deniable(
+        path: &Path,
+        cred: &luksbox_core::deniable::DeniableCredential,
+    ) -> Result<Container, Error> {
+        let env = Container::try_open_envelope_v2_deniable(
+            path,
+            None,
+            cred,
+            CipherSuite::Aes256GcmSiv,
+            None,
+        )?;
+        Container::complete_open_v2_deniable(env, cred)
+    }
+
+    #[test]
+    fn deniable_header_v3_round_trips_and_counts_slot_changes() {
+        use luksbox_core::deniable::DeniableCredential;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("d.lbx");
+        let admin = DeniableCredential::Passphrase {
+            passphrase: b"admin",
+            argon2: cheap_argon2(),
+        };
+        deniable_v3_vault(&path, &admin);
+        let mut c = open_deniable(&path, &admin).unwrap();
+        assert_eq!(c.header_generation(), Some(1));
+        c.enroll_passphrase_deniable(3, b"user", cheap_argon2())
+            .unwrap();
+        c.persist_header().unwrap();
+        assert_eq!(c.header_generation(), Some(2));
+        c.clear_deniable_slot(3).unwrap();
+        c.persist_header().unwrap();
+        drop(c);
+        let c = open_deniable(&path, &admin).unwrap();
+        assert_eq!(c.header_generation(), Some(3));
+    }
+
+    /// Splicing a cleared slot's old envelope back into the current
+    /// header (the deniable header-rollback that needs no full-header
+    /// restore) fails the slot-table digest: no credential opens it.
+    #[test]
+    fn deniable_header_v3_rejects_spliced_slot_table() {
+        use crate::deniable_header::DeniableMaterial;
+        use luksbox_core::deniable::{
+            DENIABLE_SLOT_SIZE, DENIABLE_SLOT_TABLE_OFFSET, DeniableCredential,
+        };
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("d.lbx");
+        let admin = DeniableCredential::Passphrase {
+            passphrase: b"admin",
+            argon2: cheap_argon2(),
+        };
+        let user = DeniableCredential::Passphrase {
+            passphrase: b"user",
+            argon2: cheap_argon2(),
+        };
+        deniable_v3_vault(&path, &admin);
+        let mut c = open_deniable(&path, &admin).unwrap();
+        c.enroll_credential_v2_deniable(2, &user, &DeniableMaterial::passphrase_only())
+            .unwrap();
+        c.persist_header().unwrap();
+        drop(c);
+        let off = DENIABLE_SLOT_TABLE_OFFSET + 2 * DENIABLE_SLOT_SIZE;
+        let old_slot = std::fs::read(&path).unwrap()[off..off + DENIABLE_SLOT_SIZE].to_vec();
+
+        let mut c = open_deniable(&path, &admin).unwrap();
+        c.clear_deniable_slot(2).unwrap();
+        c.persist_header().unwrap();
+        drop(c);
+        assert!(matches!(
+            open_deniable(&path, &user),
+            Err(Error::OpaqueUnlockFailed)
+        ));
+
+        // Splice the revoked user's envelope back in.
+        write_at_offset(&path, off as u64, &old_slot);
+        assert!(matches!(
+            open_deniable(&path, &user),
+            Err(Error::OpaqueUnlockFailed)
+        ));
+        assert!(matches!(
+            open_deniable(&path, &admin),
+            Err(Error::OpaqueUnlockFailed)
+        ));
+    }
+
+    /// A whole, consistent older deniable header (generation and digest
+    /// both genuine) is caught by the anchor instead.
+    #[test]
+    fn deniable_header_v3_anchor_detects_restored_header() {
+        use luksbox_core::deniable::{DENIABLE_HEADER_SIZE, DeniableCredential};
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("d.lbx");
+        let anchor = dir.path().join("d.anchor");
+        let admin = DeniableCredential::Passphrase {
+            passphrase: b"admin",
+            argon2: cheap_argon2(),
+        };
+        deniable_v3_vault(&path, &admin);
+        let mut c = open_deniable(&path, &admin).unwrap();
+        c.enroll_passphrase_deniable(4, b"user", cheap_argon2())
+            .unwrap();
+        c.persist_header().unwrap();
+        c.init_anchor(anchor.clone(), 1).unwrap();
+        drop(c);
+        let backup = std::fs::read(&path).unwrap()[..DENIABLE_HEADER_SIZE].to_vec();
+
+        let mut c = open_deniable(&path, &admin).unwrap();
+        c.set_anchor(Some(anchor.clone())).unwrap();
+        c.clear_deniable_slot(4).unwrap();
+        c.persist_header().unwrap();
+        drop(c);
+
+        write_header_region(&path, &backup);
+        let mut c = open_deniable(&path, &admin).unwrap();
+        assert!(matches!(
+            c.set_anchor(Some(anchor)),
+            Err(Error::HeaderRollbackDetected { .. })
+        ));
+    }
+
+    /// The FUSE-T helper re-opens with the MVK and the 38-byte pre-v3
+    /// inner fields only; it must recover the v3 state from disk.
+    #[test]
+    fn deniable_header_v3_survives_mvk_handoff() {
+        use luksbox_core::deniable::DeniableCredential;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("d.lbx");
+        let admin = DeniableCredential::Passphrase {
+            passphrase: b"admin",
+            argon2: cheap_argon2(),
+        };
+        deniable_v3_vault(&path, &admin);
+        let c = open_deniable(&path, &admin).unwrap();
+        let (salt, inner, slot_idx) = c.deniable_handoff_state().unwrap();
+        let mvk = c.mvk_clone();
+        drop(c);
+        let wire = inner.serialise_for_handoff();
+        let inner = crate::deniable_header::DeniableInnerHeader::parse_from_handoff(&wire).unwrap();
+        let helper =
+            Container::open_with_mvk_deniable(&path, None, mvk, salt, inner, slot_idx).unwrap();
+        assert_eq!(helper.header_generation(), Some(1));
+    }
+
+    /// `header restore` of a verified pre-revoke backup on a header-v3
+    /// vault is a deliberate new state: it lands above the anchor's
+    /// header generation instead of tripping the rollback check.
+    #[test]
+    fn header_v3_deliberate_restore_is_a_new_state() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("v.lbx");
+        let anchor = dir.path().join("v.anchor");
+        let mut c = v2_vault(&path, b"admin");
+        c.upgrade_header_to_v3().unwrap();
+        c.enroll_passphrase(b"user", test_params()).unwrap();
+        c.persist_header().unwrap();
+        c.init_anchor(anchor.clone(), 1).unwrap();
+        let backup = read_header_region(&path);
+        c.revoke_slot(1).unwrap();
+        c.persist_header().unwrap();
+        let hg = c.header_generation().unwrap();
+
+        let backup: [u8; HEADER_SIZE] = backup.try_into().unwrap();
+        let parsed = Header::from_bytes(&backup).unwrap();
+        parsed.verify_hmac(&backup, &c.mvk).unwrap();
+        c.restore_header_as_new_state(parsed).unwrap();
+        assert!(c.header_generation().unwrap() > hg);
+        drop(c);
+
+        let mut c = Container::open(&path, None, UnlockMaterial::Passphrase(b"user")).unwrap();
+        c.set_anchor(Some(anchor))
+            .expect("a deliberate restore is ahead of the anchor");
     }
 }

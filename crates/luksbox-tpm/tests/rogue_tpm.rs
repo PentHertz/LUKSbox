@@ -365,3 +365,45 @@ fn multi_slot_vault_picks_first_unsealable_slot() {
         r.err()
     );
 }
+
+/// R15-F5: an SRK-pinned TPM slot unlocks normally, and once an
+/// (active-interposer) substituted SRK is reported the slot refuses,
+/// with `SrkMismatch` raised before anything is unsealed. The pinned
+/// blob, 19 bytes longer, still fits the keyslot's variable region.
+#[test]
+fn srk_pinned_slot_refuses_substituted_srk() {
+    let dir = TempDir::new().unwrap();
+    let mut tpm = MockTpm2Sealer::new();
+    tpm.set_srk_pinning(true);
+    let (path, _kek, blob_bytes) = build_vault_with_tpm_slot(&dir, &mut tpm);
+    assert!(luksbox_tpm::blob_is_srk_pinned(&blob_bytes));
+
+    open_with_mock_tpm(&path, &mut tpm).expect("pinned slot unlocks against the real SRK");
+
+    tpm.substitute_srk();
+    let mut saw_mismatch = false;
+    let mut unseal = |blob: &[u8]| -> Result<[u8; 32], String> {
+        let b = SealedBlob::from_bytes(blob).map_err(|e| e.to_string())?;
+        match tpm.unseal(&b) {
+            Ok(s) => Ok(*s),
+            Err(luksbox_tpm::Error::SrkMismatch) => {
+                saw_mismatch = true;
+                Err("srk mismatch".into())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    };
+    let r = Container::open(
+        &path,
+        None,
+        UnlockMaterial::Tpm2 {
+            unseal: &mut unseal,
+        },
+    );
+    assert!(
+        matches!(r, Err(FormatError::UnlockFailed)),
+        "got {:?}",
+        r.err()
+    );
+    assert!(saw_mismatch);
+}

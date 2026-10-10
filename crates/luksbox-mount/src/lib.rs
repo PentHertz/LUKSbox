@@ -43,6 +43,14 @@ mod unix_statvfs;
 ))]
 mod mountpoint;
 
+// Shared fork-to-background helpers (`luksbox mount` daemonizes by
+// default), used by both Unix mount adapters.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "fuse"),
+    all(target_os = "macos", feature = "fuse-t"),
+))]
+mod daemon;
+
 #[cfg(all(target_os = "windows", feature = "winfsp"))]
 mod winfsp;
 
@@ -54,8 +62,10 @@ mod winfsp;
 /// return as soon as the in-memory tree is updated rather than driving
 /// a synchronous flush per call. Users who want pre-Layer-1 semantics
 /// (durable on every metadata op return) pass `--sync` to
-/// `luksbox mount`, which disables the timer and re-enables eager
-/// flushing in every adapter.
+/// `luksbox mount`, which re-enables eager flushing in every adapter
+/// and disables the timer on libfuse3 / FUSE-T. WinFsp keeps its timer
+/// under `--sync` as a backstop for paging writes the Windows cache
+/// manager delivers after a handle's cleanup (R15-G3).
 ///
 /// Crash-loss window: up to `LAZY_FLUSH_INTERVAL_SECS` of metadata
 /// changes if the host loses power between activity and the next

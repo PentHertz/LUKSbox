@@ -56,6 +56,59 @@ use zeroize::Zeroizing;
 /// `&[u8]` everywhere.
 pub const SEALED_SECRET_LEN: usize = 32;
 
+/// Length of a pinned SRK identity (R15-F5): the first 16 bytes of a
+/// domain-separated SHA-256 over the SRK's marshalled public area.
+/// 128 bits of second-preimage resistance is far beyond what an
+/// interposer forging an ECC public area could search, and the short
+/// pin keeps a fused TPM+FIDO2 blob inside the 352-byte slot region.
+pub const SRK_PIN_LEN: usize = 16;
+
+/// Leading bytes of a pinned `SealedBlob` encoding. A legacy blob
+/// starts with its `public_len: u16 LE`; 0xFFFF there would claim a
+/// 64 KiB public area, which no slot can hold, so the two encodings
+/// never collide and pre-R15-F5 binaries reject a pinned blob as
+/// malformed instead of unsealing without the check.
+const PINNED_BLOB_MARKER: [u8; 2] = [0xFF, 0xFF];
+const PINNED_BLOB_VERSION: u8 = 2;
+const SRK_PIN_LABEL: &[u8] = b"luksbox-tpm-srk-pin/v1";
+
+/// SRK identity pinned into a sealed blob, from the marshalled
+/// TPMT_PUBLIC that `CreatePrimary` returned for the SRK.
+pub fn srk_pin_from_public(marshalled_public: &[u8]) -> [u8; SRK_PIN_LEN] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(SRK_PIN_LABEL);
+    h.update(marshalled_public);
+    let d = h.finalize();
+    let mut pin = [0u8; SRK_PIN_LEN];
+    pin.copy_from_slice(&d[..SRK_PIN_LEN]);
+    pin
+}
+
+/// Whether serialized blob bytes (as stored in a keyslot) carry an SRK
+/// pin. For display (`luksbox info`); unseal parses the blob anyway.
+pub fn blob_is_srk_pinned(bytes: &[u8]) -> bool {
+    bytes.starts_with(&PINNED_BLOB_MARKER)
+}
+
+static DEFAULT_SRK_PINNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Process-wide default for SRK pinning of NEW seals (R15-F5), read by
+/// every `Tpm2Sealer` constructor. The CLI sets it from `--tpm-pin-srk`
+/// and the GUI from its preference, so the many enroll / create paths
+/// do not each need a parameter. Unsealing always enforces a pin that
+/// a blob carries, whatever this says. Off by default: a pinned blob
+/// cannot be unsealed by LUKSbox versions before the pinning release.
+pub fn set_default_srk_pinning(on: bool) {
+    DEFAULT_SRK_PINNING.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current process-wide default, see `set_default_srk_pinning`.
+pub fn default_srk_pinning() -> bool {
+    DEFAULT_SRK_PINNING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// On-disk format of a TPM-sealed secret. The two `Vec<u8>` fields
 /// are the marshalled TPM2B_PUBLIC and TPM2B_PRIVATE blobs returned
 /// by `Esys_Create`. The wire representation is platform-portable
@@ -66,14 +119,29 @@ pub const SEALED_SECRET_LEN: usize = 32;
 pub struct SealedBlob {
     pub public: Vec<u8>,
     pub private: Vec<u8>,
+    /// R15-F5: identity of the SRK the object was sealed under
+    /// (`srk_pin_from_public`). When present, unseal refuses to start
+    /// the salted session unless the SRK the TPM returns hashes to it:
+    /// an ACTIVE bus interposer that substitutes its own public area in
+    /// the `CreatePrimary` response would otherwise receive the session
+    /// salt encrypted to its key and read the unsealed KEK.
+    pub srk_pin: Option<[u8; SRK_PIN_LEN]>,
 }
 
 impl SealedBlob {
     /// Concatenate the two blobs with `u16` length prefixes for
     /// embedding in a fixed-size keyslot. Layout:
     ///   `[public_len: u16 LE | public_bytes | private_len: u16 LE | private_bytes]`
+    /// A pinned blob (R15-F5) is prefixed with
+    ///   `[0xFF 0xFF | version = 2 | srk_pin (16 B)]`.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(4 + self.public.len() + self.private.len());
+        let mut out =
+            Vec::with_capacity(3 + SRK_PIN_LEN + 4 + self.public.len() + self.private.len());
+        if let Some(pin) = &self.srk_pin {
+            out.extend_from_slice(&PINNED_BLOB_MARKER);
+            out.push(PINNED_BLOB_VERSION);
+            out.extend_from_slice(pin);
+        }
         out.extend_from_slice(&(self.public.len() as u16).to_le_bytes());
         out.extend_from_slice(&self.public);
         out.extend_from_slice(&(self.private.len() as u16).to_le_bytes());
@@ -85,6 +153,21 @@ impl SealedBlob {
     /// length prefixes don't match the actual byte counts (happens
     /// when a slot was truncated or written by a buggy version).
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
+        let (srk_pin, bytes) = if bytes.starts_with(&PINNED_BLOB_MARKER) {
+            if bytes.len() < 3 + SRK_PIN_LEN {
+                return Err(Error::BlobMalformed(
+                    "pinned blob too short for its SRK pin",
+                ));
+            }
+            if bytes[2] != PINNED_BLOB_VERSION {
+                return Err(Error::BlobMalformed("unknown pinned-blob version"));
+            }
+            let mut pin = [0u8; SRK_PIN_LEN];
+            pin.copy_from_slice(&bytes[3..3 + SRK_PIN_LEN]);
+            (Some(pin), &bytes[3 + SRK_PIN_LEN..])
+        } else {
+            (None, bytes)
+        };
         if bytes.len() < 4 {
             return Err(Error::BlobMalformed("too short for both length prefixes"));
         }
@@ -99,7 +182,11 @@ impl SealedBlob {
             return Err(Error::BlobMalformed("private_len overruns buffer"));
         }
         let private = bytes[priv_off + 2..priv_off + 2 + priv_len].to_vec();
-        Ok(Self { public, private })
+        Ok(Self {
+            public,
+            private,
+            srk_pin,
+        })
     }
 }
 
@@ -115,6 +202,15 @@ pub enum Error {
     TpmError(String),
     #[error("sealed blob malformed: {0}")]
     BlobMalformed(&'static str),
+    /// R15-F5: the SRK returned by `CreatePrimary` is not the one the
+    /// blob was sealed under. Nothing secret was sent to the TPM.
+    #[error(
+        "the TPM's storage root key does not match the one this keyslot was sealed under; \
+         refusing to unseal. Either the TPM was cleared or replaced (the slot can no \
+         longer be unsealed on this machine), or something between this computer and \
+         the TPM substituted the key (a TPM-bus interposer)"
+    )]
+    SrkMismatch,
 }
 
 // ---------- compiled-out stub (no hardware feature, OR no backend) ----
@@ -142,6 +238,7 @@ mod stub {
         pub fn from_tcti_str(_tcti: &str) -> Result<Self, Error> {
             Err(Error::NotCompiledIn)
         }
+        pub fn set_srk_pinning(&mut self, _on: bool) {}
         pub fn seal(&mut self, _plaintext: &[u8; SEALED_SECRET_LEN]) -> Result<SealedBlob, Error> {
             Err(Error::NotCompiledIn)
         }
@@ -213,10 +310,52 @@ mod tests {
         let original = SealedBlob {
             public: vec![0xAA; 80],
             private: vec![0xBB; 200],
+            srk_pin: None,
         };
         let bytes = original.to_bytes();
         let parsed = SealedBlob::from_bytes(&bytes).unwrap();
         assert_eq!(parsed, original);
+    }
+
+    /// R15-F5: the pinned encoding round-trips, is recognisable, and
+    /// adds exactly 19 bytes.
+    #[test]
+    fn pinned_sealed_blob_roundtrip() {
+        let legacy = SealedBlob {
+            public: vec![0xAA; 80],
+            private: vec![0xBB; 200],
+            srk_pin: None,
+        };
+        let pinned = SealedBlob {
+            srk_pin: Some(srk_pin_from_public(b"srk public area")),
+            ..legacy.clone()
+        };
+        let bytes = pinned.to_bytes();
+        assert_eq!(bytes.len(), legacy.to_bytes().len() + 3 + SRK_PIN_LEN);
+        assert!(blob_is_srk_pinned(&bytes));
+        assert!(!blob_is_srk_pinned(&legacy.to_bytes()));
+        assert_eq!(SealedBlob::from_bytes(&bytes).unwrap(), pinned);
+    }
+
+    /// What a pre-R15-F5 parser sees in a pinned blob: a 0xFFFF public
+    /// length that overruns any slot, i.e. a clean `BlobMalformed`.
+    #[test]
+    fn pinned_blob_is_malformed_for_legacy_parsers() {
+        let pinned = SealedBlob {
+            public: vec![1; 80],
+            private: vec![2; 200],
+            srk_pin: Some([3; SRK_PIN_LEN]),
+        }
+        .to_bytes();
+        let legacy_pub_len = u16::from_le_bytes([pinned[0], pinned[1]]) as usize;
+        assert!(legacy_pub_len + 4 > pinned.len());
+        // And an unknown future pinned version is refused, not guessed.
+        let mut future = pinned.clone();
+        future[2] = 3;
+        assert!(matches!(
+            SealedBlob::from_bytes(&future),
+            Err(Error::BlobMalformed(_))
+        ));
     }
 
     #[test]

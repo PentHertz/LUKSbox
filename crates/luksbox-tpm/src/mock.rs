@@ -15,6 +15,8 @@
 //!   - `simulate_seal_error()`            -return Err(TpmError(...)) on next seal
 //!   - `forget_blobs()`                   -drop all known blobs (rogue swap to a
 //!     different chip; subsequent unseal fails)
+//!   - `substitute_srk()`                 -the SRK public area the "TPM" reports
+//!     changes (an active bus interposer, R15-F5); pinned blobs refuse to unseal
 //!
 //! The format-layer's `UnlockMaterial::Tpm2 { unseal: closure }` already
 //! takes a closure, so tests just wrap a `MockTpm2Sealer` in a closure
@@ -29,7 +31,7 @@ use std::collections::HashMap;
 use rand_core::{OsRng, RngCore};
 use zeroize::Zeroizing;
 
-use crate::{Error, SEALED_SECRET_LEN, SealedBlob};
+use crate::{Error, SEALED_SECRET_LEN, SealedBlob, srk_pin_from_public};
 
 /// Deterministic in-memory "TPM": a HashMap mapping
 /// `(public_bytes, private_bytes) -> 32-byte secret`. Each call to
@@ -53,6 +55,10 @@ pub struct MockTpm2Sealer {
     /// If set, the next `seal()` returns `Err(TpmError(...))`.
     /// One-shot, then auto-clears.
     next_seal_errors: bool,
+    /// Stand-in for the SRK's marshalled public area, pinned into new
+    /// seals when `pin_srk` is on and checked at unseal (R15-F5).
+    srk_public: [u8; 32],
+    pin_srk: bool,
 }
 
 impl Default for MockTpm2Sealer {
@@ -63,12 +69,30 @@ impl Default for MockTpm2Sealer {
 
 impl MockTpm2Sealer {
     pub fn new() -> Self {
+        let mut srk_public = [0u8; 32];
+        OsRng.fill_bytes(&mut srk_public);
         Self {
             blobs: HashMap::new(),
             forced_unsealed: None,
             next_unseal_errors: false,
             next_seal_errors: false,
+            srk_public,
+            pin_srk: false,
         }
+    }
+
+    /// Mirrors `Tpm2Sealer::set_srk_pinning`.
+    pub fn set_srk_pinning(&mut self, on: bool) {
+        self.pin_srk = on;
+    }
+
+    /// Hostile knob (R15-F5): from now on the "TPM" reports a different
+    /// SRK public area, as an active interposer rewriting the
+    /// `CreatePrimary` response would. Pinned blobs then fail with
+    /// `SrkMismatch` before anything is "sent"; unpinned blobs are not
+    /// protected (they still unseal here, as the attack goes unnoticed).
+    pub fn substitute_srk(&mut self) {
+        OsRng.fill_bytes(&mut self.srk_public);
     }
 
     /// Hostile knob: every subsequent `unseal()` ignores the blob and
@@ -138,7 +162,12 @@ impl MockTpm2Sealer {
         let mut private = vec![0u8; 200];
         OsRng.fill_bytes(&mut public);
         OsRng.fill_bytes(&mut private);
-        let blob = SealedBlob { public, private };
+        let srk_pin = self.pin_srk.then(|| srk_pin_from_public(&self.srk_public));
+        let blob = SealedBlob {
+            public,
+            private,
+            srk_pin,
+        };
         let key = blob.to_bytes();
         self.blobs
             .insert(key, (*plaintext, pin.map(|p| p.to_vec())));
@@ -162,6 +191,13 @@ impl MockTpm2Sealer {
         if self.next_unseal_errors {
             self.next_unseal_errors = false;
             return Err(Error::TpmError("simulated unseal failure".into()));
+        }
+        // R15-F5: same order as the real sealer: the pin is checked
+        // right after `CreatePrimary`, before any session or unseal.
+        if let Some(pin) = &blob.srk_pin
+            && *pin != srk_pin_from_public(&self.srk_public)
+        {
+            return Err(Error::SrkMismatch);
         }
         if let Some(forced) = &self.forced_unsealed {
             // Downstream API requires exactly SEALED_SECRET_LEN bytes;
@@ -275,5 +311,27 @@ mod tests {
         // Second call clears the flag and succeeds.
         let out = tpm.unseal(&blob).unwrap();
         assert_eq!(*out, secret);
+    }
+
+    #[test]
+    fn pinned_blob_refuses_a_substituted_srk() {
+        let mut tpm = MockTpm2Sealer::new();
+        tpm.set_srk_pinning(true);
+        let secret = [0x66u8; SEALED_SECRET_LEN];
+        let blob = tpm.seal(&secret).unwrap();
+        assert!(blob.srk_pin.is_some());
+        assert_eq!(*tpm.unseal(&blob).unwrap(), secret);
+        tpm.substitute_srk();
+        assert!(matches!(tpm.unseal(&blob), Err(Error::SrkMismatch)));
+    }
+
+    #[test]
+    fn unpinned_blob_has_no_srk_check() {
+        let mut tpm = MockTpm2Sealer::new();
+        let secret = [0x67u8; SEALED_SECRET_LEN];
+        let blob = tpm.seal(&secret).unwrap();
+        assert!(blob.srk_pin.is_none());
+        tpm.substitute_srk();
+        assert_eq!(*tpm.unseal(&blob).unwrap(), secret);
     }
 }

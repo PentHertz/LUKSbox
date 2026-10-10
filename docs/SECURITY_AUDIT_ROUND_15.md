@@ -191,7 +191,10 @@ of the job.
   tag; `github.ref_name` interpolated into `run:` scripts (a crafted tag
   name is shell injection on every runner holding the signing secrets).
   Fixes: SHA-256 pins for the tpm2-tss archives (Windows action and a
-  new Linux staging step that sets `TPM2_TSS_SOURCE_PATH`), the WinFsp
+  new Linux staging step, `scripts/stage_tpm2_tss.sh`, that sets
+  `TPM2_TSS_SOURCE_PATH`; it also writes the `VERSION` file that
+  tpm2-tss's `bootstrap` would otherwise take from `git describe`,
+  which fails on an archive), the WinFsp
   MSI and the choco package version; a CN-anchored signer check; least
   privilege per job with `persist-credentials: false`; every action
   pinned to a commit SHA (with `toolchain:` passed explicitly to
@@ -283,17 +286,108 @@ of the job.
 
 | ID | Why not fixed in this revision |
 |---|---|
-| R15-D1 (header half) | Detecting a rolled-back HEADER (a revoked slot restored from a backup) needs a header generation counter inside the HMAC'd region plus an anchor v2 format and anchor updates from every header-mutating command. Format change; tracked. `ROLLBACK_PROTECTION.md` and `SECURITY.md` now state the limit precisely. |
+| R15-D1 (header half) | Detecting a rolled-back HEADER (a revoked slot restored from a backup) needs a header generation counter inside the HMAC'd region plus an anchor v2 format and anchor updates from every header-mutating command. Format change; tracked. `ROLLBACK_PROTECTION.md` and `SECURITY.md` now state the limit precisely. **Fixed in the follow-up below, as the opt-in header format v3.** |
 | R15-D3 | A v3 hybrid sidecar rewritten as v1/v2 drops its vault binding. Impact is an unlock failure for that slot only (the slot AEAD fails closed); refusing unbound sidecars would break pre-v3 vaults. Documented. |
 | R15-C5 | Detached-header rotation is not crash-safe; the CLI's "back up the header sidecar" advice was wrong (a header backup cannot decrypt re-keyed chunks). Message and spec corrected to "back up the whole vault + header". |
-| R15-F5 | TPM salted sessions defeat a passive bus interposer only; an active interposer that substitutes the SRK public area in `CreatePrimary` learns the KEK. Needs SRK-name pinning in the slot (format change). Documented in `SECURITY.md`. |
-| R15-G3 | WinFsp `--sync` does not flush from `create` / `overwrite` / `set_file_size` and the timer is off in that mode. Windows-only adapter change we could not compile-test in this round; tracked. |
-| R15-H3 | KDF-strength and passphrase-strength guardrails differ between `deniable-init`, the wizard's custom KDF and `enroll`/`update` (which always use interactive cost). Tracked as UX hardening. |
+| R15-F5 | TPM salted sessions defeat a passive bus interposer only; an active interposer that substitutes the SRK public area in `CreatePrimary` learns the KEK. Needs SRK-name pinning in the slot (format change). Documented in `SECURITY.md`. **Fixed in the follow-up below, as opt-in SRK pinning.** |
+| R15-G3 | WinFsp `--sync` does not flush from `create` / `overwrite` / `set_file_size` and the timer is off in that mode. Windows-only adapter change we could not compile-test in this round; tracked. **Fixed in the follow-up below.** |
+| R15-H3 | KDF-strength and passphrase-strength guardrails differ between `deniable-init`, the wizard's custom KDF and `enroll`/`update` (which always use interactive cost). Tracked as UX hardening. **Fixed in the follow-up below.** |
 
 Also noted (INFO): `examples/passphrase_crack.rs --threads N>1` counts
 `VaultLocked` as a miss (the `flock` is taken before the KDF); run with
 `LUKSBOX_NO_LOCK=1`. `unlink` of an open file drops it immediately
 (POSIX unlink-while-open semantics are not supported).
+
+## Follow-up fixes (after the round)
+
+Two of the tracked items above were closed in a follow-up revision.
+Each fix carries the same `R15-...` marker in the code.
+
+- **R15-G3** (WinFsp `--sync`). `create`, `overwrite`, `set_file_size`
+  and `set_basic_info` now flush under `--sync` like `rename` and
+  `cleanup` already did, matching what the FUSE adapters do for every
+  mutation. The deferred-flush timer now also runs under `--sync`. On
+  Windows the cache manager's lazy writer and the mapped-page writer
+  deliver paging writes after the handle's `cleanup` (the volume does
+  not set `FlushAndPurgeOnCleanup`), so no callback was left to persist
+  them before unmount. On a clean tree the timer tick is a no-op. This
+  is still Windows-only code: it passes rustfmt here but is
+  compile-checked only by the Windows CI job.
+- **R15-H3** (KDF / passphrase guardrails). One floor for the Argon2id
+  cost of a NEW keyslot (`passphrase::kdf_weakness`): 64 MiB of memory
+  and 64 MiB x 3 passes of total work, RFC 9106's memory-constrained
+  option. Every preset passes it.
+  - `deniable-init --argon2-*` and `create --kdf-target-time` print a
+    warning below the floor. The wizard's custom KDF asks for an
+    explicit confirmation (default no). Re-entering the parameters of
+    an existing deniable vault (open / info / rotation) is not gated.
+  - `update` keeps the rewritten slot's own Argon2id cost. `enroll`,
+    the wizard's enrolls into an existing vault and the CLI
+    `rotate-mvk` take the strongest passphrase cost already in the
+    vault. All of these used to hard-code the interactive preset, so
+    updating or rotating a `--kdf sensitive` vault (1 GiB) silently
+    re-wrapped its slots at 256 MiB. `enroll` / `update` take
+    `--kdf <preset>` to override, which is refused for kinds without
+    a passphrase factor.
+  - The zxcvbn weak-passphrase gate now runs on every new-passphrase
+    prompt. The wizard's prompt and the CLI's deniable prompts had
+    none.
+  - The wizard's two deniable hybrid-PQ enrolls asked for no Argon2id
+    parameters and silently used the interactive preset, while the
+    open-side picker defaults to Moderate. They now ask, like every
+    other deniable enroll.
+
+### Format changes
+
+Both format-level items were closed afterwards as new formats. Header
+format v3 is the default for new vaults (v0.6.0-rc.1); SRK pinning is
+opt-in. Existing vaults and keyslots keep their format until upgraded.
+Each is available from the CLI, the wizard and the GUI.
+
+- **R15-D1, header half: header format v3.**
+  - Standard vaults: a new `LUKSBOX3` magic and a `header_generation`
+    u64 at header offset 88, inside the HMAC.
+  - Deniable vaults: the inner header gains the generation plus a
+    SHA-256 digest of the slot table, sealed under a new
+    `luksbox-deniable-v3/inner-header-aad` label.
+  - `Container::persist_header` bumps the generation (and re-seals the
+    deniable inner header) before every header write, and only commits
+    the new value once the write succeeded.
+  - A new anchor format (`LBXANCH2`, 56 B; marked deniable anchors)
+    records the header generation. `Container::set_anchor` refuses a
+    header below it (`HeaderRollbackDetected`).
+  - The deniable slot-table digest also rejects a cleared slot's old
+    envelope spliced back in, with no anchor needed.
+  - The CLI attaches `--anchor` on every command, so `enroll` /
+    `revoke` / `update` advance it.
+  - `header-restore` re-seals a verified backup as a new state.
+  - Default for new vaults (`create`, `deniable-init`, the wizard, the
+    GUI checkbox); `--header-v2` opts out. Existing vaults:
+    `upgrade-header`, `deniable-upgrade-header`, the wizard's vault-menu
+    entry, or the GUI's "Upgrade header to v3" button.
+  - Pre-v3 binaries refuse such vaults: the standard magic is
+    rejected, and the deniable inner header fails to open with an
+    opaque error.
+- **R15-F5: TPM SRK pinning.**
+  - A pinned `SealedBlob` encoding (`0xFF 0xFF | version 2 | 16-byte
+    pin | legacy blob`) records a truncated, domain-separated SHA-256
+    of the SRK's marshalled public area.
+  - Unseal compares it with the SRK that `CreatePrimary` returns,
+    before the salted session is started, and fails with
+    `SrkMismatch`, so nothing secret reaches a substituted key.
+  - Pre-pinning parsers read the marker as a 64 KiB public length and
+    reject the blob as malformed.
+  - The pin is trust-on-first-use and is not authenticated before
+    unseal: an attacker who can also rewrite the vault file can swap it.
+  - Opt in with the global `--tpm-pin-srk` flag (or
+    `LUKSBOX_TPM_PIN_SRK=1`), the wizard's one-time prompt before the
+    first TPM seal, or the GUI preference.
+  - `luksbox info` shows which TPM slots are pinned.
+
+| Finding | Test |
+|---|---|
+| R15-D1 header half | `header::tests::{v3_header_round_trips_generation_and_magic, v3_header_generation_is_hmac_authenticated, pre_v3_headers_ignore_the_generation_field, v3_magic_with_mismatched_version_field_rejected}`; `anchor::tests::{v2_anchor_round_trips_both_generations, v2_anchor_header_generation_is_authenticated, anchor_magic_length_mismatch_is_corrupt, deniable_anchor_carries_header_generation_behind_marker}`; `container::tests::{header_v3_*, deniable_header_v3_*}` (11 tests, including the restored pre-revoke header and the spliced deniable slot); `deniable_header::tests::v3_inner_header_is_refused_under_the_v2_label`; `vfs::tests::{upgrade_header_to_v3_from_fresh_vault_keeps_content, rotate_mvk_on_header_v3_vault_keeps_anchor_consistent, deniable_rotation_keeps_header_v3}`; CLI `functional::{header_v3_anchor_catches_file_level_header_rollback, header_v3_header_restore_command_stays_ahead_of_the_anchor, upgrade_header_command_switches_an_existing_vault, header_v3_refuses_format_v2}` |
+| R15-F5 | `tests::{pinned_sealed_blob_roundtrip, pinned_blob_is_malformed_for_legacy_parsers}`, `mock::tests::{pinned_blob_refuses_a_substituted_srk, unpinned_blob_has_no_srk_check}`, `rogue_tpm::srk_pinned_slot_refuses_substituted_srk` (luksbox-tpm); `swtpm_integration::swtpm_srk_pinned_seal_round_trips_and_refuses_wrong_pin` (real TPM path, runs in the Linux CI job with swtpm) |
 
 ## New regression coverage
 
@@ -309,6 +403,7 @@ Also noted (INFO): `examples/passphrase_crack.rs --threads N>1` counts
 | R15-E2 | `vfs::tests::extension_after_shrink_reads_zeros_not_stale_bytes` |
 | R15-E3 | existing free-list tests now flush before asserting reuse (`unlink_frees_chunks_for_reuse`, ...) |
 | R15-E4 | `vfs::tests::validator_rejects_directory_with_external_chain` |
+| R15-H3 (follow-up) | `passphrase::tests::{builtin_kdf_presets_meet_the_floor, weak_kdf_params_flagged, kdf_work_orders_presets}`; `tests::{inherited_kdf_keeps_the_replaced_slots_cost, inherited_kdf_picks_the_strongest_passphrase_slot, inherited_kdf_ignores_non_passphrase_and_insane_slots}` (luksbox-cli); `kdf_calibration::{update_and_enroll_inherit_the_vaults_kdf_cost, enroll_kdf_flag_rejected_for_non_passphrase_kinds}` |
 
 ## Surfaces reviewed and found sound
 

@@ -8,6 +8,7 @@
 
 mod app;
 mod clipboard_guard;
+mod file_dialog;
 mod fonts;
 mod ops;
 mod preferences;
@@ -21,6 +22,9 @@ use app::LuksboxApp;
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 fn main() -> eframe::Result<()> {
+    // Surface rfd's file-dialog errors (and other library warnings) on
+    // stderr, and let the GUI tell "dialog failed" from "cancelled".
+    file_dialog::install_logger();
     // Process-wide hardening before we touch any keying material.
     luksbox_core::secret_mem::disable_core_dumps();
     let _ = luksbox_core::secret_mem::enable_memory_lock();

@@ -60,22 +60,219 @@ pub struct DeniableInnerHeader {
 
 /// Static prefix for the inner-header AEAD AAD. The full AAD is
 /// `INNER_AAD_PREFIX || per_vault_salt`, built per call via
-/// `inner_header_aad()`. The per-vault salt is already in the
+/// `inner_header_aad_for()`. The per-vault salt is already in the
 /// inner-header KEK derivation (HKDF salt input) so this is
 /// belt-and-suspenders: future MVK-reuse scenarios that would
 /// otherwise allow swapping inner headers between vaults are
 /// rejected by the AAD check too.
 const INNER_AAD_PREFIX: &[u8] = b"luksbox-deniable-v2/inner-header-aad";
 
+/// Inner-header AAD prefix of header format v3 (R15-D1). A distinct
+/// label rather than a flag: pre-v3 binaries then fail the inner-header
+/// AEAD (an opaque unlock failure) instead of opening the vault and
+/// mutating slots without re-sealing the generation and slot digest,
+/// which would make the next v3 open reject the vault as spliced.
+const INNER_AAD_PREFIX_V3: &[u8] = b"luksbox-deniable-v3/inner-header-aad";
+
+/// Domain label of `slot_table_digest`.
+const SLOT_TABLE_DIGEST_LABEL: &[u8] = b"luksbox-deniable-v3/slot-table";
+
+/// Offsets of the v3 fields inside the inner-header plaintext, right
+/// after the 38 bytes of `DeniableInnerHeader::serialise` (which pre-v3
+/// code leaves zero and never reads).
+const INNER_OFF_HEADER_GEN: usize = DENIABLE_INNER_HEADER_SERIALIZED_LEN;
+const INNER_OFF_SLOT_DIGEST: usize = INNER_OFF_HEADER_GEN + 8;
+const INNER_V3_END: usize = INNER_OFF_SLOT_DIGEST + 32;
+
+/// Header-format-v3 fields of a deniable vault (R15-D1, header half),
+/// sealed in the inner header next to `DeniableInnerHeader`.
+///
+/// The slot envelopes and the inner header are separate AEADs, so a
+/// counter alone could be spliced around: an old slot table (still
+/// holding a since-cleared credential) next to the current, higher-
+/// generation inner header. `slot_table_digest` commits the inner
+/// header to the exact slot table it was sealed with, and open refuses
+/// a mismatch; `header_generation` then lets an anchor catch a
+/// restore of a whole, consistent older header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeniableHeaderV3 {
+    pub header_generation: u64,
+    pub slot_table_digest: [u8; 32],
+}
+
+/// SHA-256 over the 8-slot table (`DENIABLE_SLOT_TABLE_OFFSET ..
+/// DENIABLE_INNER_OFFSET`), domain-separated. Empty slots are random
+/// bytes, so they are covered too: re-filling a cleared slot with an
+/// old envelope changes the digest.
+pub fn slot_table_digest(header_bytes: &[u8; DENIABLE_HEADER_SIZE]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(SLOT_TABLE_DIGEST_LABEL);
+    h.update(&header_bytes[DENIABLE_SLOT_TABLE_OFFSET..DENIABLE_INNER_OFFSET]);
+    h.finalize().into()
+}
+
 /// Build the inner-header AEAD AAD: `INNER_AAD_PREFIX || per_vault_salt`.
 /// Used by create / open / rotate so an inner-header ciphertext
 /// from one vault cannot decrypt against another vault's MVK even
 /// if the MVK is somehow shared.
-fn inner_header_aad(per_vault_salt: &[u8; DENIABLE_SALT_SIZE]) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(INNER_AAD_PREFIX.len() + DENIABLE_SALT_SIZE);
-    aad.extend_from_slice(INNER_AAD_PREFIX);
+/// `v3` selects the header-format-v3 label (`INNER_AAD_PREFIX_V3`).
+fn inner_header_aad_for(per_vault_salt: &[u8; DENIABLE_SALT_SIZE], v3: bool) -> Vec<u8> {
+    let prefix = if v3 {
+        INNER_AAD_PREFIX_V3
+    } else {
+        INNER_AAD_PREFIX
+    };
+    let mut aad = Vec::with_capacity(prefix.len() + DENIABLE_SALT_SIZE);
+    aad.extend_from_slice(prefix);
     aad.extend_from_slice(per_vault_salt);
     aad
+}
+
+/// Seal `inner` (plus the v3 fields when `v3` is `Some`) into the inner-
+/// header region of `header_bytes` with a fresh nonce.
+fn seal_inner_into(
+    header_bytes: &mut [u8; DENIABLE_HEADER_SIZE],
+    inner: &DeniableInnerHeader,
+    v3: Option<&DeniableHeaderV3>,
+    mvk: &MasterVolumeKey,
+    per_vault_salt: &[u8; DENIABLE_SALT_SIZE],
+    cipher_suite: CipherSuite,
+) -> Result<(), Error> {
+    let mut inner_pt = inner.serialise();
+    if let Some(v3) = v3 {
+        inner_pt[INNER_OFF_HEADER_GEN..INNER_OFF_SLOT_DIGEST]
+            .copy_from_slice(&v3.header_generation.to_le_bytes());
+        inner_pt[INNER_OFF_SLOT_DIGEST..INNER_V3_END].copy_from_slice(&v3.slot_table_digest);
+    }
+    let inner_key = deniable::inner_header_key(mvk, per_vault_salt);
+    let mut inner_nonce = [0u8; SLOT_NONCE_LEN];
+    deniable::fill_random(&mut inner_nonce).map_err(Error::Crypto)?;
+    let inner_ct = aead::seal(
+        cipher_suite,
+        inner_key.as_bytes(),
+        &inner_nonce,
+        &inner_header_aad_for(per_vault_salt, v3.is_some()),
+        &inner_pt,
+    )
+    .map_err(Error::Crypto)?;
+    header_bytes[DENIABLE_INNER_OFFSET..DENIABLE_INNER_OFFSET + SLOT_NONCE_LEN]
+        .copy_from_slice(&inner_nonce);
+    let ct_off = DENIABLE_INNER_OFFSET + SLOT_NONCE_LEN;
+    header_bytes[ct_off..ct_off + inner_ct.len()].copy_from_slice(&inner_ct);
+    Ok(())
+}
+
+/// R15-D1: re-seal the inner header of a header-v3 deniable vault for a
+/// new persisted state: `header_generation` set to `generation` and
+/// `slot_table_digest` recomputed over the CURRENT slot table. Called
+/// by `Container::persist_header` before every write (and once by the
+/// v2 -> v3 upgrade), so every slot mutation (enroll, clear, rotation)
+/// is covered by one code path.
+pub fn reseal_inner_v3(
+    header_bytes: &mut [u8; DENIABLE_HEADER_SIZE],
+    inner: &DeniableInnerHeader,
+    generation: u64,
+    mvk: &MasterVolumeKey,
+    per_vault_salt: &[u8; DENIABLE_SALT_SIZE],
+    cipher_suite: CipherSuite,
+) -> Result<DeniableHeaderV3, Error> {
+    let v3 = DeniableHeaderV3 {
+        header_generation: generation,
+        slot_table_digest: slot_table_digest(header_bytes),
+    };
+    seal_inner_into(
+        header_bytes,
+        inner,
+        Some(&v3),
+        mvk,
+        per_vault_salt,
+        cipher_suite,
+    )?;
+    Ok(v3)
+}
+
+/// Decrypt the inner-header region (nonce || ct || tag) under `mvk`,
+/// trying the v3 label first and then the v2 one. Returns the v3 fields
+/// when the v3 label matched. Every failure is `OpaqueUnlockFailed`.
+fn open_inner_region(
+    region: &[u8],
+    mvk: &MasterVolumeKey,
+    per_vault_salt: &[u8; DENIABLE_SALT_SIZE],
+    cipher_suite: CipherSuite,
+) -> Result<(DeniableInnerHeader, Option<DeniableHeaderV3>), Error> {
+    if region.len() < DENIABLE_INNER_SIZE {
+        return Err(Error::OpaqueUnlockFailed);
+    }
+    let nonce: [u8; SLOT_NONCE_LEN] = region[..SLOT_NONCE_LEN].try_into().unwrap();
+    let inner_ct = &region[SLOT_NONCE_LEN..DENIABLE_INNER_SIZE];
+    let inner_key = deniable::inner_header_key(mvk, per_vault_salt);
+    for v3 in [true, false] {
+        let Ok(pt) = aead::open(
+            cipher_suite,
+            inner_key.as_bytes(),
+            &nonce,
+            &inner_header_aad_for(per_vault_salt, v3),
+            inner_ct,
+        ) else {
+            continue;
+        };
+        let pt = Zeroizing::new(pt);
+        let inner = DeniableInnerHeader::parse(&pt).map_err(|_| Error::OpaqueUnlockFailed)?;
+        let v3_fields = if v3 {
+            if pt.len() < INNER_V3_END {
+                return Err(Error::OpaqueUnlockFailed);
+            }
+            let mut digest = [0u8; 32];
+            digest.copy_from_slice(&pt[INNER_OFF_SLOT_DIGEST..INNER_V3_END]);
+            Some(DeniableHeaderV3 {
+                header_generation: u64::from_le_bytes(
+                    pt[INNER_OFF_HEADER_GEN..INNER_OFF_SLOT_DIGEST]
+                        .try_into()
+                        .unwrap(),
+                ),
+                slot_table_digest: digest,
+            })
+        } else {
+            None
+        };
+        return Ok((inner, v3_fields));
+    }
+    Err(Error::OpaqueUnlockFailed)
+}
+
+/// Refuse a v3 inner header whose slot digest does not match the slot
+/// table it sits next to (a splice of slot envelopes from another copy
+/// of the header). Opaque, like every other deniable open failure.
+fn check_slot_digest(v3: Option<&DeniableHeaderV3>, actual: &[u8; 32]) -> Result<(), Error> {
+    match v3 {
+        Some(v3) if !bool::from(v3.slot_table_digest.ct_eq(actual)) => {
+            Err(Error::OpaqueUnlockFailed)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Decrypt and check the inner header of an on-disk deniable header
+/// with an MVK obtained elsewhere (the FUSE-T mount helper's handoff,
+/// which only carries the 38-byte pre-v3 inner fields). The on-disk
+/// copy is authoritative: it is authenticated under the MVK and is the
+/// only place the v3 generation and slot digest live.
+pub fn open_inner_with_mvk(
+    header_bytes: &[u8; DENIABLE_HEADER_SIZE],
+    mvk: &MasterVolumeKey,
+    cipher_suite: CipherSuite,
+) -> Result<(DeniableInnerHeader, Option<DeniableHeaderV3>), Error> {
+    let mut per_vault_salt = [0u8; DENIABLE_SALT_SIZE];
+    per_vault_salt.copy_from_slice(&header_bytes[..DENIABLE_SALT_SIZE]);
+    let (inner, v3) = open_inner_region(
+        &header_bytes[DENIABLE_INNER_OFFSET..],
+        mvk,
+        &per_vault_salt,
+        cipher_suite,
+    )?;
+    check_slot_digest(v3.as_ref(), &slot_table_digest(header_bytes))?;
+    Ok((inner, v3))
 }
 
 /// Plaintext size of the inner header (bytes). 28 bytes of AEAD
@@ -97,6 +294,8 @@ pub struct OpenedDeniableHeader {
     /// only to whoever holds the credential that opened the vault;
     /// an external observer cannot infer slot occupancy.
     pub matched_slot_idx: usize,
+    /// Header-format-v3 fields, when the vault uses header v3.
+    pub v3: Option<DeniableHeaderV3>,
 }
 
 const _: () = assert!(DENIABLE_HEADER_SIZE == 36864);
@@ -366,34 +565,25 @@ pub fn create_with_credential_v2(
     target[SLOT_NONCE_LEN..SLOT_NONCE_LEN + env_ct.len()].copy_from_slice(&env_ct);
     debug_assert_eq!(SLOT_NONCE_LEN + env_ct.len(), DENIABLE_SLOT_SIZE);
 
-    // Step 7: seal the inner header with MVK-derived key.
-    let inner_pt = inner.serialise();
-    let inner_key = deniable::inner_header_key(&mvk, &per_vault_salt);
-    let mut inner_nonce = [0u8; SLOT_NONCE_LEN];
-    deniable::fill_random(&mut inner_nonce).map_err(Error::Crypto)?;
-    let inner_aad_bytes = inner_header_aad(&per_vault_salt);
-    let inner_ct = aead::seal(
-        cipher_suite,
-        inner_key.as_bytes(),
-        &inner_nonce,
-        &inner_aad_bytes,
-        &inner_pt,
-    )
-    .map_err(Error::Crypto)?;
-
-    // Assemble final 36864-byte header.
-    let mut header = vec![0u8; DENIABLE_HEADER_SIZE];
+    // Assemble final 36864-byte header, then (step 7) seal the inner
+    // header with the MVK-derived key. New vaults start on the pre-v3
+    // inner format; `Container::upgrade_header_to_v3` opts in.
+    let mut header = Box::new([0u8; DENIABLE_HEADER_SIZE]);
     header[..DENIABLE_SALT_SIZE].copy_from_slice(&per_vault_salt);
     for (i, slot) in slots.iter().enumerate() {
         let off = DENIABLE_SLOT_TABLE_OFFSET + i * DENIABLE_SLOT_SIZE;
         header[off..off + DENIABLE_SLOT_SIZE].copy_from_slice(slot);
     }
-    header[DENIABLE_INNER_OFFSET..DENIABLE_INNER_OFFSET + SLOT_NONCE_LEN]
-        .copy_from_slice(&inner_nonce);
-    let ct_off = DENIABLE_INNER_OFFSET + SLOT_NONCE_LEN;
-    header[ct_off..ct_off + inner_ct.len()].copy_from_slice(&inner_ct);
+    seal_inner_into(
+        &mut header,
+        &inner,
+        None,
+        &mvk,
+        &per_vault_salt,
+        cipher_suite,
+    )?;
 
-    Ok((header, mvk))
+    Ok((header.to_vec(), mvk))
 }
 
 /// Intermediate state after v2 envelope discovery. Hand this to
@@ -410,6 +600,9 @@ pub struct OpenedDeniableEnvelope {
     /// the on-disk header. Hand back to `complete_open_v2` so the
     /// MVK can decrypt the inner header without re-reading the file.
     pub inner_header_region: Vec<u8>,
+    /// `slot_table_digest` of the slot table this envelope was found
+    /// in, checked against a v3 inner header in `complete_open_v2`.
+    pub slot_table_digest: [u8; 32],
 }
 
 /// Phase 1 of v2 open: derive `KEK_envelope` from the passphrase,
@@ -600,6 +793,7 @@ pub fn try_open_envelope_v2(
         matched_slot_idx,
         payload,
         inner_header_region: inner_region,
+        slot_table_digest: slot_table_digest(header),
     })
 }
 
@@ -648,33 +842,22 @@ pub fn complete_open_v2(
     mvk_bytes.copy_from_slice(&mvk_pt[..]);
     let mvk = MasterVolumeKey::from_zeroizing(&mvk_bytes);
 
-    // Decrypt and parse inner header.
-    if opened.inner_header_region.len() < DENIABLE_INNER_SIZE {
-        return Err(Error::OpaqueUnlockFailed);
-    }
-    let nonce: [u8; SLOT_NONCE_LEN] = opened.inner_header_region[..SLOT_NONCE_LEN]
-        .try_into()
-        .unwrap();
-    let inner_ct = &opened.inner_header_region[SLOT_NONCE_LEN..DENIABLE_INNER_SIZE];
-    let inner_key = deniable::inner_header_key(&mvk, &opened.per_vault_salt);
-    let inner_aad_bytes = inner_header_aad(&opened.per_vault_salt);
-    let inner_pt = match aead::open(
+    // Decrypt and parse inner header (v3 label first, then v2), and
+    // for v3 bind it to the slot table the envelope came from.
+    let (inner, v3) = open_inner_region(
+        &opened.inner_header_region,
+        &mvk,
+        &opened.per_vault_salt,
         cipher_suite,
-        inner_key.as_bytes(),
-        &nonce,
-        &inner_aad_bytes,
-        inner_ct,
-    ) {
-        Ok(pt) => Zeroizing::new(pt),
-        Err(_) => return Err(Error::OpaqueUnlockFailed),
-    };
-    let inner = DeniableInnerHeader::parse(&inner_pt).map_err(|_| Error::OpaqueUnlockFailed)?;
+    )?;
+    check_slot_digest(v3.as_ref(), &opened.slot_table_digest)?;
 
     Ok(OpenedDeniableHeader {
         mvk,
         inner,
         per_vault_salt: opened.per_vault_salt,
         matched_slot_idx: opened.matched_slot_idx,
+        v3,
     })
 }
 
@@ -917,36 +1100,28 @@ pub fn rotate_mvk_v2(
         target[SLOT_NONCE_LEN..SLOT_NONCE_LEN + env_ct.len()].copy_from_slice(&env_ct);
     }
 
-    // Re-encrypt the inner header with the new MVK's key.
-    let inner_pt = inner.serialise();
-    let inner_key = deniable::inner_header_key(&new_mvk, &new_per_vault_salt);
-    let mut inner_nonce = [0u8; SLOT_NONCE_LEN];
-    deniable::fill_random(&mut inner_nonce).map_err(Error::Crypto)?;
-    let inner_aad_bytes = inner_header_aad(&new_per_vault_salt);
-    let inner_ct = aead::seal(
-        cipher_suite,
-        inner_key.as_bytes(),
-        &inner_nonce,
-        &inner_aad_bytes,
-        &inner_pt,
-    )
-    .map_err(Error::Crypto)?;
-
-    // Assemble the new header in a temp buffer.
-    let mut new_header = vec![0u8; DENIABLE_HEADER_SIZE];
+    // Assemble the new header in a temp buffer, then re-encrypt the
+    // inner header with the new MVK's key. A header-v3 vault gets its
+    // v3 inner header (new generation + digest of the NEW slot table)
+    // from `Container::persist_header`, which re-seals before writing.
+    let mut new_header = Box::new([0u8; DENIABLE_HEADER_SIZE]);
     new_header[..DENIABLE_SALT_SIZE].copy_from_slice(&new_per_vault_salt);
     for (i, slot) in new_slots.iter().enumerate() {
         let off = DENIABLE_SLOT_TABLE_OFFSET + i * DENIABLE_SLOT_SIZE;
         new_header[off..off + DENIABLE_SLOT_SIZE].copy_from_slice(slot);
     }
-    new_header[DENIABLE_INNER_OFFSET..DENIABLE_INNER_OFFSET + SLOT_NONCE_LEN]
-        .copy_from_slice(&inner_nonce);
-    let ct_off = DENIABLE_INNER_OFFSET + SLOT_NONCE_LEN;
-    new_header[ct_off..ct_off + inner_ct.len()].copy_from_slice(&inner_ct);
+    seal_inner_into(
+        &mut new_header,
+        &inner,
+        None,
+        &new_mvk,
+        &new_per_vault_salt,
+        cipher_suite,
+    )?;
 
     // Commit: single memcpy into the caller's buffer. Until this
     // point any error has left header_bytes untouched.
-    header_bytes.copy_from_slice(&new_header);
+    header_bytes.copy_from_slice(&new_header[..]);
     Ok(new_mvk)
 }
 
@@ -1405,5 +1580,48 @@ mod tests {
             h -= p * p.log2();
         }
         h
+    }
+
+    /// R15-D1: a header-v3 inner header must not decrypt under the
+    /// pre-v3 label, i.e. a pre-v3 binary gets an opaque unlock failure
+    /// instead of an open vault it would corrupt (slot mutations without
+    /// re-sealing the slot digest). And the v3 fields round-trip.
+    #[test]
+    fn v3_inner_header_is_refused_under_the_v2_label() {
+        let inner = sane_inner();
+        let cred = luksbox_core::deniable::DeniableCredential::Passphrase {
+            passphrase: b"pw",
+            argon2: cheap_test_params(),
+        };
+        let suite = CipherSuite::Aes256GcmSiv;
+        let (header, mvk) =
+            create_with_credential_v2(&cred, &DeniableMaterial::passphrase_only(), 0, suite, inner)
+                .unwrap();
+        let mut header: Box<[u8; DENIABLE_HEADER_SIZE]> =
+            header.into_boxed_slice().try_into().unwrap();
+        let mut salt = [0u8; DENIABLE_SALT_SIZE];
+        salt.copy_from_slice(&header[..DENIABLE_SALT_SIZE]);
+        let v3 = reseal_inner_v3(&mut header, &inner, 7, &mvk, &salt, suite).unwrap();
+        assert_eq!(v3.slot_table_digest, slot_table_digest(&header));
+
+        // What a pre-v3 binary does: open with the v2 AAD only.
+        let region = &header[DENIABLE_INNER_OFFSET..];
+        let nonce: [u8; SLOT_NONCE_LEN] = region[..SLOT_NONCE_LEN].try_into().unwrap();
+        let key = deniable::inner_header_key(&mvk, &salt);
+        assert!(
+            aead::open(
+                suite,
+                key.as_bytes(),
+                &nonce,
+                &inner_header_aad_for(&salt, false),
+                &region[SLOT_NONCE_LEN..DENIABLE_INNER_SIZE],
+            )
+            .is_err()
+        );
+
+        let (got_inner, got_v3) = open_inner_with_mvk(&header, &mvk, suite).unwrap();
+        assert_eq!(got_inner, inner);
+        assert_eq!(got_v3, Some(v3));
+        assert_eq!(got_v3.unwrap().header_generation, 7);
     }
 }

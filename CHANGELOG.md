@@ -14,7 +14,15 @@ canonical record.
 
 ---
 
-## [Unreleased]
+## [v0.6.0-rc.1] - 2026-10-10
+
+First release candidate of the v0.6.0 line. The minor bump marks two
+new on-disk formats (header format v3, now the default for new vaults,
+and opt-in TPM SRK pinning, below) that close the last open Round 15
+items. Existing vaults, headers, anchors and keyslots open unchanged and
+keep their format until you upgrade them; a vault on header v3, or a
+keyslot sealed with SRK pinning, needs v0.6.0+ to open. It also carries the full Round 15 audit fix set
+and the KDF / passphrase guardrail and Windows `--sync` follow-ups.
 
 Security audit Round 15 (full-workspace white-box review): 48 findings,
 43 fixed, 6 accepted and documented. Full report with per-finding
@@ -60,12 +68,98 @@ one new inner-header flag (see below). Highlights:
   every action pinned to a commit SHA; `github.ref_name` validated and
   passed to shells via the environment; tpm2-tss / WinFsp / choco
   packages hash- or version-pinned; the MSI's WinFsp copy action no
-  longer runs through `cmd.exe` with a client-settable property.
+  longer runs through `cmd.exe` with a client-settable property. The
+  pinned tpm2-tss archive of the Linux `bundled-tpm` lanes is staged by
+  `scripts/stage_tpm2_tss.sh`, which also gives the tree the `VERSION`
+  file tpm2-tss's `bootstrap` otherwise derives with `git describe`
+  (the archive is not a git checkout, so the vendored build failed).
 - Windows mount: memory-mapped writes no longer extend the file;
   allocation-size changes no longer grow EOF. FUSE-T: `nlink` no longer
   wraps. `luksbox umount` can detach a zombie mount on old glibc.
 - `audit.toml` moved to `.cargo/audit.toml` (the only path cargo-audit
   reads); the pre-push script now really blocks on vulnerabilities.
+
+Follow-up fixes for two items the Round 15 report had left tracked:
+
+- **KDF cost no longer silently downgraded (R15-H3).** `update` keeps
+  the slot's Argon2id cost. `enroll`, the wizard's enrolls and
+  `rotate-mvk` take the strongest passphrase cost already in the vault
+  instead of the fixed interactive preset (256 MiB), which re-wrapped
+  `--kdf sensitive` vaults at a quarter of their cost. New
+  `--kdf <preset>` flag on `enroll` and `update` to choose explicitly.
+- **One strength bar for new secrets (R15-H3).** Argon2id parameters
+  below 64 MiB / 3 passes (RFC 9106) now trigger a warning from
+  `deniable-init` and `create --kdf-target-time`, and a confirmation in
+  the wizard's custom KDF. The zxcvbn weak-passphrase check now also
+  runs in the wizard and on deniable creates. The wizard's deniable
+  hybrid-PQ enrolls now ask for their Argon2id parameters instead of
+  silently using the interactive preset.
+- **Windows `--sync` mounts (R15-G3).** File/directory creation,
+  overwrite, resize and timestamp changes are now flushed immediately,
+  and the background flush also runs under `--sync`, catching cached
+  writes Windows delivers after a handle is closed.
+- **GUI AppImage.** Every release now also ships the GUI as an AppImage
+  for x86_64 and aarch64 (FIDO2, TPM 2.0 and `mount` included), for
+  distributions the .deb / .rpm do not cover; any glibc 2.35+ system.
+  Version-less copies (`LUKSbox-<arch>.AppImage`) back stable
+  `releases/latest/download/...` links. Packaged by
+  `scripts/build_appimage.sh`, with appimagetool and the AppImage
+  runtime pinned by SHA-256.
+- **Static Linux CLI (GitHub #34).** Every release now also ships a
+  fully static musl build of the CLI for x86_64 and aarch64: one binary
+  for any distribution, with the TUI and `luksbox mount` (pure-Rust FUSE,
+  needs `fusermount3`) but without FIDO2 / TPM. Version-less copies
+  (`luksbox-<arch>-unknown-linux-musl.tar.gz`) make
+  `releases/latest/download/...` links work. Build it locally with
+  `scripts/build_static_musl.sh` (`--docker` on any host).
+- **GUI file dialogs on Linux (GitHub #35).** When the system file
+  chooser could not be opened (the XDG desktop portal, on GNOME
+  `xdg-desktop-portal-gnome` / Nautilus, failing, with no `zenity`
+  fallback installed), every Browse, Mount, Add file and extract button
+  silently did nothing, because the dialog library reports that the same
+  way as a Cancel. The GUI now detects it, says what failed, and offers a
+  "type the path" box for mounting, adding and extracting files.
+  `LUKSBOX_GUI_TYPED_PATHS=1` skips the system dialog altogether, and
+  the dialog library's errors now reach stderr.
+- **macOS FUSE-T: `luksbox mount` now daemonizes**, as `--help` always
+  said and as the libfuse backend does. It used to stay in the
+  foreground and hold the caller's stdout open until unmount, hanging
+  scripts. It now returns once the mount is live, and a background mount
+  that fails is reported with a non-zero exit. `--foreground` keeps the
+  old behaviour.
+
+New formats closing the two format-level Round 15 items. Existing vaults
+keep their format until upgraded. A vault or keyslot using them needs
+LUKSbox 0.6.0+ to open:
+
+- **Header format v3 (R15-D1, header half).** Every keyslot change
+  bumps a header generation (new `LUKSBOX3` magic; for deniable vaults
+  inside the sealed inner header) and the anchor records it (new 56-byte
+  `LBXANCH2` anchor). Restoring an older header (for example a backup
+  taken before a `revoke`, which would bring the revoked credential
+  back) is refused at an anchored open. Deniable v3 headers also commit
+  to their slot table, so an old slot envelope spliced back in is
+  rejected even without an anchor.
+  - **Default for new vaults** (CLI `create` and `deniable-init`, the
+    wizard, the GUI). Opt out with `--header-v2` (or by answering no /
+    unticking the box) when LUKSbox 0.2.1-0.5.x must still open the
+    vault; the legacy `--format v2` keeps the v2 header automatically.
+  - Existing vaults: the new `upgrade-header` / `deniable-upgrade-header`
+    commands, a wizard vault-menu entry, and "Upgrade header to v3"
+    under Manage keyslots in the GUI.
+  - `info` shows the header format.
+- **TPM SRK pinning (R15-F5).** New TPM keyslots can record the TPM's
+  storage root key; unlock then refuses a substituted key before
+  anything is unsealed, defeating an active TPM-bus interposer. Enable
+  it with the global `--tpm-pin-srk` flag (or `LUKSBOX_TPM_PIN_SRK=1`),
+  the wizard prompt or the GUI preference. `info` shows which TPM slots
+  are pinned.
+- **Behaviour change:** `--anchor` is now honoured by every command
+  that unlocks a vault (`enroll`, `revoke`, `update`, `header-restore`,
+  ...), not only by the file-access commands. A rolled-back vault is
+  refused before the command runs, and header changes advance the
+  anchor. `header-restore` of a verified backup on a header-v3 vault
+  re-seals it as a new header generation.
 
 ## [v0.5.2] - 2026-08-12
 

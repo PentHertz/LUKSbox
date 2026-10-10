@@ -97,6 +97,17 @@ struct Cli {
     #[arg(long, global = true, value_name = "PATH")]
     fido2_device: Option<String>,
 
+    /// Pin the TPM's storage root key (SRK) into every NEW TPM keyslot
+    /// sealed by this command (create, enroll, update, deniable-init,
+    /// wizard). Unseal then refuses to run if the TPM reports a
+    /// different SRK, which defeats an ACTIVE TPM-bus interposer that
+    /// substitutes the key to learn the sealed KEK (R15-F5). A pinned
+    /// slot needs LUKSbox 0.6.0+ to unlock; existing slots are not
+    /// changed (re-enroll, or `update`, to pin them). Also enabled by
+    /// LUKSBOX_TPM_PIN_SRK=1.
+    #[arg(long, global = true)]
+    tpm_pin_srk: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -358,6 +369,21 @@ enum SlotKindArg {
 }
 
 impl SlotKindArg {
+    /// Kinds `enroll` / `update` install with an Argon2id-stretched
+    /// passphrase factor, i.e. the ones `--kdf` applies to.
+    fn has_passphrase_factor(self) -> bool {
+        matches!(
+            self,
+            Self::Passphrase
+                | Self::SepPassphrase
+                | Self::SepFido2Passphrase
+                | Self::HybridPqSepPassphrase
+                | Self::HybridPqSepPassphrase1024
+                | Self::HybridPqSepFido2Passphrase
+                | Self::HybridPqSepFido2Passphrase1024
+        )
+    }
+
     pub(crate) fn from_core(k: SlotKind) -> Option<Self> {
         match k {
             SlotKind::Passphrase => Some(Self::Passphrase),
@@ -499,6 +525,21 @@ enum Command {
         /// Once the auto-upgrade fires, the format is permanent.
         #[arg(long, default_value = "v3")]
         format: VaultFormatArg,
+        /// Header format v3 (LUKSBOX3) is the default for new vaults
+        /// since 0.6.0: every change to the keyslot table (enroll,
+        /// revoke, update, rotate) bumps a header generation that the
+        /// `--anchor` records, so restoring an older header (for
+        /// instance a backup taken before a revoke) is detected. Needs
+        /// LUKSbox 0.6.0+ to open. The flag is accepted for explicit
+        /// scripts; `--format v2` cannot be combined with it.
+        #[arg(long, conflicts_with = "header_v2")]
+        header_v3: bool,
+        /// Keep header format v2 (LUKSBOX2) so LUKSbox 0.2.1-0.5.x can
+        /// still open the vault, at the cost of header rollback
+        /// detection. Implied by `--format v2`. The vault can be moved
+        /// to v3 later with `luksbox upgrade-header`.
+        #[arg(long)]
+        header_v2: bool,
     },
     /// Show container header / keyslot summary (no unlock required).
     Info {
@@ -520,6 +561,11 @@ enum Command {
         /// Slot kind to enroll.
         #[arg(long, value_enum, default_value = "passphrase")]
         kind: SlotKindArg,
+        /// Argon2id strength for the new slot's passphrase (kinds with a
+        /// passphrase factor). Defaults to the strongest cost already
+        /// used by a passphrase slot of this vault, or `interactive`.
+        #[arg(long, value_enum)]
+        kdf: Option<KdfStrengthArg>,
     },
     /// Remove a keyslot. WARNING: cannot recover access if you remove the last one.
     Revoke {
@@ -555,6 +601,11 @@ enum Command {
         /// Slot kind to install. Defaults to the slot's existing kind.
         #[arg(long, value_enum)]
         kind: Option<SlotKindArg>,
+        /// Argon2id strength for the new passphrase. Defaults to the
+        /// cost the slot already has (or the strongest passphrase cost
+        /// in the vault when the slot had no passphrase).
+        #[arg(long, value_enum)]
+        kdf: Option<KdfStrengthArg>,
     },
     /// List a directory inside the container.
     Ls {
@@ -735,6 +786,20 @@ enum Command {
         /// protection. See docs/CRYPTO_SPEC.md "Anchor sidecar".
         #[arg(long)]
         anchor: Option<PathBuf>,
+        /// Header format v3 is the default for new deniable vaults
+        /// since 0.6.0: the sealed inner header carries a header
+        /// generation and a digest of the slot table, so a slot
+        /// envelope spliced back in after it was cleared is refused,
+        /// and the `--anchor` detects a restored older header. Needs
+        /// LUKSbox 0.6.0+ to open (older versions report the usual
+        /// opaque unlock failure). Accepted for explicit scripts.
+        #[arg(long, conflicts_with = "header_v2")]
+        header_v3: bool,
+        /// Keep the pre-v3 inner header so LUKSbox 0.2.x-0.5.x can still
+        /// open the vault, without the generation / slot digest. Can be
+        /// upgraded later with `luksbox deniable-upgrade-header`.
+        #[arg(long)]
+        header_v2: bool,
     },
     /// Mount a deniable-header vault. Same passphrase / cipher /
     /// Argon2 params requirements as `deniable-init`; all failure
@@ -811,6 +876,48 @@ enum Command {
         /// remaining in v2; FIDO2 / TPM material lives in the slot.
         #[arg(long)]
         kyber_path: Option<PathBuf>,
+    },
+    /// Switch an existing vault to header format v3 (LUKSBOX3): a
+    /// header generation counter, bumped by every keyslot change and
+    /// recorded by the `--anchor`, so restoring an older header (a
+    /// backup from before a revoke) is detected. One-way: LUKSbox
+    /// versions before 0.6.0 can no longer open the vault. Pass the
+    /// vault's `--anchor` so it is verified first and starts recording
+    /// the header generation right away.
+    #[command(name = "upgrade-header")]
+    UpgradeHeader {
+        path: PathBuf,
+        #[command(flatten)]
+        unlock: UnlockArgs,
+    },
+    /// `upgrade-header` for a deniable vault: the sealed inner header
+    /// gains a header generation and a digest of the slot table.
+    /// Same cipher / Argon2 / credential arguments as `deniable-info`.
+    #[command(name = "deniable-upgrade-header")]
+    DeniableUpgradeHeader {
+        path: PathBuf,
+        /// Cipher suite. Must match what was used at init.
+        #[arg(long, default_value = "aes")]
+        cipher: String,
+        /// Argon2id memory cost in KiB. Must match init.
+        #[arg(long, default_value_t = 262_144)]
+        argon2_m: u32,
+        /// Argon2id iteration count. Must match init.
+        #[arg(long, default_value_t = 3)]
+        argon2_t: u32,
+        /// Argon2id parallelism. Must match init.
+        #[arg(long, default_value_t = 4)]
+        argon2_p: u32,
+        /// Credential type. Must match init.
+        #[arg(long, default_value = "passphrase")]
+        credential: String,
+        /// `.kyber` seed file path (pq-* combos).
+        #[arg(long)]
+        kyber_path: Option<PathBuf>,
+        /// The vault's deniable anchor, verified before the upgrade and
+        /// advanced to the new header generation.
+        #[arg(long)]
+        anchor: Option<PathBuf>,
     },
     /// Interactive wizard. Walks you through create / open / mount / keyslot
     /// management with prompts. Supports every option the regular subcommands
@@ -1204,6 +1311,9 @@ fn dispatch(cli: Cli) -> Result<()> {
     // (used inside every FIDO2-touching subcommand below) binds to
     // the right authenticator. Independent of which subcommand runs.
     set_fido2_device_override(cli.fido2_device);
+    if cli.tpm_pin_srk || std::env::var_os("LUKSBOX_TPM_PIN_SRK").is_some_and(|v| v == "1") {
+        luksbox_tpm::set_default_srk_pinning(true);
+    }
 
     match cli.command {
         Command::Create {
@@ -1219,12 +1329,21 @@ fn dispatch(cli: Cli) -> Result<()> {
             kdf_target_time,
             metadata_size,
             format,
+            header_v3,
+            header_v2,
         } => {
+            let header_v3 = resolve_header_v3(header_v3, header_v2, format)?;
             // Round 9G: if --kdf-target-time was supplied, calibrate
             // params on this CPU; otherwise resolve from the static
             // --kdf preset.
             let resolved_params = match kdf_target_time {
-                Some(t) => calibrate_kdf_for_target(&t)?,
+                Some(t) => {
+                    let p = calibrate_kdf_for_target(&t)?;
+                    // R15-H3: a short target on a slow host scales the
+                    // memory cost below the floor.
+                    warn_if_weak_kdf(&p);
+                    p
+                }
                 None => kdf_params_for(kdf),
             };
             // Resolve --metadata-size to a byte count (or None for default).
@@ -1246,11 +1365,22 @@ fn dispatch(cli: Cli) -> Result<()> {
                 resolved_params,
                 resolved_metadata_size,
                 format,
+                header_v3,
             )
         }
         Command::Info { path, header } => cmd_info(&path, header.as_deref()),
-        Command::Enroll { path, unlock, kind } => match kind {
-            SlotKindArg::Passphrase => cmd_enroll_passphrase(&path, &unlock),
+        Command::Enroll {
+            kind, kdf: Some(_), ..
+        } if !kind.has_passphrase_factor() => Err(cli_err!(
+            "--kdf only applies to slot kinds with a passphrase factor, not {kind:?}"
+        )),
+        Command::Enroll {
+            path,
+            unlock,
+            kind,
+            kdf,
+        } => match kind {
+            SlotKindArg::Passphrase => cmd_enroll_passphrase(&path, &unlock, kdf),
             SlotKindArg::Fido2 => cmd_enroll_fido2(&path, &unlock),
             SlotKindArg::Tpm2 => cmd_enroll_tpm2(&path, &unlock),
             SlotKindArg::Tpm2Fido2 => cmd_enroll_tpm2_fido2(&path, &unlock),
@@ -1265,30 +1395,32 @@ fn dispatch(cli: Cli) -> Result<()> {
             SlotKindArg::SepBiometric => cmd_enroll_sep(&path, &unlock, true),
             SlotKindArg::HybridPqSep => cmd_enroll_hybrid_pq_sep(&path, &unlock, 768),
             SlotKindArg::HybridPqSep1024 => cmd_enroll_hybrid_pq_sep(&path, &unlock, 1024),
-            SlotKindArg::SepFido2 => cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2, None),
+            SlotKindArg::SepFido2 => {
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2, None, kdf)
+            }
             SlotKindArg::SepPassphrase => {
-                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Passphrase, None)
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Passphrase, None, kdf)
             }
             SlotKindArg::SepFido2Passphrase => {
-                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2Passphrase, None)
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2Passphrase, None, kdf)
             }
             SlotKindArg::HybridPqSepFido2 => {
-                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2, Some(768))
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2, Some(768), kdf)
             }
             SlotKindArg::HybridPqSepFido21024 => {
-                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2, Some(1024))
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2, Some(1024), kdf)
             }
             SlotKindArg::HybridPqSepPassphrase => {
-                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Passphrase, Some(768))
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Passphrase, Some(768), kdf)
             }
             SlotKindArg::HybridPqSepPassphrase1024 => {
-                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Passphrase, Some(1024))
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Passphrase, Some(1024), kdf)
             }
             SlotKindArg::HybridPqSepFido2Passphrase => {
-                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2Passphrase, Some(768))
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2Passphrase, Some(768), kdf)
             }
             SlotKindArg::HybridPqSepFido2Passphrase1024 => {
-                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2Passphrase, Some(1024))
+                cmd_enroll_sep_fused(&path, &unlock, SepFactors::Fido2Passphrase, Some(1024), kdf)
             }
             SlotKindArg::HybridPq => Err(
                 "hybrid-pq slots can only be created at vault creation time \
@@ -1326,7 +1458,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             unlock,
             slot,
             kind,
-        } => cmd_update(&path, &unlock, slot, kind),
+            kdf,
+        } => cmd_update(&path, &unlock, slot, kind, kdf),
         Command::Ls {
             path,
             unlock,
@@ -1401,6 +1534,8 @@ fn dispatch(cli: Cli) -> Result<()> {
             kyber_path,
             pq_1024,
             anchor,
+            header_v3: _,
+            header_v2,
         } => cmd_deniable_init(
             &path,
             &cipher,
@@ -1411,6 +1546,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             kyber_path.as_deref(),
             pq_1024,
             anchor.as_deref(),
+            !header_v2,
         ),
         Command::DeniableMount {
             path,
@@ -1453,6 +1589,26 @@ fn dispatch(cli: Cli) -> Result<()> {
             argon2_p,
             &credential,
             kyber_path.as_deref(),
+        ),
+        Command::UpgradeHeader { path, unlock } => cmd_upgrade_header(&path, &unlock),
+        Command::DeniableUpgradeHeader {
+            path,
+            cipher,
+            argon2_m,
+            argon2_t,
+            argon2_p,
+            credential,
+            kyber_path,
+            anchor,
+        } => cmd_deniable_upgrade_header(
+            &path,
+            &cipher,
+            argon2_m,
+            argon2_t,
+            argon2_p,
+            &credential,
+            kyber_path.as_deref(),
+            anchor.as_deref(),
         ),
         Command::Wizard => wizard::run(),
         Command::Genpass => {
@@ -1739,9 +1895,20 @@ fn cmd_header_restore(
         })?;
         println!("  HMAC verify: OK (the backup was sealed under this vault's current MVK)");
 
+        // R15-D1: installed as a NEW header state (re-sealed with a
+        // fresh header generation on header-v3 vaults) so the anchor,
+        // if given, accepts this deliberate restore instead of flagging
+        // it like a silent file-level rollback.
+        let had_v3 = container.header_generation().is_some() || new_header.has_header_generation();
         container
-            .restore_header_bytes(&new_bytes)
+            .restore_header_as_new_state(new_header)
             .map_err(|e| format!("installing verified backup header: {e}"))?;
+        if had_v3 {
+            println!(
+                "  header format v3: re-sealed as header generation {}",
+                container.header_generation().unwrap_or(0)
+            );
+        }
         match header_sidecar {
             Some(hp) => println!(
                 "restored detached header to {} (atomic rename via container)",
@@ -2581,40 +2748,120 @@ fn read_passphrase_confirmed(prompt: &str, purpose: NewSecretFor) -> io::Result<
                 continue;
             }
         }
-        // Strength check. Skip in test mode (`LUKSBOX_TEST_FAST_KDF` is set
-        // for tests with weak Argon2 params; same env signal stands for
-        // "I'm in tests, skip nag prompts"). Release builds always run
-        // the strength check - see `test_fast_kdf_enabled`.
-        if !test_fast_kdf_enabled() && !a.is_empty() {
-            let strength = passphrase::estimate(&a);
-            if strength.score < passphrase::MIN_ACCEPTABLE_SCORE {
-                eprintln!(
-                    "warning: weak passphrase (zxcvbn score {}/4, ~{:.0} bits estimated){}",
-                    strength.score,
-                    strength.bits,
-                    strength
-                        .feedback
-                        .map(|f| format!("\n  hint: {f}"))
-                        .unwrap_or_default(),
-                );
-                eprintln!(
-                    "  Argon2id stretches the passphrase substantially, but a stronger\n\
-                     passphrase still helps if your vault file is ever exposed.\n\
-                     Tip: run `luksbox genpass` for a 20-char random passphrase (99 bits)."
-                );
-                let proceed = std::env::var_os("LUKSBOX_ACCEPT_WEAK").is_some()
-                    || dialoguer::Confirm::new()
-                        .with_prompt("Use this passphrase anyway?")
-                        .default(false)
-                        .interact()
-                        .unwrap_or(false);
-                if !proceed {
-                    continue;
-                }
-            }
+        if !confirm_weak_passphrase(&a) {
+            continue;
         }
         return Ok(a);
     }
+}
+
+/// zxcvbn strength gate for a NEW passphrase typed interactively.
+/// Returns true when the passphrase may be used: strong enough, empty
+/// (the empty case has its own confirmation at each caller), or
+/// explicitly accepted after the warning. Skipped in test mode
+/// (`LUKSBOX_TEST_FAST_KDF` is set for tests with weak Argon2 params;
+/// same env signal stands for "I'm in tests, skip nag prompts");
+/// release builds always run it - see `test_fast_kdf_enabled`.
+/// `LUKSBOX_ACCEPT_WEAK` auto-confirms; a non-tty confirm fails closed.
+///
+/// R15-H3: shared by every new-passphrase prompt (this file's
+/// `read_passphrase_confirmed` and `prompt_pass_twice`, the wizard's
+/// `ask_new_passphrase`). Before, only the first ran it, so the wizard
+/// and every deniable create accepted "password" without a word.
+pub(crate) fn confirm_weak_passphrase(pw: &str) -> bool {
+    if test_fast_kdf_enabled() || pw.is_empty() {
+        return true;
+    }
+    let strength = passphrase::estimate(pw);
+    if strength.score >= passphrase::MIN_ACCEPTABLE_SCORE {
+        return true;
+    }
+    eprintln!(
+        "warning: weak passphrase (zxcvbn score {}/4, ~{:.0} bits estimated){}",
+        strength.score,
+        strength.bits,
+        strength
+            .feedback
+            .map(|f| format!("\n  hint: {f}"))
+            .unwrap_or_default(),
+    );
+    eprintln!(
+        "  Argon2id stretches the passphrase substantially, but a stronger\n\
+         passphrase still helps if your vault file is ever exposed.\n\
+         Tip: run `luksbox genpass` for a 20-char random passphrase (99 bits)."
+    );
+    std::env::var_os("LUKSBOX_ACCEPT_WEAK").is_some()
+        || dialoguer::Confirm::new()
+            .with_prompt("Use this passphrase anyway?")
+            .default(false)
+            .interact()
+            .unwrap_or(false)
+}
+
+/// R15-H3: print a warning when Argon2id parameters chosen for a NEW
+/// keyslot fall below `passphrase::kdf_weakness`'s floor. Used where the
+/// parameters come from an explicit flag (`deniable-init --argon2-*`,
+/// `create --kdf-target-time`) or are inherited from the vault, i.e.
+/// where the user already chose and a confirm prompt would only break
+/// scripts; the wizard's interactive custom-KDF path confirms instead.
+/// Silent in test mode, whose fast KDF is below the floor by design.
+pub(crate) fn warn_if_weak_kdf(params: &Argon2idParams) {
+    if test_fast_kdf_enabled() {
+        return;
+    }
+    if let Some(why) = passphrase::kdf_weakness(params) {
+        eprintln!(
+            "warning: {why}.\n  \
+             A stolen vault is then cheap to brute-force; prefer the interactive \
+             preset (256 MiB, t=3) or stronger unless this host cannot allocate it."
+        );
+    }
+}
+
+/// Slot kinds whose `kdf_params` actually drive an Argon2id run over a
+/// user passphrase (the cost an attacker of the stolen vault pays).
+fn slot_runs_passphrase_kdf(kind: SlotKind) -> bool {
+    kind == SlotKind::Passphrase || kind.is_hybrid_pq_passphrase() || kind.is_sep_passphrase()
+}
+
+/// R15-H3: Argon2id cost for a passphrase written into an EXISTING vault
+/// (`enroll`, `update`, `rotate-mvk`). An explicit `--kdf` preset wins.
+/// Otherwise `update` keeps the cost of the slot it rewrites, and a new
+/// slot / a rotation takes the strongest cost already used by any
+/// passphrase slot, falling back to the interactive preset. These paths
+/// used to hard-code the interactive preset, so updating or rotating a
+/// vault created with `--kdf sensitive` (1 GiB) silently re-wrapped its
+/// slots at 256 MiB, and the weakest slot is the one an attacker picks.
+pub(crate) fn kdf_params_for_existing(
+    header: &Header,
+    explicit: Option<KdfStrengthArg>,
+    replacing: Option<usize>,
+) -> Argon2idParams {
+    match explicit {
+        Some(strength) => kdf_params_for(strength),
+        None => inherited_kdf_params(header, replacing).unwrap_or_else(kdf_params),
+    }
+}
+
+/// The environment-independent half of `kdf_params_for_existing`: the
+/// cost to inherit from the vault, or `None` when no passphrase slot
+/// carries one. Slots with params outside the on-disk envelope are
+/// ignored rather than propagated.
+fn inherited_kdf_params(header: &Header, replacing: Option<usize>) -> Option<Argon2idParams> {
+    let usable = |s: &luksbox_core::Keyslot| {
+        slot_runs_passphrase_kdf(s.kind) && s.kdf_params.is_sane_for_disk()
+    };
+    if let Some(slot) = replacing.and_then(|i| header.keyslots.get(i))
+        && usable(slot)
+    {
+        return Some(slot.kdf_params);
+    }
+    header
+        .keyslots
+        .iter()
+        .filter(|s| usable(s))
+        .map(|s| s.kdf_params)
+        .max_by_key(passphrase::kdf_work)
 }
 
 /// Read a FIDO2 PIN. Honors `LUKSBOX_FIDO2_PIN` for scripting/tests.
@@ -2654,7 +2901,21 @@ fn open_container_passphrase(path: &Path, header_path: Option<&Path>) -> Result<
     )?)
 }
 
+/// Unlock the vault and, when `--anchor` was given, attach and verify
+/// the anchor. Done here, for every command, rather than only on the
+/// file-access paths (`open_vfs`): on a header-v3 vault the keyslot
+/// changes (`enroll`, `revoke`, `update`, ...) must advance the anchor's
+/// header generation, and an anchored open refuses a rolled-back
+/// header before any of them runs (R15-D1).
 fn open_container(path: &Path, unlock: &UnlockArgs) -> Result<Container> {
+    let mut cont = open_container_unanchored(path, unlock)?;
+    if let Some(ap) = unlock.anchor.as_deref() {
+        cont.set_anchor(Some(ap.to_path_buf()))?;
+    }
+    Ok(cont)
+}
+
+fn open_container_unanchored(path: &Path, unlock: &UnlockArgs) -> Result<Container> {
     if let Some(kp) = unlock.pq_hybrid.as_deref() {
         // Decide between hybrid-passphrase / hybrid-fido2 / hybrid-tpm2 /
         // hybrid-tpm2-fido2 by peeking at the header's slot kinds.
@@ -2980,13 +3241,17 @@ fn open_container_hybrid_pq(
 }
 
 fn open_vfs(path: &Path, unlock: &UnlockArgs) -> Result<Vfs> {
-    let mut cont = open_container(path, unlock)?;
-    let trusted_anchor_gen = if let Some(ap) = unlock.anchor.as_deref() {
-        cont.set_anchor(Some(ap.to_path_buf()))?
-    } else {
-        None
-    };
+    let cont = open_container(path, unlock)?;
+    let trusted_anchor_gen = cont.anchored_metadata_generation();
     let vfs = Vfs::open(cont)?;
+    check_anchor_generation(trusted_anchor_gen, &vfs)?;
+    Ok(vfs)
+}
+
+/// Compare the anchor's trusted metadata generation with the opened
+/// vault's (the metadata half of rollback detection; the header half is
+/// checked inside `Container::set_anchor`).
+fn check_anchor_generation(trusted_anchor_gen: Option<u64>, vfs: &Vfs) -> Result<()> {
     if let Some(anchor_gen) = trusted_anchor_gen {
         use luksbox_format::anchor;
         match anchor::compare(anchor_gen, vfs.vault_generation()) {
@@ -3016,7 +3281,110 @@ fn open_vfs(path: &Path, unlock: &UnlockArgs) -> Result<Vfs> {
             }
         }
     }
-    Ok(vfs)
+    Ok(())
+}
+
+/// Header format for a new standard vault: v3 by default since 0.6.0,
+/// v2 with `--header-v2` or with the legacy `--format v2` (whose point is
+/// readability by old binaries, which v3 would defeat). An explicit
+/// `--header-v3` with `--format v2` is a contradiction and refused.
+fn resolve_header_v3(explicit_v3: bool, explicit_v2: bool, format: VaultFormatArg) -> Result<bool> {
+    let legacy = matches!(format, VaultFormatArg::V2);
+    if explicit_v3 && legacy {
+        return Err(
+            "--header-v3 cannot be combined with --format v2: header v3 is a v0.6.0+ \
+             format, while --format v2 exists to keep the vault readable by pre-v0.3 binaries"
+                .into(),
+        );
+    }
+    Ok(!explicit_v2 && !legacy)
+}
+
+/// R15-D1: take a container (fresh from `create` / `deniable-init`, or
+/// just unlocked) to header format v3 and hand it back, with the vault's
+/// metadata generation after the upgrade. Goes through the Vfs so a
+/// LUKSBOX1 vault gets the regular LUKSBOX2 + LBM5 step first; that
+/// step's flush moves a fresh vault past generation 1, so a create
+/// bootstrapping an anchor afterwards must use the returned generation
+/// (with 1 the anchor started out stale).
+fn upgrade_container_to_header_v3(cont: Container) -> Result<(Container, u64)> {
+    let mut vfs = Vfs::open(cont)?;
+    vfs.upgrade_header_to_v3()?;
+    let generation = vfs.vault_generation();
+    Ok((vfs.close()?, generation))
+}
+
+/// One-line description of the header format, for `info` /
+/// `deniable-info` / the upgrade commands.
+fn describe_header_format(version_major: u16, header_generation: Option<u64>) -> String {
+    match header_generation {
+        Some(g) => {
+            format!("v3 (header generation {g}; a restored older header is caught by the anchor)")
+        }
+        None if version_major >= luksbox_core::VERSION_MAJOR_V2 => {
+            "v2 (no header generation; `luksbox upgrade-header` opts into v3)".to_string()
+        }
+        None => "v1 (upgraded to v2 on the next write)".to_string(),
+    }
+}
+
+fn cmd_upgrade_header(path: &Path, unlock: &UnlockArgs) -> Result<()> {
+    let mut vfs = open_vfs(path, unlock)?;
+    if vfs.container().is_deniable() {
+        return Err("this is a deniable vault; use `luksbox deniable-upgrade-header`".into());
+    }
+    let changed = vfs.upgrade_header_to_v3()?;
+    let cont = vfs.close()?;
+    if changed {
+        println!(
+            "upgraded {} to header format v3 (generation {})",
+            path.display(),
+            cont.header_generation().unwrap_or(0)
+        );
+        if unlock.anchor.is_none() {
+            eprintln!(
+                "  note: no --anchor given. The header generation only protects you once an \
+                 anchor records it: pass --anchor <file> on your next write (or create one with \
+                 the wizard), and keep it on separate trusted storage."
+            );
+        }
+        eprintln!("  LUKSbox versions before 0.6.0 can no longer open this vault.");
+    } else {
+        println!("{} already uses header format v3", path.display());
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_deniable_upgrade_header(
+    path: &Path,
+    cipher: &str,
+    m: u32,
+    t: u32,
+    p: u32,
+    credential: &str,
+    kyber_path: Option<&Path>,
+    anchor: Option<&Path>,
+) -> Result<()> {
+    let cipher_suite = parse_deniable_cipher(cipher)?;
+    let argon2_params = parse_deniable_argon2(m, t, p)?;
+    let cred = parse_cli_den_cred(credential)?;
+    let mut container = cli_open_deniable_v2(path, cipher_suite, argon2_params, cred, kyber_path)?;
+    if let Some(ap) = anchor {
+        container.set_anchor(Some(ap.to_path_buf()))?;
+    }
+    let trusted_anchor_gen = container.anchored_metadata_generation();
+    let mut vfs = Vfs::open(container)?;
+    check_anchor_generation(trusted_anchor_gen, &vfs)?;
+    let changed = vfs.upgrade_header_to_v3()?;
+    drop(vfs.close()?);
+    if changed {
+        println!("OK deniable vault upgraded to header format v3");
+        eprintln!("  LUKSbox versions before 0.6.0 can no longer open this vault.");
+    } else {
+        println!("OK deniable vault already uses header format v3");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "fido2-hardware")]
@@ -3915,6 +4283,7 @@ fn cmd_create(
     kdf_p: Argon2idParams,
     metadata_size_override: Option<u64>,
     format: VaultFormatArg,
+    header_v3: bool,
 ) -> Result<()> {
     let suite = parse_cipher(cipher)?;
     if path.exists() {
@@ -4099,10 +4468,18 @@ fn cmd_create(
             kdf_p,
         )?,
     };
+    // Bootstrap anchor at gen=1 (the default `next_chunk_gen` for a
+    // fresh DirectoryTree) unless the header-v3 upgrade flushed past it.
+    let mut anchor_gen = 1;
+    if header_v3 {
+        // Before the anchor bootstrap, so the anchor is written in the
+        // v2 format carrying header generation 1.
+        (cont, anchor_gen) = upgrade_container_to_header_v3(cont)?;
+        eprintln!("  header format v3 (LUKSBOX3, header generation counter)");
+    }
     if let Some(ap) = anchor_path {
-        // Bootstrap anchor at gen=1 (the default `next_chunk_gen` for a
-        // fresh DirectoryTree). Subsequent vfs writes will bump it.
-        cont.init_anchor(ap.clone(), 1)?;
+        // Subsequent vfs writes will bump it.
+        cont.init_anchor(ap.clone(), anchor_gen)?;
         eprintln!("  anchor file initialized at {}", ap.display());
     }
     if let Some(hp) = header_path {
@@ -4487,6 +4864,13 @@ fn cmd_info(path: &Path, header_path: Option<&Path>) -> Result<()> {
         h.metadata_size, h.metadata_offset
     );
     println!("  data area:     starts at offset {}", h.data_offset);
+    println!(
+        "  header format: {}",
+        describe_header_format(
+            h.version_major,
+            h.has_header_generation().then_some(h.header_generation)
+        )
+    );
     println!("keyslots:");
     for (i, s) in h.keyslots.iter().enumerate() {
         match s.kind {
@@ -4690,6 +5074,16 @@ fn cmd_info(path: &Path, header_path: Option<&Path>) -> Result<()> {
                  SEP material in-header, ML-KEM in .lbx.hybrid)"
             ),
         }
+        // R15-F5: whether the TPM blob carries an SRK pin.
+        if let Some(blob) = s.tpm2_sealed_blob().or_else(|| s.tpm2_fido2_sealed_blob()) {
+            if luksbox_tpm::blob_is_srk_pinned(blob) {
+                println!("       TPM storage root key: pinned (unseal refuses a substituted SRK)");
+            } else {
+                println!(
+                    "       TPM storage root key: not pinned (re-seal with --tpm-pin-srk to pin)"
+                );
+            }
+        }
         // V0.3.0 cross-platform tag for every FIDO2-touching slot.
         // V4 slots open on Linux, macOS, and Windows. V1/V2/V3 slots
         // open only on Linux/macOS; point the user at the migration
@@ -4723,10 +5117,17 @@ fn cmd_info(path: &Path, header_path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_enroll_passphrase(path: &Path, unlock: &UnlockArgs) -> Result<()> {
+fn cmd_enroll_passphrase(
+    path: &Path,
+    unlock: &UnlockArgs,
+    kdf: Option<KdfStrengthArg>,
+) -> Result<()> {
     let mut c = open_container(path, unlock)?;
     let new_pw = read_passphrase_confirmed("new passphrase: ", NewSecretFor::ExistingVault)?;
-    let idx = c.enroll_passphrase(new_pw.as_bytes(), kdf_params())?;
+    // R15-H3: `--kdf`, else the vault's strongest passphrase cost.
+    let params = kdf_params_for_existing(&c.header, kdf, None);
+    warn_if_weak_kdf(&params);
+    let idx = c.enroll_passphrase(new_pw.as_bytes(), params)?;
     c.persist_header()?;
     println!("enrolled passphrase in slot {idx}");
     Ok(())
@@ -5476,6 +5877,7 @@ fn cmd_enroll_sep_fused(
     unlock: &UnlockArgs,
     factors: SepFactors,
     kem_size: Option<u16>,
+    kdf: Option<KdfStrengthArg>,
 ) -> Result<()> {
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
@@ -5583,6 +5985,15 @@ fn cmd_enroll_sep_fused(
     let pq_shared_ref = pq.as_ref().map(|(_, _, _, _, s)| &**s);
     let cred_id_ref: &[u8] = fido2.as_ref().map(|(c, _, _)| c.as_slice()).unwrap_or(&[]);
     let hmac_salt = fido2.as_ref().map(|(_, s, _)| *s).unwrap_or([0u8; 32]);
+    // R15-H3: the passphrase factor takes `--kdf` or the vault's
+    // strongest existing passphrase cost, not a hard-coded preset.
+    let slot_kdf = if passphrase_ref.is_some() {
+        let p = kdf_params_for_existing(&c.header, kdf, None);
+        warn_if_weak_kdf(&p);
+        p
+    } else {
+        kdf_params()
+    };
 
     let idx = c.enroll_sep(
         kind,
@@ -5590,7 +6001,7 @@ fn cmd_enroll_sep_fused(
         &blob_bytes,
         hmac_secret_ref,
         passphrase_ref,
-        kdf_params(),
+        slot_kdf,
         pq_shared_ref,
         cred_id_ref,
         hmac_salt,
@@ -5715,6 +6126,7 @@ fn cmd_enroll_sep_fused(
     _unlock: &UnlockArgs,
     _factors: SepFactors,
     _kem_size: Option<u16>,
+    _kdf: Option<KdfStrengthArg>,
 ) -> Result<()> {
     Err(
         "fused Secure Enclave enroll requires --features hardware (macOS Secure Enclave; \
@@ -5887,6 +6299,7 @@ fn cmd_update(
     unlock: &UnlockArgs,
     slot: usize,
     kind_override: Option<SlotKindArg>,
+    kdf: Option<KdfStrengthArg>,
 ) -> Result<()> {
     let mut c = open_container(path, unlock)?;
     let existing_kind = c
@@ -5903,11 +6316,21 @@ fn cmd_update(
     let existing = SlotKindArg::from_core(existing_kind)
         .ok_or_else(|| format!("slot {slot} is empty; nothing to update"))?;
     let target = kind_override.unwrap_or(existing);
+    if kdf.is_some() && !target.has_passphrase_factor() {
+        return Err(cli_err!(
+            "--kdf only applies to slot kinds with a passphrase factor, not {target:?}"
+        ));
+    }
     match target {
         SlotKindArg::Passphrase => {
             let new_pw =
                 read_passphrase_confirmed("new passphrase: ", NewSecretFor::ExistingVault)?;
-            c.update_passphrase_at(slot, new_pw.as_bytes(), kdf_params())?;
+            // R15-H3: keep the slot's own cost unless `--kdf` says
+            // otherwise (was: always the interactive preset, a silent
+            // downgrade for a `--kdf sensitive` vault).
+            let params = kdf_params_for_existing(&c.header, kdf, Some(slot));
+            warn_if_weak_kdf(&params);
+            c.update_passphrase_at(slot, new_pw.as_bytes(), params)?;
         }
         SlotKindArg::Fido2 => update_fido2_at(&mut c, slot)?,
         SlotKindArg::Fido2Direct => {
@@ -6768,9 +7191,13 @@ fn cmd_deniable_init(
     kyber_path: Option<&Path>,
     pq_1024: bool,
     anchor: Option<&Path>,
+    header_v3: bool,
 ) -> Result<()> {
     let cipher_suite = parse_deniable_cipher(cipher)?;
     let argon2_params = parse_deniable_argon2(m, t, p)?;
+    // R15-H3: `parse_deniable_argon2` only enforces the on-disk DoS
+    // envelope (m >= 8 KiB); flag a cost that is no real KDF.
+    warn_if_weak_kdf(&argon2_params);
     let cred = parse_cli_den_cred(credential)?;
 
     if path.exists() {
@@ -6861,13 +7288,18 @@ fn cmd_deniable_init(
         }
     };
 
+    let mut anchor_gen = 1;
+    if header_v3 {
+        (cont, anchor_gen) = upgrade_container_to_header_v3(cont)?;
+    }
     // Optional anchor bootstrap. `init_anchor` branches on is_deniable()
     // and writes the AEAD-encrypted deniable anchor (256 B, byte-wise
     // indistinguishable from random) instead of the standard plaintext-
-    // magic format. Generation starts at 1 - matches the wizard/GUI
-    // create path and Vfs::flush bumps from there.
+    // magic format. Generation starts at 1 (or wherever the header-v3
+    // upgrade's flush left it) - matches the wizard/GUI create path and
+    // Vfs::flush bumps from there.
     if let Some(ap) = anchor {
-        cont.init_anchor(ap.to_path_buf(), 1)?;
+        cont.init_anchor(ap.to_path_buf(), anchor_gen)?;
     }
     drop(cont);
 
@@ -6875,6 +7307,9 @@ fn cmd_deniable_init(
     println!("  cipher:     {:?}", cipher_suite);
     println!("  argon2:     m={m}KiB t={t} p={p}");
     println!("  credential: {credential}");
+    if header_v3 {
+        println!("  header:     format v3 (needs LUKSbox 0.6.0+ to open)");
+    }
     if let Some(ap) = anchor {
         println!(
             "  anchor:     {} (keep on separate trusted storage!)",
@@ -6913,6 +7348,13 @@ fn cmd_deniable_info(
     println!("  data offset:    {}", container.header.data_offset);
     println!("  chunk size:     {}", container.header.chunk_size);
     println!("  is deniable:    {}", container.is_deniable());
+    println!(
+        "  header format:  {}",
+        describe_header_format(
+            luksbox_core::VERSION_MAJOR_V2,
+            container.header_generation()
+        )
+    );
     // R15-H6: the matched slot index is deliberately NOT printed. A
     // coerced co-user who shows this output reveals that lower-indexed
     // slots (the creator's) exist; the index is only ever needed by the
@@ -7082,6 +7524,14 @@ fn prompt_pass_twice(p1: &str, p2: &str) -> Result<zeroize::Zeroizing<String>> {
     }
     if a.is_empty() {
         return Err(cli_err!("empty passphrase not accepted for deniable mode"));
+    }
+    // R15-H3: same zxcvbn gate as every other new-passphrase prompt. In
+    // deniable mode this passphrase + the Argon2id params are the whole
+    // secret (no visible slot table, nothing else to brute-force).
+    if !confirm_weak_passphrase(&a) {
+        return Err(cli_err!(
+            "weak passphrase rejected; choose a stronger one (`luksbox genpass` generates one)"
+        ));
     }
     Ok(a)
 }
@@ -8917,5 +9367,89 @@ mod tests {
                  (CVE-class regression - see kdf_params_for)",
             );
         }
+    }
+
+    fn header_with(slots: &[(usize, SlotKind, Argon2idParams)]) -> Header {
+        let mut h = Header::new(
+            CipherSuite::Aes256GcmSiv,
+            luksbox_core::KdfId::Argon2id,
+            64 * 1024,
+            1 << 20,
+        );
+        for &(i, kind, params) in slots {
+            h.keyslots[i].kind = kind;
+            h.keyslots[i].kdf_params = params;
+        }
+        h
+    }
+
+    const SMALL: Argon2idParams = Argon2idParams {
+        m_cost_kib: 96 * 1024,
+        t_cost: 3,
+        p_cost: 1,
+    };
+
+    /// R15-H3: `update` keeps the rewritten slot's own cost, even when a
+    /// stronger slot exists (the user chose that slot's cost).
+    #[test]
+    fn inherited_kdf_keeps_the_replaced_slots_cost() {
+        let h = header_with(&[
+            (0, SlotKind::Passphrase, Argon2idParams::SENSITIVE),
+            (1, SlotKind::Passphrase, SMALL),
+        ]);
+        assert_eq!(
+            inherited_kdf_params(&h, Some(0)),
+            Some(Argon2idParams::SENSITIVE)
+        );
+        assert_eq!(inherited_kdf_params(&h, Some(1)), Some(SMALL));
+    }
+
+    /// R15-H3: a new slot / a rotation takes the strongest passphrase
+    /// cost in the vault, never the interactive preset by default.
+    #[test]
+    fn inherited_kdf_picks_the_strongest_passphrase_slot() {
+        let h = header_with(&[
+            (0, SlotKind::Passphrase, SMALL),
+            (
+                2,
+                SlotKind::HybridPqKemPassphrase,
+                Argon2idParams::SENSITIVE,
+            ),
+            (3, SlotKind::Passphrase, Argon2idParams::MODERATE),
+        ]);
+        assert_eq!(
+            inherited_kdf_params(&h, None),
+            Some(Argon2idParams::SENSITIVE)
+        );
+        // Rewriting a slot that has no passphrase cost (FIDO2 -> passphrase)
+        // falls back to the strongest one too.
+        let mut h = h;
+        h.keyslots[5].kind = SlotKind::Fido2HmacSecret;
+        assert_eq!(
+            inherited_kdf_params(&h, Some(5)),
+            Some(Argon2idParams::SENSITIVE)
+        );
+    }
+
+    /// Kinds without an Argon2id-stretched passphrase, and params outside
+    /// the on-disk envelope, are never inherited.
+    #[test]
+    fn inherited_kdf_ignores_non_passphrase_and_insane_slots() {
+        let h = header_with(&[
+            (0, SlotKind::Fido2HmacSecret, Argon2idParams::SENSITIVE),
+            (1, SlotKind::Tpm2Sealed, Argon2idParams::SENSITIVE),
+        ]);
+        assert_eq!(inherited_kdf_params(&h, None), None);
+        let insane = Argon2idParams {
+            m_cost_kib: u32::MAX,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let h = header_with(&[
+            (0, SlotKind::Passphrase, insane),
+            (1, SlotKind::Passphrase, SMALL),
+        ]);
+        assert_eq!(inherited_kdf_params(&h, Some(0)), Some(SMALL));
+        assert_eq!(inherited_kdf_params(&h, None), Some(SMALL));
     }
 }

@@ -35,6 +35,70 @@ use crate::{Result, copy_into, copy_out, kdf_params, split_parent_name};
 struct CreateOptions {
     flags: u32,
     anchor: Option<PathBuf>,
+    /// Header format v3 (R15-D1): header generation counter.
+    header_v3: bool,
+}
+
+/// Apply the create-time options that need the freshly created vault:
+/// header format v3 first, so the anchor is born in the v2 format
+/// carrying header generation 1, then the anchor bootstrap.
+fn finish_create(
+    mut cont: luksbox_format::Container,
+    opts: &CreateOptions,
+) -> Result<luksbox_format::Container> {
+    let mut anchor_gen = 1;
+    if opts.header_v3 {
+        (cont, anchor_gen) = crate::upgrade_container_to_header_v3(cont)?;
+        eprintln!("  header format v3 (LUKSBOX3, header generation counter)");
+    }
+    if let Some(ap) = &opts.anchor {
+        cont.init_anchor(ap.clone(), anchor_gen)?;
+        eprintln!("  anchor file initialized at {}", ap.display());
+    }
+    Ok(cont)
+}
+
+/// R15-F5: "pin the TPM storage root key?", asked once per wizard
+/// session right before the first NEW TPM seal and applied to every
+/// seal after it. Skipped when `--tpm-pin-srk` (or the env var) already
+/// turned pinning on; unlock paths never ask.
+#[cfg(feature = "fido2-hardware")]
+fn ask_tpm_srk_pinning_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ASKED: AtomicBool = AtomicBool::new(false);
+    if luksbox_tpm::default_srk_pinning() || ASKED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let pin = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(
+            "Pin the TPM's storage root key into the new TPM keyslot? (unlock then refuses \
+             a substituted key, defeating an active TPM-bus interposer; the slot needs \
+             LUKSbox 0.6.0+ to unlock)",
+        )
+        .default(false)
+        .interact()
+        .unwrap_or(false);
+    luksbox_tpm::set_default_srk_pinning(pin);
+}
+
+/// R15-D1: the header-format-v3 question, shared by the standard and
+/// deniable create flows. Defaults to yes (v3 is the default for new
+/// vaults since 0.6.0); not asked at all after the legacy metadata
+/// format was picked, whose purpose (old readers) v3 would defeat.
+fn ask_header_v3(theme: &ColorfulTheme, legacy_format: bool) -> Result<bool> {
+    if legacy_format {
+        println!("  header format: v2 (kept for the legacy metadata format)");
+        return Ok(false);
+    }
+    Ok(Confirm::with_theme(theme)
+        .with_prompt(
+            "Use header format v3? (default; every keyslot change bumps a header \
+             generation that the anchor records, so restoring an older header, e.g. \
+             one from before a revoke, is detected; needs LUKSbox 0.6.0+ to open. \
+             Answer no only if LUKSbox 0.2.1-0.5.x must still open this vault)",
+        )
+        .default(true)
+        .interact()?)
 }
 
 /// Probe libfido2 for connected FIDO2 authenticators (any brand) and,
@@ -236,8 +300,47 @@ fn ask_den_cipher(theme: &ColorfulTheme, label: &str) -> Result<luksbox_core::Ci
     })
 }
 
+/// Re-enter the Argon2id params a deniable envelope was CREATED with
+/// (open / info / rotation). No strength gate: they are whatever the
+/// user picked back then, and only the exact values open the vault.
 fn ask_den_kdf(theme: &ColorfulTheme, label: &str) -> Result<luksbox_core::Argon2idParams> {
+    pick_kdf_params(theme, label, 1)
+}
+
+/// Pick the Argon2id params for a NEW deniable envelope (create /
+/// enroll). Same picker and default as `ask_den_kdf`, plus the R15-H3
+/// strength gate.
+fn ask_new_den_kdf(theme: &ColorfulTheme, label: &str) -> Result<luksbox_core::Argon2idParams> {
     ask_kdf_strength(theme, label, 1)
+}
+
+/// Argon2id strength picker for a NEW keyslot. R15-H3: a custom choice
+/// below `passphrase::kdf_weakness`'s floor (the picker itself accepts
+/// anything down to the 8 KiB on-disk minimum) needs an explicit
+/// confirmation, defaulting to "no" and re-asking, the way the weak-
+/// passphrase prompt does. Every preset passes the floor.
+fn ask_kdf_strength(
+    theme: &ColorfulTheme,
+    label: &str,
+    default_idx: usize,
+) -> Result<luksbox_core::Argon2idParams> {
+    loop {
+        let params = pick_kdf_params(theme, label, default_idx)?;
+        let Some(why) = crate::passphrase::kdf_weakness(&params) else {
+            return Ok(params);
+        };
+        eprintln!("warning: {why}.");
+        if Confirm::with_theme(theme)
+            .with_prompt(
+                "Use these Argon2id parameters anyway? (a stolen vault is then cheap \
+                 to brute-force; only do this on a host that cannot allocate more)",
+            )
+            .default(false)
+            .interact()?
+        {
+            return Ok(params);
+        }
+    }
 }
 
 /// Argon2id strength picker. `default_idx` selects the highlighted preset
@@ -246,7 +349,7 @@ fn ask_den_kdf(theme: &ColorfulTheme, label: &str) -> Result<luksbox_core::Argon
 /// Interactive preset, which is what makes enrolment possible on
 /// memory-constrained hosts (small VMs, containers with a tight cgroup
 /// limit, QubesOS AppVMs) where a 256 MiB Argon2id buffer won't allocate.
-fn ask_kdf_strength(
+fn pick_kdf_params(
     theme: &ColorfulTheme,
     label: &str,
     default_idx: usize,
@@ -386,7 +489,8 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
     }
 
     let cipher_suite = ask_den_cipher(theme, "Cipher suite (you must remember this choice)")?;
-    let argon2_params = ask_den_kdf(theme, "Argon2id strength (you must remember this choice)")?;
+    let argon2_params =
+        ask_new_den_kdf(theme, "Argon2id strength (you must remember this choice)")?;
     let kind = ask_den_credential_kind(theme, "Credential type for the initial slot")?;
 
     // Metadata format for the DENIABLE vault. Deniable vaults
@@ -407,6 +511,7 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
         .default(0)
         .interact()?;
     let _format_guard = luksbox_vfs::set_format_v3_override(Some(format_choice == 0));
+    let header_v3 = ask_header_v3(theme, format_choice == 1)?;
 
     // Anchor prompt before any device touches so the user isn't asked
     // mid-Argon2 / mid-FIDO2-touch. Matches the GUI's create form
@@ -507,8 +612,13 @@ fn create_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
         }
     };
 
+    let mut anchor_gen = 1;
+    if header_v3 {
+        (cont, anchor_gen) = crate::upgrade_container_to_header_v3(cont)?;
+        println!("  header format v3 (needs LUKSbox 0.6.0+ to open)");
+    }
     if let Some(ap) = &anchor_path {
-        cont.init_anchor(ap.clone(), 1)?;
+        cont.init_anchor(ap.clone(), anchor_gen)?;
         println!("  anchor file initialized at {}", ap.display());
     }
     drop(cont);
@@ -1021,6 +1131,7 @@ fn create_den_pq_tpm_fido2(
 #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
 fn tpm_seal_blob_to_bytes(pin: Option<&[u8]>) -> Result<(zeroize::Zeroizing<[u8; 32]>, Vec<u8>)> {
     use luksbox_tpm::Tpm2Sealer;
+    ask_tpm_srk_pinning_once();
     let mut sealer = Tpm2Sealer::new()?;
     let mut secret = zeroize::Zeroizing::new([0u8; 32]);
     {
@@ -1982,6 +2093,11 @@ fn ask_new_passphrase(theme: &ColorfulTheme, prompt: &str) -> Result<zeroize::Ze
                 continue;
             }
         }
+        // R15-H3: the same zxcvbn gate as the CLI's prompts (this one
+        // had none, so every wizard-created slot took "password").
+        if !crate::confirm_weak_passphrase(&s) {
+            continue;
+        }
         return Ok(s);
     }
 }
@@ -1990,7 +2106,11 @@ fn ask_new_passphrase(theme: &ColorfulTheme, prompt: &str) -> Result<zeroize::Ze
 /// `--anchor`). The pad/hide flags don't yet apply to FIDO2-direct vaults
 /// (the create_with_fido2_derived_mvk API takes no flags param), so they
 /// are skipped in that mode. The anchor IS supported for all three kinds.
-fn ask_create_options(theme: &ColorfulTheme, fido2_direct: bool) -> Result<CreateOptions> {
+fn ask_create_options(
+    theme: &ColorfulTheme,
+    fido2_direct: bool,
+    legacy_format: bool,
+) -> Result<CreateOptions> {
     let mut flags = 0u32;
     if !fido2_direct {
         let pad = Confirm::with_theme(theme)
@@ -2014,6 +2134,7 @@ fn ask_create_options(theme: &ColorfulTheme, fido2_direct: bool) -> Result<Creat
             flags |= FLAG_HIDE_SIZE_HEADER;
         }
     }
+    let header_v3 = ask_header_v3(theme, legacy_format)?;
     let anchor_path = if Confirm::with_theme(theme)
         .with_prompt(
             "Initialize a rollback-detection anchor sidecar? (small 48-byte file you \
@@ -2033,6 +2154,7 @@ fn ask_create_options(theme: &ColorfulTheme, fido2_direct: bool) -> Result<Creat
     Ok(CreateOptions {
         flags,
         anchor: anchor_path,
+        header_v3,
     })
 }
 
@@ -2432,7 +2554,7 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
     // and the size-hardening flags don't apply to keyslot wrapping).
     // On macOS the SEP block runs to index 19; on Linux/Windows the
     // TPM block ends at 13.
-    let opts = ask_create_options(theme, matches!(kind_choice, 2..=19))?;
+    let opts = ask_create_options(theme, matches!(kind_choice, 2..=19), format_choice == 1)?;
 
     match kind_choice {
         0 => create_passphrase(theme, &pb, header_path.as_deref(), cipher, &opts)?,
@@ -2766,10 +2888,7 @@ fn create_with_sep_bootstrap(
         opts.flags,
         pw.as_bytes(),
     )?;
-    if let Some(ap) = &opts.anchor {
-        cont.init_anchor(ap.clone(), 1)?;
-        eprintln!("  anchor file initialized at {}", ap.display());
-    }
+    cont = finish_create(cont, opts)?;
     println!(
         "OK created {} (bootstrapping with backup passphrase; SEP keyslot will move to slot 0)",
         vault.display()
@@ -2928,10 +3047,7 @@ fn create_with_tpm_bootstrap(
         opts.flags,
         pw.as_bytes(),
     )?;
-    if let Some(ap) = &opts.anchor {
-        cont.init_anchor(ap.clone(), 1)?;
-        eprintln!("  anchor file initialized at {}", ap.display());
-    }
+    cont = finish_create(cont, opts)?;
     println!(
         "OK created {} (bootstrapping with backup passphrase; TPM keyslot will move to slot 0)",
         vault.display()
@@ -3043,6 +3159,7 @@ fn create_single_slot_tpm_vault(
     use rand_core::{OsRng, RngCore};
     use zeroize::Zeroizing;
 
+    ask_tpm_srk_pinning_once();
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
 
     // sidecars_on_disk records files we created BEFORE the Container
@@ -3309,8 +3426,19 @@ fn create_single_slot_tpm_vault(
         }
     };
 
+    let mut anchor_gen = 1;
+    if opts.header_v3 {
+        (cont, anchor_gen) = match crate::upgrade_container_to_header_v3(cont) {
+            Ok(r) => r,
+            Err(e) => {
+                cleanup(&sidecars_on_disk);
+                return Err(format!("header format v3 upgrade failed: {e}").into());
+            }
+        };
+        eprintln!("  header format v3 (LUKSBOX3, header generation counter)");
+    }
     if let Some(ap) = &opts.anchor {
-        if let Err(e) = cont.init_anchor(ap.clone(), 1) {
+        if let Err(e) = cont.init_anchor(ap.clone(), anchor_gen) {
             drop(cont);
             cleanup(&sidecars_on_disk);
             let _ = std::fs::remove_file(ap);
@@ -3354,10 +3482,7 @@ fn create_passphrase(
         opts.flags,
         pw.as_bytes(),
     )?;
-    if let Some(ap) = &opts.anchor {
-        cont.init_anchor(ap.clone(), 1)?;
-        eprintln!("  anchor file initialized at {}", ap.display());
-    }
+    cont = finish_create(cont, opts)?;
     println!("OK created {}", vault.display());
     // No post-creation FIDO2 nag: it fired even with no authenticator plugged
     // in (guaranteeing a confusing FAIL) and is redundant with the keyslot
@@ -3419,10 +3544,7 @@ fn create_fido2_wrap(
             &cred_id,
             hmac_salt,
         )?;
-        if let Some(ap) = &opts.anchor {
-            cont.init_anchor(ap.clone(), 1)?;
-            eprintln!("  anchor file initialized at {}", ap.display());
-        }
+        cont = finish_create(cont, opts)?;
         println!(
             "OK created {} with FIDO2 wrap-style keyslot",
             vault.display()
@@ -3489,10 +3611,7 @@ fn create_fido2_direct(
             &hmac_secret,
             hmac_salt,
         )?;
-        if let Some(ap) = &opts.anchor {
-            cont.init_anchor(ap.clone(), 1)?;
-            eprintln!("  anchor file initialized at {}", ap.display());
-        }
+        cont = finish_create(cont, opts)?;
         println!("OK created {} (FIDO2-direct, MVK derived)", vault.display());
 
         if Confirm::with_theme(theme)
@@ -3597,10 +3716,7 @@ fn create_hybrid_pq(
     )
     .map_err(|e| format!("write kyber seed: {e}"))?;
 
-    if let Some(ap) = &opts.anchor {
-        cont.init_anchor(ap.clone(), 1)?;
-        eprintln!("  anchor file initialized at {}", ap.display());
-    }
+    cont = finish_create(cont, opts)?;
     println!("OK created {} (hybrid-pq, {level_label})", vault.display());
     eprintln!(
         "  hybrid sidecar (public Kyber blobs): {}",
@@ -3727,10 +3843,7 @@ fn create_hybrid_pq_fido2(
     )
     .map_err(|e| format!("write kyber seed: {e}"))?;
 
-    if let Some(ap) = &opts.anchor {
-        cont.init_anchor(ap.clone(), 1)?;
-        eprintln!("  anchor file initialized at {}", ap.display());
-    }
+    cont = finish_create(cont, opts)?;
     println!(
         "OK created {} (hybrid-pq-fido2, FIDO2 + {level_label})",
         vault.display()
@@ -4192,6 +4305,15 @@ fn info_wizard(theme: &ColorfulTheme) -> Result<()> {
         header.metadata_offset,
         header.data_offset
     );
+    println!(
+        "  header format: {}",
+        crate::describe_header_format(
+            header.version_major,
+            header
+                .has_header_generation()
+                .then_some(header.header_generation)
+        )
+    );
     print_slots(&header, true);
     Ok(())
 }
@@ -4213,6 +4335,7 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
                 "Rename a file or directory (same parent dir)",
                 "Manage keyslots",
                 "Rotate master volume key",
+                "Upgrade header to format v3 (rollback-detectable keyslot table)",
                 "Mount as a filesystem",
                 "PANIC: irreversibly destroy this vault",
                 "Close vault",
@@ -4254,11 +4377,12 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
                 vfs = Vfs::open(cont)?;
                 Ok(())
             }
-            10 => {
+            10 => upgrade_header_action(theme, &mut vfs),
+            11 => {
                 vfs.flush()?;
                 return mount_action(theme, vfs, vault);
             }
-            11 => {
+            12 => {
                 vfs.flush()?;
                 let cont = vfs.close()?;
                 if panic_action(theme, cont, vault)? {
@@ -4266,7 +4390,7 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
                 }
                 return Err("vault was destroyed".into());
             }
-            12 => {
+            13 => {
                 vfs.flush()?;
                 return Ok(());
             }
@@ -4279,6 +4403,39 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
 }
 
 // ---- vault actions ---------------------------------------------------------
+
+/// R15-D1: opt the open vault into header format v3.
+fn upgrade_header_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
+    if let Some(g) = vfs.container().header_generation() {
+        println!("  this vault already uses header format v3 (header generation {g})");
+        return Ok(());
+    }
+    println!(
+        "Header format v3: every keyslot change (enroll, revoke, update, rotate) bumps a\n\
+         header generation that the anchor records, so restoring an older header (for\n\
+         example a backup taken before a revoke) is detected at open. One-way: LUKSbox\n\
+         versions before 0.6.0 can no longer open this vault."
+    );
+    if vfs.container().anchor_path().is_none() {
+        println!(
+            "  note: no anchor is attached to this session; the counter only protects you\n  \
+             once an anchor (kept on separate trusted storage) records it."
+        );
+    }
+    if !Confirm::with_theme(theme)
+        .with_prompt("Upgrade the header now?")
+        .default(false)
+        .interact()?
+    {
+        return Ok(());
+    }
+    vfs.upgrade_header_to_v3()?;
+    println!(
+        "OK header format v3 (header generation {})",
+        vfs.container().header_generation().unwrap_or(0)
+    );
+    Ok(())
+}
 
 fn list_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
     let inner: String = Input::with_theme(theme)
@@ -4613,6 +4770,11 @@ fn rotate_mvk_action(
         credentials.push(cred);
     }
 
+    // R15-H3: every passphrase slot is rebuilt with ONE Argon2id cost.
+    // Use the strongest one already in the vault so no slot comes out of
+    // the rotation weaker than it went in (was: the interactive preset,
+    // which re-wrapped a `--kdf sensitive` vault at 256 MiB).
+    let rotate_kdf = crate::kdf_params_for_existing(&cont.header, None, None);
     let mut vfs = Vfs::open(cont)?;
     // Rollback check: refuse to rotate a vault that has been rolled back
     // past the anchor. Rotating a stale vault and then advancing the
@@ -4635,8 +4797,11 @@ fn rotate_mvk_action(
         }
     }
     eprintln!();
-    eprintln!("rotating...");
-    vfs.rotate_mvk(credentials, kdf_params())?;
+    eprintln!(
+        "rotating (passphrase slots re-wrapped at Argon2id m={} KiB t={} p={})...",
+        rotate_kdf.m_cost_kib, rotate_kdf.t_cost, rotate_kdf.p_cost
+    );
+    vfs.rotate_mvk(credentials, rotate_kdf)?;
     vfs.flush()?;
     println!(
         "OK MVK rotated. {} keyslot(s) rebuilt with fresh salts.",
@@ -5474,8 +5639,12 @@ fn update_keyslot_action(theme: &ColorfulTheme, cont: &mut Container) -> Result<
 
     if target_passphrase {
         let pw = ask_new_passphrase(theme, "New passphrase")?;
-        eprintln!("Stretching with Argon2id (about 500 ms)...");
-        cont.update_passphrase_at(slot_idx, pw.as_bytes(), kdf_params())?;
+        // R15-H3: keep the slot's own Argon2id cost (was: always the
+        // interactive preset, a silent downgrade of a sensitive slot).
+        let kdf = crate::kdf_params_for_existing(&cont.header, None, Some(slot_idx));
+        crate::warn_if_weak_kdf(&kdf);
+        eprintln!("Stretching with Argon2id...");
+        cont.update_passphrase_at(slot_idx, pw.as_bytes(), kdf)?;
     } else {
         update_fido2_in(theme, cont, slot_idx)?;
     }
@@ -5605,7 +5774,7 @@ fn enroll_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Resul
 
     fido2_preflight()?;
     let slot_idx = ask_deniable_slot_idx(theme, c)?;
-    let argon2 = ask_den_kdf(theme, "Argon2id strength for the new envelope")?;
+    let argon2 = ask_new_den_kdf(theme, "Argon2id strength for the new envelope")?;
     let pass = ask_new_passphrase(theme, "Envelope passphrase for the new FIDO2 slot")?;
     let pin = zeroize::Zeroizing::new(
         Password::with_theme(theme)
@@ -5648,7 +5817,7 @@ fn enroll_tpm2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Result
     use luksbox_format::deniable_header::DeniableMaterial;
 
     let slot_idx = ask_deniable_slot_idx(theme, c)?;
-    let argon2 = ask_den_kdf(theme, "Argon2id strength for the new envelope")?;
+    let argon2 = ask_new_den_kdf(theme, "Argon2id strength for the new envelope")?;
     let pass = ask_new_passphrase(theme, "Envelope passphrase for the new TPM slot")?;
     // Optional userAuth on the TPM-sealed object. An empty input
     // means "no PIN", matching the seal/unseal asymmetry: the
@@ -5699,7 +5868,7 @@ fn enroll_tpm2_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> 
 
     fido2_preflight()?;
     let slot_idx = ask_deniable_slot_idx(theme, c)?;
-    let argon2 = ask_den_kdf(theme, "Argon2id strength for the new envelope")?;
+    let argon2 = ask_new_den_kdf(theme, "Argon2id strength for the new envelope")?;
     let pass = ask_new_passphrase(theme, "Envelope passphrase for the new TPM+FIDO2 slot")?;
     let pin = zeroize::Zeroizing::new(
         Password::with_theme(theme)
@@ -5755,7 +5924,7 @@ fn enroll_hybrid_pq_tpm2_deniable_into(
     use luksbox_pq::{encapsulate_with, keygen_with, seed_file};
 
     let slot_idx = ask_deniable_slot_idx(theme, c)?;
-    let argon2 = ask_den_kdf(theme, "Argon2id strength for the new envelope")?;
+    let argon2 = ask_new_den_kdf(theme, "Argon2id strength for the new envelope")?;
     let envelope_pw =
         ask_new_passphrase(theme, "Envelope passphrase for the new hybrid-PQ+TPM slot")?;
     let seed_pw = ask_optional_seed_pw(theme, &envelope_pw)?;
@@ -5852,7 +6021,7 @@ fn enroll_hybrid_pq_tpm2_fido2_deniable_into(
 
     fido2_preflight()?;
     let slot_idx = ask_deniable_slot_idx(theme, c)?;
-    let argon2 = ask_den_kdf(theme, "Argon2id strength for the new envelope")?;
+    let argon2 = ask_new_den_kdf(theme, "Argon2id strength for the new envelope")?;
     let envelope_pw = ask_new_passphrase(
         theme,
         "Envelope passphrase for the new hybrid-PQ+TPM+FIDO2 slot",
@@ -6239,6 +6408,7 @@ fn enroll_tpm2_into(_theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
          kind so the chip's dictionary-attack lockout gates an \
          offline PIN attack."
     );
+    ask_tpm_srk_pinning_once();
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
     let mut kek = Zeroizing::new([0u8; 32]);
     OsRng
@@ -6525,13 +6695,21 @@ fn enroll_sep_fused_into(
         .unwrap_or(&[]);
     let hmac_salt = fido2.as_ref().map(|(_, s, _)| *s).unwrap_or([0u8; 32]);
 
+    // R15-H3: the vault's strongest passphrase cost, not a fixed preset.
+    let slot_kdf = if passphrase_ref.is_some() {
+        let p = crate::kdf_params_for_existing(&c.header, None, None);
+        crate::warn_if_weak_kdf(&p);
+        p
+    } else {
+        kdf_params()
+    };
     let idx = c.enroll_sep(
         kind,
         &sep_shared,
         &blob_bytes,
         hmac_secret_ref,
         passphrase_ref,
-        kdf_params(),
+        slot_kdf,
         pq_shared_ref,
         cred_id_ref,
         hmac_salt,
@@ -6598,6 +6776,7 @@ fn enroll_tpm2_pin_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> 
     use rand_core::{OsRng, RngCore};
     use zeroize::Zeroizing;
 
+    ask_tpm_srk_pinning_once();
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
     let pin = ask_new_tpm_pin(theme)?;
 
@@ -6630,6 +6809,7 @@ fn enroll_tpm2_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()
     use zeroize::Zeroizing;
 
     fido2_preflight()?;
+    ask_tpm_srk_pinning_once();
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
     let pin = zeroize::Zeroizing::new(
         Password::with_theme(theme)
@@ -6715,6 +6895,7 @@ fn enroll_hybrid_pq_tpm2_into(
     }
     let seed_pw = ask_new_passphrase(theme, "Seed-file passphrase")?;
 
+    ask_tpm_srk_pinning_once();
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
 
     let mut tpm_kek = Zeroizing::new([0u8; 32]);
@@ -6817,6 +6998,7 @@ fn enroll_hybrid_pq_tpm2_fido2_into(
     );
     let seed_pw = ask_new_passphrase(theme, "Seed-file passphrase")?;
 
+    ask_tpm_srk_pinning_once();
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
@@ -6949,12 +7131,15 @@ fn enroll_hybrid_pq_passphrase_into(
     let (ct, pq_shared) =
         encapsulate_with(params, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
 
+    // R15-H3: the vault's strongest passphrase cost, not a fixed preset.
+    let slot_kdf = crate::kdf_params_for_existing(&c.header, None, None);
+    crate::warn_if_weak_kdf(&slot_kdf);
     let idx = match params {
         PqParams::Ml768 => {
-            c.enroll_hybrid_pq_passphrase(slot_pw.as_bytes(), &pq_shared, kdf_params())?
+            c.enroll_hybrid_pq_passphrase(slot_pw.as_bytes(), &pq_shared, slot_kdf)?
         }
         PqParams::Ml1024 => {
-            c.enroll_hybrid_pq_1024_passphrase(slot_pw.as_bytes(), &pq_shared, kdf_params())?
+            c.enroll_hybrid_pq_1024_passphrase(slot_pw.as_bytes(), &pq_shared, slot_kdf)?
         }
     };
     c.persist_header()?;
@@ -7015,6 +7200,11 @@ fn enroll_hybrid_pq_passphrase_deniable_into(
         PqParams::Ml768 => "ML-KEM-768",
         PqParams::Ml1024 => "ML-KEM-1024",
     };
+    // R15-H3: ask like every sibling deniable enroll. This used the
+    // interactive preset without saying so, while the open-side picker
+    // defaults to Moderate: the user had no way to know which params
+    // the new envelope needs.
+    let argon2 = ask_new_den_kdf(theme, "Argon2id strength for the new envelope")?;
     let envelope_pw = ask_new_passphrase(theme, "Envelope passphrase for the new hybrid-PQ slot")?;
     let kyber_path = ask_path(theme, "Path for the new Kyber seed (.kyber) file")?;
     if kyber_path.exists() {
@@ -7029,7 +7219,7 @@ fn enroll_hybrid_pq_passphrase_deniable_into(
 
     let cred = luksbox_core::deniable::DeniableCredential::HybridPqPassphrase {
         passphrase: envelope_pw.as_bytes(),
-        argon2: kdf_params(),
+        argon2,
         mlkem_shared: &pq_shared,
     };
     let material = DeniableMaterial::passphrase_only();
@@ -7147,6 +7337,15 @@ fn enroll_hybrid_pq_fido2_into(
     let (ct, pq_shared) =
         encapsulate_with(params, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
 
+    // R15-H3: an optional slot passphrase takes the vault's strongest
+    // passphrase cost, not a fixed preset.
+    let slot_kdf = if slot_pw_opt.is_some() {
+        let p = crate::kdf_params_for_existing(&c.header, None, None);
+        crate::warn_if_weak_kdf(&p);
+        p
+    } else {
+        kdf_params()
+    };
     let idx = match params {
         PqParams::Ml768 => c.enroll_hybrid_pq_fido2(
             slot_pw_opt,
@@ -7154,7 +7353,7 @@ fn enroll_hybrid_pq_fido2_into(
             &pq_shared,
             &cred_id,
             hmac_salt,
-            kdf_params(),
+            slot_kdf,
         )?,
         PqParams::Ml1024 => c.enroll_hybrid_pq_1024_fido2(
             slot_pw_opt,
@@ -7162,7 +7361,7 @@ fn enroll_hybrid_pq_fido2_into(
             &pq_shared,
             &cred_id,
             hmac_salt,
-            kdf_params(),
+            slot_kdf,
         )?,
     };
     c.persist_header()?;
@@ -7236,6 +7435,8 @@ fn enroll_hybrid_pq_fido2_deniable_into(
         PqParams::Ml768 => "ML-KEM-768",
         PqParams::Ml1024 => "ML-KEM-1024",
     };
+    // R15-H3: see enroll_hybrid_pq_passphrase_deniable_into.
+    let argon2 = ask_new_den_kdf(theme, "Argon2id strength for the new envelope")?;
     let envelope_pw = ask_new_passphrase(theme, "Envelope passphrase for the new slot")?;
     let pin = zeroize::Zeroizing::new(
         Password::with_theme(theme)
@@ -7270,7 +7471,7 @@ fn enroll_hybrid_pq_fido2_deniable_into(
 
     let cred = luksbox_core::deniable::DeniableCredential::HybridPqFido2Passphrase {
         passphrase: envelope_pw.as_bytes(),
-        argon2: kdf_params(),
+        argon2,
         mlkem_shared: &pq_shared,
         hmac_secret_output: &hmac_secret,
     };

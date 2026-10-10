@@ -1,8 +1,9 @@
 # Cross-platform release builds.
 #
 # Triggers on tags `v*` (e.g. `v0.1.0`), builds CLI + GUI for Linux,
-# Windows, macOS Intel, macOS Apple Silicon, then publishes a GitHub
-# Release with all four artifacts attached.
+# Windows, macOS Intel, macOS Apple Silicon, plus a fully static musl
+# CLI and a GUI AppImage for x86_64 / aarch64 Linux, then publishes a
+# GitHub Release with all the artifacts attached.
 #
 # Manual run: Actions tab -> Release -> "Run workflow" (won't publish a
 # release; just builds artifacts you can download from the run page).
@@ -710,23 +711,16 @@ jobs:
       - name: Stage pinned tpm2-tss source (Linux bundled-tpm lanes)
         if: runner.os == 'Linux' && contains(env.LUKSBOX_FEATURES, 'bundled-tpm')
         shell: bash
-        env:
-          TPM2_TSS_VERSION: "4.1.3"
-          TPM2_TSS_TARBALL_SHA256: "8a389bda64690910e7af7deaf64703a3faed416dc538c9c3e4f893f24893524d"
         run: |
           set -euo pipefail
           # R15-J3: without TPM2_TSS_SOURCE_PATH, tss-esapi-sys runs
           # `git clone --depth 1 --branch 4.1.3` at build time (a mutable
           # tag, no hash) and statically links the result into the
-          # shipped binary. Fetch the release archive once, verify it,
-          # and point the build script at the unpacked tree instead.
-          tarball="$RUNNER_TEMP/tpm2-tss-$TPM2_TSS_VERSION.tar.gz"
-          curl -fsSL --retry 3 -o "$tarball" \
-            "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/$TPM2_TSS_VERSION.tar.gz"
-          echo "$TPM2_TSS_TARBALL_SHA256  $tarball" | sha256sum -c -
-          mkdir -p "$RUNNER_TEMP/tpm2-tss-src"
-          tar -xzf "$tarball" -C "$RUNNER_TEMP/tpm2-tss-src"
-          echo "TPM2_TSS_SOURCE_PATH=$RUNNER_TEMP/tpm2-tss-src/tpm2-tss-$TPM2_TSS_VERSION" >> "$GITHUB_ENV"
+          # shipped binary. The script fetches the pinned release
+          # archive, verifies its SHA-256 and prepares it for
+          # tss-esapi-sys's bootstrap step (see its header).
+          src="$(bash scripts/stage_tpm2_tss.sh "$RUNNER_TEMP/tpm2-tss-src")"
+          echo "TPM2_TSS_SOURCE_PATH=$src" >> "$GITHUB_ENV"
 
       - name: Build CLI
         shell: bash
@@ -2428,9 +2422,204 @@ jobs:
           # any later step or job, on success and on failure alike.
           security delete-keychain "$MACOS_KEYCHAIN_PATH" || true
 
+  # Fully static musl CLI (GitHub #34): one binary that runs on every
+  # Linux distribution, no shared libraries at all. Built by the same
+  # script maintainers use locally (scripts/build_static_musl.sh). No
+  # FIDO2 / TPM (they need system C libraries); `mount` stays in: the
+  # FUSE support is pure Rust and only needs `fusermount3` at runtime.
+  static-linux:
+    name: ${{ matrix.target }} (static)
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      ARCH: ${{ matrix.arch }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools file
+
+      - name: Build static binary
+        run: scripts/build_static_musl.sh --arch "$ARCH" --out dist-static
+
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release-hardened/luksbox"
+          "$bin" --version
+          work="$(mktemp -d)"
+          echo "static build smoke test" > "$work/in.txt"
+          export LUKSBOX_PASSPHRASE="static-smoke-$RANDOM-$RANDOM"
+          "$bin" create "$work/v.lbx" </dev/null
+          "$bin" put "$work/v.lbx" "$work/in.txt" /in.txt </dev/null
+          "$bin" ls "$work/v.lbx" / </dev/null | grep -q in.txt
+          "$bin" get "$work/v.lbx" /in.txt "$work/out.txt" </dev/null
+          cmp "$work/in.txt" "$work/out.txt"
+
+      - name: Add a version-less copy for releases/latest/download links
+        run: |
+          set -euo pipefail
+          cd dist-static
+          # `.../releases/latest/download/<name>` only works with a name
+          # that does not change between releases.
+          cp luksbox-v*-"$ARCH"-linux-musl-static.tar.gz "luksbox-$TARGET.tar.gz"
+          ls -l
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}-static
+          path: dist-static/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+  # GUI AppImage (x86_64 / aarch64): one file for distributions the
+  # .deb / .rpm do not cover. Built on Ubuntu 22.04, the oldest glibc we
+  # target (an AppImage still uses the host glibc). Same feature set as
+  # the jammy lanes of `build` (bundled-tpm + fuse + FIDO2); libfido2,
+  # libcbor and libcrypto are bundled, glibc / libudev / the graphics
+  # stack come from the host. Packaging is scripts/build_appimage.sh,
+  # which pins appimagetool + the AppImage runtime by SHA-256.
+  appimage:
+    name: ${{ matrix.arch }} AppImage
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            arch: x86_64
+            runner: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            arch: aarch64
+            runner: ubuntu-22.04-arm
+    env:
+      ARCH: ${{ matrix.arch }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Linux deps (apt)
+        uses: ./.github/actions/apt-install
+        with:
+          # Build: the jammy `bundled-tpm` set of the `build` job.
+          # Package: patchelf + file. Smoke test: Xvfb and Mesa's
+          # software rasteriser, so the GUI can start headless.
+          packages: |
+            pkg-config
+            libfido2-dev
+            libclang-dev
+            libssl-dev
+            autoconf
+            automake
+            libtool
+            libltdl-dev
+            autoconf-archive
+            libjson-c-dev
+            uuid-dev
+            patchelf
+            file
+            xvfb
+            xauth
+            libgl1-mesa-dri
+            libegl1
+            libxkbcommon-x11-0
+            libxcursor1
+            libxrandr2
+            libxi6
+
+      - name: Stage pinned tpm2-tss source
+        run: |
+          set -euo pipefail
+          # Same pinned source as the `build` job (R15-J3).
+          src="$(bash scripts/stage_tpm2_tss.sh "$RUNNER_TEMP/tpm2-tss-src")"
+          echo "TPM2_TSS_SOURCE_PATH=$src" >> "$GITHUB_ENV"
+
+      - name: Build GUI
+        env:
+          # Same static vendored tpm2-tss settings as the jammy lanes of
+          # `build` (see "Set Linux feature list" there for why).
+          TSS2_SYS_STATIC: "1"
+          TSS2_ESYS_STATIC: "1"
+          TSS2_MU_STATIC: "1"
+          TSS2_TCTILDR_STATIC: "1"
+          CFLAGS: "-DOPENSSL_NO_SM4"
+        run: |
+          cargo build --locked --profile release-hardened -p luksbox-gui \
+            --no-default-features --features bundled-tpm,fuse --target "$TARGET"
+
+      - name: Package AppImage
+        run: |
+          scripts/build_appimage.sh \
+            --bin "target/$TARGET/release-hardened/luksbox-gui" \
+            --arch "$ARCH" --out dist-appimage
+
+      - name: Smoke test (extract, resolve libraries, start headless)
+        run: |
+          set -euo pipefail
+          img="$(ls dist-appimage/luksbox-v*-"$ARCH".AppImage)"
+          work="$(mktemp -d)"
+          cp "$img" "$work/app.AppImage"
+          (cd "$work" && ./app.AppImage --appimage-extract >/dev/null)
+          if ldd "$work/squashfs-root/usr/bin/luksbox-gui" | grep 'not found'; then
+            echo "error: unresolved shared libraries in the AppImage" >&2
+            exit 1
+          fi
+          # The GUI must still be running when the timeout fires
+          # (status 124); an early exit means it failed to start.
+          set +e
+          LIBGL_ALWAYS_SOFTWARE=1 timeout 20 xvfb-run -a "$work/squashfs-root/AppRun"
+          status=$?
+          set -e
+          echo "exit status: $status"
+          test "$status" -eq 124
+
+      - name: Add a version-less copy for releases/latest/download links
+        run: |
+          set -euo pipefail
+          cd dist-appimage
+          cp luksbox-v*-"$ARCH".AppImage "LUKSbox-$ARCH.AppImage"
+          ls -l
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}-appimage
+          path: dist-appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 14
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, static-linux, appimage]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -2632,6 +2821,25 @@ jobs:
               Same runtime deps and installer as x86_64. Built natively
               on a GitHub ARM64 runner, no QEMU emulation. Same
               jammy/noble distinction applies as for the .deb above.
+
+            **Linux (any distro, GUI, AppImage):** download
+              `luksbox-${{ github.ref_name }}-x86_64.AppImage` (or
+              `-aarch64.AppImage`), `chmod +x` it and run it. Nothing to
+              install; libfido2 / libcbor / libcrypto are bundled, glibc
+              2.35+ (Ubuntu 22.04, Debian 12, Fedora 36 or newer) and
+              the desktop's graphics stack come from the host. `mount`
+              needs `fusermount3` (package `fuse3`). The same files are
+              also published as `LUKSbox-x86_64.AppImage` /
+              `LUKSbox-aarch64.AppImage` for stable download links.
+
+            **Linux (any distro, CLI only, static):** `tar xzf
+              luksbox-${{ github.ref_name }}-x86_64-linux-musl-static.tar.gz`
+              (or `aarch64`) and copy the single `luksbox` binary onto
+              your PATH. Fully static (musl), no shared-library
+              dependency at all; includes the TUI wizard and `mount`
+              (needs `fusermount3`), but not FIDO2 or TPM 2.0 keyslots.
+              Also published as `luksbox-x86_64-unknown-linux-musl.tar.gz`
+              / `luksbox-aarch64-unknown-linux-musl.tar.gz`.
 
             **macOS (Apple Silicon):** two .dmg variants, one per
               FUSE backend. Pick one based on which FUSE provider you

@@ -23,6 +23,7 @@ use luksbox_core::SlotKind;
 use luksbox_vfs::InodeKind;
 
 use crate::clipboard_guard;
+use crate::file_dialog::{self, Picked};
 use crate::ops::{self, KdfStrength, OpenedVault, PassgenOpts, SlotKindArg, UnlockMethod};
 use crate::preferences;
 use crate::recent::{self, RecentVault};
@@ -440,6 +441,9 @@ struct CreateForm {
     /// the field actually toggles the broader v0.2.1 envelope, not
     /// just LBM3.
     use_v3_format: bool,
+    /// Header format v3 (R15-D1); default for new vaults since 0.6.0.
+    /// Only applied together with `use_v3_format` (see `submit_create`).
+    header_v3: bool,
 }
 
 impl Default for CreateForm {
@@ -469,6 +473,7 @@ impl Default for CreateForm {
             // "On-disk format" panel still lets the user pick v2
             // explicitly for cross-version compatibility scenarios.
             use_v3_format: true,
+            header_v3: true,
         }
     }
 }
@@ -960,6 +965,10 @@ enum Pending {
     EnrollTpm2 {
         rx: Receiver<VaultRet<usize>>,
     },
+    /// R15-D1: background header-format-v3 upgrade of the open vault.
+    UpgradeHeader {
+        rx: Receiver<VaultRet<bool>>,
+    },
     EnrollTpm2Pin {
         rx: Receiver<VaultRet<usize>>,
     },
@@ -1051,6 +1060,7 @@ impl Pending {
             }
             Pending::EnrollFido2 { .. } => format!("registering credential - {auth_verb}"),
             Pending::EnrollTpm2 { .. } => "sealing key under the local TPM 2.0...".to_string(),
+            Pending::UpgradeHeader { .. } => "switching the header to format v3...".to_string(),
             Pending::EnrollTpm2Pin { .. } => {
                 "sealing key under the local TPM 2.0 with PIN-binding...".to_string()
             }
@@ -1316,6 +1326,8 @@ pub struct LuksboxApp {
     /// that produced cred_id+hmac_salt or a .tpm-blob sidecar
     /// path. The user must acknowledge before continuing.
     recovery_display: Option<DeniableRecoveryDisplay>,
+    /// Typed-path fallback modal (system file dialog unavailable, #35).
+    path_prompt: Option<PathPrompt>,
 }
 
 /// In-flight keyslot-revocation confirmation. Carries the slot index,
@@ -1453,8 +1465,26 @@ impl DeniableModal {
 }
 
 struct PendingPicker {
-    rx: std::sync::mpsc::Receiver<Option<std::path::PathBuf>>,
+    rx: std::sync::mpsc::Receiver<Picked>,
     target: PickerTarget,
+}
+
+/// Typed-path fallback for actions that have no path field of their
+/// own, shown when the system file dialog could not be opened (#35).
+struct PathPrompt {
+    title: &'static str,
+    reason: String,
+    buf: String,
+    action: PathPromptAction,
+}
+
+enum PathPromptAction {
+    MountAt,
+    AddFile,
+    /// Recursive extract of the named directory into a typed folder.
+    ExtractDirInto(String),
+    /// Extract the named file to a typed destination path.
+    SaveFileAs(String),
 }
 
 #[derive(Clone, Copy)]
@@ -1686,7 +1716,9 @@ impl LuksboxApp {
             revoke_confirm: None,
             deniable_modal: None,
             recovery_display: None,
+            path_prompt: None,
         };
+        luksbox_tpm::set_default_srk_pinning(s.prefs.tpm_pin_srk);
         // Cheap initial probe so the welcome banner + sidebar reflect
         // which FIDO2 authenticators are available before the user
         // touches anything.
@@ -1781,10 +1813,11 @@ impl LuksboxApp {
         let default_name = default_name.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let r = rfd::FileDialog::new()
-                .set_title(&title)
-                .set_file_name(&default_name)
-                .save_file();
+            let r = file_dialog::save_file(
+                rfd::FileDialog::new()
+                    .set_title(&title)
+                    .set_file_name(&default_name),
+            );
             let _ = tx.send(r);
         });
         self.pending_picker = Some(PendingPicker { rx, target });
@@ -1797,7 +1830,7 @@ impl LuksboxApp {
         let title = title.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let r = rfd::FileDialog::new().set_title(&title).pick_file();
+            let r = file_dialog::pick_file(rfd::FileDialog::new().set_title(&title));
             let _ = tx.send(r);
         });
         self.pending_picker = Some(PendingPicker { rx, target });
@@ -1810,7 +1843,10 @@ impl LuksboxApp {
             return;
         };
         match p.rx.try_recv() {
-            Ok(Some(path)) => {
+            Ok(Picked::Unavailable(reason)) => {
+                self.toast_err(file_dialog::unavailable_message(&reason));
+            }
+            Ok(Picked::Path(path)) => {
                 let s = path.display().to_string();
                 match p.target {
                     PickerTarget::CreateHybridKyber => self.create.hybrid_kyber_path = s,
@@ -1843,7 +1879,7 @@ impl LuksboxApp {
                     }
                 }
             }
-            Ok(None) => {}
+            Ok(Picked::Cancelled) => {}
             Err(std::sync::mpsc::TryRecvError::Empty) => {
                 self.pending_picker = Some(p);
             }
@@ -2313,6 +2349,20 @@ impl LuksboxApp {
                     self.pending = Some(Pending::EnrollTpm2 { rx });
                 }
                 Err(_) => self.toast_err("TPM enroll task crashed"),
+            },
+            Pending::UpgradeHeader { rx } => match rx.try_recv() {
+                Ok((vault, result)) => {
+                    match result {
+                        Ok(true) => self.toast_ok("vault switched to header format v3"),
+                        Ok(false) => self.toast_ok("vault already uses header format v3"),
+                        Err(e) => self.toast_err(e),
+                    }
+                    self.vault = Some(vault);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Pending::UpgradeHeader { rx });
+                }
+                Err(_) => self.toast_err("header upgrade task crashed"),
             },
             Pending::EnrollTpm2Pin { rx } => match rx.try_recv() {
                 Ok((mut vault, result)) => {
@@ -2982,10 +3032,18 @@ impl LuksboxApp {
         // the picker render its directory listing verbatim. Users
         // can still type a path manually via "Type path manually..."
         // on Welcome if even this doesn't help.
-        if let Some(path) = rfd::FileDialog::new()
-            .set_title("Open LUKSbox vault")
-            .pick_file()
-        {
+        let path =
+            match file_dialog::pick_file(rfd::FileDialog::new().set_title("Open LUKSbox vault")) {
+                Picked::Path(p) => Some(p),
+                Picked::Cancelled => None,
+                Picked::Unavailable(reason) => {
+                    // Same destination as Welcome's "Type path manually...".
+                    self.toast_err(file_dialog::unavailable_message(&reason));
+                    self.request_navigate(NavigateAction::OpenManualEntry);
+                    None
+                }
+            };
+        if let Some(path) = path {
             let mut entry = RecentVault {
                 path: path.clone(),
                 header_path: None,
@@ -3490,9 +3548,9 @@ impl LuksboxApp {
                         // extensionless vaults (the old default name was
                         // `secret`). See `open_existing_picker` for why no
                         // filter variant works cross-platform (#12).
-                        && let Some(p) = rfd::FileDialog::new()
-                            .set_title("New vault file")
-                            .save_file()
+                        && let Some(p) = self.dialog_path(file_dialog::save_file(
+                            rfd::FileDialog::new().set_title("New vault file"),
+                        ))
                         {
                             self.create.path = p.display().to_string();
                         }
@@ -3516,7 +3574,7 @@ impl LuksboxApp {
                             let (field_w, browse_w) = trailing_button_row_widths(ui, FORM_FIELD_MAX_W, 90.0);
                             ui.add_sized([field_w, CONTROL_H], egui::TextEdit::singleline(&mut self.create.header_path).hint_text(path_hints::usb("secret.hdr")));
                             if ui.add_sized([browse_w, CONTROL_H], ghost_button("Browse...")).clicked()
-                                && let Some(p) = rfd::FileDialog::new().set_title("Header sidecar").save_file() {
+                                && let Some(p) = self.dialog_path(file_dialog::save_file(rfd::FileDialog::new().set_title("Header sidecar"))) {
                                     self.create.header_path = p.display().to_string();
                                 }
                         });
@@ -3752,6 +3810,13 @@ impl LuksboxApp {
                         .size(11.0),
                     );
                 });
+            }
+
+            // R15-F5: TPM storage-root-key pinning for the slot this
+            // create seals (same persisted preference as the keyslot view).
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            if self.create.kind.is_tpm_bootstrap() {
+                self.draw_tpm_pin_srk_toggle(ui);
             }
 
             match self.create.kind {
@@ -4975,6 +5040,31 @@ impl LuksboxApp {
                                 &mut self.create.use_v3_format,
                                 "Use v0.2.1 format (default; LBM5 + LUKSBOX2 header + crash-safety mirrors)",
                             );
+                            // R15-D1: header format v3 (default) needs the
+                            // v0.2.1 envelope; shown off and disabled with the
+                            // legacy format, the stored choice is kept.
+                            const HEADER_V3_LABEL: &str =
+                                "Header format v3 (default; rollback-detectable keyslot table)";
+                            if self.create.use_v3_format {
+                                ui.checkbox(&mut self.create.header_v3, HEADER_V3_LABEL)
+                                    .on_hover_text(
+                                        "Every keyslot change (enroll, revoke, update, rotate) \
+                                         bumps a header generation that the anchor records, so \
+                                         restoring an older header (for example a backup taken \
+                                         before a revoke, which would bring the revoked \
+                                         credential back) is detected at open. Pair it with an \
+                                         anchor on separate storage. Needs LUKSbox 0.6.0+ to \
+                                         open; untick only if LUKSbox 0.2.1-0.5.x must still \
+                                         open this vault.",
+                                    );
+                            } else {
+                                let mut off = false;
+                                ui.add_enabled(false, egui::Checkbox::new(&mut off, HEADER_V3_LABEL))
+                                    .on_disabled_hover_text(
+                                        "Header format v3 needs the v0.2.1 format; the legacy \
+                                         format keeps the v2 header for old LUKSbox versions.",
+                                    );
+                            }
                             if !self.create.use_v3_format {
                                 ui.label(
                                     RichText::new(
@@ -5239,6 +5329,9 @@ impl LuksboxApp {
             use_deniable: self.create.use_deniable,
             enable_recovery_passphrase: self.create.enable_recovery_passphrase,
             use_v3_format: self.create.use_v3_format,
+            // Header v3 builds on the v0.2.1 envelope; the legacy format
+            // exists for old readers, which v3 would lock out.
+            header_v3: self.create.use_v3_format && self.create.header_v3,
         };
         let needs_touch = self.create.kind.needs_fido2();
 
@@ -5282,7 +5375,11 @@ impl LuksboxApp {
             } else {
                 None
             };
-            let rx = ops::spawn(move || ops::create_vault_tpm2_only(opts, pin_opt));
+            let header_v3 = opts.header_v3;
+            let rx = ops::spawn(move || {
+                ops::create_vault_tpm2_only(opts, pin_opt)
+                    .and_then(|o| ops::apply_header_v3(o, header_v3))
+            });
             self.pending = Some(Pending::CreateWithTpmBootstrap {
                 rx,
                 needs_touch,
@@ -5381,7 +5478,11 @@ impl LuksboxApp {
                 self.toast_err(e);
                 return;
             }
-            let rx = ops::spawn(move || ops::create_vault_with_tpm_bootstrap(opts, kind));
+            let header_v3 = opts.header_v3;
+            let rx = ops::spawn(move || {
+                ops::create_vault_with_tpm_bootstrap(opts, kind)
+                    .and_then(|o| ops::apply_header_v3(o, header_v3))
+            });
             self.pending = Some(Pending::CreateWithTpmBootstrap {
                 rx,
                 needs_touch,
@@ -5403,7 +5504,11 @@ impl LuksboxApp {
                 return;
             }
             let biometric = self.create.kind == CreateKind::SepBiometric;
-            let rx = ops::spawn(move || ops::create_vault_sep_only(opts, biometric));
+            let header_v3 = opts.header_v3;
+            let rx = ops::spawn(move || {
+                ops::create_vault_sep_only(opts, biometric)
+                    .and_then(|o| ops::apply_header_v3(o, header_v3))
+            });
             self.pending = Some(Pending::CreateWithTpmBootstrap {
                 rx,
                 needs_touch,
@@ -5507,7 +5612,11 @@ impl LuksboxApp {
                 self.toast_err(e);
                 return;
             }
-            let rx = ops::spawn(move || ops::create_vault_with_sep_bootstrap(opts, kind));
+            let header_v3 = opts.header_v3;
+            let rx = ops::spawn(move || {
+                ops::create_vault_with_sep_bootstrap(opts, kind)
+                    .and_then(|o| ops::apply_header_v3(o, header_v3))
+            });
             self.pending = Some(Pending::CreateWithTpmBootstrap {
                 rx,
                 needs_touch,
@@ -5516,8 +5625,197 @@ impl LuksboxApp {
             return;
         }
 
-        let rx = ops::spawn(move || ops::create_vault(opts));
+        let header_v3 = opts.header_v3;
+        let rx = ops::spawn(move || {
+            ops::create_vault(opts).and_then(|o| ops::apply_header_v3(o, header_v3))
+        });
         self.pending = Some(Pending::Create { rx, needs_touch });
+    }
+}
+
+// ---- system file dialog fallback (#35) -------------------------------------
+
+impl LuksboxApp {
+    /// Path from a dialog attached to a path text field: on failure the
+    /// user is told why and types into the field instead.
+    fn dialog_path(&mut self, picked: Picked) -> Option<PathBuf> {
+        match picked {
+            Picked::Path(p) => Some(p),
+            Picked::Cancelled => None,
+            Picked::Unavailable(reason) => {
+                self.toast_err(file_dialog::unavailable_message(&reason));
+                None
+            }
+        }
+    }
+
+    fn open_path_prompt(&mut self, title: &'static str, reason: String, action: PathPromptAction) {
+        self.path_prompt = Some(PathPrompt {
+            title,
+            reason,
+            buf: String::new(),
+            action,
+        });
+    }
+
+    fn draw_path_prompt_modal(&mut self, ctx: &egui::Context) {
+        let Some(prompt) = self.path_prompt.as_mut() else {
+            return;
+        };
+        let mut confirmed = false;
+        let mut cancelled = false;
+        let modal = egui::Modal::new(egui::Id::new("path-prompt-modal"))
+            .frame(
+                Frame::default()
+                    .fill(theme::PANEL)
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(20),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(capped_width(ui, 480.0));
+                ui.label(RichText::new(prompt.title).size(15.0).strong());
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(file_dialog::unavailable_message(&prompt.reason))
+                        .color(theme::DIM)
+                        .size(12.0),
+                );
+                ui.add_space(10.0);
+                let edit = ui.add_sized(
+                    [capped_width(ui, 460.0), CONTROL_H],
+                    egui::TextEdit::singleline(&mut prompt.buf).hint_text("/home/you/..."),
+                );
+                if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    confirmed = true;
+                }
+                ui.add_space(10.0);
+                ui.horizontal(|ui| {
+                    if ui.add(primary_button("OK")).clicked() {
+                        confirmed = true;
+                    }
+                    if ui.add(ghost_button("Cancel")).clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+        if modal.backdrop_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancelled = true;
+        }
+        if cancelled {
+            self.path_prompt = None;
+            return;
+        }
+        if !confirmed {
+            return;
+        }
+        let Some(prompt) = self.path_prompt.take() else {
+            return;
+        };
+        let typed = prompt.buf.trim();
+        if typed.is_empty() {
+            self.toast_err("no path entered");
+            self.path_prompt = Some(prompt);
+            return;
+        }
+        let path = expand_home(typed);
+        match prompt.action {
+            PathPromptAction::MountAt => self.mount_at(path),
+            PathPromptAction::AddFile => self.add_file_from(path),
+            PathPromptAction::ExtractDirInto(name) => self.get_dir_into(&name, path),
+            PathPromptAction::SaveFileAs(name) => self.get_file_to(&name, path),
+        }
+    }
+}
+
+/// `~` / `~/...` in a typed path means the home directory, as in the
+/// file dialogs the prompt stands in for.
+fn expand_home(typed: &str) -> PathBuf {
+    let home = || dirs::home_dir().unwrap_or_default();
+    match typed.strip_prefix('~') {
+        Some("") => home(),
+        Some(rest) if rest.starts_with('/') => home().join(&rest[1..]),
+        _ => PathBuf::from(typed),
+    }
+}
+
+// ---- header format v3 / TPM SRK pinning (R15-D1, R15-F5) -----------------
+
+impl LuksboxApp {
+    /// Header-format line of the keyslot view, with the opt-in upgrade.
+    fn draw_header_format_row(&mut self, ui: &mut egui::Ui) {
+        let Some(hg) = self
+            .vault
+            .as_ref()
+            .map(|v| v.vfs.container().header_generation())
+        else {
+            return;
+        };
+        ui.add_space(6.0);
+        ui.horizontal_wrapped(|ui| match hg {
+            Some(g) => {
+                ui.label(
+                    RichText::new(format!(
+                        "Header format v3 (header generation {g}): with an anchor, \
+                             a restored older keyslot table is detected at open."
+                    ))
+                    .color(theme::FAINT)
+                    .size(12.0),
+                );
+            }
+            None => {
+                ui.label(
+                    RichText::new(
+                        "Header format v2: restoring an older copy of the keyslot \
+                             table (e.g. from before a revoke) is not detectable.",
+                    )
+                    .color(theme::FAINT)
+                    .size(12.0),
+                );
+                let can = self.pending.is_none();
+                if ui
+                    .add_enabled(can, ghost_button("Upgrade header to v3"))
+                    .on_hover_text(
+                        "One-way: adds a header generation counter that the anchor \
+                             records. LUKSbox versions before 0.6.0 can no longer open the \
+                             vault afterwards.",
+                    )
+                    .clicked()
+                    && let Some(v) = self.vault.take()
+                {
+                    let (tx, rx) = std::sync::mpsc::channel::<VaultRet<bool>>();
+                    std::thread::spawn(move || {
+                        let mut v = v;
+                        let r = ops::upgrade_header_v3(&mut v.vfs);
+                        let _ = tx.send((v, r));
+                    });
+                    self.pending = Some(Pending::UpgradeHeader { rx });
+                }
+            }
+        });
+    }
+
+    /// "Pin the TPM storage root key" preference, shown next to every
+    /// place a TPM keyslot is created. Persisted, and applied process-
+    /// wide so all TPM create / enroll paths honour it.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    fn draw_tpm_pin_srk_toggle(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .checkbox(
+                &mut self.prefs.tpm_pin_srk,
+                "Pin the TPM storage root key in new TPM keyslots",
+            )
+            .on_hover_text(
+                "Unlock then refuses to run if the TPM reports a different storage root \
+                 key, which defeats an active TPM-bus interposer substituting the key to \
+                 read the unsealed secret. Pinned keyslots need LUKSbox 0.6.0+ to unlock. \
+                 Existing keyslots are not changed.",
+            )
+            .changed()
+        {
+            luksbox_tpm::set_default_srk_pinning(self.prefs.tpm_pin_srk);
+            preferences::save(&self.prefs);
+        }
     }
 }
 
@@ -5569,9 +5867,9 @@ impl LuksboxApp {
                 // analysis). Showing the unfiltered directory
                 // listing is the only behavior that matches user
                 // expectation across Windows, macOS, and Linux.
-                && let Some(p) = rfd::FileDialog::new()
-                    .set_title("Open LUKSbox vault")
-                    .pick_file()
+                && let Some(p) = self.dialog_path(file_dialog::pick_file(
+                    rfd::FileDialog::new().set_title("Open LUKSbox vault"),
+                ))
             {
                 self.unlock.path = p.display().to_string();
             }
@@ -5725,9 +6023,9 @@ impl LuksboxApp {
                         if ui
                             .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
                             .clicked()
-                            && let Some(p) = rfd::FileDialog::new()
-                                .set_title("Header sidecar")
-                                .pick_file()
+                            && let Some(p) = self.dialog_path(file_dialog::pick_file(
+                                rfd::FileDialog::new().set_title("Header sidecar"),
+                            ))
                         {
                             self.unlock.header_path = p.display().to_string();
                         }
@@ -5751,9 +6049,9 @@ impl LuksboxApp {
                     if ui
                         .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
                         .clicked()
-                        && let Some(p) = rfd::FileDialog::new()
-                            .set_title("Anchor sidecar")
-                            .pick_file()
+                        && let Some(p) = self.dialog_path(file_dialog::pick_file(
+                            rfd::FileDialog::new().set_title("Anchor sidecar"),
+                        ))
                     {
                         self.unlock.anchor_path = p.display().to_string();
                     }
@@ -6906,12 +7204,18 @@ impl LuksboxApp {
     }
 
     fn add_file_picker(&mut self) {
-        let Some(local) = rfd::FileDialog::new()
-            .set_title("Add file to vault")
-            .pick_file()
-        else {
-            return;
-        };
+        match file_dialog::pick_file(rfd::FileDialog::new().set_title("Add file to vault")) {
+            Picked::Path(local) => self.add_file_from(local),
+            Picked::Cancelled => {}
+            Picked::Unavailable(reason) => self.open_path_prompt(
+                "Add file to vault: path of the file",
+                reason,
+                PathPromptAction::AddFile,
+            ),
+        }
+    }
+
+    fn add_file_from(&mut self, local: PathBuf) {
         let name = match local.file_name() {
             Some(n) => n.to_string_lossy().into_owned(),
             None => {
@@ -6951,13 +7255,21 @@ impl LuksboxApp {
             ));
             return;
         }
+        match file_dialog::pick_folder(
+            rfd::FileDialog::new().set_title("Choose destination folder for the recursive extract"),
+        ) {
+            Picked::Path(parent_dir) => self.get_dir_into(name, parent_dir),
+            Picked::Cancelled => {}
+            Picked::Unavailable(reason) => self.open_path_prompt(
+                "Extract folder: destination folder",
+                reason,
+                PathPromptAction::ExtractDirInto(name.to_string()),
+            ),
+        }
+    }
+
+    fn get_dir_into(&mut self, name: &str, parent_dir: PathBuf) {
         let inner = join_path(&self.cwd, name);
-        let Some(parent_dir) = rfd::FileDialog::new()
-            .set_title("Choose destination folder for the recursive extract")
-            .pick_folder()
-        else {
-            return;
-        };
         let local = parent_dir.join(name);
         if local.exists() {
             self.toast_err(format!(
@@ -6980,7 +7292,6 @@ impl LuksboxApp {
     }
 
     fn start_get_file(&mut self, name: &str) {
-        let inner = join_path(&self.cwd, name);
         // Build the save dialog with a filter matching the file's
         // own extension. Windows' `IFileSaveDialog` (which `rfd`
         // wraps) strips a pre-filled filename's extension when no
@@ -7006,9 +7317,19 @@ impl LuksboxApp {
         // is treated as a `*.*` glob on GTK portals and silently
         // hides extensionless files (Fedora user report).
         dialog = dialog.add_filter("All files", &[] as &[&str]);
-        let Some(mut local) = dialog.save_file() else {
-            return;
-        };
+        match file_dialog::save_file(dialog) {
+            Picked::Path(local) => self.get_file_to(name, local),
+            Picked::Cancelled => {}
+            Picked::Unavailable(reason) => self.open_path_prompt(
+                "Save extracted file as: destination path",
+                reason,
+                PathPromptAction::SaveFileAs(name.to_string()),
+            ),
+        }
+    }
+
+    fn get_file_to(&mut self, name: &str, mut local: PathBuf) {
+        let inner = join_path(&self.cwd, name);
         // Last-resort guard: if the chosen path has NO extension
         // but the source file did (e.g. user typed a bare name in
         // the dialog, or Windows stripped it despite the filter),
@@ -7147,14 +7468,27 @@ impl LuksboxApp {
                 return;
             }
         } else {
-            let Some(mp) = rfd::FileDialog::new()
-                .set_title("Choose mountpoint (existing empty directory)")
-                .pick_folder()
-            else {
-                return;
-            };
-            mp
+            match file_dialog::pick_folder(
+                rfd::FileDialog::new().set_title("Choose mountpoint (existing empty directory)"),
+            ) {
+                Picked::Path(mp) => mp,
+                Picked::Cancelled => return,
+                Picked::Unavailable(reason) => {
+                    self.open_path_prompt(
+                        "Mount as volume: mountpoint (an existing empty folder)",
+                        reason,
+                        PathPromptAction::MountAt,
+                    );
+                    return;
+                }
+            }
         };
+        self.mount_at(mountpoint);
+    }
+
+    /// Second half of `start_mount_picker`, also reached from the
+    /// typed-path fallback.
+    fn mount_at(&mut self, mountpoint: PathBuf) {
         let Some(opened) = self.vault.take() else {
             return;
         };
@@ -7521,6 +7855,7 @@ impl LuksboxApp {
             .color(theme::FAINT)
             .size(12.0),
         );
+        self.draw_header_format_row(ui);
         ui.add_space(14.0);
 
         // Wrap the slot list + add buttons in a ScrollArea so a short
@@ -7856,6 +8191,8 @@ impl LuksboxApp {
                 // button pre-flights its hardware before opening the
                 // modal so the user gets the friendly missing-device
                 // toast BEFORE typing PIN / passphrase.
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                self.draw_tpm_pin_srk_toggle(ui);
                 #[cfg(any(target_os = "linux", target_os = "windows"))]
                 if ui
                     .add_sized(
@@ -8848,9 +9185,9 @@ impl LuksboxApp {
                 if ui
                     .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
                     .clicked()
-                    && let Some(p) = rfd::FileDialog::new()
-                        .set_title("Vault to destroy")
-                        .pick_file()
+                    && let Some(p) = self.dialog_path(file_dialog::pick_file(
+                        rfd::FileDialog::new().set_title("Vault to destroy"),
+                    ))
                 {
                     self.panic.vault = p.display().to_string();
                 }
@@ -8872,9 +9209,9 @@ impl LuksboxApp {
                     if ui
                         .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
                         .clicked()
-                        && let Some(p) = rfd::FileDialog::new()
-                            .set_title("Header sidecar to destroy")
-                            .pick_file()
+                        && let Some(p) = self.dialog_path(file_dialog::pick_file(
+                            rfd::FileDialog::new().set_title("Header sidecar to destroy"),
+                        ))
                     {
                         self.panic.header_path = p.display().to_string();
                     }
@@ -9099,6 +9436,7 @@ impl LuksboxApp {
         self.draw_close_confirm_modal(ctx);
         self.draw_empty_passphrase_confirm_modal(ctx);
         self.draw_deniable_modal(ctx);
+        self.draw_path_prompt_modal(ctx);
         self.draw_deniable_recovery_modal(ctx);
         self.draw_recovery_report_modal(ctx);
         self.draw_forget_recent_modal(ctx);
@@ -12762,6 +13100,7 @@ impl LuksboxApp {
 
         let mut close = false;
         let mut submit = false;
+        let mut dialog_error: Option<String> = None;
         let title = match form.mode {
             DeniableMode::Create => "Create deniable header",
             DeniableMode::Verify => "Verify deniable header",
@@ -12803,15 +13142,17 @@ impl LuksboxApp {
                         .clicked()
                     {
                         let picked = match form.mode {
-                            DeniableMode::Create => rfd::FileDialog::new()
-                                .set_title("Save deniable-header file")
-                                .save_file(),
-                            DeniableMode::Verify => rfd::FileDialog::new()
-                                .set_title("Open deniable-header file")
-                                .pick_file(),
+                            DeniableMode::Create => file_dialog::save_file(
+                                rfd::FileDialog::new().set_title("Save deniable-header file"),
+                            ),
+                            DeniableMode::Verify => file_dialog::pick_file(
+                                rfd::FileDialog::new().set_title("Open deniable-header file"),
+                            ),
                         };
-                        if let Some(p) = picked {
-                            form.path = p.to_string_lossy().into_owned();
+                        match picked {
+                            Picked::Path(p) => form.path = p.to_string_lossy().into_owned(),
+                            Picked::Unavailable(reason) => dialog_error = Some(reason),
+                            Picked::Cancelled => {}
                         }
                     }
                 });
@@ -12926,6 +13267,9 @@ impl LuksboxApp {
                 });
             });
 
+        if let Some(reason) = dialog_error {
+            self.toast_err(file_dialog::unavailable_message(&reason));
+        }
         // Handle submit OUTSIDE the egui::Window closure so we can
         // mutate `self.deniable_modal` (the closure borrowed it
         // mutably already via `form`).

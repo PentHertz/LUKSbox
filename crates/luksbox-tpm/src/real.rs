@@ -53,10 +53,14 @@ use tss_esapi::{
 use tss_esapi::tcti_ldr::DeviceConfig;
 use zeroize::Zeroizing;
 
-use crate::{Error, SEALED_SECRET_LEN, SealedBlob};
+use crate::{Error, SEALED_SECRET_LEN, SealedBlob, default_srk_pinning, srk_pin_from_public};
 
 pub struct Tpm2Sealer {
     ctx: Context,
+    /// R15-F5: pin the SRK identity into new seals (see
+    /// `SealedBlob::srk_pin`). Initialised from the process-wide
+    /// `default_srk_pinning()`.
+    pin_srk: bool,
 }
 
 impl Tpm2Sealer {
@@ -90,7 +94,10 @@ impl Tpm2Sealer {
         let primary = Tcti::Tbs;
         let ctx = Context::new(primary)
             .map_err(|e| Error::DeviceNotAvailable(diagnose_device_open_failure(&e.to_string())))?;
-        Ok(Self { ctx })
+        Ok(Self {
+            ctx,
+            pin_srk: default_srk_pinning(),
+        })
     }
 
     /// Construct from an explicit TCTI configuration string. Used by
@@ -104,7 +111,28 @@ impl Tpm2Sealer {
         let ctx = Context::new(conf).map_err(|e| {
             Error::DeviceNotAvailable(format!("could not open TPM via {tcti:?}: {e}"))
         })?;
-        Ok(Self { ctx })
+        Ok(Self {
+            ctx,
+            pin_srk: default_srk_pinning(),
+        })
+    }
+
+    /// Pin (or stop pinning) the SRK identity into blobs sealed by this
+    /// sealer from now on (R15-F5). Overrides `default_srk_pinning()`.
+    pub fn set_srk_pinning(&mut self, on: bool) {
+        self.pin_srk = on;
+    }
+
+    /// R15-F5: identity of the SRK `CreatePrimary` just returned. The
+    /// salted session below encrypts its salt to exactly this public
+    /// area (ESAPI caches it on the key handle), so this is the key
+    /// whose identity a pinned blob must match.
+    fn srk_pin_of(primary: &CreatePrimaryKeyResult) -> Result<[u8; crate::SRK_PIN_LEN], Error> {
+        let public = primary
+            .out_public
+            .marshall()
+            .map_err(|e| Error::TpmError(format!("marshall SRK TPMT_PUBLIC: {e}")))?;
+        Ok(srk_pin_from_public(&public))
     }
 
     /// Seal `plaintext` under a fresh sealed-data object that's a
@@ -137,6 +165,20 @@ impl Tpm2Sealer {
         // makes that session's parameter encryption effective against
         // a TPM-bus interposer (see `start_hmac_session`).
         let primary = self.create_srk()?;
+        // R15-F5: record the SRK identity (trust on first use: an
+        // interposer present at enroll time is not detected, one that
+        // appears later is).
+        let srk_pin = if self.pin_srk {
+            match Self::srk_pin_of(&primary) {
+                Ok(p) => Some(p),
+                Err(e) => {
+                    let _ = self.ctx.flush_context(primary.key_handle.into());
+                    return Err(e);
+                }
+            }
+        } else {
+            None
+        };
 
         // Salted HMAC session for command/response auth AND parameter
         // encryption. Without a session any subsequent `Esys_Create`
@@ -176,6 +218,7 @@ impl Tpm2Sealer {
         Ok(SealedBlob {
             public: public_bytes,
             private: private_bytes,
+            srk_pin,
         })
     }
 
@@ -204,6 +247,25 @@ impl Tpm2Sealer {
         // it protects the unsealed 32-byte secret as it crosses the
         // bus in the Esys_Unseal response).
         let primary = self.create_srk()?;
+        // R15-F5: a pinned blob only proceeds if the SRK the TPM handed
+        // back is the one it was sealed under. Checked BEFORE the salted
+        // session is started, because that session's salt is encrypted
+        // to this public area: a substituted key (active interposer)
+        // would otherwise receive the salt and could decrypt the
+        // unsealed KEK in the Esys_Unseal response.
+        if let Some(pinned) = &blob.srk_pin {
+            let actual = match Self::srk_pin_of(&primary) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = self.ctx.flush_context(primary.key_handle.into());
+                    return Err(e);
+                }
+            };
+            if actual != *pinned {
+                let _ = self.ctx.flush_context(primary.key_handle.into());
+                return Err(Error::SrkMismatch);
+            }
+        }
         let session = match self.start_hmac_session(primary.key_handle) {
             Ok(s) => s,
             Err(e) => {

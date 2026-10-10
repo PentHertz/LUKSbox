@@ -50,10 +50,14 @@ eframe = { version = "0.34", default-features = false, features = ["default_font
 egui = "0.34"
 egui_extras = { version = "0.34", default-features = false, features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
-# rfd default uses GTK3 on Linux, small system dep, no JS engine, no
-# WebView. We use the synchronous picker so the GUI doesn't need an
-# async runtime.
+# rfd's default Linux backend is the XDG desktop portal (D-Bus, via
+# ashpd), falling back to `zenity` when the portal call fails; no GTK
+# link. We use the synchronous picker so the GUI doesn't need an async
+# runtime. When both the portal and zenity fail rfd returns `None`,
+# like a cancel; `src/file_dialog.rs` tells the two apart (issue #35).
 rfd = "0.15"
+# Receives rfd's dialog errors (see `file_dialog::install_logger`).
+log = "0.4"
 dirs = "5"
 serde = { workspace = true }
 serde_json = "1"

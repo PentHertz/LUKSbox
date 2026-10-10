@@ -41,6 +41,26 @@ pub enum Error {
     #[error("anchor file is corrupt or has wrong magic")]
     AnchorCorrupt,
 
+    /// R15-D1 (header half): the vault's header generation is BELOW the
+    /// one a trusted anchor recorded, i.e. the keyslot table was replaced
+    /// by an older, validly MAC'd copy (typically a backup taken before a
+    /// `revoke`, which brings the revoked credential back).
+    #[error(
+        "header rollback detected: the anchor recorded header generation \
+         {anchor_header_gen}, but the vault's header is at generation {header_gen}. \
+         The keyslot table was replaced by an older copy (for example a backup \
+         taken before a revoke). Restore the current header, or re-establish the \
+         anchor deliberately if you restored it yourself."
+    )]
+    HeaderRollbackDetected {
+        anchor_header_gen: u64,
+        header_gen: u64,
+    },
+
+    /// `Container::upgrade_header_to_v3` cannot run in this state.
+    #[error("header format v3 upgrade not possible: {0}")]
+    HeaderUpgradeUnsupported(&'static str),
+
     #[error(
         "vault locked by another process (path: {path}). \
          Close the other luksbox instance and retry, or check `lsof {path}` \

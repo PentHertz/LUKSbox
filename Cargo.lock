@@ -2539,7 +2539,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "luksbox-cli"
-version = "0.5.2"
+version = "0.6.0-rc.1"
 dependencies = [
  "clap",
  "dialoguer",
@@ -2564,7 +2564,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-core"
-version = "0.5.2"
+version = "0.6.0-rc.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2591,14 +2591,14 @@ dependencies = [
 
 [[package]]
 name = "luksbox-ct-bench"
-version = "0.5.2"
+version = "0.6.0-rc.1"
 dependencies = [
  "rand",
 ]
 
 [[package]]
 name = "luksbox-fido2"
-version = "0.5.2"
+version = "0.6.0-rc.1"
 dependencies = [
  "aes",
  "bindgen 0.72.1",
@@ -2620,7 +2620,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-format"
-version = "0.5.2"
+version = "0.6.0-rc.1"
 dependencies = [
  "fs2",
  "hmac",
@@ -2638,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-fuse-t"
-version = "0.5.2"
+version = "0.6.0-rc.1"
 dependencies = [
  "bindgen 0.71.1",
  "libc",
@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-gui"
-version = "0.5.2"
+version = "0.6.0-rc.1"
 dependencies = [
  "arboard",
  "dirs",
@@ -2659,6 +2659,7 @@ dependencies = [
  "hex",
  "image",
  "libc",
+ "log",
  "luksbox-core",
  "luksbox-fido2",
  "luksbox-format",
@@ -2680,7 +2681,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-mount"
-version = "0.5.2"
+version = "0.6.0-rc.1"
 dependencies = [
  "ctrlc",
  "fuser",
@@ -2698,7 +2699,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-pq"
-version = "0.5.2"
+version = "0.6.0-rc.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2720,7 +2721,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-sep"
-version = "0.5.2"
+version = "0.6.0-rc.1"
 dependencies = [
  "rand_core 0.6.4",
  "tempfile",
@@ -2730,11 +2731,12 @@ dependencies = [
 
 [[package]]
 name = "luksbox-tpm"
-version = "0.5.2"
+version = "0.6.0-rc.1"
 dependencies = [
  "luksbox-core",
  "luksbox-format",
  "rand_core 0.6.4",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
  "tss-esapi",
@@ -2744,7 +2746,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-vfs"
-version = "0.5.2"
+version = "0.6.0-rc.1"
 dependencies = [
  "luksbox-core",
  "luksbox-format",

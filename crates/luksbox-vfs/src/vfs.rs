@@ -2002,18 +2002,7 @@ impl Vfs {
             && !self.container.is_deniable()
             && use_v3_for_fresh_vault()
         {
-            self.container.header.version_major = luksbox_core::VERSION_MAJOR_V2;
-            self.container.mark_header_dirty();
-            // Bump the metadata format too. V5 supersedes V2/V3/V4
-            // for the v0.2.1+ shape: lower spill threshold, paired
-            // with the LUKSBOX2 header.
-            self.format = MetadataFormat::V5;
-            // Layer 2: format upgrade changes the inline-vs-external
-            // threshold AND the encoding of inode rows; every
-            // existing inode must be re-walked through the spill
-            // logic on this flush. The reuse fast path checks
-            // chunks_dirty, so mark every inode dirty here.
-            self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+            self.upgrade_v1_header_in_memory();
         }
         // Auto-upgrade to V4 if any inode has been touched by an
         // LBM4-only op (non-default mode, or hardlink count > 1).
@@ -2217,6 +2206,55 @@ impl Vfs {
         // place for the next attempt.
         self.chunks_dirty.clear();
         Ok(())
+    }
+
+    /// The LUKSBOX1 -> LUKSBOX2 + LBM5 step of the v0.2.1 auto-upgrade
+    /// (see `flush`), applied in memory; the caller's flush persists it.
+    fn upgrade_v1_header_in_memory(&mut self) {
+        self.container.header.version_major = luksbox_core::VERSION_MAJOR_V2;
+        self.container.mark_header_dirty();
+        // Bump the metadata format too. V5 supersedes V2/V3/V4
+        // for the v0.2.1+ shape: lower spill threshold, paired
+        // with the LUKSBOX2 header.
+        self.format = MetadataFormat::V5;
+        // Layer 2: format upgrade changes the inline-vs-external
+        // threshold AND the encoding of inode rows; every
+        // existing inode must be re-walked through the spill
+        // logic on this flush. The reuse fast path checks
+        // chunks_dirty, so mark every inode dirty here.
+        self.chunks_dirty.extend(self.tree.inodes.keys().copied());
+    }
+
+    /// Opt the vault into header format v3 (R15-D1, header half) and
+    /// persist it: see `Container::upgrade_header_to_v3`. Unlike the
+    /// container method this also handles a LUKSBOX1 vault, by applying
+    /// the regular LUKSBOX2 + LBM5 upgrade first (refused when
+    /// `LUKSBOX_FORMAT_V2` asks to keep the vault readable by pre-v0.2.1
+    /// binaries, which header v3 would defeat anyway). Metadata is
+    /// flushed before the header is written, the same order as the
+    /// automatic upgrade. Returns `Ok(false)` if already on header v3.
+    pub fn upgrade_header_to_v3(&mut self) -> Result<bool, Error> {
+        self.ensure_writable()?;
+        if self.container.header_generation().is_some() {
+            return Ok(false);
+        }
+        if self.container.header.version_major == luksbox_core::VERSION_MAJOR_V1
+            && !self.container.is_deniable()
+        {
+            if !use_v3_for_fresh_vault() {
+                return Err(Error::Format(
+                    luksbox_format::Error::HeaderUpgradeUnsupported(
+                        "LUKSBOX_FORMAT_V2 is set (pre-v0.2.1 compatibility); unset it first",
+                    ),
+                ));
+            }
+            self.upgrade_v1_header_in_memory();
+            self.dirty = true;
+        }
+        self.container.upgrade_header_to_v3()?;
+        self.flush()?;
+        self.container.persist_header()?;
+        Ok(true)
     }
 
     /// Detects whether the in-memory tree has any inode that
@@ -8964,5 +9002,157 @@ mod tests {
         );
         vfs.flush().unwrap();
         assert_eq!(vfs.vault_generation(), g2, "a clean flush is a no-op");
+    }
+
+    /// R15-D1: `Vfs::upgrade_header_to_v3` takes a fresh (LUKSBOX1)
+    /// vault through the regular LUKSBOX2 + LBM5 step and on to
+    /// LUKSBOX3 without losing content.
+    #[test]
+    fn upgrade_header_to_v3_from_fresh_vault_keeps_content() {
+        use luksbox_format::Container;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hv3.lbx");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "doc").unwrap();
+        vfs.write(f, 0, b"payload").unwrap();
+        assert!(vfs.upgrade_header_to_v3().unwrap());
+        assert!(!vfs.upgrade_header_to_v3().unwrap());
+        assert_eq!(
+            vfs.container.header.version_major,
+            luksbox_core::VERSION_MAJOR_V3
+        );
+        assert_eq!(vfs.format, MetadataFormat::V5);
+        let _ = vfs.close().unwrap();
+
+        assert_eq!(&std::fs::read(&path).unwrap()[..8], b"LUKSBOX3");
+        let cont = Container::open(&path, None, UnlockMaterial::Passphrase(b"pw")).unwrap();
+        assert_eq!(cont.header_generation(), Some(1));
+        let mut vfs = Vfs::open(cont).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.lookup(root, "doc").unwrap();
+        let mut buf = [0u8; 7];
+        vfs.read(f, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"payload");
+    }
+
+    /// MVK rotation on a header-v3 vault with an anchor: the header is
+    /// written into the `.rotating` copy (anchor refresh skipped there),
+    /// and after commit the anchor carries the new header generation
+    /// under the new MVK, so the next anchored open is clean.
+    #[test]
+    fn rotate_mvk_on_header_v3_vault_keeps_anchor_consistent() {
+        use luksbox_format::Container;
+        use zeroize::Zeroizing;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hv3-rot.lbx");
+        let anchor_path = dir.path().join("hv3-rot.anchor");
+        let cont = Container::create_with_passphrase(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            test_params(),
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        vfs.upgrade_header_to_v3().unwrap();
+        vfs.container.init_anchor(anchor_path.clone(), 1).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "blob").unwrap();
+        vfs.write(f, 0, &vec![3u8; 5000]).unwrap();
+        vfs.flush().unwrap();
+        let _ = vfs.close().unwrap();
+
+        let mut cont = Container::open(&path, None, UnlockMaterial::Passphrase(b"pw")).unwrap();
+        cont.set_anchor(Some(anchor_path.clone())).unwrap();
+        let hg_before = cont.header_generation().unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        vfs.rotate_mvk(
+            vec![SlotCredential::Passphrase {
+                slot_idx: 0,
+                passphrase: Zeroizing::new("pw".to_string()),
+            }],
+            test_params(),
+        )
+        .unwrap();
+        vfs.flush().unwrap();
+        let _ = vfs.close().unwrap();
+
+        let mut cont = Container::open(&path, None, UnlockMaterial::Passphrase(b"pw")).unwrap();
+        cont.set_anchor(Some(anchor_path.clone()))
+            .expect("anchor re-verifies under the rotated MVK, no header rollback");
+        assert!(cont.header_generation().unwrap() > hg_before);
+        let a = luksbox_format::anchor::read_and_verify(
+            &anchor_path,
+            &cont.mvk_clone(),
+            cont.header_salt(),
+        )
+        .unwrap();
+        assert_eq!(a.header_generation, cont.header_generation());
+    }
+
+    /// Deniable rotation on a header-v3 deniable vault: `rotate_mvk_v2`
+    /// seals a pre-v3 inner header for the new MVK and salt, and the
+    /// persist that follows must re-seal it as v3 over the NEW slot table
+    /// (otherwise the vault would silently drop to pre-v3, or fail its
+    /// own slot digest at the next open).
+    #[test]
+    fn deniable_rotation_keeps_header_v3() {
+        use luksbox_format::Container;
+        use luksbox_format::deniable_header::DeniableMaterial;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("d-hv3-rot.lbx");
+        let cont = Container::create_with_passphrase_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256GcmSiv,
+            test_params(),
+            0,
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        assert!(vfs.upgrade_header_to_v3().unwrap());
+        let root = vfs.root_id();
+        let f = vfs.create(root, "n").unwrap();
+        vfs.write(f, 0, b"deniable").unwrap();
+        vfs.flush().unwrap();
+        let hg_before = vfs.container().header_generation().unwrap();
+        let creds = vec![DeniableRotationCredential {
+            slot_idx: 0,
+            kind: luksbox_core::deniable::DeniableKindTag::Passphrase,
+            passphrase: Zeroizing::new(b"pw".to_vec()),
+            argon2: test_params(),
+            material: DeniableMaterial::passphrase_only(),
+            hmac_secret_output: None,
+            unsealed: None,
+            mlkem_shared: None,
+        }];
+        vfs.rotate_mvk_deniable(creds).unwrap();
+        let _ = vfs.close().unwrap();
+
+        let cont = Container::open_with_passphrase_deniable(
+            &path,
+            None,
+            b"pw",
+            test_params(),
+            CipherSuite::Aes256GcmSiv,
+        )
+        .unwrap();
+        assert!(cont.header_generation().unwrap() > hg_before);
+        let mut vfs = Vfs::open(cont).unwrap();
+        let f = vfs.lookup(vfs.root_id(), "n").unwrap();
+        let mut got = [0u8; 8];
+        vfs.read(f, 0, &mut got).unwrap();
+        assert_eq!(&got, b"deniable");
     }
 }

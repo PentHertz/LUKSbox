@@ -379,17 +379,19 @@ pub struct LuksboxFs {
     /// Mirrors the same pattern used on Linux/macOS in `fuse.rs` so all
     /// three platforms surface honest space numbers to file managers.
     vault_parent: Option<PathBuf>,
-    /// When true, the per-handle `cleanup` callback drives an
-    /// immediate `Vfs::flush()` (pre-Layer-1 behavior). Set via
-    /// `luksbox mount --sync`. When false, `cleanup` only marks the
-    /// Vfs dirty and returns; the timer thread below catches up
-    /// within `LAZY_FLUSH_INTERVAL_SECS`. `Drop` always flushes
-    /// unconditionally as a final safety net.
+    /// When true, every metadata-mutating callback (`create`,
+    /// `overwrite`, `set_file_size`, `set_basic_info`, `rename`) and the
+    /// per-handle `cleanup` drive an immediate `Vfs::flush()`
+    /// (pre-Layer-1 behavior). Set via `luksbox mount --sync`. When
+    /// false, those callbacks only leave the Vfs dirty; the timer thread
+    /// below catches up within `LAZY_FLUSH_INTERVAL_SECS`. `Drop` always
+    /// flushes unconditionally as a final safety net.
     sync_mode: bool,
     /// Wakes / shuts down the deferred-flush timer thread. Dropping
     /// the sender (or sending on it) causes the timer's
-    /// `recv_timeout` to return `Disconnected` immediately. `None`
-    /// when `sync_mode == true` (no timer was spawned).
+    /// `recv_timeout` to return `Disconnected` immediately. Always
+    /// `Some` until `Drop`: the timer also runs under `--sync`
+    /// (R15-G3), see `new`.
     timer_stop_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 
@@ -415,9 +417,16 @@ impl LuksboxFs {
             .parent()
             .map(|p| p.to_path_buf());
         let inner = Arc::new(Mutex::new(vfs));
-        let timer_stop_tx = if sync_mode {
-            None
-        } else {
+        // R15-G3: unlike fuse.rs / fuse_t.rs, the timer is spawned in
+        // `--sync` mode too. On Windows the cache manager's lazy writer
+        // and the mapped-page writer deliver paging writes AFTER the
+        // handle's `cleanup` has run (we do not set
+        // FlushAndPurgeOnCleanup), and no later callback flushes them, so
+        // with the timer off those writes stayed in memory until
+        // unmount. With every mutation already flushed eagerly, the
+        // timer is a no-op tick in the common case (`Vfs::flush()`
+        // returns immediately on a clean tree).
+        let timer_stop_tx = {
             // Background flush timer: wakes every
             // LAZY_FLUSH_INTERVAL_SECS, briefly takes the Vfs lock
             // and calls `vfs.flush()`. Same lifecycle as fuse.rs /
@@ -460,12 +469,20 @@ impl LuksboxFs {
     }
 
     /// Called from the WinFsp `cleanup` callback (the analogue of FUSE
-    /// `release`) in lieu of the pre-Layer-1 unconditional
-    /// `Vfs::flush()`. With the default `sync_mode == false` this is a
-    /// no-op -- the in-memory tree stays dirty and the timer thread
-    /// catches up within `LAZY_FLUSH_INTERVAL_SECS`. With `--sync`
-    /// every cleanup persists immediately, restoring pre-Layer-1
-    /// data-loss-on-forced-kill semantics.
+    /// `release`) and from every metadata-mutating callback, in lieu of
+    /// the pre-Layer-1 unconditional `Vfs::flush()`. With the default
+    /// `sync_mode == false` this is a no-op -- the in-memory tree stays
+    /// dirty and the timer thread catches up within
+    /// `LAZY_FLUSH_INTERVAL_SECS`. With `--sync` every call persists
+    /// immediately, restoring pre-Layer-1 data-loss-on-forced-kill
+    /// semantics.
+    ///
+    /// R15-G3: `create`, `overwrite`, `set_file_size` and
+    /// `set_basic_info` used to skip this, so under `--sync` an empty
+    /// file or directory, a truncation or an mtime set only reached the
+    /// vault at the next cleanup that happened to flush, or at unmount
+    /// (with `set_post_cleanup_when_modified_only(true)` a handle is not
+    /// guaranteed a cleanup callback at all).
     fn maybe_flush_now(&self, vfs: &mut Vfs) {
         if self.sync_mode
             && let Err(e) = vfs.flush()
@@ -640,6 +657,7 @@ impl FileSystemInterface for LuksboxFs {
         } else {
             vfs.create(parent_id, name).map_err(|e| vfs_err_to_nt(&e))?
         };
+        self.maybe_flush_now(&mut vfs);
         let info = make_file_info(&mut vfs, new_id)?;
         let ctx = Arc::new(OpenContext {
             file_id: new_id,
@@ -862,6 +880,7 @@ impl FileSystemInterface for LuksboxFs {
         // writer wrote less than it had pre-allocated.
         vfs.truncate(ctx.file_id, 0)
             .map_err(|e| vfs_err_to_nt(&e))?;
+        self.maybe_flush_now(&mut vfs);
         make_file_info(&mut vfs, ctx.file_id)
     }
 
@@ -912,8 +931,12 @@ impl FileSystemInterface for LuksboxFs {
         // the FILETIME (100-ns ticks since 1601) to UNIX nanoseconds and
         // persist so rsync / robocopy / Explorer's "Date modified" round
         // -trip. Best-effort: keep returning success for UI compat.
-        if mtime != 0 {
-            let _ = vfs.set_mtime(ctx.file_id, filetime_to_unix_ns(mtime));
+        if mtime != 0
+            && vfs
+                .set_mtime(ctx.file_id, filetime_to_unix_ns(mtime))
+                .is_ok()
+        {
+            self.maybe_flush_now(&mut vfs);
         }
         make_file_info(&mut vfs, ctx.file_id)
     }
@@ -940,6 +963,7 @@ impl FileSystemInterface for LuksboxFs {
         }
         vfs.truncate(ctx.file_id, new_size)
             .map_err(|e| vfs_err_to_nt(&e))?;
+        self.maybe_flush_now(&mut vfs);
         make_file_info(&mut vfs, ctx.file_id)
     }
 

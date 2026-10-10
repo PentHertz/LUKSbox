@@ -488,6 +488,10 @@ pub struct CreateOpts {
     /// The boolean name predates the broader v0.2.1 envelope but is
     /// kept for API stability across the GUI -> ops boundary.
     pub use_v3_format: bool,
+    /// Header format v3 (R15-D1): a header generation counter that the
+    /// anchor records, so a restored older keyslot table is detected.
+    /// Applied by `apply_header_v3` once the create path succeeded.
+    pub header_v3: bool,
 }
 
 // Hand-written redacting Debug: `CreateOpts` carries up to four
@@ -6022,6 +6026,28 @@ pub fn enroll_hybrid_pq_tpm2_fido2_deniable(
 /// installs a `Tpm2Sealed` slot wrapping the MVK under that KEK.
 /// No passphrase, no FIDO2 - subsequent unlocks via TPM only.
 #[cfg(feature = "fido2-hardware")]
+/// R15-D1: apply the create form's "header format v3" choice to a vault
+/// a create path just produced (every create path funnels through this,
+/// so the individual creators stay untouched). An attached anchor is
+/// advanced to the new header generation by the upgrade itself.
+pub fn apply_header_v3(mut opened: OpenedVault, header_v3: bool) -> Result<OpenedVault, String> {
+    if header_v3 {
+        opened.vfs.upgrade_header_to_v3().map_err(|e| {
+            format!(
+                "vault created, but switching it to header format v3 failed: {e}. The vault \
+                 is usable as is; retry from Manage keyslots > Upgrade header."
+            )
+        })?;
+    }
+    Ok(opened)
+}
+
+/// R15-D1: switch the open vault to header format v3. `Ok(false)` if it
+/// already was.
+pub fn upgrade_header_v3(vfs: &mut Vfs) -> Result<bool, String> {
+    vfs.upgrade_header_to_v3().map_err(estr)
+}
+
 pub fn enroll_tpm2(vfs: &mut Vfs) -> Result<usize, String> {
     use luksbox_tpm::Tpm2Sealer;
     use zeroize::Zeroizing;

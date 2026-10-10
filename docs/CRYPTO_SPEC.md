@@ -186,7 +186,7 @@ random padding.
 ```
 +----------------------------------------------------------------+
 | HEADER  (offset 0, size 8192 bytes)                            |
-|   0..8     magic "LUKSBOX1"                                    |
+|   0..8     magic "LUKSBOX1" / "LUKSBOX2" / "LUKSBOX3"          |
 |   8..12    version (major, minor)                              |
 |   12..16   header_size = 8192                                  |
 |   16..18   cipher_suite (1=GCM, 2=ChaCha20Poly1305, 3=GCM-SIV) |
@@ -195,13 +195,32 @@ random padding.
 |   24..56   header_salt (32 random bytes)                       |
 |   56..72   metadata_offset, metadata_size                      |
 |   72..80   data_offset                                         |
-|   80..96   keyslot_count = 8, flags, reserved                  |
+|   80..88   keyslot_count = 8, flags                            |
+|   88..96   header_generation u64 (LUKSBOX3 only; else zero)    |
 |   96..608  Keyslot 0   (512 bytes)                             |
 |   608..1120 Keyslot 1                                          |
 |     ...                                                        |
 |   3680..4192 Keyslot 7                                         |
 |   4192..8160 random padding (entropy obfuscation)              |
 |   8160..8192 HMAC-SHA256 over bytes 0..8160 (under MVK subkey) |
++----------------------------------------------------------------+
+
+**Header format v3 (`LUKSBOX3`, default for new vaults since v0.6.0).** Same layout as
+`LUKSBOX2`, plus a `header_generation` counter at offset 88, inside the
+HMAC-covered region. `Container::persist_header` bumps it before every
+header write (enroll, revoke, update, rotation, the v2 -> v3 upgrade
+itself), and the anchor (v2 format, see section 17) records it, so a
+restored older header, which still carries a valid HMAC because the MVK
+did not change, compares lower than a trusted anchor at open. The
+in-memory counter only advances once the write succeeded, so an anchor
+never records a generation that is not on disk. Pre-v3 binaries reject
+the `LUKSBOX3` magic, which is intentional: they would rewrite the
+header without the counter. New vaults get it by default (`luksbox
+create`, the wizard, the GUI); `--header-v2` keeps the old header for
+vaults that LUKSbox 0.2.1-0.5.x must still open. Existing vaults move to
+it with `luksbox upgrade-header` (one-way), the wizard or the GUI.
+
+```
 +----------------------------------------------------------------+
 | METADATA BLOB  (offset 8192, size = metadata_size)             |
 |   nonce(12) || AEAD(metadata_key, file_tree + inodes) || tag   |
@@ -1738,6 +1757,34 @@ state from a week ago.
 - Whole-vault rollback (entire `.lbx` restored to a consistent older
   snapshot): only caught if the anchor file is on storage the
   attacker can't roll back along with the vault.
+
+**Header-only rollback (header format v3).** Restoring an older
+*header* leaves the metadata current, so the metadata generation above
+cannot see it. That matters because the header is the keyslot table: a
+backup taken before `luksbox revoke` brings the revoked credential back.
+On a header-v3 vault the anchor (v2 format) also records the header
+generation, and the open refuses with `header rollback detected` when
+the vault's header generation is below the anchor's (a pre-v3 header
+against an anchor that recorded one counts as generation 0). Header
+changes must therefore run with the anchor attached: the CLI honours
+`--anchor` on every command, including `enroll` / `revoke` / `update`,
+and `persist_header` advances the anchor. A change made without the
+anchor leaves it stale, which is accepted (only *lower* is a rollback).
+`luksbox header-restore` of a verified backup is a deliberate new state:
+it is re-sealed with a generation above both the current one and the
+backup's, so the anchor accepts it.
+
+Anchor file formats:
+
+```text
+v1 (48 B):  "LBXANCH1" | metadata_gen u64 | HMAC-SHA256(anchor_key, [0..16])
+v2 (56 B):  "LBXANCH2" | metadata_gen u64 | header_gen u64 | HMAC-SHA256(anchor_key, [0..24])
+```
+
+v2 anchors are written only for header-v3 vaults; deniable anchors keep
+their 256-byte AEAD shape and carry the header generation behind an
+in-plaintext marker (`"LBXDAHG2"` at [8..16], generation at [16..24]),
+so the random padding of an older anchor is never read as a generation.
 
 **Where to put the anchor file:**
 

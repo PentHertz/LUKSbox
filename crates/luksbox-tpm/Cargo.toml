@@ -40,6 +40,8 @@ thiserror = { workspace = true }
 # scenarios). Not gated on `hardware` because the mock works on
 # every platform without tss-esapi.
 rand_core = { workspace = true }
+# SHA-256 of the SRK public area for SRK pinning (R15-F5).
+sha2 = { workspace = true }
 
 # tss-esapi 8.0.0-alpha.2: the first line with the Windows TBS TCTI
 # (`TctiNameConf::Tbs`). Method signatures used by real.rs are

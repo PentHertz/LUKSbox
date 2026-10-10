@@ -53,15 +53,28 @@ The metadata half of the gap is closed for anchored vaults: `Vfs::flush`
 now allocates one generation for every persisted state, so two
 snapshots of the vault never share an anchored generation and a
 rollback across `unlink` / `rmdir` / `rename` / `chmod` compares
-`Greater` against a trusted anchor (R15-D1). The header half remains:
-the keyslot table carries no generation, so a pre-revoke header
-restored from a backup (an 8 KiB file whose HMAC is still valid under
-the unchanged MVK) is not visible to the anchor. The planned fix is a
-`header_generation` field inside the HMAC'd header (and the deniable
-inner header), bumped by every `persist_header`, carried in an anchor
-v2 record and compared at open; it needs anchor updates from every
-header-mutating command. Until then, treat `rotate-mvk` as the only
-revocation that survives a restored header.
+`Greater` against a trusted anchor (R15-D1).
+
+The header half is closed for vaults on **header format v3** (the
+default for new vaults since v0.6.0): the HMAC'd header (`LUKSBOX3`, offset 88) and the deniable
+inner header carry a `header_generation` bumped by every
+`persist_header`, the anchor records it (`LBXANCH2`, or the marked
+deniable anchor), and `Container::set_anchor` refuses a header whose
+generation is below the anchor's. A pre-revoke header restored from a
+backup is therefore detected. Two operational rules follow:
+
+- Run header changes with the anchor attached (`--anchor` is honoured
+  by every CLI command, including `enroll` / `revoke` / `update`). A
+  change made without it only leaves the anchor stale, which is
+  accepted; the protection is against going *below* the anchor.
+- `luksbox header-restore` of a verified backup re-seals it with a new
+  generation, since an unlocked, deliberate restore is not a rollback.
+
+Vaults on header format v2 keep the previous behaviour: the keyslot
+table carries no generation, a restored header is invisible to the
+anchor, and `rotate-mvk` remains the only revocation that survives a
+restored header. Upgrade with `luksbox upgrade-header` (or
+`deniable-upgrade-header`), the wizard or the GUI.
 
 ## Candidate mitigation
 

@@ -325,3 +325,37 @@ fn swtpm_fresh_sealer_can_unseal_old_blob() {
         .expect("unseal in fresh sealer instance");
     assert_eq!(unsealed.as_slice(), &secret);
 }
+
+/// R15-F5: a pinned seal records the SRK identity and a FRESH sealer
+/// (which re-derives the same SRK) accepts it; a forged pin (what the
+/// check sees when an interposer substitutes the SRK public area) is
+/// refused with `SrkMismatch` before the salted session starts.
+#[test]
+fn swtpm_srk_pinned_seal_round_trips_and_refuses_wrong_pin() {
+    let Some(swtpm) = maybe_spawn_swtpm() else {
+        return;
+    };
+    let secret = [0x5Au8; 32];
+    let blob = {
+        let mut sealer = Tpm2Sealer::from_tcti_str(&swtpm.tcti).expect("Tpm2Sealer #1");
+        sealer.set_srk_pinning(true);
+        sealer.seal(&secret).expect("pinned seal")
+    };
+    assert!(blob.srk_pin.is_some(), "pinning was requested");
+    let bytes = blob.to_bytes();
+    assert!(luksbox_tpm::blob_is_srk_pinned(&bytes));
+    let reparsed = SealedBlob::from_bytes(&bytes).expect("pinned blob round-trip");
+
+    let mut sealer = Tpm2Sealer::from_tcti_str(&swtpm.tcti).expect("Tpm2Sealer #2");
+    let unsealed = sealer.unseal(&reparsed).expect("pinned unseal");
+    assert_eq!(unsealed.as_slice(), &secret);
+
+    let mut forged = reparsed.clone();
+    if let Some(pin) = forged.srk_pin.as_mut() {
+        pin[0] ^= 1;
+    }
+    assert!(matches!(
+        sealer.unseal(&forged),
+        Err(luksbox_tpm::Error::SrkMismatch)
+    ));
+}

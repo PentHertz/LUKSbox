@@ -44,9 +44,19 @@ pub const MAGIC_V1: [u8; 8] = *b"LUKSBOX1";
 /// the version-major check in `Header::from_bytes`, which is the
 /// correct behavior (they'd silently miss the recovery sidecars).
 pub const MAGIC_V2: [u8; 8] = *b"LUKSBOX2";
+/// On-disk magic of header format v3 (R15-D1, header half): a LUKSBOX2
+/// header plus a `header_generation` counter in the HMAC'd region,
+/// bumped by every header write, so an anchor can detect a rolled-back
+/// keyslot table (a pre-revoke header restored from a backup). Opt-in
+/// per vault. Pre-v3 binaries refuse the magic in `Header::from_bytes`,
+/// which is required: they would rewrite the header without bumping
+/// (in fact zeroing) the counter.
+pub const MAGIC_V3: [u8; 8] = *b"LUKSBOX3";
 
 pub const VERSION_MAJOR_V1: u16 = 1;
 pub const VERSION_MAJOR_V2: u16 = 2;
+/// Header format v3; a superset of v2 (mirror sidecars included).
+pub const VERSION_MAJOR_V3: u16 = 3;
 const VERSION_MINOR: u16 = 0;
 
 const OFF_MAGIC: usize = 0;
@@ -62,6 +72,10 @@ const OFF_METADATA_SIZE: usize = 64;
 const OFF_DATA_OFFSET: usize = 72;
 const OFF_KEYSLOT_COUNT: usize = 80;
 const OFF_FLAGS: usize = 84;
+/// v3 only: `header_generation` u64 LE. Bytes 88..96 were always written
+/// as zero and never read by v1/v2, so v3 claims them without moving
+/// anything else.
+const OFF_HEADER_GEN: usize = 88;
 const OFF_KEYSLOTS: usize = 96;
 const OFF_HMAC: usize = HEADER_SIZE - HMAC_LEN;
 
@@ -146,6 +160,7 @@ const OFF_SEP_REGION: usize = OFF_KEYSLOTS + MAX_KEYSLOTS * SLOT_SIZE;
 const SEP_REGION_LEN: usize = OFF_HMAC - OFF_SEP_REGION;
 
 const _: () = assert!(OFF_KEYSLOTS + MAX_KEYSLOTS * SLOT_SIZE <= OFF_HMAC);
+const _: () = assert!(OFF_FLAGS + 4 <= OFF_HEADER_GEN && OFF_HEADER_GEN + 8 <= OFF_KEYSLOTS);
 
 #[derive(Clone)]
 pub struct Header {
@@ -169,8 +184,16 @@ pub struct Header {
     /// no sidecar mirrors). `2` = LUKSBOX2 (v0.2.1+, supports the
     /// header/metadata mirror sidecars guarded by FLAG_HAS_*_MIRROR).
     /// Default `try_new` builds a v1 header for back-compat; container
-    /// code that wants new vaults on v2 sets this explicitly.
+    /// code that wants new vaults on v2 sets this explicitly. `3` =
+    /// LUKSBOX3 (opt-in, adds `header_generation`).
     pub version_major: u16,
+    /// v3 only (0 otherwise): monotonic counter of persisted header
+    /// states, HMAC-authenticated with the rest of the header.
+    /// `Container::persist_header` bumps it before every write and the
+    /// anchor records it, so restoring an older (validly MAC'd) header
+    /// compares lower than a trusted anchor. See
+    /// `docs/ROLLBACK_PROTECTION.md`.
+    pub header_generation: u64,
 }
 
 impl Header {
@@ -200,6 +223,7 @@ impl Header {
             keyslots: core::array::from_fn(|_| Keyslot::empty()),
             sep_blobs: core::array::from_fn(|_| None),
             version_major: VERSION_MAJOR_V1,
+            header_generation: 0,
         })
     }
 
@@ -239,6 +263,12 @@ impl Header {
     /// Whether this header carries an in-header Secure Enclave region.
     pub fn has_sep_region(&self) -> bool {
         (self.flags & FLAG_HAS_SEP_REGION) != 0
+    }
+
+    /// Whether this is a v3 (LUKSBOX3) header carrying a meaningful
+    /// `header_generation` counter.
+    pub fn has_header_generation(&self) -> bool {
+        self.version_major >= VERSION_MAJOR_V3
     }
 
     /// R15-D2: whether the metadata region's length field is masked
@@ -338,6 +368,8 @@ impl Header {
             VERSION_MAJOR_V1
         } else if magic_bytes == MAGIC_V2 {
             VERSION_MAJOR_V2
+        } else if magic_bytes == MAGIC_V3 {
+            VERSION_MAJOR_V3
         } else {
             return Err(Error::InvalidMagic);
         };
@@ -379,6 +411,13 @@ impl Header {
             return Err(Error::InvalidField);
         }
         let flags = u32::from_le_bytes(buf[OFF_FLAGS..OFF_FLAGS + 4].try_into().unwrap());
+        // Pre-v3 headers never carried a counter there; ignore whatever
+        // the bytes hold rather than inventing a generation for them.
+        let header_generation = if version_major >= VERSION_MAJOR_V3 {
+            u64::from_le_bytes(buf[OFF_HEADER_GEN..OFF_HEADER_GEN + 8].try_into().unwrap())
+        } else {
+            0
+        };
         let mut header_salt = [0u8; 32];
         header_salt.copy_from_slice(&buf[OFF_HEADER_SALT..OFF_HEADER_SALT + 32]);
         let metadata_offset = u64::from_le_bytes(
@@ -474,6 +513,7 @@ impl Header {
             keyslots,
             sep_blobs,
             version_major,
+            header_generation,
         })
     }
 
@@ -509,6 +549,7 @@ impl Header {
 
         let magic = match self.version_major {
             VERSION_MAJOR_V2 => MAGIC_V2,
+            VERSION_MAJOR_V3 => MAGIC_V3,
             // Default to v1 magic for any other value, including 0 from
             // a freshly-built `Header` that hasn't been initialized via
             // try_new (defensive; try_new always sets v1).
@@ -531,6 +572,10 @@ impl Header {
         buf[OFF_KEYSLOT_COUNT..OFF_KEYSLOT_COUNT + 4]
             .copy_from_slice(&(MAX_KEYSLOTS as u32).to_le_bytes());
         buf[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&self.flags.to_le_bytes());
+        if self.has_header_generation() {
+            buf[OFF_HEADER_GEN..OFF_HEADER_GEN + 8]
+                .copy_from_slice(&self.header_generation.to_le_bytes());
+        }
 
         for (i, slot) in self.keyslots.iter().enumerate() {
             let off = OFF_KEYSLOTS + i * SLOT_SIZE;
@@ -845,8 +890,10 @@ mod tests {
 
     #[test]
     fn header_unknown_magic_still_rejected() {
+        // LUKSBOX3 became a real format (header v3); the next magic up
+        // is still unknown to this binary.
         let mut bytes = [0u8; HEADER_SIZE];
-        bytes[..8].copy_from_slice(b"LUKSBOX3");
+        bytes[..8].copy_from_slice(b"LUKSBOX4");
         assert!(matches!(
             Header::from_bytes(&bytes),
             Err(Error::InvalidMagic)
@@ -1028,5 +1075,77 @@ mod tests {
         let parsed = Header::from_bytes(&bytes).unwrap();
         assert!(!parsed.has_sep_region());
         assert!(parsed.sep_blobs.iter().all(Option::is_none));
+    }
+
+    // ---- header format v3 (R15-D1, header half) -------------------------
+
+    #[test]
+    fn v3_header_round_trips_generation_and_magic() {
+        let mvk = MasterVolumeKey::from_bytes([0x31; 32]);
+        let mut header = header_with_pp_slot(&mvk);
+        header.version_major = VERSION_MAJOR_V3;
+        header.header_generation = 0x0102_0304_0506_0708;
+        let bytes = header.to_bytes(&mvk);
+        assert_eq!(&bytes[..8], &MAGIC_V3);
+        assert_eq!(
+            &bytes[OFF_HEADER_GEN..OFF_HEADER_GEN + 8],
+            &0x0102_0304_0506_0708u64.to_le_bytes()
+        );
+        let parsed = Header::from_bytes(&bytes).unwrap();
+        assert!(parsed.has_header_generation());
+        assert_eq!(parsed.version_major, VERSION_MAJOR_V3);
+        assert_eq!(parsed.header_generation, 0x0102_0304_0506_0708);
+        parsed.verify_hmac(&bytes, &mvk).unwrap();
+    }
+
+    /// The counter sits below `OFF_HMAC`: editing it (to make a restored
+    /// header look current) needs the MVK.
+    #[test]
+    fn v3_header_generation_is_hmac_authenticated() {
+        let mvk = MasterVolumeKey::from_bytes([0x32; 32]);
+        let mut header = header_with_pp_slot(&mvk);
+        header.version_major = VERSION_MAJOR_V3;
+        header.header_generation = 7;
+        let mut bytes = header.to_bytes(&mvk);
+        bytes[OFF_HEADER_GEN] ^= 0x10;
+        let parsed = Header::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.header_generation, 7 ^ 0x10);
+        assert!(matches!(
+            parsed.verify_hmac(&bytes, &mvk),
+            Err(Error::HeaderAuthFailed)
+        ));
+    }
+
+    /// v1 / v2 headers neither write nor read the counter bytes, so they
+    /// stay byte-compatible with every older binary.
+    #[test]
+    fn pre_v3_headers_ignore_the_generation_field() {
+        let mvk = MasterVolumeKey::from_bytes([0x33; 32]);
+        for major in [VERSION_MAJOR_V1, VERSION_MAJOR_V2] {
+            let mut header = header_with_pp_slot(&mvk);
+            header.version_major = major;
+            header.header_generation = 99;
+            let mut bytes = header.to_bytes(&mvk);
+            assert_eq!(&bytes[OFF_HEADER_GEN..OFF_HEADER_GEN + 8], &[0u8; 8]);
+            // A foreign value in those bytes is not invented into a
+            // generation either.
+            bytes[OFF_HEADER_GEN] = 5;
+            let parsed = Header::from_bytes(&bytes).unwrap();
+            assert!(!parsed.has_header_generation());
+            assert_eq!(parsed.header_generation, 0);
+        }
+    }
+
+    #[test]
+    fn v3_magic_with_mismatched_version_field_rejected() {
+        let mvk = MasterVolumeKey::from_bytes([0x34; 32]);
+        let mut header = header_with_pp_slot(&mvk);
+        header.version_major = VERSION_MAJOR_V3;
+        let mut bytes = header.to_bytes(&mvk);
+        bytes[OFF_VER_MAJOR..OFF_VER_MAJOR + 2].copy_from_slice(&VERSION_MAJOR_V2.to_le_bytes());
+        assert!(matches!(
+            Header::from_bytes(&bytes),
+            Err(Error::UnsupportedVersion { .. })
+        ));
     }
 }

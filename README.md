@@ -208,6 +208,8 @@ walkthroughs.
 |---|---|
 | Debian / Ubuntu / Mint | `.deb` from [Releases](https://github.com/penthertz/LUKSbox/releases), `sudo apt install ./luksbox_*_amd64.deb` |
 | Fedora / RHEL / Rocky | `.rpm` from Releases, `sudo dnf install ./luksbox-*.x86_64.rpm` |
+| Any Linux, GUI | AppImage, no install: [`LUKSbox-x86_64.AppImage`](https://github.com/penthertz/LUKSbox/releases/latest/download/LUKSbox-x86_64.AppImage) (aarch64: `LUKSbox-aarch64.AppImage`), `chmod +x` and run; needs glibc 2.35+ (Ubuntu 22.04 / Debian 12 / Fedora 36 era or newer) |
+| Any Linux, CLI only | static binary, no dependencies: [`luksbox-x86_64-unknown-linux-musl.tar.gz`](https://github.com/penthertz/LUKSbox/releases/latest/download/luksbox-x86_64-unknown-linux-musl.tar.gz) (aarch64: `luksbox-aarch64-unknown-linux-musl.tar.gz`); no FIDO2 / TPM, `mount` needs `fusermount3` |
 | macOS | `.dmg` from Releases, drag to /Applications; on first run the app installs the kext-free FUSE-T backend (`brew install --cask fuse-t`), with macFUSE kept as a legacy fallback |
 | Windows | `LUKSboxSetup.exe` from Releases (bundles WinFsp); IT admins can use the bare `.msi` and install WinFsp separately |
 | From source | `cargo build --release -p luksbox-cli -p luksbox-gui` after the deps in [`BUILDING.md`](BUILDING.md) |

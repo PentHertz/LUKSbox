@@ -26,6 +26,11 @@ pub struct Preferences {
     /// warning they can delete `preferences.json` manually.
     #[serde(default)]
     pub clipboard_warning_acknowledged: bool,
+    /// R15-F5: pin the TPM storage root key into new TPM keyslots
+    /// (drives `luksbox_tpm::set_default_srk_pinning`). Off by default:
+    /// pinned slots need LUKSbox 0.6.0+ to unlock.
+    #[serde(default)]
+    pub tpm_pin_srk: bool,
 }
 
 fn store_path() -> Option<PathBuf> {

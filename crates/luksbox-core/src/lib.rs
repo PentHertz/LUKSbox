@@ -20,7 +20,7 @@ pub use crate::error::Error;
 pub use crate::header::{
     FLAG_HAS_HEADER_MIRROR, FLAG_HAS_METADATA_MIRROR, FLAG_HIDE_SIZE_HEADER,
     FLAG_MASKED_METADATA_LEN, FLAG_PAD_FILES_POW2, HEADER_SIZE, Header, MAGIC_V1, MAGIC_V2,
-    MAX_KEYSLOTS, VERSION_MAJOR_V1, VERSION_MAJOR_V2,
+    MAGIC_V3, MAX_KEYSLOTS, VERSION_MAJOR_V1, VERSION_MAJOR_V2, VERSION_MAJOR_V3,
 };
 pub use crate::kdf::{Argon2idParams, KdfId};
 pub use crate::key::{KeyEncryptionKey, MasterVolumeKey, SubKey};

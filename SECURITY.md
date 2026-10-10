@@ -132,11 +132,16 @@ provenance-pinning property that `SHA256SUMS.txt.asc` would add.
   sidecars on separate trusted storage. Since Round 15 every flush
   advances the anchored generation, so a rollback across a metadata-only
   change (a deleted or renamed file) is detected too, not only one that
-  crossed a chunk write. The anchor does **not** cover header-only
-  changes: a backup taken before `luksbox revoke` can be restored
-  without the anchor noticing (the keyslot table carries no generation
-  yet; see `docs/ROLLBACK_PROTECTION.md`). After revoking a credential
-  whose holder may possess an old copy of the vault, run `rotate-mvk`.
+  crossed a chunk write. Header-only changes are covered on vaults using
+  **header format v3** (the default for new vaults since v0.6.0;
+  existing vaults: `upgrade-header`, the wizard or the GUI): the keyslot table carries a generation the
+  anchor records, so a backup taken before `luksbox revoke` restored
+  over the header is refused at an anchored open. Keep the anchor
+  attached for keyslot changes (`--anchor` works on every command). On
+  header format v2 the keyslot table carries no generation and such a
+  restore goes unnoticed (see `docs/ROLLBACK_PROTECTION.md`); there,
+  after revoking a credential whose holder may possess an old copy of
+  the vault, run `rotate-mvk`.
   Without an anchor, rollback is **not** detected, that's the user's
   choice and is documented in TUTORIAL.md.
 
@@ -824,13 +829,21 @@ risk first.
       those two public nonces alone and provide no bus
       confidentiality at all (the interposer would just recompute it);
       this is the gap v0.5.0-rc.2 closes, and it matches the
-      protection systemd-cryptenroll applies. The protection is
-      against a *passive* interposer only: an *active* interposer
+      protection systemd-cryptenroll applies. On its own the salt
+      defeats a *passive* interposer only: an *active* interposer
       that rewrites the SRK public area in the `CreatePrimary`
       response to its own key learns the session salt and can
-      decrypt the unseal traffic, because nothing in the keyslot pins
-      the SRK's identity yet (Round 15, R15-F5; SRK-name pinning is
-      the planned fix). Firmware TPMs (Intel
+      decrypt the unseal traffic. TPM keyslots sealed with
+      **SRK pinning** (opt-in: `--tpm-pin-srk`, the wizard prompt,
+      or the GUI's "Pin the TPM storage root key" preference; v0.6.0+
+      to unlock) record a 128-bit hash of the SRK's public area and
+      refuse to start the salted session if the TPM returns a
+      different one (Round 15, R15-F5). Pinning is trust-on-first-use
+      (an interposer already present at enroll time is not detected),
+      and an attacker who can also rewrite the vault file can swap the
+      pin along with the SRK; the slot AEAD and header HMAC catch that
+      only after the unseal. Unpinned slots keep the passive-only
+      protection; re-enroll (or `update`) a slot to pin it. Firmware TPMs (Intel
       PTT / AMD fTPM) have no external bus and were never exposed;
       Apple's Secure Enclave is likewise an on-die coprocessor with
       no interposable bus, so the macOS SEP keyslots do not need (and
@@ -1145,6 +1158,7 @@ If you're using LUKSbox to protect material information, please:
     | `LUKSBOX_TOLERATE_BAD_CHUNK_LISTS=1` | Recovery mode: a file whose chunk-list is corrupt is installed with zero chunks so the rest of the vault still opens | Honored | Recovery only. It silently turns an unreadable file into an empty one. Use it on a copy, mount read-only, and never write. |
     | `LUKSBOX_PASSPHRASE`, `LUKSBOX_NEW_PASSPHRASE`, `LUKSBOX_FIDO2_PIN` | Supply a secret non-interactively | Honored | Leaks the secret into the process environment, readable via `/proc/<pid>/environ` by the same UID. Prefer the stdin pipe (item 10). Since Round 15 `LUKSBOX_PASSPHRASE` is the *unlock* secret only: `enroll`, `update`, `migrate-to-v3` and the seed-file prompts take their NEW secret from `LUKSBOX_NEW_PASSPHRASE` or the interactive prompt, never from the unlock variable (R15-H1). |
     | `LUKSBOX_NO_FOLLOW_SYMLINKS=1` | Refuses to open a vault reached through a symlink | Honored | Hardening opt-in (protective). |
+    | `LUKSBOX_TPM_PIN_SRK=1` | Same as the global `--tpm-pin-srk` flag: new TPM keyslots record the TPM storage root key and refuse a substituted one at unlock (R15-F5) | Honored | Hardening opt-in (protective). Pinned slots need LUKSbox 0.6.0+ to unlock. |
     | `LUKSBOX_SANDBOX_HELPER=1` | Enables the Linux GUI sandbox helper | Honored | Hardening opt-in (protective). |
     | `LUKSBOX_FAKE_NO_AES`, `LUKSBOX_SUPPRESS_AES_WARNING` | Force, or hide, the software-AES advisory | Honored | Cosmetic. Neither changes the cipher; the advisory just recommends `--cipher chacha` on CPUs without AES acceleration. |
     | `LUKSBOX_DEBUG_OPEN`, `LUKSBOX_WINFSP_DEBUG` | Verbose open / WinFsp diagnostics to stderr | Honored | Diagnostic. May print structural (not secret) detail, so avoid it in shared logs. |

@@ -401,6 +401,61 @@ Linux).
 
 ---
 
+## Static Linux CLI (musl)
+
+A single `luksbox` binary with no shared-library dependencies, for any
+x86_64 / aarch64 distribution (GitHub issue #34). It is built
+`--no-default-features --features fuse` against the musl target:
+
+- **Included:** every passphrase, hybrid post-quantum and deniable
+  feature of the CLI and the `luksbox wizard` TUI, and `luksbox mount`.
+  The FUSE support is pure Rust (no libfuse link) and only needs the
+  `fusermount3` helper (package `fuse3`) and `/dev/fuse` at runtime.
+- **Not included:** FIDO2 security keys and TPM 2.0 keyslots. They need
+  system C libraries (libfido2 + libudev, tpm2-tss) that cannot be
+  linked statically across distributions; use the packages for those.
+
+```bash
+scripts/build_static_musl.sh                    # this Linux host's arch
+scripts/build_static_musl.sh --arch aarch64 --docker   # any host with Docker, macOS included
+```
+
+The script refuses a binary that is not statically linked and writes
+`dist-static/luksbox-vX.Y.Z-<arch>-linux-musl-static.tar.gz`. Every
+release attaches the same tarballs (the `static-linux` job in
+`release.yml`), also under a version-less name, so this link always
+points at the newest release:
+
+    https://github.com/penthertz/LUKSbox/releases/latest/download/luksbox-x86_64-unknown-linux-musl.tar.gz
+
+## GUI AppImage
+
+`scripts/build_appimage.sh` packages a built `luksbox-gui` into an
+AppImage. The release workflow's `appimage` job builds it on Ubuntu
+22.04 (an AppImage still uses the host's glibc, so it is built on the
+oldest one supported: glibc 2.35) with the same features as the jammy
+packages: FIDO2, TPM 2.0 (`bundled-tpm`) and `mount`.
+
+- **Bundled:** libfido2, libcbor and libcrypto (license files under
+  `usr/share/licenses/`), found through an `$ORIGIN` rpath rather than
+  `LD_LIBRARY_PATH`, so the programs the GUI starts (file manager,
+  `fusermount3`) never load them.
+- **From the host:** glibc, libudev (FIDO2 keys also need the host's
+  udev rules, shipped by every mainstream distribution), zlib, the
+  graphics stack (OpenGL / EGL / Wayland / X11, loaded at run time),
+  `fusermount3` for `mount`, and for TPM slots the `tss` group / udev
+  rules plus `libtss2-tcti-device`.
+- **Runtime:** the static AppImage runtime, so no `libfuse2` is needed
+  to start it; `--appimage-extract-and-run` works without FUSE at all.
+- appimagetool and the runtime are pinned by version and SHA-256 inside
+  the script.
+
+```bash
+cargo build --profile release-hardened -p luksbox-gui \
+    --no-default-features --features bundled-tpm,fuse --target x86_64-unknown-linux-gnu
+scripts/build_appimage.sh --bin target/x86_64-unknown-linux-gnu/release-hardened/luksbox-gui
+```
+
 ## Cross-compiling from Linux
 
 Use [`scripts/build_release.sh`](scripts/build_release.sh), it covers
@@ -589,8 +644,10 @@ Artifacts attached to each GitHub Release:
 
 | Target | Artifact | Notes |
 |---|---|---|
-| Linux x86_64 | `luksbox-vX.Y.Z-x86_64-linux.tar.gz` | extract, run `./install.sh` (offers TPM perm setup if a TPM is present) |
-| Linux aarch64 | `luksbox-vX.Y.Z-aarch64-linux.tar.gz` | extract, run `./install.sh` (offers TPM perm setup if a TPM is present) |
+| Linux x86_64 / aarch64 | `luksbox-vX.Y.Z-<arch>-linux-<jammy\|noble\|trixie\|resolute>.tar.gz` | CLI + GUI built against that distro release's libraries; extract, run `./install.sh` (offers TPM perm setup if a TPM is present) |
+| Linux x86_64 / aarch64 (packages) | `luksbox_*.deb` per codename, `luksbox-*.rpm` | `apt install ./...deb` / `dnf install ./...rpm` |
+| Linux x86_64 / aarch64 (GUI AppImage) | `luksbox-vX.Y.Z-<arch>.AppImage`, also as `LUKSbox-<arch>.AppImage` | single-file GUI for any glibc 2.35+ distribution (see [GUI AppImage](#gui-appimage)) |
+| Linux x86_64 / aarch64 (static CLI) | `luksbox-vX.Y.Z-<arch>-linux-musl-static.tar.gz`, also as `luksbox-<arch>-unknown-linux-musl.tar.gz` | one static binary for any distribution, no FIDO2 / TPM (see [Static Linux CLI](#static-linux-cli-musl)) |
 | macOS aarch64 (.dmg) | `luksbox-vX.Y.Z-aarch64-macos.dmg` | drag .app to /Applications, libfido2 bundled inside |
 | macOS aarch64 (portable) | `luksbox-vX.Y.Z-aarch64-macos-portable.tar.gz` | bare CLI + GUI binaries, no .app, no Gatekeeper quarantine |
 | Windows x86_64 (installer) | `luksbox-vX.Y.Z-x86_64-windows.msi` | double-click, .lbx association + Start menu + PATH |

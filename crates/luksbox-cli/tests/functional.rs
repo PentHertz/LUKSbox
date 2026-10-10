@@ -1451,3 +1451,184 @@ fn extract_tolerates_one_bad_chunk_and_zero_fills_the_gap() {
     assert_eq!(report["chunks_bad"].as_u64(), Some(1));
     assert_eq!(report["failures"][0]["chunk_idx"].as_u64(), Some(1));
 }
+
+// ---- header format v3 (R15-D1, header half) -----------------------------
+
+fn env_pw(unlock: &'static str, new: &'static str) -> HashMap<&'static str, &'static str> {
+    let mut env = test_env();
+    env.insert("LUKSBOX_PASSPHRASE", unlock);
+    env.insert("LUKSBOX_NEW_PASSPHRASE", new);
+    env
+}
+
+/// The finding end to end through the CLI: enroll a user, back up the
+/// header, revoke the user with `--anchor`, put the backup back at file
+/// level. The revoked passphrase opens the vault again, but an anchored
+/// open refuses it as a header rollback.
+#[test]
+fn header_v3_anchor_catches_file_level_header_rollback() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let admin = env_pw("admin", "admin");
+    assert_ok(
+        &run_with(
+            dir,
+            &admin,
+            &["create", "v.lbx", "--header-v3", "--anchor", "v.anchor"],
+        ),
+        "create --header-v3",
+    );
+    assert!(stdout(&run(dir, &["info", "v.lbx"])).contains("header format: v3"));
+    assert_ok(
+        &run_with(
+            dir,
+            &env_pw("admin", "user"),
+            &["enroll", "v.lbx", "--anchor", "v.anchor"],
+        ),
+        "enroll",
+    );
+    assert_ok(
+        &run(dir, &["header-backup", "v.lbx", "pre-revoke.hdr"]),
+        "header-backup",
+    );
+    assert_ok(
+        &run_with(
+            dir,
+            &admin,
+            &["revoke", "v.lbx", "--slot", "1", "--anchor", "v.anchor"],
+        ),
+        "revoke",
+    );
+
+    // File-level restore of the pre-revoke header.
+    let backup = std::fs::read(dir.join("pre-revoke.hdr")).unwrap();
+    let mut vault = std::fs::read(dir.join("v.lbx")).unwrap();
+    vault[..backup.len()].copy_from_slice(&backup);
+    std::fs::write(dir.join("v.lbx"), &vault).unwrap();
+
+    let user = env_pw("user", "user");
+    assert_ok(
+        &run_with(dir, &user, &["ls", "v.lbx"]),
+        "without an anchor the restored header is indistinguishable",
+    );
+    let out = run_with(dir, &user, &["ls", "v.lbx", "--anchor", "v.anchor"]);
+    assert_err(&out, "anchored open must refuse the rolled-back header");
+    assert!(
+        stderr(&out).contains("header rollback detected"),
+        "stderr: {}",
+        stderr(&out)
+    );
+}
+
+/// `header-restore` of a verified backup is a deliberate new state: it
+/// is re-sealed above the anchor's header generation.
+#[test]
+fn header_v3_header_restore_command_stays_ahead_of_the_anchor() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let admin = env_pw("admin", "admin");
+    assert_ok(
+        &run_with(
+            dir,
+            &admin,
+            &["create", "v.lbx", "--header-v3", "--anchor", "v.anchor"],
+        ),
+        "create",
+    );
+    assert_ok(&run(dir, &["header-backup", "v.lbx", "b.hdr"]), "backup");
+    assert_ok(
+        &run_with(
+            dir,
+            &env_pw("admin", "second"),
+            &["enroll", "v.lbx", "--anchor", "v.anchor"],
+        ),
+        "enroll",
+    );
+    let out = run_with(dir, &admin, &["header-restore", "v.lbx", "b.hdr"]);
+    assert_ok(&out, "header-restore");
+    assert!(stdout(&out).contains("re-sealed as header generation"));
+    assert_ok(
+        &run_with(dir, &admin, &["ls", "v.lbx", "--anchor", "v.anchor"]),
+        "anchored open after a deliberate restore",
+    );
+}
+
+#[test]
+fn upgrade_header_command_switches_an_existing_vault() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    assert_ok(
+        &run(
+            dir,
+            &["create", "v.lbx", "--header-v2", "--anchor", "v.anchor"],
+        ),
+        "create --header-v2",
+    );
+    std::fs::write(dir.join("f.txt"), b"content").unwrap();
+    assert_ok(
+        &run(
+            dir,
+            &["put", "v.lbx", "f.txt", "/f.txt", "--anchor", "v.anchor"],
+        ),
+        "put",
+    );
+    assert!(!stdout(&run(dir, &["info", "v.lbx"])).contains("header format: v3"));
+    let out = run(dir, &["upgrade-header", "v.lbx", "--anchor", "v.anchor"]);
+    assert_ok(&out, "upgrade-header");
+    assert!(stdout(&out).contains("upgraded"));
+    assert!(stdout(&run(dir, &["info", "v.lbx"])).contains("header format: v3"));
+    let again = run(dir, &["upgrade-header", "v.lbx"]);
+    assert_ok(&again, "upgrade-header is idempotent");
+    assert!(stdout(&again).contains("already uses header format v3"));
+    assert_ok(
+        &run(dir, &["ls", "v.lbx", "--anchor", "v.anchor"]),
+        "anchored open after upgrade",
+    );
+}
+
+/// Header format v3 is the default for new vaults since 0.6.0;
+/// `--header-v2` and the legacy `--format v2` keep the old header.
+#[test]
+fn header_v3_is_the_default_and_header_v2_opts_out() {
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let header_line = |vault: &str| {
+        stdout(&run(dir, &["info", vault]))
+            .lines()
+            .find(|l| l.contains("header format:"))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_ok(&run(dir, &["create", "default.lbx"]), "create");
+    assert!(header_line("default.lbx").contains("v3"));
+    assert_eq!(
+        &std::fs::read(dir.join("default.lbx")).unwrap()[..8],
+        b"LUKSBOX3"
+    );
+
+    assert_ok(
+        &run(dir, &["create", "old.lbx", "--header-v2"]),
+        "create --header-v2",
+    );
+    assert!(!header_line("old.lbx").contains("v3"));
+
+    assert_ok(
+        &run(dir, &["create", "legacy.lbx", "--format", "v2"]),
+        "create --format v2 keeps the old header instead of failing",
+    );
+    assert!(!header_line("legacy.lbx").contains("v3"));
+
+    let out = run(dir, &["create", "x.lbx", "--header-v2", "--header-v3"]);
+    assert_err(&out, "--header-v2 conflicts with --header-v3");
+}
+
+#[test]
+fn header_v3_refuses_format_v2() {
+    let tmp = tempdir().unwrap();
+    let out = run(
+        tmp.path(),
+        &["create", "v.lbx", "--header-v3", "--format", "v2"],
+    );
+    assert_err(&out, "--header-v3 with --format v2");
+    assert!(!tmp.path().join("v.lbx").exists());
+}
