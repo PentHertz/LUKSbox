@@ -151,6 +151,27 @@ runs:
             exit 1
         }
 
+        # d. MSBuild writes the tss2-*.lib files into $src, which is fresh
+        #    on every runner, while Swatinem/rust-cache restores target/
+        #    together with tss-esapi-sys's build-script result from an
+        #    earlier run. That build script declares no rerun-if-*
+        #    triggers, so cargo reuses the cached result, MSBuild never
+        #    runs here, and the first executable to link fails with
+        #    LNK1181 "cannot open input file 'tss2-sys.lib'" (the build
+        #    step itself passes: a library links nothing). Drop the
+        #    cached tss-esapi-sys state so cargo rebuilds tpm2-tss on
+        #    this runner. Must run after the cache restore and before
+        #    any cargo build.
+        $target = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'target' }
+        if (Test-Path $target) {
+            # -Force: also walk into `.fingerprint`, which counts as hidden
+            # on some platforms.
+            $stale = @(Get-ChildItem -Path $target -Directory -Recurse -Depth 3 -Force -Filter 'tss-esapi-sys-*' |
+                Where-Object { $_.Parent.Name -in @('build', '.fingerprint') })
+            foreach ($d in $stale) { Remove-Item -Recurse -Force $d.FullName }
+            Write-Host "==> dropped $($stale.Count) cached tss-esapi-sys build dir(s) under $target"
+        }
+
         "TPM2_TSS_SOURCE_PATH=$src" >> $env:GITHUB_ENV
         "LIBCLANG_PATH=$libclang" >> $env:GITHUB_ENV
         Write-Host "==> TPM2_TSS_SOURCE_PATH=$src"
