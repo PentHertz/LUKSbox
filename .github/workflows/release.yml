@@ -1327,41 +1327,102 @@ jobs:
           security unlock-keychain    -p "$MACOS_CI_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
           # Pre-verify the .p12 with OpenSSL BEFORE handing to
-          # `security import`. macOS's `security import` only accepts
-          # PKCS12 envelopes encrypted with the legacy PBES1 algorithm
-          # set (3DES); modern OpenSSL 3.x defaults to PBES2 (AES-256)
-          # which `security` rejects with a generic "MAC verification
-          # failed" that is identical to the wrong-password error.
-          # OpenSSL accepts both, so a successful OpenSSL verify here
-          # combined with a `security import` failure proves the
-          # .p12 is in the wrong format (re-export with `-legacy`).
-          # Also surfaces the password length so a hidden trailing
-          # newline / quote becomes visible without leaking the value.
+          # `security import`. macOS 14 (this runner) only accepts
+          # PKCS12 envelopes built with the legacy PBE set (RC2/3DES,
+          # SHA-1 MAC); the OpenSSL 3 default (PBES2/AES-256, SHA-256
+          # MAC) is rejected with a generic "MAC verification failed"
+          # that is identical to the wrong-password error (macOS 15
+          # fixed this). OpenSSL reads both formats, so its error text
+          # tells the two apart: a MAC failure means the password is
+          # wrong for this file, an "unsupported" error means this
+          # openssl build lacks the algorithm (OpenSSL 3 needs -legacy
+          # for the RC2/3DES set). stderr is kept on purpose, and the
+          # password reaches openssl through the environment, not argv.
+          # Also surfaces the password length and shape so a hidden
+          # trailing newline / quote becomes visible without leaking
+          # the value.
           PW_LEN=${#APPLE_DEVELOPER_ID_CERT_PASSWORD}
           P12_SHA=$(shasum -a 256 "$P12_PATH" | awk '{print $1}')
-          echo "==> .p12 sha256: $P12_SHA"
+          echo "==> .p12 sha256: $P12_SHA   (compare locally: shasum -a 256 devid.p12)"
           echo "==> APPLE_DEVELOPER_ID_CERT_PASSWORD length: $PW_LEN chars"
-          if openssl pkcs12 -in "$P12_PATH" \
-              -password "pass:$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
-              -nokeys -noout 2>/dev/null
-          then
-              echo "==> OpenSSL pre-verify: .p12 + password OK"
+          # Use the OS's own openssl (LibreSSL) for the check when it
+          # exists. It is pinned to the OS and untouched by the
+          # `brew update` / `brew install` in the deps step, whereas
+          # the runner's PATH openssl is a Homebrew symlink (openssl@1.1
+          # on macOS 14) that can move or break, and it reads the
+          # legacy PBE set that macOS 14 `security import` needs.
+          OPENSSL_BIN=/usr/bin/openssl
+          [ -x "$OPENSSL_BIN" ] || OPENSSL_BIN=$(command -v openssl || echo openssl)
+          echo "==> openssl for pre-verify: $OPENSSL_BIN [$("$OPENSSL_BIN" version 2>&1 | head -1)]"
+          echo "==> openssl on PATH: $(command -v openssl || echo none) [$(openssl version 2>&1 | head -1)]"
+          case "$APPLE_DEVELOPER_ID_CERT_PASSWORD" in
+            *$'\n'*|*$'\r'*)
+              echo "::warning::APPLE_DEVELOPER_ID_CERT_PASSWORD contains a newline or carriage return (paste it without a trailing line break)";;
+          esac
+          case "$APPLE_DEVELOPER_ID_CERT_PASSWORD" in
+            ' '*|*' '|$'\t'*|*$'\t')
+              echo "::warning::APPLE_DEVELOPER_ID_CERT_PASSWORD has leading or trailing whitespace";;
+          esac
+          case "$APPLE_DEVELOPER_ID_CERT_PASSWORD" in
+            \"*\"|\'*\')
+              echo "::warning::APPLE_DEVELOPER_ID_CERT_PASSWORD is wrapped in quotes";;
+          esac
+
+          p12_verify() {
+              "$OPENSSL_BIN" pkcs12 -in "$P12_PATH" \
+                  -passin env:APPLE_DEVELOPER_ID_CERT_PASSWORD \
+                  -nokeys -noout "$@" 2>&1
+          }
+          PREVERIFY=unknown
+          OPENSSL_HELP=$("$OPENSSL_BIN" pkcs12 -help 2>&1 || true)
+          if VERIFY_OUT=$(p12_verify); then
+              PREVERIFY=ok
+          elif [[ "$OPENSSL_HELP" == *-legacy* ]] && VERIFY_OUT=$(p12_verify -legacy); then
+              PREVERIFY=ok
+              echo "==> note: this openssl needed -legacy to read the .p12 (RC2/3DES PBE set)"
           else
-              echo "::error::OpenSSL pre-verify FAILED. The .p12 password"
-              echo "         does not match the .p12 file. Either:"
+              echo "----- openssl pkcs12 output -----"
+              echo "$VERIFY_OUT"
+              echo "---------------------------------"
+              if grep -qiE 'mac verify|mac verification|invalid password' <<<"$VERIFY_OUT"; then
+                  PREVERIFY=badpass
+              elif grep -qiE 'unsupported|not supported|unknown (cipher|algorithm|pbe)|digital envelope' <<<"$VERIFY_OUT"; then
+                  PREVERIFY=unsupported
+              fi
+          fi
+          case "$PREVERIFY" in
+            ok)
+              echo "==> OpenSSL pre-verify: .p12 + password OK";;
+            badpass)
+              echo "::error::OpenSSL pre-verify: MAC check failed, so the"
+              echo "         password does not match THIS .p12. Either:"
               echo "           1. The APPLE_DEVELOPER_ID_CERT_PASSWORD secret"
-              echo "              contains hidden characters (trailing newline,"
-              echo "              quotes, leading whitespace), OR"
-              echo "           2. The .p12 was re-exported with a different"
+              echo "              contains hidden characters (see the warnings"
+              echo "              above, if any), OR"
+              echo "           2. The .p12 in the secret is not the one you"
+              echo "              tested locally (compare the sha256 above with"
+              echo "              'shasum -a 256 devid.p12'), OR"
+              echo "           3. The .p12 was re-exported with a different"
               echo "              password and the new one wasn't pushed to"
               echo "              the GitHub secret yet."
-              echo "         Re-export locally and verify before re-uploading:"
+              echo "         Re-export locally and verify with the SAME command"
+              echo "         CI runs before re-uploading:"
               echo "             openssl pkcs12 -export -legacy -out devid.p12 \\"
               echo "                 -inkey devid.key -in devid.pem"
-              echo "             openssl pkcs12 -in devid.p12 \\"
-              echo "                 -password \"pass:THE_PASSWORD\" -nokeys -noout"
-              exit 1
-          fi
+              echo "             openssl pkcs12 -in devid.p12 -nokeys -noout \\"
+              echo "                 -passin pass:THE_PASSWORD   # add -legacy on OpenSSL 3"
+              echo "             openssl base64 -A -in devid.p12 | pbcopy"
+              exit 1;;
+            unsupported)
+              echo "::warning::OpenSSL pre-verify: this openssl build cannot parse the"
+              echo "         .p12's encryption (output above), so the password was NOT"
+              echo "         checked. Continuing to 'security import', which is"
+              echo "         authoritative.";;
+            *)
+              echo "::warning::OpenSSL pre-verify failed for a reason other than the"
+              echo "         password (output above). Continuing to 'security import',"
+              echo "         which is authoritative.";;
+          esac
 
           # Import .p12 into the new keychain. -A allows any tool to
           # use the key (codesign needs this); -t cert + -f pkcs12
@@ -1370,12 +1431,19 @@ jobs:
               -P "$APPLE_DEVELOPER_ID_CERT_PASSWORD" \
               -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           then
-              echo "::error::OpenSSL accepted the .p12 + password, but macOS"
-              echo "         'security import' rejected it. This is the"
-              echo "         classic symptom of a PBES2 (AES-encrypted)"
-              echo "         PKCS12, which OpenSSL accepts but pre-Sonoma-14.4"
-              echo "         'security import' does not. Re-export the .p12"
-              echo "         with the legacy PBES1 algorithms:"
+              if [[ "$PREVERIFY" == ok ]]; then
+                  echo "::error::OpenSSL accepted the .p12 + password, but macOS"
+                  echo "         'security import' rejected it. This is the"
+                  echo "         classic symptom of a PBES2 (AES-256 / SHA-256 MAC)"
+                  echo "         PKCS12, which OpenSSL reads but macOS 14"
+                  echo "         'security import' does not (macOS 15 does)."
+              else
+                  echo "::error::'security import' rejected the .p12 and the OpenSSL"
+                  echo "         pre-verify could not check the password (see above),"
+                  echo "         so this is either a wrong password or a PBES2"
+                  echo "         (AES-256 / SHA-256 MAC) PKCS12 that macOS 14 cannot read."
+              fi
+              echo "         Re-export the .p12 with the legacy PBES1 algorithms:"
               echo "             openssl pkcs12 -export -legacy \\"
               echo "                 -out devid.p12 \\"
               echo "                 -inkey devid.key -in devid.pem \\"
