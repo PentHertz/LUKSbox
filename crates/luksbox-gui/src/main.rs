@@ -14,6 +14,8 @@ mod ops;
 mod preferences;
 mod recent;
 mod theme;
+#[cfg(target_os = "linux")]
+mod wayland_dnd;
 
 use app::LuksboxApp;
 
@@ -74,7 +76,14 @@ fn main() -> eframe::Result<()> {
             {
                 cc.egui_ctx.set_zoom_factor(z);
             }
-            Ok(Box::new(LuksboxApp::new_with_vault(initial_vault)))
+            #[allow(unused_mut)]
+            let mut app = LuksboxApp::new_with_vault(initial_vault);
+            // Native Wayland windows get file drops from our own
+            // listener (winit 0.30 has none there); X11 / other
+            // platforms keep winit's.
+            #[cfg(target_os = "linux")]
+            app.attach_wayland_dnd(cc);
+            Ok(Box::new(app))
         }),
     );
 

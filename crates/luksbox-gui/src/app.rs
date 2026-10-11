@@ -1187,6 +1187,10 @@ enum ToastKind {
 
 pub struct LuksboxApp {
     view: View,
+    /// Native-Wayland drop listener (Linux only); `None` on X11, where
+    /// winit delivers drops itself. See `wayland_dnd`.
+    #[cfg(target_os = "linux")]
+    wayland_dnd: Option<crate::wayland_dnd::WaylandDnd>,
     /// All FIDO2 authenticators currently visible to libfido2,
     /// `(path, label)`. Refreshed at startup and on demand from the
     /// sidebar. Multiple entries are common on Windows where Windows
@@ -1755,6 +1759,12 @@ impl LuksboxApp {
     /// on a .lbx file). When set we land directly on the Unlock view
     /// with that path filled in, so the user just types their
     /// passphrase / taps their authenticator.
+    /// Linux: start the native-Wayland drop listener for this window.
+    #[cfg(target_os = "linux")]
+    pub fn attach_wayland_dnd(&mut self, cc: &eframe::CreationContext<'_>) {
+        self.wayland_dnd = crate::wayland_dnd::WaylandDnd::start(cc);
+    }
+
     pub fn new_with_vault(initial_vault: Option<std::path::PathBuf>) -> Self {
         let mut unlock = UnlockForm::default();
         let mut view = View::Welcome;
@@ -1774,6 +1784,8 @@ impl LuksboxApp {
             cwd: "/".into(),
             listing: Vec::new(),
             listing_err: None,
+            #[cfg(target_os = "linux")]
+            wayland_dnd: None,
             pending: None,
             toasts: Vec::new(),
             metadata_warned_pct: 0,
@@ -2099,6 +2111,24 @@ impl eframe::App for LuksboxApp {
         // Drive pending ops; repaint quickly while one is in flight.
         self.poll_pending(&ctx);
         self.poll_mount();
+        // Files dropped on a native Wayland window arrive from our own
+        // listener rather than egui's input; route them like a drop on
+        // the browser, and tell the user when they land anywhere else.
+        #[cfg(target_os = "linux")]
+        {
+            let dropped = self
+                .wayland_dnd
+                .as_ref()
+                .map(|d| d.take_dropped())
+                .unwrap_or_default();
+            if !dropped.is_empty() {
+                if matches!(self.view, View::Browser) {
+                    self.import_paths(dropped);
+                } else {
+                    self.toast_err("drop files onto the browser of an open vault");
+                }
+            }
+        }
         // If a vault-switch confirmation deferred its navigation until the
         // mount tore down, `poll_mount` has now cleared `mount_status`; run
         // the navigation so the user lands on the new open/create flow.
@@ -7491,7 +7521,9 @@ impl LuksboxApp {
 
         // Files and folders dragged in from the system file manager are
         // imported into the current folder. winit delivers OS drops on
-        // Windows, macOS and X11 (not to native Wayland windows).
+        // Windows, macOS and X11; native Wayland windows get them from
+        // `wayland_dnd` (drained in `ui`), which only contributes the
+        // hover highlight here.
         let (os_drag_hover, dropped) = ui.ctx().input(|i| {
             (
                 !i.raw.hovered_files.is_empty(),
@@ -7502,6 +7534,9 @@ impl LuksboxApp {
                     .collect::<Vec<_>>(),
             )
         });
+        #[cfg(target_os = "linux")]
+        let os_drag_hover =
+            os_drag_hover || self.wayland_dnd.as_ref().is_some_and(|d| d.hovering());
         if !dropped.is_empty() {
             self.import_paths(dropped);
         }

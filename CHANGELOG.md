@@ -126,8 +126,11 @@ Follow-up fixes for two items the Round 15 report had left tracked:
   machine).
 - **GUI vault browser.** Folder and file icons; folders listed first.
   Drag files or whole folders from the system file manager onto the
-  browser to encrypt them into the current folder (Windows, macOS and
-  X11; winit does not deliver file drops to native Wayland windows).
+  browser to encrypt them into the current folder. Works on Windows,
+  macOS, X11 and, from this release, native Wayland sessions (GNOME,
+  KDE): the windowing library delivers no file drops there, so the GUI
+  listens for them itself on the window's Wayland connection
+  (`LUKSBOX_GUI_NO_WAYLAND_DND=1` turns that off).
   Folders are imported recursively, symlinks are skipped and reported
   rather than followed, and a name that already exists stops the import
   instead of being merged or overwritten. Drag a row onto a folder, or

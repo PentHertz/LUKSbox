@@ -104,6 +104,14 @@ fs2 = "0.4"
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Native-Wayland file drag and drop (`wayland_dnd.rs`): winit 0.30 has
+# none, so the GUI speaks wl_data_device itself on winit's connection.
+# Same toolkit version winit uses, so nothing extra is compiled twice.
+smithay-client-toolkit = { version = "0.19", default-features = false }
+wayland-backend = { version = "0.3", features = ["client_system"] }
+raw-window-handle = "0.6"
+
 [dev-dependencies]
 tempfile = "3"
 # Used by the recents-permissions test (Unix-only) which sets
