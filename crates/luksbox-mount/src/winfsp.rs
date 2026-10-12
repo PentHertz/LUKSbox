@@ -393,6 +393,11 @@ pub struct LuksboxFs {
     /// `Some` until `Drop`: the timer also runs under `--sync`
     /// (R15-G3), see `new`.
     timer_stop_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    /// The timer thread, joined in `Drop`: it holds a reference to the
+    /// Vfs, and the vault must be closed (flushed, file lock released)
+    /// by the time `FileSystem::stop()` returns, which is what a
+    /// `luksbox umount` from another process waits for (`MountHolder`).
+    timer_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl LuksboxFs {
@@ -426,7 +431,7 @@ impl LuksboxFs {
         // unmount. With every mutation already flushed eagerly, the
         // timer is a no-op tick in the common case (`Vfs::flush()`
         // returns immediately on a clean tree).
-        let timer_stop_tx = {
+        let (timer_stop_tx, timer_thread) = {
             // Background flush timer: wakes every
             // LAZY_FLUSH_INTERVAL_SECS, briefly takes the Vfs lock
             // and calls `vfs.flush()`. Same lifecycle as fuse.rs /
@@ -436,7 +441,7 @@ impl LuksboxFs {
             // after the remaining sleep period.
             let (tx, rx) = std::sync::mpsc::channel::<()>();
             let timer_vfs = Arc::clone(&inner);
-            let _ = std::thread::Builder::new()
+            let handle = std::thread::Builder::new()
                 .name("luksbox-flush-timer".to_string())
                 .spawn(move || {
                     loop {
@@ -456,8 +461,9 @@ impl LuksboxFs {
                             }
                         }
                     }
-                });
-            Some(tx)
+                })
+                .ok();
+            (Some(tx), handle)
         };
         Self {
             inner,
@@ -465,6 +471,7 @@ impl LuksboxFs {
             vault_parent,
             sync_mode,
             timer_stop_tx: Mutex::new(timer_stop_tx),
+            timer_thread,
         }
     }
 
@@ -524,6 +531,12 @@ impl Drop for LuksboxFs {
             && let Some(tx) = tx.take()
         {
             drop(tx);
+        }
+        // Wait for it to let go of its Vfs reference (at most the end of
+        // a flush it is in the middle of), so the Vfs, and with it the
+        // vault, is closed when this file system is dropped.
+        if let Some(timer) = self.timer_thread.take() {
+            let _ = timer.join();
         }
         if let Ok(mut vfs) = self.inner.lock()
             && let Err(e) = vfs.flush()
@@ -1172,6 +1185,20 @@ impl FileSystemInterface for LuksboxFs {
 /// mount are the in-process `stop()` (handled here) or letting the
 /// process exit, which the kernel driver detects and unwinds.
 pub fn mount(vfs: Vfs, mountpoint: &Path, sync_mode: bool) -> Result<(), MountError> {
+    mount_with_ready(vfs, mountpoint, sync_mode, || {})
+}
+
+/// [`mount`], calling `on_ready` once the volume is live: WinFsp has
+/// attached the mountpoint and the mount already answers Ctrl-C and
+/// `luksbox umount`. Runs on the mounting thread, before it blocks until
+/// unmount. The background `luksbox mount` uses it to tell the process
+/// that started it that the drive is up.
+pub fn mount_with_ready(
+    vfs: Vfs,
+    mountpoint: &Path,
+    sync_mode: bool,
+    on_ready: impl FnOnce(),
+) -> Result<(), MountError> {
     winfsp_wrs::init().map_err(map_init_error)?;
 
     // Default OperationGuardStrategy (Coarse) matches our `Mutex<Vfs>`:
@@ -1305,14 +1332,22 @@ pub fn mount(vfs: Vfs, mountpoint: &Path, sync_mode: bool) -> Result<(), MountEr
     install_ctrlc_handler_once();
     // `None` only if the event could not be created; Ctrl-C and the
     // in-process unmount still work then.
+    // Taken before the unmount event exists, so a `luksbox umount` that
+    // finds the event also finds this. `None` only if the mutex could
+    // not be created; `umount` then waits for the mountpoint to go.
+    let holder = MountHolder::acquire(&mp_norm);
     let _remote = RemoteUnmountListener::start(&mp_norm, tx);
+    on_ready();
 
     let _ = rx.recv();
     deregister_mount(&key);
     if winfsp_debug() {
         eprintln!("[winfsp] received shutdown signal, stopping FS");
     }
+    // Removes the mountpoint first, then drops the file system: final
+    // flush, vault closed. Only after that may `luksbox umount` return.
     running.stop();
+    drop(holder);
     Ok(())
 }
 
@@ -1476,6 +1511,17 @@ fn deregister_mount(key: &Path) {
 /// whole (case-folded) mountpoint, so sanitising and truncating it can
 /// not make two mountpoints share an event.
 fn remote_unmount_event_name(mp_norm: &str) -> Vec<u16> {
+    mount_object_name("unmount", mp_norm)
+}
+
+/// Name of the mutex a mount at `mp_norm` holds until it has fully
+/// stopped (see `MountHolder`). Same scheme as the unmount event; a
+/// different prefix, since events and mutexes share one namespace.
+fn mount_holder_mutex_name(mp_norm: &str) -> Vec<u16> {
+    mount_object_name("mounted", mp_norm)
+}
+
+fn mount_object_name(kind: &str, mp_norm: &str) -> Vec<u16> {
     let folded = mp_norm.to_uppercase();
     let hash = folded.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
@@ -1485,10 +1531,77 @@ fn remote_unmount_event_name(mp_norm: &str) -> Vec<u16> {
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .take(64)
         .collect();
-    format!("Local\\luksbox-unmount-{readable}-{hash:016x}")
+    format!("Local\\luksbox-{kind}-{readable}-{hash:016x}")
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect()
+}
+
+/// How long a `luksbox umount` waits for the mount to finish stopping
+/// (final flush, vault closed), and how long a new mount waits for a
+/// previous mount of the same mountpoint to finish stopping.
+const MOUNT_STOP_WAIT: Duration = Duration::from_secs(120);
+
+/// A named mutex (`mount_holder_mutex_name`) owned by the mounting
+/// thread from mount start until the vault is closed.
+///
+/// `FileSystem::stop()` removes the mountpoint BEFORE it drops the file
+/// system (final flush, vault closed, file lock released). A `luksbox
+/// umount` in another process that only waited for the mountpoint to
+/// disappear could therefore return while the final flush was still
+/// running and the vault still locked: a `luksbox` command right after
+/// it failed with "vault locked", and unplugging the drive then could
+/// lose the last writes. `umount` waits on this mutex instead. A mutex
+/// whose owning thread ends is released (abandoned), so a mount process
+/// that dies does not leave `umount` waiting.
+struct MountHolder(windows_sys::Win32::Foundation::HANDLE);
+
+impl MountHolder {
+    fn acquire(mp_norm: &str) -> Option<Self> {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, WAIT_ABANDONED, WAIT_OBJECT_0,
+        };
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+
+        let name = mount_holder_mutex_name(mp_norm);
+        // Initially owned. The default security descriptor limits
+        // opening it to this user, SYSTEM and Administrators.
+        // SAFETY: plain Win32 calls; `name` is NUL-terminated.
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
+        if handle.is_null() {
+            if winfsp_debug() {
+                eprintln!(
+                    "[winfsp] CreateMutexW failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            return None;
+        }
+        // It already existed, so it is not ours yet: a mount of this
+        // mountpoint that is still stopping (its drive letter is already
+        // gone) holds it. Take it over once that one is done.
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            let wait = unsafe { WaitForSingleObject(handle, MOUNT_STOP_WAIT.as_millis() as u32) };
+            if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+                unsafe { CloseHandle(handle) };
+                return None;
+            }
+        }
+        Some(Self(handle))
+    }
+}
+
+impl Drop for MountHolder {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::ReleaseMutex;
+        // SAFETY: owned by this thread since `acquire`; dropped on the
+        // mounting thread, which is the one that owns it.
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
 }
 
 /// Waits on a mount's named unmount event (see `remote_unmount_event_name`)
@@ -1546,11 +1659,18 @@ impl Drop for RemoteUnmountListener {
 }
 
 /// Ask the luksbox process holding `mp_norm` to unmount it, through the
-/// event its `RemoteUnmountListener` waits on, and wait until the
-/// mountpoint is gone (the final flush can take a few seconds).
+/// event its `RemoteUnmountListener` waits on, and wait until it has
+/// fully stopped: final flush done, vault closed (`MountHolder`). A
+/// mount from a LUKSbox without the holder mutex is waited for until its
+/// mountpoint is gone, which can be before its final flush ends.
 fn signal_remote_unmount(mp_norm: &str, mountpoint: &Path) -> Result<(), MountError> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{
+        EVENT_MODIFY_STATE, MUTEX_MODIFY_STATE, OpenEventW, OpenMutexW, ReleaseMutex,
+        SYNCHRONIZATION_SYNCHRONIZE, SetEvent, WaitForSingleObject,
+    };
 
     let name = remote_unmount_event_name(mp_norm);
     let event: HANDLE = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
@@ -1563,14 +1683,52 @@ fn signal_remote_unmount(mp_norm: &str, mountpoint: &Path) -> Result<(), MountEr
             mountpoint.display()
         ))));
     }
+    // Opened before signalling, so the mount cannot finish and close it
+    // in between.
+    let holder_name = mount_holder_mutex_name(mp_norm);
+    let holder: HANDLE = unsafe {
+        OpenMutexW(
+            SYNCHRONIZATION_SYNCHRONIZE | MUTEX_MODIFY_STATE,
+            0,
+            holder_name.as_ptr(),
+        )
+    };
     let signalled = unsafe { SetEvent(event) } != 0;
     let err = std::io::Error::last_os_error();
     unsafe { CloseHandle(event) };
     if !signalled {
+        if !holder.is_null() {
+            unsafe { CloseHandle(holder) };
+        }
         return Err(MountError::Io(std::io::Error::other(format!(
             "could not signal the luksbox mount at {}: {err}",
             mountpoint.display()
         ))));
+    }
+    if !holder.is_null() {
+        // SAFETY: our handle; a wait that acquires it makes us the owner,
+        // and the owner releases it.
+        let wait = unsafe { WaitForSingleObject(holder, MOUNT_STOP_WAIT.as_millis() as u32) };
+        if wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED {
+            unsafe { ReleaseMutex(holder) };
+        }
+        unsafe { CloseHandle(holder) };
+        return match wait {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(()),
+            WAIT_TIMEOUT => Err(MountError::Io(std::io::Error::other(format!(
+                "asked the luksbox process to unmount {}, but it has not finished \
+                 after {} s; it is probably still flushing and will finish on its \
+                 own. Do not unplug the drive holding the vault until no luksbox \
+                 process is left.",
+                mountpoint.display(),
+                MOUNT_STOP_WAIT.as_secs(),
+            )))),
+            _ => Err(MountError::Io(std::io::Error::other(format!(
+                "asked the luksbox process to unmount {}, but could not wait for it: {}",
+                mountpoint.display(),
+                std::io::Error::last_os_error()
+            )))),
+        };
     }
     // A drive letter is probed through its root (`Z:` alone means the
     // current directory on Z:); a directory mountpoint disappears with

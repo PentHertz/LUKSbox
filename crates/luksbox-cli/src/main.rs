@@ -690,16 +690,19 @@ enum Command {
     ///    as a reparse point. Passing an existing directory yields
     ///    STATUS_OBJECT_NAME_COLLISION (0xC0000035) at mount start.
     ///
-    /// By default the mount daemonizes on Linux/macOS (you get your
-    /// shell back; unmount with `luksbox umount`). Windows always runs
-    /// in the foreground until the process exits (WinFsp's mount is
-    /// tied to the holding handle's lifetime). Pass `-f`/`--foreground`
-    /// to override the Linux/macOS default.
+    /// By default the mount runs in the background and you get your
+    /// shell back; unmount with `luksbox umount <mountpoint>`. Linux and
+    /// macOS daemonize. On Windows, where a WinFsp mount lives only as
+    /// long as the process holding it, the vault is unlocked here and
+    /// its key handed over a pipe to a hidden `luksbox` process that
+    /// holds the mount; the passphrase never leaves this process. Pass
+    /// `-f`/`--foreground` to stay attached to the terminal instead
+    /// (Ctrl-C unmounts).
     Mount {
         path: PathBuf,
         #[command(flatten)]
         unlock: UnlockArgs,
-        /// Run in the foreground instead of daemonizing.
+        /// Stay in the foreground instead of running in the background.
         #[arg(short = 'f', long)]
         foreground: bool,
         /// Mountpoint. Required unless `--private-mount` is given.
@@ -728,16 +731,17 @@ enum Command {
         #[arg(long)]
         sync: bool,
     },
-    /// Subprocess-isolated FUSE-T mount helper. Reads a 32-byte
+    /// Subprocess-isolated mount helper. Reads a 32-byte
     /// MasterVolumeKey from stdin and uses it to open the vault
-    /// without re-running the unlock derivation, then runs the FUSE
-    /// event loop in foreground until unmount. Spawned by the GUI on
-    /// macOS+FUSE-T builds so libfuse-t lives in its own process and
-    /// can't take down the GUI when it aborts itself during teardown.
+    /// without re-running the unlock derivation, then runs the mount
+    /// in foreground until unmount. Spawned by the GUI on macOS+FUSE-T
+    /// builds so libfuse-t lives in its own process and can't take
+    /// down the GUI when it aborts itself during teardown, and by the
+    /// background `luksbox mount` / `deniable-mount` on Windows, where
+    /// it is the process holding the WinFsp mount.
     /// Hidden from --help because it's not intended for direct
     /// invocation: there's no UX for typing 32 bytes into stdin and
-    /// the same effect is achieved by `luksbox mount` on every other
-    /// backend.
+    /// the same effect is achieved by `luksbox mount`.
     #[command(name = "mount-fuse-t-helper", hide = true)]
     MountFuseTHelper {
         /// Path to the .lbx vault.
@@ -745,6 +749,19 @@ enum Command {
         /// Optional detached header path.
         #[arg(long)]
         header: Option<PathBuf>,
+        /// Rollback-detection anchor to verify and keep updated, as
+        /// `luksbox mount --anchor`.
+        #[arg(long)]
+        anchor: Option<PathBuf>,
+        /// Eager-flush durability, as `luksbox mount --sync`.
+        #[arg(long)]
+        sync: bool,
+        /// Windows: once the volume is live, write a ready line on
+        /// stderr and point stderr at NUL. The background `luksbox
+        /// mount` reads stderr up to that line, then exits. Ignored on
+        /// other platforms.
+        #[arg(long)]
+        report_ready: bool,
         /// Where to mount the vault.
         mountpoint: PathBuf,
     },
@@ -848,9 +865,10 @@ enum Command {
         /// the slot envelope.
         #[arg(long)]
         kyber_path: Option<PathBuf>,
-        /// Stay in the foreground (don't daemonize). Default is to
-        /// daemonize on Unix; ignored on Windows where WinFsp is
-        /// always foreground.
+        /// Stay in the foreground instead of running in the
+        /// background. Background works as for `luksbox mount`: Unix
+        /// daemonizes; Windows hands the unlocked vault to a hidden
+        /// `luksbox` process that holds the mount.
         #[arg(short = 'f', long)]
         foreground: bool,
         /// Optional anchor sidecar to verify before mount. Must be
@@ -1541,8 +1559,18 @@ fn dispatch(cli: Cli) -> Result<()> {
         Command::MountFuseTHelper {
             vault,
             header,
+            anchor,
+            sync,
+            report_ready,
             mountpoint,
-        } => cmd_mount_fuse_t_helper(&vault, header.as_deref(), &mountpoint),
+        } => cmd_mount_fuse_t_helper(
+            &vault,
+            header.as_deref(),
+            anchor.as_deref(),
+            sync,
+            report_ready,
+            &mountpoint,
+        ),
         Command::Umount { mountpoint } => cmd_umount(&mountpoint),
         Command::DeniableInit {
             path,
@@ -7023,6 +7051,21 @@ fn cmd_mount(
         drop(final_probe);
     }
 
+    // Windows has no fork: a WinFsp mount lives exactly as long as the
+    // process holding it, so the background mount is a separate,
+    // windowless `luksbox` process that this one hands the unlocked
+    // vault to.
+    #[cfg(target_os = "windows")]
+    if !foreground {
+        return mount_in_background(
+            vfs,
+            unlock.header.as_deref(),
+            unlock.anchor.as_deref(),
+            &mp_abs,
+            sync_mode,
+        );
+    }
+
     if foreground {
         eprintln!(
             "mounted {} at {} (foreground)\n  unmount: luksbox umount {}  (or Ctrl-C, clean either way)",
@@ -7054,7 +7097,14 @@ fn cmd_mount(
 /// [`Zeroize`] immediately after the [`MasterVolumeKey`] takes
 /// ownership of the bytes. Brief stack exposure (microseconds)
 /// is the security trade-off documented in `docs/MACOS_FUSE_T.md`.
-fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Path) -> Result<()> {
+fn cmd_mount_fuse_t_helper(
+    vault: &Path,
+    header: Option<&Path>,
+    anchor: Option<&Path>,
+    sync_mode: bool,
+    report_ready: bool,
+    mountpoint: &Path,
+) -> Result<()> {
     // Stage trace - the parent captures our stderr and surfaces the
     // last lines in its error toast when we exit non-zero. Emitting a
     // line at each stage lets us pinpoint which step failed from the
@@ -7179,6 +7229,15 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
         ),
         None => None,
     };
+    // Same for the anchor: it is verified below against the MVK and then
+    // rewritten on every flush, so pin the real file once, up front.
+    let anchor_abs: Option<std::path::PathBuf> = match anchor {
+        Some(p) => Some(
+            p.canonicalize()
+                .map_err(|e| format!("cannot resolve --anchor {}: {e}", p.display()))?,
+        ),
+        None => None,
+    };
     eprintln!(
         "luksbox-mount-helper: canonicalized vault={} mountpoint={} header={:?}",
         vault_abs.display(),
@@ -7224,7 +7283,7 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
         version_byte[0]
     );
 
-    let container = match version_byte[0] {
+    let mut container = match version_byte[0] {
         0x01 => {
             // Standard format: HMAC verification inside open_with_mvk
             // catches a wrong MVK with HeaderAuthFailed before any
@@ -7268,18 +7327,339 @@ fn cmd_mount_fuse_t_helper(vault: &Path, header: Option<&Path>, mountpoint: &Pat
             .into());
         }
     };
+    // The parent verified the anchor before the hand-off, but this
+    // process opens the vault file again: verify it again here, so a
+    // vault swapped for an older copy in between is still refused, and
+    // attach it so every flush of this mount keeps it current.
+    let trusted_anchor_gen = match anchor_abs {
+        Some(ap) => container
+            .set_anchor(Some(ap))
+            .map_err(|e| format!("anchor: {e}"))?,
+        None => None,
+    };
     let vfs = Vfs::open(container).map_err(|e| format!("open Vfs: {e}"))?;
+    check_anchor_generation(trusted_anchor_gen, &vfs)?;
     eprintln!("luksbox-mount-helper: Vfs ready, calling mount");
 
-    // Run the FUSE event loop in foreground (no daemonize). The
-    // parent process polls our exit status; daemonizing here would
-    // leave the parent unable to detect mount-end.
-    // sync_mode = false: FUSE-T helper inherits the GUI's default;
-    // FUSE-T's mount() ignores the flag for v0.2.2 anyway.
-    luksbox_mount::mount(vfs, &mp_abs, false, false)
-        .map_err(|e| format!("mount {}: {e}", mp_abs.display()))?;
+    // Run the mount in foreground (no daemonize). The parent process
+    // watches our stderr (Windows background mount: up to the ready
+    // line) or our exit status (macOS GUI); daemonizing here would
+    // leave it unable to follow the mount. FUSE-T's mount() ignores
+    // `sync_mode` (the GUI passes no --sync anyway).
+    #[cfg(target_os = "windows")]
+    let mounted = if report_ready {
+        luksbox_mount::mount_with_ready(vfs, &mp_abs, sync_mode, report_ready_and_release_stderr)
+    } else {
+        luksbox_mount::mount(vfs, &mp_abs, false, sync_mode)
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mounted = {
+        let _ = report_ready;
+        luksbox_mount::mount(vfs, &mp_abs, false, sync_mode)
+    };
+    mounted.map_err(|e| format!("mount {}: {e}", mp_abs.display()))?;
     eprintln!("luksbox-mount-helper: mount returned cleanly, exiting");
     Ok(())
+}
+
+/// The line the mount helper writes on its stderr once the volume is
+/// live (`--report-ready`); the background `luksbox mount` waits for it.
+#[cfg(target_os = "windows")]
+const HELPER_READY_LINE: &str = "luksbox-mount-helper: ready";
+
+/// `--report-ready`: tell the background `luksbox mount` that started us
+/// that the volume is live, and let go of the pipe it reads.
+///
+/// That parent exits as soon as it reads the ready line, which closes
+/// the read end of our stderr pipe. Rust's `eprintln!` panics when a
+/// write fails, so any later log line (a flush failure, the WinFsp debug
+/// trace) would then kill the mount. So stderr is pointed at NUL first
+/// (Rust looks the std handle up on every write, so this covers every
+/// thread from here on), then the ready line goes down the old pipe
+/// handle, which is closed so the parent's reader sees end-of-file.
+#[cfg(target_os = "windows")]
+fn report_ready_and_release_stderr() {
+    use std::os::windows::io::{FromRawHandle as _, IntoRawHandle as _};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, SetStdHandle};
+
+    let Ok(nul) = std::fs::OpenOptions::new().write(true).open("NUL") else {
+        // Cannot detach: report on the pipe anyway, the mount is up.
+        eprintln!("{HELPER_READY_LINE}");
+        return;
+    };
+    // SAFETY: plain Win32 calls on this process's own std handle table.
+    // The NUL handle is leaked on purpose: it is stderr until exit.
+    let pipe = unsafe { GetStdHandle(STD_ERROR_HANDLE) };
+    let nul = nul.into_raw_handle();
+    if unsafe { SetStdHandle(STD_ERROR_HANDLE, nul) } == 0 {
+        // SAFETY: `nul` came from `into_raw_handle` above and is unused.
+        drop(unsafe { File::from_raw_handle(nul) });
+        eprintln!("{HELPER_READY_LINE}");
+        return;
+    }
+    if !pipe.is_null() && pipe != INVALID_HANDLE_VALUE {
+        // SAFETY: the inherited stderr pipe handle; nothing else uses it
+        // now that the std handle points at NUL, so this File owns it and
+        // closes it on drop.
+        let mut pipe = unsafe { File::from_raw_handle(pipe) };
+        let _ = writeln!(pipe, "{HELPER_READY_LINE}");
+    }
+}
+
+/// The only `LUKSBOX_*` variables the background mount process gets:
+/// settings its code path (vault open, Vfs, WinFsp) honours. Every other
+/// `LUKSBOX_*` variable is removed from its environment, which drops the
+/// unlock secrets (`LUKSBOX_PASSPHRASE`, `LUKSBOX_NEW_PASSPHRASE`,
+/// `LUKSBOX_SEED_PASSPHRASE`, `LUKSBOX_SLOT_PASSPHRASE`, `LUKSBOX_TPM_PIN`,
+/// `LUKSBOX_FIDO2_PIN`, the GUI's `LUKSBOX_REAL_SEP_*_PW` test values) and
+/// any added later: the vault key arrives over a pipe, so the process
+/// needs none of them, and a secret in its environment would stay
+/// readable there for as long as the vault is mounted. An allowlist, so
+/// forgetting to update it can only lose a setting, never leak a secret.
+#[cfg(target_os = "windows")]
+const BACKGROUND_MOUNT_ENV_ALLOWLIST: [&str; 8] = [
+    "LUKSBOX_NO_FOLLOW_SYMLINKS",
+    "LUKSBOX_NO_LOCK",
+    "LUKSBOX_FORMAT_V2",
+    "LUKSBOX_TOLERATE_BAD_CHUNK_LISTS",
+    "LUKSBOX_DEBUG_OPEN",
+    "LUKSBOX_WINFSP_DEBUG",
+    "LUKSBOX_FAKE_NO_AES",
+    "LUKSBOX_SUPPRESS_AES_WARNING",
+];
+
+/// How long the background `luksbox mount` waits for the helper to report
+/// the volume live. Opening with the key skips the KDF, so this is only
+/// reached when something is stuck.
+#[cfg(target_os = "windows")]
+const BACKGROUND_MOUNT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The background `luksbox mount` / `deniable-mount` on Windows.
+///
+/// WinFsp ties a mount to the process holding it, and Windows has no
+/// fork, so the vault unlocked here (all prompts, FIDO2, TPM, in this
+/// terminal) is handed to a separate `luksbox mount-fuse-t-helper`
+/// process, as the macOS GUI does:
+///
+/// 1. Build the hand-off (MVK, plus the deniable state for a deniable
+///    vault) and close the vault, which releases its lock for the helper.
+/// 2. Start the helper detached from this terminal: no console (closing
+///    the terminal or Ctrl-C in it cannot kill the mount uncleanly), its
+///    own process group, out of the terminal's job object when allowed,
+///    none of this process's std handles (a caller capturing our output
+///    gets end-of-file when we exit), no `LUKSBOX_*` variable outside
+///    `BACKGROUND_MOUNT_ENV_ALLOWLIST` (so no unlock secret), and the
+///    Windows directory as its working directory (so it pins none of
+///    the user's folders).
+/// 3. Write the hand-off to its stdin pipe and close it.
+/// 4. Read its stderr until the ready line (volume live, `luksbox
+///    umount` works), or until it exits, and then report its error.
+///
+/// The passphrase never leaves this process; the key goes through an
+/// anonymous pipe only the two processes hold.
+#[cfg(target_os = "windows")]
+fn mount_in_background(
+    vfs: Vfs,
+    header: Option<&Path>,
+    anchor: Option<&Path>,
+    mountpoint: &Path,
+    sync_mode: bool,
+) -> Result<()> {
+    use std::io::BufRead as _;
+    use std::os::windows::process::CommandExt as _;
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::{
+        ERROR_ACCESS_DENIED, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, SetHandleInformation,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
+    };
+
+    let exe = std::env::current_exe()
+        .map_err(|e| cli_err!("cannot locate the luksbox executable: {e}"))?;
+    // Absolute paths: the helper does not run in this directory, and a
+    // deniable container keeps the vault path as typed.
+    let resolve = |p: &Path, what: &str| {
+        p.canonicalize()
+            .map_err(|e| cli_err!("cannot resolve {what} {}: {e}", p.display()))
+    };
+    let vault = resolve(vfs.container().vault_path(), "vault")?;
+    let header = header.map(|p| resolve(p, "--header")).transpose()?;
+    let anchor = anchor.map(|p| resolve(p, "--anchor")).transpose()?;
+
+    // 1. Hand-off, protocol v1 (standard) or v2 (deniable): see
+    // `cmd_mount_fuse_t_helper`. Sized up front so the Zeroizing buffer
+    // never reallocates and leaves a copy behind.
+    const HANDOFF_MAX: usize = 1
+        + 32
+        + luksbox_core::deniable::DENIABLE_SALT_SIZE
+        + 1
+        + luksbox_format::deniable_header::DENIABLE_INNER_HEADER_SERIALIZED_LEN;
+    let mut handoff: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(HANDOFF_MAX));
+    {
+        let mvk = vfs.container().mvk_clone();
+        match vfs.container().deniable_handoff_state() {
+            None => {
+                handoff.push(0x01);
+                handoff.extend_from_slice(mvk.as_bytes());
+            }
+            Some((salt, inner, slot_idx)) => {
+                let salt = Zeroizing::new(salt);
+                let inner = Zeroizing::new(inner.serialise_for_handoff());
+                let slot = u8::try_from(slot_idx)
+                    .map_err(|_| cli_err!("deniable slot index {slot_idx} out of range"))?;
+                handoff.push(0x02);
+                handoff.extend_from_slice(mvk.as_bytes());
+                handoff.extend_from_slice(&salt[..]);
+                handoff.push(slot);
+                handoff.extend_from_slice(&inner[..]);
+            }
+        }
+    }
+    // Flush and close: the helper takes the vault's lock next.
+    drop(vfs.close()?);
+
+    // 2. Start the helper.
+    let mut cmd = Command::new(&exe);
+    cmd.arg("mount-fuse-t-helper").arg("--report-ready");
+    if let Some(h) = &header {
+        cmd.arg("--header").arg(h);
+    }
+    if let Some(a) = &anchor {
+        cmd.arg("--anchor").arg(a);
+    }
+    if sync_mode {
+        cmd.arg("--sync");
+    }
+    cmd.arg("--").arg(&vault).arg(mountpoint);
+    // Environment names are case-insensitive on Windows.
+    for (key, _) in std::env::vars_os() {
+        let name = key.to_string_lossy().to_ascii_uppercase();
+        if name.starts_with("LUKSBOX_") && !BACKGROUND_MOUNT_ENV_ALLOWLIST.contains(&name.as_str())
+        {
+            cmd.env_remove(&key);
+        }
+    }
+    if let Some(windir) = std::env::var_os("SystemRoot") {
+        cmd.current_dir(windir);
+    }
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // Keep this process's own std handles out of the helper.
+    // CreateProcess gives a child every inheritable handle, whatever its
+    // STARTUPINFO says. When ours are pipes (`$out = luksbox mount ...`,
+    // a script, CI), the caller reads them until every copy is closed, so
+    // a helper holding one would keep the caller waiting until unmount.
+    // This process starts nothing else and exits right after.
+    for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: flag change on this process's own std handles.
+        let handle = unsafe { GetStdHandle(id) };
+        if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
+            unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
+    let detached = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP;
+    cmd.creation_flags(detached | CREATE_BREAKAWAY_FROM_JOB);
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        // The terminal runs in a job object that forbids breakaway: the
+        // mount then ends with that job, like anything started from it.
+        Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
+            cmd.creation_flags(detached);
+            cmd.spawn()
+                .map_err(|e| cli_err!("cannot start the background mount process: {e}"))?
+        }
+        Err(e) => return Err(cli_err!("cannot start the background mount process: {e}")),
+    };
+
+    // 3. Hand the key over. A failed write means the helper is already
+    // gone; its stderr below says why.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&handoff);
+    }
+    drop(handoff);
+
+    // 4. Wait for the ready line.
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let (tx, rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in io::BufReader::new(stderr).split(b'\n') {
+            let Ok(line) = line else { break };
+            let line = String::from_utf8_lossy(&line).trim_end().to_string();
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + BACKGROUND_MOUNT_TIMEOUT;
+    let mut output: Vec<String> = Vec::new();
+    loop {
+        match rx.recv_timeout(Duration::from_millis(200)) {
+            Ok(line) if line == HELPER_READY_LINE => {
+                // `C:\...` rather than the canonical `\\?\C:\...`.
+                let shown = vault.display().to_string();
+                let shown = match shown.strip_prefix(r"\\?\") {
+                    Some(rest) if rest.as_bytes().get(1) == Some(&b':') => rest.to_string(),
+                    _ => shown,
+                };
+                eprintln!(
+                    "mounted {} at {} (background, pid {})\n  unmount: luksbox umount {}",
+                    shown,
+                    mountpoint.display(),
+                    child.id(),
+                    mountpoint.display(),
+                );
+                return Ok(());
+            }
+            Ok(line) => output.push(line),
+            Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+            Err(RecvTimeoutError::Timeout) => {
+                return Err(cli_err!(
+                    "the background mount process (pid {}) did not report {} as mounted \
+                     within {} s. It is still running: check the drive, then run \
+                     `luksbox umount {}` or end that process.",
+                    child.id(),
+                    mountpoint.display(),
+                    BACKGROUND_MOUNT_TIMEOUT.as_secs(),
+                    mountpoint.display(),
+                ));
+            }
+            // End of its stderr without the ready line: it is exiting.
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let exit_deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < exit_deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            _ => break None,
+        }
+    };
+    // Its own error lines, without the stage trace or `error: ` prefix.
+    let detail: Vec<&str> = output
+        .iter()
+        .filter(|l| !l.is_empty() && !l.starts_with("luksbox-mount-helper:"))
+        .map(|l| l.strip_prefix("error: ").unwrap_or(l))
+        .collect();
+    let status = status.map_or_else(|| "still running".to_string(), |s| s.to_string());
+    Err(if detail.is_empty() {
+        cli_err!("the background mount process failed ({status})")
+    } else {
+        cli_err!(
+            "the background mount process failed ({status}): {}",
+            detail.join("\n")
+        )
+    })
 }
 
 fn cmd_umount(mountpoint: &Path) -> Result<()> {
@@ -7720,6 +8100,14 @@ fn cmd_deniable_mount(
             ));
         }
         drop(final_probe);
+    }
+
+    // See `cmd_mount`: Windows runs the background mount in a separate
+    // `luksbox` process (protocol v2 of the helper hand-off carries the
+    // deniable state it cannot re-derive from the key alone).
+    #[cfg(target_os = "windows")]
+    if !foreground {
+        return mount_in_background(vfs, None, anchor, &mp_abs, sync_mode);
     }
 
     luksbox_mount::mount(vfs, &mp_abs, !foreground, sync_mode)?;

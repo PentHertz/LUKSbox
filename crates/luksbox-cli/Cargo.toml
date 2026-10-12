@@ -53,6 +53,17 @@ hex = "0.4"
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# Windows background `mount`: the creation flags that detach the mount
+# helper from the terminal, and the std-handle calls the helper uses to
+# let go of the pipe to its parent once the volume is live. Same version
+# luksbox-mount already pulls in.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
 [features]
 default = ["fido2-hardware", "fuse", "winfsp"]
 # FIDO2 hardware alone (libfido2 link on Linux/macOS, webauthn.dll on

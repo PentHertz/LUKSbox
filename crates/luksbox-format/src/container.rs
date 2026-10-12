@@ -4002,23 +4002,32 @@ impl Container {
         //   2. read source -> write into tmp_file
         //   3. (existing) fsync + rename on commit
         //
-        // Windows: there is no portable `O_NOFOLLOW`/`O_EXCL` combo for
-        // refusing reparse points. Keep the previous `std::fs::copy`
-        // path (tracked under R12-15) and rely on the parent directory
-        // ACL for protection.
-        #[cfg(unix)]
-        let mut tmp_file: File = {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&tmp)?
-        };
+        // Windows: `create_new` with FILE_FLAG_OPEN_REPARSE_POINT, so a
+        // symlink or junction already at the temp path is not followed:
+        // it exists, so the create fails (closes the R12-15 gap; the
+        // previous `std::fs::copy` followed it and overwrote the target).
+        let mut tmp_opts = OpenOptions::new();
+        tmp_opts.read(true).write(true).create_new(true);
         #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            tmp_opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+            tmp_opts.custom_flags(0x0020_0000);
+        }
+        let mut tmp_file: File = tmp_opts.open(&tmp)?;
+        // Copy through the handle we already hold, never a second one.
+        // On Windows the vault's byte-range lock (R15-C2) is mandatory,
+        // so any other handle, which is what the previous `std::fs::copy`
+        // fallback opened, failed with ERROR_LOCK_VIOLATION (os error 33)
+        // and MVK rotation could not start there at all. A failed copy
+        // removes the partial temp, which this call just created, so a
+        // retry is not refused as a rotation to recover.
+        let copied = (|| -> std::io::Result<()> {
             use std::io::{Read, Seek, SeekFrom, Write};
             // Reset the source's read position before slurping.
             self.file.seek(SeekFrom::Start(0))?;
@@ -4031,15 +4040,13 @@ impl Container {
                 }
                 tmp_file.write_all(&buf[..n])?;
             }
-            tmp_file.flush()?;
+            tmp_file.flush()
+        })();
+        if let Err(e) = copied {
+            drop(tmp_file);
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
         }
-        // Windows fallback: legacy copy + chmod-equivalent.
-        #[cfg(not(unix))]
-        {
-            std::fs::copy(&original, &tmp)?;
-        }
-        #[cfg(not(unix))]
-        let tmp_file = OpenOptions::new().read(true).write(true).open(&tmp)?;
         // R15-C2: lock the temp exactly like the committed vault, so the
         // handle that becomes the vault at commit is locked from the
         // start and stays locked across the rename (the lock follows

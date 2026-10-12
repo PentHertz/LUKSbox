@@ -142,7 +142,12 @@ in another, the way a user does with two terminals (GitHub #37), then
 checks that the mount process exits cleanly and that a file written
 through the mount is in the vault. Linux (FUSE), macOS (macFUSE or
 FUSE-T) and Windows (WinFsp); skipped when the host can't mount (see
-`LUKSBOX_REQUIRE_MOUNT_TESTS` below).
+`LUKSBOX_REQUIRE_MOUNT_TESTS` below). On Windows it also runs `luksbox
+mount` without `-f` (the background mount: a hidden `luksbox` process
+holds the WinFsp mount) with its output captured, checks that the
+command returns once the volume is live rather than when it is
+unmounted, then that `luksbox umount` returns only once the vault is
+flushed and released.
 
 ### `luksbox-mount` (6 tests, Windows-only)
 

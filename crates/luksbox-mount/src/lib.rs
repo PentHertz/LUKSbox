@@ -319,7 +319,10 @@ pub enum MountError {
 ///   the foreground/daemonize split is the caller's responsibility.
 /// - Windows: `daemonize` is ignored, WinFsp's mount lifetime is tied to
 ///   the process holding the FileSystem handle. The function blocks
-///   until the process is killed (Ctrl-C, taskkill, or quit from GUI).
+///   until the volume is unmounted (Ctrl-C, [`unmount`], quit from the
+///   GUI) or the process is killed. `luksbox mount` runs in the
+///   background by handing the unlocked vault to a hidden `luksbox`
+///   process that calls `mount_with_ready` (Windows only).
 ///
 /// Backend selection on macOS when both `fuse` and `fuse-t` are
 /// enabled: FUSE-T wins. This is intentional, the only realistic
@@ -360,6 +363,31 @@ pub fn mount<P: AsRef<Path>>(
     sync_mode: bool,
 ) -> Result<(), MountError> {
     winfsp::mount(vfs, mountpoint.as_ref(), sync_mode)
+}
+
+/// Windows only: [`mount`], calling `on_ready` once the volume is live
+/// (the mountpoint is attached and the mount answers Ctrl-C and
+/// [`unmount`] from any process), then blocking until it is unmounted.
+/// For a mount holder started in the background, to report that the
+/// drive is up to the process that started it.
+#[cfg(all(target_os = "windows", feature = "winfsp"))]
+pub fn mount_with_ready<P: AsRef<Path>>(
+    vfs: luksbox_vfs::Vfs,
+    mountpoint: P,
+    sync_mode: bool,
+    on_ready: impl FnOnce(),
+) -> Result<(), MountError> {
+    winfsp::mount_with_ready(vfs, mountpoint.as_ref(), sync_mode, on_ready)
+}
+
+#[cfg(all(target_os = "windows", not(feature = "winfsp")))]
+pub fn mount_with_ready<P: AsRef<Path>>(
+    _vfs: luksbox_vfs::Vfs,
+    _mountpoint: P,
+    _sync_mode: bool,
+    _on_ready: impl FnOnce(),
+) -> Result<(), MountError> {
+    Err(MountError::Unsupported)
 }
 
 #[cfg(any(

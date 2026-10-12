@@ -42,9 +42,44 @@ canonical record.
   `scripts/static_deps_reviewed.txt`. A weekly workflow
   (`static-deps-audit`) re-runs the check against the latest release's
   tarball, for vulnerabilities disclosed after it shipped.
+- **`luksbox mount` runs in the background on Windows too.** As on Linux
+  and macOS, `mount` and `deniable-mount` now give the prompt back once
+  the volume is live; `-f` keeps the previous foreground behaviour. A
+  WinFsp mount lives only as long as the process holding it, so the vault
+  is unlocked in the terminal as before (passphrase, FIDO2 and TPM
+  prompts) and its key is handed over an anonymous pipe to a hidden
+  `luksbox` process that holds the mount, the `mount-fuse-t-helper`
+  hand-off the macOS GUI already uses. The passphrase never reaches that
+  process. It has no console, so closing the terminal or pressing Ctrl-C
+  in it cannot tear the mount down uncleanly. It inherits neither the
+  terminal's output handles (a script capturing `luksbox mount` output
+  gets it back at once), nor any `LUKSBOX_*` variable outside a short
+  allowlist of mount settings (so no unlock secret such as
+  `LUKSBOX_PASSPHRASE`), nor the working directory. It re-verifies the
+  `--anchor` when it opens the vault and keeps it current, and honours
+  `--sync`. Unmount with `luksbox umount Z:`.
 
 ### Fixed
 
+- **`luksbox umount` on Windows could return before the final flush.**
+  WinFsp removes the drive letter before it tears the file system down,
+  and `umount` returned as soon as the drive letter was gone, while the
+  mount was still flushing and holding the vault. A `luksbox` command
+  run right after it could fail with "vault locked by another process",
+  and unplugging the drive at that point could lose the last writes. A
+  mount now holds a named mutex until the vault is flushed and closed,
+  and `umount` waits for it. Mounts started by an older LUKSbox are still
+  waited for by drive letter only.
+- **MVK rotation failed on Windows ("another process has locked a portion
+  of the file", os error 33).** `rotate-mvk` and the wizard's rotation
+  stopped before changing anything on every inline-header vault, standard
+  and deniable. Starting a rotation copies the vault to `<vault>.rotating`;
+  on Windows that copy used `std::fs::copy`, whose second handle hit the
+  vault's own byte-range lock, which Windows enforces (R15-C2). The copy
+  now goes through the locked handle, as on Linux and macOS. The temp file
+  is now created without following a symlink or junction already at its
+  path (the old copy followed it), and a copy that fails part-way removes
+  the temp so a retry is not refused.
 - **GUI file "Download..." froze on Linux (GitHub #35).** The save
   dialog for a single file passed an "All files" filter with no
   patterns, which xdg-desktop-portal rejects ("invalid filter: no

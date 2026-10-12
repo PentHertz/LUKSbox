@@ -188,8 +188,15 @@ something to exploit).
 **Signature**:
 
 ```
-luksbox mount-fuse-t-helper [--header HDR] <vault.lbx> <mountpoint>
+luksbox mount-fuse-t-helper [--header HDR] [--anchor ANCHOR] [--sync] [--report-ready] <vault.lbx> <mountpoint>
 ```
+
+The GUI passes only `--header`. The background `luksbox mount` /
+`deniable-mount` on Windows starts the same helper (WinFsp ties a mount
+to the process holding it) with `--anchor` and `--sync` as given to
+`mount`, plus `--report-ready`: once the volume is live the helper
+writes a ready line on stderr, which the parent waits for, then points
+its stderr at NUL.
 
 **Behaviour**:
 

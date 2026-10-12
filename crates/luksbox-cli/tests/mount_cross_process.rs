@@ -41,6 +41,14 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_luksbox")
 }
 
+/// One mount test at a time: they take the same free drive letter
+/// (Windows) and share the host's mount table.
+static MOUNT_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn one_mount_test_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    MOUNT_TESTS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 const ENV: [(&str, &str); 3] = [
     ("LUKSBOX_TEST_FAST_KDF", "1"),
     ("LUKSBOX_PASSPHRASE", "pw"),
@@ -232,6 +240,7 @@ fn umount_from_another_process_releases_the_mount() {
     if !mount_backend_or_skip() {
         return;
     }
+    let _serial = one_mount_test_at_a_time();
     let tmp = tempdir().unwrap();
     let dir = tmp.path();
 
@@ -306,5 +315,112 @@ fn umount_from_another_process_releases_the_mount() {
     assert_eq!(
         std::fs::read(dir.join("out.txt")).unwrap(),
         b"written through the mount"
+    );
+}
+
+/// Unmounts a Windows mountpoint that is still mounted when dropped (the
+/// test failed half-way), so a failed run leaves no background mount.
+#[cfg(target_os = "windows")]
+struct UnmountOnDrop(PathBuf);
+
+#[cfg(target_os = "windows")]
+impl Drop for UnmountOnDrop {
+    fn drop(&mut self) {
+        if Path::new(&format!("{}\\", self.0.display())).exists() {
+            let _ = Command::new(bin()).arg("umount").arg(&self.0).output();
+        }
+    }
+}
+
+/// Windows: `luksbox mount` without `-f` runs in the background. The
+/// vault is unlocked in the `mount` process, handed to a hidden `luksbox`
+/// process that holds the WinFsp mount, and `mount` returns once the
+/// volume is live. Its output is captured here the way a script would:
+/// that only completes once every copy of the output pipes is closed, so
+/// a background process that inherited one would hang it until unmount.
+#[cfg(target_os = "windows")]
+#[test]
+fn background_mount_returns_and_umount_releases_it() {
+    if !mount_backend_or_skip() {
+        return;
+    }
+    let _serial = one_mount_test_at_a_time();
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+
+    assert_ok(&run(dir, &["create", "vault.lbx"]), "create");
+    std::fs::write(dir.join("hello.txt"), b"hello from the vault").unwrap();
+    assert_ok(
+        &run(dir, &["put", "vault.lbx", "hello.txt", "/hello.txt"]),
+        "put",
+    );
+
+    let mountpoint = new_mountpoint(dir);
+    // Declared after `tmp`, so on a panic it is dropped (unmounted)
+    // before the temp dir is removed.
+    let _unmount = UnmountOnDrop(mountpoint.clone());
+
+    let child = Command::new(bin())
+        .arg("mount")
+        .arg("vault.lbx")
+        .arg(&mountpoint)
+        .current_dir(dir)
+        .envs(ENV)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn luksbox mount");
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    let out = rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect(
+            "luksbox mount did not return within 60 s: its output pipes are still open \
+             (inherited by the background mount process?)",
+        )
+        .expect("wait for luksbox mount");
+    assert_ok(&out, "background luksbox mount");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("(background, pid "),
+        "expected the background notice, got: {stderr}"
+    );
+
+    // Live as soon as `mount` returned.
+    assert_eq!(
+        std::fs::read(in_mount(&mountpoint, "hello.txt")).expect("read through the mount"),
+        b"hello from the vault"
+    );
+    std::fs::write(
+        in_mount(&mountpoint, "written.txt"),
+        b"written through the background mount",
+    )
+    .expect("write through the mount");
+
+    let out = Command::new(bin())
+        .arg("umount")
+        .arg(&mountpoint)
+        .current_dir(dir)
+        .output()
+        .expect("spawn luksbox umount");
+    assert_ok(&out, "luksbox umount of the background mount");
+    // `umount` returns once the drive letter is gone.
+    assert!(
+        !Path::new(&format!("{}\\", mountpoint.display())).exists(),
+        "{} still mounted after luksbox umount",
+        mountpoint.display()
+    );
+
+    // The background mount flushed on the way out.
+    assert_ok(
+        &run(dir, &["get", "vault.lbx", "/written.txt", "out.txt"]),
+        "get after unmount",
+    );
+    assert_eq!(
+        std::fs::read(dir.join("out.txt")).unwrap(),
+        b"written through the background mount"
     );
 }

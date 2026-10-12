@@ -168,9 +168,11 @@ The full attack matrix (defended vs not defended) is at
 # Create a vault (defaults: AES-256-GCM-SIV, Argon2id interactive)
 luksbox create my-vault.lbx
 
-# Mount it on a drive letter / mountpoint
+# Mount it on a drive letter / mountpoint (runs in the background;
+# add -f to keep it in the foreground)
 luksbox mount my-vault.lbx /mnt/v       # Linux/macOS
 luksbox mount my-vault.lbx Z:           # Windows
+luksbox umount Z:                       # unmount (or /mnt/v)
 
 # Add a FIDO2 hardware factor
 luksbox enroll my-vault.lbx --kind fido2
