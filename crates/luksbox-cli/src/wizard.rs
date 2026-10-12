@@ -171,11 +171,28 @@ pub(crate) fn run() -> Result<()> {
     // No prompt when 0 or 1 are present.
     match select_fido2_device(&theme) {
         Some(label) => println!("FIDO2 authenticator selected: {label}"),
+        None if !FIDO2_COMPILED => println!(
+            "This build has no FIDO2, TPM 2.0 or Secure Enclave support (e.g. the \
+             passphrase-only static Linux build), so only passphrase and passphrase + \
+             ML-KEM keyslots are offered."
+        ),
         None => println!(
             "No FIDO2 authenticator detected (plug one in for hardware-backed keyslots; \
              any CTAP2 authenticator works: YubiKey, Nitrokey, SoloKey, Token2, OnlyKey, \
              Windows Hello on Windows, etc.)"
         ),
+    }
+    // A TPM-enabled build (the static FIDO2 + TPM one included) on a
+    // machine without a TPM: say so up front instead of after the prompts.
+    if cfg!(target_os = "linux")
+        && luksbox_tpm::BACKEND_COMPILED
+        && std::env::var_os("TCTI_NAME_CONF").is_none()
+        && !Path::new("/dev/tpmrm0").exists()
+        && !Path::new("/dev/tpm0").exists()
+    {
+        println!(
+            "No TPM 2.0 device found (/dev/tpmrm0): TPM keyslots will not work on this machine."
+        );
     }
     println!();
 
@@ -395,6 +412,40 @@ fn pick_kdf_params(
     })
 }
 
+/// FIDO2 support is compiled in. Menus hide keyslot kinds this binary
+/// cannot use instead of failing after the user answered every prompt
+/// (the GUI does the same with `UnlockMethod::available_here`). The
+/// static musl build has no FIDO2, TPM 2.0 or Secure Enclave support
+/// (GitHub #34); TPM and SEP entries check `luksbox_tpm::BACKEND_COMPILED`
+/// / `luksbox_sep::BACKEND_COMPILED`.
+const FIDO2_COMPILED: bool = cfg!(feature = "fido2-hardware");
+
+/// `Select` over the `(label, available)` entries this build can carry
+/// out. Returns the chosen entry's index in the full `entries` list, so
+/// callers keep matching on stable indices.
+fn select_available(
+    theme: &ColorfulTheme,
+    prompt: &str,
+    entries: &[(&'static str, bool)],
+) -> Result<usize> {
+    let shown: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.1)
+        .map(|(i, _)| i)
+        .collect();
+    if shown.is_empty() {
+        return Err("none of these options is available in this build".into());
+    }
+    let labels: Vec<&'static str> = shown.iter().map(|&i| entries[i].0).collect();
+    let choice = Select::with_theme(theme)
+        .with_prompt(prompt)
+        .items(&labels)
+        .default(0)
+        .interact()?;
+    Ok(shown[choice])
+}
+
 fn ask_den_credential_kind(theme: &ColorfulTheme, label: &str) -> Result<DenCredKind> {
     let kinds = available_den_kinds();
     let items: Vec<&'static str> = kinds.iter().map(|k| k.label()).collect();
@@ -407,12 +458,11 @@ fn ask_den_credential_kind(theme: &ColorfulTheme, label: &str) -> Result<DenCred
 }
 
 fn available_den_kinds() -> Vec<DenCredKind> {
-    let mut v = vec![
-        DenCredKind::Passphrase,
-        DenCredKind::Fido2,
-        DenCredKind::HybridPqPassphrase,
-        DenCredKind::HybridPqFido2,
-    ];
+    let mut v = vec![DenCredKind::Passphrase, DenCredKind::HybridPqPassphrase];
+    if FIDO2_COMPILED {
+        v.insert(1, DenCredKind::Fido2);
+        v.push(DenCredKind::HybridPqFido2);
+    }
     #[cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
     {
         v.push(DenCredKind::Tpm2);
@@ -2501,26 +2551,54 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
 
     // TPM-bound kinds on Linux + Windows (via TBS). macOS uses Secure
     // Enclave instead. On platforms without a TPM backend the menu
-    // hides them rather than offering options that would just error.
-    let mut items: Vec<&'static str> = vec![
-        "Passphrase (most familiar; can add an authenticator backup later)",
-        "FIDO2 wrap-style (authenticator wraps a random MVK; rotation possible)",
-        "FIDO2-direct (MVK derived from the authenticator, no wrap; STRONGEST but no MVK-layer backup)",
-        "Hybrid passphrase + ML-KEM-768 (post-quantum; needs a separate .kyber seed file)",
-        "Hybrid FIDO2 + ML-KEM-768 (post-quantum; authenticator + .kyber seed file, closes the actual PQ gap)",
-        "Hybrid passphrase + ML-KEM-1024 (NIST Category 5, AES-256-equivalent PQ strength; .kyber seed file)",
-        "Hybrid FIDO2 + ML-KEM-1024 (NIST Category 5, AES-256-equivalent PQ strength; authenticator + .kyber seed)",
+    // hides them rather than offering options that would just error,
+    // and `select_available` hides the kinds this build has no FIDO2 /
+    // TPM / Secure Enclave support for.
+    let mut items: Vec<(&'static str, bool)> = vec![
+        ("Passphrase (most familiar; can add an authenticator backup later)", true),
+        ("FIDO2 wrap-style (authenticator wraps a random MVK; rotation possible)", FIDO2_COMPILED),
+        (
+            "FIDO2-direct (MVK derived from the authenticator, no wrap; STRONGEST but no MVK-layer backup)",
+            FIDO2_COMPILED,
+        ),
+        ("Hybrid passphrase + ML-KEM-768 (post-quantum; needs a separate .kyber seed file)", true),
+        (
+            "Hybrid FIDO2 + ML-KEM-768 (post-quantum; authenticator + .kyber seed file, closes the actual PQ gap)",
+            FIDO2_COMPILED,
+        ),
+        (
+            "Hybrid passphrase + ML-KEM-1024 (NIST Category 5, AES-256-equivalent PQ strength; .kyber seed file)",
+            true,
+        ),
+        (
+            "Hybrid FIDO2 + ML-KEM-1024 (NIST Category 5, AES-256-equivalent PQ strength; authenticator + .kyber seed)",
+            FIDO2_COMPILED,
+        ),
     ];
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
+        let tpm = luksbox_tpm::BACKEND_COMPILED;
+        let tpm_fido2 = tpm && FIDO2_COMPILED;
         items.extend_from_slice(&[
-            "TPM 2.0 (this machine; bootstrap passphrase kept as backup)",
-            "TPM 2.0 + PIN (this machine + memorised PIN; bootstrap passphrase kept as backup)",
-            "Fused TPM 2.0 + FIDO2 (TPM + authenticator both required; bootstrap passphrase kept as backup)",
-            "Hybrid TPM 2.0 + ML-KEM-768 (2-factor; bootstrap passphrase kept as backup)",
-            "Hybrid TPM 2.0 + ML-KEM-1024 (2-factor; bootstrap passphrase kept as backup)",
-            "3-factor TPM 2.0 + FIDO2 + ML-KEM-768 (paranoid; bootstrap passphrase kept as backup)",
-            "3-factor TPM 2.0 + FIDO2 + ML-KEM-1024 (paranoid; bootstrap passphrase kept as backup)",
+            ("TPM 2.0 (this machine; bootstrap passphrase kept as backup)", tpm),
+            (
+                "TPM 2.0 + PIN (this machine + memorised PIN; bootstrap passphrase kept as backup)",
+                tpm,
+            ),
+            (
+                "Fused TPM 2.0 + FIDO2 (TPM + authenticator both required; bootstrap passphrase kept as backup)",
+                tpm_fido2,
+            ),
+            ("Hybrid TPM 2.0 + ML-KEM-768 (2-factor; bootstrap passphrase kept as backup)", tpm),
+            ("Hybrid TPM 2.0 + ML-KEM-1024 (2-factor; bootstrap passphrase kept as backup)", tpm),
+            (
+                "3-factor TPM 2.0 + FIDO2 + ML-KEM-768 (paranoid; bootstrap passphrase kept as backup)",
+                tpm_fido2,
+            ),
+            (
+                "3-factor TPM 2.0 + FIDO2 + ML-KEM-1024 (paranoid; bootstrap passphrase kept as backup)",
+                tpm_fido2,
+            ),
         ]);
     }
     #[cfg(target_os = "macos")]
@@ -2532,24 +2610,49 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
         // display->logical remap right after the Select keeps the
         // dispatch `match kind_choice` numbering stable so its arms
         // never had to be renumbered.
+        let sep = luksbox_sep::BACKEND_COMPILED;
+        let sep_fido2 = sep && FIDO2_COMPILED;
         items.extend_from_slice(&[
-            "Secure Enclave (this Mac; bootstrap passphrase kept as backup)",
-            "Secure Enclave + Touch ID (this Mac + biometry; bootstrap passphrase kept as backup)",
-            "Hybrid Secure Enclave + ML-KEM-768 (2-factor; bootstrap passphrase kept as backup)",
-            "Hybrid Secure Enclave + ML-KEM-1024 (2-factor; bootstrap passphrase kept as backup)",
-            "Fused Secure Enclave + FIDO2 (both required; bootstrap passphrase kept as backup)",
-            "Fused Secure Enclave + passphrase (SEP + a slot passphrase; bootstrap passphrase kept as backup)",
-            "Hybrid Secure Enclave + FIDO2 + ML-KEM-768 (3-factor; bootstrap passphrase kept as backup)",
-            "Hybrid Secure Enclave + FIDO2 + ML-KEM-1024 (3-factor; bootstrap passphrase kept as backup)",
-            "Hybrid Secure Enclave + passphrase + ML-KEM-768 (3-factor; bootstrap passphrase kept as backup)",
-            "Hybrid Secure Enclave + passphrase + ML-KEM-1024 (3-factor; bootstrap passphrase kept as backup)",
+            ("Secure Enclave (this Mac; bootstrap passphrase kept as backup)", sep),
+            (
+                "Secure Enclave + Touch ID (this Mac + biometry; bootstrap passphrase kept as backup)",
+                sep,
+            ),
+            (
+                "Hybrid Secure Enclave + ML-KEM-768 (2-factor; bootstrap passphrase kept as backup)",
+                sep,
+            ),
+            (
+                "Hybrid Secure Enclave + ML-KEM-1024 (2-factor; bootstrap passphrase kept as backup)",
+                sep,
+            ),
+            (
+                "Fused Secure Enclave + FIDO2 (both required; bootstrap passphrase kept as backup)",
+                sep_fido2,
+            ),
+            (
+                "Fused Secure Enclave + passphrase (SEP + a slot passphrase; bootstrap passphrase kept as backup)",
+                sep,
+            ),
+            (
+                "Hybrid Secure Enclave + FIDO2 + ML-KEM-768 (3-factor; bootstrap passphrase kept as backup)",
+                sep_fido2,
+            ),
+            (
+                "Hybrid Secure Enclave + FIDO2 + ML-KEM-1024 (3-factor; bootstrap passphrase kept as backup)",
+                sep_fido2,
+            ),
+            (
+                "Hybrid Secure Enclave + passphrase + ML-KEM-768 (3-factor; bootstrap passphrase kept as backup)",
+                sep,
+            ),
+            (
+                "Hybrid Secure Enclave + passphrase + ML-KEM-1024 (3-factor; bootstrap passphrase kept as backup)",
+                sep,
+            ),
         ]);
     }
-    let kind_choice = Select::with_theme(theme)
-        .with_prompt("Initial keyslot kind")
-        .items(&items)
-        .default(0)
-        .interact()?;
+    let kind_choice = select_available(theme, "Initial keyslot kind", &items)?;
     // macOS: the displayed SEP list dropped the redundant
     // FIDO2+passphrase row (old logical 13) from the middle, so every
     // displayed SEP row at/after that position is shifted down by one.
@@ -4008,13 +4111,13 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
     if has_passphrase {
         options.push("Passphrase");
     }
-    if has_fido2 {
+    if has_fido2 && FIDO2_COMPILED {
         options.push("FIDO2 authenticator");
     }
     if has_hybrid_pq {
         options.push("Hybrid passphrase + ML-KEM (post-quantum)");
     }
-    if has_hybrid_pq_fido2 {
+    if has_hybrid_pq_fido2 && FIDO2_COMPILED {
         options.push("Hybrid FIDO2 + ML-KEM (post-quantum)");
     }
     // TPM unlock options only on Linux + Windows. The slot-detection
@@ -4071,6 +4174,13 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
         has_hybrid_pq_tpm2_fido2,
     );
     if options.is_empty() {
+        if header.keyslots.iter().any(|s| s.kind != SlotKind::Empty) {
+            return Err("this build cannot open any of this vault's keyslots: they need \
+                        FIDO2, TPM 2.0 or Secure Enclave support that this binary does not \
+                        have (the passphrase-only static Linux build has none). Use a \
+                        full LUKSbox build."
+                .into());
+        }
         return Err("vault has no usable keyslots".into());
     }
     // Pick the FIDO2-using method as default when a device is plugged
@@ -4098,6 +4208,10 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
     };
     if let Some(label) = &fido_device {
         eprintln!("  FIDO2 authenticator available: {label}");
+    } else if (has_fido2 || has_hybrid_pq_fido2) && !FIDO2_COMPILED {
+        eprintln!(
+            "  This build has no FIDO2 support, so the vault's FIDO2 keyslots are not offered."
+        );
     } else if has_fido2 || has_hybrid_pq_fido2 {
         eprintln!(
             "  No FIDO2 authenticator detected, plug in your security key if you \
@@ -5152,24 +5266,29 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
         // Windows). Build the menu list dynamically and remap the
         // choice index back to fixed action numbers so the match
         // arms below stay stable.
-        let mut menu: Vec<&'static str> = vec![
-            "Add a passphrase keyslot",
-            "Add a FIDO2 keyslot (wrap-style)",
-            "Add a passphrase + ML-KEM-768 keyslot",
-            "Add a passphrase + ML-KEM-1024 keyslot",
-            "Add a FIDO2 + ML-KEM-768 keyslot",
-            "Add a FIDO2 + ML-KEM-1024 keyslot",
+        // `select_available` hides the rows this build has no FIDO2 /
+        // TPM / Secure Enclave support for and still returns the full
+        // menu index, so the remap below is unchanged.
+        let mut menu: Vec<(&'static str, bool)> = vec![
+            ("Add a passphrase keyslot", true),
+            ("Add a FIDO2 keyslot (wrap-style)", FIDO2_COMPILED),
+            ("Add a passphrase + ML-KEM-768 keyslot", true),
+            ("Add a passphrase + ML-KEM-1024 keyslot", true),
+            ("Add a FIDO2 + ML-KEM-768 keyslot", FIDO2_COMPILED),
+            ("Add a FIDO2 + ML-KEM-1024 keyslot", FIDO2_COMPILED),
         ];
         #[cfg(any(target_os = "linux", target_os = "windows"))]
         {
+            let tpm = luksbox_tpm::BACKEND_COMPILED;
+            let tpm_fido2 = tpm && FIDO2_COMPILED;
             menu.extend_from_slice(&[
-                "Add a TPM 2.0 keyslot (this machine, no PIN)",
-                "Add a TPM 2.0 + PIN keyslot",
-                "Add a fused TPM 2.0 + FIDO2 keyslot (both required)",
-                "Add a hybrid TPM 2.0 + ML-KEM-768 keyslot",
-                "Add a hybrid TPM 2.0 + ML-KEM-1024 keyslot",
-                "Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-768 keyslot",
-                "Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-1024 keyslot",
+                ("Add a TPM 2.0 keyslot (this machine, no PIN)", tpm),
+                ("Add a TPM 2.0 + PIN keyslot", tpm),
+                ("Add a fused TPM 2.0 + FIDO2 keyslot (both required)", tpm_fido2),
+                ("Add a hybrid TPM 2.0 + ML-KEM-768 keyslot", tpm),
+                ("Add a hybrid TPM 2.0 + ML-KEM-1024 keyslot", tpm),
+                ("Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-768 keyslot", tpm_fido2),
+                ("Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-1024 keyslot", tpm_fido2),
             ]);
         }
         #[cfg(target_os = "macos")]
@@ -5179,29 +5298,27 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             // passphrase as the extra factor, never both. The remap below
             // skips action 22 so the `match action` dispatch numbering
             // stays stable and its arms never had to be renumbered.
+            let sep = luksbox_sep::BACKEND_COMPILED;
+            let sep_fido2 = sep && FIDO2_COMPILED;
             menu.extend_from_slice(&[
-                "Add a Secure Enclave keyslot (this Mac)",
-                "Add a Secure Enclave + Touch ID keyslot",
-                "Add a hybrid Secure Enclave + ML-KEM-768 keyslot",
-                "Add a hybrid Secure Enclave + ML-KEM-1024 keyslot",
-                "Add a fused Secure Enclave + FIDO2 keyslot (both required)",
-                "Add a fused Secure Enclave + passphrase keyslot",
-                "Add a hybrid Secure Enclave + FIDO2 + ML-KEM-768 keyslot",
-                "Add a hybrid Secure Enclave + FIDO2 + ML-KEM-1024 keyslot",
-                "Add a hybrid Secure Enclave + passphrase + ML-KEM-768 keyslot",
-                "Add a hybrid Secure Enclave + passphrase + ML-KEM-1024 keyslot",
+                ("Add a Secure Enclave keyslot (this Mac)", sep),
+                ("Add a Secure Enclave + Touch ID keyslot", sep),
+                ("Add a hybrid Secure Enclave + ML-KEM-768 keyslot", sep),
+                ("Add a hybrid Secure Enclave + ML-KEM-1024 keyslot", sep),
+                ("Add a fused Secure Enclave + FIDO2 keyslot (both required)", sep_fido2),
+                ("Add a fused Secure Enclave + passphrase keyslot", sep),
+                ("Add a hybrid Secure Enclave + FIDO2 + ML-KEM-768 keyslot", sep_fido2),
+                ("Add a hybrid Secure Enclave + FIDO2 + ML-KEM-1024 keyslot", sep_fido2),
+                ("Add a hybrid Secure Enclave + passphrase + ML-KEM-768 keyslot", sep),
+                ("Add a hybrid Secure Enclave + passphrase + ML-KEM-1024 keyslot", sep),
             ]);
         }
         menu.extend_from_slice(&[
-            "Update an existing keyslot's secret in place",
-            "Revoke a keyslot",
-            "Back to vault menu",
+            ("Update an existing keyslot's secret in place", true),
+            ("Revoke a keyslot", true),
+            ("Back to vault menu", true),
         ]);
-        let choice = Select::with_theme(theme)
-            .with_prompt("Keyslot action")
-            .items(&menu)
-            .default(0)
-            .interact()?;
+        let choice = select_available(theme, "Keyslot action", &menu)?;
 
         // Action-number mapping. Menu choices 0..=5 are always the
         // six "no TPM needed" rows (passphrase, FIDO2, and the four
@@ -5636,14 +5753,14 @@ fn update_keyslot_action(theme: &ColorfulTheme, cont: &mut Container) -> Result<
         );
     }
 
-    let target_options: &[&str] = match existing {
+    let target_options: &[(&'static str, bool)] = match existing {
         SlotKind::Passphrase => &[
-            "Replace with a fresh passphrase (same kind)",
-            "Convert this slot to a FIDO2 wrap-style keyslot",
+            ("Replace with a fresh passphrase (same kind)", true),
+            ("Convert this slot to a FIDO2 wrap-style keyslot", FIDO2_COMPILED),
         ],
         SlotKind::Fido2HmacSecret => &[
-            "Re-enroll a FIDO2 credential (same kind)",
-            "Convert this slot to a passphrase keyslot",
+            ("Re-enroll a FIDO2 credential (same kind)", FIDO2_COMPILED),
+            ("Convert this slot to a passphrase keyslot", true),
         ],
         other => {
             return Err(format!(
@@ -5653,11 +5770,7 @@ fn update_keyslot_action(theme: &ColorfulTheme, cont: &mut Container) -> Result<
             .into());
         }
     };
-    let target_pick = Select::with_theme(theme)
-        .with_prompt("New kind")
-        .items(target_options)
-        .default(0)
-        .interact()?;
+    let target_pick = select_available(theme, "New kind", target_options)?;
     let target_passphrase = matches!(
         (existing, target_pick),
         (SlotKind::Passphrase, 0) | (SlotKind::Fido2HmacSecret, 1)

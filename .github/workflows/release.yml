@@ -2563,6 +2563,83 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # Static Linux CLI WITH FIDO2 + TPM 2.0 (x86_64 / aarch64): libfido2,
+  # tpm2-tss and their dependencies compiled into the binary, built inside
+  # an Alpine container by scripts/static_fido2_tpm_alpine.sh (GitHub #34).
+  # Optional for now: the release job publishes it when it succeeds and
+  # goes ahead without it when it fails, so the passphrase-only static
+  # build above stays the fallback.
+  static-linux-fido2-tpm:
+    name: ${{ matrix.target }} (static, FIDO2 + TPM)
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: x86_64
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            arch: aarch64
+            runner: ubuntu-24.04-arm
+    env:
+      ARCH: ${{ matrix.arch }}
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install swtpm and file
+        run: sudo apt-get update && sudo apt-get install -y swtpm file
+
+      - name: Build static binary (Alpine container)
+        run: scripts/build_static_musl.sh --fido2-tpm --arch "$ARCH" --out dist-static
+
+      - name: Smoke test (passphrase vault, FIDO2 enumeration, TPM via swtpm)
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          tar -xzf dist-static/luksbox-v*-"$ARCH"-linux-musl-static-fido2-tpm.tar.gz -C "$work"
+          bin="$(echo "$work"/luksbox-*/luksbox)"
+          "$bin" --version
+          echo "static build smoke test" > "$work/in.txt"
+          export LUKSBOX_PASSPHRASE="static-smoke-$RANDOM-$RANDOM"
+          "$bin" create "$work/v.lbx" </dev/null
+          "$bin" put "$work/v.lbx" "$work/in.txt" /in.txt </dev/null
+          "$bin" get "$work/v.lbx" /in.txt "$work/out.txt" </dev/null
+          cmp "$work/in.txt" "$work/out.txt"
+          # libfido2 + libudev-zero are linked in: enumeration runs (and
+          # finds no key on the runner) instead of "not compiled in".
+          "$bin" list-fido2-devices </dev/null
+          # TPM 2.0 round trip against swtpm through tpm2-tss's built-in
+          # swtpm TCTI (a static binary cannot dlopen one).
+          mkdir "$work/tpm"
+          swtpm socket --tpm2 --tpmstate dir="$work/tpm" \
+              --server type=unixio,path="$work/tpm.sock" \
+              --ctrl type=unixio,path="$work/tpm.ctrl" \
+              --flags not-need-init,startup-clear --daemon
+          for _ in $(seq 50); do [ -S "$work/tpm.sock" ] && break; sleep 0.1; done
+          export TCTI_NAME_CONF="swtpm:path=$work/tpm.sock"
+          "$bin" enroll "$work/v.lbx" --kind tpm2 </dev/null
+          "$bin" ls "$work/v.lbx" --tpm2 / </dev/null | grep -q in.txt
+
+      - name: Add a version-less copy for releases/latest/download links
+        run: |
+          set -euo pipefail
+          cd dist-static
+          cp luksbox-v*-"$ARCH"-linux-musl-static-fido2-tpm.tar.gz "luksbox-$TARGET-fido2-tpm.tar.gz"
+          ls -l
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}-static-fido2-tpm
+          path: dist-static/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
   # GUI AppImage (x86_64 / aarch64): one file for distributions the
   # .deb / .rpm do not cover. Built on Ubuntu 22.04, the oldest glibc we
   # target (an AppImage still uses the host glibc). Same feature set as
@@ -2690,9 +2767,17 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build, static-linux, appimage]
+    needs: [build, static-linux, static-linux-fido2-tpm, appimage]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    # `static-linux-fido2-tpm` is optional (GitHub #34): its tarballs are
+    # published when it succeeds, and the release still goes out when it
+    # fails. Every other job must have succeeded.
+    if: >-
+      always()
+      && startsWith(github.ref, 'refs/tags/v')
+      && needs.build.result == 'success'
+      && needs.static-linux.result == 'success'
+      && needs.appimage.result == 'success'
     permissions:
       contents: write       # to create the release + upload assets
       # The two scopes below enable GitHub Artifact Attestations
@@ -2717,6 +2802,40 @@ jobs:
 
       - name: List artifacts
         run: ls -lh artifacts/
+
+      - name: Add version-less copies for releases/latest/download links
+        # `.../releases/latest/download/<name>` only resolves for a name
+        # that is the same in every release, so the docs can link one URL
+        # that always serves the newest stable build (GitHub's `latest`
+        # skips pre-releases). The musl tarballs and the AppImages get
+        # theirs in their own jobs; this covers the rest (GitHub #34) by
+        # dropping the version from each name:
+        #   luksbox-v1.2.3-x86_64-windows.zip -> luksbox-x86_64-windows.zip
+        #   luksbox_1.2.3-1_noble_amd64.deb   -> luksbox_noble_amd64.deb
+        #   luksbox-1.2.3-1.x86_64.rpm        -> luksbox.x86_64.rpm
+        # Runs before the checksum and attestation steps so the copies
+        # are covered by both.
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          cd artifacts
+          for f in *; do
+            stable=""
+            case "$f" in
+              *.AppImage | *-linux-musl-static*.tar.gz) continue ;;
+              luksbox-"$TAG"-*) stable="luksbox-${f#luksbox-"$TAG"-}" ;;
+            esac
+            if [[ "$f" =~ ^luksbox_[^_]+_([a-z]+)_(amd64|arm64)\.deb$ ]]; then
+              stable="luksbox_${BASH_REMATCH[1]}_${BASH_REMATCH[2]}.deb"
+            elif [[ "$f" =~ ^luksbox-[0-9][^/]*\.(x86_64|aarch64)\.rpm$ ]]; then
+              stable="luksbox.${BASH_REMATCH[1]}.rpm"
+            fi
+            if [ -n "$stable" ] && [ ! -e "$stable" ]; then
+              cp "$f" "$stable"
+            fi
+          done
+          ls -lh
 
       - name: Compute SHA-256 checksums
         run: |
@@ -2911,6 +3030,11 @@ jobs:
               (needs `fusermount3`), but not FIDO2 or TPM 2.0 keyslots.
               Also published as `luksbox-x86_64-unknown-linux-musl.tar.gz`
               / `luksbox-aarch64-unknown-linux-musl.tar.gz`.
+              The `-linux-musl-static-fido2-tpm` tarballs (also
+              `luksbox-<arch>-unknown-linux-musl-fido2-tpm.tar.gz`) are
+              the same static binary with FIDO2 security keys and TPM
+              2.0 keyslots built in; nothing to install, only access to
+              `/dev/hidraw*` / `/dev/tpmrm0` is needed.
 
             **macOS (Apple Silicon):** two .dmg variants, one per
               FUSE backend. Pick one based on which FUSE provider you

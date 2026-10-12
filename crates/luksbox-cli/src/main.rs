@@ -749,6 +749,10 @@ enum Command {
         mountpoint: PathBuf,
     },
     /// Unmount a luksbox mountpoint (wraps fusermount3 -u on Linux, umount on macOS).
+    ///
+    /// Windows: press Ctrl-C in the window running `luksbox mount`
+    /// instead. WinFsp has no cross-process unmount, so this command
+    /// cannot release a mount held by another process.
     Umount { mountpoint: PathBuf },
     /// Create a deniable-header file: an 8 KiB header where every
     /// on-disk byte is indistinguishable from random output. See
@@ -6846,9 +6850,11 @@ fn cmd_mount(
             );
         }
         (None, false) => {
-            return Err("missing <mountpoint>. Either give one explicitly or pass \
-                 `--private-mount` (macOS+FUSE-T only) to derive \
-                 ~/Library/LUKSbox/Mounts/<vault-name>."
+            return Err("missing <mountpoint>. Linux/macOS: give an existing empty \
+                 directory. Windows: give a free drive letter (e.g. \
+                 `luksbox mount vault.lbx Z:`) or a path that does not exist yet. \
+                 macOS+FUSE-T only: `--private-mount` derives \
+                 ~/Library/LUKSbox/Mounts/<vault-name> instead."
                 .into());
         }
         (Some(p), false) => p.to_path_buf(),

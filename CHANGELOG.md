@@ -14,6 +14,57 @@ canonical record.
 
 ---
 
+## [Unreleased]
+
+### Added
+
+- **Static Linux CLI with FIDO2 + TPM 2.0 (GitHub #34).** A second
+  static musl build, `luksbox-<arch>-unknown-linux-musl-fido2-tpm.tar.gz`,
+  has libfido2 and tpm2-tss compiled in (with OpenSSL, libcbor, zlib and
+  libudev-zero, a daemonless libudev), so FIDO2 security keys and TPM 2.0
+  keyslots work on any distribution with nothing installed; only access
+  to `/dev/hidraw*` / `/dev/tpmrm0` is needed. tpm2-tss is built with
+  `--enable-nodl` (its TCTIs linked in, since a static binary cannot
+  dlopen them). Built in an Alpine container from SHA-256-pinned sources
+  by `scripts/build_static_musl.sh --fido2-tpm`; CI checks FIDO2
+  enumeration and a TPM round trip against swtpm. The passphrase-only
+  static build is still published. The wizard now also warns at startup
+  when a TPM-enabled build finds no TPM device.
+
+- **GUI file "Download..." froze on Linux (GitHub #35).** The save
+  dialog for a single file passed an "All files" filter with no
+  patterns, which xdg-desktop-portal rejects ("invalid filter: no
+  filters"). Every file save therefore skipped the portal and fell back
+  to `zenity`, and the GUI froze in that path on Fedora 44, while folder
+  downloads (no filter) worked. The save dialog now has no filters on
+  Linux, like every other dialog in the GUI; Windows and macOS keep their
+  extension filter.
+- **CLI `mount` / `umount` help on Windows (GitHub #37).** A missing
+  mountpoint now says what each platform expects (a free drive letter
+  such as `Z:` on Windows) instead of only pointing at the macOS-only
+  `--private-mount`. `umount --help` explains that a Windows mount is
+  released with Ctrl-C in the `mount` window, since WinFsp has no
+  cross-process unmount.
+- **Wizard offered keyslots the build cannot use (GitHub #34).** The
+  passphrase-only static musl CLI has no FIDO2, TPM 2.0 or Secure
+  Enclave support, but
+  the wizard's create, unlock, add-keyslot, update and deniable menus
+  still listed those kinds and only failed after the prompts. They are
+  now hidden when the backend is not compiled in (as the GUI already
+  did), the wizard says so at startup, and a vault whose keyslots all
+  need missing hardware gets an explicit error instead of "vault has no
+  usable keyslots".
+
+### Changed
+
+- **Stable download names for every asset (GitHub #34).** Each release
+  now also publishes version-less copies of the Linux `.deb` / `.rpm` /
+  tarballs and the Windows and macOS installers (for example
+  `luksbox_noble_amd64.deb`, `luksbox.x86_64.rpm`,
+  `luksbox-x86_64-windows.zip`), alongside the existing musl and
+  AppImage ones, so `releases/latest/download/<name>` links in the docs
+  keep working across releases.
+
 ## [v0.6.0-rc.1] - 2026-10-10
 
 First release candidate of the v0.6.0 line. The minor bump marks two

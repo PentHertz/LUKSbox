@@ -7915,25 +7915,34 @@ impl LuksboxApp {
         // file-type filter matches it - so "foo.pptx" gets saved
         // as "foo" with no extension. Registering the extension as
         // a filter makes the dialog treat it as a known type and
-        // preserves it. macOS / Linux handle pre-filled names
-        // verbatim regardless of filters but the filter is harmless
-        // there. The "All files" fallback lets the user override
-        // the suggested type.
+        // preserves it. The "All files" fallback lets the user
+        // override the suggested type.
+        //
+        // Linux / BSD get no filters at all (issue #35). rfd turns the
+        // empty "All files" list into a portal filter with no
+        // patterns, which xdg-desktop-portal rejects ("invalid filter:
+        // no filters"), so every file save skipped the portal and fell
+        // back to zenity, and the GUI froze in that path on Fedora 44
+        // while folder picks (no filters) worked. `["*"]` is
+        // no better: rfd's zenity fallback emits it as `*.*`, hiding
+        // extensionless files. The portal keeps the pre-filled name
+        // verbatim without a filter, and `get_file_to` restores a
+        // dropped extension anyway.
         let mut dialog = rfd::FileDialog::new()
             .set_title("Save extracted file as")
             .set_file_name(name);
-        if let Some(ext) = std::path::Path::new(name)
-            .extension()
-            .and_then(|s| s.to_str())
-        {
-            let filter_label = format!(".{ext} file");
-            dialog = dialog.add_filter(&filter_label, &[ext]);
+        if cfg!(any(target_os = "windows", target_os = "macos")) {
+            if let Some(ext) = std::path::Path::new(name)
+                .extension()
+                .and_then(|s| s.to_str())
+            {
+                let filter_label = format!(".{ext} file");
+                dialog = dialog.add_filter(&filter_label, &[ext]);
+            }
+            // Empty extension list = "match anything" on the Windows
+            // and macOS backends, including extensionless files.
+            dialog = dialog.add_filter("All files", &[] as &[&str]);
         }
-        // Empty extension list = "match anything" on most rfd
-        // backends, including extensionless files. Literal `["*"]`
-        // is treated as a `*.*` glob on GTK portals and silently
-        // hides extensionless files (Fedora user report).
-        dialog = dialog.add_filter("All files", &[] as &[&str]);
         match file_dialog::save_file(dialog) {
             Picked::Path(local) => self.get_file_to(name, local),
             Picked::Cancelled => {}
