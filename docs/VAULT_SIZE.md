@@ -61,6 +61,13 @@ Refused for deniable vaults (`ShrinkDeniable`): a vault file that
 shrinks over time hints that data was deleted from it. Refused in
 tolerant recovery mode, like every mutation.
 
+`Vfs::shrink_allow_deniable` does the same for a deniable vault, on an
+explicit request only: the GUI's "Vault size" dialog offers "Give back
+... anyway" once the user ticks that they understand a smaller file
+reveals deletions. A deniable file holds one vault with nothing after
+its data area, so cutting the free tail is safe for the format. Nothing
+shrinks a deniable vault on its own (`finish` never does).
+
 `Vfs::finish` is what the three mount backends run at unmount: a flush,
 then whatever the vault's `ShrinkControl` mode says (`ShrinkOnFinish`):
 keep (default), give back (`set_shrink_on_close(true)`, `mount

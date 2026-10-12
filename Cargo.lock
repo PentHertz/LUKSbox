@@ -2623,6 +2623,7 @@ dependencies = [
 name = "luksbox-format"
 version = "0.6.0-rc.1"
 dependencies = [
+ "chacha20",
  "fs2",
  "hmac",
  "libc",

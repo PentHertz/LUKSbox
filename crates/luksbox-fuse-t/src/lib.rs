@@ -375,6 +375,13 @@ pub struct MountOptions {
     /// `-o volname=<name>`. macOS-specific, sets the volume name in
     /// Finder.
     pub volname: Option<String>,
+    /// `-o rwsize=<bytes>`. Read/write size FUSE-T's NFS server
+    /// advertises, which caps each READ/WRITE the macOS NFS client
+    /// sends. FUSE-T's own default is 32 KiB. The client also sends an
+    /// NFS COMMIT (which FUSE-T delivers as `fsync`) after a fixed
+    /// number of uncommitted write buffers, so the buffer size sets how
+    /// often a large copy hits `fsync`. `None` leaves FUSE-T's default.
+    pub rwsize: Option<u32>,
 }
 
 impl Default for MountOptions {
@@ -387,6 +394,9 @@ impl Default for MountOptions {
             nodev: true,
             noatime: false,
             volname: None,
+            // 1 MiB. At FUSE-T's 32 KiB default a 190 MB copy drew 43
+            // COMMIT-driven fsyncs; at 1 MiB it draws 2.
+            rwsize: Some(1024 * 1024),
         }
     }
 }

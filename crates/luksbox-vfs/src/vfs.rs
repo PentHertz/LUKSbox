@@ -4085,12 +4085,27 @@ impl Vfs {
     /// that, and only then truncates the file. A crash in between leaves
     /// a file longer than needed, never metadata pointing past its end.
     /// Refused for deniable vaults: a vault file that shrinks over time
-    /// hints that data was deleted from it.
+    /// hints that data was deleted from it. See `shrink_allow_deniable`.
     pub fn shrink(&mut self) -> Result<u64, Error> {
         self.ensure_writable()?;
         if self.container.is_deniable() {
             return Err(Error::ShrinkDeniable);
         }
+        self.shrink_tail()
+    }
+
+    /// `shrink`, also for a deniable vault. Only for an explicit request
+    /// from a user who was told what it reveals (`ShrinkDeniable`): anyone
+    /// who compares the file's size across two points in time learns
+    /// that data was deleted, about how much, and when. `finish` never
+    /// calls this. Safe for the format: a deniable file holds one vault,
+    /// with nothing stored after its data area.
+    pub fn shrink_allow_deniable(&mut self) -> Result<u64, Error> {
+        self.ensure_writable()?;
+        self.shrink_tail()
+    }
+
+    fn shrink_tail(&mut self) -> Result<u64, Error> {
         self.flush()?;
         let keep = self.first_unused_tail_slot();
         if keep < self.tree.next_chunk_id {
@@ -10114,5 +10129,50 @@ mod tests {
         vfs.set_shrink_on_close(true);
         assert_eq!(vfs.finish().unwrap(), 0);
         assert_eq!(file_len(&path), before);
+    }
+
+    /// The explicit opt-in gives back a deniable vault's free tail, and
+    /// the vault reopens with its remaining file intact.
+    #[test]
+    fn deniable_vault_shrinks_when_explicitly_allowed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deniable-forced-shrink.bin");
+        let cont = Container::create_with_passphrase_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            0,
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let data_offset = vfs.container().data_offset();
+        let root = vfs.root_id();
+        let keep = vfs.create(root, "keep").unwrap();
+        vfs.write(keep, 0, &vec![7u8; FOUR_CHUNKS]).unwrap();
+        let gone = vfs.create(root, "gone").unwrap();
+        vfs.write(gone, 0, &vec![1u8; FOUR_CHUNKS]).unwrap();
+        vfs.flush().unwrap();
+        assert_eq!(file_len(&path), data_offset + 8 * SLOT);
+        vfs.unlink(root, "gone").unwrap();
+        assert_eq!(vfs.shrink_allow_deniable().unwrap(), 4 * SLOT);
+        assert_eq!(file_len(&path), data_offset + 4 * SLOT);
+        vfs.close().unwrap();
+
+        let cont = Container::open_with_passphrase_deniable(
+            &path,
+            None,
+            b"pw",
+            test_params(),
+            CipherSuite::Aes256Gcm,
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let keep = vfs.lookup(vfs.root_id(), "keep").unwrap();
+        let mut buf = vec![0u8; FOUR_CHUNKS];
+        assert_eq!(vfs.read(keep, 0, &mut buf).unwrap(), FOUR_CHUNKS);
+        assert!(buf.iter().all(|&b| b == 7));
+        assert!(vfs.lookup(vfs.root_id(), "gone").is_err());
     }
 }

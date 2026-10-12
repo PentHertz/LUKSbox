@@ -13300,6 +13300,9 @@ fn can_shrink(vfs: &luksbox_vfs::Vfs) -> bool {
 /// State of the "Vault size" dialog.
 struct SizeDialog {
     input: SizeLimitInput,
+    /// Deniable vault: the user ticked "I understand" to give back the
+    /// free space anyway (`Vfs::shrink_allow_deniable`).
+    deniable_ack: bool,
 }
 
 /// "Give back free space?" (Ask mode), asked before locking an open
@@ -13322,6 +13325,7 @@ impl LuksboxApp {
         if let Some(v) = &self.vault {
             self.size_dialog = Some(SizeDialog {
                 input: SizeLimitInput::new(v.vfs.max_vault_size()),
+                deniable_ack: false,
             });
         }
     }
@@ -13367,6 +13371,7 @@ impl LuksboxApp {
         };
         let shrinkable = can_shrink(&v.vfs);
         let deniable = v.vfs.container().is_deniable();
+        let tolerant = !v.vfs.tolerated_inodes().is_empty();
         let min = v.vfs.minimum_vault_size();
         let max = report.file_size.saturating_add(free.unwrap_or(0));
 
@@ -13437,12 +13442,41 @@ impl LuksboxApp {
                 if deniable {
                     ui.label(
                         RichText::new(
-                            "Deniable vaults are never shrunk: a file that shrinks would \
-                             reveal that data was deleted.",
+                            "Deniable vaults are not shrunk on their own: anyone who sees the \
+                             file at two points in time (backups, sync history, disk images) \
+                             would learn from a smaller file that data was deleted, about how \
+                             much, and when.",
                         )
-                        .color(theme::DIM)
+                        .color(theme::WARN)
                         .size(12.0),
                     );
+                    if report.reclaimable > 0 && !tolerant {
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "{} at the end of the vault file is unused.",
+                                format_size(report.reclaimable)
+                            ))
+                            .color(theme::DIM)
+                            .size(12.0),
+                        );
+                        ui.checkbox(
+                            &mut dialog.deniable_ack,
+                            "I understand that a smaller file reveals deletions",
+                        );
+                        if ui
+                            .add_enabled(
+                                dialog.deniable_ack,
+                                ghost_button(format!(
+                                    "Give back {} anyway",
+                                    format_size(report.reclaimable)
+                                )),
+                            )
+                            .clicked()
+                        {
+                            shrink = true;
+                        }
+                    }
                 } else if report.reclaimable > 0 && shrinkable {
                     ui.label(
                         RichText::new(format!(
@@ -13528,7 +13562,17 @@ impl LuksboxApp {
             }
         }
         if shrink && let Some(v) = self.vault.as_mut() {
-            match v.vfs.shrink() {
+            // The deniable button is only enabled once the user ticked
+            // the acknowledgement above.
+            let r = if v.vfs.container().is_deniable() {
+                v.vfs.shrink_allow_deniable()
+            } else {
+                v.vfs.shrink()
+            };
+            if let Some(d) = self.size_dialog.as_mut() {
+                d.deniable_ack = false;
+            }
+            match r {
                 Ok(freed) => self.toast_ok(format!("gave back {}", format_size(freed))),
                 Err(e) => self.toast_err(format!("could not give back free space: {e}")),
             }

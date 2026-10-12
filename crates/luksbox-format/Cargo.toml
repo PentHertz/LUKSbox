@@ -20,6 +20,8 @@ test-injection = []
 luksbox-core = { path = "../luksbox-core" }
 luksbox-pq = { path = "../luksbox-pq" }
 rand_core.workspace = true
+# Keystream for the metadata region's padding (`metadata::fill_padding`).
+chacha20.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 hmac.workspace = true

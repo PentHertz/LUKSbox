@@ -748,6 +748,9 @@ pub(crate) fn run_mount<F: Filesystem + 'static>(
     if let Some(volname) = &options.volname {
         o_parts.push(format!("volname={volname}"));
     }
+    if let Some(rwsize) = options.rwsize {
+        o_parts.push(format!("rwsize={rwsize}"));
+    }
     if !o_parts.is_empty() {
         owned.push(CString::new("-o").unwrap());
         owned.push(CString::new(o_parts.join(",")).unwrap());

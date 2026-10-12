@@ -507,11 +507,19 @@ impl Filesystem for LuksboxFuseTFs {
     }
 
     fn flush(&self, _path: &Path) -> Result<(), Errno> {
+        // Called on close(2), which POSIX does not require to be
+        // durable; that is fsync()'s job. Deferred like release() and
+        // like fuse.rs's flush(); eager only in --sync mode. Each eager
+        // vfs.flush() rewrites the whole metadata region with fsyncs,
+        // which made every file closed on the mount cost about 300 ms.
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
-        vfs.flush().map_err(|e| Self::vfs_errno(&e))
+        self.maybe_flush_now(&mut vfs)
     }
 
     fn fsync(&self, _path: &Path, _datasync: bool) -> Result<(), Errno> {
+        // Always durable, as in fuse.rs. Under FUSE-T this also runs on
+        // the NFS COMMITs the macOS client sends on its own during a
+        // large write; `MountOptions::rwsize` keeps those rare.
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
         vfs.flush().map_err(|e| Self::vfs_errno(&e))
     }

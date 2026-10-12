@@ -18,6 +18,12 @@ canonical record.
 
 ### Added
 
+- **Give back a deniable vault's free space, on request.** Deniable
+  vaults are still never shrunk on their own, since a file that gets
+  smaller tells anyone comparing it over time that data was deleted. The
+  GUI's "Vault size" dialog now explains that more plainly and, once you
+  tick that you understand it, offers "Give back ... anyway"
+  (`Vfs::shrink_allow_deniable`).
 - **Static Linux CLI with FIDO2 + TPM 2.0 (GitHub #34).** A second
   static musl build, `luksbox-<arch>-unknown-linux-musl-fido2-tpm.tar.gz`,
   has libfido2 and tpm2-tss compiled in (with OpenSSL, libcbor, zlib and
@@ -82,6 +88,25 @@ canonical record.
 
 ### Fixed
 
+- **Copying files into a FUSE-T mount on macOS was 4-5x slower than
+  importing them from the browser.** FUSE-T serves the vault over NFS,
+  and with its default 32 KiB read/write size the macOS NFS client sent
+  a COMMIT about every 4 MB of a large copy. Each COMMIT reached the
+  vault as an `fsync`, and each `fsync` rewrote the whole metadata
+  region with full fsyncs (about 300 ms). A 190 MB copy took 17 s, 13 s
+  of it in 43 such fsyncs. The FUSE-T mount now asks for a 1 MiB
+  read/write size (`rwsize`), which cuts that to 2 fsyncs and the copy
+  to under 4 s, the same as a browser import. Closing a file on a
+  FUSE-T mount also no longer forces its own metadata flush (as on the
+  libfuse backend, `close()` is deferred to the 30 s flush timer and
+  unmount; `fsync`, or `luksbox mount --sync`, is still durable).
+  Every metadata save is also about 2.5x faster, on every backend: the
+  random padding of the metadata region is now a ChaCha20 keystream
+  under a fresh OS-random key instead of OS RNG output, which on macOS
+  meant about 262,000 256-byte `getentropy` calls per save. Copying 300
+  small files into a FUSE-T mount went from 180 s to 37 s; what remains
+  is the COMMIT the NFS client sends when it closes each file, which is
+  still a durable save.
 - **`luksbox umount` on Windows could return before the final flush.**
   WinFsp removes the drive letter before it tears the file system down,
   and `umount` returned as soon as the drive letter was gone, while the

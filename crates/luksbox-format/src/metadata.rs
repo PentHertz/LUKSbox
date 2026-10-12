@@ -224,9 +224,7 @@ pub fn write_metadata_opts(
     // indistinguishable from ciphertext to an external observer.
     // RNG failure here is non-cryptographic (the AEAD nonce above used
     // try_fill_bytes); document the panic explicitly.
-    OsRng
-        .try_fill_bytes(region)
-        .expect("OS RNG failure during metadata padding fill");
+    fill_padding(region);
     region[..NONCE_LEN].copy_from_slice(&nonce);
     let stored_len = if mask_len {
         ct_len ^ u64::from_le_bytes(len_mask(mvk, header_salt, &nonce))
@@ -236,6 +234,25 @@ pub fn write_metadata_opts(
     region[NONCE_LEN..NONCE_LEN + LEN_FIELD_LEN].copy_from_slice(&stored_len.to_le_bytes());
     region[NONCE_LEN + LEN_FIELD_LEN..NONCE_LEN + LEN_FIELD_LEN + ct.len()].copy_from_slice(&ct);
     Ok(())
+}
+
+/// Fill `region` with random-looking padding for `write_metadata_opts`:
+/// a ChaCha20 keystream under a fresh key from the OS RNG, rather than
+/// OS RNG output directly. macOS caps getentropy(2) at 256 bytes a call,
+/// so filling the 64 MiB default region took about 262k syscalls
+/// (~250 ms) on every flush, and a FUSE-T mount flushes once per file
+/// closed. A keystream under a single-use random key is
+/// indistinguishable from uniform bytes, which is all the padding needs.
+/// The zero IV is safe because the key is never reused, and the region
+/// (at most `MAX_METADATA_SIZE`) is far below ChaCha20's 256 GiB limit.
+fn fill_padding(region: &mut [u8]) {
+    use chacha20::cipher::{KeyIvInit, StreamCipher};
+    let mut key = Zeroizing::new([0u8; 32]);
+    OsRng
+        .try_fill_bytes(&mut key[..])
+        .expect("OS RNG failure during metadata padding fill");
+    region.fill(0);
+    chacha20::ChaCha20::new(&(*key).into(), &[0u8; 12].into()).apply_keystream(region);
 }
 
 /// Parse and decrypt an on-disk metadata region. Returned plaintext is
@@ -393,6 +410,45 @@ mod tests {
         write_metadata(CipherSuite::Aes256Gcm, &mvk, &salt, b"", &mut region).unwrap();
         let pt = read_metadata(CipherSuite::Aes256Gcm, &mvk, &salt, &region).unwrap();
         assert_eq!(&**pt, b"");
+    }
+
+    /// The padding after the blob looks uniform (every byte value about
+    /// equally common) and is fresh on every write, so two snapshots of
+    /// the region differ throughout, not just where the blob is.
+    #[test]
+    fn metadata_padding_is_uniform_and_fresh_per_write() {
+        let mvk = MasterVolumeKey::from_bytes([0x55; 32]);
+        let salt = [0x66u8; 32];
+        let pt = b"same blob both times";
+        let pad_start = METADATA_OVERHEAD + pt.len();
+        let mut a = vec![0u8; 1 << 20];
+        let mut b = vec![0u8; 1 << 20];
+        write_metadata(CipherSuite::Aes256GcmSiv, &mvk, &salt, pt, &mut a).unwrap();
+        write_metadata(CipherSuite::Aes256GcmSiv, &mvk, &salt, pt, &mut b).unwrap();
+        let mut counts = [0u64; 256];
+        for &x in &a[pad_start..] {
+            counts[x as usize] += 1;
+        }
+        let expected = (a.len() - pad_start) as f64 / 256.0;
+        let chi2: f64 = counts
+            .iter()
+            .map(|&c| (c as f64 - expected).powi(2) / expected)
+            .sum();
+        // 255 degrees of freedom: mean 255, and 400 is far past p = 1e-6.
+        assert!(
+            chi2 < 400.0,
+            "padding byte histogram is skewed: chi2 = {chi2}"
+        );
+        let same = a[pad_start..]
+            .iter()
+            .zip(&b[pad_start..])
+            .filter(|(x, y)| x == y)
+            .count();
+        // Independent uniform bytes match 1 time in 256.
+        assert!(
+            same < (a.len() - pad_start) / 128,
+            "padding repeats across writes"
+        );
     }
 
     #[test]
