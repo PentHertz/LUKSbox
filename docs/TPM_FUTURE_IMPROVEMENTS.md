@@ -47,14 +47,19 @@ design constraints already written down.
 >   `TryFrom<&[u8]>` in favour of `Auth::from_bytes()`. Bonus: 8.0
 >   buffers store `Zeroizing<Vec<u8>>`, so the Rust-side PIN/secret
 >   copies are now wiped on drop (7.x only did this for some types).
-> - **The bundled MSBuild build has two sharp edges**: (a) tpm2-tss's
+> - **The bundled MSBuild build has three sharp edges**: (a) tpm2-tss's
 >   VS solution hardcodes OpenSSL at `C:\OpenSSL-v11-Win64` in
 >   `src\tss2-esys\openssl.props` - the CI steps patch that file to a
 >   real OpenSSL install (runner-preinstalled or the portable
 >   FireDaemon zip); (b) deep source paths make MSBuild's file
 >   tracker throw path-too-long as an inscrutable `MSB6003`, so the
 >   source is staged at a short path via `TPM2_TSS_SOURCE_PATH`
->   (which also avoids the build script's git-clone fallback).
+>   (which also avoids the build script's git-clone fallback); (c) the
+>   build script runs `msbuild /p:Configuration=Release tpm2-tss.sln`
+>   with no platform, so MSBuild builds the solution's first one, and
+>   4.2.0's solution lists ARM first - the stage-tpm2-tss action keeps
+>   only the x64 solution configurations (a manual build sets
+>   `$env:Platform = "x64"` instead).
 > - **Runtime DLL closure to ship**: tss2-esys, tss2-sys, tss2-mu,
 >   tss2-tctildr, tss2-tcti-tbs (dlopen()ed by tctildr - never in an
 >   import table, still required), libcrypto-3-x64. `tbs.dll` itself

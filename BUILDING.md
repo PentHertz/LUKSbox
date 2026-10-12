@@ -343,6 +343,9 @@ Linux).
    Invoke-WebRequest -Uri "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/4.2.0.zip" -OutFile "$env:TEMP\t2t.zip"
    Expand-Archive "$env:TEMP\t2t.zip" -DestinationPath "$env:TEMP\t2t"
    $env:TPM2_TSS_SOURCE_PATH = "$env:TEMP\t2t\tpm2-tss-4.2.0"
+   # The tss-esapi-sys build script runs MSBuild without a platform,
+   # and 4.2.0's solution lists ARM first; make it build x64:
+   $env:Platform = "x64"
 
    # b. OpenSSL 3 with x64 import libs (tss2-esys links libcrypto.lib
    #    and libssl.lib from <dir>\lib\VC\x64\MD, headers from
