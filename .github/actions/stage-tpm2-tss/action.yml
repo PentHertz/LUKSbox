@@ -90,6 +90,32 @@ runs:
         # build script writes its own minimum (4.1.3) there.
         Set-Content "$src\VERSION" $ver -NoNewline
 
+        # tpm2-tss 4.2.0's solution adds ARM and ARM64 platforms and lists
+        # them before x64. tss-esapi-sys runs `msbuild /p:Configuration=Release
+        # tpm2-tss.sln` without a platform, so MSBuild builds the first one
+        # it finds and fails ("The BaseOutputPath/OutputPath property is
+        # not set ... Platform='ARM'"). Keep only the x64 solution
+        # configurations, the platform OpenSSL is staged for below; the
+        # per-project entries of the dropped platforms are then unused.
+        $sln = "$src\tpm2-tss.sln"
+        $inPlatforms = $false
+        $slnLines = foreach ($line in Get-Content $sln) {
+            if ($line -match 'GlobalSection\(SolutionConfigurationPlatforms\)') {
+                $inPlatforms = $true
+            } elseif ($inPlatforms -and $line -match 'EndGlobalSection') {
+                $inPlatforms = $false
+            } elseif ($inPlatforms -and $line -notmatch '\|x64 = ') {
+                continue
+            }
+            $line
+        }
+        if (-not ($slnLines -match '^\s+Release\|x64 = Release\|x64\s*$')) {
+            Write-Error "no Release|x64 solution configuration in $sln; the tpm2-tss VS solution changed"
+            exit 1
+        }
+        Set-Content $sln $slnLines
+        Write-Host "==> $sln reduced to its x64 solution configurations"
+
         # b. OpenSSL 3 with x64 import libs: tss2-esys compiles with
         #    $(OpenSslDir)\include and links libcrypto.lib (plus
         #    libssl.lib since 4.1.4) from $(OpenSslDir)\lib (up to 4.1.3)
