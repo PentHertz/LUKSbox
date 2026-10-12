@@ -2555,13 +2555,22 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
     // and `select_available` hides the kinds this build has no FIDO2 /
     // TPM / Secure Enclave support for.
     let mut items: Vec<(&'static str, bool)> = vec![
-        ("Passphrase (most familiar; can add an authenticator backup later)", true),
-        ("FIDO2 wrap-style (authenticator wraps a random MVK; rotation possible)", FIDO2_COMPILED),
+        (
+            "Passphrase (most familiar; can add an authenticator backup later)",
+            true,
+        ),
+        (
+            "FIDO2 wrap-style (authenticator wraps a random MVK; rotation possible)",
+            FIDO2_COMPILED,
+        ),
         (
             "FIDO2-direct (MVK derived from the authenticator, no wrap; STRONGEST but no MVK-layer backup)",
             FIDO2_COMPILED,
         ),
-        ("Hybrid passphrase + ML-KEM-768 (post-quantum; needs a separate .kyber seed file)", true),
+        (
+            "Hybrid passphrase + ML-KEM-768 (post-quantum; needs a separate .kyber seed file)",
+            true,
+        ),
         (
             "Hybrid FIDO2 + ML-KEM-768 (post-quantum; authenticator + .kyber seed file, closes the actual PQ gap)",
             FIDO2_COMPILED,
@@ -4175,11 +4184,13 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
     );
     if options.is_empty() {
         if header.keyslots.iter().any(|s| s.kind != SlotKind::Empty) {
-            return Err("this build cannot open any of this vault's keyslots: they need \
+            return Err(
+                "this build cannot open any of this vault's keyslots: they need \
                         FIDO2, TPM 2.0 or Secure Enclave support that this binary does not \
                         have (the passphrase-only static Linux build has none). Use a \
                         full LUKSbox build."
-                .into());
+                    .into(),
+            );
         }
         return Err("vault has no usable keyslots".into());
     }
@@ -5284,11 +5295,20 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             menu.extend_from_slice(&[
                 ("Add a TPM 2.0 keyslot (this machine, no PIN)", tpm),
                 ("Add a TPM 2.0 + PIN keyslot", tpm),
-                ("Add a fused TPM 2.0 + FIDO2 keyslot (both required)", tpm_fido2),
+                (
+                    "Add a fused TPM 2.0 + FIDO2 keyslot (both required)",
+                    tpm_fido2,
+                ),
                 ("Add a hybrid TPM 2.0 + ML-KEM-768 keyslot", tpm),
                 ("Add a hybrid TPM 2.0 + ML-KEM-1024 keyslot", tpm),
-                ("Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-768 keyslot", tpm_fido2),
-                ("Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-1024 keyslot", tpm_fido2),
+                (
+                    "Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-768 keyslot",
+                    tpm_fido2,
+                ),
+                (
+                    "Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-1024 keyslot",
+                    tpm_fido2,
+                ),
             ]);
         }
         #[cfg(target_os = "macos")]
@@ -5305,12 +5325,27 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                 ("Add a Secure Enclave + Touch ID keyslot", sep),
                 ("Add a hybrid Secure Enclave + ML-KEM-768 keyslot", sep),
                 ("Add a hybrid Secure Enclave + ML-KEM-1024 keyslot", sep),
-                ("Add a fused Secure Enclave + FIDO2 keyslot (both required)", sep_fido2),
+                (
+                    "Add a fused Secure Enclave + FIDO2 keyslot (both required)",
+                    sep_fido2,
+                ),
                 ("Add a fused Secure Enclave + passphrase keyslot", sep),
-                ("Add a hybrid Secure Enclave + FIDO2 + ML-KEM-768 keyslot", sep_fido2),
-                ("Add a hybrid Secure Enclave + FIDO2 + ML-KEM-1024 keyslot", sep_fido2),
-                ("Add a hybrid Secure Enclave + passphrase + ML-KEM-768 keyslot", sep),
-                ("Add a hybrid Secure Enclave + passphrase + ML-KEM-1024 keyslot", sep),
+                (
+                    "Add a hybrid Secure Enclave + FIDO2 + ML-KEM-768 keyslot",
+                    sep_fido2,
+                ),
+                (
+                    "Add a hybrid Secure Enclave + FIDO2 + ML-KEM-1024 keyslot",
+                    sep_fido2,
+                ),
+                (
+                    "Add a hybrid Secure Enclave + passphrase + ML-KEM-768 keyslot",
+                    sep,
+                ),
+                (
+                    "Add a hybrid Secure Enclave + passphrase + ML-KEM-1024 keyslot",
+                    sep,
+                ),
             ]);
         }
         menu.extend_from_slice(&[
@@ -5756,7 +5791,10 @@ fn update_keyslot_action(theme: &ColorfulTheme, cont: &mut Container) -> Result<
     let target_options: &[(&'static str, bool)] = match existing {
         SlotKind::Passphrase => &[
             ("Replace with a fresh passphrase (same kind)", true),
-            ("Convert this slot to a FIDO2 wrap-style keyslot", FIDO2_COMPILED),
+            (
+                "Convert this slot to a FIDO2 wrap-style keyslot",
+                FIDO2_COMPILED,
+            ),
         ],
         SlotKind::Fido2HmacSecret => &[
             ("Re-enroll a FIDO2 credential (same kind)", FIDO2_COMPILED),
