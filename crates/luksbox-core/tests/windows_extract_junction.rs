@@ -16,7 +16,7 @@
 
 use luksbox_core::file_util::secure_create_or_truncate;
 use std::io::{Read as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Create a directory junction `link` -> `target` with the `mklink /J`
@@ -35,6 +35,29 @@ fn make_junction(link: &Path, target: &Path) {
         link.display(),
         target.display()
     );
+}
+
+/// The 8.3 short form of an existing `path` (`C:\Users\RUNNER~1\...`).
+/// Equal to `path` when the volume does not generate short names.
+fn short_path(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetShortPathNameW(long_path: *const u16, short_path: *mut u16, len: u32) -> u32;
+    }
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: `wide` is NUL-terminated; `buf` has `buf.len()` slots.
+    let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    assert!(
+        n > 0 && (n as usize) < buf.len(),
+        "GetShortPathNameW({}) failed: {}",
+        path.display(),
+        std::io::Error::last_os_error()
+    );
+    PathBuf::from(std::ffi::OsString::from_wide(&buf[..n as usize]))
 }
 
 #[test]
@@ -116,4 +139,30 @@ fn final_component_junction_is_refused_without_destroying_target() {
     // The victim directory and its sentinel file are intact.
     assert!(victim_dir.is_dir());
     assert_eq!(std::fs::read(&sentinel).unwrap(), b"do not touch");
+}
+
+#[test]
+fn short_8_3_names_in_path_are_accepted() {
+    // %TEMP% is often spelled with 8.3 short names (`C:\Users\RUNNER~1\...`
+    // on GitHub's runners, `C:\Users\FIRSTN~1\...` for a long user name),
+    // while the opened handle's path has the long names. That difference
+    // is not a junction and must not be refused (it was, found by the
+    // CLI's mount_cross_process test on CI).
+    let dir = tempfile::tempdir().unwrap();
+    let long_dir = dir.path().join("a directory with a long name");
+    std::fs::create_dir(&long_dir).unwrap();
+    let short_dir = short_path(&long_dir);
+    if short_dir == long_dir {
+        eprintln!("[note] this volume has no 8.3 short names; testing the long path only");
+    }
+
+    let mut f = secure_create_or_truncate(&short_dir.join("extract.txt"))
+        .expect("a path spelled with 8.3 short names must be accepted");
+    f.write_all(b"hello").unwrap();
+    drop(f);
+
+    assert_eq!(
+        std::fs::read(long_dir.join("extract.txt")).unwrap(),
+        b"hello"
+    );
 }

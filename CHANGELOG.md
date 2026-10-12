@@ -62,6 +62,14 @@ canonical record.
   SYSTEM and Administrators) that `umount` signals; the mount then stops
   exactly as on Ctrl-C, and `umount` waits until the drive letter is
   gone. `umount --help` says it takes only the mountpoint.
+- **Windows: extracting to a path with 8.3 short names was refused.**
+  `luksbox get`, GUI downloads, and writing Kyber seed files or hybrid
+  sidecars refuse to write through a junction by comparing the path
+  they were given with the path Windows reports for the opened file.
+  8.3 short names (`C:\Users\FIRSTN~1\...`, how `%TEMP%` is often
+  spelled) also differ in that comparison, so such paths failed with "a
+  junction in the path redirected the write". Short names are now
+  expanded before comparing; junctions are still refused.
 - **FIDO2 PIN asked twice on Windows (GitHub #37).** On Windows FIDO2
   goes through webauthn.dll, which always asks for the PIN in its own
   Windows Hello / security-key prompt and accepts none from the

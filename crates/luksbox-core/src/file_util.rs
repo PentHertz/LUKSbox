@@ -565,8 +565,12 @@ pub fn secure_create_or_truncate(path: &Path) -> io::Result<File> {
         // `abs`. The OS always follows intermediate junctions, so if any
         // component along the path was a junction, the resolved path
         // differs from `abs` -- refuse without truncating.
+        // `abs` keeps any 8.3 short names the caller used
+        // (`C:\Users\RUNNER~1\...`, common in %TEMP%); the handle's path
+        // never has them. Expand them first (the file exists now), or
+        // every short name looks like a junction.
         let resolved = final_path_by_handle(&f)?;
-        if !windows_paths_eq_ci(&resolved, &abs) {
+        if !windows_paths_eq_ci(&resolved, &long_path_name(&abs)) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
@@ -640,6 +644,42 @@ fn final_path_by_handle(f: &File) -> io::Result<PathBuf> {
     }
     let w = (written as usize).min(buf.len());
     Ok(PathBuf::from(OsString::from_wide(&buf[..w])))
+}
+
+/// `p` with every 8.3 short component (`RUNNER~1`) expanded to its long
+/// name, via `GetLongPathNameW`. Junctions are NOT resolved: each
+/// component keeps its own name, so a junction along `p` still shows up
+/// as a mismatch against `final_path_by_handle`. Returns `p` unchanged
+/// when the call fails (a missing component, or a path too long for
+/// it), which keeps that comparison strict.
+#[cfg(windows)]
+fn long_path_name(p: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetLongPathNameW(short_path: *const u16, long_path: *mut u16, len: u32) -> u32;
+    }
+
+    let wide: Vec<u16> = p.as_os_str().encode_wide().chain(Some(0)).collect();
+    // Like GetFinalPathNameByHandleW: a NULL buffer returns the required
+    // length INCLUDING the terminating NUL, a large enough one the length
+    // written EXCLUDING it.
+    // SAFETY: `wide` is NUL-terminated and outlives the call.
+    let needed = unsafe { GetLongPathNameW(wide.as_ptr(), std::ptr::null_mut(), 0) };
+    if needed == 0 {
+        return p.to_path_buf();
+    }
+    let mut buf = vec![0u16; needed as usize];
+    // SAFETY: `buf` has `needed` u16 slots; `wide` as above.
+    let written = unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    // 0: failed; >= len: the path changed between the calls and the
+    // buffer is too small.
+    if written == 0 || written as usize >= buf.len() {
+        return p.to_path_buf();
+    }
+    PathBuf::from(OsString::from_wide(&buf[..written as usize]))
 }
 
 /// Case-insensitive Windows path comparison that first strips the
