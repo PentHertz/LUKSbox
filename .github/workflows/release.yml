@@ -2615,13 +2615,18 @@ jobs:
           # finds no key on the runner) instead of "not compiled in".
           "$bin" list-fido2-devices </dev/null
           # TPM 2.0 round trip against swtpm through tpm2-tss's built-in
-          # swtpm TCTI (a static binary cannot dlopen one).
+          # swtpm TCTI (a static binary cannot dlopen one). With
+          # `path=<socket>` the TCTI expects the control channel at
+          # `<socket>.ctrl`.
           mkdir "$work/tpm"
           swtpm socket --tpm2 --tpmstate dir="$work/tpm" \
               --server type=unixio,path="$work/tpm.sock" \
-              --ctrl type=unixio,path="$work/tpm.ctrl" \
+              --ctrl type=unixio,path="$work/tpm.sock.ctrl" \
               --flags not-need-init,startup-clear --daemon
-          for _ in $(seq 50); do [ -S "$work/tpm.sock" ] && break; sleep 0.1; done
+          for _ in $(seq 50); do
+              [ -S "$work/tpm.sock" ] && [ -S "$work/tpm.sock.ctrl" ] && break
+              sleep 0.1
+          done
           export TCTI_NAME_CONF="swtpm:path=$work/tpm.sock"
           "$bin" enroll "$work/v.lbx" --kind tpm2 </dev/null
           "$bin" ls "$work/v.lbx" --tpm2 / </dev/null | grep -q in.txt
