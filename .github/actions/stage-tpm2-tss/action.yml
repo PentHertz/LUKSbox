@@ -12,9 +12,11 @@ description: >-
 inputs:
   tpm2-tss-version:
     description: tpm2-tss release tag to build. Must satisfy the
-      tss-esapi-sys minimum (4.1.3).
+      tss-esapi-sys minimum (4.1.3). 4.2.0 carries the fixes for the
+      security advisories open against 4.1.3; keep in step with
+      scripts/stage_tpm2_tss.sh.
     required: false
-    default: "4.1.3"
+    default: "4.2.0"
 runs:
   using: composite
   steps:
@@ -65,7 +67,10 @@ runs:
         # R15-J3: hash-pin the archive (keyed by version so a bump must
         # record a new pin instead of silently accepting whatever the
         # mutable tag serves that day).
-        $pins = @{ '4.1.3' = '43328bfefcdcdff1b89a45e7f2bba246d4ec6847801e864d696337a956b33f0b' }
+        $pins = @{
+            '4.1.3' = '43328bfefcdcdff1b89a45e7f2bba246d4ec6847801e864d696337a956b33f0b'
+            '4.2.0' = '354aaa996c5737b6d3871296095820385682a133252b56abfb375d9f1f39ccce'
+        }
         if (-not $pins.ContainsKey($ver)) {
             Write-Error "no SHA-256 pin recorded for tpm2-tss $ver; add it to the `$pins table in stage-tpm2-tss/action.yml"
             exit 1
@@ -81,13 +86,18 @@ runs:
             Write-Error "tpm2-tss.sln not found under $src; the archive layout changed"
             exit 1
         }
+        # The archive has no VERSION file; without one the tss-esapi-sys
+        # build script writes its own minimum (4.1.3) there.
+        Set-Content "$src\VERSION" $ver -NoNewline
 
-        # b. OpenSSL 3 with an x64 import lib: tss2-esys compiles with
-        #    $(OpenSslDir)\include and links $(OpenSslDir)\lib\libcrypto.lib.
-        #    Runner images and the ShiningLight choco package lay their
-        #    files out differently, so normalise whatever is present
-        #    into C:\ossl with exactly that shape; install via choco
-        #    only if nothing usable is preinstalled.
+        # b. OpenSSL 3 with x64 import libs: tss2-esys compiles with
+        #    $(OpenSslDir)\include and links libcrypto.lib (plus
+        #    libssl.lib since 4.1.4) from $(OpenSslDir)\lib (up to 4.1.3)
+        #    or $(OpenSslDir)\lib\VC\x64\MD (4.1.4+). Runner images and
+        #    the ShiningLight choco package lay their files out
+        #    differently, so normalise whatever is present into C:\ossl
+        #    with both shapes; install via choco only if nothing usable
+        #    is preinstalled.
         function Find-Crypto([string[]]$roots) {
             foreach ($r in $roots) {
                 foreach ($rel in @('lib\libcrypto.lib', 'lib\VC\x64\MD\libcrypto.lib')) {
@@ -114,9 +124,18 @@ runs:
             Write-Error "libcrypto-3-x64.dll not found under $($ossl.Root)\bin; tss2-esys.dll would not load at runtime"
             exit 1
         }
-        New-Item -ItemType Directory -Force -Path 'C:\ossl\lib', 'C:\ossl\bin' | Out-Null
+        $sslLib = Join-Path (Split-Path $ossl.Lib) 'libssl.lib'
+        if (-not (Test-Path $sslLib)) {
+            Write-Error "libssl.lib not found next to $($ossl.Lib); tpm2-tss 4.1.4+ links it"
+            exit 1
+        }
+        $libDirs = @('C:\ossl\lib', 'C:\ossl\lib\VC\x64\MD')
+        New-Item -ItemType Directory -Force -Path ($libDirs + 'C:\ossl\bin') | Out-Null
         Copy-Item -Recurse -Force "$($ossl.Root)\include" 'C:\ossl\include'
-        Copy-Item $ossl.Lib 'C:\ossl\lib\libcrypto.lib'
+        foreach ($d in $libDirs) {
+            Copy-Item $ossl.Lib "$d\libcrypto.lib"
+            Copy-Item $sslLib "$d\libssl.lib"
+        }
         Copy-Item $cryptoDll 'C:\ossl\bin\'
         Write-Host "==> OpenSSL normalised from $($ossl.Root) into C:\ossl"
 
@@ -135,9 +154,16 @@ runs:
         }
 
         # tpm2-tss's VS solution hardcodes the OpenSSL location in a
-        # props file; point it at the normalised dir.
+        # props file (C:\OpenSSL-v11-Win64 up to 4.1.3, C:\OpenSSL-v35-Win64
+        # since 4.1.4); point it at the normalised dir, whatever it was.
         $props = "$src\src\tss2-esys\openssl.props"
-        (Get-Content $props -Raw).Replace('C:\OpenSSL-v11-Win64', 'C:\ossl') | Set-Content $props -NoNewline
+        $text = Get-Content $props -Raw
+        $patched = [regex]::Replace($text, '<OpenSslDir>[^<]*</OpenSslDir>', '<OpenSslDir>C:\ossl</OpenSslDir>')
+        if ($patched -notmatch '<OpenSslDir>C:\\ossl</OpenSslDir>') {
+            Write-Error "no <OpenSslDir> element in $props; the tpm2-tss VS solution changed"
+            exit 1
+        }
+        Set-Content $props $patched -NoNewline
 
         # c. libclang for bindgen: Windows has no pregenerated bindings
         #    in tss-esapi-sys, so its Windows flavour always runs

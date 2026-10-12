@@ -71,12 +71,20 @@ jobs:
     # built without it, so release binaries drop the EVP_sm4_cfb128
     # dependency; CI builds the same shape so it tests what ships.
     # LUKSbox only negotiates AES-CFB TPM sessions, nothing is lost.
+    #
+    # LUKSBOX_REQUIRE_MOUNT_TESTS: the FUSE mount tests
+    # (luksbox-mount/tests/fuse_mount.rs and the cross-process
+    # mount/umount test, luksbox-cli/tests/mount_cross_process.rs) skip
+    # on hosts that can't mount; here they fail instead, so a runner
+    # without a usable /dev/fuse or fusermount3 (fuse3, installed below)
+    # can't pass without testing.
     env:
       TSS2_SYS_STATIC: "1"
       TSS2_ESYS_STATIC: "1"
       TSS2_MU_STATIC: "1"
       TSS2_TCTILDR_STATIC: "1"
       CFLAGS: "-DOPENSSL_NO_SM4"
+      LUKSBOX_REQUIRE_MOUNT_TESTS: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -102,14 +110,22 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: ci-test-${{ matrix.profile }}
+          # `-tss420`: tpm2-tss 4.1.3 -> 4.2.0. tss-esapi-sys declares no
+          # rerun-if-* triggers, so an old cache would keep the old
+          # vendored tpm2-tss despite the new staged source.
+          shared-key: ci-test-tss420-${{ matrix.profile }}
       - name: Linux deps
         uses: ./.github/actions/apt-install
         with:
           packages: |
             pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
-            libtss2-dev
+            libtss2-dev fuse3
             autoconf automake libtool libltdl-dev autoconf-archive libjson-c-dev uuid-dev
+      - name: Stage pinned tpm2-tss source (bundled-tpm lane)
+        # Test the tpm2-tss the release builds ship (scripts/stage_tpm2_tss.sh),
+        # not the 4.1.3 tss-esapi-sys would git-clone on its own.
+        if: contains(matrix.features, 'bundled-tpm')
+        run: echo "TPM2_TSS_SOURCE_PATH=$(bash scripts/stage_tpm2_tss.sh "$RUNNER_TEMP/tpm2-tss-src")" >> "$GITHUB_ENV"
       - name: Run ${{ matrix.profile }} tests
         run: ${{ matrix.cmd }}
 
@@ -171,6 +187,76 @@ jobs:
             libtss2-dev libclang-dev clang
       - name: Run ${{ matrix.profile }} tests
         run: ${{ matrix.cmd }}
+
+  # ---- macOS (Apple Silicon) ----------------------------------------------
+  # The test suite on macOS, which no other job runs. Builds the FUSE-T
+  # flavour (release.yml's `fuset` .dmg): fuser needs macFUSE's fuse.pc
+  # to build on macOS, and macFUSE's kernel extension can't load on a
+  # hosted runner anyway, so the macFUSE flavour stays covered by the
+  # release build only. `luksbox-cli/hardware` and `luksbox-sep/hardware`
+  # compile the Secure Enclave backend (Swift shim); runners have no
+  # Secure Enclave, so its round-trip test no-ops, like the TPM tests on
+  # the Windows job.
+  #
+  # luksbox-cli and luksbox-mount get their own step because
+  # `cargo test --workspace` would build luksbox-mount with its default
+  # `fuse` (macFUSE) feature. The cross-process mount/umount test runs
+  # in a separate non-blocking step until a run shows FUSE-T can mount
+  # on GitHub's macOS runners; then drop its `continue-on-error` so it
+  # gates like on Linux and Windows.
+  test-macos:
+    name: test macOS (FUSE-T)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable branch
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci-test-macos
+      - name: macOS deps (Homebrew)
+        # HOMEBREW_NO_INSTALL_FROM_API: see the same step in release.yml
+        # (Homebrew's cask API parser regression).
+        env:
+          HOMEBREW_NO_INSTALL_FROM_API: "1"
+        run: |
+          set -euo pipefail
+          brew update
+          brew install --formula libfido2 pkg-config
+          # FUSE-T: luksbox-fuse-t (a workspace member) needs its headers
+          # and fuse-t.pc to build.
+          brew tap macos-fuse-t/homebrew-cask
+          brew install --cask fuse-t
+          FUSE_PC_PATH=""
+          for cand in /usr/local/lib/pkgconfig /opt/homebrew/lib/pkgconfig; do
+              if [ -f "$cand/fuse-t.pc" ]; then
+                  FUSE_PC_PATH="$cand"
+                  break
+              fi
+          done
+          if [ -z "$FUSE_PC_PATH" ]; then
+              echo "::error::FUSE-T installed but fuse-t.pc not found in /usr/local/lib/pkgconfig or /opt/homebrew/lib/pkgconfig"
+              exit 1
+          fi
+          {
+            echo "PKG_CONFIG_PATH=$(brew --prefix libfido2)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$FUSE_PC_PATH"
+            echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix libfido2)/lib"
+          } >> "$GITHUB_ENV"
+      - name: Test workspace (except CLI and mount)
+        run: cargo test --workspace --features luksbox-sep/hardware --exclude luksbox-cli --exclude luksbox-mount --exclude luksbox-gui --exclude luksbox-fuzz --exclude luksbox-fuzz-afl
+      - name: Test CLI and mount (FUSE-T, Secure Enclave)
+        run: cargo test -p luksbox-cli -p luksbox-mount --no-default-features --features luksbox-cli/hardware,luksbox-cli/fuse-t -- --skip umount_from_another_process
+      - name: Cross-process mount / umount (FUSE-T, non-blocking)
+        continue-on-error: true
+        # A hung NFS (FUSE-T) mount can block a read for good; don't let
+        # it hold the runner for the 6 h job default.
+        timeout-minutes: 10
+        env:
+          LUKSBOX_REQUIRE_MOUNT_TESTS: "1"
+        run: cargo test -p luksbox-cli --no-default-features --features hardware,fuse-t --test mount_cross_process -- --nocapture
 
   # ---- Windows mount integration tests (WinFsp kernel mount) -------------
   # Mounts a real luksbox vault on a free drive letter via the WinFsp
@@ -239,22 +325,18 @@ jobs:
           if (-not $sdk) { Write-Error "WinFsp SDK headers missing"; exit 1 }
           if (-not $drv) { Write-Error "WinFsp kernel driver missing"; exit 1 }
           Write-Host "==> WinFsp ok (sdk=$sdk, driver=$drv)"
-      - name: Run WinFsp integration tests
+      - name: Put WinFsp's bin dir on PATH
         shell: pwsh
-        # --test-threads=1 because the tests share the host's drive-letter
-        # pool (D:..Z:) and parallel runs would race on the same letter.
-        # --release because debug builds of winfsp_wrs_sys take ~3x longer
-        # to link, and we don't need debug symbols here.
-        #
-        # PATH munging: luksbox-mount is statically linked against
-        # winfsp-x64.lib, so the produced test exe needs winfsp-x64.dll
-        # to be reachable by the Windows loader at startup. WinFsp ships
-        # the DLL under <install>\bin\ but does NOT add that directory
-        # to system PATH. Without this prepend, the loader fails with
+        # luksbox-mount is statically linked against winfsp-x64.lib, so
+        # the test exes and luksbox.exe need winfsp-x64.dll to be
+        # reachable by the Windows loader at startup. WinFsp ships the
+        # DLL under <install>\bin\ but does NOT add that directory to
+        # system PATH. Without this, the loader fails with
         # STATUS_DLL_NOT_FOUND (0xC0000135) before main() runs and the
-        # test process exits with that NTSTATUS as its exit code.
-        # The verify step above already established that the bin dir
-        # exists in one of the two standard locations.
+        # process exits with that NTSTATUS as its exit code. The verify
+        # step above already established that the bin dir exists in one
+        # of the two standard locations. GITHUB_PATH prepends it for
+        # every later step.
         run: |
           $winfspBin = if (Test-Path "C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll") {
               "C:\Program Files (x86)\WinFsp\bin"
@@ -265,8 +347,24 @@ jobs:
               exit 1
           }
           Write-Host "==> prepending WinFsp bin dir to PATH: $winfspBin"
-          $env:PATH = "$winfspBin;$env:PATH"
-          cargo test --release -p luksbox-mount --test winfsp_mount -- --test-threads=1 --nocapture
+          $winfspBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Run WinFsp integration tests
+        shell: pwsh
+        # --test-threads=1 because the tests share the host's drive-letter
+        # pool (D:..Z:) and parallel runs would race on the same letter.
+        # --release because debug builds of winfsp_wrs_sys take ~3x longer
+        # to link, and we don't need debug symbols here.
+        run: cargo test --release -p luksbox-mount --test winfsp_mount -- --test-threads=1 --nocapture
+      - name: Run cross-process mount / umount test (CLI)
+        shell: pwsh
+        # `luksbox mount` in one process, `luksbox umount Z:` in another
+        # (GitHub #37), through the real luksbox.exe:
+        # crates/luksbox-cli/tests/mount_cross_process.rs.
+        # LUKSBOX_REQUIRE_MOUNT_TESTS: fail rather than skip if
+        # luksbox.exe can't start (winfsp-x64.dll not found).
+        env:
+          LUKSBOX_REQUIRE_MOUNT_TESTS: "1"
+        run: cargo test --release -p luksbox-cli --test mount_cross_process -- --nocapture
 
   # ---- Security regression spotlight (always-green gate) ------------------
   # Runs JUST the 26 security regression tests added during the audit
@@ -387,7 +485,8 @@ jobs:
           # `hardware`: this job runs on jammy, whose system tpm2-tss
           # (3.2) is below the 4.1.3 build floor of tss-esapi 8.x, so
           # the system link no longer builds here. bundled-tpm compiles
-          # a vendored tpm2-tss 4.1.3 via autotools at build time
+          # the pinned tpm2-tss (scripts/stage_tpm2_tss.sh) via autotools
+          # at build time
           # (hence the autotools packages in extra_apt); the
           # system-link `hardware` flavour keeps being exercised by the
           # test-ubuntu-2604 job. This mirrors the jammy/noble release
@@ -422,7 +521,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          shared-key: ci-build-${{ matrix.target }}
+          # `-tss420`: see the test job; drops caches holding the old
+          # vendored tpm2-tss 4.1.3.
+          shared-key: ci-build-tss420-${{ matrix.target }}
       - name: Linux deps
         uses: ./.github/actions/apt-install
         with:
@@ -430,6 +531,9 @@ jobs:
             pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
             libtss2-dev
             ${{ matrix.extra_apt }}
+      - name: Stage pinned tpm2-tss source (bundled-tpm entries)
+        if: contains(matrix.cmd, 'bundled-tpm')
+        run: echo "TPM2_TSS_SOURCE_PATH=$(bash scripts/stage_tpm2_tss.sh "$RUNNER_TEMP/tpm2-tss-src")" >> "$GITHUB_ENV"
       - name: Build
         run: ${{ matrix.cmd }}
 

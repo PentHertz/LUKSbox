@@ -136,6 +136,14 @@ per-crate `tests/` directories.
 rm / mkdir / mv / enroll / revoke flows. Run as subprocess of the
 real binary.
 
+`crates/luksbox-cli/tests/mount_cross_process.rs` runs
+`luksbox mount -f` in one process and `luksbox umount <mountpoint>`
+in another, the way a user does with two terminals (GitHub #37), then
+checks that the mount process exits cleanly and that a file written
+through the mount is in the vault. Linux (FUSE), macOS (macFUSE or
+FUSE-T) and Windows (WinFsp); skipped when the host can't mount (see
+`LUKSBOX_REQUIRE_MOUNT_TESTS` below).
+
 ### `luksbox-mount` (6 tests, Windows-only)
 
 `crates/luksbox-mount/tests/winfsp_mount.rs`, **6 integration tests**
@@ -172,13 +180,19 @@ Coverage:
   the registry re-entry path (must not leak senders). A regression
   here would manifest as a hang on round 2 or 3.
 - `unmount_of_unknown_mountpoint_errors_clearly`, asserts that
-  cross-process unmount does NOT silently succeed (WinFsp has no
-  out-of-band unmount IPC; pretending we honored the request would
-  mislead the user).
+  unmounting a drive letter no luksbox process holds does NOT silently
+  succeed (pretending we honored the request would mislead the user).
+  Unmounting from another process is covered by the CLI test
+  `mount_cross_process.rs`.
 
-The Linux/macOS FUSE adapter has no automated tests yet - a FUSE
-integration test would need a tmpfs mountpoint and either root or a
-working FUSE setup with `/etc/fuse.conf` `user_allow_other`.
+`crates/luksbox-mount/tests/fuse_mount.rs` is the Linux/macOS
+counterpart: mount, write and remount, unmount from another thread,
+three cycles, unknown mountpoint. Needs a usable `/dev/fuse` and
+`fusermount3` (Linux) or macFUSE (macOS).
+
+Mount tests skip (and show as passed) on a host that can't mount.
+Set `LUKSBOX_REQUIRE_MOUNT_TESTS=1` to make them fail instead; CI's
+Linux test job and Windows mount job do.
 
 #### Running the WinFsp tests
 
@@ -315,10 +329,9 @@ LUKSBOX_TEST_FAST_KDF=1 LUKSBOX_PASSPHRASE=pw \
 ### What's NOT in the functional tests
 
 - **FIDO2 anything.** Needs real hardware. See "Hardware tests" below.
-- **Linux/macOS mount / unmount.** Needs FUSE setup, tmpfs, possibly
-  root. See the manual mount smoke in "Hardware tests". Windows
-  mount IS covered by `luksbox-mount/tests/winfsp_mount.rs` when
-  WinFsp 2.x is installed on the test host.
+- **Mount / unmount** beyond the cross-process test: covered by
+  `luksbox-mount/tests/fuse_mount.rs` (Linux/macOS) and
+  `winfsp_mount.rs` (Windows) when the host can mount.
 - **GUI flows.** No headless test for egui. Manual click-through.
 - **Multi-process concurrent access.** Vault file isn't designed for
   concurrent writers; out of scope.

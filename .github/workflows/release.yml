@@ -297,7 +297,11 @@ jobs:
           # artifacts then reported "can't find crate for fuser" and
           # "can't find crate for zbus" because the cached luksbox-mount
           # rlib was built before the dep graph was reshaped.).
-          shared-key: release-v3
+          # Bumped to v4 on 2026-10-12: tpm2-tss 4.1.3 -> 4.2.0. The
+          # tss-esapi-sys build script declares no rerun-if-* triggers,
+          # so a restored cache would keep linking the old static tpm2-tss
+          # into the Linux bundled-tpm lanes despite the new staged source.
+          shared-key: release-v4
 
       - name: Derive LUKSBOX_VERSION
         # On a tag push (`refs/tags/vX.Y.Z`), GITHUB_REF_NAME is the tag
@@ -2015,6 +2019,16 @@ jobs:
                   }
               }
           }
+          # tpm2-tss 4.1.4+ also links tss2-esys against libssl.lib. MSVC
+          # only imports a DLL whose symbols are used, and tss2-esys needs
+          # libcrypto alone, so libssl-3-x64.dll must not appear here: the
+          # zip / MSI ship libcrypto-3-x64.dll only.
+          $esysDeps = & dumpbin /dependents staging\tss2-esys.dll 2>&1
+          Write-Host ($esysDeps | Out-String)
+          if ($esysDeps -match 'libssl') {
+              Write-Error "==> tss2-esys.dll imports libssl, which the Windows packages do not ship"
+              $bad = $true
+          }
           if ($bad) {
               Write-Error "==> Surprise dynamic dep, vcpkg likely picked the wrong triplet (or a MinGW binary leaked into the MSVC release). Bundle the DLL or switch back to x64-windows-static-md."
               exit 1
@@ -2630,6 +2644,20 @@ jobs:
           export TCTI_NAME_CONF="swtpm:path=$work/tpm.sock"
           "$bin" enroll "$work/v.lbx" --kind tpm2 </dev/null
           "$bin" ls "$work/v.lbx" --tpm2 / </dev/null | grep -q in.txt
+
+      - name: Check bundled libraries for known vulnerabilities
+        # OpenSSL, zlib, musl (OSV, Alpine fixes), libfido2, libcbor,
+        # libudev-zero, tpm2-tss (NVD + upstream release notes). These do
+        # not get distro security updates, so a hit here stops the tarball
+        # from being published; the release goes out without it.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tar -xzf dist-static/luksbox-v*-"$ARCH"-linux-musl-static-fido2-tpm.tar.gz \
+              -O --wildcards '*/licenses/components.tsv' > components.tsv
+          cat components.tsv
+          python3 scripts/check_static_deps.py components.tsv
 
       - name: Add a version-less copy for releases/latest/download links
         run: |

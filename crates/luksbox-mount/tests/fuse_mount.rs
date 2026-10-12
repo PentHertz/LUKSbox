@@ -38,6 +38,9 @@
 //!   Most modern distros tag the user automatically; the GitHub
 //!   ubuntu-latest runner doesn't always, so we fall through with
 //!   `[skip]` if a probe-mount fails.
+//! - `LUKSBOX_REQUIRE_MOUNT_TESTS=1` turns that skip into a failure.
+//!   CI's Linux test job sets it (after installing fuse3), so a runner
+//!   that can't mount fails loudly instead of passing without testing.
 //!
 //! ### Why these tests aren't in the default `cargo test --workspace` hot path
 //!
@@ -169,6 +172,10 @@ static MOUNT_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 macro_rules! require_fuse {
     () => {
         if !fuse_available() {
+            assert!(
+                std::env::var_os("LUKSBOX_REQUIRE_MOUNT_TESTS").is_none(),
+                "LUKSBOX_REQUIRE_MOUNT_TESTS is set but FUSE is not available"
+            );
             eprintln!(
                 "[skip] FUSE not available in this environment. \
                  On Linux: install libfuse3 + ensure user is in the \

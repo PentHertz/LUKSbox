@@ -563,17 +563,16 @@ fn delete_and_rename_via_win32() {
     );
 }
 
-/// Cross-process unmount (the user opening a second terminal and
-/// running `luksbox umount Y:`) must NOT silently succeed - WinFsp
-/// has no out-of-band unmount IPC and pretending we honored the
-/// request would leave the user thinking the drive is gone when it
-/// isn't. This test verifies the error path returns a `MountError`
-/// with a clear message, not `Ok(())`.
+/// Unmounting a mountpoint that no luksbox process holds must NOT
+/// silently succeed - pretending we honored the request would leave
+/// the user thinking the drive is gone when it isn't. `unmount()`
+/// first looks in this process's registry, then signals the named
+/// event of a `luksbox mount` in another process (GitHub #37). This
+/// test verifies that when both miss, it returns a `MountError` with
+/// a clear message, not `Ok(())`.
 ///
-/// Implemented as a unit test (no actual mount) since the registry
-/// is per-process: looking up a key that was never inserted
-/// reliably exercises the not-in-this-process branch without
-/// needing a second process.
+/// Implemented as a unit test (no actual mount): nothing mounts Q:,
+/// so neither the registry nor the named event exists.
 #[test]
 fn unmount_of_unknown_mountpoint_errors_clearly() {
     let result = luksbox_mount::unmount(Path::new("Q:"));
@@ -585,6 +584,6 @@ fn unmount_of_unknown_mountpoint_errors_clearly() {
     );
     assert!(
         msg.to_lowercase().contains("process"),
-        "error message must explain cross-process limitation, got: {msg}"
+        "error message must say only the process running the mount can release it, got: {msg}"
     );
 }

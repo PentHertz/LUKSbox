@@ -1,0 +1,46 @@
+# Weekly re-check of the C libraries bundled into the latest released
+# static FIDO2 + TPM build (GitHub #34). The release workflow checks them
+# before publishing; this catches vulnerabilities disclosed afterwards.
+# Those libraries do not get distro security updates, so a failure here
+# means a LUKSbox release with bumped pins is due (see
+# scripts/static_fido2_tpm_alpine.sh).
+name: static-deps-audit
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # Mondays, 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch the latest release's component list
+        id: fetch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Same versions in the aarch64 tarball; one is enough.
+          asset=luksbox-x86_64-unknown-linux-musl-fido2-tpm.tar.gz
+          if ! gh release download --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir dl; then
+              echo "::notice::the latest release has no $asset; nothing to audit"
+              echo "found=false" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          tar -xzf "dl/$asset" -O --wildcards '*/licenses/components.tsv' > components.tsv
+          cat components.tsv
+          echo "found=true" >> "$GITHUB_OUTPUT"
+
+      - name: Check for known vulnerabilities
+        if: steps.fetch.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check_static_deps.py components.tsv

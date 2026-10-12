@@ -43,6 +43,8 @@ canonical record.
   (`static-deps-audit`) re-runs the check against the latest release's
   tarball, for vulnerabilities disclosed after it shipped.
 
+### Fixed
+
 - **GUI file "Download..." froze on Linux (GitHub #35).** The save
   dialog for a single file passed an "All files" filter with no
   patterns, which xdg-desktop-portal rejects ("invalid filter: no
@@ -85,6 +87,15 @@ canonical record.
   `luksbox-x86_64-windows.zip`), alongside the existing musl and
   AppImage ones, so `releases/latest/download/<name>` links in the docs
   keep working across releases.
+- **CI tests on macOS, and `umount` from a second process.** CI now runs
+  the test suite on macOS (Apple Silicon; the FUSE-T build, with the
+  Secure Enclave backend compiled in). A new CLI test runs `luksbox
+  mount` in one process and `luksbox umount` in another, then checks
+  that the mount process exits cleanly and that a file written through
+  the mount is in the vault. It runs on Linux and Windows, and on macOS
+  as a non-blocking step until FUSE-T mounts are known to work on
+  GitHub's runners. The Linux FUSE mount tests now fail instead of
+  silently skipping when CI cannot mount.
 
 ### Security
 

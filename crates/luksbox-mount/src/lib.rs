@@ -383,8 +383,10 @@ pub fn mount<P: AsRef<Path>>(
 /// - macOS (macFUSE / FUSE-T): wraps `umount`. Both providers
 ///   surface as a normal kernel mount that the system `umount`
 ///   can detach.
-/// - Windows: returns an error explaining there is no separate unmount
-///   API; user must terminate the mount-holding process.
+/// - Windows: wakes the mount thread when the mount lives in this
+///   process; otherwise signals the named event a `luksbox mount` in
+///   another process waits on (WinFsp has no cross-process unmount
+///   API; see `winfsp::unmount`).
 #[cfg(all(target_os = "macos", feature = "fuse-t"))]
 pub fn unmount<P: AsRef<Path>>(mountpoint: P) -> Result<(), MountError> {
     fuse_t::unmount(mountpoint.as_ref())?;
