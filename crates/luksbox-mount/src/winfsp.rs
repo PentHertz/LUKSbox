@@ -1289,15 +1289,23 @@ pub fn mount(vfs: Vfs, mountpoint: &Path, sync_mode: bool) -> Result<(), MountEr
     //      "Unmount" button) - looks the mountpoint up in the
     //      registry and sends to its sender.
     //
-    // Either way, on wake-up we deregister and call
+    //   3. `luksbox umount <mountpoint>` in another process (GitHub
+    //      #37): WinFsp has no cross-process unmount, so the mount
+    //      waits on a named event that `unmount()` signals when the
+    //      mountpoint is not in its own registry.
+    //
+    // Any way, on wake-up we deregister and call
     // `FileSystem::stop()` to tear the kernel mount down cleanly.
     // Killing the process without `stop()` works in the happy path
     // but has been observed to leave the drive letter half-attached
     // on some Windows builds until the user reboots.
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let key = PathBuf::from(&mp_norm);
-    register_mount(&key, tx);
+    register_mount(&key, tx.clone());
     install_ctrlc_handler_once();
+    // `None` only if the event could not be created; Ctrl-C and the
+    // in-process unmount still work then.
+    let _remote = RemoteUnmountListener::start(&mp_norm, tx);
 
     let _ = rx.recv();
     deregister_mount(&key);
@@ -1462,6 +1470,129 @@ fn deregister_mount(key: &Path) {
     let _ = mount_registry().lock().unwrap().remove(key);
 }
 
+/// Name of the event a `luksbox umount` in another process signals to
+/// stop the mount at `mp_norm` (NUL-terminated UTF-16). `Local\`: the
+/// same Windows session only. Readable part plus an FNV-1a hash of the
+/// whole (case-folded) mountpoint, so sanitising and truncating it can
+/// not make two mountpoints share an event.
+fn remote_unmount_event_name(mp_norm: &str) -> Vec<u16> {
+    let folded = mp_norm.to_uppercase();
+    let hash = folded.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    let readable: String = folded
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .take(64)
+        .collect();
+    format!("Local\\luksbox-unmount-{readable}-{hash:016x}")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+/// Waits on a mount's named unmount event (see `remote_unmount_event_name`)
+/// and wakes the mount thread when another process signals it. Dropping
+/// it, when the mount ends, stops the waiting thread, which then closes
+/// the event handle.
+struct RemoteUnmountListener {
+    done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RemoteUnmountListener {
+    fn start(mp_norm: &str, tx: Sender<()>) -> Option<Self> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let name = remote_unmount_event_name(mp_norm);
+        // Auto-reset, not signalled. The default security descriptor
+        // limits opening it to this user, SYSTEM and Administrators.
+        let event: HANDLE = unsafe { CreateEventW(std::ptr::null(), 0, 0, name.as_ptr()) };
+        if event.is_null() {
+            if winfsp_debug() {
+                eprintln!(
+                    "[winfsp] CreateEventW failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+            return None;
+        }
+        let done = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&done);
+        // HANDLE is a raw pointer (not Send); hand the thread its address.
+        let event_addr = event as usize;
+        std::thread::Builder::new()
+            .name("luksbox-remote-unmount".into())
+            .spawn(move || {
+                let event = event_addr as HANDLE;
+                while !stop.load(Ordering::Acquire) {
+                    if unsafe { WaitForSingleObject(event, 250) } == WAIT_OBJECT_0 {
+                        let _ = tx.send(());
+                        break;
+                    }
+                }
+                unsafe { CloseHandle(event) };
+            })
+            .ok()?;
+        Some(Self { done })
+    }
+}
+
+impl Drop for RemoteUnmountListener {
+    fn drop(&mut self) {
+        self.done.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Ask the luksbox process holding `mp_norm` to unmount it, through the
+/// event its `RemoteUnmountListener` waits on, and wait until the
+/// mountpoint is gone (the final flush can take a few seconds).
+fn signal_remote_unmount(mp_norm: &str, mountpoint: &Path) -> Result<(), MountError> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::System::Threading::{EVENT_MODIFY_STATE, OpenEventW, SetEvent};
+
+    let name = remote_unmount_event_name(mp_norm);
+    let event: HANDLE = unsafe { OpenEventW(EVENT_MODIFY_STATE, 0, name.as_ptr()) };
+    if event.is_null() {
+        return Err(MountError::Io(std::io::Error::other(format!(
+            "no luksbox mount at {} found. A mount started by LUKSbox before \
+             0.6.0, or in another Windows session, can only be released by \
+             pressing Ctrl-C in the window running `luksbox mount` (or \
+             taskkill /pid <pid>).",
+            mountpoint.display()
+        ))));
+    }
+    let signalled = unsafe { SetEvent(event) } != 0;
+    let err = std::io::Error::last_os_error();
+    unsafe { CloseHandle(event) };
+    if !signalled {
+        return Err(MountError::Io(std::io::Error::other(format!(
+            "could not signal the luksbox mount at {}: {err}",
+            mountpoint.display()
+        ))));
+    }
+    // A drive letter is probed through its root (`Z:` alone means the
+    // current directory on Z:); a directory mountpoint disappears with
+    // the mount.
+    let probe = if mp_norm.len() == 2 && mp_norm.ends_with(':') {
+        PathBuf::from(format!("{mp_norm}\\"))
+    } else {
+        PathBuf::from(mp_norm)
+    };
+    for _ in 0..150 {
+        if !probe.exists() {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(MountError::Io(std::io::Error::other(format!(
+        "asked the luksbox process to unmount {}, but it is still mounted \
+         after 15 s; it may still be flushing. Check its window.",
+        mountpoint.display()
+    ))))
+}
+
 /// Install a process-wide Ctrl-C handler exactly once. The handler
 /// broadcasts a stop signal to every mount currently registered. We
 /// can't install per-mount handlers because `ctrlc::set_handler`
@@ -1496,27 +1627,19 @@ fn install_ctrlc_handler_once() {
     });
 }
 
-/// Unmount a luksbox volume that's mounted IN THIS PROCESS. Looks the
-/// mountpoint up in the registry, sends the wake-up signal to the
+/// Unmount a luksbox volume. Mounted in this process: look the
+/// mountpoint up in the registry and send the wake-up signal to the
 /// owning mount thread, which then calls `FileSystem::stop()` and
-/// returns. WinFsp has no out-of-band unmount API equivalent to
-/// `fusermount -u`, so cross-process unmount isn't possible - kill
-/// the process holding the mount instead.
+/// returns. Mounted by another luksbox process (`luksbox umount Z:`
+/// while `luksbox mount ... Z:` runs elsewhere): WinFsp has no
+/// out-of-band unmount API equivalent to `fusermount -u`, so signal the
+/// named event that process's mount waits on (`signal_remote_unmount`).
 pub fn unmount(mountpoint: &Path) -> Result<(), MountError> {
     let mp_norm = normalize_mountpoint(mountpoint)?;
     let key = PathBuf::from(&mp_norm);
     let tx = match mount_registry().lock().unwrap().remove(&key) {
         Some(tx) => tx,
-        None => {
-            return Err(MountError::Io(std::io::Error::other(format!(
-                "no luksbox mount at {} found in this process. \
-                 Mounts owned by another process can only be released \
-                 by terminating that process (Ctrl-C in the foreground \
-                 process, or taskkill /pid <pid>); WinFsp does not \
-                 expose a cross-process unmount API.",
-                mountpoint.display()
-            ))));
-        }
+        None => return signal_remote_unmount(&mp_norm, mountpoint),
     };
     // Errors here mean the receiver was already dropped - the mount
     // thread is exiting on its own. Either way, we're done.

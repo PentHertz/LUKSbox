@@ -733,11 +733,7 @@ fn create_den_fido2(
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
     use luksbox_format::deniable_header::DeniableMaterial;
     let pass = ask_new_passphrase(theme, "Passphrase (outer envelope of the FIDO2 slot)")?;
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
     println!("{}", crate::auth_prompt("register a new credential"));
@@ -857,11 +853,7 @@ fn create_den_pq_fido2(
         PqParams::Ml768
     };
     let envelope_pw = ask_new_passphrase(theme, "Envelope passphrase (deniable - required)")?;
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let seed_pw = ask_optional_seed_pw(theme, &envelope_pw)?;
     let kyber_path = ask_path(theme, "Path for the .kyber seed file")?;
 
@@ -990,11 +982,7 @@ fn create_den_tpm_fido2(
     use luksbox_format::deniable_header::DeniableMaterial;
     let pass = ask_new_passphrase(theme, "Passphrase (outer envelope)")?;
     let (secret, blob) = tpm_seal_blob_to_bytes(None)?;
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
     eprintln!("{}", crate::auth_prompt("register a new credential"));
@@ -1109,11 +1097,7 @@ fn create_den_pq_tpm_fido2(
     };
     let envelope_pw = ask_new_passphrase(theme, "Envelope passphrase (deniable - required)")?;
     let (tpm_secret, blob) = tpm_seal_blob_to_bytes(None)?;
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let seed_pw = ask_optional_seed_pw(theme, &envelope_pw)?;
     let kyber_path = ask_path(theme, "Path for the .kyber seed file")?;
 
@@ -1725,10 +1709,16 @@ fn wizard_fido2_hmac_from_payload(
     Ok(auth.hmac_secret(RP_ID, cred_id, salt, prehash_salt, Some(pin))?)
 }
 
-/// Prompt the FIDO2 PIN once for a deniable unlock (shared between
-/// the first probe attempt and the raw-salt fallback).
-#[cfg(feature = "fido2-hardware")]
+/// Prompt for the FIDO2 PIN.
+///
+/// Windows: no prompt. FIDO2 goes through webauthn.dll there, which always
+/// asks for the PIN in its own Windows Hello / security-key dialog and
+/// takes none from the caller, so a PIN typed here was silently ignored
+/// and users had to enter it twice (GitHub #37).
 fn wizard_prompt_fido2_pin(theme: &ColorfulTheme) -> Result<zeroize::Zeroizing<String>> {
+    if cfg!(target_os = "windows") {
+        return Ok(zeroize::Zeroizing::new(String::new()));
+    }
     Ok(zeroize::Zeroizing::new(
         Password::with_theme(theme)
             .with_prompt("FIDO2 PIN")
@@ -2555,13 +2545,22 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
     // and `select_available` hides the kinds this build has no FIDO2 /
     // TPM / Secure Enclave support for.
     let mut items: Vec<(&'static str, bool)> = vec![
-        ("Passphrase (most familiar; can add an authenticator backup later)", true),
-        ("FIDO2 wrap-style (authenticator wraps a random MVK; rotation possible)", FIDO2_COMPILED),
+        (
+            "Passphrase (most familiar; can add an authenticator backup later)",
+            true,
+        ),
+        (
+            "FIDO2 wrap-style (authenticator wraps a random MVK; rotation possible)",
+            FIDO2_COMPILED,
+        ),
         (
             "FIDO2-direct (MVK derived from the authenticator, no wrap; STRONGEST but no MVK-layer backup)",
             FIDO2_COMPILED,
         ),
-        ("Hybrid passphrase + ML-KEM-768 (post-quantum; needs a separate .kyber seed file)", true),
+        (
+            "Hybrid passphrase + ML-KEM-768 (post-quantum; needs a separate .kyber seed file)",
+            true,
+        ),
         (
             "Hybrid FIDO2 + ML-KEM-768 (post-quantum; authenticator + .kyber seed file, closes the actual PQ gap)",
             FIDO2_COMPILED,
@@ -3332,11 +3331,7 @@ fn create_single_slot_tpm_vault(
             )
         }
         TpmBootstrap::Fido2 => {
-            let pin = zeroize::Zeroizing::new(
-                Password::with_theme(theme)
-                    .with_prompt("FIDO2 PIN")
-                    .interact()?,
-            );
+            let pin = wizard_prompt_fido2_pin(theme)?;
             let mut auth = crate::make_fido2_authenticator();
             let user_handle = random_user_handle()?;
             eprintln!("{}", crate::auth_prompt("register a new FIDO2 credential"));
@@ -3450,11 +3445,7 @@ fn create_single_slot_tpm_vault(
                 PqParams::Ml1024 => "ML-KEM-1024",
             };
             eprintln!("3-factor TPM 2.0 + FIDO2 + {level_label} keyslot.");
-            let pin = zeroize::Zeroizing::new(
-                Password::with_theme(theme)
-                    .with_prompt("FIDO2 PIN")
-                    .interact()?,
-            );
+            let pin = wizard_prompt_fido2_pin(theme)?;
             let kyber_path = ask_path(theme, "Path for the new Kyber seed (.kyber) file")?;
             if kyber_path.exists() {
                 return Err(format!("{} already exists", kyber_path.display()).into());
@@ -3640,11 +3631,7 @@ fn create_fido2_wrap(
         // we ask for the PIN. Without this the user types the PIN
         // and then sees a libfido2 NoDevices error.
         fido2_preflight()?;
-        let pin = zeroize::Zeroizing::new(
-            Password::with_theme(theme)
-                .with_prompt("FIDO2 PIN")
-                .interact()?,
-        );
+        let pin = wizard_prompt_fido2_pin(theme)?;
         let mut auth = crate::make_fido2_authenticator();
         let user_handle = random_user_handle()?;
 
@@ -3713,11 +3700,7 @@ fn create_fido2_direct(
             return Ok(());
         }
 
-        let pin = zeroize::Zeroizing::new(
-            Password::with_theme(theme)
-                .with_prompt("FIDO2 PIN")
-                .interact()?,
-        );
+        let pin = wizard_prompt_fido2_pin(theme)?;
         let mut auth = crate::make_fido2_authenticator();
         let user_handle = random_user_handle()?;
 
@@ -3895,11 +3878,7 @@ fn create_hybrid_pq_fido2(
         return Err(format!("{} already exists", kyber_path.display()).into());
     }
 
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     eprintln!("Now choose a passphrase that encrypts the .kyber seed file at rest.");
     let seed_pw = ask_new_passphrase(theme, "Seed-file passphrase")?;
 
@@ -4175,11 +4154,13 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
     );
     if options.is_empty() {
         if header.keyslots.iter().any(|s| s.kind != SlotKind::Empty) {
-            return Err("this build cannot open any of this vault's keyslots: they need \
+            return Err(
+                "this build cannot open any of this vault's keyslots: they need \
                         FIDO2, TPM 2.0 or Secure Enclave support that this binary does not \
                         have (the passphrase-only static Linux build has none). Use a \
                         full LUKSbox build."
-                .into());
+                    .into(),
+            );
         }
         return Err("vault has no usable keyslots".into());
     }
@@ -5066,11 +5047,7 @@ fn collect_fido2_credential_for_rotate(
     use luksbox_fido2::{Fido2Authenticator, RP_ID};
     use rand_core::{OsRng, RngCore};
 
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let slot = &cont.header.keyslots[slot_idx];
     let cred_id = slot.fido2_cred_id.clone();
     let mut auth = crate::make_fido2_authenticator();
@@ -5284,11 +5261,20 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             menu.extend_from_slice(&[
                 ("Add a TPM 2.0 keyslot (this machine, no PIN)", tpm),
                 ("Add a TPM 2.0 + PIN keyslot", tpm),
-                ("Add a fused TPM 2.0 + FIDO2 keyslot (both required)", tpm_fido2),
+                (
+                    "Add a fused TPM 2.0 + FIDO2 keyslot (both required)",
+                    tpm_fido2,
+                ),
                 ("Add a hybrid TPM 2.0 + ML-KEM-768 keyslot", tpm),
                 ("Add a hybrid TPM 2.0 + ML-KEM-1024 keyslot", tpm),
-                ("Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-768 keyslot", tpm_fido2),
-                ("Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-1024 keyslot", tpm_fido2),
+                (
+                    "Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-768 keyslot",
+                    tpm_fido2,
+                ),
+                (
+                    "Add a 3-factor TPM 2.0 + FIDO2 + ML-KEM-1024 keyslot",
+                    tpm_fido2,
+                ),
             ]);
         }
         #[cfg(target_os = "macos")]
@@ -5305,12 +5291,27 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                 ("Add a Secure Enclave + Touch ID keyslot", sep),
                 ("Add a hybrid Secure Enclave + ML-KEM-768 keyslot", sep),
                 ("Add a hybrid Secure Enclave + ML-KEM-1024 keyslot", sep),
-                ("Add a fused Secure Enclave + FIDO2 keyslot (both required)", sep_fido2),
+                (
+                    "Add a fused Secure Enclave + FIDO2 keyslot (both required)",
+                    sep_fido2,
+                ),
                 ("Add a fused Secure Enclave + passphrase keyslot", sep),
-                ("Add a hybrid Secure Enclave + FIDO2 + ML-KEM-768 keyslot", sep_fido2),
-                ("Add a hybrid Secure Enclave + FIDO2 + ML-KEM-1024 keyslot", sep_fido2),
-                ("Add a hybrid Secure Enclave + passphrase + ML-KEM-768 keyslot", sep),
-                ("Add a hybrid Secure Enclave + passphrase + ML-KEM-1024 keyslot", sep),
+                (
+                    "Add a hybrid Secure Enclave + FIDO2 + ML-KEM-768 keyslot",
+                    sep_fido2,
+                ),
+                (
+                    "Add a hybrid Secure Enclave + FIDO2 + ML-KEM-1024 keyslot",
+                    sep_fido2,
+                ),
+                (
+                    "Add a hybrid Secure Enclave + passphrase + ML-KEM-768 keyslot",
+                    sep,
+                ),
+                (
+                    "Add a hybrid Secure Enclave + passphrase + ML-KEM-1024 keyslot",
+                    sep,
+                ),
             ]);
         }
         menu.extend_from_slice(&[
@@ -5756,7 +5757,10 @@ fn update_keyslot_action(theme: &ColorfulTheme, cont: &mut Container) -> Result<
     let target_options: &[(&'static str, bool)] = match existing {
         SlotKind::Passphrase => &[
             ("Replace with a fresh passphrase (same kind)", true),
-            ("Convert this slot to a FIDO2 wrap-style keyslot", FIDO2_COMPILED),
+            (
+                "Convert this slot to a FIDO2 wrap-style keyslot",
+                FIDO2_COMPILED,
+            ),
         ],
         SlotKind::Fido2HmacSecret => &[
             ("Re-enroll a FIDO2 credential (same kind)", FIDO2_COMPILED),
@@ -5798,11 +5802,7 @@ fn update_fido2_in(theme: &ColorfulTheme, c: &mut Container, slot_idx: usize) ->
     use rand_core::{OsRng, RngCore};
 
     fido2_preflight()?;
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
 
@@ -5843,11 +5843,7 @@ fn enroll_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()> {
     use rand_core::{OsRng, RngCore};
 
     fido2_preflight()?;
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     // Asked before the touch prompts so the user isn't holding a finger on
     // the authenticator while a menu waits. A FIDO2-wrapped slot tolerates a
     // low Argon2id memory cost well: its entropy comes from the hardware
@@ -5915,11 +5911,7 @@ fn enroll_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Resul
     let slot_idx = ask_deniable_slot_idx(theme, c)?;
     let argon2 = ask_new_den_kdf(theme, "Argon2id strength for the new envelope")?;
     let pass = ask_new_passphrase(theme, "Envelope passphrase for the new FIDO2 slot")?;
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
     eprintln!("{}", crate::auth_prompt("register a new credential"));
@@ -6009,11 +6001,7 @@ fn enroll_tpm2_fido2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> 
     let slot_idx = ask_deniable_slot_idx(theme, c)?;
     let argon2 = ask_new_den_kdf(theme, "Argon2id strength for the new envelope")?;
     let pass = ask_new_passphrase(theme, "Envelope passphrase for the new TPM+FIDO2 slot")?;
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let (tpm_secret, tpm_blob) = tpm_seal_blob_to_bytes(None)?;
 
     let mut auth = crate::make_fido2_authenticator();
@@ -6165,11 +6153,7 @@ fn enroll_hybrid_pq_tpm2_fido2_deniable_into(
         theme,
         "Envelope passphrase for the new hybrid-PQ+TPM+FIDO2 slot",
     )?;
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let seed_pw = ask_optional_seed_pw(theme, &envelope_pw)?;
     let kyber_path = ask_path(theme, "Path for the .kyber seed file")?;
 
@@ -6269,11 +6253,7 @@ fn unlock_via_fido2(
 
     // No authenticator plugged in: say so before asking for its PIN.
     fido2_preflight()?;
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let mut auth = crate::make_fido2_authenticator();
 
     let mut last_err: Option<Box<dyn std::error::Error>> = None;
@@ -6425,11 +6405,7 @@ fn unlock_via_hybrid_pq_fido2(
     if !kyber_path.is_file() {
         return Err(format!("{} is not a file", kyber_path.display()).into());
     }
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let seed_pw = zeroize::Zeroizing::new(
         Password::with_theme(theme)
             .with_prompt(".kyber seed-file passphrase")
@@ -7006,11 +6982,7 @@ fn enroll_tpm2_fido2_into(theme: &ColorfulTheme, c: &mut Container) -> Result<()
     fido2_preflight()?;
     ask_tpm_srk_pinning_once();
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let mut auth = crate::make_fido2_authenticator();
     let user_handle = random_user_handle()?;
 
@@ -7189,11 +7161,7 @@ fn enroll_hybrid_pq_tpm2_fido2_into(
         return Err(format!("{} already exists", kyber_path.display()).into());
     }
 
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let seed_pw = ask_new_passphrase(theme, "Seed-file passphrase")?;
 
     ask_tpm_srk_pinning_once();
@@ -7496,11 +7464,7 @@ fn enroll_hybrid_pq_fido2_into(
          FIDO2 authenticator AND a separate .kyber seed file will be\n  \
          required at every unlock."
     );
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let slot_pw = zeroize::Zeroizing::new(
         Password::with_theme(theme)
             .with_prompt("Optional extra passphrase (leave blank for none)")
@@ -7639,11 +7603,7 @@ fn enroll_hybrid_pq_fido2_deniable_into(
     // R15-H3: see enroll_hybrid_pq_passphrase_deniable_into.
     let argon2 = ask_new_den_kdf(theme, "Argon2id strength for the new envelope")?;
     let envelope_pw = ask_new_passphrase(theme, "Envelope passphrase for the new slot")?;
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let kyber_path = ask_path(theme, "Path for the new Kyber seed (.kyber) file")?;
     if kyber_path.exists() {
         return Err(format!("{} already exists", kyber_path.display()).into());
@@ -8113,11 +8073,7 @@ fn unlock_via_tpm2_fido2(
     use luksbox_fido2::RP_ID;
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
     let mut auth = crate::make_fido2_authenticator();
     // One assertion over every Tpm2Fido2 slot's credential (one prompt
@@ -8289,11 +8245,7 @@ fn unlock_via_hybrid_pq_tpm2_fido2(
     if !kyber_path.is_file() {
         return Err(format!("{} is not a file", kyber_path.display()).into());
     }
-    let pin = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("FIDO2 PIN")
-            .interact()?,
-    );
+    let pin = wizard_prompt_fido2_pin(theme)?;
     let seed_pw = zeroize::Zeroizing::new(
         Password::with_theme(theme)
             .with_prompt(".kyber seed-file passphrase")

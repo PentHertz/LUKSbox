@@ -4110,8 +4110,12 @@ impl LuksboxApp {
                             );
                             ui.add_space(8.0);
                         }
-                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                        ui.add_sized([form_width(ui), CONTROL_H], egui::TextEdit::singleline(&mut *self.create.pin).password(true));
+                        if PLATFORM_ASKS_FIDO2_PIN {
+                            platform_pin_note(ui);
+                        } else {
+                            ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                            ui.add_sized([form_width(ui), CONTROL_H], egui::TextEdit::singleline(&mut *self.create.pin).password(true));
+                        }
                         ui.label(
                             RichText::new("You'll be asked to touch the FIDO2 authenticator twice, once to register a new credential, once to derive the keyslot secret.")
                                 .color(theme::FAINT).size(12.0),
@@ -4120,8 +4124,12 @@ impl LuksboxApp {
                 }
                 CreateKind::Fido2Direct => {
                     section(ui, "FIDO2-direct", |ui| {
-                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                        ui.add_sized([form_width(ui), CONTROL_H], egui::TextEdit::singleline(&mut *self.create.pin).password(true));
+                        if PLATFORM_ASKS_FIDO2_PIN {
+                            platform_pin_note(ui);
+                        } else {
+                            ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                            ui.add_sized([form_width(ui), CONTROL_H], egui::TextEdit::singleline(&mut *self.create.pin).password(true));
+                        }
                         ui.add_space(10.0);
                         let cb_resp = ui.checkbox(
                             &mut self.create.enable_backup_passphrase,
@@ -4277,9 +4285,13 @@ impl LuksboxApp {
                         "Hybrid FIDO2 + ML-KEM-768"
                     };
                     section(ui, title, |ui| {
-                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                        let te = egui::TextEdit::singleline(&mut *self.create.pin).password(true);
-                        ui.add_sized([form_width(ui), CONTROL_H], te);
+                        if PLATFORM_ASKS_FIDO2_PIN {
+                            platform_pin_note(ui);
+                        } else {
+                            ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                            let te = egui::TextEdit::singleline(&mut *self.create.pin).password(true);
+                            ui.add_sized([form_width(ui), CONTROL_H], te);
+                        }
                         ui.add_space(8.0);
                         if self.create.use_deniable {
                             ui.label(
@@ -4609,9 +4621,13 @@ impl LuksboxApp {
                             }
                         }
                         ui.add_space(8.0);
-                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                        let te = egui::TextEdit::singleline(&mut *self.create.pin).password(true);
-                        ui.add_sized([form_width(ui), CONTROL_H], te);
+                        if PLATFORM_ASKS_FIDO2_PIN {
+                            platform_pin_note(ui);
+                        } else {
+                            ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                            let te = egui::TextEdit::singleline(&mut *self.create.pin).password(true);
+                            ui.add_sized([form_width(ui), CONTROL_H], te);
+                        }
                     });
                 }
                 CreateKind::HybridPqTpm2 | CreateKind::HybridPq1024Tpm2 => {
@@ -4823,9 +4839,13 @@ impl LuksboxApp {
                             }
                             ui.add_space(8.0);
                         }
-                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                        let te = egui::TextEdit::singleline(&mut *self.create.pin).password(true);
-                        ui.add_sized([form_width(ui), CONTROL_H], te);
+                        if PLATFORM_ASKS_FIDO2_PIN {
+                            platform_pin_note(ui);
+                        } else {
+                            ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                            let te = egui::TextEdit::singleline(&mut *self.create.pin).password(true);
+                            ui.add_sized([form_width(ui), CONTROL_H], te);
+                        }
                         ui.add_space(8.0);
                         if self.create.use_deniable {
                             ui.label(
@@ -5095,11 +5115,15 @@ impl LuksboxApp {
                         ui.add_space(8.0);
 
                         if has_fido2 {
-                            ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                            ui.add_sized(
-                                [form_width(ui), CONTROL_H],
-                                egui::TextEdit::singleline(&mut *self.create.pin).password(true),
-                            );
+                            if PLATFORM_ASKS_FIDO2_PIN {
+                                platform_pin_note(ui);
+                            } else {
+                                ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                                ui.add_sized(
+                                    [form_width(ui), CONTROL_H],
+                                    egui::TextEdit::singleline(&mut *self.create.pin).password(true),
+                                );
+                            }
                             ui.label(
                                 RichText::new(
                                     "You'll be asked to touch the authenticator twice (register \
@@ -5641,7 +5665,7 @@ impl LuksboxApp {
             }
             CreateKind::Tpm2Fido2 => {
                 let pin = std::mem::take(&mut self.create.pin);
-                if pin.is_empty() {
+                if pin.is_empty() && !PLATFORM_ASKS_FIDO2_PIN {
                     self.toast_err("FIDO2 PIN required");
                     return;
                 }
@@ -5685,7 +5709,7 @@ impl LuksboxApp {
                     return;
                 }
                 let pin = std::mem::take(&mut self.create.pin);
-                if pin.is_empty() {
+                if pin.is_empty() && !PLATFORM_ASKS_FIDO2_PIN {
                     self.toast_err("FIDO2 PIN required");
                     return;
                 }
@@ -5809,7 +5833,7 @@ impl LuksboxApp {
                 // analogs above): an empty PIN would die mid-ceremony
                 // with a raw CTAP error, and an empty slot passphrase
                 // would enroll a slot the unlock path refuses to open.
-                if factors.has_fido2() && self.create.pin.is_empty() {
+                if factors.has_fido2() && self.create.pin.is_empty() && !PLATFORM_ASKS_FIDO2_PIN {
                     self.toast_err("FIDO2 PIN required");
                     return;
                 }
@@ -6663,12 +6687,18 @@ impl LuksboxApp {
                             egui::TextEdit::singleline(&mut *self.unlock.passphrase).password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         ui.add_space(8.0);
-                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                        if !PLATFORM_ASKS_FIDO2_PIN {
+                            ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                        }
                     }
-                    let te = egui::TextEdit::singleline(&mut *self.unlock.pin).password(true);
-                    let resp = ui.add_sized([form_width(ui), CONTROL_H], te);
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        self.submit_unlock();
+                    if PLATFORM_ASKS_FIDO2_PIN {
+                        platform_pin_note(ui);
+                    } else {
+                        let te = egui::TextEdit::singleline(&mut *self.unlock.pin).password(true);
+                        let resp = ui.add_sized([form_width(ui), CONTROL_H], te);
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            self.submit_unlock();
+                        }
                     }
                     ui.label(
                         RichText::new(
@@ -6835,11 +6865,15 @@ impl LuksboxApp {
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         ui.add_space(8.0);
                     }
-                    ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                    let te = egui::TextEdit::singleline(&mut *self.unlock.pin).password(true);
-                    let resp = ui.add_sized([form_width(ui), CONTROL_H], te);
-                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                        self.submit_unlock();
+                    if PLATFORM_ASKS_FIDO2_PIN {
+                        platform_pin_note(ui);
+                    } else {
+                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                        let te = egui::TextEdit::singleline(&mut *self.unlock.pin).password(true);
+                        let resp = ui.add_sized([form_width(ui), CONTROL_H], te);
+                        if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            self.submit_unlock();
+                        }
                     }
                     ui.add_space(6.0);
                     ui.label(
@@ -6936,9 +6970,13 @@ impl LuksboxApp {
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         ui.add_space(8.0);
                     }
-                    ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                    let te = egui::TextEdit::singleline(&mut *self.unlock.pin).password(true);
-                    ui.add_sized([form_width(ui), CONTROL_H], te);
+                    if PLATFORM_ASKS_FIDO2_PIN {
+                        platform_pin_note(ui);
+                    } else {
+                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                        let te = egui::TextEdit::singleline(&mut *self.unlock.pin).password(true);
+                        ui.add_sized([form_width(ui), CONTROL_H], te);
+                    }
                     ui.add_space(8.0);
                     if use_deniable {
                         ui.label(
@@ -7012,9 +7050,13 @@ impl LuksboxApp {
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         ui.add_space(8.0);
                     }
-                    ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                    let te = egui::TextEdit::singleline(&mut *self.unlock.pin).password(true);
-                    ui.add_sized([form_width(ui), CONTROL_H], te);
+                    if PLATFORM_ASKS_FIDO2_PIN {
+                        platform_pin_note(ui);
+                    } else {
+                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                        let te = egui::TextEdit::singleline(&mut *self.unlock.pin).password(true);
+                        ui.add_sized([form_width(ui), CONTROL_H], te);
+                    }
                     ui.add_space(8.0);
                     if use_deniable {
                         ui.label(
@@ -10550,9 +10592,13 @@ impl LuksboxApp {
                         ui.add_space(10.0);
                     }
 
-                    ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                    let te = egui::TextEdit::singleline(&mut *form.pin).password(true);
-                    ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    if PLATFORM_ASKS_FIDO2_PIN {
+                        platform_pin_note(ui);
+                    } else {
+                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                        let te = egui::TextEdit::singleline(&mut *form.pin).password(true);
+                        ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    }
                     ui.label(
                         RichText::new("You'll be asked to touch the FIDO2 authenticator twice.")
                             .color(theme::FAINT)
@@ -10615,9 +10661,13 @@ impl LuksboxApp {
                         draw_deniable_extras(ui, &mut form.extras);
                         ui.add_space(8.0);
                     }
-                    ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                    let te = egui::TextEdit::singleline(&mut *form.pin).password(true);
-                    ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    if PLATFORM_ASKS_FIDO2_PIN {
+                        platform_pin_note(ui);
+                    } else {
+                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                        let te = egui::TextEdit::singleline(&mut *form.pin).password(true);
+                        ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    }
                     ui.label(
                         RichText::new(
                             "Both factors required at every future unlock: the local TPM \
@@ -11240,11 +11290,15 @@ impl LuksboxApp {
                     ui.add_space(8.0);
 
                     if form.factors.has_fido2() {
-                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                        ui.add_sized(
-                            [capped_width(ui, 320.0), CONTROL_H],
-                            egui::TextEdit::singleline(&mut *form.pin).password(true),
-                        );
+                        if PLATFORM_ASKS_FIDO2_PIN {
+                            platform_pin_note(ui);
+                        } else {
+                            ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                            ui.add_sized(
+                                [capped_width(ui, 320.0), CONTROL_H],
+                                egui::TextEdit::singleline(&mut *form.pin).password(true),
+                            );
+                        }
                         ui.add_space(8.0);
                     }
                     if form.factors.has_passphrase() {
@@ -11305,7 +11359,10 @@ impl LuksboxApp {
                             close_sf = true;
                         }
                         if ui.add(primary_button("Enroll")).clicked() {
-                            if form.factors.has_fido2() && form.pin.is_empty() {
+                            if form.factors.has_fido2()
+                                && form.pin.is_empty()
+                                && !PLATFORM_ASKS_FIDO2_PIN
+                            {
                                 sf_err = Some("FIDO2 PIN cannot be empty".into());
                             } else if form.factors.has_passphrase() && form.slot_pw.is_empty() {
                                 sf_err = Some("slot passphrase cannot be empty".into());
@@ -11402,9 +11459,13 @@ impl LuksboxApp {
                         draw_deniable_extras(ui, &mut form.extras);
                         ui.add_space(10.0);
                     }
-                    ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                    let te = egui::TextEdit::singleline(&mut *form.fido2_pin).password(true);
-                    ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    if PLATFORM_ASKS_FIDO2_PIN {
+                        platform_pin_note(ui);
+                    } else {
+                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                        let te = egui::TextEdit::singleline(&mut *form.fido2_pin).password(true);
+                        ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    }
                     ui.add_space(8.0);
                     ui.label(
                         RichText::new("Path for the new .kyber seed file")
@@ -11457,7 +11518,7 @@ impl LuksboxApp {
                             close_h3 = true;
                         }
                         if ui.add(primary_button("Enroll")).clicked() {
-                            if form.fido2_pin.is_empty() {
+                            if form.fido2_pin.is_empty() && !PLATFORM_ASKS_FIDO2_PIN {
                                 h3_err = Some("FIDO2 PIN cannot be empty".into());
                             } else if form.kyber_path.trim().is_empty() {
                                 h3_err = Some(".kyber path cannot be empty".into());
@@ -11778,9 +11839,13 @@ impl LuksboxApp {
                         draw_deniable_extras(ui, &mut form.extras);
                         ui.add_space(10.0);
                     }
-                    ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
-                    let te = egui::TextEdit::singleline(&mut *form.pin).password(true);
-                    ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    if PLATFORM_ASKS_FIDO2_PIN {
+                        platform_pin_note(ui);
+                    } else {
+                        ui.label(RichText::new("FIDO2 PIN").color(theme::DIM).size(12.0));
+                        let te = egui::TextEdit::singleline(&mut *form.pin).password(true);
+                        ui.add_sized([capped_width(ui, 320.0), CONTROL_H], te);
+                    }
                     ui.add_space(10.0);
                     ui.label(
                         RichText::new("Path for the new .kyber seed file")
@@ -11832,7 +11897,7 @@ impl LuksboxApp {
                             close_hpf = true;
                         }
                         if ui.add(primary_button("Enroll")).clicked() {
-                            if form.pin.is_empty() {
+                            if form.pin.is_empty() && !PLATFORM_ASKS_FIDO2_PIN {
                                 hpf_err = Some("FIDO2 PIN cannot be empty".into());
                             } else if form.kyber_path.trim().is_empty() {
                                 hpf_err = Some(".kyber path cannot be empty".into());
@@ -13240,6 +13305,22 @@ fn capped_width(ui: &egui::Ui, max: f32) -> f32 {
 
 fn form_width(ui: &egui::Ui) -> f32 {
     capped_width(ui, FORM_FIELD_MAX_W)
+}
+
+/// True where the platform asks for the FIDO2 PIN itself. On Windows FIDO2
+/// goes through webauthn.dll, which always prompts for the PIN in its own
+/// Windows Hello / security-key dialog and takes none from the application,
+/// so a PIN typed into LUKSbox was silently ignored (GitHub #37). The forms
+/// show a note instead of the field there and do not require a PIN.
+const PLATFORM_ASKS_FIDO2_PIN: bool = cfg!(target_os = "windows");
+
+/// Shown in place of a FIDO2 PIN field when `PLATFORM_ASKS_FIDO2_PIN`.
+fn platform_pin_note(ui: &mut egui::Ui) {
+    ui.label(
+        RichText::new("FIDO2 PIN: Windows asks for it in its own security-key prompt.")
+            .color(theme::DIM)
+            .size(12.0),
+    );
 }
 
 fn trailing_button_row_widths(ui: &egui::Ui, field_max: f32, button_max: f32) -> (f32, f32) {

@@ -750,9 +750,11 @@ enum Command {
     },
     /// Unmount a luksbox mountpoint (wraps fusermount3 -u on Linux, umount on macOS).
     ///
-    /// Windows: press Ctrl-C in the window running `luksbox mount`
-    /// instead. WinFsp has no cross-process unmount, so this command
-    /// cannot release a mount held by another process.
+    /// Takes only the mountpoint (`luksbox umount Z:`), no vault file and
+    /// no unlock flags. Windows: asks the `luksbox mount` (or GUI) process
+    /// holding the mountpoint to unmount, the same as Ctrl-C in its window;
+    /// that works within the same Windows session, for mounts started by
+    /// LUKSbox 0.6.0 or later.
     Umount { mountpoint: PathBuf },
     /// Create a deniable-header file: an 8 KiB header where every
     /// on-disk byte is indistinguishable from random output. See
@@ -2952,8 +2954,16 @@ fn read_seed_with_fallback(
 }
 
 /// Read a FIDO2 PIN. Honors `LUKSBOX_FIDO2_PIN` for scripting/tests.
+///
+/// Windows: no prompt. FIDO2 goes through webauthn.dll there, which always
+/// asks for the PIN in its own Windows Hello / security-key dialog and
+/// takes none from the caller, so a PIN typed here was silently ignored and
+/// users had to enter it twice (GitHub #37).
 #[cfg(feature = "fido2-hardware")]
 fn read_fido2_pin() -> io::Result<Zeroizing<String>> {
+    if cfg!(target_os = "windows") {
+        return Ok(Zeroizing::new(String::new()));
+    }
     if let Ok(p) = std::env::var("LUKSBOX_FIDO2_PIN") {
         return Ok(Zeroizing::new(p));
     }
@@ -7816,7 +7826,7 @@ fn cli_create_sep_fido2_deniable_v2(
     use luksbox_sep::SepSealer;
     use rand_core::RngCore;
     let pass = prompt_pass_twice("Envelope passphrase: ", "Confirm:             ")?;
-    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    let pin = read_fido2_pin()?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
     let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
@@ -7923,7 +7933,7 @@ fn cli_create_pq_sep_fido2_deniable_v2(
     use rand_core::RngCore;
     let pass = prompt_pass_twice("Envelope passphrase: ", "Confirm:             ")?;
     let seed_pw = prompt_deniable_seed_pw(&pass)?;
-    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    let pin = read_fido2_pin()?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
     let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
@@ -8567,7 +8577,7 @@ fn cli_create_fido2_deniable_v2(
     use luksbox_format::deniable_header::DeniableMaterial;
     use rand_core::RngCore;
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    let pin = read_fido2_pin()?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
     let er = auth.enroll(RP_ID, &user_handle, Some(pin.as_str()))?;
@@ -8667,7 +8677,7 @@ fn cli_create_pq_fido2_deniable_v2(
         PqParams::Ml768
     };
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    let pin = read_fido2_pin()?;
     // Blank = reuse envelope passphrase (aligns with GUI/wizard).
     let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(
         "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
@@ -8785,7 +8795,7 @@ fn cli_create_tpm_fido2_deniable_v2(
     use luksbox_format::deniable_header::DeniableMaterial;
     use rand_core::RngCore;
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    let pin = read_fido2_pin()?;
     let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
@@ -8898,7 +8908,7 @@ fn cli_create_pq_tpm_fido2_deniable_v2(
         PqParams::Ml768
     };
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
-    let pin = zeroize::Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?);
+    let pin = read_fido2_pin()?;
     // Blank = reuse envelope passphrase (aligns with GUI/wizard).
     let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(
         "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",

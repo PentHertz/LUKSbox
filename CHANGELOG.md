@@ -51,12 +51,21 @@ canonical record.
   downloads (no filter) worked. The save dialog now has no filters on
   Linux, like every other dialog in the GUI; Windows and macOS keep their
   extension filter.
-- **CLI `mount` / `umount` help on Windows (GitHub #37).** A missing
+- **CLI `mount` / `umount` on Windows (GitHub #37).** A missing
   mountpoint now says what each platform expects (a free drive letter
   such as `Z:` on Windows) instead of only pointing at the macOS-only
-  `--private-mount`. `umount --help` explains that a Windows mount is
-  released with Ctrl-C in the `mount` window, since WinFsp has no
-  cross-process unmount.
+  `--private-mount`. `luksbox umount Z:` now works on Windows too:
+  WinFsp has no cross-process unmount, so a mount listens on a named
+  event (current Windows session only, default security: the same user,
+  SYSTEM and Administrators) that `umount` signals; the mount then stops
+  exactly as on Ctrl-C, and `umount` waits until the drive letter is
+  gone. `umount --help` says it takes only the mountpoint.
+- **FIDO2 PIN asked twice on Windows (GitHub #37).** On Windows FIDO2
+  goes through webauthn.dll, which always asks for the PIN in its own
+  Windows Hello / security-key prompt and accepts none from the
+  application, so the PIN typed into LUKSbox was silently ignored. The
+  CLI and the wizard no longer ask for it on Windows, and the GUI shows
+  a note instead of the PIN field (and no longer requires one).
 - **Wizard offered keyslots the build cannot use (GitHub #34).** The
   passphrase-only static musl CLI has no FIDO2, TPM 2.0 or Secure
   Enclave support, but
