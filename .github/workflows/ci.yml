@@ -365,6 +365,14 @@ jobs:
         env:
           LUKSBOX_REQUIRE_MOUNT_TESTS: "1"
         run: cargo test --release -p luksbox-cli --test mount_cross_process -- --nocapture
+      - name: Run Windows extraction tests (junctions, 8.3 short names)
+        shell: pwsh
+        # The Windows-only checks in luksbox-core's
+        # secure_create_or_truncate (used by `get`, GUI downloads, seed
+        # files and hybrid sidecars): refuse a junction anywhere in the
+        # path, accept 8.3 short names. Needs no WinFsp; lives in this job
+        # to reuse its Windows runner.
+        run: cargo test --release -p luksbox-core --test windows_extract_junction
 
   # ---- Security regression spotlight (always-green gate) ------------------
   # Runs JUST the 26 security regression tests added during the audit
