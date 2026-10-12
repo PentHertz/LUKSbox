@@ -156,6 +156,11 @@ impl LbxFile for SimFile {
         self.durable = self.backing.clone();
         Ok(())
     }
+    fn set_len(&mut self, len: u64) -> io::Result<()> {
+        // Page-cache view only, like a real truncate before fsync.
+        self.backing.resize(len as usize, 0);
+        Ok(())
+    }
     fn inode_pair(&self) -> io::Result<(u64, u64)> {
         // In-memory backend: no real inode. Never reached on the
         // real-filesystem rotation path; a stable sentinel is fine.
@@ -273,6 +278,12 @@ impl LbxFile for SharedSimFile {
             .lock()
             .map_err(|_| io::Error::other("SimFile mutex poisoned"))?
             .sync_all()
+    }
+    fn set_len(&mut self, len: u64) -> io::Result<()> {
+        self.inner
+            .lock()
+            .map_err(|_| io::Error::other("SimFile mutex poisoned"))?
+            .set_len(len)
     }
     fn inode_pair(&self) -> io::Result<(u64, u64)> {
         Ok((0, 0))

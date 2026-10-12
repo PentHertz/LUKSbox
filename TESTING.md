@@ -136,6 +136,12 @@ per-crate `tests/` directories.
 rm / mkdir / mv / enroll / revoke flows. Run as subprocess of the
 real binary.
 
+`crates/luksbox-cli/tests/vault_size.rs` covers `create --max-size`
+(refusals and their messages), `luksbox size` (report, `--max`,
+`--shrink`) and a write refused at the limit, through the real binary.
+The VFS side (limit, LBM6 round trip, shrink, a file longer than its
+metadata, deniable refusal) is in `luksbox-vfs`'s unit tests.
+
 `crates/luksbox-cli/tests/mount_cross_process.rs` runs
 `luksbox mount -f` in one process and `luksbox umount <mountpoint>`
 in another, the way a user does with two terminals (GitHub #37), then

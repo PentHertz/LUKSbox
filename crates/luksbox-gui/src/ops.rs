@@ -492,6 +492,9 @@ pub struct CreateOpts {
     /// anchor records, so a restored older keyslot table is detected.
     /// Applied by `apply_header_v3` once the create path succeeded.
     pub header_v3: bool,
+    /// Maximum size of the vault file, 0 = unlimited. Applied by
+    /// `apply_max_size` once the create path succeeded.
+    pub max_size: u64,
 }
 
 // Hand-written redacting Debug: `CreateOpts` carries up to four
@@ -6417,6 +6420,23 @@ pub fn apply_header_v3(mut opened: OpenedVault, header_v3: bool) -> Result<Opene
                  is usable as is; retry from Manage keyslots > Upgrade header."
             )
         })?;
+    }
+    Ok(opened)
+}
+
+/// Set the new vault's maximum size (0 = unlimited) and save it.
+pub fn apply_max_size(mut opened: OpenedVault, max_size: u64) -> Result<OpenedVault, String> {
+    if max_size != 0 {
+        opened
+            .vfs
+            .set_max_vault_size(max_size)
+            .and_then(|()| opened.vfs.flush())
+            .map_err(|e| {
+                format!(
+                    "vault created, but setting its maximum size failed: {e}. The vault is \
+                     usable as is; set the size again from Vault size."
+                )
+            })?;
     }
     Ok(opened)
 }

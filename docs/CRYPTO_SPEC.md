@@ -277,6 +277,16 @@ that identifies the metadata format inside the encrypted region:
   on the first `Vfs::flush` against a dirty tree; the upgrade
   is one-way.
 
+- `LBM\x06` ("v6", 0.6.0) -- the LBM5 payload followed by the
+  vault settings, postcard-encoded: `VaultSettingsOnDisk {
+  max_vault_size: u64 }` (maximum size of the `.lbx` file in bytes,
+  0 = unlimited; see `docs/VAULT_SIZE.md`). Nothing may follow the
+  settings. Written only while a setting differs from its default: a
+  vault without a size limit is written as LBM5 (and goes back to LBM5
+  when the limit is removed), so it stays readable by older binaries.
+  Pre-LBM6 binaries refuse an LBM6 blob (unknown magic) rather than
+  ignore its limit. In memory an LBM6 vault is a V5 vault.
+
 Users who need to keep new vaults openable by older binaries
 can opt back to LBM2 via `LUKSBOX_FORMAT_V2=1` at create time;
 they then lose chmod/link/symlink AND mirror-based crash recovery.
@@ -284,7 +294,7 @@ they then lose chmod/link/symlink AND mirror-based crash recovery.
 Choice of v2 vs v3 vs v4 vs v5 is stamped implicitly via the
 magic byte (which is itself inside the AEAD-encrypted region, so
 an attacker without MVK cannot flip it). Old binaries presented
-with an `LBM\x03` / `LBM\x04` / `LBM\x05` blob they don't
+with an `LBM\x03` / `LBM\x04` / `LBM\x05` / `LBM\x06` blob they don't
 understand fail with a clean `MetadataDeserialize` error rather
 than silently mis-parsing.
 

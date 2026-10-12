@@ -234,6 +234,8 @@ fn vfs_err_to_nt(e: &luksbox_vfs::Error) -> NTSTATUS {
         // POSIX: rename(2) into own descendant -> EINVAL.
         E::RenameCycle => STATUS_INVALID_PARAMETER,
         E::MetadataBudgetExhausted => STATUS_DISK_FULL,
+        // The vault reached the maximum size its owner set.
+        E::VaultSizeLimit { .. } => STATUS_DISK_FULL,
         E::FileSizeExceedsCap => STATUS_FILE_TOO_LARGE,
         _ => STATUS_ACCESS_DENIED,
     }
@@ -538,10 +540,8 @@ impl Drop for LuksboxFs {
         if let Some(timer) = self.timer_thread.take() {
             let _ = timer.join();
         }
-        if let Ok(mut vfs) = self.inner.lock()
-            && let Err(e) = vfs.flush()
-        {
-            eprintln!("luksbox-mount: final unmount flush failed: {e}");
+        if let Ok(mut vfs) = self.inner.lock() {
+            crate::finish_on_unmount(&mut vfs);
         }
     }
 }

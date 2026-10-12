@@ -444,6 +444,9 @@ struct CreateForm {
     /// Header format v3 (R15-D1); default for new vaults since 0.6.0.
     /// Only applied together with `use_v3_format` (see `submit_create`).
     header_v3: bool,
+    /// Maximum size of the vault file (unlimited by default). Needs
+    /// `use_v3_format`.
+    max_size: SizeLimitInput,
 }
 
 impl Default for CreateForm {
@@ -474,6 +477,7 @@ impl Default for CreateForm {
             // explicitly for cross-version compatibility scenarios.
             use_v3_format: true,
             header_v3: true,
+            max_size: SizeLimitInput::new(0),
         }
     }
 }
@@ -1349,6 +1353,13 @@ pub struct LuksboxApp {
     /// Persisted preferences (currently just the
     /// "I've seen the clipboard-history warning" flag).
     prefs: preferences::Preferences,
+    /// "Vault size" dialog of the open vault.
+    size_dialog: Option<SizeDialog>,
+    /// "Give back free space?" asked before locking a vault (Ask mode).
+    shrink_prompt: Option<ShrinkPrompt>,
+    /// Free space on the disk of the last directory asked, refreshed
+    /// every few seconds (`cached_free_space`).
+    free_space_cache: Option<(PathBuf, std::time::Instant, Option<u64>)>,
     /// `Some` while the one-time clipboard-warning modal is on screen.
     /// Holds the passphrase + target that triggered it; on "I
     /// understand", we proceed with the actual copy + guard
@@ -1630,6 +1641,10 @@ struct MountStatus {
     /// When the last attempt started; throttles the auto-retry loop
     /// that runs while "Unmount and quit" is armed.
     last_unmount_attempt: Option<std::time::Instant>,
+    /// What the end of an in-process mount does with the free space at
+    /// the end of the vault file; in Ask mode the mount asks through it
+    /// (`draw_shrink_prompt`). None for the FUSE-T helper process.
+    shrink: Option<luksbox_vfs::ShrinkControl>,
 }
 
 /// Backend-specific transport for the running mount session.
@@ -1821,6 +1836,9 @@ impl LuksboxApp {
             force_close: false,
             clipboard_guard: None,
             prefs: preferences::load(),
+            size_dialog: None,
+            shrink_prompt: None,
+            free_space_cache: None,
             pending_clipboard_warning: None,
             revoke_confirm: None,
             deniable_modal: None,
@@ -3375,6 +3393,16 @@ impl LuksboxApp {
     fn lock_and_drop_vault(&mut self) {
         if let Some(mut v) = self.vault.take() {
             let _ = v.vfs.flush();
+            if self.prefs.shrink_on_close == preferences::ShrinkOnClose::Always
+                && can_shrink(&v.vfs)
+                && let Ok(freed) = v.vfs.shrink()
+                && freed > 0
+            {
+                self.toast_ok(format!(
+                    "gave back {} of free space at the end of the vault",
+                    format_size(freed)
+                ));
+            }
         }
         self.cwd = "/".into();
         self.listing.clear();
@@ -3417,6 +3445,26 @@ impl LuksboxApp {
     /// reachable through `request_navigate` or the confirm-lock
     /// modal's "Lock and continue" button.
     fn execute_navigate(&mut self, action: NavigateAction) {
+        // Ask mode: offer to give back the free space at the end of the
+        // vault file first; the prompt runs `navigate_now` when answered.
+        if self.prefs.shrink_on_close == preferences::ShrinkOnClose::Ask
+            && let Some(v) = self.vault.as_mut()
+            && can_shrink(&v.vfs)
+            && let Ok(report) = v.vfs.space_report()
+            && report.reclaimable >= luksbox_vfs::SHRINK_ASK_MIN
+        {
+            self.shrink_prompt = Some(ShrinkPrompt {
+                target: ShrinkPromptTarget::Lock(action),
+                reclaimable: report.reclaimable,
+                remember: false,
+            });
+            return;
+        }
+        self.navigate_now(action);
+    }
+
+    /// Lock the open vault (if any) and run `action`.
+    fn navigate_now(&mut self, action: NavigateAction) {
         self.lock_and_drop_vault();
         match action {
             NavigateAction::OpenRecent(r) => self.start_unlock(r),
@@ -5258,6 +5306,46 @@ impl LuksboxApp {
                 });
             }
 
+            section(ui, "Vault size", |ui| {
+                ui.label(
+                    RichText::new(
+                        "Maximum size of the vault file. Unlimited (the default): it grows \
+                         as you add files. With a limit, writes that would grow it further \
+                         fail with \"no space left\", while free space inside the vault is \
+                         still reused. Change it any time from Vault size once the vault \
+                         is open.",
+                    )
+                    .color(theme::DIM)
+                    .size(12.0),
+                );
+                ui.add_space(6.0);
+                if self.create.use_v3_format {
+                    let dir = PathBuf::from(self.create.path.trim());
+                    let free = self.cached_free_space(&dir);
+                    let min = new_vault_min_size();
+                    let max = free.unwrap_or(0);
+                    size_limit_editor(ui, "create-max-size", &mut self.create.max_size, min, max, free);
+                    if let Some(f) = free {
+                        ui.label(
+                            RichText::new(format!(
+                                "Disk free: {}. A {} backup copy of the metadata \
+                                 (vault.lbx.meta-bak) is kept next to the vault.",
+                                format_size(f),
+                                format_size(luksbox_format::DEFAULT_METADATA_REGION_SIZE)
+                            ))
+                            .color(theme::FAINT)
+                            .size(12.0),
+                        );
+                    }
+                } else {
+                    ui.label(
+                        RichText::new("Needs the v0.2.1 format (On-disk format, below).")
+                            .color(theme::FAINT)
+                            .size(12.0),
+                    );
+                }
+            });
+
             section(ui, "Hardening", |ui| {
                 ui.checkbox(
                     &mut self.create.use_anchor,
@@ -5372,6 +5460,12 @@ impl LuksboxApp {
     fn submit_create(&mut self) {
         if self.create.path.trim().is_empty() {
             self.toast_err("vault path is required");
+            return;
+        }
+        if self.create.use_v3_format
+            && let Some(e) = &self.create.max_size.error
+        {
+            self.toast_err(format!("maximum size: {e}"));
             return;
         }
         // Empty-passphrase guard: every CreateKind that needs a
@@ -5598,6 +5692,11 @@ impl LuksboxApp {
             // Header v3 builds on the v0.2.1 envelope; the legacy format
             // exists for old readers, which v3 would lock out.
             header_v3: self.create.use_v3_format && self.create.header_v3,
+            max_size: if self.create.use_v3_format {
+                self.create.max_size.bytes
+            } else {
+                0
+            },
         };
         let needs_touch = self.create.kind.needs_fido2();
 
@@ -5642,9 +5741,11 @@ impl LuksboxApp {
                 None
             };
             let header_v3 = opts.header_v3;
+            let max_size = opts.max_size;
             let rx = ops::spawn(move || {
                 ops::create_vault_tpm2_only(opts, pin_opt)
                     .and_then(|o| ops::apply_header_v3(o, header_v3))
+                    .and_then(|o| ops::apply_max_size(o, max_size))
             });
             self.pending = Some(Pending::CreateWithTpmBootstrap {
                 rx,
@@ -5745,9 +5846,11 @@ impl LuksboxApp {
                 return;
             }
             let header_v3 = opts.header_v3;
+            let max_size = opts.max_size;
             let rx = ops::spawn(move || {
                 ops::create_vault_with_tpm_bootstrap(opts, kind)
                     .and_then(|o| ops::apply_header_v3(o, header_v3))
+                    .and_then(|o| ops::apply_max_size(o, max_size))
             });
             self.pending = Some(Pending::CreateWithTpmBootstrap {
                 rx,
@@ -5771,9 +5874,11 @@ impl LuksboxApp {
             }
             let biometric = self.create.kind == CreateKind::SepBiometric;
             let header_v3 = opts.header_v3;
+            let max_size = opts.max_size;
             let rx = ops::spawn(move || {
                 ops::create_vault_sep_only(opts, biometric)
                     .and_then(|o| ops::apply_header_v3(o, header_v3))
+                    .and_then(|o| ops::apply_max_size(o, max_size))
             });
             self.pending = Some(Pending::CreateWithTpmBootstrap {
                 rx,
@@ -5879,9 +5984,11 @@ impl LuksboxApp {
                 return;
             }
             let header_v3 = opts.header_v3;
+            let max_size = opts.max_size;
             let rx = ops::spawn(move || {
                 ops::create_vault_with_sep_bootstrap(opts, kind)
                     .and_then(|o| ops::apply_header_v3(o, header_v3))
+                    .and_then(|o| ops::apply_max_size(o, max_size))
             });
             self.pending = Some(Pending::CreateWithTpmBootstrap {
                 rx,
@@ -5892,8 +5999,12 @@ impl LuksboxApp {
         }
 
         let header_v3 = opts.header_v3;
+
+        let max_size = opts.max_size;
         let rx = ops::spawn(move || {
-            ops::create_vault(opts).and_then(|o| ops::apply_header_v3(o, header_v3))
+            ops::create_vault(opts)
+                .and_then(|o| ops::apply_header_v3(o, header_v3))
+                .and_then(|o| ops::apply_max_size(o, max_size))
         });
         self.pending = Some(Pending::Create { rx, needs_touch });
     }
@@ -7544,6 +7655,16 @@ impl LuksboxApp {
                 {
                     self.start_mount_picker(true);
                 }
+                if ui
+                    .add(ghost_button("Vault size"))
+                    .on_hover_text(
+                        "How much disk space the vault uses, its maximum size, and giving \
+                         back the free space at the end of the vault file",
+                    )
+                    .clicked()
+                {
+                    self.open_size_dialog();
+                }
                 if ui.add(ghost_button("Keyslots")).clicked() {
                     self.view = View::Keyslots;
                 }
@@ -8170,8 +8291,22 @@ impl LuksboxApp {
         //   Everything else (macFUSE, Linux libfuse3, Windows WinFsp):
         //     in-process worker thread, the legacy path. None of these
         //     have the close-on-unmount bug FUSE-T has.
+        // Free space at the end of the vault when the mount ends: an
+        // in-process mount asks through its ShrinkControl in Ask mode
+        // (`draw_shrink_prompt`); the FUSE-T helper process can only be
+        // told up front, so there only Always gives it back.
+        use luksbox_vfs::ShrinkOnFinish;
+        let shrink_mode = match self.prefs.shrink_on_close {
+            preferences::ShrinkOnClose::Always => ShrinkOnFinish::GiveBack,
+            preferences::ShrinkOnClose::Never => ShrinkOnFinish::Keep,
+            preferences::ShrinkOnClose::Ask => ShrinkOnFinish::Ask {
+                min: luksbox_vfs::SHRINK_ASK_MIN,
+            },
+        };
+        let mut shrink = None;
         let backend = if luksbox_mount::FUSE_BACKEND == "fuse-t" {
-            match start_mount_subprocess(opened, &mountpoint) {
+            let give_back = shrink_mode == ShrinkOnFinish::GiveBack;
+            match start_mount_subprocess(opened, &mountpoint, give_back) {
                 Ok((child, stderr)) => MountBackend::Subprocess { child, stderr },
                 Err(e) => {
                     self.toast_err(format!("could not start mount helper: {e}"));
@@ -8189,6 +8324,9 @@ impl LuksboxApp {
             // checkbox state doesn't bleed into the next mount.
             let sync_mode = self.mount_sync_mode;
             self.mount_sync_mode = false;
+            let control = opened.vfs.shrink_control();
+            control.set_mode(shrink_mode);
+            shrink = Some(control);
             std::thread::spawn(move || {
                 let r = luksbox_mount::mount(opened.vfs, &mp_clone, false, sync_mode)
                     .map_err(|e| e.to_string());
@@ -8204,6 +8342,7 @@ impl LuksboxApp {
             unmount_rx: None,
             unmount_error: None,
             last_unmount_attempt: None,
+            shrink,
         });
     }
 
@@ -10308,6 +10447,8 @@ impl LuksboxApp {
         self.draw_revoke_confirm_modal(ctx);
         self.draw_rotate_modal(ctx);
         self.draw_confirm_lock_modal(ctx);
+        self.draw_size_dialog(ctx);
+        self.draw_shrink_prompt(ctx);
         self.draw_close_confirm_modal(ctx);
         self.draw_empty_passphrase_confirm_modal(ctx);
         self.draw_deniable_modal(ctx);
@@ -12993,6 +13134,530 @@ impl Clone for Toast {
     }
 }
 
+// ---- vault size -----------------------------------------------------------
+
+/// The maximum-size control: a logarithmic slider whose far left is
+/// "Unlimited", next to a field for exact values (`6G`, `500M`, `1.5G`,
+/// `0`), kept in sync both ways. `bytes` is the value (0 = unlimited);
+/// `text` is what the field shows.
+#[derive(Clone, Default)]
+struct SizeLimitInput {
+    bytes: u64,
+    text: String,
+    /// Why `text` is not a usable size; `bytes` keeps the last good one.
+    error: Option<String>,
+}
+
+impl SizeLimitInput {
+    fn new(bytes: u64) -> Self {
+        Self {
+            bytes,
+            text: size_limit_text(bytes),
+            error: None,
+        }
+    }
+}
+
+fn size_limit_text(bytes: u64) -> String {
+    if bytes == 0 {
+        "unlimited".to_string()
+    } else {
+        format_size(bytes)
+    }
+}
+
+/// Smallest maximum size for a vault created by the GUI: header, default
+/// metadata region and one chunk slot.
+fn new_vault_min_size() -> u64 {
+    luksbox_core::header::HEADER_SIZE as u64
+        + luksbox_format::DEFAULT_METADATA_REGION_SIZE
+        + luksbox_vfs::CHUNK_SLOT_SIZE
+}
+
+/// Slider share kept at the far left for "Unlimited".
+const SLIDER_UNLIMITED_ZONE: f64 = 0.03;
+
+/// Slider position (0..=1) for `bytes`: "Unlimited" at the far left,
+/// then logarithmic from `min` to `max`, so small and large limits are
+/// both reachable.
+fn size_to_slider(bytes: u64, min: u64, max: u64) -> f64 {
+    if bytes == 0 {
+        return 0.0;
+    }
+    let (b, lo, hi) = (bytes.clamp(min, max) as f64, min as f64, max as f64);
+    if hi <= lo {
+        return 1.0;
+    }
+    let t = (b / lo).ln() / (hi / lo).ln();
+    (SLIDER_UNLIMITED_ZONE + (1.0 - SLIDER_UNLIMITED_ZONE) * t).clamp(0.0, 1.0)
+}
+
+fn slider_to_size(pos: f64, min: u64, max: u64) -> u64 {
+    if pos < SLIDER_UNLIMITED_ZONE {
+        return 0;
+    }
+    let t = (pos - SLIDER_UNLIMITED_ZONE) / (1.0 - SLIDER_UNLIMITED_ZONE);
+    let raw = (min as f64) * ((max as f64) / (min as f64)).powf(t);
+    round_size(raw as u64).clamp(min, max)
+}
+
+/// Round to what `format_size` shows (0.1 GB from 1 GB up, else 1 MB), so
+/// the slider, the field and the echo agree.
+fn round_size(bytes: u64) -> u64 {
+    use luksbox_core::size::{GIB, MIB};
+    if bytes >= GIB {
+        ((bytes as f64 / GIB as f64 * 10.0).round() * GIB as f64 / 10.0) as u64
+    } else {
+        ((bytes as f64 / MIB as f64).round() as u64).max(1) * MIB
+    }
+}
+
+/// Draw `input`: the slider (from "Unlimited" up to `max`, the disk's
+/// free space when known), the exact field, and what the value was
+/// understood as. `min` is the smallest limit the vault accepts.
+fn size_limit_editor(
+    ui: &mut egui::Ui,
+    id: &str,
+    input: &mut SizeLimitInput,
+    min: u64,
+    max: u64,
+    free: Option<u64>,
+) {
+    use luksbox_core::size::{MIB, describe_size, parse_size};
+    // Without a known free space, still offer a useful range.
+    let max = max.max(min.saturating_mul(16)).max(input.bytes);
+    ui.horizontal(|ui| {
+        let mut pos = size_to_slider(input.bytes, min, max);
+        let slider = ui.add_sized(
+            [capped_width(ui, 300.0), CONTROL_H],
+            egui::Slider::new(&mut pos, 0.0..=1.0).show_value(false),
+        );
+        if slider.changed() {
+            input.bytes = slider_to_size(pos, min, max);
+            input.text = size_limit_text(input.bytes);
+            input.error = None;
+        }
+        let field = ui.add_sized(
+            [120.0, CONTROL_H],
+            egui::TextEdit::singleline(&mut input.text)
+                .id_salt(id)
+                .hint_text("6G"),
+        );
+        if field.changed() {
+            match parse_size(&input.text) {
+                Ok(0) => {
+                    input.bytes = 0;
+                    input.error = None;
+                }
+                Ok(b) if b < min => {
+                    input.error = Some(format!(
+                        "smaller than the vault itself ({}); use at least {}M",
+                        format_size(min),
+                        min.div_ceil(MIB)
+                    ));
+                }
+                Ok(b) => {
+                    input.bytes = b;
+                    input.error = None;
+                }
+                Err(e) => input.error = Some(e.to_string()),
+            }
+        }
+        // Tidy the field once the value is final.
+        if field.lost_focus() && input.error.is_none() {
+            input.text = size_limit_text(input.bytes);
+        }
+    });
+    let echo = match (&input.error, input.bytes) {
+        (Some(e), _) => RichText::new(e).color(theme::DANGER),
+        (None, 0) => {
+            RichText::new("Unlimited: the vault grows as you add files.").color(theme::DIM)
+        }
+        (None, b) => RichText::new(format!("= {}", describe_size(b))).color(theme::DIM),
+    };
+    ui.label(echo.size(12.0));
+    if input.error.is_none()
+        && let Some(f) = free
+        && input.bytes > f
+    {
+        ui.label(
+            RichText::new(format!(
+                "More than the free space on this disk ({}): the disk will fill up first.",
+                format_size(f)
+            ))
+            .color(theme::WARN)
+            .size(12.0),
+        );
+    }
+}
+
+/// Whether `shrink` may run on this vault: not deniable (a shrinking file
+/// would reveal deletions), not opened in recovery mode.
+fn can_shrink(vfs: &luksbox_vfs::Vfs) -> bool {
+    !vfs.container().is_deniable() && vfs.tolerated_inodes().is_empty()
+}
+
+/// State of the "Vault size" dialog.
+struct SizeDialog {
+    input: SizeLimitInput,
+}
+
+/// "Give back free space?" (Ask mode), asked before locking an open
+/// vault, or when a mounted vault's mount ends.
+struct ShrinkPrompt {
+    target: ShrinkPromptTarget,
+    reclaimable: u64,
+    remember: bool,
+}
+
+enum ShrinkPromptTarget {
+    /// Locking a vault being browsed; answering runs the deferred action.
+    Lock(NavigateAction),
+    /// The end of a mount, waiting for the answer in `Vfs::finish`.
+    Mount(luksbox_vfs::ShrinkControl),
+}
+
+impl LuksboxApp {
+    fn open_size_dialog(&mut self) {
+        if let Some(v) = &self.vault {
+            self.size_dialog = Some(SizeDialog {
+                input: SizeLimitInput::new(v.vfs.max_vault_size()),
+            });
+        }
+    }
+
+    /// Free space on the disk holding `path` (a file to be, or a
+    /// directory), refreshed at most every few seconds.
+    fn cached_free_space(&mut self, path: &Path) -> Option<u64> {
+        let dir = match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ if path.is_dir() => path.to_path_buf(),
+            _ => PathBuf::from("."),
+        };
+        if let Some((d, at, free)) = &self.free_space_cache
+            && *d == dir
+            && at.elapsed() < Duration::from_secs(3)
+        {
+            return *free;
+        }
+        let free = luksbox_format::available_disk_space(&dir).ok();
+        self.free_space_cache = Some((dir, std::time::Instant::now(), free));
+        free
+    }
+
+    fn draw_size_dialog(&mut self, ctx: &egui::Context) {
+        if self.size_dialog.is_none() {
+            return;
+        }
+        let Some(vault_path) = self.vault.as_ref().map(|v| v.vault_path.clone()) else {
+            self.size_dialog = None;
+            return;
+        };
+        let free = self.cached_free_space(&vault_path);
+        let Some(v) = self.vault.as_mut() else {
+            return;
+        };
+        let report = match v.vfs.space_report() {
+            Ok(r) => r,
+            Err(e) => {
+                self.size_dialog = None;
+                self.toast_err(format!("could not read the vault's size: {e}"));
+                return;
+            }
+        };
+        let shrinkable = can_shrink(&v.vfs);
+        let deniable = v.vfs.container().is_deniable();
+        let min = v.vfs.minimum_vault_size();
+        let max = report.file_size.saturating_add(free.unwrap_or(0));
+
+        let mut apply = false;
+        let mut shrink = false;
+        let mut close = false;
+        let mut pref_changed = false;
+        let prefs = &mut self.prefs;
+        let dialog = self.size_dialog.as_mut().expect("checked above");
+        let modal = egui::Modal::new(egui::Id::new("vault-size-modal"))
+            .frame(
+                Frame::default()
+                    .fill(theme::PANEL)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(20),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(capped_width(ui, 520.0));
+                ui.label(RichText::new("Vault size").size(16.0).strong());
+                ui.add_space(8.0);
+                egui::Grid::new("vault-size-grid")
+                    .num_columns(2)
+                    .spacing([16.0, 4.0])
+                    .show(ui, |ui| {
+                        let mut row = |name: &str, value: String| {
+                            ui.label(RichText::new(name).color(theme::DIM));
+                            ui.label(value);
+                            ui.end_row();
+                        };
+                        row("File size", format_size(report.file_size));
+                        row("Metadata (fixed)", format_size(report.fixed_size));
+                        row("Used by files", format_size(report.used));
+                        row("Free inside", format_size(report.free_inside));
+                        if let Some(f) = free {
+                            row("Disk free", format_size(f));
+                        }
+                    });
+                ui.add_space(12.0);
+                ui.label(RichText::new("Maximum size").strong());
+                size_limit_editor(ui, "vault-max-size", &mut dialog.input, min, max, free);
+                if dialog.input.error.is_none()
+                    && dialog.input.bytes != 0
+                    && dialog.input.bytes < report.file_size
+                {
+                    ui.label(
+                        RichText::new(
+                            "The vault is already larger: it will stop growing. Giving back \
+                             the free space at its end, or deleting files, brings it under \
+                             the limit.",
+                        )
+                        .color(theme::WARN)
+                        .size(12.0),
+                    );
+                }
+                let changed = dialog.input.error.is_none() && dialog.input.bytes != report.max_size;
+                if ui
+                    .add_enabled(changed, primary_button("Apply maximum size"))
+                    .clicked()
+                {
+                    apply = true;
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("Free space").strong());
+                if deniable {
+                    ui.label(
+                        RichText::new(
+                            "Deniable vaults are never shrunk: a file that shrinks would \
+                             reveal that data was deleted.",
+                        )
+                        .color(theme::DIM)
+                        .size(12.0),
+                    );
+                } else if report.reclaimable > 0 && shrinkable {
+                    ui.label(
+                        RichText::new(format!(
+                            "{} at the end of the vault file is unused.",
+                            format_size(report.reclaimable)
+                        ))
+                        .color(theme::DIM)
+                        .size(12.0),
+                    );
+                    if ui
+                        .add(ghost_button(format!(
+                            "Give back {}",
+                            format_size(report.reclaimable)
+                        )))
+                        .clicked()
+                    {
+                        shrink = true;
+                    }
+                } else {
+                    ui.label(
+                        RichText::new(
+                            "No free space at the end of the vault file. Free space in the \
+                             middle stays inside the vault and new files reuse it.",
+                        )
+                        .color(theme::DIM)
+                        .size(12.0),
+                    );
+                }
+                if !deniable {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "When locking or unmounting a vault, give back the free space at \
+                             its end:",
+                        )
+                        .color(theme::DIM)
+                        .size(12.0),
+                    );
+                    ui.horizontal(|ui| {
+                        use preferences::ShrinkOnClose as S;
+                        for (value, label) in [
+                            (S::Ask, "Ask (from 1 MB)"),
+                            (S::Always, "Always"),
+                            (S::Never, "Never"),
+                        ] {
+                            if ui
+                                .radio_value(&mut prefs.shrink_on_close, value, label)
+                                .changed()
+                            {
+                                pref_changed = true;
+                            }
+                        }
+                    });
+                }
+
+                ui.add_space(14.0);
+                if ui
+                    .add_sized(
+                        [capped_width(ui, 480.0), CONTROL_H],
+                        egui::Button::new("Close"),
+                    )
+                    .clicked()
+                {
+                    close = true;
+                }
+            });
+        if modal.backdrop_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            close = true;
+        }
+        let new_max = dialog.input.bytes;
+        if pref_changed {
+            preferences::save(&self.prefs);
+        }
+        if apply && let Some(v) = self.vault.as_mut() {
+            let r = v
+                .vfs
+                .set_max_vault_size(new_max)
+                .and_then(|()| v.vfs.flush());
+            match r {
+                Ok(()) if new_max == 0 => self.toast_ok("maximum size removed"),
+                Ok(()) => self.toast_ok(format!("maximum size set to {}", format_size(new_max))),
+                Err(e) => self.toast_err(format!("could not set the maximum size: {e}")),
+            }
+        }
+        if shrink && let Some(v) = self.vault.as_mut() {
+            match v.vfs.shrink() {
+                Ok(freed) => self.toast_ok(format!("gave back {}", format_size(freed))),
+                Err(e) => self.toast_err(format!("could not give back free space: {e}")),
+            }
+        }
+        if close {
+            self.size_dialog = None;
+        }
+    }
+
+    fn draw_shrink_prompt(&mut self, ctx: &egui::Context) {
+        // A mount ending in Ask mode waits in `Vfs::finish` for an answer.
+        if self.shrink_prompt.is_none()
+            && let Some(control) = self.mount_status.as_ref().and_then(|ms| ms.shrink.clone())
+            && let Some(bytes) = control.question()
+        {
+            self.shrink_prompt = Some(ShrinkPrompt {
+                target: ShrinkPromptTarget::Mount(control),
+                reclaimable: bytes,
+                remember: false,
+            });
+        }
+        let Some(prompt) = self.shrink_prompt.as_mut() else {
+            return;
+        };
+        // The mount stopped waiting (it timed out and kept the space).
+        if let ShrinkPromptTarget::Mount(control) = &prompt.target
+            && control.question().is_none()
+        {
+            self.shrink_prompt = None;
+            return;
+        }
+        let unmounting = matches!(prompt.target, ShrinkPromptTarget::Mount(_));
+        let freed_label = format_size(prompt.reclaimable);
+        // Some(true) = give back, Some(false) = keep; None = undecided.
+        let mut decision: Option<bool> = None;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("shrink-on-lock-modal"))
+            .frame(
+                Frame::default()
+                    .fill(theme::PANEL)
+                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(20),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(capped_width(ui, 460.0));
+                ui.label(RichText::new("Give back free space?").size(16.0).strong());
+                ui.add_space(8.0);
+                let when = if unmounting {
+                    "now that the vault is unmounted"
+                } else {
+                    "before locking"
+                };
+                ui.label(
+                    RichText::new(format!(
+                        "{freed_label} at the end of the vault file is unused. Give it back to \
+                         the disk {when}? If you keep it, new files reuse it."
+                    ))
+                    .color(theme::DIM)
+                    .size(12.0),
+                );
+                ui.add_space(8.0);
+                ui.checkbox(&mut prompt.remember, "Remember my choice");
+                ui.add_space(10.0);
+                if ui
+                    .add_sized(
+                        [capped_width(ui, 420.0), 30.0],
+                        primary_button(format!("Give back {freed_label}")),
+                    )
+                    .clicked()
+                {
+                    decision = Some(true);
+                }
+                ui.add_space(4.0);
+                if ui
+                    .add_sized(
+                        [capped_width(ui, 420.0), CONTROL_H],
+                        egui::Button::new("Keep it"),
+                    )
+                    .clicked()
+                {
+                    decision = Some(false);
+                }
+            });
+        if modal.backdrop_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if cancel {
+            // A mount ends either way: keep the space. A lock: not
+            // locking after all.
+            if let Some(ShrinkPromptTarget::Mount(control)) =
+                self.shrink_prompt.take().map(|p| p.target)
+            {
+                control.answer(false);
+            }
+            return;
+        }
+        let Some(give_back) = decision else {
+            return;
+        };
+        let prompt = self.shrink_prompt.take().expect("checked above");
+        if prompt.remember {
+            self.prefs.shrink_on_close = if give_back {
+                preferences::ShrinkOnClose::Always
+            } else {
+                preferences::ShrinkOnClose::Never
+            };
+            preferences::save(&self.prefs);
+        }
+        match prompt.target {
+            ShrinkPromptTarget::Mount(control) => {
+                control.answer(give_back);
+                if give_back {
+                    self.toast_ok(format!("giving back {freed_label}"));
+                }
+            }
+            ShrinkPromptTarget::Lock(action) => {
+                if give_back && let Some(v) = self.vault.as_mut() {
+                    match v.vfs.shrink() {
+                        Ok(freed) => self.toast_ok(format!("gave back {}", format_size(freed))),
+                        Err(e) => self.toast_err(format!("could not give back free space: {e}")),
+                    }
+                }
+                self.navigate_now(action);
+            }
+        }
+    }
+}
+
 // ---- helpers --------------------------------------------------------------
 
 /// OS-aware example file paths used as `hint_text` placeholders. Pure
@@ -13571,6 +14236,7 @@ fn resolved_default_app_opener() -> Option<std::path::PathBuf> {
 fn start_mount_subprocess(
     opened: OpenedVault,
     mountpoint: &Path,
+    shrink_on_close: bool,
 ) -> Result<
     (
         std::process::Child,
@@ -13624,6 +14290,9 @@ fn start_mount_subprocess(
     // for defense-in-depth (opt-in via LUKSBOX_SANDBOX_HELPER=1
     // until validated end-to-end on macOS hosts).
     let mut cmd = build_helper_command(&helper, &vault_path, header_path.as_deref(), mountpoint)?;
+    if shrink_on_close {
+        cmd.arg("--shrink-on-close");
+    }
     cmd.stdin(Stdio::piped());
     // stdout is irrelevant - the helper doesn't print anything on
     // the happy path. Inherit so user-launched-from-Terminal devs

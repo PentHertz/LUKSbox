@@ -93,4 +93,30 @@ pub enum Error {
     /// transient thread-local/env flag that enabled the open.
     #[error("vault holds recovered (lossy) inodes; mutation refused (mount is read-only)")]
     ReadOnlyMount,
+    /// Refused a write that would grow the vault file past the maximum
+    /// size the user set (`Vfs::set_max_vault_size`). Free space inside
+    /// the vault is still reused; only growth is refused. Mount layers
+    /// map it to `ENOSPC` / `STATUS_DISK_FULL`, like a full disk.
+    #[error(
+        "vault is at its maximum size ({}): raise the limit or delete files",
+        luksbox_core::size::format_size(*limit)
+    )]
+    VaultSizeLimit { limit: u64 },
+    /// `Vfs::set_max_vault_size` below what the vault itself takes
+    /// (header and metadata region, plus one chunk slot).
+    #[error(
+        "{} is smaller than the vault itself; the minimum is {}",
+        luksbox_core::size::format_size(*requested),
+        luksbox_core::size::format_size(*minimum)
+    )]
+    MaxSizeBelowMinimum { requested: u64, minimum: u64 },
+    /// `Vfs::set_max_vault_size` on a vault kept in a metadata format
+    /// older than LBM5 (created with `LUKSBOX_FORMAT_V2=1` for older
+    /// LUKSbox versions), which has no room for the setting.
+    #[error("this vault uses an older format that cannot store a maximum size")]
+    MaxSizeNeedsCurrentFormat,
+    /// `Vfs::shrink` on a deniable vault: a vault file that shrinks over
+    /// time hints that data was deleted from it.
+    #[error("deniable vaults are not shrunk: a shrinking file would reveal deletions")]
+    ShrinkDeniable,
 }

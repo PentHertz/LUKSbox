@@ -506,6 +506,8 @@ fn errno(e: &VfsError) -> Errno {
         // hold any more chunk references) and triggers the
         // "no space left on device" message users already know.
         VfsError::MetadataBudgetExhausted => Errno::ENOSPC,
+        // The vault reached the maximum size its owner set.
+        VfsError::VaultSizeLimit { .. } => Errno::ENOSPC,
         // File-size cap is "exceeds the maximum file size" -> EFBIG.
         VfsError::FileSizeExceedsCap => Errno::EFBIG,
         // Tolerant-recovery sessions refuse every mutation; EROFS
@@ -1077,10 +1079,8 @@ impl Filesystem for LuksboxFs {
         // (in --sync mode) is a defensive no-op. destroy() has no
         // syscall to report to, so log -- this is the last chance
         // to tell the user their final changes did not persist.
-        if let Ok(mut v) = self.vfs.lock()
-            && let Err(e) = v.flush()
-        {
-            eprintln!("luksbox-mount: final unmount flush failed: {e}");
+        if let Ok(mut v) = self.vfs.lock() {
+            crate::finish_on_unmount(&mut v);
         }
     }
 

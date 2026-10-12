@@ -59,6 +59,27 @@ canonical record.
   `--anchor` when it opens the vault and keeps it current, and honours
   `--sync`. Unmount with `luksbox umount Z:`.
 
+- **Maximum vault size, and giving back free space (GitHub #37).** A
+  vault can now have a maximum size: writes that would grow the vault
+  file past it fail with "no space left", as on a full disk, while free
+  space inside the vault is still reused. It is off by default (0 =
+  unlimited), set with `create --max-size 6G`, and changeable while the
+  vault is unlocked with `luksbox size vault.lbx --max 6G`, from the
+  wizard's "Vault size" menu, or in the GUI's Vault size dialog
+  (logarithmic slider plus an exact field). It is stored in the
+  encrypted metadata (new magic `LBM\x06`); vaults without a limit
+  stay LBM5 and keep opening in older versions. A vault still never
+  shrinks on its own (a deleted file's space is reused by the next
+  files), but the free space at the END of the vault file can now be
+  given back: `luksbox size vault.lbx --shrink`, `luksbox mount
+  --shrink-on-close`, the GUI (Give back, and an Ask / Always / Never
+  choice when locking or unmounting, asking from 1 MB) and the wizard
+  (offered when closing the vault).
+  Deniable vaults are never shrunk. `luksbox size` also reports where
+  the vault's size goes, and every size option reads `6G`, `500M`,
+  `1.5G` the same way (1024-based units; `--metadata-size` now accepts
+  them too). See `docs/VAULT_SIZE.md`.
+
 ### Fixed
 
 - **`luksbox umount` on Windows could return before the final flush.**

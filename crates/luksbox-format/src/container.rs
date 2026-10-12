@@ -78,6 +78,9 @@ pub enum FlushOp {
 /// the std I/O traits -- it's an inherent on `std::fs::File`).
 pub trait LbxFile: std::io::Read + std::io::Write + std::io::Seek + Send {
     fn sync_all(&mut self) -> std::io::Result<()>;
+    /// Truncate or extend the file to `len` bytes, like
+    /// `std::fs::File::set_len`. Durable only after `sync_all`.
+    fn set_len(&mut self, len: u64) -> std::io::Result<()>;
     /// `(device, inode)` identity of the backing handle. Used to bind a
     /// later no-follow reopen to the exact file we currently hold, so a
     /// directory-level attacker cannot redirect a rotation-abort write
@@ -91,6 +94,9 @@ pub trait LbxFile: std::io::Read + std::io::Write + std::io::Seek + Send {
 impl LbxFile for std::fs::File {
     fn sync_all(&mut self) -> std::io::Result<()> {
         std::fs::File::sync_all(self)
+    }
+    fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        std::fs::File::set_len(self, len)
     }
     fn inode_pair(&self) -> std::io::Result<(u64, u64)> {
         inode_of(self)
@@ -3750,6 +3756,27 @@ impl Container {
     pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), Error> {
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(buf)?;
+        Ok(())
+    }
+
+    /// Current length of the `.lbx` file (metadata region and data area;
+    /// for an inline header, the header too).
+    pub fn data_file_len(&mut self) -> Result<u64, Error> {
+        Ok(self.file.seek(SeekFrom::End(0))?)
+    }
+
+    /// Cut the `.lbx` file to `len` bytes and make that durable. For
+    /// giving back free space at the end of the data area
+    /// (`Vfs::shrink`); refuses to cut into the metadata region.
+    pub fn truncate_data_file(&mut self, len: u64) -> Result<(), Error> {
+        if len < self.data_offset() {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "refusing to truncate the vault into its metadata region",
+            )));
+        }
+        self.file.set_len(len)?;
+        self.file.sync_all()?;
         Ok(())
     }
 

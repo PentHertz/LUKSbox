@@ -37,6 +37,8 @@ struct CreateOptions {
     anchor: Option<PathBuf>,
     /// Header format v3 (R15-D1): header generation counter.
     header_v3: bool,
+    /// Maximum size of the vault file in bytes, 0 = unlimited.
+    max_size: u64,
 }
 
 /// Apply the create-time options that need the freshly created vault:
@@ -55,7 +57,70 @@ fn finish_create(
         cont.init_anchor(ap.clone(), anchor_gen)?;
         eprintln!("  anchor file initialized at {}", ap.display());
     }
+    if opts.max_size != 0 {
+        // The limit lives in the encrypted metadata.
+        let mut vfs = Vfs::open(cont)?;
+        vfs.set_max_vault_size(opts.max_size)?;
+        cont = vfs.close()?;
+        eprintln!(
+            "  maximum size {}",
+            luksbox_core::size::describe_size(opts.max_size)
+        );
+    }
     Ok(cont)
+}
+
+/// Ask a maximum vault size: `6G`, `500M`, `1.5G` or `0` (unlimited), as
+/// `luksbox size --max` reads it. Re-asks until the answer parses and
+/// leaves room for the vault itself (`minimum`), then echoes what it was
+/// understood as. `current` is the default shown.
+fn ask_max_size(theme: &ColorfulTheme, vault: &Path, minimum: u64, current: u64) -> Result<u64> {
+    use luksbox_core::size::{MIB, describe_size, format_size, parse_size};
+    let free = luksbox_format::available_disk_space(crate::parent_dir(vault)).ok();
+    let prompt = match free {
+        Some(f) => format!(
+            "Maximum vault size (e.g. 6G, 500M; 0 = unlimited; {} free on this disk)",
+            format_size(f)
+        ),
+        None => "Maximum vault size (e.g. 6G, 500M; 0 = unlimited)".to_string(),
+    };
+    let default = if current == 0 {
+        "0".to_string()
+    } else {
+        format_size(current)
+    };
+    let answer: String = Input::with_theme(theme)
+        .with_prompt(prompt)
+        .default(default)
+        .validate_with(|s: &String| -> std::result::Result<(), String> {
+            match parse_size(s) {
+                Err(e) => Err(e.to_string()),
+                Ok(b) if b != 0 && b < minimum => Err(format!(
+                    "{} is smaller than the vault itself ({}); use at least {}M.{}",
+                    format_size(b),
+                    format_size(minimum),
+                    minimum.div_ceil(MIB),
+                    crate::missing_unit_hint(s)
+                )),
+                Ok(_) => Ok(()),
+            }
+        })
+        .interact_text()?;
+    let bytes = parse_size(&answer)?;
+    if bytes == 0 {
+        println!("  -> unlimited");
+    } else {
+        println!("  -> {}", describe_size(bytes));
+        if let Some(f) = free
+            && bytes > f
+        {
+            println!(
+                "  note: more than the free space on this disk ({}); the disk will fill up first",
+                format_size(f)
+            );
+        }
+    }
+    Ok(bytes)
 }
 
 /// R15-F5: "pin the TPM storage root key?", asked once per wizard
@@ -1715,6 +1780,7 @@ fn wizard_fido2_hmac_from_payload(
 /// asks for the PIN in its own Windows Hello / security-key dialog and
 /// takes none from the caller, so a PIN typed here was silently ignored
 /// and users had to enter it twice (GitHub #37).
+#[cfg_attr(not(feature = "fido2-hardware"), allow(dead_code))]
 fn wizard_prompt_fido2_pin(theme: &ColorfulTheme) -> Result<zeroize::Zeroizing<String>> {
     if cfg!(target_os = "windows") {
         return Ok(zeroize::Zeroizing::new(String::new()));
@@ -2163,6 +2229,7 @@ fn ask_new_passphrase(theme: &ColorfulTheme, prompt: &str) -> Result<zeroize::Ze
 /// are skipped in that mode. The anchor IS supported for all three kinds.
 fn ask_create_options(
     theme: &ColorfulTheme,
+    vault: &Path,
     fido2_direct: bool,
     legacy_format: bool,
 ) -> Result<CreateOptions> {
@@ -2206,10 +2273,20 @@ fn ask_create_options(
     } else {
         None
     };
+    // The legacy metadata format has no room for a maximum size.
+    let max_size = if legacy_format {
+        0
+    } else {
+        let minimum = luksbox_core::header::HEADER_SIZE as u64
+            + luksbox_format::DEFAULT_METADATA_REGION_SIZE
+            + luksbox_vfs::CHUNK_SLOT_SIZE;
+        ask_max_size(theme, vault, minimum, 0)?
+    };
     Ok(CreateOptions {
         flags,
         anchor: anchor_path,
         header_v3,
+        max_size,
     })
 }
 
@@ -2671,7 +2748,12 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
     // and the size-hardening flags don't apply to keyslot wrapping).
     // On macOS the SEP block runs to index 19; on Linux/Windows the
     // TPM block ends at 13.
-    let opts = ask_create_options(theme, matches!(kind_choice, 2..=19), format_choice == 1)?;
+    let opts = ask_create_options(
+        theme,
+        &pb,
+        matches!(kind_choice, 2..=19),
+        format_choice == 1,
+    )?;
 
     match kind_choice {
         0 => create_passphrase(theme, &pb, header_path.as_deref(), cipher, &opts)?,
@@ -4457,6 +4539,7 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
                 "Manage keyslots",
                 "Rotate master volume key",
                 "Upgrade header to format v3 (rollback-detectable keyslot table)",
+                "Vault size (usage, maximum size, give back free space)",
                 "Mount as a filesystem",
                 "PANIC: irreversibly destroy this vault",
                 "Close vault",
@@ -4499,11 +4582,12 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
                 Ok(())
             }
             10 => upgrade_header_action(theme, &mut vfs),
-            11 => {
+            11 => vault_size_action(theme, &mut vfs, vault),
+            12 => {
                 vfs.flush()?;
                 return mount_action(theme, vfs, vault);
             }
-            12 => {
+            13 => {
                 vfs.flush()?;
                 let cont = vfs.close()?;
                 if panic_action(theme, cont, vault)? {
@@ -4511,8 +4595,9 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
                 }
                 return Err("vault was destroyed".into());
             }
-            13 => {
+            14 => {
                 vfs.flush()?;
+                offer_shrink_on_close(theme, &mut vfs)?;
                 return Ok(());
             }
             _ => unreachable!(),
@@ -4524,6 +4609,68 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
 }
 
 // ---- vault actions ---------------------------------------------------------
+
+/// "Vault size": what the vault file holds, its maximum size, and giving
+/// back the free space at its end.
+fn vault_size_action(theme: &ColorfulTheme, vfs: &mut Vfs, vault: &Path) -> Result<()> {
+    use luksbox_core::size::format_size;
+    loop {
+        let report = vfs.space_report()?;
+        crate::print_space_report(vault, &report, false);
+        let can_shrink = report.reclaimable > 0
+            && !vfs.container().is_deniable()
+            && vfs.tolerated_inodes().is_empty();
+        let mut items = vec!["Change the maximum size".to_string()];
+        if can_shrink {
+            items.push(format!(
+                "Give back {} at the end of the vault",
+                format_size(report.reclaimable)
+            ));
+        }
+        items.push("Back".to_string());
+        let choice = Select::with_theme(theme)
+            .with_prompt("Vault size")
+            .items(&items)
+            .default(items.len() - 1)
+            .interact()?;
+        if choice == 0 {
+            let minimum = vfs.minimum_vault_size();
+            let bytes = ask_max_size(theme, vault, minimum, report.max_size)?;
+            vfs.set_max_vault_size(bytes)?;
+            vfs.flush()?;
+        } else if can_shrink && choice == 1 {
+            let freed = vfs.shrink()?;
+            println!("OK gave back {}", format_size(freed));
+        } else {
+            return Ok(());
+        }
+    }
+}
+
+/// When closing a vault: offer to give back the free space at the end of
+/// its file, once at least `SHRINK_ASK_MIN` can be freed.
+fn offer_shrink_on_close(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
+    use luksbox_core::size::format_size;
+    if vfs.container().is_deniable() || !vfs.tolerated_inodes().is_empty() {
+        return Ok(());
+    }
+    let reclaimable = vfs.space_report()?.reclaimable;
+    if reclaimable < luksbox_vfs::SHRINK_ASK_MIN {
+        return Ok(());
+    }
+    if Confirm::with_theme(theme)
+        .with_prompt(format!(
+            "{} at the end of the vault is unused. Give it back to the disk?",
+            format_size(reclaimable)
+        ))
+        .default(true)
+        .interact()?
+    {
+        let freed = vfs.shrink()?;
+        println!("OK gave back {}", format_size(freed));
+    }
+    Ok(())
+}
 
 /// R15-D1: opt the open vault into header format v3.
 fn upgrade_header_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {

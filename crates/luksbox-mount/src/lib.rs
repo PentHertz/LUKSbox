@@ -77,6 +77,26 @@ mod winfsp;
 ))]
 pub(crate) const LAZY_FLUSH_INTERVAL_SECS: u64 = 30;
 
+/// Final save when a mount ends, shared by the three backends:
+/// `Vfs::finish`, which flushes and then gives back the free space at the
+/// end of the vault if `Vfs::set_shrink_on_close(true)` was called. The
+/// teardown callbacks have no caller to report to, so this logs.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "fuse"),
+    all(target_os = "macos", feature = "fuse-t"),
+    all(target_os = "windows", feature = "winfsp"),
+))]
+pub(crate) fn finish_on_unmount(vfs: &mut luksbox_vfs::Vfs) {
+    match vfs.finish() {
+        Ok(0) => {}
+        Ok(freed) => eprintln!(
+            "luksbox-mount: gave back {} of free space at the end of the vault",
+            luksbox_core::size::format_size(freed)
+        ),
+        Err(e) => eprintln!("luksbox-mount: final unmount flush failed: {e}"),
+    }
+}
+
 /// Re-export of `winfsp::winfsp_preflight` so the GUI can fail the
 /// "Mount" button early with an actionable WinFsp-missing message
 /// instead of waiting for the dispatcher set-up to surface the

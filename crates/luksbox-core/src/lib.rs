@@ -14,6 +14,7 @@ pub mod key;
 pub mod keyslot;
 pub mod secret_box;
 pub mod secret_mem;
+pub mod size;
 
 pub use crate::aead::CipherSuite;
 pub use crate::error::Error;

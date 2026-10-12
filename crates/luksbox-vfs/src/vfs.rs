@@ -544,6 +544,22 @@ const METADATA_V4_MAGIC: &[u8; 4] = b"LBM\x04";
 /// silently miss the recovery sidecars.
 const METADATA_V5_MAGIC: &[u8; 4] = b"LBM\x05";
 
+/// v6 metadata magic: the LBM5 payload followed by the vault settings
+/// (`VaultSettingsOnDisk`, postcard-encoded). Written only while a
+/// setting differs from its default, which today means a maximum vault
+/// size is set: a vault without one stays LBM5 and keeps opening in older
+/// LUKSbox versions, and clearing the limit writes LBM5 again. Pre-LBM6
+/// binaries refuse an LBM6 vault (unknown magic) instead of silently
+/// ignoring its limit.
+const METADATA_V6_MAGIC: &[u8; 4] = b"LBM\x06";
+
+/// Vault-wide settings stored after the LBM5 payload in LBM6 metadata.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct VaultSettingsOnDisk {
+    /// Maximum size of the vault file in bytes; 0 = unlimited.
+    max_vault_size: u64,
+}
+
 /// Environment-variable gate for the v3 (external chunk-list)
 /// metadata format. Historic naming kept (`LUKSBOX_FORMAT_V2`) so
 /// scripts that opted into v3 during the v0.2-dev cycle still work
@@ -1506,6 +1522,12 @@ pub struct Vfs {
     /// rewritten in place. Raised to `tree.next_chunk_gen` at open and
     /// before every metadata commit.
     cow_floor_gen: u64,
+    /// Maximum size of the vault file in bytes, 0 = unlimited
+    /// (`set_max_vault_size`). Stored in LBM6 metadata.
+    max_vault_size: u64,
+    /// What `finish` does with the free space at the end of the file
+    /// (`set_shrink_on_close`, `shrink_control`).
+    shrink: ShrinkControl,
 }
 
 /// Vault on-disk size beyond which the runtime emits a one-shot
@@ -1519,6 +1541,146 @@ const TESTED_VAULT_SIZE_BYTES: u64 = 30 * 1024 * 1024 * 1024;
 /// so without a bound, rewriting a large file between two timer flushes
 /// would grow the vault by up to the whole file.
 const PENDING_FREE_FLUSH_THRESHOLD: usize = 65_536;
+
+/// At its maximum size, a copy-on-write rewrite that finds no free slot
+/// flushes to recycle the slots retired since the last flush only once
+/// at least this many are waiting (4 MiB); otherwise it rewrites in place
+/// (`rewrite_target`), so a full vault does not flush on every chunk.
+const PENDING_FREE_RECYCLE_MIN: usize = 1024;
+
+/// `luksbox rm` mentions `luksbox size --shrink` once at least this much
+/// at the end of the vault can be given back (64 MiB): script output, so
+/// only for amounts worth a command.
+pub const SHRINK_SUGGEST_MIN: u64 = 64 * 1024 * 1024;
+
+/// The GUI and the wizard ask whether to give back the free space at the
+/// end of the vault (`Vfs::shrink`) once at least this much can be freed
+/// (1 MiB); below it the question would be noise.
+pub const SHRINK_ASK_MIN: u64 = 1024 * 1024;
+
+/// What `Vfs::finish` does with the free space at the end of the vault
+/// file once the final save is done.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ShrinkOnFinish {
+    /// Keep it (the default).
+    #[default]
+    Keep,
+    /// Give it back (`luksbox mount --shrink-on-close`).
+    GiveBack,
+    /// Ask whoever holds the vault's `ShrinkControl`, if at least `min`
+    /// bytes can be freed: `finish` publishes the amount
+    /// (`ShrinkControl::question`) and waits for `ShrinkControl::answer`,
+    /// keeping the space if no answer comes in time. For a GUI, whose
+    /// `Vfs` is inside a mount when the mount ends.
+    Ask { min: u64 },
+}
+
+/// Shared handle on what a vault's `Vfs::finish` does with the free space
+/// at the end of its file (`Vfs::shrink_control`). Lets the code that
+/// started a mount decide, and answer `ShrinkOnFinish::Ask`, while the
+/// `Vfs` itself is inside the mount.
+#[derive(Clone, Debug)]
+pub struct ShrinkControl(std::sync::Arc<(std::sync::Mutex<ShrinkState>, std::sync::Condvar)>);
+
+#[derive(Debug)]
+struct ShrinkState {
+    mode: ShrinkOnFinish,
+    /// Bytes `finish` is asking about, while it waits.
+    question: Option<u64>,
+    answer: Option<bool>,
+    answer_timeout: std::time::Duration,
+}
+
+impl Default for ShrinkControl {
+    fn default() -> Self {
+        Self(std::sync::Arc::new((
+            std::sync::Mutex::new(ShrinkState {
+                mode: ShrinkOnFinish::Keep,
+                question: None,
+                answer: None,
+                answer_timeout: std::time::Duration::from_secs(120),
+            }),
+            std::sync::Condvar::new(),
+        )))
+    }
+}
+
+impl ShrinkControl {
+    fn state(&self) -> std::sync::MutexGuard<'_, ShrinkState> {
+        self.0.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn set_mode(&self, mode: ShrinkOnFinish) {
+        self.state().mode = mode;
+    }
+
+    pub fn mode(&self) -> ShrinkOnFinish {
+        self.state().mode
+    }
+
+    /// How long `finish` waits for an answer in `Ask` mode (default two
+    /// minutes) before keeping the space.
+    pub fn set_answer_timeout(&self, timeout: std::time::Duration) {
+        self.state().answer_timeout = timeout;
+    }
+
+    /// The bytes `finish` asks about while it waits for `answer`.
+    pub fn question(&self) -> Option<u64> {
+        self.state().question
+    }
+
+    /// Answer the pending question: give the space back or keep it.
+    pub fn answer(&self, give_back: bool) {
+        let mut state = self.state();
+        if state.question.is_some() {
+            state.answer = Some(give_back);
+            self.0.1.notify_all();
+        }
+    }
+
+    /// Publish `reclaimable` as the question and wait for the answer;
+    /// false (keep) on timeout.
+    fn ask(&self, reclaimable: u64) -> bool {
+        let mut state = self.state();
+        state.question = Some(reclaimable);
+        state.answer = None;
+        let deadline = std::time::Instant::now() + state.answer_timeout;
+        while state.answer.is_none() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            state = match self.0.1.wait_timeout(state, deadline - now) {
+                Ok((guard, _)) => guard,
+                Err(p) => p.into_inner().0,
+            };
+        }
+        state.question = None;
+        state.answer.take().unwrap_or(false)
+    }
+}
+
+/// Where a vault's file size goes (`Vfs::space_report`). All values are
+/// bytes of the `.lbx` file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpaceReport {
+    /// Current size of the `.lbx` file.
+    pub file_size: u64,
+    /// What the vault takes before any file: the header (unless
+    /// detached) and the metadata region.
+    pub fixed_size: u64,
+    /// Chunk slots holding file data or chunk lists.
+    pub used: u64,
+    /// Free chunk slots inside the file, which the next writes reuse
+    /// (including the ones freed since the last save).
+    pub free_inside: u64,
+    /// What `Vfs::shrink` would give back now: the part of the file past
+    /// the last slot in use. A save can move chunk lists, so treat it as
+    /// an estimate until `shrink` has run.
+    pub reclaimable: u64,
+    /// Maximum size of the file, 0 = unlimited.
+    pub max_size: u64,
+}
 
 impl Vfs {
     /// Open a Vfs over an already-unlocked container. If the metadata blob is
@@ -1559,11 +1721,36 @@ impl Vfs {
                 Error::MetadataDeserialize
             }
         };
+        let mut settings = VaultSettingsOnDisk::default();
         let (mut tree, format) = if blob.is_empty() {
             // Fresh vault: pick the format based on the env-var gate.
             // The choice is locked in by the first flush writing the
             // appropriate magic onto disk.
             (DirectoryTree::new(), MetadataFormat::for_fresh_vault())
+        } else if blob.len() >= METADATA_V6_MAGIC.len()
+            && &blob[..METADATA_V6_MAGIC.len()] == METADATA_V6_MAGIC
+        {
+            if debug {
+                eprintln!("luksbox-debug: matched LBM6 magic");
+            }
+            // LBM6: the LBM5 payload, then the vault settings, and
+            // nothing after them.
+            let payload = &blob[METADATA_V6_MAGIC.len()..];
+            if payload.len() > METADATA_DECODE_LIMIT_BYTES {
+                return Err(Error::MetadataDeserialize);
+            }
+            let (v4, rest): (DirectoryTreeV4OnDisk, &[u8]) =
+                postcard::take_from_bytes(payload).map_err(map_decode("LBM6 tree"))?;
+            let (on_disk, rest): (VaultSettingsOnDisk, &[u8]) =
+                postcard::take_from_bytes(rest).map_err(map_decode("LBM6 settings"))?;
+            if !rest.is_empty() {
+                return Err(Error::MetadataDeserialize);
+            }
+            settings = on_disk;
+            (
+                v4_on_disk_to_in_memory(v4, &mut container)?,
+                MetadataFormat::V5,
+            )
         } else if blob.len() >= METADATA_V5_MAGIC.len()
             && &blob[..METADATA_V5_MAGIC.len()] == METADATA_V5_MAGIC
         {
@@ -1750,6 +1937,8 @@ impl Vfs {
             chunks_dirty: std::collections::BTreeSet::new(),
             pending_free: Vec::new(),
             cow_floor_gen,
+            max_vault_size: settings.max_vault_size,
+            shrink: ShrinkControl::default(),
         })
     }
 
@@ -2049,9 +2238,33 @@ impl Vfs {
                 if payload.len() > METADATA_DECODE_LIMIT_BYTES {
                     return Err(Error::MetadataSerialize);
                 }
-                let mut bytes = Vec::with_capacity(METADATA_V5_MAGIC.len() + payload.len());
-                bytes.extend_from_slice(METADATA_V5_MAGIC);
-                bytes.extend_from_slice(&payload);
+                // LBM6 (LBM5 + vault settings) only while a setting is
+                // set, so a vault without a size limit stays readable by
+                // pre-LBM6 binaries.
+                let settings = VaultSettingsOnDisk {
+                    max_vault_size: self.max_vault_size,
+                };
+                let settings_bytes = if settings == VaultSettingsOnDisk::default() {
+                    None
+                } else {
+                    Some(postcard::to_allocvec(&settings).map_err(|_| Error::MetadataSerialize)?)
+                };
+                let mut bytes = Vec::with_capacity(
+                    METADATA_V5_MAGIC.len()
+                        + payload.len()
+                        + settings_bytes.as_ref().map_or(0, Vec::len),
+                );
+                match &settings_bytes {
+                    Some(tail) => {
+                        bytes.extend_from_slice(METADATA_V6_MAGIC);
+                        bytes.extend_from_slice(&payload);
+                        bytes.extend_from_slice(tail);
+                    }
+                    None => {
+                        bytes.extend_from_slice(METADATA_V5_MAGIC);
+                        bytes.extend_from_slice(&payload);
+                    }
+                }
                 bytes
             }
             MetadataFormat::V4 => {
@@ -3182,8 +3395,17 @@ impl Vfs {
         // single chunk was written. Grow incrementally instead.
         let mut appended: Vec<ChunkRef> = Vec::new();
         while cur_len + appended.len() < target_count {
+            let slot = match self.alloc_slot(1) {
+                Ok(slot) => slot,
+                Err(e) => {
+                    // At the maximum size: hand back the slots this call
+                    // allocated so far (R15-E6).
+                    self.pending_free.extend(appended.iter().map(|c| c.id));
+                    return Err(e);
+                }
+            };
             let cref = ChunkRef {
-                id: self.tree.alloc_chunk_id().ok_or(Error::IdSpaceExhausted)?,
+                id: slot,
                 generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
             };
             let chunk_idx = (cur_len + appended.len()) as u32;
@@ -3295,9 +3517,17 @@ impl Vfs {
             if hide_size && chunk_idx == 0 {
                 install_size_header(&mut pt, new_real);
             }
-            // New nonce + generation; a fresh slot unless the chunk was
-            // written since the last flush (appended ones always were).
-            let (new_ref, old) = self.rewrite_chunk(&key, id, chunk_idx as u32, cur_ref, &pt)?;
+            // New nonce + generation. A chunk this call appended is
+            // referenced by no metadata yet (even if a flush ran since),
+            // so it is rewritten in place; an existing one copy-on-write.
+            let (new_ref, old) = if chunk_idx < cur_len {
+                self.rewrite_chunk(&key, id, chunk_idx as u32, cur_ref, &pt)?
+            } else {
+                (
+                    self.rewrite_in_place(&key, id, chunk_idx as u32, cur_ref, &pt)?,
+                    None,
+                )
+            };
             retired.extend(old);
             if chunk_idx < cur_len {
                 updates.push((chunk_idx, new_ref));
@@ -3327,7 +3557,11 @@ impl Vfs {
             };
             let mut pt = chunk::read_chunk(&mut self.container, &key, id, 0, cur0)?;
             install_size_header(&mut pt, new_real);
-            let (new0, old) = self.rewrite_chunk(&key, id, 0, cur0, &pt)?;
+            let (new0, old) = if cur_len > 0 {
+                self.rewrite_chunk(&key, id, 0, cur0, &pt)?
+            } else {
+                (self.rewrite_in_place(&key, id, 0, cur0, &pt)?, None)
+            };
             retired.extend(old);
             if cur_len > 0 {
                 updates.push((0, new0));
@@ -3440,8 +3674,18 @@ impl Vfs {
         let zero = vec![0u8; CHUNK_PLAINTEXT_SIZE];
         let grow_from = chunks.len();
         while chunks.len() < new_chunk_count {
+            let slot = match self.alloc_slot(1) {
+                Ok(slot) => slot,
+                Err(e) => {
+                    // At the maximum size: hand back the slots this call
+                    // allocated so far (R15-E6).
+                    self.pending_free
+                        .extend(chunks[grow_from..].iter().map(|c| c.id));
+                    return Err(e);
+                }
+            };
             let cref = ChunkRef {
-                id: self.tree.alloc_chunk_id().ok_or(Error::IdSpaceExhausted)?,
+                id: slot,
                 generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
             };
             let chunk_idx = chunks.len() as u32;
@@ -3647,19 +3891,223 @@ impl Vfs {
     /// >= `cow_floor_gen`) sits in a slot no durable metadata references:
     /// it is rewritten in place and nothing is retired, which keeps
     /// appends and repeated small writes from churning slots.
+    ///
+    /// A vault at its maximum size with no free slot also rewrites in
+    /// place: crash protection for overwrites needs free space, like on
+    /// any copy-on-write file system, and refusing the overwrite instead
+    /// would make every file in a full vault read-only.
     fn rewrite_target(&mut self, cur: ChunkRef) -> Result<(ChunkRef, Option<ChunkId>), Error> {
         let generation = self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?;
+        let in_place = ChunkRef {
+            id: cur.id,
+            generation,
+        };
         if cur.generation >= self.cow_floor_gen {
-            return Ok((
-                ChunkRef {
-                    id: cur.id,
-                    generation,
-                },
-                None,
-            ));
+            return Ok((in_place, None));
         }
-        let id = self.tree.alloc_chunk_id().ok_or(Error::IdSpaceExhausted)?;
-        Ok((ChunkRef { id, generation }, Some(cur.id)))
+        match self.alloc_slot(PENDING_FREE_RECYCLE_MIN) {
+            Ok(id) => Ok((ChunkRef { id, generation }, Some(cur.id))),
+            Err(Error::VaultSizeLimit { .. }) => Ok((in_place, None)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Rewrite chunk `idx` of file `id` in its own slot under a fresh
+    /// generation. Only for a chunk no metadata references yet: one
+    /// appended by the current call.
+    fn rewrite_in_place(
+        &mut self,
+        key: &luksbox_core::SubKey,
+        id: FileId,
+        idx: u32,
+        cur: ChunkRef,
+        pt: &[u8],
+    ) -> Result<ChunkRef, Error> {
+        let new_ref = ChunkRef {
+            id: cur.id,
+            generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
+        };
+        chunk::write_chunk(&mut self.container, key, id, idx, new_ref, pt)?;
+        Ok(new_ref)
+    }
+
+    /// Slot for a new data chunk: a free one if any, else a new one at the
+    /// end of the vault, which grows the file. Growth past
+    /// `max_vault_size` fails with `VaultSizeLimit`. Before failing, a
+    /// flush turns the slots retired since the last one (`pending_free`)
+    /// into free ones, if at least `recycle_min` are waiting. Chunk-list
+    /// blocks written during a flush do not come through here: a save
+    /// must never fail on the limit.
+    fn alloc_slot(&mut self, recycle_min: usize) -> Result<ChunkId, Error> {
+        if self.max_vault_size != 0 && self.tree.free_chunks.is_empty() {
+            let over = |vfs: &Self| -> Result<bool, Error> {
+                Ok(vfs.slot_end(vfs.tree.next_chunk_id)? > vfs.max_vault_size)
+            };
+            if over(self)? && self.pending_free.len() >= recycle_min.max(1) {
+                self.flush()?;
+            }
+            if self.tree.free_chunks.is_empty() && over(self)? {
+                return Err(Error::VaultSizeLimit {
+                    limit: self.max_vault_size,
+                });
+            }
+        }
+        self.tree.alloc_chunk_id().ok_or(Error::IdSpaceExhausted)
+    }
+
+    /// File offset just past chunk slot `id`.
+    fn slot_end(&self, id: ChunkId) -> Result<u64, Error> {
+        chunk::slot_offset(self.container.data_offset(), id)?
+            .checked_add(chunk::CHUNK_SLOT_SIZE)
+            .ok_or(Error::IdSpaceExhausted)
+    }
+
+    /// Maximum size of the vault file in bytes; 0 = unlimited.
+    pub fn max_vault_size(&self) -> u64 {
+        self.max_vault_size
+    }
+
+    /// The smallest maximum size `set_max_vault_size` accepts: what the
+    /// vault takes before any file (header and metadata region) plus one
+    /// chunk slot.
+    pub fn minimum_vault_size(&self) -> u64 {
+        self.container
+            .data_offset()
+            .saturating_add(chunk::CHUNK_SLOT_SIZE)
+    }
+
+    /// Limit the size of the vault file to `bytes`; 0 removes the limit.
+    /// Takes effect immediately and is saved at the next flush, in the
+    /// encrypted metadata (LBM6; a vault without a limit stays LBM5).
+    /// Writes that would grow the file past it fail with
+    /// `VaultSizeLimit`; free space inside the vault is still used. A
+    /// limit below the current file size is fine: the vault stops
+    /// growing, and `shrink` gives back what is free at its end.
+    pub fn set_max_vault_size(&mut self, bytes: u64) -> Result<(), Error> {
+        self.ensure_writable()?;
+        if bytes != 0 {
+            if self.format != MetadataFormat::V5 {
+                return Err(Error::MaxSizeNeedsCurrentFormat);
+            }
+            let minimum = self.minimum_vault_size();
+            if bytes < minimum {
+                return Err(Error::MaxSizeBelowMinimum {
+                    requested: bytes,
+                    minimum,
+                });
+            }
+        }
+        if bytes != self.max_vault_size {
+            self.max_vault_size = bytes;
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
+    /// Let `finish` give back the free space at the end of the vault
+    /// file (`shrink`). Off by default. Deniable vaults never shrink.
+    pub fn set_shrink_on_close(&mut self, on: bool) {
+        self.shrink.set_mode(if on {
+            ShrinkOnFinish::GiveBack
+        } else {
+            ShrinkOnFinish::Keep
+        });
+    }
+
+    /// Shared handle on what `finish` does with the free space at the end
+    /// of the file, for deciding (or answering `ShrinkOnFinish::Ask`)
+    /// while this `Vfs` is inside a mount.
+    pub fn shrink_control(&self) -> ShrinkControl {
+        self.shrink.clone()
+    }
+
+    /// Final save when a mount or session ends: `flush`, then `shrink`
+    /// as the `ShrinkOnFinish` mode says (`set_shrink_on_close`,
+    /// `shrink_control`); never for a deniable vault or one opened in
+    /// tolerant recovery mode. Returns the bytes given back.
+    pub fn finish(&mut self) -> Result<u64, Error> {
+        self.flush()?;
+        if self.container.is_deniable() || !self.tolerated_inodes.is_empty() {
+            return Ok(0);
+        }
+        let give_back = match self.shrink.mode() {
+            ShrinkOnFinish::Keep => false,
+            ShrinkOnFinish::GiveBack => true,
+            ShrinkOnFinish::Ask { min } => {
+                // Exact now: the final save has freed everything this
+                // session deleted.
+                let reclaimable = self.space_report()?.reclaimable;
+                reclaimable >= min.max(1) && self.shrink.ask(reclaimable)
+            }
+        };
+        if give_back { self.shrink() } else { Ok(0) }
+    }
+
+    /// Highest chunk slot in use plus one: every slot from there on is
+    /// free (or leaked by a failed write) and can be cut off the file.
+    fn first_unused_tail_slot(&self) -> ChunkId {
+        self.tree
+            .inodes
+            .values()
+            .flat_map(|inode| inode.chunks.iter().chain(&inode.external_list_blocks))
+            .map(|c| c.id + 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Where the vault file's size goes. See `SpaceReport`.
+    pub fn space_report(&mut self) -> Result<SpaceReport, Error> {
+        let file_size = self.container.data_file_len()?;
+        let fixed_size = self.container.data_offset();
+        let used_slots: u64 = self
+            .tree
+            .inodes
+            .values()
+            .map(|inode| (inode.chunks.len() + inode.external_list_blocks.len()) as u64)
+            .sum();
+        let free_slots = (self.tree.free_chunks.len() + self.pending_free.len()) as u64;
+        let keep = chunk::slot_offset(fixed_size, self.first_unused_tail_slot())?;
+        Ok(SpaceReport {
+            file_size,
+            fixed_size,
+            used: used_slots.saturating_mul(chunk::CHUNK_SLOT_SIZE),
+            free_inside: free_slots.saturating_mul(chunk::CHUNK_SLOT_SIZE),
+            reclaimable: file_size.saturating_sub(keep),
+            max_size: self.max_vault_size,
+        })
+    }
+
+    /// Give the free space at the end of the vault file back to the
+    /// disk; returns the bytes freed. Free space in the middle stays
+    /// inside the vault (the next writes reuse it). Saves first, so every
+    /// slot freed this session counts; then drops the free slots past the
+    /// last one in use from the free list, lowers `next_chunk_id`, saves
+    /// that, and only then truncates the file. A crash in between leaves
+    /// a file longer than needed, never metadata pointing past its end.
+    /// Refused for deniable vaults: a vault file that shrinks over time
+    /// hints that data was deleted from it.
+    pub fn shrink(&mut self) -> Result<u64, Error> {
+        self.ensure_writable()?;
+        if self.container.is_deniable() {
+            return Err(Error::ShrinkDeniable);
+        }
+        self.flush()?;
+        let keep = self.first_unused_tail_slot();
+        if keep < self.tree.next_chunk_id {
+            self.tree.free_chunks.retain(|&slot| slot < keep);
+            self.tree.next_chunk_id = keep;
+            self.dirty = true;
+            self.flush()?;
+        }
+        // The save may have placed a chunk list past `keep`; cut at what
+        // the committed metadata covers.
+        let new_len = chunk::slot_offset(self.container.data_offset(), self.tree.next_chunk_id)?;
+        let old_len = self.container.data_file_len()?;
+        if old_len <= new_len {
+            return Ok(0);
+        }
+        self.container.truncate_data_file(new_len)?;
+        Ok(old_len - new_len)
     }
 
     /// Write `pt` as the new contents of chunk `idx` of file `id`, whose
@@ -9387,5 +9835,284 @@ mod tests {
             "truncated bytes resurfaced"
         );
         assert_eq!(&buf[9000..], b"tail");
+    }
+
+    // ---- Maximum vault size and shrink ----------------------------------
+
+    const SLOT: u64 = chunk::CHUNK_SLOT_SIZE;
+    /// 4 chunks of plaintext: exactly 4 slots on a vault without padding.
+    const FOUR_CHUNKS: usize = 4 * CHUNK_PLAINTEXT_SIZE;
+
+    fn file_len(path: &Path) -> u64 {
+        std::fs::metadata(path).unwrap().len()
+    }
+
+    #[test]
+    fn max_size_is_saved_as_lbm6_and_zero_goes_back_to_lbm5() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("limit.lbx");
+        let limit;
+        {
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            assert_eq!(vfs.max_vault_size(), 0, "unlimited by default");
+            limit = vfs.minimum_vault_size() + 100 * SLOT;
+            vfs.set_max_vault_size(limit).unwrap();
+            vfs.close().unwrap();
+        }
+        {
+            let mut c = open_container(&path);
+            assert!(c.read_metadata().unwrap().starts_with(METADATA_V6_MAGIC));
+            let mut vfs = Vfs::open(c).unwrap();
+            assert_eq!(vfs.max_vault_size(), limit);
+            vfs.set_max_vault_size(0).unwrap();
+            vfs.close().unwrap();
+        }
+        let mut c = open_container(&path);
+        assert!(
+            c.read_metadata().unwrap().starts_with(METADATA_V5_MAGIC),
+            "without a limit the vault must stay readable by pre-LBM6 versions"
+        );
+        assert_eq!(Vfs::open(c).unwrap().max_vault_size(), 0);
+    }
+
+    #[test]
+    fn max_size_below_the_vault_itself_is_refused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("min.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let minimum = vfs.minimum_vault_size();
+        assert!(minimum > vfs.container().data_offset());
+        assert!(matches!(
+            vfs.set_max_vault_size(minimum - 1),
+            Err(Error::MaxSizeBelowMinimum { minimum: m, .. }) if m == minimum
+        ));
+        vfs.set_max_vault_size(minimum).unwrap();
+    }
+
+    #[test]
+    fn growth_past_max_size_fails_but_free_space_is_reused() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("full.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        // Room for exactly 8 chunk slots.
+        let limit = vfs.container().data_offset() + 8 * SLOT;
+        vfs.set_max_vault_size(limit).unwrap();
+
+        let a = vfs.create(root, "a").unwrap();
+        vfs.write(a, 0, &vec![1u8; FOUR_CHUNKS]).unwrap();
+        let b = vfs.create(root, "b").unwrap();
+        vfs.write(b, 0, &vec![2u8; FOUR_CHUNKS]).unwrap();
+        let c = vfs.create(root, "c").unwrap();
+        assert!(matches!(
+            vfs.write(c, 0, b"one byte too many"),
+            Err(Error::VaultSizeLimit { limit: l }) if l == limit
+        ));
+        assert!(file_len(&path) <= limit);
+
+        // A full vault can still be rewritten (in place: no free slot).
+        vfs.write(b, 10, &[9u8; 100]).unwrap();
+        let mut buf = vec![0u8; FOUR_CHUNKS];
+        vfs.read(b, 0, &mut buf).unwrap();
+        assert!(buf[10..110].iter().all(|&x| x == 9));
+        assert!(buf[110..].iter().all(|&x| x == 2));
+
+        // Deleting frees slots (after the next save) that new data reuses.
+        vfs.unlink(root, "a").unwrap();
+        vfs.write(c, 0, b"fits now").unwrap();
+        vfs.close().unwrap();
+        assert!(file_len(&path) <= limit);
+    }
+
+    #[test]
+    fn shrink_gives_back_only_the_free_tail() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("shrink.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let data_offset = vfs.container().data_offset();
+        let a = vfs.create(root, "a").unwrap();
+        vfs.write(a, 0, &vec![1u8; FOUR_CHUNKS]).unwrap();
+        let b = vfs.create(root, "b").unwrap();
+        vfs.write(b, 0, &vec![2u8; FOUR_CHUNKS]).unwrap();
+        vfs.flush().unwrap();
+        assert_eq!(file_len(&path), data_offset + 8 * SLOT);
+
+        // a sits in the middle: its space stays inside the vault.
+        vfs.unlink(root, "a").unwrap();
+        let report = vfs.space_report().unwrap();
+        assert_eq!(report.free_inside, 4 * SLOT);
+        assert_eq!(report.reclaimable, 0);
+        assert_eq!(vfs.shrink().unwrap(), 0);
+        assert_eq!(file_len(&path), data_offset + 8 * SLOT);
+
+        // Once b is gone too, everything after the metadata comes back.
+        vfs.unlink(root, "b").unwrap();
+        assert_eq!(vfs.space_report().unwrap().reclaimable, 8 * SLOT);
+        assert_eq!(vfs.shrink().unwrap(), 8 * SLOT);
+        assert_eq!(file_len(&path), data_offset);
+        let report = vfs.space_report().unwrap();
+        assert_eq!((report.file_size, report.free_inside), (data_offset, 0));
+
+        // The shrunk vault reopens and grows again.
+        let c = vfs.create(root, "c").unwrap();
+        vfs.write(c, 0, b"after shrink").unwrap();
+        vfs.close().unwrap();
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        let c = vfs.lookup(vfs.root_id(), "c").unwrap();
+        let mut buf = [0u8; 12];
+        vfs.read(c, 0, &mut buf).unwrap();
+        assert_eq!(&buf, b"after shrink");
+    }
+
+    /// `shrink` commits the shorter metadata before it truncates. A crash
+    /// in between leaves the file longer than the metadata says, which
+    /// must open normally and get overwritten by later writes.
+    #[test]
+    fn vault_longer_than_its_metadata_still_opens() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("long.lbx");
+        {
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            let root = vfs.root_id();
+            let a = vfs.create(root, "a").unwrap();
+            vfs.write(a, 0, &vec![1u8; FOUR_CHUNKS]).unwrap();
+            vfs.close().unwrap();
+        }
+        // Garbage tail, as if the truncate never happened.
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            f.write_all(&vec![0x5Au8; 3 * SLOT as usize]).unwrap();
+        }
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let b = vfs.create(root, "b").unwrap();
+        vfs.write(b, 0, &vec![2u8; FOUR_CHUNKS]).unwrap();
+        vfs.close().unwrap();
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        let b = vfs.lookup(vfs.root_id(), "b").unwrap();
+        let mut buf = vec![0u8; FOUR_CHUNKS];
+        vfs.read(b, 0, &mut buf).unwrap();
+        assert!(buf.iter().all(|&x| x == 2));
+    }
+
+    #[test]
+    fn finish_shrinks_only_when_asked() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("finish.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let data_offset = vfs.container().data_offset();
+        let a = vfs.create(root, "a").unwrap();
+        vfs.write(a, 0, &vec![1u8; FOUR_CHUNKS]).unwrap();
+        vfs.flush().unwrap();
+        vfs.unlink(root, "a").unwrap();
+        assert_eq!(vfs.finish().unwrap(), 0);
+        assert_eq!(file_len(&path), data_offset + 4 * SLOT);
+        vfs.set_shrink_on_close(true);
+        assert_eq!(vfs.finish().unwrap(), 4 * SLOT);
+        assert_eq!(file_len(&path), data_offset);
+    }
+
+    /// A file over the inline threshold keeps its chunk list in blocks in
+    /// the data area, written at the save after its data. Deleting the
+    /// last file added must free those too, so its whole space comes back.
+    #[test]
+    fn shrink_reclaims_a_deleted_large_file_and_its_chunk_lists() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("spilled.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        // 2 MiB each: 512 chunks, past the 256-chunk inline threshold.
+        let two_mib = vec![3u8; 2 * 1024 * 1024];
+        let a = vfs.create(root, "a").unwrap();
+        vfs.write(a, 0, &two_mib).unwrap();
+        vfs.flush().unwrap();
+        let after_a = file_len(&path);
+        let b = vfs.create(root, "b").unwrap();
+        vfs.write(b, 0, &two_mib).unwrap();
+        vfs.flush().unwrap();
+        assert!(!vfs.tree.inodes[&a].external_list_blocks.is_empty());
+        assert!(!vfs.tree.inodes[&b].external_list_blocks.is_empty());
+
+        vfs.unlink(root, "b").unwrap();
+        let report = vfs.space_report().unwrap();
+        assert_eq!(report.reclaimable, file_len(&path) - after_a);
+        assert_eq!(vfs.shrink().unwrap(), report.reclaimable);
+        assert_eq!(file_len(&path), after_a);
+        let mut buf = vec![0u8; two_mib.len()];
+        vfs.read(a, 0, &mut buf).unwrap();
+        assert_eq!(buf, two_mib);
+    }
+
+    #[test]
+    fn finish_asks_through_the_shrink_control() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("ask.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let data_offset = vfs.container().data_offset();
+        let a = vfs.create(root, "a").unwrap();
+        vfs.write(a, 0, &vec![1u8; FOUR_CHUNKS]).unwrap();
+        vfs.flush().unwrap();
+        vfs.unlink(root, "a").unwrap();
+
+        // Below the threshold: no question, nothing given back.
+        let control = vfs.shrink_control();
+        control.set_mode(ShrinkOnFinish::Ask { min: 5 * SLOT });
+        assert_eq!(vfs.finish().unwrap(), 0);
+        assert_eq!(file_len(&path), data_offset + 4 * SLOT);
+
+        // No answer in time: kept.
+        control.set_mode(ShrinkOnFinish::Ask { min: SLOT });
+        control.set_answer_timeout(std::time::Duration::from_millis(50));
+        assert_eq!(vfs.finish().unwrap(), 0);
+        assert_eq!(control.question(), None, "the question is withdrawn");
+
+        // Answered from another thread (a GUI), with the exact amount.
+        control.set_answer_timeout(std::time::Duration::from_secs(30));
+        let answerer = control.clone();
+        let gui = std::thread::spawn(move || {
+            loop {
+                if let Some(bytes) = answerer.question() {
+                    answerer.answer(true);
+                    return bytes;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        assert_eq!(vfs.finish().unwrap(), 4 * SLOT);
+        assert_eq!(gui.join().unwrap(), 4 * SLOT);
+        assert_eq!(file_len(&path), data_offset);
+    }
+
+    #[test]
+    fn deniable_vaults_are_not_shrunk() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("deniable-shrink.bin");
+        let cont = Container::create_with_passphrase_deniable(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            0,
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(cont).unwrap();
+        let root = vfs.root_id();
+        let a = vfs.create(root, "a").unwrap();
+        vfs.write(a, 0, &vec![1u8; FOUR_CHUNKS]).unwrap();
+        vfs.flush().unwrap();
+        vfs.unlink(root, "a").unwrap();
+        let before = file_len(&path);
+        assert!(matches!(vfs.shrink(), Err(Error::ShrinkDeniable)));
+        vfs.set_shrink_on_close(true);
+        assert_eq!(vfs.finish().unwrap(), 0);
+        assert_eq!(file_len(&path), before);
     }
 }

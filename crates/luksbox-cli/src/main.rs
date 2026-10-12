@@ -515,6 +515,13 @@ enum Command {
         /// on every later open; you cannot resize an existing vault.
         #[arg(long, value_name = "BYTES")]
         metadata_size: Option<String>,
+        /// Maximum size of the vault file, e.g. `6G`, `500M`, `1.5G`
+        /// (K/M/G/T, 1024-based) or `0` / `unlimited` (the default).
+        /// Writes that would grow the vault past it fail with "no space
+        /// left"; free space inside the vault is still reused. Change it
+        /// later with `luksbox size <vault> --max`.
+        #[arg(long, value_name = "SIZE")]
+        max_size: Option<String>,
         /// Metadata format for the new vault.
         ///
         /// - `v3` (NEW DEFAULT in v0.2.1): LBM5 on disk, paired with
@@ -552,6 +559,29 @@ enum Command {
         /// to v3 later with `luksbox upgrade-header`.
         #[arg(long)]
         header_v2: bool,
+    },
+    /// Show how much disk space a vault uses; set its maximum size or give
+    /// back the free space at its end (unlocks the vault).
+    ///
+    /// A vault grows as you add data and does not shrink on its own:
+    /// deleted files leave free space inside it, which new files reuse.
+    /// `--shrink` gives the free space at the end of the file back to the
+    /// disk; free space in the middle stays inside the vault.
+    Size {
+        path: PathBuf,
+        #[command(flatten)]
+        unlock: UnlockArgs,
+        /// Set the maximum size of the vault file, e.g. `6G`, `500M`,
+        /// `1.5G` (K/M/G/T, 1024-based), or `0` / `unlimited` to remove
+        /// it. Writes that would grow the vault past it fail with "no
+        /// space left"; free space inside the vault is still reused.
+        #[arg(long, value_name = "SIZE")]
+        max: Option<String>,
+        /// Give the free space at the end of the vault file back to the
+        /// disk. Not available for deniable vaults (a shrinking file
+        /// would reveal deletions).
+        #[arg(long)]
+        shrink: bool,
     },
     /// Show container header / keyslot summary (no unlock required).
     Info {
@@ -730,6 +760,11 @@ enum Command {
         /// mode, hence the v0.2.2 default change).
         #[arg(long)]
         sync: bool,
+        /// When the mount ends, give the free space at the end of the
+        /// vault file back to the disk (as `luksbox size --shrink`).
+        /// Ignored for deniable vaults.
+        #[arg(long)]
+        shrink_on_close: bool,
     },
     /// Subprocess-isolated mount helper. Reads a 32-byte
     /// MasterVolumeKey from stdin and uses it to open the vault
@@ -762,6 +797,9 @@ enum Command {
         /// other platforms.
         #[arg(long)]
         report_ready: bool,
+        /// As `luksbox mount --shrink-on-close`.
+        #[arg(long)]
+        shrink_on_close: bool,
         /// Where to mount the vault.
         mountpoint: PathBuf,
     },
@@ -1366,6 +1404,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             kdf,
             kdf_target_time,
             metadata_size,
+            max_size,
             format,
             header_v3,
             header_v2,
@@ -1391,6 +1430,10 @@ fn dispatch(cli: Cli) -> Result<()> {
                 Some(s) => Some(parse_byte_size(&s)?),
                 None => None,
             };
+            let max_size = match &max_size {
+                Some(s) => check_new_vault_max_size(&path, s, resolved_metadata_size, format)?,
+                None => 0,
+            };
             cmd_create(
                 &path,
                 &cipher,
@@ -1402,11 +1445,18 @@ fn dispatch(cli: Cli) -> Result<()> {
                 pq_hybrid,
                 resolved_params,
                 resolved_metadata_size,
+                max_size,
                 format,
                 header_v3,
             )
         }
         Command::Info { path, header } => cmd_info(&path, header.as_deref()),
+        Command::Size {
+            path,
+            unlock,
+            max,
+            shrink,
+        } => cmd_size(&path, &unlock, max.as_deref(), shrink),
         Command::Enroll {
             kind, kdf: Some(_), ..
         } if !kind.has_passphrase_factor() => Err(cli_err!(
@@ -1548,6 +1598,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             mountpoint,
             private_mount,
             sync,
+            shrink_on_close,
         } => cmd_mount(
             &path,
             &unlock,
@@ -1555,6 +1606,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             mountpoint.as_deref(),
             private_mount,
             sync,
+            shrink_on_close,
         ),
         Command::MountFuseTHelper {
             vault,
@@ -1562,6 +1614,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             anchor,
             sync,
             report_ready,
+            shrink_on_close,
             mountpoint,
         } => cmd_mount_fuse_t_helper(
             &vault,
@@ -1569,6 +1622,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             anchor.as_deref(),
             sync,
             report_ready,
+            shrink_on_close,
             &mountpoint,
         ),
         Command::Umount { mountpoint } => cmd_umount(&mountpoint),
@@ -4498,6 +4552,7 @@ fn cmd_create(
     pq_hybrid_path: Option<PathBuf>,
     kdf_p: Argon2idParams,
     metadata_size_override: Option<u64>,
+    max_size: u64,
     format: VaultFormatArg,
     header_v3: bool,
 ) -> Result<()> {
@@ -4697,6 +4752,17 @@ fn cmd_create(
         // Subsequent vfs writes will bump it.
         cont.init_anchor(ap.clone(), anchor_gen)?;
         eprintln!("  anchor file initialized at {}", ap.display());
+    }
+    if max_size != 0 {
+        // The limit lives in the encrypted metadata: open the new vault
+        // to set it.
+        let mut vfs = Vfs::open(cont)?;
+        vfs.set_max_vault_size(max_size)?;
+        vfs.close()?;
+        eprintln!(
+            "  maximum size {}",
+            luksbox_core::size::describe_size(max_size)
+        );
     }
     if let Some(hp) = header_path {
         println!(
@@ -5330,6 +5396,10 @@ fn cmd_info(path: &Path, header_path: Option<&Path>) -> Result<()> {
             }
         }
     }
+    println!(
+        "  space usage and maximum size: luksbox size {} (unlocks the vault)",
+        path.display()
+    );
     Ok(())
 }
 
@@ -6784,7 +6854,26 @@ fn cmd_rm(path: &Path, unlock: &UnlockArgs, inner: &str) -> Result<()> {
     let (parent, name) = split_parent_name(&vfs, inner)?;
     vfs.unlink(parent, &name)?;
     vfs.flush()?;
+    hint_reclaimable(&mut vfs, path);
     Ok(())
+}
+
+/// After a delete, mention it when a lot of space at the end of the
+/// vault file can be given back. Never asks: scripts must not hang on a
+/// question.
+fn hint_reclaimable(vfs: &mut Vfs, path: &Path) {
+    if vfs.container().is_deniable() {
+        return;
+    }
+    if let Ok(report) = vfs.space_report()
+        && report.reclaimable >= luksbox_vfs::SHRINK_SUGGEST_MIN
+    {
+        eprintln!(
+            "note: {} at the end of the vault can be given back: luksbox size {} --shrink",
+            luksbox_core::size::format_size(report.reclaimable),
+            path.display()
+        );
+    }
 }
 
 fn cmd_rmdir(path: &Path, unlock: &UnlockArgs, inner: &str) -> Result<()> {
@@ -6871,6 +6960,7 @@ fn cmd_mount(
     mountpoint: Option<&Path>,
     private_mount: bool,
     sync_mode: bool,
+    shrink_on_close: bool,
 ) -> Result<()> {
     // Resolve mountpoint:
     //   --private-mount + no explicit path -> derive ~/Library/LUKSbox/Mounts/<vault-name>
@@ -7012,7 +7102,8 @@ fn cmd_mount(
     let path_abs = path
         .canonicalize()
         .map_err(|e| format!("cannot resolve {}: {e}", path.display()))?;
-    let vfs = open_vfs(&path_abs, unlock)?;
+    let mut vfs = open_vfs(&path_abs, unlock)?;
+    vfs.set_shrink_on_close(shrink_on_close);
 
     // Round 12 fix R12-08: re-probe the canonical mountpoint inode
     // IMMEDIATELY before the mount syscall and refuse if it changed.
@@ -7063,6 +7154,7 @@ fn cmd_mount(
             unlock.anchor.as_deref(),
             &mp_abs,
             sync_mode,
+            shrink_on_close,
         );
     }
 
@@ -7103,6 +7195,7 @@ fn cmd_mount_fuse_t_helper(
     anchor: Option<&Path>,
     sync_mode: bool,
     report_ready: bool,
+    shrink_on_close: bool,
     mountpoint: &Path,
 ) -> Result<()> {
     // Stage trace - the parent captures our stderr and surfaces the
@@ -7337,8 +7430,9 @@ fn cmd_mount_fuse_t_helper(
             .map_err(|e| format!("anchor: {e}"))?,
         None => None,
     };
-    let vfs = Vfs::open(container).map_err(|e| format!("open Vfs: {e}"))?;
+    let mut vfs = Vfs::open(container).map_err(|e| format!("open Vfs: {e}"))?;
     check_anchor_generation(trusted_anchor_gen, &vfs)?;
+    vfs.set_shrink_on_close(shrink_on_close);
     eprintln!("luksbox-mount-helper: Vfs ready, calling mount");
 
     // Run the mount in foreground (no daemonize). The parent process
@@ -7465,6 +7559,7 @@ fn mount_in_background(
     anchor: Option<&Path>,
     mountpoint: &Path,
     sync_mode: bool,
+    shrink_on_close: bool,
 ) -> Result<()> {
     use std::io::BufRead as _;
     use std::os::windows::process::CommandExt as _;
@@ -7536,6 +7631,9 @@ fn mount_in_background(
     }
     if sync_mode {
         cmd.arg("--sync");
+    }
+    if shrink_on_close {
+        cmd.arg("--shrink-on-close");
     }
     cmd.arg("--").arg(&vault).arg(mountpoint);
     // Environment names are case-insensitive on Windows.
@@ -8107,7 +8205,8 @@ fn cmd_deniable_mount(
     // deniable state it cannot re-derive from the key alone).
     #[cfg(target_os = "windows")]
     if !foreground {
-        return mount_in_background(vfs, None, anchor, &mp_abs, sync_mode);
+        // Deniable vaults never shrink (a shrinking file would reveal deletions).
+        return mount_in_background(vfs, None, anchor, &mp_abs, sync_mode, false);
     }
 
     luksbox_mount::mount(vfs, &mp_abs, !foreground, sync_mode)?;
@@ -9557,9 +9656,9 @@ fn parse_kdf_target(s: &str) -> Result<u64> {
 ///
 /// Bounded by available RAM (`Vec::try_reserve` pre-flight) and by
 /// `Argon2idParams::SAFE_M_COST_KIB_MAX` (4 GiB cap).
-/// Parse a human-readable byte count for `--metadata-size`. Accepts
-/// plain decimal (`16777216`) or a single-character binary unit suffix
-/// (`k` = KiB, `m` = MiB; case-insensitive).
+/// Parse a human-readable byte count for `--metadata-size`: plain bytes
+/// (`16777216`) or a 1024-based unit (`16M`, `512K`, `1.5M`), as every
+/// size option reads them (`luksbox_core::size::parse_size`).
 ///
 /// Validates against BOTH:
 ///   - lower floor (64 KiB): below this the AEAD overhead + magic +
@@ -9572,32 +9671,7 @@ fn parse_kdf_target(s: &str) -> Result<u64> {
 ///     a vault they could never re-open. Refuse at the CLI boundary
 ///     instead.
 fn parse_byte_size(s: &str) -> Result<u64> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err("--metadata-size: empty value".into());
-    }
-    let (num_part, mult) = match s.chars().last() {
-        Some(c) if c.is_ascii_alphabetic() => {
-            let mult = match c.to_ascii_lowercase() {
-                'k' => 1024u64,
-                'm' => 1024u64 * 1024,
-                _ => {
-                    return Err(format!(
-                        "--metadata-size: unrecognised unit '{c}' (use K or M, e.g. 16M)"
-                    )
-                    .into());
-                }
-            };
-            (&s[..s.len() - 1], mult)
-        }
-        _ => (s, 1u64),
-    };
-    let n: u64 = num_part
-        .parse()
-        .map_err(|e| format!("--metadata-size: invalid number '{num_part}': {e}"))?;
-    let bytes = n
-        .checked_mul(mult)
-        .ok_or("--metadata-size: value overflows u64")?;
+    let bytes = parse_size_option("--metadata-size", s)?;
     const FLOOR: u64 = 64 * 1024;
     if bytes < FLOOR {
         return Err(format!(
@@ -9618,6 +9692,161 @@ fn parse_byte_size(s: &str) -> Result<u64> {
         .into());
     }
     Ok(bytes)
+}
+
+/// Parse a size option (`6G`, `500M`, `1.5G`, `0` / `unlimited`) with
+/// the units the wizard and the GUI use (`luksbox_core::size`).
+fn parse_size_option(flag: &str, s: &str) -> Result<u64> {
+    luksbox_core::size::parse_size(s).map_err(|e| format!("{flag}: {e}").into())
+}
+
+/// For a size typed without a unit that turned out too small (`6`): the
+/// likely intended value.
+fn missing_unit_hint(s: &str) -> String {
+    let t = s.trim();
+    if !t.is_empty() && t.len() <= 4 && t.bytes().all(|b| b.is_ascii_digit()) {
+        format!(" Did you mean {t}G?")
+    } else {
+        String::new()
+    }
+}
+
+/// Validate `create --max-size` before anything is created. The vault
+/// itself takes the header, the metadata region and one chunk slot (a
+/// detached header makes it 8 KiB less, which this ignores); a larger
+/// limit than the disk's free space only gets a warning.
+fn check_new_vault_max_size(
+    path: &Path,
+    s: &str,
+    metadata_size: Option<u64>,
+    format: VaultFormatArg,
+) -> Result<u64> {
+    use luksbox_core::size::{MIB, format_size};
+    let bytes = parse_size_option("--max-size", s)?;
+    if bytes == 0 {
+        return Ok(0);
+    }
+    if matches!(format, VaultFormatArg::V2) {
+        return Err("--max-size needs the default --format v3".into());
+    }
+    let minimum = luksbox_core::header::HEADER_SIZE as u64
+        + metadata_size.unwrap_or(luksbox_format::DEFAULT_METADATA_REGION_SIZE)
+        + luksbox_vfs::CHUNK_SLOT_SIZE;
+    if bytes < minimum {
+        return Err(format!(
+            "--max-size: {} is smaller than the vault itself ({}). Use at least {}M, \
+             or create the vault with a smaller --metadata-size.{}",
+            format_size(bytes),
+            format_size(minimum),
+            minimum.div_ceil(MIB),
+            missing_unit_hint(s)
+        )
+        .into());
+    }
+    if let Ok(free) = luksbox_format::available_disk_space(parent_dir(path))
+        && bytes > free
+    {
+        eprintln!(
+            "note: --max-size {} is more than the free space on this disk ({}); \
+             the disk will fill up first",
+            format_size(bytes),
+            format_size(free)
+        );
+    }
+    Ok(bytes)
+}
+
+/// `luksbox size`: show where the vault file's size goes, and optionally
+/// set its maximum size (`--max`) or give back the free space at its end
+/// (`--shrink`).
+fn cmd_size(path: &Path, unlock: &UnlockArgs, max: Option<&str>, shrink: bool) -> Result<()> {
+    let mut vfs = open_vfs(path, unlock)?;
+    if let Some(s) = max {
+        let bytes = parse_size_option("--max", s)?;
+        if let Err(e) = vfs.set_max_vault_size(bytes) {
+            return Err(match e {
+                luksbox_vfs::Error::MaxSizeBelowMinimum { .. } => {
+                    format!("--max: {e}.{}", missing_unit_hint(s)).into()
+                }
+                e => e.into(),
+            });
+        }
+    }
+    let freed = if shrink { Some(vfs.shrink()?) } else { None };
+    let report = vfs.space_report()?;
+    // Saves a changed maximum size.
+    vfs.close()?;
+
+    match freed {
+        Some(0) => println!("Nothing to give back: no free space at the end of the vault."),
+        Some(n) => println!("Gave back {}.", luksbox_core::size::format_size(n)),
+        None => {}
+    }
+    print_space_report(path, &report, true);
+    Ok(())
+}
+
+/// Directory holding `path`, for asking its disk's free space.
+pub(crate) fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    }
+}
+
+/// The `luksbox size` report, shared with the wizard. `cli` adds the
+/// command that gives back the free space at the end.
+pub(crate) fn print_space_report(path: &Path, report: &luksbox_vfs::SpaceReport, cli: bool) {
+    use luksbox_core::size::{describe_size, format_size};
+    println!("{}", path.display());
+    println!("  File size:      {}", format_size(report.file_size));
+    println!(
+        "  Metadata:       {} (header and encrypted file tree, fixed)",
+        format_size(report.fixed_size)
+    );
+    println!("  Used by files:  {}", format_size(report.used));
+    let tail = match (report.reclaimable, cli) {
+        (0, _) => String::new(),
+        (r, true) => format!(
+            " ({} at the end can be given back: luksbox size {} --shrink)",
+            format_size(r),
+            path.display()
+        ),
+        (r, false) => format!(" ({} at the end can be given back)", format_size(r)),
+    };
+    println!(
+        "  Free inside:    {}{tail}",
+        format_size(report.free_inside)
+    );
+    let max_line = if report.max_size == 0 {
+        "unlimited".to_string()
+    } else {
+        describe_size(report.max_size)
+    };
+    println!("  Maximum size:   {max_line}");
+    if let Ok(free) = luksbox_format::available_disk_space(parent_dir(path)) {
+        println!("  Disk free:      {}", format_size(free));
+    }
+    if report.max_size != 0 && report.file_size > report.max_size {
+        let next = match (report.reclaimable, cli) {
+            (0, _) => format!(
+                "delete files to get it under {}",
+                format_size(report.max_size)
+            ),
+            (r, true) => format!(
+                "`luksbox size {} --shrink` gives back {}",
+                path.display(),
+                format_size(r)
+            ),
+            (r, false) => format!(
+                "giving back the free space at the end frees {}",
+                format_size(r)
+            ),
+        };
+        println!(
+            "  note: the vault is already larger than its maximum size and will not grow; {next}."
+        );
+    }
 }
 
 fn calibrate_kdf_for_target(target_str: &str) -> Result<Argon2idParams> {

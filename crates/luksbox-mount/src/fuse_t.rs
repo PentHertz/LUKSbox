@@ -278,6 +278,7 @@ impl LuksboxFuseTFs {
             VfsError::InvalidPath(_) => Errno::EINVAL,
             VfsError::RenameCycle => Errno::EINVAL,
             VfsError::MetadataBudgetExhausted => Errno::ENOSPC,
+            VfsError::VaultSizeLimit { .. } => Errno::ENOSPC,
             VfsError::FileSizeExceedsCap => Errno::EFBIG,
             _ => Errno::EIO,
         }
@@ -542,10 +543,8 @@ impl Filesystem for LuksboxFuseTFs {
         // anything deferred since the last timer tick (or held back
         // by release()'s soft-flush) lands on disk before the
         // Container is dropped. No syscall to report to, so log.
-        if let Ok(mut vfs) = self.vfs.lock()
-            && let Err(e) = vfs.flush()
-        {
-            eprintln!("luksbox-mount: final unmount flush failed: {e}");
+        if let Ok(mut vfs) = self.vfs.lock() {
+            crate::finish_on_unmount(&mut vfs);
         }
     }
 

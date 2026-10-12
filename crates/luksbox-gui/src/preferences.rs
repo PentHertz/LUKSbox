@@ -31,6 +31,24 @@ pub struct Preferences {
     /// pinned slots need LUKSbox 0.6.0+ to unlock.
     #[serde(default)]
     pub tpm_pin_srk: bool,
+    /// What locking a vault does with the free space at the end of its
+    /// file (`Vfs::shrink`).
+    #[serde(default)]
+    pub shrink_on_close: ShrinkOnClose,
+}
+
+/// Giving back the free space at the end of a vault file when the vault
+/// is locked or unmounted. `Ask` asks when at least
+/// `luksbox_vfs::SHRINK_ASK_MIN` can be freed. The macOS FUSE-T mount
+/// runs in a helper process that cannot ask, so there only `Always`
+/// applies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShrinkOnClose {
+    #[default]
+    Ask,
+    Always,
+    Never,
 }
 
 fn store_path() -> Option<PathBuf> {

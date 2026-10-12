@@ -8,6 +8,7 @@ description = "Mount adapter for luksbox containers (FUSE3 on Linux/macOS, WinFs
 
 [dependencies]
 luksbox-vfs = { path = "../luksbox-vfs" }
+luksbox-core = { path = "../luksbox-core" }
 thiserror.workspace = true
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
@@ -57,7 +58,6 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-luksbox-core = { path = "../luksbox-core" }
 luksbox-format = { path = "../luksbox-format" }
 tempfile = "3"
 
