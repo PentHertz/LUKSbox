@@ -109,6 +109,14 @@ echo "Requires.private: libcbor zlib libudev" >>"$PREFIX/lib/pkgconfig/libfido2.
     # also creates a `tss` user and runs systemd-sysusers / -tmpfiles.
     make install-libLTLIBRARIES install-pkgconfigDATA install-tss2HEADERS >/dev/null
 )
+# Every TCTI also exports the generic `Tss2_Tcti_Info` entry point that the
+# dlopen() loader looks up, so linked statically side by side they collide
+# ("multiple definition of `Tss2_Tcti_Info'"). The nodl loader calls each
+# TCTI's *_Init function directly and never uses it: make those copies local.
+for tcti in device swtpm mssim cmd; do
+    objcopy --localize-symbol=Tss2_Tcti_Info "$PREFIX/lib/libtss2-tcti-$tcti.a"
+    ranlib "$PREFIX/lib/libtss2-tcti-$tcti.a"
+done
 # With --enable-nodl the TCTI loader (built into both libtss2-esys and
 # libtss2-tctildr) calls the device / swtpm / mssim TCTIs directly, but no
 # .pc file lists them; add them so the static link pulls them in.
