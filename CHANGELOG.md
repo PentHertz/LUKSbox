@@ -62,6 +62,26 @@ canonical record.
   SYSTEM and Administrators) that `umount` signals; the mount then stops
   exactly as on Ctrl-C, and `umount` waits until the drive letter is
   gone. `umount --help` says it takes only the mountpoint.
+- **A power loss while a file was being overwritten could make parts of
+  it unreadable (GitHub #37).** Overwriting part of a file rewrote each
+  4 KiB block in place under a new generation number, while the metadata
+  recording that number was only saved at the next flush (every 30
+  seconds on a mount). If the drive lost power or was unplugged in
+  between, after the OS had written the block back, the recovered
+  metadata still expected the old generation: the block failed its
+  integrity check, and neither the old nor the new contents could be
+  read. Overwrites are now copy-on-write: the new contents go to a fresh
+  slot, and the old one is reused only after the next flush, so a crash
+  loses the unsaved change but keeps the last saved contents. Blocks
+  written since the last flush are still rewritten in place, so appends
+  and new files cost nothing extra; a write flushes first once 256 MiB of
+  old slots are waiting, which bounds the extra space.
+- **Hide-size vaults: a write past the end of a shrunk file failed.**
+  When the write's gap started in block 0, block 0 was scrubbed (zeroing
+  the bytes the shrink left behind) and then re-read through its
+  pre-scrub reference to update the size header, which failed its
+  integrity check. The size-header update now starts from the scrubbed
+  block.
 - **Windows: extracting to a path with 8.3 short names was refused.**
   `luksbox get`, GUI downloads, and writing Kyber seed files or hybrid
   sidecars refuse to write through a junction by comparing the path

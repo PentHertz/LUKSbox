@@ -130,6 +130,10 @@ Current guarantees:
   into place, then fsync the parent directory on Unix.
 - Inline MVK rotation writes to a rotating temp file, fsyncs it, renames it
   over the original vault, then fsyncs the parent directory.
+- File data is copy-on-write: overwriting a chunk the committed metadata
+  references writes a fresh slot, and the old slot is reused only after the
+  next metadata commit. A crash before that commit loses the uncommitted
+  changes but leaves the last committed contents readable.
 
 Current limitation:
 

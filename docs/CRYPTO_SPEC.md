@@ -1594,8 +1594,14 @@ echo "hello" > /mnt/v/docs/notes.txt
 2. **Derive the file key** (same as the read path; cached for the
    open).
 3. **For each 4 KiB chunk of plaintext:**
-   - **Pick a chunk slot.** Either reuse the existing one (overwrite)
-     or allocate a new one (extend).
+   - **Pick a chunk slot.** Allocate a new one when extending. When
+     overwriting, copy-on-write: a chunk the last committed metadata
+     references is written to a fresh slot, and its old slot is freed
+     only after the next metadata commit, so a crash before that commit
+     leaves the old contents readable. A chunk written since the last
+     commit (no committed metadata references it) is rewritten in its
+     own slot. A write first commits the metadata when 256 MiB of
+     retired slots are waiting, which bounds the extra space.
    - **Bump the chunk generation counter.** Vault-wide monotonic u64.
      This is what makes the chunk's AAD unique per write - if an
      attacker swaps in an older version of this same chunk (same

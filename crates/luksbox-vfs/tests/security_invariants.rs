@@ -8,20 +8,20 @@
 //!      different files. The chunk AAD includes `file_id`, so the
 //!      receiving file's read should fail AEAD verification.
 //!
-//!   E. Chunk generation-counter rollback within a single chunk slot,
-//!      the chunk AAD includes the per-vault monotonic generation
-//!      counter. An attacker who saves a chunk slot's bytes at gen=N,
-//!      waits for legit overwrite at gen=N+1, then restores the
-//!      saved bytes, must fail AEAD verification because the
-//!      metadata-recorded generation no longer matches the on-disk
-//!      AAD.
+//!   E. Chunk generation-counter rollback of a single chunk, the
+//!      chunk AAD includes the per-vault monotonic generation
+//!      counter. An attacker who saves a chunk's bytes at gen=N,
+//!      waits for legit overwrite at gen=N+1, then writes the saved
+//!      bytes into the slot the metadata now references, must fail
+//!      AEAD verification because the metadata-recorded generation no
+//!      longer matches the on-disk AAD.
 
 use std::path::{Path, PathBuf};
 
 use luksbox_core::{Argon2idParams, CipherSuite};
 use luksbox_format::{Container, UnlockMaterial};
 use luksbox_vfs::Vfs;
-use luksbox_vfs::chunk::CHUNK_SLOT_SIZE;
+use luksbox_vfs::chunk::{CHUNK_SLOT_SIZE, slot_offset};
 use tempfile::TempDir;
 
 const PASS: &[u8] = b"correct horse battery staple";
@@ -129,12 +129,13 @@ fn chunk_substitution_between_files_fails_aead() {
 
 // ---- E. Chunk generation-counter rollback ------------------------------
 
-/// An attacker with disk access AND the MVK saves a chunk slot's
-/// bytes when its generation counter is N, waits for the legit user
-/// to overwrite that slot at gen=N+1 (refreshes metadata's recorded
-/// generation), then restores the saved old bytes. Reading the file
-/// MUST fail AEAD because the slot's AAD encodes the OLD generation
-/// while metadata expects the NEW one.
+/// An attacker with disk access AND the MVK saves a chunk's bytes when
+/// its generation counter is N, waits for the legit user to overwrite
+/// it at gen=N+1 (refreshes metadata's recorded generation; the rewrite
+/// goes to a fresh slot, copy-on-write), then writes the saved old bytes
+/// into the slot the metadata now references. Reading the file MUST
+/// fail AEAD because the slot's AAD encodes the OLD generation while
+/// metadata expects the NEW one.
 #[test]
 fn chunk_generation_rollback_fails_aead() {
     let dir = TempDir::new().unwrap();
@@ -142,42 +143,52 @@ fn chunk_generation_rollback_fails_aead() {
 
     // Write file once -> chunk allocated at gen=N.
     let file_id;
+    let old_ref;
     {
         let mut vfs = open_vfs(&path);
         let root = vfs.root_id();
         file_id = vfs.create(root, "f").unwrap();
         vfs.write(file_id, 0, b"original content at gen N").unwrap();
         vfs.flush().unwrap();
+        old_ref = vfs.file_chunks(file_id).unwrap()[0];
     }
 
-    // Snapshot the on-disk chunk slot bytes (slot N).
+    // Snapshot the chunk's on-disk slot bytes (gen N).
     let data_off;
     let slot_size = CHUNK_SLOT_SIZE as usize;
     let mut snapshot_old = vec![0u8; slot_size];
     {
         let mut cont = Container::open(&path, None, UnlockMaterial::Passphrase(PASS)).unwrap();
         data_off = cont.data_offset();
-        cont.read_at(data_off, &mut snapshot_old).unwrap();
+        cont.read_at(
+            slot_offset(data_off, old_ref.id).unwrap(),
+            &mut snapshot_old,
+        )
+        .unwrap();
     } // cont dropped here -> flock released
 
-    // Legit user overwrites the file -> same chunk slot, new
-    // generation N+1, fresh nonce, new bytes on disk.
+    // Legit user overwrites the file -> new generation N+1, fresh
+    // nonce, written to a fresh slot (copy-on-write).
+    let new_ref;
     {
         let mut vfs = open_vfs(&path);
         vfs.write(file_id, 0, b"updated content at gen N+1")
             .unwrap();
         vfs.flush().unwrap();
+        new_ref = vfs.file_chunks(file_id).unwrap()[0];
     }
+    assert!(new_ref.generation > old_ref.generation);
+    let new_off = slot_offset(data_off, new_ref.id).unwrap();
 
-    // Confirm the on-disk bytes really did change (sanity).
+    // Confirm the referenced slot holds different bytes (sanity).
     let mut snapshot_new = vec![0u8; slot_size];
     {
         let mut cont = Container::open(&path, None, UnlockMaterial::Passphrase(PASS)).unwrap();
-        cont.read_at(data_off, &mut snapshot_new).unwrap();
+        cont.read_at(new_off, &mut snapshot_new).unwrap();
     }
     assert_ne!(
         snapshot_old, snapshot_new,
-        "overwrite should change the on-disk slot bytes"
+        "overwrite should change the referenced slot's bytes"
     );
 
     // Sanity: legit read works.
@@ -188,10 +199,10 @@ fn chunk_generation_rollback_fails_aead() {
         assert!(buf[..n].starts_with(b"updated"));
     }
 
-    // Now: attacker rolls back the slot bytes to the gen-N snapshot.
+    // Now: attacker rolls the referenced slot back to the gen-N bytes.
     {
         let mut cont = Container::open(&path, None, UnlockMaterial::Passphrase(PASS)).unwrap();
-        cont.write_at(data_off, &snapshot_old).unwrap();
+        cont.write_at(new_off, &snapshot_old).unwrap();
     }
 
     // Re-open and read. Metadata still records gen=N+1 (it was flushed

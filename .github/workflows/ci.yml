@@ -241,9 +241,25 @@ jobs:
               echo "::error::FUSE-T installed but fuse-t.pc not found in /usr/local/lib/pkgconfig or /opt/homebrew/lib/pkgconfig"
               exit 1
           fi
+          # libfuse-t.dylib's install name is `@rpath/libfuse-t.dylib`
+          # (release.yml rewrites it with dylibbundler); test binaries and
+          # the luksbox they spawn find it through
+          # DYLD_FALLBACK_LIBRARY_PATH, or abort at load ("Library not
+          # loaded: @rpath/libfuse-t.dylib").
+          FUSE_T_LIB=""
+          for cand in "$(brew --prefix)/lib" /usr/local/lib /opt/homebrew/lib; do
+              if [ -f "$cand/libfuse-t.dylib" ]; then
+                  FUSE_T_LIB="$cand"
+                  break
+              fi
+          done
+          if [ -z "$FUSE_T_LIB" ]; then
+              echo "::error::FUSE-T installed but libfuse-t.dylib not found in $(brew --prefix)/lib, /usr/local/lib or /opt/homebrew/lib"
+              exit 1
+          fi
           {
             echo "PKG_CONFIG_PATH=$(brew --prefix libfido2)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$FUSE_PC_PATH"
-            echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix libfido2)/lib"
+            echo "DYLD_FALLBACK_LIBRARY_PATH=$(brew --prefix libfido2)/lib:$FUSE_T_LIB"
           } >> "$GITHUB_ENV"
       - name: Test workspace (except CLI and mount)
         run: cargo test --workspace --features luksbox-sep/hardware --exclude luksbox-cli --exclude luksbox-mount --exclude luksbox-gui --exclude luksbox-fuzz --exclude luksbox-fuzz-afl

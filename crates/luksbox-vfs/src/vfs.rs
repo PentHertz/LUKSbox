@@ -1499,12 +1499,26 @@ pub struct Vfs {
     /// NEW metadata (nothing references them there) and moved into
     /// `tree.free_chunks` only after `write_metadata` has returned.
     pending_free: Vec<ChunkId>,
+    /// Copy-on-write floor (see `rewrite_target`). A chunk whose
+    /// generation is at or above it was written after the last metadata
+    /// commit began, into a slot that no durable metadata (live region,
+    /// `.meta-bak` mirror, rotated vault) references, so it may be
+    /// rewritten in place. Raised to `tree.next_chunk_gen` at open and
+    /// before every metadata commit.
+    cow_floor_gen: u64,
 }
 
 /// Vault on-disk size beyond which the runtime emits a one-shot
 /// "untested territory" advisory. Aligns with the validation
 /// boundary documented in CRYPTO_SPEC.md and PROJECT_OVERVIEW.md.
 const TESTED_VAULT_SIZE_BYTES: u64 = 30 * 1024 * 1024 * 1024;
+
+/// `write` flushes first once this many chunk slots wait in
+/// `pending_free` (256 MiB of 4 KiB slots). Copy-on-write retires the old
+/// slot of every rewritten chunk until the next flush (`rewrite_target`),
+/// so without a bound, rewriting a large file between two timer flushes
+/// would grow the vault by up to the whole file.
+const PENDING_FREE_FLUSH_THRESHOLD: usize = 65_536;
 
 impl Vfs {
     /// Open a Vfs over an already-unlocked container. If the metadata blob is
@@ -1721,6 +1735,7 @@ impl Vfs {
                     .unwrap_or_else(|| "<unreachable>".to_string());
             }
         }
+        let cow_floor_gen = tree.next_chunk_gen;
         Ok(Self {
             container,
             tree,
@@ -1734,6 +1749,7 @@ impl Vfs {
             // entries here as they touch chunks.
             chunks_dirty: std::collections::BTreeSet::new(),
             pending_free: Vec::new(),
+            cow_floor_gen,
         })
     }
 
@@ -1962,6 +1978,11 @@ impl Vfs {
         if !self.dirty && !metadata_recovered {
             return Ok(());
         }
+        // The metadata committed below may reference every chunk written
+        // so far. Raised before anything is written, so a flush that fails
+        // halfway (possibly after committing the `.meta-bak` mirror) errs
+        // on the side of copying.
+        self.cow_floor_gen = self.tree.next_chunk_gen;
         validate_metadata_tree(
             &self.tree,
             self.container.data_offset(),
@@ -3086,6 +3107,9 @@ impl Vfs {
         if buf.is_empty() {
             return Ok(0);
         }
+        if self.pending_free.len() >= PENDING_FREE_FLUSH_THRESHOLD {
+            self.flush()?;
+        }
         let old_real = self.real_size(id)?;
         // Read the scalar inode fields we need WITHOUT cloning the
         // chunk-ref vec. A large file's `chunks` holds one 16-byte entry
@@ -3188,11 +3212,15 @@ impl Vfs {
         };
 
         // Read-modify-write over the covered range. Each rewrite gets a
-        // fresh generation counter (replay protection). The new ref is
-        // recorded only AFTER its write succeeds: updates to existing
-        // chunks go in `updates`, updates to freshly-appended chunks are
-        // applied to `appended` in place.
+        // fresh generation counter (replay protection) and, for a chunk
+        // the durable metadata references, a fresh slot (copy-on-write,
+        // see `rewrite_target`). The new ref is recorded only AFTER its
+        // write succeeds: updates to existing chunks go in `updates`,
+        // updates to freshly-appended chunks are applied to `appended` in
+        // place. The slots rewrites retire go in `retired`, freed once the
+        // inode is committed (on an error the inode still references them).
         let mut updates: Vec<(usize, ChunkRef)> = Vec::new();
+        let mut retired: Vec<ChunkId> = Vec::new();
 
         // R15-E2: a write past EOF opens a hole [old_real, offset). The
         // EXISTING chunks covering it (pow2 padding, or what a previous
@@ -3222,11 +3250,8 @@ impl Vfs {
                     continue;
                 }
                 pt[ds + zs..ds + ze].fill(0);
-                let new_ref = ChunkRef {
-                    id: cur_ref.id,
-                    generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
-                };
-                chunk::write_chunk(&mut self.container, &key, id, idx as u32, new_ref, &pt)?;
+                let (new_ref, old) = self.rewrite_chunk(&key, id, idx as u32, cur_ref, &pt)?;
+                retired.extend(old);
                 updates.push((idx, new_ref));
             }
         }
@@ -3270,20 +3295,10 @@ impl Vfs {
             if hide_size && chunk_idx == 0 {
                 install_size_header(&mut pt, new_real);
             }
-            // Fresh generation for the rewrite (same chunk id, new nonce
-            // + new generation for replay protection).
-            let new_ref = ChunkRef {
-                id: cur_ref.id,
-                generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
-            };
-            chunk::write_chunk(
-                &mut self.container,
-                &key,
-                id,
-                chunk_idx as u32,
-                new_ref,
-                &pt,
-            )?;
+            // New nonce + generation; a fresh slot unless the chunk was
+            // written since the last flush (appended ones always were).
+            let (new_ref, old) = self.rewrite_chunk(&key, id, chunk_idx as u32, cur_ref, &pt)?;
+            retired.extend(old);
             if chunk_idx < cur_len {
                 updates.push((chunk_idx, new_ref));
             } else {
@@ -3298,18 +3313,22 @@ impl Vfs {
         // one when the write started past a hole into a previously-empty
         // file.
         if hide_size && new_real != old_real && first_chunk > 0 && target_count > 0 {
-            let cur0 = if cur_len > 0 {
+            // The hole scrub above may already have rewritten chunk 0 in
+            // this call: start from that ref, not the inode's pre-write
+            // one (whose slot the scrub may have overwritten, or whose
+            // contents predate the scrub).
+            let scrubbed0 = updates.iter().rev().find(|(i, _)| *i == 0).map(|(_, r)| *r);
+            let cur0 = if let Some(r) = scrubbed0 {
+                r
+            } else if cur_len > 0 {
                 self.tree.inodes.get(&id).ok_or(Error::NotFound)?.chunks[0]
             } else {
                 appended[0]
             };
             let mut pt = chunk::read_chunk(&mut self.container, &key, id, 0, cur0)?;
             install_size_header(&mut pt, new_real);
-            let new0 = ChunkRef {
-                id: cur0.id,
-                generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
-            };
-            chunk::write_chunk(&mut self.container, &key, id, 0, new0, &pt)?;
+            let (new0, old) = self.rewrite_chunk(&key, id, 0, cur0, &pt)?;
+            retired.extend(old);
             if cur_len > 0 {
                 updates.push((0, new0));
             } else {
@@ -3346,6 +3365,8 @@ impl Vfs {
         // next spill_to_v3_on_disk re-encrypts its chunk-list chain
         // instead of reusing the existing on-disk blocks.
         self.chunks_dirty.insert(id);
+        // The inode no longer references the slots the rewrites retired.
+        self.pending_free.extend(retired);
         Ok(buf.len())
     }
 
@@ -3401,8 +3422,19 @@ impl Vfs {
         // used last chunk, pow2 padding, or what an earlier shrink left
         // in place) still hold discarded bytes; scrub them so truncated
         // content can never resurface through `truncate` up.
+        // Slots retired by copy-on-write rewrites below; freed with
+        // `freed_ids`, once the inode is committed.
+        let mut retired: Vec<ChunkId> = Vec::new();
         if new_size > old_real {
-            self.zero_fill_existing_range(id, &key, &mut chunks, old_real, new_size, hide_size)?;
+            self.zero_fill_existing_range(
+                id,
+                &key,
+                &mut chunks,
+                old_real,
+                new_size,
+                hide_size,
+                &mut retired,
+            )?;
         }
 
         let zero = vec![0u8; CHUNK_PLAINTEXT_SIZE];
@@ -3430,8 +3462,9 @@ impl Vfs {
         if hide_size && !chunks.is_empty() {
             let mut pt = chunk::read_chunk(&mut self.container, &key, id, 0, chunks[0])?;
             install_size_header(&mut pt, new_size);
-            chunks[0].generation = self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?;
-            chunk::write_chunk(&mut self.container, &key, id, 0, chunks[0], &pt)?;
+            let (new0, old) = self.rewrite_chunk(&key, id, 0, chunks[0], &pt)?;
+            retired.extend(old);
+            chunks[0] = new0;
         }
 
         let inode_size_field = if hide_size {
@@ -3456,6 +3489,7 @@ impl Vfs {
         for freed in freed_ids {
             self.pending_free.push(freed);
         }
+        self.pending_free.extend(retired);
         Ok(())
     }
 
@@ -3601,11 +3635,64 @@ impl Vfs {
         Ok(())
     }
 
+    /// New ref for rewriting `cur`, an existing chunk of a file, and the
+    /// slot the rewrite retires, if any. Copy-on-write: until the next
+    /// flush the durable metadata (live region and `.meta-bak` mirror)
+    /// still points at `cur`, and rewriting its slot in place meant that
+    /// a power loss before that flush left the chunk failing its AEAD
+    /// check, with neither the old nor the new contents readable. So the
+    /// new contents go to a fresh slot, and the caller hands the retired
+    /// slot to `pending_free` once the inode references the new ref. A
+    /// chunk written since the last metadata commit began (generation
+    /// >= `cow_floor_gen`) sits in a slot no durable metadata references:
+    /// it is rewritten in place and nothing is retired, which keeps
+    /// appends and repeated small writes from churning slots.
+    fn rewrite_target(&mut self, cur: ChunkRef) -> Result<(ChunkRef, Option<ChunkId>), Error> {
+        let generation = self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?;
+        if cur.generation >= self.cow_floor_gen {
+            return Ok((
+                ChunkRef {
+                    id: cur.id,
+                    generation,
+                },
+                None,
+            ));
+        }
+        let id = self.tree.alloc_chunk_id().ok_or(Error::IdSpaceExhausted)?;
+        Ok((ChunkRef { id, generation }, Some(cur.id)))
+    }
+
+    /// Write `pt` as the new contents of chunk `idx` of file `id`, whose
+    /// current ref is `cur`, copy-on-write (see `rewrite_target`).
+    /// Returns the new ref and the retired slot, if any.
+    fn rewrite_chunk(
+        &mut self,
+        key: &luksbox_core::SubKey,
+        id: FileId,
+        idx: u32,
+        cur: ChunkRef,
+        pt: &[u8],
+    ) -> Result<(ChunkRef, Option<ChunkId>), Error> {
+        let (new_ref, retired) = self.rewrite_target(cur)?;
+        if let Err(e) = chunk::write_chunk(&mut self.container, key, id, idx, new_ref, pt) {
+            if retired.is_some() {
+                // R15-E6: the fresh slot is recorded nowhere; don't leak it.
+                self.pending_free.push(new_ref.id);
+            }
+            return Err(e);
+        }
+        Ok((new_ref, retired))
+    }
+
     /// R15-E2: zero the bytes of file range `[from, to)` that live in
     /// chunks ALREADY present in `chunks` (new chunks are allocated
     /// zero-filled by the caller). Rewritten chunks get a fresh
-    /// generation and their refs are updated in place in `chunks`;
-    /// chunks whose share of the range is already zero are left alone.
+    /// generation (and, copy-on-write, usually a fresh slot: see
+    /// `rewrite_target`) and their refs are updated in place in
+    /// `chunks`; the slots they retire are added to `retired`, for the
+    /// caller to free once the inode is committed. Chunks whose share of
+    /// the range is already zero are left alone.
+    #[allow(clippy::too_many_arguments)]
     fn zero_fill_existing_range(
         &mut self,
         id: FileId,
@@ -3614,6 +3701,7 @@ impl Vfs {
         from: u64,
         to: u64,
         hide_size: bool,
+        retired: &mut Vec<ChunkId>,
     ) -> Result<(), Error> {
         if from >= to || chunks.is_empty() {
             return Ok(());
@@ -3638,11 +3726,8 @@ impl Vfs {
                 continue;
             }
             pt[ds + zs..ds + ze].fill(0);
-            let new_ref = ChunkRef {
-                id: cur.id,
-                generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
-            };
-            chunk::write_chunk(&mut self.container, key, id, idx as u32, new_ref, &pt)?;
+            let (new_ref, old) = self.rewrite_chunk(key, id, idx as u32, cur, &pt)?;
+            retired.extend(old);
             chunks[idx] = new_ref;
         }
         Ok(())
@@ -4130,6 +4215,9 @@ impl Vfs {
         kdf_params: luksbox_core::Argon2idParams,
     ) -> Result<(), Error> {
         self.ensure_writable()?;
+        // The rotated vault's metadata references every current chunk
+        // (see `cow_floor_gen`).
+        self.cow_floor_gen = self.tree.next_chunk_gen;
         use luksbox_core::{MasterVolumeKey, SlotKind};
 
         // Reject any fido2-direct slots upfront.
@@ -4391,6 +4479,8 @@ impl Vfs {
         credentials: Vec<DeniableRotationCredential>,
     ) -> Result<(), Error> {
         self.ensure_writable()?;
+        // Same as `rotate_mvk`.
+        self.cow_floor_gen = self.tree.next_chunk_gen;
         use luksbox_core::deniable::DeniableCredential;
 
         if !self.container.is_deniable() {
@@ -9154,5 +9244,148 @@ mod tests {
         let mut got = [0u8; 8];
         vfs.read(f, 0, &mut got).unwrap();
         assert_eq!(&got, b"deniable");
+    }
+
+    /// Copy-on-write rewrites (GitHub #37 follow-up): overwriting part of
+    /// a flushed file must not touch the chunk slots the durable metadata
+    /// points at before the next flush. The old code rewrote each chunk
+    /// in its own slot under a new generation; once the OS had written
+    /// that back to disk, a power loss before the next flush left the
+    /// recovered metadata expecting the old generation, and the chunk
+    /// failed its AEAD check: neither the old nor the new contents
+    /// readable. Now the last flushed contents survive.
+    #[test]
+    fn overwrite_survives_crash_before_flush() {
+        use luksbox_format::{SharedSimFile, SimFile};
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cow.lbx");
+        let old = vec![0xAAu8; 3 * CHUNK_PLAINTEXT_SIZE];
+        {
+            let mut vfs = Vfs::open(create_container(&path)).unwrap();
+            let root = vfs.root_id();
+            let f = vfs.create(root, "doc").unwrap();
+            vfs.write(f, 0, &old).unwrap();
+            vfs.close().unwrap();
+        }
+
+        // Reopen on a simulated disk; overwrite the middle chunk and the
+        // edges of its neighbours without flushing.
+        let sim = SharedSimFile::new(SimFile::from_bytes(std::fs::read(&path).unwrap()));
+        {
+            let mut vfs = Vfs::open(open_container(&path)).unwrap();
+            vfs.container_mut()
+                .swap_lbx_file_for_test(Box::new(sim.handle()));
+            let root = vfs.root_id();
+            let f = vfs.lookup(root, "doc").unwrap();
+            vfs.write(
+                f,
+                CHUNK_PLAINTEXT_SIZE as u64 - 100,
+                &vec![0xBBu8; CHUNK_PLAINTEXT_SIZE + 200],
+            )
+            .unwrap();
+            // The OS may write its page cache back at any time: make the
+            // chunk writes durable, but no new metadata.
+            vfs.container_mut().sync_data_area().unwrap();
+            // No flush; Vfs has no Drop that writes.
+            drop(vfs);
+        }
+
+        // Power loss, then reopen from what reached the disk.
+        sim.crash();
+        std::fs::write(&path, sim.backing_snapshot()).unwrap();
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.lookup(root, "doc").unwrap();
+        let mut buf = vec![0u8; old.len()];
+        vfs.read(f, 0, &mut buf)
+            .expect("the last flushed contents must still be readable");
+        assert_eq!(buf, old);
+    }
+
+    /// Copy-on-write bookkeeping: rewriting a flushed chunk moves it to a
+    /// fresh slot and keeps the old one out of reuse until the next
+    /// flush; a chunk written since the last flush, which no durable
+    /// metadata references, is rewritten in its own slot.
+    #[test]
+    fn rewrite_moves_flushed_chunks_only() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cow2.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "doc").unwrap();
+        vfs.write(f, 0, &vec![1u8; 2 * CHUNK_PLAINTEXT_SIZE])
+            .unwrap();
+
+        // Not flushed yet: rewritten in place.
+        let unflushed = vfs.tree.inodes[&f].chunks.clone();
+        vfs.write(f, 0, &[2u8; 10]).unwrap();
+        let rewritten = vfs.tree.inodes[&f].chunks.clone();
+        assert_eq!(rewritten[0].id, unflushed[0].id);
+        assert!(vfs.pending_free.is_empty());
+
+        // Flushed: the rewrite goes to a fresh slot; the old slot waits
+        // for the next flush before it can be reused.
+        vfs.flush().unwrap();
+        vfs.write(f, CHUNK_PLAINTEXT_SIZE as u64, &[3u8; 10])
+            .unwrap();
+        let moved = vfs.tree.inodes[&f].chunks.clone();
+        assert_eq!(moved[0], rewritten[0]);
+        assert_ne!(moved[1].id, rewritten[1].id);
+        assert_eq!(vfs.pending_free, vec![rewritten[1].id]);
+        assert!(!vfs.tree.free_chunks.contains(&rewritten[1].id));
+        vfs.flush().unwrap();
+        assert!(vfs.pending_free.is_empty());
+        assert!(vfs.tree.free_chunks.contains(&rewritten[1].id));
+
+        let mut buf = vec![0u8; 2 * CHUNK_PLAINTEXT_SIZE];
+        vfs.read(f, 0, &mut buf).unwrap();
+        assert_eq!(&buf[..10], &[2u8; 10]);
+        assert!(buf[10..CHUNK_PLAINTEXT_SIZE].iter().all(|&b| b == 1));
+        assert_eq!(
+            &buf[CHUNK_PLAINTEXT_SIZE..CHUNK_PLAINTEXT_SIZE + 10],
+            &[3u8; 10]
+        );
+        assert!(buf[CHUNK_PLAINTEXT_SIZE + 10..].iter().all(|&b| b == 1));
+    }
+
+    /// Hide-size vault: a write past EOF whose hole starts in chunk 0
+    /// rewrites chunk 0 twice in one call, once to scrub the bytes a
+    /// shrink left behind (R15-E2) and once to refresh the size header.
+    /// The refresh must start from the scrubbed chunk. It used to re-read
+    /// the inode's pre-write ref, which failed AEAD once the scrub had
+    /// rewritten the slot (and, with copy-on-write, would have undone the
+    /// scrub).
+    #[test]
+    fn hide_size_write_past_eof_scrubs_then_refreshes_chunk0() {
+        use luksbox_format::Container;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hs-scrub.lbx");
+        Container::create_with_passphrase_flags(
+            &path,
+            None,
+            CipherSuite::Aes256Gcm,
+            test_params(),
+            luksbox_core::FLAG_PAD_FILES_POW2 | luksbox_core::FLAG_HIDE_SIZE_HEADER,
+            b"pw",
+        )
+        .unwrap();
+        let mut vfs = Vfs::open(open_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let f = vfs.create(root, "doc").unwrap();
+        vfs.write(f, 0, &vec![0x55u8; 3000]).unwrap();
+        vfs.truncate(f, 100).unwrap();
+        // Chunk 0 holds 4088 bytes in hide-size mode; 9000 is in chunk 2.
+        vfs.write(f, 9000, b"tail").unwrap();
+
+        assert_eq!(vfs.stat(f).unwrap().size, 9004);
+        let mut buf = vec![0u8; 9004];
+        vfs.read(f, 0, &mut buf).unwrap();
+        assert!(buf[..100].iter().all(|&b| b == 0x55));
+        assert!(
+            buf[100..9000].iter().all(|&b| b == 0),
+            "truncated bytes resurfaced"
+        );
+        assert_eq!(&buf[9000..], b"tail");
     }
 }
