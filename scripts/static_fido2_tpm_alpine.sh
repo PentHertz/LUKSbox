@@ -122,7 +122,24 @@ LIBCLANG="$(find /usr/lib -name 'libclang.so*' | head -n1)"
 export LIBCLANG_PATH="${LIBCLANG%/*}"
 export CARGO_TARGET_DIR=/tmp/target
 TARGET="$(rustc -vV | sed -n 's/^host: //p')"
-RUSTFLAGS="-C target-feature=+crt-static" cargo build --locked \
+# What pkg-config hands the -sys build scripts, for the build log.
+for pc in libfido2 tss2-esys tss2-tctildr; do
+    echo "pkg-config --static --libs $pc: $(pkg-config --static --libs "$pc")"
+done
+# The build scripts emit each library's link flags separately (and the
+# pkg-config crate only marks a library static when its -L came first,
+# which tpm2-tss's .pc files do not do), while GNU ld resolves archives
+# strictly left to right: an archive placed before the one that needs it
+# (libtss2-sys before libtss2-esys, the TCTIs, libcbor) is never pulled
+# in. List every bundled archive once more inside one --start-group /
+# --end-group; rustc puts link-args after all libraries, and ld searches
+# a group repeatedly until nothing new resolves.
+group="-C link-arg=-Wl,--start-group"
+for archive in "$PREFIX"/lib/*.a /usr/lib/libcrypto.a /usr/lib/libz.a; do
+    group="$group -C link-arg=$archive"
+done
+group="$group -C link-arg=-Wl,--end-group"
+RUSTFLAGS="-C target-feature=+crt-static $group" cargo build --locked \
     --profile release-hardened -p luksbox-cli \
     --no-default-features --features hardware,fuse --target "$TARGET"
 install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release-hardened/luksbox" "$OUT/luksbox"
