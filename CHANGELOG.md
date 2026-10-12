@@ -30,6 +30,18 @@ canonical record.
   enumeration and a TPM round trip against swtpm. The passphrase-only
   static build is still published. The wizard now also warns at startup
   when a TPM-enabled build finds no TPM device.
+- **Vulnerability gate for the bundled libraries.** The tarball lists every
+  library linked in (`licenses/components.tsv`: libfido2 1.17.0,
+  tpm2-tss 4.2.0, libcbor 0.14.0, libudev-zero 1.0.4, and Alpine's
+  OpenSSL, zlib and musl). Before publishing it, `scripts/check_static_deps.py`
+  checks them against OSV (Alpine packages) and NVD, and against newer
+  upstream releases whose notes announce security fixes (which catches
+  fixes whose advisories are not public yet, such as the ten tpm2-tss
+  GHSAs fixed in 4.1.4). Any hit keeps the tarball out of the release.
+  Unanalysed NVD entries reviewed by hand are listed in
+  `scripts/static_deps_reviewed.txt`. A weekly workflow
+  (`static-deps-audit`) re-runs the check against the latest release's
+  tarball, for vulnerabilities disclosed after it shipped.
 
 - **GUI file "Download..." froze on Linux (GitHub #35).** The save
   dialog for a single file passed an "All files" filter with no
@@ -64,6 +76,21 @@ canonical record.
   `luksbox-x86_64-windows.zip`), alongside the existing musl and
   AppImage ones, so `releases/latest/download/<name>` links in the docs
   keep working across releases.
+
+### Security
+
+- **tpm2-tss 4.1.3 -> 4.2.0 in every build that bundles it.** 4.1.3 has
+  eleven security advisories fixed upstream (ten in 4.1.4, one more in
+  4.2.0; their details are not public yet). The Windows installers and
+  zip, the jammy / noble Linux `.deb`s and tarballs, the `.rpm` (built
+  on the jammy lane) and the AppImage compile tpm2-tss in (`bundled-tpm`) and now stage 4.2.0
+  (`scripts/stage_tpm2_tss.sh`, `.github/actions/stage-tpm2-tss`). The
+  Windows staging follows 4.1.4+'s new OpenSSL layout (import libs under
+  `lib\VC\x64\MD`, `libssl.lib` linked too) and the release checks that
+  `tss2-esys.dll` still imports libcrypto only. Release and CI build
+  caches were reset so no cached 4.1.3 build is reused. The trixie and
+  resolute builds link the distribution's own tpm2-tss and are
+  unaffected.
 
 ## [v0.6.0-rc.1] - 2026-10-10
 

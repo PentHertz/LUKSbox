@@ -20,9 +20,12 @@
 
 set -euo pipefail
 
-# Bump deliberately, together with the hash.
-TPM2_TSS_VERSION="4.1.3"
-TPM2_TSS_TARBALL_SHA256="8a389bda64690910e7af7deaf64703a3faed416dc538c9c3e4f893f24893524d"
+# Bump deliberately, together with the hash. 4.2.0: 4.1.3 has eleven
+# security advisories fixed upstream (ten in 4.1.4, one more in 4.2.0).
+# Keep in step with .github/actions/stage-tpm2-tss and
+# scripts/static_fido2_tpm_alpine.sh.
+TPM2_TSS_VERSION="4.2.0"
+TPM2_TSS_TARBALL_SHA256="5f5907d3a3ca1e37c2d6d4027b4ccda5bbad61873751fb78ebecaca5744218a5"
 
 [ $# -eq 1 ] || { echo "usage: $0 DEST_DIR" >&2; exit 2; }
 mkdir -p "$1"

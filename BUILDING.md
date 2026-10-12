@@ -34,8 +34,16 @@ TPM 2.0 keyslots are opt-in on every platform:
 - `--features hardware` (FIDO2 + TPM + SEP) links the SYSTEM
   tpm2-tss and needs tpm2-tss >= 4.1.3 installed (Debian 13+,
   Ubuntu 24.10+, Fedora 40+, Arch).
-- `--features bundled-tpm` compiles a vendored tpm2-tss 4.1.3
-  during `cargo build` instead. Use it on LTS distros whose system
+- `--features bundled-tpm` compiles a vendored tpm2-tss during
+  `cargo build` instead. Stage the pinned source first: on its own,
+  tss-esapi-sys clones its minimum, 4.1.3, which has security advisories
+  fixed in 4.2.0. The release builds do this:
+
+  ```bash
+  export TPM2_TSS_SOURCE_PATH="$(scripts/stage_tpm2_tss.sh /tmp/tpm2-tss-src)"
+  ```
+
+  Use it on LTS distros whose system
   tpm2-tss is older (Ubuntu 22.04 ships 3.2, 24.04 ships 4.0.1) and
   on Windows, which has no system tpm2-tss at all. On Linux it
   needs the autotools stack on top of the base dependencies:
@@ -53,7 +61,7 @@ TPM 2.0 keyslots are opt-in on every platform:
   of tpm2-tss.)
 
   The vendored libraries are built static-only, so the resulting
-  binary embeds the tss2 core at 4.1.3 and has no `libtss2-*.so`
+  binary embeds the tss2 core (4.2.0 when staged as above) and has no `libtss2-*.so`
   runtime dependency; at runtime only the small TCTI module (for
   example `libtss2-tcti-device.so.0` on Linux, from the distro's
   tpm2-tss packages) is loaded when a TPM slot is actually used.
@@ -328,22 +336,24 @@ Linux).
    driver, no admin rights. Three things to stage first:
 
    ```powershell
-   # a. tpm2-tss 4.1.3 source at a SHORT path (deep paths trip
+   # a. tpm2-tss 4.2.0 source at a SHORT path (deep paths trip
    #    MSBuild's file tracker with an inscrutable MSB6003; the
    #    repo snapshot is required - the autotools dist tarball
-   #    omits the VS solution).
-   Invoke-WebRequest -Uri "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/4.1.3.zip" -OutFile "$env:TEMP\t2t.zip"
+   #    omits the VS solution). Same version the release builds pin.
+   Invoke-WebRequest -Uri "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/4.2.0.zip" -OutFile "$env:TEMP\t2t.zip"
    Expand-Archive "$env:TEMP\t2t.zip" -DestinationPath "$env:TEMP\t2t"
-   $env:TPM2_TSS_SOURCE_PATH = "$env:TEMP\t2t\tpm2-tss-4.1.3"
+   $env:TPM2_TSS_SOURCE_PATH = "$env:TEMP\t2t\tpm2-tss-4.2.0"
 
-   # b. OpenSSL 3 with an x64 import lib (tss2-esys links
-   #    libcrypto). Any install layout with lib\libcrypto.lib +
-   #    include\openssl works; the portable FireDaemon zip is the
-   #    easiest (https://kb.firedaemon.com/support/solutions/articles/4000121705).
-   #    tpm2-tss's VS solution hardcodes the OpenSSL location, so
-   #    patch it:
+   # b. OpenSSL 3 with x64 import libs (tss2-esys links libcrypto.lib
+   #    and libssl.lib from <dir>\lib\VC\x64\MD, headers from
+   #    <dir>\include). The ShiningLight installer and the portable
+   #    FireDaemon zip both work
+   #    (https://kb.firedaemon.com/support/solutions/articles/4000121705);
+   #    copy the two .lib files into lib\VC\x64\MD if your layout keeps
+   #    them in lib\. tpm2-tss's VS solution hardcodes the OpenSSL
+   #    location, so patch it:
    $props = "$env:TPM2_TSS_SOURCE_PATH\src\tss2-esys\openssl.props"
-   (Get-Content $props -Raw).Replace('C:\OpenSSL-v11-Win64', '<your-openssl-x64-dir>') | Set-Content $props -NoNewline
+   (Get-Content $props -Raw) -replace '<OpenSslDir>[^<]*</OpenSslDir>', '<OpenSslDir><your-openssl-x64-dir></OpenSslDir>' | Set-Content $props -NoNewline
 
    # c. libclang for bindgen. LLVM's install works (step 4 above);
    #    so does the copy inside VS 2022:

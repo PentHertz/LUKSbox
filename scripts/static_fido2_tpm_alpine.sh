@@ -30,6 +30,15 @@
 
 set -eu
 
+# Bundled library versions. When upstream ships a fix, bump the version
+# and its SHA-256 pin below. scripts/check_static_deps.py, run on every
+# release build, fails when a bundled library has a known vulnerability or
+# a newer upstream release announces security fixes.
+UDEV_ZERO_VERSION=1.0.4
+LIBCBOR_VERSION=0.14.0
+LIBFIDO2_VERSION=1.17.0
+TPM2_TSS_VERSION=4.2.0
+
 OUT="$1"
 PREFIX=/opt/luksbox-static
 SRC=/tmp/luksbox-static-src
@@ -50,28 +59,28 @@ fetch() {
     tar -xzf "$SRC/$3" -C "$SRC"
 }
 
-fetch https://github.com/illiliti/libudev-zero/archive/refs/tags/1.0.3.tar.gz \
-    0bd89b657d62d019598e6c7ed726ff8fed80e8ba092a83b484d66afb80b77da5 \
-    libudev-zero-1.0.3.tar.gz
-fetch https://github.com/PJK/libcbor/archive/refs/tags/v0.12.0.tar.gz \
-    5368add109db559f546d7ed10f440f39a273b073daa8da4abffc83815069fa7f \
-    libcbor-0.12.0.tar.gz
-fetch https://developers.yubico.com/libfido2/Releases/libfido2-1.16.0.tar.gz \
-    8c2b6fb279b5b42e9ac92ade71832e485852647b53607c43baaafbbcecea04e4 \
-    libfido2-1.16.0.tar.gz
-fetch https://github.com/tpm2-software/tpm2-tss/releases/download/4.1.3/tpm2-tss-4.1.3.tar.gz \
-    37f1580200ab78305d1fc872d89241aaee0c93cbe85bc559bf332737a60d3be8 \
-    tpm2-tss-4.1.3.tar.gz
+fetch "https://github.com/illiliti/libudev-zero/archive/refs/tags/$UDEV_ZERO_VERSION.tar.gz" \
+    10148cfd6047d387bf71eca72cd19c177084224d96434a118d8def6e0a3d6316 \
+    "libudev-zero-$UDEV_ZERO_VERSION.tar.gz"
+fetch "https://github.com/PJK/libcbor/archive/refs/tags/v$LIBCBOR_VERSION.tar.gz" \
+    a8c1516e741562cf95aa4479c64916c3d4d2623e24fdc35e414e2320e7300aae \
+    "libcbor-$LIBCBOR_VERSION.tar.gz"
+fetch "https://developers.yubico.com/libfido2/Releases/libfido2-$LIBFIDO2_VERSION.tar.gz" \
+    c1012c8871d71b65872fd5ff1a9d6b0838a55683a03e85ba97479ce57129c736 \
+    "libfido2-$LIBFIDO2_VERSION.tar.gz"
+fetch "https://github.com/tpm2-software/tpm2-tss/releases/download/$TPM2_TSS_VERSION/tpm2-tss-$TPM2_TSS_VERSION.tar.gz" \
+    b53f0c5c8c4ce17f05701a410ca9688f725ca380c9bc4640eacd0eadb1fea124 \
+    "tpm2-tss-$TPM2_TSS_VERSION.tar.gz"
 
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
 
 # ---- libudev-zero -------------------------------------------------------
-make -C "$SRC/libudev-zero-1.0.3" -j"$JOBS" PREFIX="$PREFIX" install-static >/dev/null
+make -C "$SRC/libudev-zero-$UDEV_ZERO_VERSION" -j"$JOBS" PREFIX="$PREFIX" install-static >/dev/null
 
 # ---- libcbor ------------------------------------------------------------
-# CMAKE_POLICY_VERSION_MINIMUM: libcbor declares CMake 3.0, which CMake 4
-# refuses outright.
-cmake -S "$SRC/libcbor-0.12.0" -B "$SRC/build-cbor" \
+# CMAKE_POLICY_VERSION_MINIMUM: older libcbor releases declare CMake 3.0,
+# which CMake 4 refuses outright; harmless for newer ones.
+cmake -S "$SRC/libcbor-$LIBCBOR_VERSION" -B "$SRC/build-cbor" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib \
     -DBUILD_SHARED_LIBS=OFF -DWITH_EXAMPLES=OFF >/dev/null
@@ -81,8 +90,8 @@ cmake --install "$SRC/build-cbor" >/dev/null
 # ---- libfido2 -----------------------------------------------------------
 # libfido2 compiles with -Werror; a compiler newer than the one upstream
 # tested with must not fail the build over a new warning.
-sed -i 's/add_compile_options(-Werror)//' "$SRC/libfido2-1.16.0/CMakeLists.txt"
-cmake -S "$SRC/libfido2-1.16.0" -B "$SRC/build-fido2" \
+sed -i 's/add_compile_options(-Werror)//' "$SRC/libfido2-$LIBFIDO2_VERSION/CMakeLists.txt"
+cmake -S "$SRC/libfido2-$LIBFIDO2_VERSION" -B "$SRC/build-fido2" \
     -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
     -DCMAKE_INSTALL_PREFIX="$PREFIX" -DCMAKE_INSTALL_LIBDIR=lib \
     -DBUILD_SHARED_LIBS=OFF -DBUILD_STATIC_LIBS=ON -DBUILD_TOOLS=OFF \
@@ -95,12 +104,12 @@ echo "Requires.private: libcbor zlib libudev" >>"$PREFIX/lib/pkgconfig/libfido2.
 
 # ---- tpm2-tss -----------------------------------------------------------
 (
-    cd "$SRC/tpm2-tss-4.1.3"
+    cd "$SRC/tpm2-tss-$TPM2_TSS_VERSION"
     ./configure --prefix="$PREFIX" --libdir="$PREFIX/lib" \
         --enable-static --disable-shared --enable-nodl \
         --disable-fapi --disable-policy --disable-weakcrypto \
         --disable-unit --disable-integration --disable-doxygen-doc \
-        --disable-tcti-pcap --disable-tcti-libtpms \
+        --disable-tcti-pcap --disable-tcti-libtpms --disable-tcti-null \
         --disable-tcti-spi-helper --disable-tcti-spi-ltt2go \
         --disable-tcti-spidev --disable-tcti-spi-ftdi \
         --disable-tcti-i2c-helper --disable-tcti-i2c-ftdi >/dev/null
@@ -152,20 +161,52 @@ RUSTFLAGS="-C target-feature=+crt-static $group" cargo build --locked \
     --no-default-features --features hardware,fuse --target "$TARGET"
 install -m 0755 "$CARGO_TARGET_DIR/$TARGET/release-hardened/luksbox" "$OUT/luksbox"
 
-# ---- third-party licenses -----------------------------------------------
-cp "$SRC/libudev-zero-1.0.3/LICENSE" "$OUT/licenses/libudev-zero.txt"
-cp "$SRC/libcbor-0.12.0/LICENSE.md" "$OUT/licenses/libcbor.txt"
-cp "$SRC/libfido2-1.16.0/LICENSE" "$OUT/licenses/libfido2.txt"
-cp "$SRC/tpm2-tss-4.1.3/LICENSE" "$OUT/licenses/tpm2-tss.txt"
-cat >"$OUT/licenses/README.txt" <<EOF
-Libraries linked into this luksbox binary:
+# ---- third-party licenses and component list ---------------------------
+cp "$SRC/libudev-zero-$UDEV_ZERO_VERSION/LICENSE" "$OUT/licenses/libudev-zero.txt"
+cp "$SRC/libcbor-$LIBCBOR_VERSION/LICENSE.md" "$OUT/licenses/libcbor.txt"
+cp "$SRC/libfido2-$LIBFIDO2_VERSION/LICENSE" "$OUT/licenses/libfido2.txt"
+cp "$SRC/tpm2-tss-$TPM2_TSS_VERSION/LICENSE" "$OUT/licenses/tpm2-tss.txt"
 
-  libudev-zero 1.0.3   ISC           libudev-zero.txt
-  libcbor 0.12.0       MIT           libcbor.txt
-  libfido2 1.16.0      BSD-2-Clause  libfido2.txt
-  tpm2-tss 4.1.3       BSD-2-Clause  tpm2-tss.txt
-  OpenSSL $(pkg-config --modversion libcrypto)  Apache-2.0    same text as ../LICENSE
-  zlib $(pkg-config --modversion zlib)          zlib          https://zlib.net/zlib_license.html
+# Exact versions of the Alpine packages linked in (with their -rN release,
+# which is what Alpine's security fixes bump).
+ALPINE_BRANCH="v$(cut -d. -f1,2 /etc/alpine-release)"
+apk_version() {
+    v="$(apk list --installed "$1" 2>/dev/null | sed -n "s/^$1-\([0-9][^ ]*\) .*/\1/p" | head -n1)"
+    if [ -z "$v" ]; then
+        echo "could not read the installed version of $1" >&2
+        exit 1
+    fi
+    echo "$v"
+}
+OPENSSL_APK="$(apk_version openssl-libs-static)"
+ZLIB_APK="$(apk_version zlib-static)"
+MUSL_APK="$(apk_version musl-dev)"
+
+# Machine-readable list for scripts/check_static_deps.py (and for anyone
+# checking the binary against vulnerability databases): name, version,
+# where it comes from.
+{
+    printf 'libudev-zero\t%s\tgithub:illiliti/libudev-zero\n' "$UDEV_ZERO_VERSION"
+    printf 'libcbor\t%s\tgithub:PJK/libcbor\n' "$LIBCBOR_VERSION"
+    printf 'libfido2\t%s\tgithub:Yubico/libfido2\n' "$LIBFIDO2_VERSION"
+    printf 'tpm2-tss\t%s\tgithub:tpm2-software/tpm2-tss\n' "$TPM2_TSS_VERSION"
+    printf 'openssl\t%s\talpine:%s\n' "$OPENSSL_APK" "$ALPINE_BRANCH"
+    printf 'zlib\t%s\talpine:%s\n' "$ZLIB_APK" "$ALPINE_BRANCH"
+    printf 'musl\t%s\talpine:%s\n' "$MUSL_APK" "$ALPINE_BRANCH"
+} >"$OUT/licenses/components.tsv"
+
+cat >"$OUT/licenses/README.txt" <<EOF
+Libraries linked into this luksbox binary (machine-readable list:
+components.tsv):
+
+  libudev-zero $UDEV_ZERO_VERSION        ISC           libudev-zero.txt
+  libcbor $LIBCBOR_VERSION             MIT           libcbor.txt
+  libfido2 $LIBFIDO2_VERSION            BSD-2-Clause  libfido2.txt
+  tpm2-tss $TPM2_TSS_VERSION             BSD-2-Clause  tpm2-tss.txt
+  OpenSSL $OPENSSL_APK     Apache-2.0    same text as ../LICENSE
+  zlib $ZLIB_APK          zlib          https://zlib.net/zlib_license.html
+  musl libc $MUSL_APK     MIT           https://musl.libc.org/COPYRIGHT
+  (OpenSSL, zlib and musl are Alpine Linux $ALPINE_BRANCH packages)
 EOF
 
 # The container runs as root; hand what it wrote back to the caller.

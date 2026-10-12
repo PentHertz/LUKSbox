@@ -1,0 +1,8 @@
+# CVEs naming a library bundled into the static FIDO2 + TPM build that NVD
+# has not analysed yet (no affected-version data), reviewed by hand and
+# found not to affect the pinned version. scripts/check_static_deps.py
+# fails on any such CVE that is not listed here. One CVE ID per line,
+# followed by the reason. Drop an entry once NVD has analysed the CVE.
+
+CVE-2026-40947  libfido2 < 1.17.0, Windows DLL search path (YSA-2026-01); pinned 1.17.0 is fixed and the Linux build never loads webauthn.dll
+CVE-2024-29040  tpm2-tss FAPI Fapi_Quote verification (GHSA-837m-jw3m-h9p6), fixed in 4.1.0; the static build is configured with --disable-fapi
