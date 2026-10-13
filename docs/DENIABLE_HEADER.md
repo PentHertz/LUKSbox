@@ -86,7 +86,7 @@ the credential.
 | Adversary cannot enumerate users / count slots | yes |
 | Adversary cannot identify which credential types are in use | yes (passphrase, FIDO2, TPM all in-slot); partial (PQ-hybrid via sidecar) |
 | Adversary cannot distinguish wrong-passphrase from wrong-cipher from wrong-KDF-params | yes (single AEAD failure mode) |
-| File-size pattern (~36 KiB header + N x 4 KiB) does not reveal LUKSbox | mitigated by optional `--pad-to <N>` quantization |
+| File-size pattern (~36 KiB header + N x 4 KiB) does not reveal LUKSbox | not addressed (no size-padding option is implemented) |
 | Per-chunk 4 KiB stride does not reveal LUKSbox | not addressed (same as standard mode; out of scope) |
 | Steganographic carrier (vault hidden inside PNG/JPEG/PDF) | not addressed (separate feature) |
 | Two vaults with same passphrase yield same wrapped MVK in slots | mild leak: forensic analyst who guesses the passphrase sees 2 slots match, learns ">=2 users share that passphrase" |
@@ -108,8 +108,7 @@ trivial on absolute terms and well below filesystem block-aligned
 overhead for any non-trivial vault. The size difference from the
 standard format is deliberately not aligned to any well-known
 multiple, so size alone is not a reliable LUKSbox fingerprint.
-`init --pad-to <N>` quantization remains available for users who
-want the file size to match a target distribution.
+There is no option to pad the file to a target size.
 
 The per-vault salt is the only "fixed structure" anywhere in the
 file. Since 32 bytes of uniform random is the unavoidable minimum
@@ -644,7 +643,7 @@ and a FIDO2 hmac-output, derived KEKs MUST be unequal.
 | Leak | Mitigation in this design |
 |---|---|
 | File extension (`.lbx`) | User can rename freely; format is content-agnostic. |
-| File size pattern `8192 + N x 4096 + tag overhead` | `init --pad-to {1M, 10M, 100M, 1G}` quantizes. |
+| File size pattern `36864 + N x 4096 + tag overhead` | None (a size-padding option is not implemented). Deniable vaults are never shrunk on their own, so the size does not drop after deletions; the GUI's explicit "Give back ... anyway" does reveal them (see `docs/VAULT_SIZE.md`). |
 | High file entropy (8.0 bits/byte) | Inherent to AEAD storage; stego carrier is a separate feature. |
 | Per-chunk 4 KiB stride in data area | Same as standard mode; not addressed here. |
 | TPM / PQ-hybrid sidecar files identify credential type if found alongside vault | Documented; user instructed to store sidecar on separate device. |

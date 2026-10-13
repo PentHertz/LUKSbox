@@ -139,7 +139,8 @@ Current limitation:
 
 - Detached-header MVK rotation is still not a two-file atomic commit. A crash
   in detached-header rotation can leave the vault/header pair inconsistent.
-  Back up the detached header before rotating in that mode.
+  Back up the whole vault and its detached header before rotating in that
+  mode: a header backup alone cannot decrypt re-keyed chunks (R15-C5).
 
 ## 5. Mechanism inventory
 

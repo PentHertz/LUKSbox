@@ -14,16 +14,46 @@ canonical record.
 
 ---
 
-## [Unreleased]
+## [v0.6.1] - 2026-10-13
+
+First stable release of the v0.6 line. There is no stable v0.6.0: this
+release is `v0.6.0-rc.1` (its entry below) plus the changes listed
+here, made since the release candidate.
+
+Upgrading from v0.5.x: existing vaults, headers, anchors and keyslots
+open unchanged and keep their format until you upgrade them. New vaults
+use header format v3, which needs LUKSbox 0.6.0+ to open (`--header-v2`
+when an older version must still open the vault; `upgrade-header` for
+existing ones); see the `v0.6.0-rc.1` entry. A vault given a maximum
+size (new in this release) needs 0.6.1+ to open while the limit is set;
+vaults without one stay readable by older versions.
+
+Highlights since `v0.6.0-rc.1`, details below:
+
+- **Maximum vault size, and giving back free space (GitHub #37).** Cap
+  how large a vault file may grow (`create --max-size 6G`, `luksbox
+  size`, the wizard, the GUI), and give the free space at the end of the
+  vault file back to the disk, on request or when locking / unmounting.
+- **Windows mounts.** `luksbox mount` runs in the background, as on
+  Linux and macOS, and `luksbox umount Z:` works and waits until the
+  vault is flushed and closed (GitHub #37). Master-key rotation works
+  on Windows again, the FIDO2 PIN is no longer asked twice, and paths
+  with 8.3 short names are no longer refused.
+- **Crash safety.** Overwriting part of a file is copy-on-write, so a
+  power loss or unplugged drive mid-overwrite keeps the last saved
+  contents instead of leaving blocks unreadable (GitHub #37).
+- **Speed.** Copies into a FUSE-T mount on macOS are 4-5x faster, and
+  every metadata save is about 2.5x faster on every platform.
+- **Static Linux CLI with FIDO2 + TPM 2.0 (GitHub #34)**, with a
+  vulnerability gate on the libraries it bundles, and version-less
+  download names for every release asset.
+- **Security:** every build that bundles tpm2-tss now ships 4.2.0
+  (4.1.3 has eleven advisories fixed upstream).
+- The GUI's single-file "Download..." no longer freezes on Linux
+  (GitHub #35).
 
 ### Added
 
-- **Give back a deniable vault's free space, on request.** Deniable
-  vaults are still never shrunk on their own, since a file that gets
-  smaller tells anyone comparing it over time that data was deleted. The
-  GUI's "Vault size" dialog now explains that more plainly and, once you
-  tick that you understand it, offers "Give back ... anyway"
-  (`Vfs::shrink_allow_deniable`).
 - **Static Linux CLI with FIDO2 + TPM 2.0 (GitHub #34).** A second
   static musl build, `luksbox-<arch>-unknown-linux-musl-fido2-tpm.tar.gz`,
   has libfido2 and tpm2-tss compiled in (with OpenSSL, libcbor, zlib and
@@ -81,10 +111,16 @@ canonical record.
   --shrink-on-close`, the GUI (Give back, and an Ask / Always / Never
   choice when locking or unmounting, asking from 1 MB) and the wizard
   (offered when closing the vault).
-  Deniable vaults are never shrunk. `luksbox size` also reports where
-  the vault's size goes, and every size option reads `6G`, `500M`,
-  `1.5G` the same way (1024-based units; `--metadata-size` now accepts
-  them too). See `docs/VAULT_SIZE.md`.
+  Deniable vaults are never shrunk on their own (next item). `luksbox
+  size` also reports where the vault's size goes, and every size option
+  reads `6G`, `500M`, `1.5G` the same way (1024-based units;
+  `--metadata-size` now accepts them too). See `docs/VAULT_SIZE.md`.
+- **Give back a deniable vault's free space, on request.** Deniable
+  vaults are still never shrunk on their own, since a file that gets
+  smaller tells anyone comparing it over time that data was deleted. The
+  GUI's "Vault size" dialog now explains that more plainly and, once you
+  tick that you understand it, offers "Give back ... anyway"
+  (`Vfs::shrink_allow_deniable`).
 
 ### Fixed
 
@@ -186,6 +222,19 @@ canonical record.
   did), the wizard says so at startup, and a vault whose keyslots all
   need missing hardware gets an explicit error instead of "vault has no
   usable keyslots".
+- **Outdated `--help` texts.** `rotate-mvk` (it rotates every keyslot,
+  interactively, and is crash-safe with an inline header),
+  `migrate-to-v3` (the new vault gets one passphrase keyslot),
+  `mv` (moves across folders work), `deniable-init` (36 KiB header, a
+  full vault), `create --cipher` (`aes-gcm` is accepted),
+  `--tpm-pin-srk` and `--fido2-device` / `list-fido2-devices` (with
+  several authenticators plugged in, LUKSbox asks you to pick one
+  instead of using the first) now describe what the commands do.
+  `deniable-info` on a header-v2 deniable vault now points to
+  `deniable-upgrade-header`, and the note `upgrade-header` prints no
+  longer suggests creating an anchor in the wizard, which only does so
+  for a new vault. The release page's tarball install line now
+  extracts into a folder of its own.
 
 ### Changed
 

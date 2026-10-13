@@ -1,6 +1,6 @@
 # Vault size: maximum size and giving back free space
 
-How a vault's file size is managed (0.6.0+). User docs: the website's
+How a vault's file size is managed (0.6.1+). User docs: the website's
 `luksbox size` page; the CLI, wizard and GUI share the behaviour below.
 
 ## Where the size goes

@@ -81,8 +81,10 @@ const LONG_VERSION: &str = concat!(
 )]
 struct Cli {
     /// libfido2 device path to bind every FIDO2 op to. Optional.
-    /// Without this flag, luksbox uses the first authenticator
-    /// libfido2 enumerates (the legacy single-device behavior). Set
+    /// Without this flag, luksbox uses the one authenticator plugged
+    /// in; on Linux and macOS it refuses to guess when there are
+    /// several (the PIN would go to whichever device answered), and on
+    /// Windows the Windows security-key prompt lets you pick. Set
     /// it when more than one authenticator is plugged in (e.g. a
     /// physical YubiKey alongside the Windows Hello platform
     /// authenticator on Windows) and you want to pick a specific
@@ -98,8 +100,8 @@ struct Cli {
     fido2_device: Option<String>,
 
     /// Pin the TPM's storage root key (SRK) into every NEW TPM keyslot
-    /// sealed by this command (create, enroll, update, deniable-init,
-    /// wizard). Unseal then refuses to run if the TPM reports a
+    /// sealed by this command (enroll, update, deniable-init, wizard;
+    /// `create` cannot make a TPM slot the first one). Unseal then refuses to run if the TPM reports a
     /// different SRK, which defeats an ACTIVE TPM-bus interposer that
     /// substitutes the key to learn the sealed KEK (R15-F5). A pinned
     /// slot needs LUKSbox 0.6.0+ to unlock; existing slots are not
@@ -439,7 +441,8 @@ enum Command {
     /// FIDO2 hardware keyslot, requires a connected authenticator).
     Create {
         path: PathBuf,
-        /// Cipher suite: aes (default) or chacha
+        /// Cipher suite: aes (AES-256-GCM-SIV, default), aes-gcm
+        /// (AES-256-GCM) or chacha (ChaCha20-Poly1305).
         #[arg(long, default_value = "aes")]
         cipher: String,
         /// Initial keyslot kind.
@@ -701,7 +704,8 @@ enum Command {
         unlock: UnlockArgs,
         inner: String,
     },
-    /// Rename within a directory (cross-dir rename not in v1).
+    /// Rename or move a file or directory inside the vault (both paths
+    /// are inside the vault, e.g. `mv vault.lbx /a.txt /docs/a.txt`).
     Mv {
         path: PathBuf,
         #[command(flatten)]
@@ -809,16 +813,15 @@ enum Command {
     /// no unlock flags. Windows: asks the `luksbox mount` (or GUI) process
     /// holding the mountpoint to unmount, the same as Ctrl-C in its window;
     /// that works within the same Windows session, for mounts started by
-    /// LUKSbox 0.6.0 or later.
+    /// LUKSbox 0.6.1 or later.
     Umount { mountpoint: PathBuf },
-    /// Create a deniable-header file: an 8 KiB header where every
-    /// on-disk byte is indistinguishable from random output. See
-    /// `docs/DENIABLE_HEADER.md` for the threat model. The user MUST
-    /// remember the cipher + Argon2 params; forgetting them is
-    /// permanent lockout (by design - they are part of the secret).
-    /// Currently writes only the 8 KiB deniable header to disk;
-    /// full mount support requires the Container-level integration
-    /// tracked as a separate follow-up.
+    /// Create a deniable vault: a 36 KiB header where every on-disk
+    /// byte is indistinguishable from random output, followed by the
+    /// encrypted data. See `docs/DENIABLE_HEADER.md` for the threat
+    /// model. The user MUST remember the cipher + Argon2 params;
+    /// forgetting them is permanent lockout (by design - they are part
+    /// of the secret). Open it with `deniable-mount`, the wizard or
+    /// the GUI.
     #[command(name = "deniable-init")]
     DeniableInit {
         path: PathBuf,
@@ -1017,13 +1020,16 @@ enum Command {
         samples: u32,
     },
     /// Rotate the master volume key. Re-encrypts every chunk and the
-    /// metadata blob with a freshly-generated MVK; re-wraps the keyslot
-    /// under a fresh random salt with the same passphrase. Useful when
-    /// you suspect the wrapped MVK may have been copied (e.g. from an
-    /// old backup that was exposed). v1 limitation: the vault must have
-    /// exactly one populated keyslot, and it must be a passphrase slot.
-    /// **BACK UP THE VAULT FIRST**, a crash mid-rotation leaves it in
-    /// an inconsistent state.
+    /// metadata blob with a freshly-generated MVK and re-wraps every
+    /// populated keyslot under it, asking for each slot's credential in
+    /// turn (interactive, the same flow as the wizard). Useful when you
+    /// suspect the wrapped MVK may have been copied (e.g. from an old
+    /// backup that was exposed). Passphrase slots keep the strongest
+    /// Argon2id cost already in the vault. Refused while a fido2-direct
+    /// slot is present. With an inline header a crash mid-rotation
+    /// leaves the original intact (the new bytes go to
+    /// `<vault>.rotating`); with a detached header it does not, so
+    /// **BACK UP THE VAULT AND ITS HEADER FIRST**.
     RotateMvk {
         path: PathBuf,
         #[command(flatten)]
@@ -1080,17 +1086,19 @@ enum Command {
         delete: bool,
     },
     /// Migrate a v2-format vault to v3 (out-of-line chunk lists).
-    /// Reads the source vault, creates a new vault at `--dst` with
-    /// the same cipher / KDF / keyslots / data, then writes it in
-    /// v3 format. The source vault is left untouched (no in-place
-    /// migration -- too risky on a format change). After verifying
-    /// the destination opens cleanly the user can delete the source.
+    /// Reads the source vault and copies its files into a new vault
+    /// at `--dst` in v3 format, with the same cipher and ONE new
+    /// passphrase keyslot (Argon2id interactive preset, passphrase
+    /// asked for). Enroll other keyslots afterwards, and run
+    /// `upgrade-header` for header format v3. The source vault is left
+    /// untouched (no in-place migration -- too risky on a format
+    /// change). After verifying the destination opens cleanly the user
+    /// can delete the source.
     ///
-    /// Requires the unlock material for the source vault. The
-    /// destination inherits the SAME initial keyslot kind as the
-    /// source's slot 0 (other slots can be re-enrolled afterward).
-    /// v3 unlocks bigger-than-10-GiB vaults; for smaller vaults the
-    /// migration is mostly a format change with no capacity benefit.
+    /// Requires the unlock material for the source vault. Deniable
+    /// vaults are refused. v3 unlocks bigger-than-10-GiB vaults; for
+    /// smaller vaults the migration is mostly a format change with no
+    /// capacity benefit.
     MigrateToV3 {
         /// Path to the existing v2 vault to read from.
         src: PathBuf,
@@ -1266,8 +1274,9 @@ fn maybe_warn_about_software_aes() {
 // top-level `Cli` struct) lands in this process-wide cell. Every
 // FIDO2-touching subcommand below constructs its authenticator via
 // `make_fido2_authenticator()` which reads the cell and binds the
-// `HidAuthenticator` to that exact device. `None` falls back to the
-// legacy "first device libfido2 enumerates wins" behavior.
+// `HidAuthenticator` to that exact device. `None` uses the only
+// device present: libfido2 refuses to pick among several (R15-F1),
+// webauthn.dll lets the user choose in its own prompt.
 //
 // Mirrors the GUI's `ops::set_selected_fido2_device` plumbing so the
 // two front-ends behave identically when the user has multiple
@@ -2524,8 +2533,9 @@ fn cmd_list_fido2_devices() -> Result<()> {
     println!();
     println!(
         "Pass --fido2-device <PATH> to subsequent commands to bind to a \
-         specific authenticator. Without --fido2-device, the first one \
-         enumerated is used."
+         specific authenticator. Without --fido2-device, LUKSbox uses the \
+         only one plugged in; with several it asks you to pick one (on \
+         Windows, the Windows security-key prompt does)."
     );
     #[cfg(target_os = "windows")]
     {
@@ -3543,13 +3553,22 @@ fn upgrade_container_to_header_v3(cont: Container) -> Result<(Container, u64)> {
 
 /// One-line description of the header format, for `info` /
 /// `deniable-info` / the upgrade commands.
-fn describe_header_format(version_major: u16, header_generation: Option<u64>) -> String {
+fn describe_header_format(
+    version_major: u16,
+    header_generation: Option<u64>,
+    deniable: bool,
+) -> String {
     match header_generation {
         Some(g) => {
             format!("v3 (header generation {g}; a restored older header is caught by the anchor)")
         }
         None if version_major >= luksbox_core::VERSION_MAJOR_V2 => {
-            "v2 (no header generation; `luksbox upgrade-header` opts into v3)".to_string()
+            let cmd = if deniable {
+                "deniable-upgrade-header"
+            } else {
+                "upgrade-header"
+            };
+            format!("v2 (no header generation; `luksbox {cmd}` opts into v3)")
         }
         None => "v1 (upgraded to v2 on the next write)".to_string(),
     }
@@ -3571,8 +3590,8 @@ fn cmd_upgrade_header(path: &Path, unlock: &UnlockArgs) -> Result<()> {
         if unlock.anchor.is_none() {
             eprintln!(
                 "  note: no --anchor given. The header generation only protects you once an \
-                 anchor records it: pass --anchor <file> on your next write (or create one with \
-                 the wizard), and keep it on separate trusted storage."
+                 anchor records it: if this vault has one, pass --anchor <file> on your next \
+                 write. An anchor is created together with a vault (`create --anchor`)."
             );
         }
         eprintln!("  LUKSbox versions before 0.6.0 can no longer open this vault.");
@@ -5150,7 +5169,8 @@ fn cmd_info(path: &Path, header_path: Option<&Path>) -> Result<()> {
         "  header format: {}",
         describe_header_format(
             h.version_major,
-            h.has_header_generation().then_some(h.header_generation)
+            h.has_header_generation().then_some(h.header_generation),
+            false
         )
     );
     println!("keyslots:");
@@ -8054,7 +8074,8 @@ fn cmd_deniable_info(
         "  header format:  {}",
         describe_header_format(
             luksbox_core::VERSION_MAJOR_V2,
-            container.header_generation()
+            container.header_generation(),
+            true
         )
     );
     // R15-H6: the matched slot index is deliberately NOT printed. A

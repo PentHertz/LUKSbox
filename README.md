@@ -86,7 +86,7 @@ Cryptomator / BitLocker / FileVault) lives at
 
 This is a **pre-1.0** release. The on-disk format is locked, the
 cryptographic primitives are NIST/RFC standards built on RustCrypto,
-and 14 internal audit rounds have shipped. External paid audit and
+and 15 internal audit rounds have shipped. External paid audit and
 broader real-world deployment are the next milestones. The
 cloud-storage threat model, provider can't read your data even under
 subpoena, is what LUKSbox is built for and what it does today.
@@ -95,7 +95,7 @@ subpoena, is what LUKSbox is built for and what it does today.
 |---|---|
 | `cargo test --workspace` | 600+ passing, 0 failing (a few platform-gated tests skip off-platform) |
 | `cargo audit` | 0 vulnerabilities, 0 unsound; 2 allow-listed unmaintained advisories (`paste`, a compile-time-only proc-macro from the TPM stack, and `registry`, Windows/WinFsp-only), both documented in `.cargo/audit.toml` + `SECURITY.md` |
-| Internal audit rounds | 14 documented at <https://luksbox.penthertz.com/docs/security/audit/> (per-round details kept internal) |
+| Internal audit rounds | 15 documented at <https://luksbox.penthertz.com/docs/security/audit/> (per-round details kept internal) |
 | Third-party audit | not yet performed; engagement scope package available on request to `security@penthertz.com` |
 | Fuzz iterations across 10 libFuzzer harnesses | 30M+ |
 
@@ -192,6 +192,12 @@ luksbox create my-vault.lbx --format v2
 
 # Migrate an existing v2 vault up to the v3 format (source untouched)
 luksbox migrate-to-v3 old-v2.lbx --dst new-v3.lbx
+
+# Cap the vault file at 6 GiB (0 = unlimited, the default), see where
+# its size goes, and give the free space at its end back to the disk
+luksbox create my-vault.lbx --max-size 6G
+luksbox size my-vault.lbx
+luksbox size my-vault.lbx --shrink
 
 # Interactive walkthrough, no flags to remember
 luksbox wizard
@@ -370,6 +376,7 @@ In-repo references for contributors:
 - [`FUZZING.md`](FUZZING.md), fuzz harness setup + target list
 - [`DEVELOPMENT.md`](DEVELOPMENT.md), maintainer dev workflow + release process
 - [`docs/CRYPTO_SPEC.md`](docs/CRYPTO_SPEC.md), per-operation cryptographic walkthrough
+- [`docs/VAULT_SIZE.md`](docs/VAULT_SIZE.md), maximum vault size and giving back free space
 - [`docs/SECURITY_ARCHITECTURE.md`](docs/SECURITY_ARCHITECTURE.md), security architecture map (mirrors the website page)
 - [`docs/HARDWARE_SIDE_CHANNEL_NOTES.md`](docs/HARDWARE_SIDE_CHANNEL_NOTES.md), published side-channel attacks against FIDO2 silicon
 - [`docs/TPM_LINUX_PERMISSIONS.md`](docs/TPM_LINUX_PERMISSIONS.md), end-user playbook for `/dev/tpmrm0` access

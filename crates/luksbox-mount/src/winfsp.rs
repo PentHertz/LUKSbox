@@ -1677,7 +1677,7 @@ fn signal_remote_unmount(mp_norm: &str, mountpoint: &Path) -> Result<(), MountEr
     if event.is_null() {
         return Err(MountError::Io(std::io::Error::other(format!(
             "no luksbox mount at {} found. A mount started by LUKSbox before \
-             0.6.0, or in another Windows session, can only be released by the \
+             0.6.1, or in another Windows session, can only be released by the \
              process running it: press Ctrl-C in the window running \
              `luksbox mount` (or taskkill /pid <pid>).",
             mountpoint.display()

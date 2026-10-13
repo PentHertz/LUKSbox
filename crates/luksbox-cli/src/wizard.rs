@@ -4514,7 +4514,8 @@ fn info_wizard(theme: &ColorfulTheme) -> Result<()> {
             header.version_major,
             header
                 .has_header_generation()
-                .then_some(header.header_generation)
+                .then_some(header.header_generation),
+            false
         )
     );
     print_slots(&header, true);

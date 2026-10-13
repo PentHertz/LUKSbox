@@ -3028,7 +3028,7 @@ jobs:
               dependencies which are stable across releases.
               Pulls in `libfido2` and `fuse3-libs` automatically.
 
-            **Linux (x86_64, generic tarball):** `tar xzf luksbox-${{ github.ref_name }}-x86_64-linux-jammy.tar.gz && cd luksbox-${{ github.ref_name }}-x86_64-linux-jammy && ./install.sh`
+            **Linux (x86_64, generic tarball):** `mkdir luksbox && tar xzf luksbox-${{ github.ref_name }}-x86_64-linux-jammy.tar.gz -C luksbox && cd luksbox && ./install.sh`
               For Arch / NixOS / Alpine / any non-deb non-rpm distro.
               The jammy variant has the broadest glibc compatibility;
               if you are on a very recent distro and prefer the noble
@@ -3040,7 +3040,7 @@ jobs:
               `sudo apt install libfido2-1 libfuse3-3` (Debian/Ubuntu)
               or `sudo dnf install libfido2 fuse3-libs` (Fedora/RHEL).
 
-            **Linux (aarch64):** `tar xzf luksbox-${{ github.ref_name }}-aarch64-linux-jammy.tar.gz && cd luksbox-${{ github.ref_name }}-aarch64-linux-jammy && ./install.sh`
+            **Linux (aarch64):** `mkdir luksbox && tar xzf luksbox-${{ github.ref_name }}-aarch64-linux-jammy.tar.gz -C luksbox && cd luksbox && ./install.sh`
               Same runtime deps and installer as x86_64. Built natively
               on a GitHub ARM64 runner, no QEMU emulation. Same
               jammy/noble distinction applies as for the .deb above.
@@ -3199,8 +3199,8 @@ jobs:
               PATH, or (b) drop a copy of `winfsp-x64.dll` next to
               `luksbox.exe` in the unzipped folder.
 
-              libfido2 is statically linked into the .exe; no runtime
-              install needed for FIDO2.
+              FIDO2 goes through Windows' built-in `webauthn.dll`; no
+              runtime install needed for FIDO2.
 
             See the **Verify your download** section at the top for
             checksum verification commands.

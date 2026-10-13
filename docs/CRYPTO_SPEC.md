@@ -277,7 +277,7 @@ that identifies the metadata format inside the encrypted region:
   on the first `Vfs::flush` against a dirty tree; the upgrade
   is one-way.
 
-- `LBM\x06` ("v6", 0.6.0) -- the LBM5 payload followed by the
+- `LBM\x06` ("v6", 0.6.1) -- the LBM5 payload followed by the
   vault settings, postcard-encoded: `VaultSettingsOnDisk {
   max_vault_size: u64 }` (maximum size of the `.lbx` file in bytes,
   0 = unlimited; see `docs/VAULT_SIZE.md`). Nothing may follow the
