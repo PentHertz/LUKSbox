@@ -1,0 +1,33 @@
+[package]
+name = "luksbox-sync"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Sync bundles (.lbxs) for luksbox: a vault stored as immutable, authenticated objects in a cloud-synced folder"
+
+[dependencies]
+luksbox-core = { path = "../luksbox-core" }
+luksbox-format = { path = "../luksbox-format" }
+luksbox-vfs = { path = "../luksbox-vfs" }
+luksbox-merge = { path = "../luksbox-merge" }
+hkdf.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+zeroize.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+# Exclusive lock on the per-device state folder (one process per bundle
+# per device). Same crate and version luksbox-format already uses.
+fs2 = "0.4"
+
+# Directory-handle-relative, no-follow file operations on the bundle
+# folder (`fs_store`): openat / linkat / unlinkat / fstat / fdopendir.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

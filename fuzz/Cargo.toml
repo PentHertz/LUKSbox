@@ -28,6 +28,9 @@ luksbox-fido2 = { path = "../crates/luksbox-fido2" }
 # (only the CryptoKit FFI ops are cfg-gated to macOS), so the SEP fuzz
 # targets run in ordinary Linux CI.
 luksbox-sep = { path = "../crates/luksbox-sep" }
+# Sync bundles: object codec, names, page tables, manifests and the
+# commit graph, all fed provider-controlled bytes in real use.
+luksbox-sync = { path = "../crates/luksbox-sync" }
 tempfile = "3"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
@@ -256,3 +259,38 @@ bench = false
 # build them with sanitizers and -C codegen-units=1. Excluding from the
 # workspace lets us keep workspace-wide `cargo build` fast and unsanitized.
 [workspace]
+
+[[bin]]
+name = "sync_object_open"
+path = "fuzz_targets/sync_object_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_manifest_decode"
+path = "fuzz_targets/sync_manifest_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_name_grammar"
+path = "fuzz_targets/sync_name_grammar.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_table_decode"
+path = "fuzz_targets/sync_table_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_graph_build"
+path = "fuzz_targets/sync_graph_build.rs"
+test = false
+doc = false
+bench = false

@@ -116,4 +116,14 @@ pub enum Error {
          is not available in deniable mode at all."
     )]
     DeniableSlotMutationUnsupported,
+
+    /// A write was attempted on a container opened read-only
+    /// (`Container::set_read_only`), such as a snapshot view.
+    #[error("the vault is open read-only")]
+    ReadOnly,
+
+    /// The operation needs a vault stored as files (`.lbx`, `.hdr`);
+    /// this one lives in a sync bundle.
+    #[error("{0} is not supported for a vault in a sync bundle")]
+    UnsupportedForExternalStorage(&'static str),
 }

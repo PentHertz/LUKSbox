@@ -453,7 +453,7 @@ impl LuksboxFs {
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                                 if let Ok(mut v) = timer_vfs.lock()
-                                    && let Err(e) = v.flush()
+                                    && let Err(e) = crate::flush_and_commit(&mut v)
                                 {
                                     // Same rationale as the FUSE3
                                     // adapter: no syscall to report

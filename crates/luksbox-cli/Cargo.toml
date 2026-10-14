@@ -14,6 +14,9 @@ path = "src/main.rs"
 luksbox-core = { path = "../luksbox-core" }
 luksbox-format = { path = "../luksbox-format" }
 luksbox-vfs = { path = "../luksbox-vfs" }
+# Sync bundles (.lbxs) and merging copies of a vault.
+luksbox-sync = { path = "../luksbox-sync" }
+luksbox-merge = { path = "../luksbox-merge" }
 # default-features = false so `--no-default-features` on the cli also
 # disables luksbox-mount's `winfsp` default. We re-enable it via the
 # `winfsp = ["luksbox-mount/winfsp"]` feature below.

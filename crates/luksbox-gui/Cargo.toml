@@ -84,6 +84,8 @@ luksbox-fido2 = { path = "../luksbox-fido2" }
 luksbox-tpm = { path = "../luksbox-tpm", default-features = false }
 luksbox-sep = { path = "../luksbox-sep", default-features = false }
 luksbox-vfs = { path = "../luksbox-vfs" }
+# Sync bundles (.lbxs): vaults kept as a folder in a cloud-synced directory.
+luksbox-sync = { path = "../luksbox-sync" }
 # default-features = false so `--no-default-features` on the gui also
 # disables luksbox-mount's `winfsp` default. Re-enabled via the
 # `winfsp = ["luksbox-mount/winfsp"]` feature above.

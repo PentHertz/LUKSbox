@@ -115,16 +115,18 @@ pub const DENIABLE_AAD_PREFIX: &[u8] = b"luksbox-deniable-v2";
 ///
 /// Two layers of KEKs in v2:
 ///
-/// - `KEK_ENVELOPE` derives the outer slot envelope key from the
-///   passphrase. There is only one of these because the envelope is
-///   always passphrase-keyed in v2 (the discovery factor).
-/// - `KEK_*_PASSPHRASE` (one per variant) derive the inner
-///   `wrapped_mvk` key from `KEK_envelope || <secondary factors>`.
+/// - The outer slot envelope key is Argon2id(passphrase, per_vault_salt)
+///   directly (`DeniableCredential::derive_envelope_kek`), with no HKDF
+///   step. There is only one of these because the envelope is always
+///   passphrase-keyed in v2 (the discovery factor). `KEK_ENVELOPE` is
+///   reserved for a future non-Argon2id outer derivation and is not
+///   currently used.
+/// - `KEK_*` (one per variant, each ending in `+passphrase` or equal to
+///   `.../kek/passphrase`) derive the inner `wrapped_mvk` key from
+///   `KEK_envelope || <secondary factors>` with HKDF salt =
+///   per_vault_salt (`DeniableCredential::derive_factors_kek`).
 ///
-/// The v1 labels (without the `+passphrase` suffix) are retained for
-/// the v1 single-step `derive_kek` API used by code that has not yet
-/// migrated to the v2 two-step envelope/factors API. New code should
-/// not reference them.
+/// Only v2 labels exist; there are no v1 KEK labels in this module.
 pub mod hkdf_info {
     pub const INNER_HEADER: &[u8] = b"luksbox-deniable-v2/inner-header";
 
@@ -158,7 +160,8 @@ pub mod hkdf_info {
 }
 
 /// Build the AAD bound into a slot's AEAD computation:
-/// `b"luksbox-deniable-v1" || per_vault_salt || (slot_idx as u8)`.
+/// `DENIABLE_AAD_PREFIX (b"luksbox-deniable-v2") || per_vault_salt ||
+/// (slot_idx as u8)`.
 ///
 /// The returned `Vec` is small (52 bytes) and not sensitive; no
 /// `Zeroizing` needed.

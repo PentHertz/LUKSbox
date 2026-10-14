@@ -54,6 +54,13 @@ provider sees one indistinguishable-from-random blob and cannot
 decrypt it even under legal compulsion. Mount it locally as a real
 drive when you need to use it.
 
+For a vault you use from several computers through a sync service
+(Dropbox, Google Drive, OneDrive, iCloud Drive, Nextcloud, Syncthing),
+convert it to a **sync bundle** (`luksbox sync convert vault.lbx
+~/Dropbox/vault.lbxs`, experimental): only changed parts upload,
+changes from several devices are merged, and rollback by the provider
+is detected. See [`docs/SYNC_BUNDLES.md`](docs/SYNC_BUNDLES.md).
+
 | Concern | Plain cloud upload | Cloud + provider encryption | LUKSbox vault on cloud |
 |---|---|---|---|
 | Provider can read your files | Yes | Yes (they hold the key) | **No** |

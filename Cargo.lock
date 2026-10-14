@@ -2539,7 +2539,7 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "luksbox-cli"
-version = "0.6.1"
+version = "0.7.0-rc.1"
 dependencies = [
  "clap",
  "dialoguer",
@@ -2548,9 +2548,11 @@ dependencies = [
  "luksbox-core",
  "luksbox-fido2",
  "luksbox-format",
+ "luksbox-merge",
  "luksbox-mount",
  "luksbox-pq",
  "luksbox-sep",
+ "luksbox-sync",
  "luksbox-tpm",
  "luksbox-vfs",
  "rand_core 0.6.4",
@@ -2565,7 +2567,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-core"
-version = "0.6.1"
+version = "0.7.0-rc.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2592,14 +2594,14 @@ dependencies = [
 
 [[package]]
 name = "luksbox-ct-bench"
-version = "0.6.1"
+version = "0.7.0-rc.1"
 dependencies = [
  "rand",
 ]
 
 [[package]]
 name = "luksbox-fido2"
-version = "0.6.1"
+version = "0.7.0-rc.1"
 dependencies = [
  "aes",
  "bindgen 0.72.1",
@@ -2621,7 +2623,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-format"
-version = "0.6.1"
+version = "0.7.0-rc.1"
 dependencies = [
  "chacha20",
  "fs2",
@@ -2640,7 +2642,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-fuse-t"
-version = "0.6.1"
+version = "0.7.0-rc.1"
 dependencies = [
  "bindgen 0.71.1",
  "libc",
@@ -2650,7 +2652,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-gui"
-version = "0.6.1"
+version = "0.7.0-rc.1"
 dependencies = [
  "arboard",
  "dirs",
@@ -2668,6 +2670,7 @@ dependencies = [
  "luksbox-mount",
  "luksbox-pq",
  "luksbox-sep",
+ "luksbox-sync",
  "luksbox-tpm",
  "luksbox-vfs",
  "rand_core 0.6.4",
@@ -2685,8 +2688,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "luksbox-merge"
+version = "0.7.0-rc.1"
+dependencies = [
+ "luksbox-core",
+ "luksbox-format",
+ "luksbox-vfs",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "luksbox-mount"
-version = "0.6.1"
+version = "0.7.0-rc.1"
 dependencies = [
  "ctrlc",
  "fuser",
@@ -2704,7 +2720,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-pq"
-version = "0.6.1"
+version = "0.7.0-rc.1"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -2726,7 +2742,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-sep"
-version = "0.6.1"
+version = "0.7.0-rc.1"
 dependencies = [
  "rand_core 0.6.4",
  "tempfile",
@@ -2735,8 +2751,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "luksbox-sync"
+version = "0.7.0-rc.1"
+dependencies = [
+ "fs2",
+ "hkdf",
+ "hmac",
+ "libc",
+ "luksbox-core",
+ "luksbox-format",
+ "luksbox-merge",
+ "luksbox-vfs",
+ "postcard",
+ "rand_core 0.6.4",
+ "serde",
+ "sha2",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "luksbox-tpm"
-version = "0.6.1"
+version = "0.7.0-rc.1"
 dependencies = [
  "luksbox-core",
  "luksbox-format",
@@ -2751,7 +2789,7 @@ dependencies = [
 
 [[package]]
 name = "luksbox-vfs"
-version = "0.6.1"
+version = "0.7.0-rc.1"
 dependencies = [
  "luksbox-core",
  "luksbox-format",

@@ -3611,7 +3611,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
     let mut cont = match opts.method {
         UnlockMethod::Passphrase => {
             let pw = opts.passphrase.as_ref().ok_or("passphrase required")?;
-            Container::open(
+            crate::sync_gui::open_with_material(
                 &opts.path,
                 opts.header_path.as_deref(),
                 UnlockMaterial::Passphrase(pw.as_bytes()),
@@ -3766,13 +3766,16 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
     let trusted_gen = if let Some(ap) = opts.anchor_path.as_ref() {
         cont.set_anchor(Some(ap.clone())).map_err(estr)?
     } else {
+        // A vault in a cloud folder: this device's automatic anchor.
+        crate::sync_gui::attach_auto_anchor(&mut cont)?;
         None
     };
     let has_fido2 = header_has_fido2(&cont.header);
     let has_hybrid_pq = header_has_hybrid_pq(&cont.header);
     let has_tpm = header_has_tpm(&cont.header);
     let cipher = cipher_label(cont.header.cipher_suite).to_string();
-    let vfs = open_vfs_with_optional_recovery(cont, opts.recovery_mode)?;
+    let mut vfs = open_vfs_with_optional_recovery(cont, opts.recovery_mode)?;
+    crate::sync_gui::settle_auto_anchor(&mut vfs)?;
     if let Some(anchor_gen) = trusted_gen {
         match anchor::compare(anchor_gen, vfs.vault_generation()) {
             anchor::VerificationOutcome::Ok | anchor::VerificationOutcome::AnchorStale { .. } => {}
@@ -4133,11 +4136,7 @@ fn unlock_with_fido2(
 ) -> Result<Container, String> {
     use luksbox_fido2::{Fido2Authenticator, RP_ID};
     let header_src = header_path.unwrap_or(path);
-    let mut f =
-        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
-    let mut header_bytes = [0u8; HEADER_SIZE];
-    f.read_exact(&mut header_bytes).map_err(estr)?;
-    drop(f);
+    let header_bytes = crate::sync_gui::read_header_src(header_src, path).map_err(estr)?;
     let header = Header::from_bytes(&header_bytes).map_err(estr)?;
     let mut auth = make_fido2_authenticator();
     // Every FIDO2 slot (wrap + direct) is a candidate in ONE batched
@@ -4186,7 +4185,7 @@ fn unlock_with_fido2(
         // still fails (e.g. a legacy-convention slot on Windows), drop
         // the slot from the candidate set and re-assert the rest.
         let slot = candidates.remove(idx);
-        match Container::open(
+        match crate::sync_gui::open_with_material(
             path,
             header_path,
             UnlockMaterial::Fido2 {
@@ -4222,11 +4221,7 @@ fn unlock_with_tpm2(path: &Path, header_path: Option<&Path>) -> Result<Container
     // friendly rather than "TPM unsealed something but it didn't
     // match anything".
     let header_src = header_path.unwrap_or(path);
-    let mut f =
-        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
-    let mut header_bytes = [0u8; HEADER_SIZE];
-    f.read_exact(&mut header_bytes).map_err(estr)?;
-    drop(f);
+    let header_bytes = crate::sync_gui::read_header_src(header_src, path).map_err(estr)?;
     let header = Header::from_bytes(&header_bytes).map_err(estr)?;
     if !header
         .keyslots
@@ -4273,7 +4268,7 @@ fn unlock_with_tpm2(path: &Path, header_path: Option<&Path>) -> Result<Container
     let mut unseal_errs = luksbox_format::UnsealErrors::default();
     let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
 
-    Container::open(
+    crate::sync_gui::open_with_material(
         path,
         header_path,
         UnlockMaterial::Tpm2 {
@@ -4301,11 +4296,7 @@ fn unlock_via_sep(
     passphrase: Option<&str>,
 ) -> Result<Container, String> {
     let header_src = header_path.unwrap_or(path);
-    let mut f =
-        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
-    let mut header_bytes = [0u8; HEADER_SIZE];
-    f.read_exact(&mut header_bytes).map_err(estr)?;
-    drop(f);
+    let header_bytes = crate::sync_gui::read_header_src(header_src, path).map_err(estr)?;
     let header = Header::from_bytes(&header_bytes).map_err(estr)?;
     // Non-hybrid SEP slots (plain / biometric / fused FIDO2 / passphrase).
     if !header
@@ -4496,7 +4487,7 @@ fn open_sep_common(
         let mut unseal_errs = luksbox_format::UnsealErrors::default();
         let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
 
-        match Container::open(
+        match crate::sync_gui::open_with_material(
             path,
             header_path,
             UnlockMaterial::Sep {
@@ -4534,11 +4525,7 @@ fn unlock_via_hybrid_pq_sep(
     use luksbox_pq::seed_file;
 
     let header_src = header_path.unwrap_or(path);
-    let mut f =
-        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
-    let mut header_bytes = [0u8; HEADER_SIZE];
-    f.read_exact(&mut header_bytes).map_err(estr)?;
-    drop(f);
+    let header_bytes = crate::sync_gui::read_header_src(header_src, path).map_err(estr)?;
     let header = Header::from_bytes(&header_bytes).map_err(estr)?;
     if !header
         .keyslots
@@ -4554,9 +4541,12 @@ fn unlock_via_hybrid_pq_sep(
     let seed = seed_file::read(kyber_path, seed_pw.as_bytes())
         .map_err(|e| format!("read kyber seed: {e}"))?;
     // v3 vault-binding verification (see `read_for_vault` doc).
-    let entries =
-        hybrid_sidecar::read_for_vault(&hybrid_sidecar::sidecar_path(path), path, header_path)
-            .map_err(|e| format!("read hybrid sidecar: {e}"))?;
+    let entries = crate::sync_gui::read_hybrid_for_vault(
+        &hybrid_sidecar::sidecar_path(path),
+        path,
+        header_path,
+    )
+    .map_err(|e| format!("read hybrid sidecar: {e}"))?;
 
     // Per-slot ML-KEM decapsulation closure, consumed by open_sep_common.
     let decap = |idx: usize| -> Option<[u8; 32]> {
@@ -4595,11 +4585,7 @@ fn unlock_with_tpm2_fido2(
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
     let header_src = header_path.unwrap_or(path);
-    let mut f =
-        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
-    let mut header_bytes = [0u8; HEADER_SIZE];
-    f.read_exact(&mut header_bytes).map_err(estr)?;
-    drop(f);
+    let header_bytes = crate::sync_gui::read_header_src(header_src, path).map_err(estr)?;
     let header = Header::from_bytes(&header_bytes).map_err(estr)?;
     if !header
         .keyslots
@@ -4652,7 +4638,7 @@ fn unlock_with_tpm2_fido2(
             // `Container::open` reports only UnlockFailed; keep the reason.
             let mut unseal_errs = luksbox_format::UnsealErrors::default();
             let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
-            Container::open(
+            crate::sync_gui::open_with_material(
                 path,
                 header_path,
                 UnlockMaterial::Tpm2Fido2 {
@@ -4691,11 +4677,7 @@ fn unlock_with_hybrid_pq_tpm2(
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
     let header_src = header_path.unwrap_or(path);
-    let mut f =
-        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
-    let mut header_bytes = [0u8; HEADER_SIZE];
-    f.read_exact(&mut header_bytes).map_err(estr)?;
-    drop(f);
+    let header_bytes = crate::sync_gui::read_header_src(header_src, path).map_err(estr)?;
     let header = Header::from_bytes(&header_bytes).map_err(estr)?;
     // Match BOTH the ML-KEM-768 and ML-KEM-1024 hybrid TPM slots.
     // The wrap-KEK derivation is identical for both KEM sizes (the
@@ -4719,9 +4701,12 @@ fn unlock_with_hybrid_pq_tpm2(
     let seed = seed_file::read(kyber_path, seed_pw.as_bytes())
         .map_err(|e| format!("read kyber seed: {e}"))?;
     // v3 vault-binding verification (see `read_for_vault` doc).
-    let entries =
-        hybrid_sidecar::read_for_vault(&hybrid_sidecar::sidecar_path(path), path, header_path)
-            .map_err(|e| format!("read hybrid sidecar: {e}"))?;
+    let entries = crate::sync_gui::read_hybrid_for_vault(
+        &hybrid_sidecar::sidecar_path(path),
+        path,
+        header_path,
+    )
+    .map_err(|e| format!("read hybrid sidecar: {e}"))?;
     let mut sealer =
         Tpm2Sealer::new().map_err(|e| format!("could not open local TPM 2.0 device: {e}"))?;
 
@@ -4761,7 +4746,7 @@ fn unlock_with_hybrid_pq_tpm2(
         // `Container::open` reports only UnlockFailed; keep the reason.
         let mut unseal_errs = luksbox_format::UnsealErrors::default();
         let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
-        match Container::open(
+        match crate::sync_gui::open_with_material(
             path,
             header_path,
             UnlockMaterial::HybridPqTpm2 {
@@ -4801,11 +4786,7 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
     let header_src = header_path.unwrap_or(path);
-    let mut f =
-        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
-    let mut header_bytes = [0u8; HEADER_SIZE];
-    f.read_exact(&mut header_bytes).map_err(estr)?;
-    drop(f);
+    let header_bytes = crate::sync_gui::read_header_src(header_src, path).map_err(estr)?;
     let header = Header::from_bytes(&header_bytes).map_err(estr)?;
     // Match BOTH 768 and 1024 hybrid-PQ-TPM-FIDO2 slot kinds. See
     // the comment in unlock_with_hybrid_pq_tpm2 above for why the
@@ -4822,9 +4803,12 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
     let seed = seed_file::read(kyber_path, seed_pw.as_bytes())
         .map_err(|e| format!("read kyber seed: {e}"))?;
     // v3 vault-binding verification (see `read_for_vault` doc).
-    let entries =
-        hybrid_sidecar::read_for_vault(&hybrid_sidecar::sidecar_path(path), path, header_path)
-            .map_err(|e| format!("read hybrid sidecar: {e}"))?;
+    let entries = crate::sync_gui::read_hybrid_for_vault(
+        &hybrid_sidecar::sidecar_path(path),
+        path,
+        header_path,
+    )
+    .map_err(|e| format!("read hybrid sidecar: {e}"))?;
     let mut sealer =
         Tpm2Sealer::new().map_err(|e| format!("could not open local TPM 2.0 device: {e}"))?;
     let mut auth = make_fido2_authenticator();
@@ -4886,7 +4870,7 @@ fn unlock_with_hybrid_pq_tpm2_fido2(
             // `Container::open` reports only UnlockFailed; keep the reason.
             let mut unseal_errs = luksbox_format::UnsealErrors::default();
             let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
-            Container::open(
+            crate::sync_gui::open_with_material(
                 path,
                 header_path,
                 UnlockMaterial::HybridPqTpm2Fido2 {
@@ -4947,10 +4931,17 @@ pub fn inspect_slots(
     header_path: Option<&Path>,
 ) -> Result<Vec<(usize, SlotKind)>, String> {
     let src = header_path.unwrap_or(vault);
-    let mut f = File::open(src).map_err(|e| format!("open {}: {e}", src.display()))?;
-    let mut bytes = [0u8; HEADER_SIZE];
-    f.read_exact(&mut bytes)
-        .map_err(|e| format!("read header: {e}"))?;
+    let bytes = if header_path.is_none() && crate::sync_gui::is_bundle(vault) {
+        // A sync bundle folder: its newest header object.
+        crate::sync_gui::read_header_src(vault, vault)
+            .map_err(|e| format!("read header of {}: {e}", vault.display()))?
+    } else {
+        let mut f = File::open(src).map_err(|e| format!("open {}: {e}", src.display()))?;
+        let mut bytes = [0u8; HEADER_SIZE];
+        f.read_exact(&mut bytes)
+            .map_err(|e| format!("read header: {e}"))?;
+        bytes
+    };
     let header = Header::from_bytes(&bytes).map_err(|e| format!("parse header: {e}"))?;
     Ok(header
         .keyslots
@@ -5184,16 +5175,13 @@ fn unlock_with_hybrid_pq_fido2(
     use luksbox_pq::seed_file;
 
     let header_src = header_path.unwrap_or(path);
-    let mut f =
-        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
-    let mut header_bytes = [0u8; HEADER_SIZE];
-    f.read_exact(&mut header_bytes).map_err(estr)?;
-    drop(f);
+    let header_bytes = crate::sync_gui::read_header_src(header_src, path).map_err(estr)?;
     let header = Header::from_bytes(&header_bytes).map_err(estr)?;
 
     let seed = seed_file::read(kyber_path, seed_passphrase.as_bytes()).map_err(estr)?;
     let sidecar = hybrid_sidecar::sidecar_path(path);
-    let entries = hybrid_sidecar::read_for_vault(&sidecar, path, header_path).map_err(estr)?;
+    let entries =
+        crate::sync_gui::read_hybrid_for_vault(&sidecar, path, header_path).map_err(estr)?;
 
     let mut auth = make_fido2_authenticator();
     // Decapsulate every hybrid FIDO2 slot's ML-KEM half first, so one
@@ -5235,7 +5223,7 @@ fn unlock_with_hybrid_pq_fido2(
         Some(pin),
         |i, hmac_secret| {
             let (slot_idx, slot, pq_shared) = &slots[i];
-            Container::open(
+            crate::sync_gui::open_with_material(
                 path,
                 header_path,
                 UnlockMaterial::HybridPqFido2 {
@@ -5283,7 +5271,8 @@ fn unlock_with_hybrid_pq(
     // GUI surfaces a separate seed-pw field at unlock.
     let seed = seed_file::read(kyber_path, seed_pw.as_bytes()).map_err(estr)?;
     let sidecar = hybrid_sidecar::sidecar_path(path);
-    let entries = hybrid_sidecar::read_for_vault(&sidecar, path, header_path).map_err(estr)?;
+    let entries =
+        crate::sync_gui::read_hybrid_for_vault(&sidecar, path, header_path).map_err(estr)?;
     if entries.is_empty() {
         return Err("hybrid sidecar is empty".into());
     }
@@ -5299,7 +5288,7 @@ fn unlock_with_hybrid_pq(
                 continue;
             }
         };
-        match Container::open(
+        match crate::sync_gui::open_with_material(
             path,
             header_path,
             UnlockMaterial::HybridPqPassphrase {
@@ -5866,6 +5855,18 @@ pub fn split_parent_name(vfs: &Vfs, p: &str) -> Result<(luksbox_vfs::FileId, Str
     Ok((parent_id, name.to_string()))
 }
 
+/// Operations a sync bundle does not support yet (the same list as the
+/// command line refuses): they need the vault as files.
+fn refuse_bundle(vfs: &Vfs, what: &str) -> Result<(), String> {
+    if vfs.container().is_external() {
+        return Err(format!(
+            "{what} is not available for a sync bundle yet (export it to a .lbx, do it \
+             there, and convert again)"
+        ));
+    }
+    Ok(())
+}
+
 // ---- panic-destroy --------------------------------------------------------
 
 pub fn panic_destroy(
@@ -5874,6 +5875,13 @@ pub fn panic_destroy(
     wipe_data: bool,
 ) -> Result<(), String> {
     use luksbox_core::file_util::{RecoveryMirrors, secure_open_existing_no_follow};
+    if crate::sync_gui::is_bundle(vault) {
+        return Err(
+            "panic is not available for a sync bundle yet: delete the bundle \
+                    folder (and empty the sync service's trash) instead"
+                .into(),
+        );
+    }
     // No-follow opens for both targets BEFORE any write, closing
     // the TOCTOU window where a symlink swap in the parent dir
     // could redirect the random-bytes overwrite to an arbitrary
@@ -6623,6 +6631,7 @@ pub fn enroll_hybrid_pq_sep(
     seed_pw: &str,
     kem_size: u16,
 ) -> Result<usize, String> {
+    refuse_bundle(vfs, "adding a post-quantum keyslot")?;
     use luksbox_core::SlotKind;
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
@@ -6951,6 +6960,7 @@ pub fn enroll_hybrid_pq_tpm2(
     seed_pw: &str,
     kem_size: u16,
 ) -> Result<usize, String> {
+    refuse_bundle(vfs, "adding a post-quantum keyslot")?;
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
     use luksbox_tpm::Tpm2Sealer;
@@ -7085,6 +7095,7 @@ pub fn enroll_hybrid_pq_tpm2_fido2(
     fido2_pin: &str,
     kem_size: u16,
 ) -> Result<usize, String> {
+    refuse_bundle(vfs, "adding a post-quantum keyslot")?;
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
@@ -7239,11 +7250,7 @@ fn unlock_with_tpm2_pin(
     use luksbox_tpm::{SealedBlob, Tpm2Sealer};
 
     let header_src = header_path.unwrap_or(path);
-    let mut f =
-        luksbox_core::file_util::open_existing_read_no_follow_policy(header_src).map_err(estr)?;
-    let mut header_bytes = [0u8; HEADER_SIZE];
-    f.read_exact(&mut header_bytes).map_err(estr)?;
-    drop(f);
+    let header_bytes = crate::sync_gui::read_header_src(header_src, path).map_err(estr)?;
     let header = Header::from_bytes(&header_bytes).map_err(estr)?;
     if !header
         .keyslots
@@ -7278,7 +7285,7 @@ fn unlock_with_tpm2_pin(
     // `Container::open` reports only UnlockFailed; keep the reason.
     let mut unseal_errs = luksbox_format::UnsealErrors::default();
     let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
-    Container::open(
+    crate::sync_gui::open_with_material(
         path,
         header_path,
         UnlockMaterial::Tpm2 {
@@ -7368,6 +7375,7 @@ pub fn rotate_mvk_passphrase_only(
     creds: Vec<(usize, zeroize::Zeroizing<String>)>,
     kdf: KdfStrength,
 ) -> Result<(), String> {
+    refuse_bundle(vfs, "rotating the master key")?;
     // Deniable vaults route through the deniable-specific rotation
     // path: their slot envelopes don't live in `header.keyslots`
     // (synthetic header is all Empty), and the full rotation has to
@@ -7553,6 +7561,7 @@ pub fn enroll_hybrid_pq_passphrase(
     seed_pw: &str,
     kem_size: u16,
 ) -> Result<usize, String> {
+    refuse_bundle(vfs, "adding a post-quantum keyslot")?;
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
 
@@ -7663,6 +7672,7 @@ pub fn enroll_hybrid_pq_fido2(
     seed_pw: &str,
     kem_size: u16,
 ) -> Result<usize, String> {
+    refuse_bundle(vfs, "adding a post-quantum keyslot")?;
     use luksbox_fido2::{Fido2Authenticator, RP_ID, random_user_handle};
     use luksbox_format::hybrid_sidecar::{self, HybridEntry};
     use luksbox_pq::{PqParams, encapsulate_with, keygen_with, seed_file};
@@ -8147,7 +8157,7 @@ mod browser_ops_tests {
         drop(vfs);
 
         // a.txt was flushed despite the error.
-        let cont = Container::open(
+        let cont = crate::sync_gui::open_with_material(
             &tmp.path().join("v.lbx"),
             None,
             UnlockMaterial::Passphrase(PASS),

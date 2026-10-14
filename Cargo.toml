@@ -6,6 +6,8 @@ members = [
     "crates/luksbox-fido2",
     "crates/luksbox-pq",
     "crates/luksbox-vfs",
+    "crates/luksbox-sync",
+    "crates/luksbox-merge",
     "crates/luksbox-fuse-t",
     "crates/luksbox-mount",
     "crates/luksbox-cli",
@@ -16,7 +18,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.7.0-rc.1"
 edition = "2024"
 # Apache-2.0 is the SPDX identifier; crates.io and `cargo publish`
 # recognise it directly. Each crate's Cargo.toml inherits this via

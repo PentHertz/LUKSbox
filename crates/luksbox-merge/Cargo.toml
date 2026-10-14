@@ -1,0 +1,18 @@
+[package]
+name = "luksbox-merge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Three-way merge of two luksbox vault versions, replayed through the Vfs API"
+
+[dependencies]
+luksbox-vfs = { path = "../luksbox-vfs" }
+sha2.workspace = true
+zeroize.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+luksbox-core = { path = "../luksbox-core" }
+luksbox-format = { path = "../luksbox-format" }

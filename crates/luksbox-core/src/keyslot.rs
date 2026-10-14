@@ -252,9 +252,10 @@ pub enum SlotKind {
     Empty = 0,
     /// Passphrase keyslot: KEK = Argon2id(passphrase, salt); wraps the MVK.
     Passphrase = 1,
-    /// FIDO2 wrap-style: KEK = Argon2id(b"lbx:fido" || passphrase || hmac_secret, salt);
-    /// wraps a random MVK. Standard model, MVK can be wrapped under multiple
-    /// keyslots, supports rotation, etc.
+    /// FIDO2 wrap-style: KEK = Argon2id(b"lbx:fido" || passphrase || 0xff ||
+    /// hmac_secret, salt) (see `kdf::derive_kek_with_fido2`); wraps a random
+    /// MVK. Standard model, MVK can be wrapped under multiple keyslots,
+    /// supports rotation, etc.
     Fido2HmacSecret = 2,
     /// FIDO2 derived-MVK: MVK = HKDF(salt=slot.hmac_salt, ikm=hmac_secret,
     /// info=b"lbx:mvk-fido/v1"). No wrap. The vault has no wrapped MVK to
@@ -375,14 +376,17 @@ pub enum SlotKind {
     /// Same as `HybridPqKemTpm2Fido2` but with ML-KEM-1024.
     HybridPqKem1024Tpm2Fido2 = 14,
     /// macOS Secure Enclave-bound keyslot, the SEP analog of
-    /// `Tpm2Sealed`. The KEK is the 32-byte ECDH shared secret a
+    /// `Tpm2Sealed`. The KEK is derived (`derive_sep_kek`, HKDF under
+    /// `lbx:sep-kek/v1`) from the 32-byte ECDH shared secret a
     /// SEP-resident P-256 key agrees with a host-side ephemeral key
     /// (derive, not seal - the SEP has no generic seal primitive); it
     /// then wraps the MVK exactly as a TPM slot does. The SEP private
     /// half never leaves the enclave. Unlike TPM slots, the inline
     /// variable region is EMPTY: the SEP material (the opaque
     /// `dataRepresentation` + ephemeral public key, 353-496 B) does
-    /// not fit the 352 B region and lives in a `.lbx.sep` sidecar.
+    /// not fit the 352 B region and lives in the header's in-header
+    /// Secure Enclave region (`Header::sep_blobs`, gated by
+    /// `FLAG_HAS_SEP_REGION`), not in an external sidecar file.
     /// macOS-only at runtime; other platforms can read a vault
     /// containing this kind and unlock via another slot. See
     /// `docs/SEP_KEYSLOT_DESIGN.md`.
@@ -395,19 +399,21 @@ pub enum SlotKind {
     /// LocalAuthentication UI (phase 2).
     SepSealedBiometric = 16,
     /// Hybrid Secure Enclave + ML-KEM-768 keyslot, the SEP analog of
-    /// `HybridPqKemTpm2`. `KEK = HKDF(salt, sep_shared || pq_shared,
-    /// "lbx:hybrid-tpm-kek/v1")` - same derivation as the TPM hybrid
-    /// (the 32-byte SEP shared secret slots in where `tpm_unsealed`
-    /// goes). Needs BOTH a `.lbx.sep` entry (SEP material) and a
-    /// `.lbx.hybrid` entry (ML-KEM material), each keyed by slot_idx.
+    /// `HybridPqKemTpm2`. `KEK = HKDF(header_salt, sep_shared ||
+    /// pq_shared, "lbx:sep-kek/v1")`, the unified SEP derivation
+    /// (`derive_sep_kek`), not the TPM hybrid's label, so a SEP slot and
+    /// a TPM slot never share a KEK. Needs BOTH an in-header SEP region
+    /// entry (SEP material) and a `.lbx.hybrid` entry (ML-KEM material),
+    /// each keyed by slot_idx.
     HybridPqKemSep = 17,
     /// Same as `HybridPqKemSep` but with ML-KEM-1024.
     HybridPqKem1024Sep = 18,
     /// Fused Secure Enclave + FIDO2 (both required), the SEP analog of
     /// `Tpm2Fido2`. KEK mixes the SEP ECDH shared secret with the
     /// FIDO2 authenticator's hmac-secret output. The SEP material is
-    /// in the `.lbx.sep` sidecar; the FIDO2 cred_id + hmac_salt use
-    /// the inline slot region (free, since the SEP blob is offloaded).
+    /// in the in-header SEP region; the FIDO2 cred_id + hmac_salt use
+    /// the inline slot region (free, since the SEP blob is stored
+    /// outside the slot).
     SepFido2 = 19,
     /// `SepFido2` + ML-KEM-768 (three factors).
     HybridPqKemSepFido2 = 20,
@@ -520,9 +526,10 @@ impl SlotKind {
     }
 
     /// True for any macOS Secure Enclave-backed slot kind. The SEP
-    /// `dataRepresentation` for these always lives in the `.lbx.sep`
-    /// sidecar; other factors (FIDO2 cred_id, Argon2 params, ML-KEM
-    /// material) may additionally use the inline region / `.lbx.hybrid`.
+    /// `dataRepresentation` for these always lives in the header's
+    /// in-header SEP region (`Header::sep_blobs`); other factors (FIDO2
+    /// cred_id, Argon2 params, ML-KEM material) may additionally use the
+    /// inline region / `.lbx.hybrid`.
     pub fn is_sep(self) -> bool {
         matches!(
             self,
@@ -550,7 +557,7 @@ impl SlotKind {
 
     /// True for SEP kinds that ALSO require a FIDO2 authenticator.
     /// These store the FIDO2 cred_id + hmac_salt in the inline slot
-    /// region (free because the SEP blob is in the sidecar).
+    /// region (free because the SEP blob is in the in-header SEP region).
     pub fn is_sep_fido2(self) -> bool {
         matches!(
             self,
@@ -638,12 +645,17 @@ impl SlotKind {
     }
 }
 
-/// One on-disk keyslot. Always 512 bytes; a fully-zero slot is `Empty`.
+/// One on-disk keyslot. Always 512 bytes; a slot whose kind byte is 0 is
+/// `Empty` (the other 511 bytes are random padding).
 ///
 /// The wrapped MVK (32 B ciphertext + 16 B tag) is sealed with the per-slot KEK
-/// using the container's `cipher_suite`, with AAD =
-///    `slot_bytes[0..76] || header_salt`
-/// so any tamper on the slot params or relocation between containers fails the AEAD tag.
+/// using the container's `cipher_suite`, with an AAD whose shape depends on
+/// `aad_version` (see `build_aead_aad`): `slot_bytes[0..76] || header_salt`
+/// for V1, plus the cred_len / hmac_salt_len / cred_id / hmac_salt fields
+/// (`[124..288]` for V2, `[124..512]` for V3 and V4, the current default)
+/// before `header_salt`. Any tamper on the slot params or relocation between
+/// containers fails the AEAD tag. The slot's index in the keyslot table is
+/// NOT in the AAD; position is bound by the header HMAC.
 #[derive(Clone)]
 pub struct Keyslot {
     pub kind: SlotKind,
@@ -941,11 +953,12 @@ impl Keyslot {
     ///   - `sep_shared`: always. The 32-byte ECDH shared secret from
     ///     `luksbox_sep::SepSealer::seal`. The SEP material itself
     ///     (`dataRepresentation` + ephemeral pubkey) is the caller's
-    ///     to store in the `.lbx.sep` sidecar - it does NOT live in
-    ///     the slot.
+    ///     to store in the header's in-header SEP region via
+    ///     `Header::set_sep_blob` (as `Container::enroll_sep` does) -
+    ///     it does NOT live in the slot.
     ///   - `hmac_secret` + `cred_id` + `hmac_salt`: iff
     ///     `kind.is_sep_fido2()`. cred_id + hmac_salt occupy the inline
-    ///     region (free, since the SEP blob is offloaded to the sidecar).
+    ///     region (free, since the SEP blob is stored outside the slot).
     ///   - `passphrase` + `kdf_params`: iff `kind.is_sep_passphrase()`.
     ///     Argon2id runs over a freshly-generated `kdf_salt`.
     ///   - `pq_shared`: iff `kind.is_hybrid_pq()`. The Kyber-decapsulated
@@ -1037,7 +1050,7 @@ impl Keyslot {
             wrapped_ct: [0; 32],
             wrapped_tag: [0; 16],
             // FIDO2 cred_id only for the SEP+FIDO2 kinds; the SEP
-            // dataRepresentation always lives in the `.lbx.sep` sidecar.
+            // dataRepresentation always lives in the in-header SEP region.
             fido2_cred_id: if kind.is_sep_fido2() {
                 cred_id.to_vec()
             } else {
@@ -1982,12 +1995,15 @@ impl Keyslot {
     }
 
     /// Write the AAD-covered part of the slot (offsets 0..76) into `dst`. The
-    /// remainder is left to the caller (zeroed in our serializer).
+    /// remainder is left to the caller (random padding in `to_bytes`,
+    /// zero-filled in `build_aead_aad`).
     ///
     /// Byte 1 carries `self.aad_version`, the AEAD AAD shape. Existing
-    /// V1 slots on disk have it = 0 (zeroed by old code). New slots have
-    /// it = `AAD_VERSION_V2` = 1, signalling that cred_id + hmac_salt
-    /// were also pulled into the AAD at wrap time.
+    /// V1 slots on disk have it = 0 (zeroed by old code); V2 = 1 and
+    /// V3 = 2 slots also pulled cred_id + hmac_salt into the AAD at wrap
+    /// time. New slots from every `Keyslot::new_*` constructor have it =
+    /// `AAD_VERSION_V4` = 3 (V3 layout and AAD, WebAuthn-PRF FIDO2 salt
+    /// convention).
     fn write_aad_region(&self, dst: &mut [u8]) {
         debug_assert!(dst.len() >= SLOT_AAD_LEN);
         dst[OFF_KIND] = self.kind as u8;
@@ -2006,19 +2022,26 @@ impl Keyslot {
     ///
     /// - V1 (legacy): `slot[0..76] || header_salt`. cred / hmac_salt
     ///   covered only by the header HMAC.
-    /// - V2 (legacy default): `slot[0..76] || slot[124..288] ||
+    /// - V2 (legacy): `slot[0..76] || slot[124..288] ||
     ///   header_salt`. Covers cred_len, hmac_salt_len, cred_id (128 B
     ///   max), and hmac_salt (32 B at offset 256).
-    /// - V3 (current default, supports stateless authenticators):
+    /// - V3 (legacy, supports stateless authenticators):
     ///   `slot[0..76] || slot[124..512] || header_salt`. Covers
     ///   cred_len, hmac_salt_len, cred_id (352 B max at offsets
     ///   128..480), and hmac_salt (32 B at 480..512). Wider range
     ///   than V2 because the layout repurposes the previously-padding
     ///   region 288..512 for the extended cred_id.
+    /// - V4 (current default, set by every `Keyslot::new_*`): same
+    ///   AAD as V3. Differs only in the FIDO2 hmac-secret salt wire
+    ///   convention (WebAuthn-PRF, see `OFF_AAD_VERSION`).
     ///
-    /// For non-FIDO2 slot kinds the cred / hmac_salt regions are
-    /// zero-filled before AAD computation, so the AAD reduces to a
-    /// constant-shape envelope regardless of slot kind.
+    /// The `[124..]` tail is rebuilt here from the structured fields
+    /// (cred_len, hmac_salt_len, the variable region - FIDO2 cred_id or
+    /// TPM sealed blob - and hmac_salt for salt-bearing kinds), with
+    /// every other byte zero-filled rather than copied from the random
+    /// on-disk padding, so the AAD has a constant shape regardless of
+    /// slot kind. The slot's index in the keyslot table is not part of
+    /// the AAD; the header HMAC binds slot positions.
     ///
     /// The aad_version byte sits at offset 1 inside the SLOT_AAD_LEN
     /// (0..76) range, so a tamper that flips V2->V3 (or any version
@@ -2149,10 +2172,10 @@ impl Keyslot {
             return Ok(Self::empty());
         }
         // AEAD AAD shape selector. V1 vaults have byte 1 = 0 (zeroed by
-        // the old `write_aad_region`); newer vaults set it to V2 = 1.
-        // Higher values are reserved for future format extensions and
-        // currently rejected to avoid silently treating unknown shapes
-        // as one we know.
+        // the old `write_aad_region`); legacy V2 / V3 slots have 1 / 2,
+        // and new slots are written as V4 = 3. Values above V4 are
+        // reserved for future format extensions and currently rejected
+        // to avoid silently treating unknown shapes as one we know.
         let aad_version = buf[OFF_AAD_VERSION];
         if aad_version > AAD_VERSION_V4 {
             return Err(Error::InvalidField);
@@ -2239,7 +2262,8 @@ impl Keyslot {
             // fido2_hmac_salt stays zero - TPM-only slots don't have one.
         }
         // Non-FIDO2 Secure Enclave slots: the SEP material lives in the
-        // `.lbx.sep` sidecar, and these kinds carry no FIDO2 cred_id /
+        // header's in-header SEP region (`Header::sep_blobs`, parsed by
+        // `Header::from_bytes`), and these kinds carry no FIDO2 cred_id /
         // hmac_salt, so the inline region is EMPTY (cred_len == 0,
         // salt_len == 0). Passphrase-bearing SEP kinds still use the
         // Argon2 params (validated via kdf_runs_argon2 above) but no

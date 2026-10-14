@@ -1474,6 +1474,14 @@ pub struct Vfs {
     /// Read via `Vfs::tolerated_inodes()`. The Vfs is read-only
     /// while non-empty (`Vfs::flush` refuses with `ReadOnlyMount`).
     tolerated_inodes: Vec<ToleratedInode>,
+    /// Where this session saved a rescue copy after the vault file was
+    /// replaced on disk while open (see `Container::replaced_on_disk`).
+    rescue_path: Option<std::path::PathBuf>,
+    /// Opened with `Vfs::open_read_only`: every mutator returns
+    /// `ReadOnlyMount`, and `flush` / `finish` write nothing (not even
+    /// the re-establishing flush after a mirror recovery). The
+    /// container is read-only too, so `Drop` writes nothing either.
+    read_only: bool,
     /// Layer-2 per-inode dirty tracking. Set of inode IDs whose
     /// `chunks` vec has been mutated since the last successful
     /// flush. Used by `spill_to_v3_on_disk` to skip the
@@ -1923,6 +1931,7 @@ impl Vfs {
             }
         }
         let cow_floor_gen = tree.next_chunk_gen;
+        let read_only = container.is_read_only();
         Ok(Self {
             container,
             tree,
@@ -1931,6 +1940,8 @@ impl Vfs {
             last_warned_pct: 0,
             warned_beyond_tested_size: false,
             tolerated_inodes: tolerated,
+            read_only,
+            rescue_path: None,
             // Fresh open: every in-memory inode matches its on-disk
             // chunk-list chain. Mutations after this point will add
             // entries here as they touch chunks.
@@ -2130,13 +2141,86 @@ impl Vfs {
     /// recovery session can never dirty the tree (writes would also
     /// recycle the broken files' chunk slots on disk immediately).
     fn ensure_writable(&self) -> Result<(), Error> {
-        if !self.tolerated_inodes.is_empty() {
+        if self.read_only || !self.tolerated_inodes.is_empty() {
             return Err(Error::ReadOnlyMount);
         }
         Ok(())
     }
 
+    /// After a save: if the vault file was replaced on disk while open (a
+    /// sync client renaming its own copy over it), what was just saved
+    /// sits in an unlinked file that vanishes at close. Copy it next to
+    /// the vault as `<name> (unsaved changes <time>).<ext>` (the same
+    /// copy is refreshed by later saves) and warn. Never for deniable
+    /// vaults: a predictable extra file would mark them.
+    fn rescue_if_replaced(&mut self) {
+        if self.container.is_deniable() || !self.container.replaced_on_disk() {
+            return;
+        }
+        let vault = self.container.vault_path().to_path_buf();
+        let dest = self.rescue_path.get_or_insert_with(|| {
+            let stem = vault
+                .file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| "vault".into());
+            let ext = vault
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            vault.with_file_name(format!("{stem} (unsaved changes {secs}){ext}"))
+        });
+        let dest = dest.clone();
+        // A detached header is not part of the copy: say which one opens it.
+        let header = self.container.header_storage_path();
+        let header_note = if header != vault.as_path() {
+            format!(", with the same detached header {}", header.display())
+        } else {
+            String::new()
+        };
+        match self.container.rescue_copy(&dest) {
+            Ok(()) => eprintln!(
+                "luksbox: warning: {} was replaced by another program (a sync client?) \
+                 while open; what this session saved is in {} (merge it back with \
+                 `luksbox merge`{header_note})",
+                vault.display(),
+                dest.display()
+            ),
+            Err(e) => eprintln!(
+                "luksbox: warning: {} was replaced by another program while open, and \
+                 saving a rescue copy to {} failed: {e}",
+                vault.display(),
+                dest.display()
+            ),
+        }
+    }
+
+    /// Open `container` as a view that can never write: the container is
+    /// switched to read-only first, so neither this `Vfs` nor the
+    /// container's `Drop` touches the storage. Used for the snapshots a
+    /// merge compares, and for inspecting a vault without changing it.
+    pub fn open_read_only(mut container: Container) -> Result<Self, Error> {
+        container.set_read_only();
+        Self::open(container)
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     pub fn flush(&mut self) -> Result<(), Error> {
+        // A read-only view never writes. Mutators are refused by
+        // `ensure_writable`, so the tree cannot be dirty here; the
+        // check is belt and braces.
+        if self.read_only {
+            if self.dirty {
+                return Err(Error::ReadOnlyMount);
+            }
+            return Ok(());
+        }
         // Tolerant-recovery mode: if the open path zeroed any
         // inode's chunks/size because its chunk-list chain failed
         // AEAD, the in-memory tree no longer reflects the truth on
@@ -2430,6 +2514,7 @@ impl Vfs {
         // current vault generation to it so a future open can detect
         // rollback via `anchor::compare`.
         self.container.write_anchor(self.tree.next_chunk_gen)?;
+        self.rescue_if_replaced();
         self.dirty = false;
         // Layer 2: every dirty inode has either been re-spilled
         // (full path) or had its existing chain reused (fast path).
@@ -2762,6 +2847,25 @@ impl Vfs {
     /// to detect rollback.
     pub fn vault_generation(&self) -> u64 {
         self.tree.next_chunk_gen
+    }
+
+    /// Raise the vault-generation counter to at least `generation`.
+    /// For a vault made from other copies of itself (`luksbox merge`):
+    /// the result must count as newer than every copy it was made from,
+    /// so a rollback anchor that saw one of them accepts it. Skipping
+    /// values is safe, the counter only has to grow. Persisted by the
+    /// next flush.
+    pub fn raise_generation_to(&mut self, generation: u64) -> Result<(), Error> {
+        self.ensure_writable()?;
+        // Leave room for the flush's own step and for later writes.
+        if generation >= u64::MAX / 2 {
+            return Err(Error::IdSpaceExhausted);
+        }
+        if generation > self.tree.next_chunk_gen {
+            self.tree.next_chunk_gen = generation;
+            self.dirty = true;
+        }
+        Ok(())
     }
 
     /// Pre-flight check: would adding `extra_chunks` to file `id`'s chunk
@@ -4027,6 +4131,9 @@ impl Vfs {
     /// tolerant recovery mode. Returns the bytes given back.
     pub fn finish(&mut self) -> Result<u64, Error> {
         self.flush()?;
+        if self.read_only {
+            return Ok(0);
+        }
         if self.container.is_deniable() || !self.tolerated_inodes.is_empty() {
             return Ok(0);
         }

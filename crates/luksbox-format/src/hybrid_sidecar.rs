@@ -80,7 +80,7 @@ use crate::Error;
 /// `luksbox-core::file_util::secure_create_or_truncate`). Closes the
 /// R12-15 follow-up that left Windows hybrid sidecars exposed to
 /// reparse-point swaps under `%LOCALAPPDATA%`.
-fn read_sidecar_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
+pub fn read_sidecar_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
     // Upper bound: v3 header + 8 entries each at the larger ML-KEM-1024
     // shape (1 + 1 + 1568 + 1568 = 3138 B). Cap rounded up to 32 KiB
     // for headroom against future entry-shape growth.

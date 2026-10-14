@@ -14,6 +14,101 @@ canonical record.
 
 ---
 
+## [v0.7.0-rc.1] - Unreleased
+
+First release candidate of the v0.7.0 line (not tagged yet; the date is
+set when it is). The minor bump marks a new storage format, sync
+bundles (`.lbxs`): a vault kept as a folder of small encrypted objects
+in a cloud folder, usable from several devices. Bundles are
+experimental: keep a `.lbx` copy of anything that matters (`luksbox
+sync export`).
+
+Upgrading from v0.6.x: existing vaults, headers, anchors and keyslots
+open unchanged and keep their format. A sync bundle needs v0.7.0+ to
+open. Turning a vault into one (`luksbox sync convert`, or Make sync
+bundle... in the GUI) leaves the `.lbx` untouched, and `luksbox sync
+export` turns a bundle back into a `.lbx`.
+
+### Added
+
+- **Sync bundles (`.lbxs`), experimental.** A vault kept as a folder in
+  Dropbox, Google Drive, OneDrive, iCloud Drive, Nextcloud or
+  Syncthing: only changed parts upload (a few MiB per small edit,
+  Google Drive included, instead of the whole vault or about 128 MiB),
+  several devices can use it (concurrent and offline changes are
+  merged, conflicting edits keep both versions), and a half-synced
+  folder never opens as a mixed state. Changes upload in the
+  background; the vault (open or mounted) stays usable while they
+  do. The provider sees no file names, sizes, count or structure.
+  Every object is sealed under its own key with a key commitment;
+  commits are hash-linked; each device detects rollback, withheld or
+  duplicated commits and revoked credentials. Keyslot changes made on
+  two devices at once are merged slot by slot (a removal always wins).
+  `luksbox sync convert | export | status | push | verify | snapshots
+  | gc | discard-local`; every other command, the wizard and the GUI
+  accept a bundle folder. The GUI creates one from New vault (Sync
+  bundle) or from an open vault (Make sync bundle...), browses its
+  earlier versions and copies files back from them (Versions), and
+  deletes one from the recent list. On Linux, bundle folders get a
+  LUKSbox folder icon in GIO-based file managers (GNOME Files and
+  others).
+  New crates `luksbox-sync` and `luksbox-merge`; format in
+  `docs/CRYPTO_SPEC.md` section 22, guide in `docs/SYNC_BUNDLES.md`,
+  design in `docs/CLOUD_SYNC_DESIGN.md` and
+  `docs/CLOUD_SYNC_IMPLEMENTATION.md`.
+- **`luksbox merge`**: merge two copies of a `.lbx` (for example a sync
+  service's "conflicted copy") into a new vault; files changed in both
+  are kept twice, nothing is dropped. The result counts as newer than
+  both copies, so it can be put in place of the vault.
+- **A single `.lbx` in a cloud folder is safer** (Dropbox, Google
+  Drive, OneDrive, iCloud Drive, Nextcloud, Syncthing, Box):
+  - each device keeps an automatic rollback anchor for it in its app
+    data (not for deniable vaults, not with `--anchor`). An older copy
+    than this device has seen (a restored version, or another device's
+    older copy kept after a sync conflict) is refused; a newer one from
+    another device is accepted. `LUKSBOX_NO_AUTO_ANCHOR=1` turns it off;
+  - copies the sync service made next to the vault ("conflicted copy",
+    `name (1).lbx`, `.sync-conflict-...`) are listed at every open,
+    with the `luksbox merge` command;
+  - if the sync service replaces the vault file while it is open, what
+    was saved after that goes to `name (unsaved changes <time>).lbx`
+    instead of being lost;
+  - the first open on each device says the folder is synced and points
+    at sync bundles.
+
+### Fixed
+
+- **GUI vault header on narrow windows.** The vault name, folder and
+  cipher no longer run into the buttons: the name is shortened with an
+  ellipsis next to Lock, and the buttons wrap onto a row of their own.
+- **GUI file dialogs with newer Linux desktop portals.** Recent
+  xdg-desktop-portal versions refused the GUI ("Unable to open
+  /proc/<pid>/root"): the GUI makes itself non-dumpable so other
+  processes cannot read its memory, which also hides that path. Only the
+  `zenity` fallback, where installed, could show a dialog. Dialogs now
+  open from a short-lived helper process of the same binary, which holds
+  no keys, so the native file chooser works and the GUI keeps its
+  protection.
+- **Creating a vault did not force it to disk.** `create` wrote the
+  header and metadata region without `fsync` on the file or its folder;
+  a crash right after it could leave an incomplete vault. Both are
+  synced now (inline and detached headers, deniable vaults included).
+
+### Changed
+
+- `Container` can be opened from caller-supplied storage
+  (`open_external`, used by sync bundles; no sidecar mirrors, no
+  path-based writes) and read-only (`set_read_only`,
+  `Vfs::open_read_only`: every write path refused, nothing written on
+  drop). New `Vfs::raise_generation_to` (used by `luksbox merge`);
+  `hybrid_sidecar::read_sidecar_bytes` is public.
+- `docs/CRYPTO_SPEC.md` sections 3.1, 3.2, 3.3 and 3.9 brought back in
+  line with the code (all 28 slot kinds and AAD V4, every HKDF label
+  with its salt, the SEP region in the header, current line
+  references); a missing code fence that flipped every later code block
+  is fixed. Stale comments in `keyslot.rs`, `deniable.rs` and
+  `chunk.rs` corrected.
+
 ## [v0.6.1] - 2026-10-13
 
 First stable release of the v0.6 line. There is no stable v0.6.0: this

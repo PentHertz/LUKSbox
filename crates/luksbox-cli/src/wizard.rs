@@ -14,7 +14,6 @@
 //!  - background or foreground mount.
 
 use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use dialoguer::theme::ColorfulTheme;
@@ -1358,6 +1357,7 @@ fn mount_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
         .default(false)
         .interact()?;
     println!("OK mounting at {}", mp_abs.display());
+    crate::sync_cmd::install_mount_hook();
     luksbox_mount::mount(vfs, &mp_abs, false, sync_mode)?;
     Ok(())
 }
@@ -2320,10 +2320,9 @@ fn ask_detached_header(theme: &ColorfulTheme, for_create: bool) -> Result<Option
 fn load_header(vault: &Path, sidecar: Option<&Path>) -> Result<Header> {
     let from = sidecar.unwrap_or(vault);
     // R15-H5: honour `LUKSBOX_NO_FOLLOW_SYMLINKS` like every other
-    // header prescan (this one drives FIDO2/TPM/SEP prompts).
-    let mut f = luksbox_core::file_util::open_existing_read_no_follow_policy(from)?;
-    let mut buf = [0u8; HEADER_SIZE];
-    f.read_exact(&mut buf)?;
+    // header prescan (this one drives FIDO2/TPM/SEP prompts). A sync
+    // bundle's newest header object stands in for the file's header.
+    let buf = crate::sync_cmd::read_header_src(from, vault)?;
     Ok(Header::from_bytes(&buf)?)
 }
 
@@ -4305,7 +4304,7 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
                         .with_prompt("Passphrase")
                         .interact()?,
                 );
-                Container::open(
+                crate::sync_cmd::open_with_material(
                     &vault,
                     header_path.as_deref(),
                     UnlockMaterial::Passphrase(pw.as_bytes()),
@@ -4347,6 +4346,8 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
     let trusted_anchor_gen = if let Some(ap) = anchor_path.as_deref() {
         cont.set_anchor(Some(ap.to_path_buf()))?
     } else {
+        // A vault in a cloud folder: this device's automatic anchor.
+        crate::sync_cmd::attach_auto_anchor(&mut cont)?;
         None
     };
     // Try the normal open. If the metadata-blob parse fails (the
@@ -4384,6 +4385,8 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
             let mut cont2 = do_unlock()?;
             if let Some(ap) = anchor_path.as_deref() {
                 cont2.set_anchor(Some(ap.to_path_buf()))?;
+            } else {
+                crate::sync_cmd::attach_auto_anchor(&mut cont2)?;
             }
             let _tolerate_guard = luksbox_vfs::set_tolerate_bad_chunk_lists(true);
             let v = Vfs::open(cont2)?;
@@ -4443,6 +4446,9 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
             }
         }
     }
+    // The automatic anchor of a vault in a cloud folder (no-op otherwise).
+    let mut vfs = vfs;
+    crate::sync_cmd::settle_auto_anchor(&mut vfs)?;
     println!("OK opened {}", vault.display());
 
     // Surface any pre-v0.3.0 FIDO2 keyslots and point at the
@@ -4485,7 +4491,10 @@ fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
         eprintln!();
     }
 
-    open_loop(theme, vfs, &vault)
+    let r = open_loop(theme, vfs, &vault);
+    // A sync bundle publishes what was saved once the vault is closed.
+    let published = crate::sync_cmd::finish_active_session();
+    r.and(published)
 }
 
 // ---- info wizard -----------------------------------------------------------
@@ -4588,6 +4597,11 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
                 vfs.flush()?;
                 return mount_action(theme, vfs, vault);
             }
+            13 if crate::sync_cmd::is_bundle(vault) => Err(
+                "panic is not available for a sync bundle yet: delete the bundle folder \
+                 (and empty the sync service's trash) instead"
+                    .into(),
+            ),
             13 => {
                 vfs.flush()?;
                 let cont = vfs.close()?;
@@ -4881,6 +4895,7 @@ fn mount_action(theme: &ColorfulTheme, vfs: Vfs, vault: &Path) -> Result<()> {
         )
         .default(false)
         .interact()?;
+    crate::sync_cmd::install_mount_hook();
     luksbox_mount::mount(vfs, &mp_abs, daemonize, sync_mode)?;
     Ok(())
 }
@@ -6436,7 +6451,7 @@ fn unlock_via_fido2(
                 continue;
             }
         };
-        match Container::open(
+        match crate::sync_cmd::open_with_material(
             vault,
             header_path,
             UnlockMaterial::Fido2 {
@@ -6504,7 +6519,7 @@ fn unlock_via_hybrid_pq(
     };
     let sidecar = hybrid_sidecar::sidecar_path(vault);
     // v3 vault-binding verification (see `read_for_vault` doc).
-    let entries = hybrid_sidecar::read_for_vault(&sidecar, vault, header_path)
+    let entries = crate::sync_cmd::read_hybrid_for_vault(&sidecar, vault, header_path)
         .map_err(|e| format!("read hybrid sidecar at {}: {e}", sidecar.display()))?;
     if entries.is_empty() {
         return Err("hybrid sidecar is empty".into());
@@ -6521,7 +6536,7 @@ fn unlock_via_hybrid_pq(
                 continue;
             }
         };
-        match Container::open(
+        match crate::sync_cmd::open_with_material(
             vault,
             header_path,
             UnlockMaterial::HybridPqPassphrase {
@@ -6564,7 +6579,7 @@ fn unlock_via_hybrid_pq_fido2(
 
     let sidecar = hybrid_sidecar::sidecar_path(vault);
     // v3 vault-binding verification (see `read_for_vault` doc).
-    let entries = hybrid_sidecar::read_for_vault(&sidecar, vault, header_path)
+    let entries = crate::sync_cmd::read_hybrid_for_vault(&sidecar, vault, header_path)
         .map_err(|e| format!("read sidecar: {e}"))?;
 
     let mut auth = crate::make_fido2_authenticator();
@@ -6615,7 +6630,7 @@ fn unlock_via_hybrid_pq_fido2(
         |i, hmac_secret| {
             let (slot_idx, slot, pq_shared) = &slots[i];
             let open = |passphrase: Option<&[u8]>| {
-                Container::open(
+                crate::sync_cmd::open_with_material(
                     vault,
                     header_path,
                     UnlockMaterial::HybridPqFido2 {
@@ -7913,7 +7928,7 @@ fn unlock_via_tpm2(
     // `Container::open` reports only UnlockFailed; keep the reason.
     let mut unseal_errs = luksbox_format::UnsealErrors::default();
     let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
-    Container::open(
+    crate::sync_cmd::open_with_material(
         vault,
         header_path,
         UnlockMaterial::Tpm2 {
@@ -7975,7 +7990,7 @@ fn unlock_via_sep_common(
         let seed = seed_file::read(&kyber_path, seed_pw.as_bytes())
             .map_err(|e| format!("read kyber seed: {e}"))?;
         let sidecar_path = hybrid_sidecar::sidecar_path(vault);
-        let entries = hybrid_sidecar::read_for_vault(&sidecar_path, vault, header_path)
+        let entries = crate::sync_cmd::read_hybrid_for_vault(&sidecar_path, vault, header_path)
             .map_err(|e| format!("read hybrid sidecar at {}: {e}", sidecar_path.display()))?;
         Some((seed, entries))
     } else {
@@ -8103,7 +8118,7 @@ fn unlock_via_sep_common(
         let mut unseal_errs = luksbox_format::UnsealErrors::default();
         let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
 
-        match Container::open(
+        match crate::sync_cmd::open_with_material(
             vault,
             header_path,
             UnlockMaterial::Sep {
@@ -8261,7 +8276,7 @@ fn unlock_via_tpm2_fido2(
             // `Container::open` reports only UnlockFailed; keep the reason.
             let mut unseal_errs = luksbox_format::UnsealErrors::default();
             let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
-            Container::open(
+            crate::sync_cmd::open_with_material(
                 vault,
                 header_path,
                 UnlockMaterial::Tpm2Fido2 {
@@ -8310,7 +8325,7 @@ fn unlock_via_hybrid_pq_tpm2(
         .map_err(|e| format!("read kyber seed: {e}"))?;
 
     let sidecar_path = hybrid_sidecar::sidecar_path(vault);
-    let entries = hybrid_sidecar::read_for_vault(&sidecar_path, vault, header_path)
+    let entries = crate::sync_cmd::read_hybrid_for_vault(&sidecar_path, vault, header_path)
         .map_err(|e| format!("read hybrid sidecar at {}: {e}", sidecar_path.display()))?;
 
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
@@ -8350,7 +8365,7 @@ fn unlock_via_hybrid_pq_tpm2(
         // `Container::open` reports only UnlockFailed; keep the reason.
         let mut unseal_errs = luksbox_format::UnsealErrors::default();
         let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
-        match Container::open(
+        match crate::sync_cmd::open_with_material(
             vault,
             header_path,
             UnlockMaterial::HybridPqTpm2 {
@@ -8403,7 +8418,7 @@ fn unlock_via_hybrid_pq_tpm2_fido2(
         .map_err(|e| format!("read kyber seed: {e}"))?;
 
     let sidecar_path = hybrid_sidecar::sidecar_path(vault);
-    let entries = hybrid_sidecar::read_for_vault(&sidecar_path, vault, header_path)
+    let entries = crate::sync_cmd::read_hybrid_for_vault(&sidecar_path, vault, header_path)
         .map_err(|e| format!("read sidecar: {e}"))?;
 
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
@@ -8467,7 +8482,7 @@ fn unlock_via_hybrid_pq_tpm2_fido2(
             // `Container::open` reports only UnlockFailed; keep the reason.
             let mut unseal_errs = luksbox_format::UnsealErrors::default();
             let mut unseal = |blob: &[u8]| unseal_errs.record(unseal_inner(blob));
-            Container::open(
+            crate::sync_cmd::open_with_material(
                 vault,
                 header_path,
                 UnlockMaterial::HybridPqTpm2Fido2 {

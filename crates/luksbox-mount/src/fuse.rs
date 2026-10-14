@@ -397,7 +397,7 @@ impl LuksboxFs {
                             }
                             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                                 if let Ok(mut v) = timer_vfs.lock()
-                                    && let Err(e) = v.flush()
+                                    && let Err(e) = crate::flush_and_commit(&mut v)
                                 {
                                     // No syscall to report to from a
                                     // timer tick; log so a failing

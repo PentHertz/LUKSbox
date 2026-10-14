@@ -32,9 +32,10 @@ pub fn slot_offset(data_offset: u64, chunk_id: u64) -> Result<u64, Error> {
         .ok_or(Error::OffsetOverflow)
 }
 
-/// AAD = `file_id_le ‖ chunk_idx_le`. Binds a chunk to its file and to its
-/// position in that file, moving a chunk between files or positions fails the
-/// AEAD tag.
+/// AAD = `file_id_le ‖ chunk_idx_le ‖ generation_le` (8 + 4 + 8 bytes).
+/// Binds a chunk to its file, to its position in that file and to the
+/// generation the metadata recorded for it: moving a chunk between files or
+/// positions, or replaying an older version of it, fails the AEAD tag.
 fn chunk_aad(file_id: u64, chunk_idx: u32, generation: u64) -> [u8; 20] {
     let mut aad = [0u8; 20];
     aad[..8].copy_from_slice(&file_id.to_le_bytes());

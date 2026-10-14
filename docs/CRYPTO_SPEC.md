@@ -33,6 +33,7 @@ about to click 'Open Vault' - what *exactly* happens to my key?"
 19. [FIDO2 / CTAP2 deep dive: how it works and why it's secure](#19-fido2--ctap2-deep-dive-how-it-works-and-why-its-secure)
 20. [Quick reference: what an attacker would need](#20-quick-reference-what-an-attacker-would-need)
 21. [Secure Enclave (SEP) keyslot deep dive](#21-secure-enclave-sep-keyslot-deep-dive)
+22. [Sync bundles (`.lbxs`)](#22-sync-bundles-lbxs)
 
 ---
 
@@ -172,7 +173,7 @@ The header layout (first 8192 bytes) includes:
 80..84   : keyslot_count (always 8)
 84..96   : flags + reserved
 96..4192 : 8 keyslots x 512 bytes
-4192..8160 : random padding (entropy obfuscation, not authenticated)
+4192..8160 : random padding, or the SEP region when FLAG_HAS_SEP_REGION is set (HMAC-covered)
 8160..8192 : HMAC-SHA256 over bytes 0..8160
 ```
 
@@ -201,9 +202,27 @@ random padding.
 |   608..1120 Keyslot 1                                          |
 |     ...                                                        |
 |   3680..4192 Keyslot 7                                         |
-|   4192..8160 random padding (entropy obfuscation)              |
+|   4192..8160 random padding (entropy obfuscation), or, when    |
+|              FLAG_HAS_SEP_REGION (flags bit 4) is set, the     |
+|              Secure Enclave region: count u8, then per entry   |
+|              slot_idx u8, blob_len u16 LE, blob; rest random   |
 |   8160..8192 HMAC-SHA256 over bytes 0..8160 (under MVK subkey) |
 +----------------------------------------------------------------+
+```
+
+**Bytes 4192..8160: padding or Secure Enclave region.** Every header
+write first fills this area with fresh RNG bytes
+(`Header::serialize_unauth` in `crates/luksbox-core/src/header.rs`).
+When at least one keyslot carries macOS Secure Enclave material,
+`Header::set_sep_blob` sets `FLAG_HAS_SEP_REGION` (bit 4 of `flags`)
+and the start of the area is overwritten with the packed table shown
+above; the bytes after the last entry stay random. The flag is cleared
+again once no slot carries SEP material (`clear_sep_blob`, also run by
+`revoke_slot`). `Header::from_bytes` parses the table only when the
+flag is set, rejecting malformed input before the HMAC check. The area
+and the flag both lie below offset 8160, so either way they are
+covered by the header HMAC. An enroll that would overflow the area is
+rejected with `SepRegionFull`. Details in §21.4.
 
 **Header format v3 (`LUKSBOX3`, default for new vaults since v0.6.0).** Same layout as
 `LUKSBOX2`, plus a `header_generation` counter at offset 88, inside the
@@ -459,11 +478,11 @@ chunks would be permanently unreachable.
 
 ```
 +----------+------------------------------------------------+
-|   0      | kind (0=Empty, 1=Passphrase, 2=Fido2HmacSecret,|
-|          |       3=Fido2DerivedMvk, 4-7=hybrid variants)  |
+|   0      | kind (u8, 0..=27; see "Slot kinds" below)      |
 +----------+------------------------------------------------+
-|   1      | aad_version (0=V1 legacy, 1=V2 legacy, 2=V3 current default) |
-|   2..4   | reserved                                       |
+|   1      | aad_version (0=V1, 1=V2, 2=V3 legacy;          |
+|          |              3=V4 current default)             |
+|   2..4   | reserved (zero)                                |
 |   4..20  | UUID (16 random bytes)                         |
 |  20..24  | kdf_param_m_cost (Argon2id memory, KiB)        |
 |  24..28  | kdf_param_t_cost (Argon2id iterations)         |
@@ -474,8 +493,8 @@ chunks would be permanently unreachable.
 |  76..108 | wrapped_ct (32 bytes = encrypted MVK)          |
 | 108..124 | wrapped_tag (16 bytes = AEAD auth tag)         |
 +----------+------------------------------------------------+
-| 124..126 | fido2_cred_id_len (u16, FIDO2 slots only)      |
-| 126..128 | fido2_hmac_salt_len (u16)                      |
+| 124..126 | cred_len (u16 LE, variable-region length)      |
+| 126..128 | hmac_salt_len (u16 LE, 32 or 0)                |
 +----------+------------------------------------------------+
        (cred_id and hmac_salt offsets depend on aad_version)
 +----------+------------------------------------------------+
@@ -484,9 +503,13 @@ chunks would be permanently unreachable.
 | 256..288 | fido2_hmac_salt (32 bytes)                     |
 | 288..512 | random padding                                 |
 +----------+------------------------------------------------+
-| V3 layout (current default; supports stateless FIDO2):    |
-| 128..480 | fido2_cred_id (up to 352 bytes)                |
-| 480..512 | fido2_hmac_salt (32 bytes)                     |
+| V3 / V4 layout (V4 = current default; stateless FIDO2):   |
+| 128..480 | variable region (up to 352 bytes), per kind:   |
+|          |   FIDO2 cred_id, or TPM sealed blob, or        |
+|          |   tpm_blob_len(u16) || tpm_blob || cred_id     |
+|          |   (TPM+FIDO2 kinds), or empty (plain SEP)      |
+|          | + random padding up to 480                     |
+| 480..512 | fido2_hmac_salt (32 bytes; random if no salt)  |
 +----------+------------------------------------------------+
 
 AEAD AAD scope:
@@ -504,7 +527,65 @@ AEAD AAD scope:
                      T(fido2_hmac_salt), T(x)=SHA-256("WebAuthn PRF"\0||x),
                      instead of the raw salt. Makes FIDO2 slots
                      cross-platform (Linux/macOS <-> Windows).
+  aad_version > 3:   rejected at parse time (InvalidField).
+
+  Never in the AAD:  wrapped_ct / wrapped_tag (76..124, the AEAD
+                     output itself) and the slot's index in the
+                     keyslot table.
+  The [124..] tail is rebuilt canonically by build_aead_aad (cred_len,
+  hmac_salt_len, cred_id, hmac_salt, unused gaps zero-filled), not
+  copied from disk, so the random padding is outside the slot AEAD and
+  is covered only by the header HMAC.
 ```
+
+**Slot index is not authenticated by the slot AEAD.** The wrap AAD
+depends only on the slot's own fields and `header_salt`
+(`Keyslot::build_aead_aad`, `crates/luksbox-core/src/keyslot.rs`), so
+a slot decrypts the same way at any index; `Container::swap_slots`
+relies on this to reorder slots without re-wrapping. The position of
+each slot is instead bound by the header HMAC (`lbx:header-mac/v1`,
+§3.3), which covers bytes 0..8160 and therefore the keyslot array
+positionally at `96 + 512*i` (§3.1): moving or swapping slots without
+the MVK fails `verify_hmac`. (Deniable-mode slots are different: their
+envelope and inner AADs do bind `slot_idx`, see §3.3.)
+
+**Slot kinds (byte 0).** `SlotKind::from_u8` accepts 0 through 27; any
+other value fails with `UnsupportedSlotKind`. "Shape as N" means the
+512 slot bytes are laid out exactly like kind N; only the kind byte
+(and, for hybrids, the `<vault>.lbx.hybrid` sidecar entry holding the
+ML-KEM material, keyed by slot index) differs. The HKDF labels and
+salts are listed in §3.3.
+
+| Kind | `SlotKind` | What it is |
+|---|---|---|
+| 0 | `Empty` | Unused slot. Kind byte 0, rest random; no AEAD. |
+| 1 | `Passphrase` | KEK = Argon2id(passphrase, kdf_salt); wraps the MVK. |
+| 2 | `Fido2HmacSecret` | KEK = Argon2id(`"lbx:fido"` ‖ passphrase ‖ `0xff` ‖ hmac_secret, kdf_salt), passphrase may be empty. Inline cred_id + hmac_salt. |
+| 3 | `Fido2DerivedMvk` | No wrap: the MVK itself is HKDF(salt = hmac_salt, IKM = hmac_secret, `lbx:mvk-fido/v1`). Create-time first slot only; result checked via the header HMAC. |
+| 4 | `HybridPqKemPassphrase` | Passphrase + ML-KEM-768 (`lbx:hybrid-kek/v1`). Shape as 1. |
+| 5 | `HybridPqKemFido2` | FIDO2 + ML-KEM-768 (`lbx:hybrid-fido-kek/v1`). Shape as 2. |
+| 6 | `HybridPqKem1024Passphrase` | Kind 4 with ML-KEM-1024. |
+| 7 | `HybridPqKem1024Fido2` | Kind 5 with ML-KEM-1024. |
+| 8 | `Tpm2Sealed` | Random KEK sealed by TPM 2.0; sealed blob in the variable region; no Argon2id (kdf params zero). |
+| 9 | `Tpm2Fido2` | TPM + FIDO2, both required (`lbx:tpm2-fido2-kek/v1`). Variable region = `tpm_blob_len ‖ tpm_blob ‖ cred_id`, plus hmac_salt. |
+| 10 | `Tpm2SealedPin` | Kind 8 with a TPM `userAuth` PIN gating the unseal (chip dictionary-attack lockout). Shape as 8. |
+| 11 | `HybridPqKemTpm2` | TPM + ML-KEM-768 (`lbx:hybrid-tpm-kek/v1`). Shape as 8. |
+| 12 | `HybridPqKemTpm2Fido2` | TPM + FIDO2 + ML-KEM-768 (`lbx:hybrid-tpm-fido2-kek/v1`). Shape as 9. |
+| 13 | `HybridPqKem1024Tpm2` | Kind 11 with ML-KEM-1024. |
+| 14 | `HybridPqKem1024Tpm2Fido2` | Kind 12 with ML-KEM-1024. |
+| 15 | `SepSealed` | macOS Secure Enclave ECDH secret as KEK input (`lbx:sep-kek/v1`). SEP blob in the in-header SEP region (§21.4); variable region empty. |
+| 16 | `SepSealedBiometric` | Kind 15 with Touch ID / passcode gating enforced by the enclave. |
+| 17 | `HybridPqKemSep` | SEP + ML-KEM-768. |
+| 18 | `HybridPqKem1024Sep` | SEP + ML-KEM-1024. |
+| 19 | `SepFido2` | SEP + FIDO2, both required. Inline cred_id + hmac_salt. |
+| 20 | `HybridPqKemSepFido2` | SEP + FIDO2 + ML-KEM-768. |
+| 21 | `HybridPqKem1024SepFido2` | SEP + FIDO2 + ML-KEM-1024. |
+| 22 | `SepPassphrase` | SEP + Argon2id passphrase (inline kdf params + kdf_salt). |
+| 23 | `HybridPqKemSepPassphrase` | SEP + passphrase + ML-KEM-768. |
+| 24 | `HybridPqKem1024SepPassphrase` | SEP + passphrase + ML-KEM-1024. |
+| 25 | `SepFido2Passphrase` | SEP + FIDO2 + passphrase. |
+| 26 | `HybridPqKemSepFido2Passphrase` | SEP + FIDO2 + passphrase + ML-KEM-768. |
+| 27 | `HybridPqKem1024SepFido2Passphrase` | SEP + FIDO2 + passphrase + ML-KEM-1024. |
 
 **Why V3 exists**: some FIDO2 authenticators emit credential IDs
 substantially larger than the typical YubiKey 64-byte case. Reported
@@ -575,22 +656,109 @@ guaranteed by HKDF's design.
 flowchart TD
     RNG["OS RNG (getrandom / getentropy / BCryptGenRandom)"] --> MVK
     MVK["Master Volume Key (MVK)<br>32 random bytes<br>in-memory only<br>(Linux: memfd_secret)"]
+    SALT["header_salt<br>32 random bytes, header 24..56<br>(deniable: per_vault_salt)"]
 
-    MVK -->|HKDF info = lbx:header-mac/v1| MAC["mac_key<br>HMAC over the 8 KiB header"]
-    MVK -->|HKDF info = lbx:metadata-key/v1| META["meta_key<br>AEAD over the metadata blob"]
-    MVK -->|HKDF info = lbx:file/v1: + file_id| FK["file_key, one per file<br>AEAD over each chunk"]
-    MVK -->|HKDF info = lbx:anchor-mac/v1| ANC["anchor_key<br>HMAC over the rollback anchor"]
+    MVK -->|IKM| PRK["PRK = HKDF-Extract(salt = header_salt, IKM = MVK)"]
+    SALT -->|salt| PRK
+
+    PRK -->|Expand info = lbx:header-mac/v1| MAC["mac_key<br>HMAC over the 8 KiB header"]
+    PRK -->|Expand info = lbx:metadata-key/v1| META["meta_key<br>AEAD over the metadata blob"]
+    PRK -->|Expand info = lbx:metadata-len-mask/v1| MASK["mask_key<br>masks the metadata ct_len field"]
+    PRK -->|Expand info = lbx:file/v1: + file_id_le| FK["file_key, one per file<br>AEAD over each data chunk"]
+    PRK -->|Expand info = lbx:file/v1: + list_file_id_le| LFK["list_file_key, one per spilled file<br>AEAD over each chunk-list block"]
+    PRK -->|Expand info = lbx:anchor-mac/v1| ANC["anchor_key<br>HMAC over the rollback anchor"]
 
     classDef root fill:#fff4e6,stroke:#d97706,stroke-width:2px;
     classDef leaf fill:#ecfdf5,stroke:#059669;
     class MVK root;
-    class MAC,META,FK,ANC leaf;
+    class MAC,META,MASK,FK,LFK,ANC leaf;
 ```
+
+**Extract, then Expand.** Every MVK subkey comes from
+`MasterVolumeKey::derive_subkey(salt, info)`
+(`crates/luksbox-core/src/key.rs:87-93`), which is full RFC 5869
+HKDF-SHA256, not a bare Expand:
+
+```
+PRK    = HKDF-Extract(salt = header_salt, IKM = MVK)    // HMAC-SHA256(header_salt, MVK)
+subkey = HKDF-Expand(PRK, info, L = 32)
+```
+
+The salt is always the vault's `header_salt`.
+`Container::derive_subkey(info)` (in
+`crates/luksbox-format/src/container.rs`) passes
+`self.header.header_salt`; the free functions that run outside a
+`Container` (header MAC, metadata, anchor, and the `*_for_mvk` helpers
+that MVK rotation uses for old and new keys) take it as an explicit
+argument. In deniable mode there is no plaintext header: the
+container's synthetic header carries the deniable `per_vault_salt`
+(first 32 bytes of the file) in its `header_salt` field, so the
+metadata and file keys are extracted under `per_vault_salt` there.
+
+**Every HKDF `info` label in use** (cross-check with
+`grep -rn 'lbx:\|luksbox-deniable' crates/`):
+
+MVK subkeys (IKM = MVK, extracted as above):
+
+| `info` | HKDF salt | Key | Defined / used in |
+|---|---|---|---|
+| `lbx:header-mac/v1` | header_salt | HMAC-SHA256 key over header bytes 0..8160 | `crates/luksbox-core/src/header.rs` (`HEADER_MAC_INFO`; `Header::to_bytes`, `verify_hmac`) |
+| `lbx:metadata-key/v1` | header_salt | AEAD key of the metadata blob | `crates/luksbox-format/src/metadata.rs` (`metadata_key`) |
+| `lbx:metadata-len-mask/v1` | header_salt | HMAC key; `HMAC(mask_key, region_nonce)[..8]` XOR-masks the stored `ct_len` when the header flag `FLAG_MASKED_METADATA_LEN` is set | `metadata.rs` (`len_mask`) |
+| `lbx:anchor-mac/v1` | header_salt | HMAC key of the `<vault>.lbx.anchor` sidecar | `crates/luksbox-format/src/anchor.rs` (`anchor_key`) |
+| `lbx:file/v1:` ‖ file_id (u64 LE) | header_salt | per-file chunk AEAD key (§3.9) | `crates/luksbox-vfs/src/chunk.rs` (`FILE_KEY_INFO_PREFIX`; `file_key`, `file_key_for_mvk`) |
+| `lbx:file/v1:` ‖ (file_id with bit 63 set) (u64 LE) | header_salt | chunk-list block AEAD key ("V3: chunk-list blocks", §3.1) | `chunk.rs` (`list_file_id`; `list_file_key`, `list_file_key_for_mvk`) |
+
+`lbx:header-mac/v1` and `lbx:anchor-mac/v1` apply to standard vaults
+only; deniable vaults have no plaintext header to MAC and use the
+deniable anchor label below.
+
+Keyslot KEK labels (IKM = unlock-factor output, not the MVK; the
+result wraps the MVK, kinds as in §3.2):
+
+| `info` | HKDF salt | IKM | Kinds | Defined in |
+|---|---|---|---|---|
+| `lbx:mvk-fido/v1` | slot `fido2_hmac_salt` | hmac_secret | 3 (output IS the MVK) | `crates/luksbox-core/src/keyslot.rs` (`derive_mvk_from_fido2`) |
+| `lbx:hybrid-kek/v1` | slot `kdf_salt` | Argon2id(passphrase, kdf_salt) ‖ pq_shared | 4, 6 | `crates/luksbox-core/src/kdf.rs` (`derive_hybrid_kek`) |
+| `lbx:hybrid-fido-kek/v1` | slot `kdf_salt` | Argon2id(`"lbx:fido"` ‖ passphrase ‖ `0xff` ‖ hmac_secret, kdf_salt) ‖ pq_shared | 5, 7 | `kdf.rs` (`derive_hybrid_fido2_kek`) |
+| `lbx:tpm2-fido2-kek/v1` | header_salt | tpm_unsealed ‖ hmac_secret | 9 | `keyslot.rs` (`derive_tpm2_fido2_kek`) |
+| `lbx:hybrid-tpm-kek/v1` | header_salt | tpm_unsealed ‖ pq_shared | 11, 13 | `keyslot.rs` (`derive_hybrid_tpm2_kek`) |
+| `lbx:hybrid-tpm-fido2-kek/v1` | header_salt | tpm_unsealed ‖ hmac_secret ‖ pq_shared | 12, 14 | `keyslot.rs` (`derive_hybrid_tpm2_fido2_kek`) |
+| `lbx:sep-kek/v1` | header_salt | sep_shared ‖ [Argon2id(passphrase, kdf_salt)] ‖ [hmac_secret] ‖ [pq_shared], fixed order, bracketed factors present per kind | 15-27 | `keyslot.rs` (`derive_sep_kek`) |
+
+Kinds 1, 2, 8 and 10 use no HKDF: the KEK is the Argon2id output (1,
+2) or the TPM-unsealed random KEK (8, 10). `"lbx:fido"` is a domain
+prefix inside the Argon2id input of kinds 2, 5 and 7, not an HKDF
+label.
+
+Deniable-mode labels (HKDF salt = `per_vault_salt` throughout):
+
+| `info` | IKM | Key | Defined in |
+|---|---|---|---|
+| `luksbox-deniable-v1/anchor` | MVK | AEAD key of the deniable anchor (the same string is also its AAD prefix) | `crates/luksbox-format/src/anchor.rs` (`DENIABLE_ANCHOR_INFO`, `deniable_anchor_key`) |
+| `luksbox-deniable-v2/inner-header` | MVK | AEAD key of the 4064-byte inner header | `crates/luksbox-core/src/deniable.rs` (`hkdf_info::INNER_HEADER`, `inner_header_key`) |
+| `luksbox-deniable-v2/kek/<combo>`, 12 labels: `passphrase`, `fido2+passphrase`, `tpm+passphrase`, `tpm+fido2+passphrase`, `pq+passphrase`, `pq+fido2+passphrase`, `pq+tpm+passphrase`, `pq+tpm+fido2+passphrase`, `sep+passphrase`, `sep+fido2+passphrase`, `pq+sep+passphrase`, `pq+sep+fido2+passphrase` | envelope_kek ‖ secondary factors | inner `wrapped_mvk` KEK, one label per `DeniableCredential` variant | `deniable.rs` (`hkdf_info::KEK_*`, `derive_factors_kek`) |
+
+The deniable envelope KEK is Argon2id(passphrase, per_vault_salt) with
+no HKDF step (`derive_envelope_kek`); `luksbox-deniable-v2/kek/envelope`
+is defined but reserved and unused. The other strings in the
+`luksbox-deniable-*` namespace are AEAD AAD prefixes or a hash domain,
+not KDF labels: `luksbox-deniable-v2` (slot envelope AAD = label ‖
+per_vault_salt ‖ slot_idx, `deniable.rs::slot_aad`),
+`luksbox-deniable-v2/inner-slot` (inner `wrapped_mvk` AAD, same
+shape), `luksbox-deniable-v2/inner-header-aad` and
+`luksbox-deniable-v3/inner-header-aad` (inner-header AAD = label ‖
+per_vault_salt), and `luksbox-deniable-v3/slot-table` (SHA-256 domain
+prefix of `slot_table_digest` over the 8-slot table, sealed in the v3
+inner header); all but `slot_aad` live in
+`crates/luksbox-format/src/deniable_header.rs`.
 
 The MVK itself is wrapped under per-keyslot KEKs (one per unlock
 factor), but those wraps are reversible only with the unlock factor
-(passphrase, FIDO2 device, hybrid combo). The MVK is the root of
-trust; the per-purpose subkeys are leaves.
+(passphrase, FIDO2 device, TPM, Secure Enclave, hybrid combo). The MVK
+is the root of trust; the per-purpose subkeys are leaves. The one
+exception to "MVK = 32 random bytes" is `Fido2DerivedMvk` (kind 3),
+where the MVK is itself the `lbx:mvk-fido/v1` HKDF output.
 
 ### 3.4 Detached header mode
 
@@ -763,14 +931,14 @@ flowchart LR
     classDef per_chunk fill:#4a3211,stroke:#f59e0b,color:#fff3d6;
 
     MVK[Master Volume Key<br>32 B, vault-wide]:::per_vault
-    MVK -->|HKDF info=lbx:file/v1: + file_id| FK[file_key<br>32 B, per file_id]:::per_file
+    MVK -->|HKDF-SHA256 salt=header_salt, info=lbx:file/v1: + file_id_le| FK[file_key<br>32 B, per file_id]:::per_file
 
     Plain([4 KiB plaintext])
     OSRNG[OsRng] -->|12 B fresh| Nonce[nonce]:::per_chunk
     Gen[generation<br>vault-wide monotonic u64] --> AAD
     FID[file_id u64] --> AAD
     Idx[chunk_idx u32] --> AAD
-    AAD["AAD = file_id ‖ chunk_idx ‖ generation<br>20 B, never on disk"]:::per_chunk
+    AAD["AAD = file_id u64 LE ‖ chunk_idx u32 LE ‖ generation u64 LE<br>8 + 4 + 8 = 20 B, never on disk"]:::per_chunk
 
     Plain --> Seal{aead::seal<br>under cipher_suite}
     FK --> Seal
@@ -783,9 +951,9 @@ The three layers are:
 
 | Layer | Width | Where it lives | Failure mode it defends against |
 |---|---|---|---|
-| **Random nonce** | 96 bits | Prepended to ciphertext on disk; fresh `OsRng` draw on every `write_chunk` (`crates/luksbox-vfs/src/chunk.rs:88-91`). | Two encryptions of the same chunk slot at different times use independent nonces. Without this, AES-GCM nonce reuse leaks the keystream and the GHASH key -- a catastrophic break of confidentiality and integrity. |
-| **Binding AAD** | 20 bytes (never on disk) | Reconstructed at read time from `file_id ‖ chunk_idx ‖ generation` (`crates/luksbox-vfs/src/chunk.rs:35-44`). The AAD itself isn't stored, only its effect on the AEAD tag is. | Cut-and-paste / chunk-shuffling: an attacker swapping chunk 7 of file A onto chunk 12 of file B fails the AEAD tag because `file_id` and `chunk_idx` no longer match. Replay of an older version of the *same* slot fails because the inode now records a higher `generation` than the saved AAD bytes. |
-| **Per-file derived key** | 256 bits | `file_key = HKDF-Expand(MVK, info = "lbx:file/v1:" ‖ file_id_le, len = 32)` (`crates/luksbox-vfs/src/chunk.rs:125-130`). | The MVK never directly encrypts user data. Even a hypothetical nonce collision *within* one file leaves every other file untouched, and the same file_key is structurally never derivable for two distinct `file_id` values. |
+| **Random nonce** | 96 bits | Prepended to ciphertext on disk; fresh `OsRng` draw on every `write_chunk` (`crates/luksbox-vfs/src/chunk.rs:89-92`). | Two encryptions of the same chunk slot at different times use independent nonces. Without this, AES-GCM nonce reuse leaks the keystream and the GHASH key -- a catastrophic break of confidentiality and integrity. |
+| **Binding AAD** | 20 bytes (never on disk) | Rebuilt on every read and write as `file_id` (u64 LE) ‖ `chunk_idx` (u32 LE) ‖ `generation` (u64 LE), 8 + 4 + 8 = 20 bytes (`chunk_aad`, `crates/luksbox-vfs/src/chunk.rs:39-45`). For chunk-list blocks `file_id` is the synthetic `list_file_id` (bit 63 set) and `chunk_idx` is the block's index in the chain. The AAD itself isn't stored, only its effect on the AEAD tag is. | Cut-and-paste / chunk-shuffling: an attacker swapping chunk 7 of file A onto chunk 12 of file B fails the AEAD tag because `file_id` and `chunk_idx` no longer match. Replay of an older version of the *same* slot fails because the inode now records a higher `generation` than the saved AAD bytes. |
+| **Per-file derived key** | 256 bits | `file_key = HKDF-SHA256(salt = header_salt, IKM = MVK, info = "lbx:file/v1:" ‖ file_id_le, L = 32)`, i.e. Extract then Expand (§3.3). Built by `file_key` (`crates/luksbox-vfs/src/chunk.rs:105-110`) through `Container::derive_subkey` (`crates/luksbox-format/src/container.rs`) and `MasterVolumeKey::derive_subkey` (`crates/luksbox-core/src/key.rs:87-93`); MVK rotation uses `file_key_for_mvk` in the same file. | The MVK never directly encrypts user data. Even a hypothetical nonce collision *within* one file leaves every other file untouched, and the same file_key is structurally never derivable for two distinct `file_id` values. |
 
 **Why three layers and not two:**
 
@@ -2466,6 +2634,250 @@ in `crates/luksbox-format/src/container.rs`. Full internal design:
 `docs/SEP_KEYSLOT_DESIGN.md`.
 
 ---
+
+## 22. Sync bundles (`.lbxs`)
+
+A sync bundle stores a vault as a folder of immutable, individually
+sealed objects that a cloud sync client replicates (crate
+`luksbox-sync`). The container (header, keyslots, metadata AEAD,
+chunk AEAD) is unchanged; the bundle adds an outer layer of sealed
+pages and an authenticated commit history. Rationale and threat
+model: `docs/CLOUD_SYNC_DESIGN.md`; build plan and invariants:
+`docs/CLOUD_SYNC_IMPLEMENTATION.md`. Since 0.7.0; status:
+experimental.
+
+### 22.1 Folder layout and names
+
+```
+<bundle>/
+  h/<bid>-<hgen>-<rnd>   header object: an 8192-byte LUKSBOX header (raw)
+  x/<bid>-<hgen>-<rnd>   hybrid post-quantum sidecar (raw sidecar bytes)
+  p/<aa>/<oid>           sealed page of the container image
+  t/<aa>/<oid>           sealed page-table block
+  m/<aa>/<oid>           sealed manifest (commit)
+  l/<lid>                sealed lease (one per open session)
+  */.tmp-<rnd>           temporary files of an interrupted write
+```
+
+`bid` is 16 random bytes (32 lowercase hex), `oid` and `lid` 32
+random bytes (64 hex), `aa` the first byte of `oid` (2 hex), `hgen`
+the header generation (16 hex, a hint only), `rnd` 16 random bytes.
+Names are matched exactly; anything else is foreign: counted, never
+parsed, never deleted.
+
+### 22.2 Image
+
+The image is the container in the detached-header layout (metadata
+region at offset 0, `data_offset = metadata_size`), cut into pages of
+`P` = 1, 4 or 16 MiB (fixed per bundle). Page `i` covers bytes
+`[i*P, (i+1)*P)`; the last page is zero-padded inside its seal; the
+image length is in the manifest. In a bundle, `write_metadata`
+refreshes only the first `max(1 MiB, next_pow2(ct_len + 36))` bytes of
+the metadata region (capped at the region), so a save changes few
+pages; the masked length field (R15-D2) stays.
+
+### 22.3 Keys
+
+```
+R_kind = HKDF-SHA256(salt = header_salt, IKM = MVK,
+                     info = "lbx:sync/<kind>/v1" || bid)        (32 bytes)
+         kind = page | table | manifest | lease | local
+K_enc || K_com = HKDF-Expand(PRK = R_kind,
+                     info = "lbx:sync/obj/v1" || kind_byte || oid, 64)
+```
+
+`kind_byte`: page 1, table 2, manifest 3, lease 4. Each `(K_enc,
+K_com)` seals exactly one object: `oid` is drawn from the OS RNG for
+every new object and never passed in by callers.
+
+### 22.4 Object envelope
+
+```
+object = commit (32) || AEAD_suite(K_enc, nonce = 0^12, AAD, plaintext) || tag (16)
+commit = HMAC-SHA256(K_com, "lbx:sync/commit/v1" || kind_byte || oid)
+AAD    = "lbxs" || u16 LE 1 || kind_byte || bid || oid || binding
+binding: page = page index (u64 LE), table = block index (u64 LE),
+         manifest and lease = empty
+```
+
+`AEAD_suite` is the vault's cipher suite. The commitment is compared
+in constant time before the AEAD runs. Object sizes are fixed: page
+`P + 48`, table block `65536 + 48`, lease `4096`, manifest one of
+16 KiB, 64 KiB, 256 KiB, 1 MiB. Variable plaintexts (manifest, lease)
+are framed as `len u32 LE || postcard payload || zero padding`;
+unframing requires every padding byte to be zero.
+
+### 22.5 Page table
+
+Block `j` holds entries for pages `[1024 j, 1024 (j+1))`: `oid (32) ||
+SHA-256(page object bytes) (32)`, all-zero for a hole (reads as
+zeros). A page is used only if its bytes hash to the entry and open
+under its `oid` with binding = its index.
+
+### 22.6 Manifest
+
+postcard of:
+
+```
+format u16 = 1, bundle [16], device [16], seq u64 (from 1, contiguous
+per device), lamport u64 (max of parents + 1), wall_clock_ns u64
+(informative), parents [<=8] (device, seq, oid, sha256), seen [<=256]
+(device, seq, sha256), checkpoint [<=256] (device, lowest kept seq),
+header (name or none, sha256 of the 8192 bytes, generation),
+hybrid (name, sha256) or none, page_size u32, logical_len u64,
+tables [ceil(pages/1024)] (oid, sha256), kind (Convert | Commit |
+Merge | Rotation | Restore | Gc), merge_log, gc_plan, device_label
+```
+
+A manifest's identity is `SHA-256(manifest object bytes)`: through the
+table and page hashes it commits to the whole image. Validation after
+opening: format, bundle id, `seq >= 1`, list bounds, page size, table
+count matching `logical_len`, sanitized label, kind/parent-count
+consistency, no device twice in `seen` or `checkpoint`.
+
+### 22.7 Device state (outside the bundle)
+
+`<data dir>/luksbox/sync/<bid>/`: `state` (device id and label, own
+newest seq, newest `(seq, hash)` seen per device, highest header
+generation seen, last head, a commit being published), `staged`
+(the last save: base commit and length, image length, staged pages
+`(index, oid, hash)`, staged header, and the lowest page count the
+image was truncated to since the base, past which base pages no
+longer count even where the image grew back), `p-<oid>` (the outbox:
+sealed pages not yet published, and pages of a save in progress),
+`manifest-pending` (exact bytes of the manifest being published).
+Records are sealed with `R_local` (random 12-byte nonce, AAD
+`"lbx:sync/local-record/v1" || bid || name`) and written with
+`atomic_secure_write`; the folder is 0700 and locked (one process per
+device). `<data dir>/luksbox/sync/paths/<sha256(canonical path)>`
+holds the bundle id last seen at a path (`BundleReplaced`).
+
+### 22.8 Opening
+
+1. Header objects (one bundle id only) are tried newest generation
+   first; the first the credential opens gives the MVK and keys.
+2. Every manifest is verified. A manifest is usable if its device's
+   sequence numbers are contiguous up to it (from the checkpoint) and
+   every parent is usable (or below the parent device's checkpoint).
+   Two manifests with one `(device, seq)` are an equivocation: both
+   kept, reported; the device involved takes a new identity.
+3. Against the device state: every recorded `(device, seq, hash)` at
+   or above the checkpoint must be present with that hash
+   (`RollbackDetected`, `Equivocation`); this device's own newest
+   commit must be one it wrote (`IdentityConflict` → new identity).
+   Every `parents` / `seen` entry of every verified manifest, usable or
+   not, must be present; a missing one makes the session read-only
+   (`Missing`).
+4. Heads (usable, nobody's parent) are ordered by `(lamport, hash)`.
+   The first complete one (all table blocks verify, all pages
+   present) is the head, else its newest complete ancestor, read-only.
+5. The head's header must open with the same credential
+   (`CredentialRevoked` otherwise); its generation must be at least
+   the highest seen.
+6. Staged changes made on this head are restored; staged changes made
+   on an older commit are merged onto the head (22.10) and published.
+7. Other complete heads are merged into the head, one merge commit
+   each (22.10).
+
+A device that has just converted a vault it holds unlocked opens the
+new bundle with that vault's MVK instead of a credential
+(`Session::open_with_key`): in steps 1 and 5 and wherever a keyslot
+table is re-checked, a header object counts as opened when it parses
+with the external layout and its HMAC verifies under that MVK
+(`Container::verify_external_header`). Everything else is the same.
+
+### 22.9 Publishing
+
+`Vfs::flush` (any `sync_all`) seals dirty pages into the outbox and
+rewrites `staged` (durable locally, nothing uploaded). A publish
+uploads exactly what `staged` holds, never pages changed or sealed
+early since (a save in progress), and does not hold the vault while
+it uploads: what the vault saves meanwhile is rebased onto the new
+commit (the published pages leave `staged`) and goes with the next
+publish. `publish`: refuse while a `Missing` notice holds; upload
+staged pages and new
+table blocks (`create_new`, no clobber, identical bytes accepted);
+upload a staged header as a new `h/` object; seal the manifest
+(`seq = own + 1`, `parents = [head]` (+ merged heads), `seen` = newest
+seen of the other devices); write `manifest-pending` and record it in
+`state`; upload the manifest; finalize `state`. A crash after the
+record re-uploads the same manifest bytes at the next open, so a
+device never writes two commits with one sequence number. If another
+device published meanwhile, the commit is published anyway as a
+second branch; the next open or `finish` merges.
+
+### 22.10 Merging
+
+`luksbox-merge` replays the changes of one version (ours) since a base
+onto a writable view of another (target), through the `Vfs` API
+(content decrypted and re-encrypted in memory). Files are matched by
+inode id when they exist in the base, by path otherwise. The base is
+the newest commit (by `(lamport, hash)`) on **both first-parent
+chains**: inode ids are preserved exactly along first parents (a
+merge writes into its first parent and gives copied-in files new
+ids), so only such a base matches files by id safely. The target is
+always the head every device would pick, so two devices merging the
+same branches produce the same tree. Rules: one-sided changes apply;
+same content on both sides is one file; different content keeps the
+target's at the path and ours as `name (conflict <label> <date>).ext`;
+an edit beats a delete; a folder deleted on one side and given new
+files on the other is re-created; nothing that cannot be placed is
+dropped (recovery folder). Keyslot tables are compared by meaning
+(format, layout, flags, generation, slot fields, SEP blobs; not
+padding): a change on one side only is adopted by the merge (a
+revocation is never undone). Changes on both sides are merged keyslot
+by keyslot against the base's table (a keyslot's AEAD binds its bytes
+and the header salt, not its index): a slot changed on one side takes
+that side's version; removed on one side and changed on the other, it
+stays removed; enrolled on both sides into the same free slot, the
+target's stays and the other moves to a slot free in all three tables
+(a post-quantum hybrid slot never moves: its sidecar entry is keyed by
+index); changed differently on both sides, the target's stays and the
+merge log says so. `FLAG_HAS_SEP_REGION` follows the merged slots, the
+generation is one above both sides', and the merged header is MAC'd
+anew under the MVK. If anything else in the header changed on both
+sides, the heads are not merged (`HeaderFork`). Unpublished local
+keyslot changes replayed onto a newer commit are merged the same way.
+
+### 22.11 Leases and garbage collection
+
+A writable session writes a sealed lease (`l/<lid>`, format 2: device,
+label, base commit, `pin`, `closed`, opened and heartbeat times). A
+heartbeat writes a new lease under a new `lid` and then removes the
+old one: no object, leases included, is ever rewritten, so each
+`(K_enc, K_com)` seals exactly one plaintext. On close the lease is
+replaced the same way by one with `closed = 1`, which the device's
+next session removes once its own lease is written. `pin` is the
+newest commit on the base's first-parent line made by another device.
+Fresh (< 15 min) leases that are not closed are reported; every lease
+pins its base and `pin` for 90 days after its last heartbeat, and
+garbage collection removes older leases.
+
+Garbage collection (explicit, one head, nothing missing) keeps as
+roots every device's newest commit, every commit younger than
+the retention or among the last `keep_last`, and every commit a lease
+pins (`base` and `pin`).
+Unreachable pages, table blocks, header and hybrid objects, and
+manifests below the new checkpoints are recorded in a `Gc` commit (at
+most 24 000 objects); a later pass, once the plan is at least the
+grace period old, deletes the planned objects still unreachable then.
+An entry whose area tag has bit `0x80` set was referenced by no commit
+known to the planner (an *orphan*, typically part of a commit whose
+manifest has not arrived yet); it waits the orphan grace period
+(90 days, never less than the grace period) instead. A plan's age is
+the younger of its own `wall_clock_ns` age and the time since the
+deleting device first saw it (recorded locally at every open; a plan
+dated in the future counts from that sighting only). A device whose
+clock is more than an hour behind its own newest commit or recorded
+sighting refuses to collect.
+
+### 22.12 What the storage provider learns
+
+Object counts and sizes per area (vault size rounded to a page; pages
+changed per commit), commit and lease timing, the number of sessions
+open, and the header (as with any `.lbx`). Not: file names, sizes,
+count, structure, which file changed, device labels, or which device
+committed.
 
 ## End-of-document references
 

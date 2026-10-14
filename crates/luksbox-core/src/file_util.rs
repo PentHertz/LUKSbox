@@ -604,7 +604,7 @@ pub fn secure_create_or_truncate(path: &Path) -> io::Result<File> {
 /// opened handle landed at the expected `canon\basename` rather than
 /// being redirected through an intermediate junction.
 #[cfg(windows)]
-fn final_path_by_handle(f: &File) -> io::Result<PathBuf> {
+pub fn final_path_by_handle(f: &File) -> io::Result<PathBuf> {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::io::AsRawHandle;
@@ -653,7 +653,7 @@ fn final_path_by_handle(f: &File) -> io::Result<PathBuf> {
 /// when the call fails (a missing component, or a path too long for
 /// it), which keeps that comparison strict.
 #[cfg(windows)]
-fn long_path_name(p: &Path) -> PathBuf {
+pub fn long_path_name(p: &Path) -> PathBuf {
     use std::ffi::OsString;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
@@ -692,7 +692,7 @@ fn long_path_name(p: &Path) -> PathBuf {
 /// false redirect alarms from prefix / drive-letter / component case
 /// differences.
 #[cfg(windows)]
-fn windows_paths_eq_ci(a: &Path, b: &Path) -> bool {
+pub fn windows_paths_eq_ci(a: &Path, b: &Path) -> bool {
     fn normalize(p: &Path) -> String {
         let s = p.as_os_str().to_string_lossy();
         // `\\?\UNC\server\share\..` describes the share `\\server\share\..`.

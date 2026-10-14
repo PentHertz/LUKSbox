@@ -539,6 +539,21 @@ fn read_metadata_mirror_nofollow(path: &Path, expected_len: usize) -> std::io::R
 enum HeaderStorage {
     Inline,
     Detached(File, PathBuf),
+    /// The header lives in a store the caller provides (a sync bundle,
+    /// `luksbox-sync`). The image then uses the detached layout
+    /// (metadata region at offset 0) and is reached only through
+    /// `LbxFile`: no sidecar mirrors, no path-based writes, no
+    /// `.rotating` temp file, no file lock (the store locks).
+    External(Box<dyn HeaderStore>),
+}
+
+/// Persistence for the header of a container opened with
+/// [`Container::open_external`]. `store_header` receives every new
+/// header state (`persist_header`, `restore_header_bytes`) and must make
+/// it durable before returning; the caller decides when it becomes
+/// visible to other devices.
+pub trait HeaderStore: Send {
+    fn store_header(&mut self, bytes: &[u8; HEADER_SIZE]) -> std::io::Result<()>;
 }
 
 use crate::error::Error;
@@ -690,6 +705,11 @@ pub struct Container {
     /// no metadata flush follows. Lags the vault at worst, which the
     /// anchor tolerates (`AnchorStale`).
     anchored_metadata_gen: Option<u64>,
+    /// Set by [`Container::set_read_only`]: every write path (header,
+    /// metadata, data, truncation, header restore) returns
+    /// `Error::ReadOnly`, and `Drop` writes nothing. Used for the
+    /// snapshot views a merge reads from.
+    read_only: bool,
     // Locks are held intrinsically by `file` (and by the `File`
     // inside `header_storage` when detached). When the Container is
     // dropped, those handles are dropped, which releases their
@@ -1005,6 +1025,11 @@ impl Container {
                 let mut hf = secure_create_new(hp)?;
                 hf.write_all(&header_bytes)?;
                 hf.flush()?;
+                // Durable before the vault is handed out: a crash right
+                // after create must not leave a header that never
+                // reached the disk.
+                hf.sync_all()?;
+                sync_parent_dir(hp)?;
                 HeaderStorage::Detached(hf, hp.to_path_buf())
             }
         };
@@ -1013,6 +1038,8 @@ impl Container {
         metadata::write_metadata(cipher, &mvk, &header.header_salt, b"", &mut region)?;
         file.write_all(&region)?;
         file.flush()?;
+        file.sync_all()?;
+        sync_parent_dir(path)?;
 
         // Lock the just-created handles in place (see lock_handles
         // doc for why we reuse the I/O handles instead of opening
@@ -1026,6 +1053,9 @@ impl Container {
             }
             (HeaderStorage::Detached(_, _), None) => {
                 unreachable!("Detached header storage requires a header_path, this is a bug")
+            }
+            (HeaderStorage::External(_), _) => {
+                unreachable!("file-backed paths never build External header storage")
             }
         }
 
@@ -1041,6 +1071,7 @@ impl Container {
             deniable: None,
             metadata_recovered_from_mirror: false,
             anchored_metadata_gen: None,
+            read_only: false,
         })
     }
 
@@ -1500,6 +1531,8 @@ impl Container {
         metadata::write_metadata_opts(cipher, &mvk, &salt, b"", &mut region, true)?;
         file.write_all(&region)?;
         file.flush()?;
+        file.sync_all()?;
+        sync_parent_dir(path)?;
 
         lock_handles(&[(&file, path)])?;
 
@@ -1524,6 +1557,7 @@ impl Container {
             }),
             metadata_recovered_from_mirror: false,
             anchored_metadata_gen: None,
+            read_only: false,
         })
     }
 
@@ -1683,6 +1717,7 @@ impl Container {
             }),
             metadata_recovered_from_mirror: false,
             anchored_metadata_gen: None,
+            read_only: false,
         })
     }
 
@@ -1993,6 +2028,11 @@ impl Container {
                 let mut hf = secure_create_new(hp)?;
                 hf.write_all(&header_bytes)?;
                 hf.flush()?;
+                // Durable before the vault is handed out: a crash right
+                // after create must not leave a header that never
+                // reached the disk.
+                hf.sync_all()?;
+                sync_parent_dir(hp)?;
                 HeaderStorage::Detached(hf, hp.to_path_buf())
             }
         };
@@ -2001,6 +2041,8 @@ impl Container {
         metadata::write_metadata(cipher, &mvk, &header.header_salt, b"", &mut region)?;
         file.write_all(&region)?;
         file.flush()?;
+        file.sync_all()?;
+        sync_parent_dir(path)?;
 
         // Lock the handles we already have open. Inline mode locks
         // just `file`; detached mode also locks the header sidecar.
@@ -2018,6 +2060,9 @@ impl Container {
             (HeaderStorage::Detached(_, _), None) => {
                 unreachable!("Detached header storage requires a header_path, this is a bug")
             }
+            (HeaderStorage::External(_), _) => {
+                unreachable!("file-backed paths never build External header storage")
+            }
         }
 
         Ok(Self {
@@ -2032,6 +2077,7 @@ impl Container {
             deniable: None,
             metadata_recovered_from_mirror: false,
             anchored_metadata_gen: None,
+            read_only: false,
         })
     }
 
@@ -2066,6 +2112,7 @@ impl Container {
             deniable: None,
             metadata_recovered_from_mirror: false,
             anchored_metadata_gen: None,
+            read_only: false,
         })
     }
 
@@ -2121,6 +2168,7 @@ impl Container {
             deniable: None,
             metadata_recovered_from_mirror: false,
             anchored_metadata_gen: None,
+            read_only: false,
         })
     }
 
@@ -2251,6 +2299,7 @@ impl Container {
             }),
             metadata_recovered_from_mirror: false,
             anchored_metadata_gen: None,
+            read_only: false,
         })
     }
 
@@ -2311,6 +2360,9 @@ impl Container {
             (HeaderStorage::Detached(_, _), None) => {
                 unreachable!("Detached header storage requires a header_path, this is a bug")
             }
+            (HeaderStorage::External(_), _) => {
+                unreachable!("file-backed paths never build External header storage")
+            }
         }
 
         // Post-lock TOCTOU re-verification: the open above and the lock just
@@ -2349,6 +2401,9 @@ impl Container {
             }
             (HeaderStorage::Detached(_, _), None) => {
                 unreachable!("Detached header storage requires a header_path, this is a bug")
+            }
+            (HeaderStorage::External(_), _) => {
+                unreachable!("file-backed paths never build External header storage")
             }
         }
         let header = Header::from_bytes(&header_bytes)?;
@@ -2481,6 +2536,11 @@ impl Container {
                 // is AEAD-bound to the same MVK and header_salt, so a
                 // forged or attacker-substituted mirror fails the same
                 // way live did and we surface the live error.
+                // External storage has no mirrors and no path to look
+                // next to: its commits are atomic by construction.
+                if self.is_external() {
+                    return Err(live_err);
+                }
                 let mirror_path = self.metadata_mirror_path();
                 if !mirror_path.exists() {
                     return Err(live_err);
@@ -2558,13 +2618,27 @@ impl Container {
     /// v0.2.0 in-place rewrite behavior until the auto-upgrade trigger
     /// in `Vfs::flush` bumps them to v2.
     pub fn write_metadata(&mut self, plaintext: &[u8]) -> Result<(), Error> {
+        self.ensure_writable()?;
         #[cfg(feature = "test-injection")]
         record_flush_op(FlushOp::WriteMetadata);
         let region_size = self.header.metadata_size as usize;
         if plaintext.len() + METADATA_OVERHEAD > region_size {
             return Err(Error::MetadataTooLarge);
         }
-        let mut region = vec![0u8; region_size];
+        // External storage (sync bundles): refresh only a prefix of the
+        // region, the ciphertext rounded up to a power-of-two bucket of
+        // at least 1 MiB, instead of all 64 MiB. Bytes past the bucket
+        // keep whatever random or stale-ciphertext bytes they held, so
+        // the storage layer sees (and uploads) only the bucket. What a
+        // provider comparing two versions learns is the metadata size
+        // bucket, not its exact size (the stored length stays masked).
+        // File vaults keep refreshing the whole region.
+        let written_len = if self.is_external() {
+            external_metadata_write_len(plaintext.len() + METADATA_OVERHEAD, region_size)
+        } else {
+            region_size
+        };
+        let mut region = vec![0u8; written_len];
         metadata::write_metadata_opts(
             self.header.cipher_suite,
             &self.mvk,
@@ -2621,7 +2695,9 @@ impl Container {
             .seek(SeekFrom::Start(self.header.metadata_offset))?;
         self.file.write_all(&region)?;
         self.file.sync_all()?;
-        sync_parent_dir(&self.path)?;
+        if !self.is_external() {
+            sync_parent_dir(&self.path)?;
+        }
         Ok(())
     }
 
@@ -2675,6 +2751,7 @@ impl Container {
         self.header.version_major >= luksbox_core::VERSION_MAJOR_V2
             && self.deniable.is_none()
             && self.rotation.is_none()
+            && !self.is_external()
     }
 
     /// Write the metadata mirror to the **intended new bytes** (NOT
@@ -3441,6 +3518,7 @@ impl Container {
         if !self.header_dirty {
             return Ok(());
         }
+        self.ensure_writable()?;
         if let Some(deniable) = &self.deniable {
             // Deniable-mode persist: write the cached 36 KiB header
             // buffer wholesale. Detached headers are not yet
@@ -3560,6 +3638,9 @@ impl Container {
                     *hf = new_hf;
                 }
             }
+            HeaderStorage::External(store) => {
+                store.store_header(&bytes)?;
+            }
         }
         Ok(())
     }
@@ -3661,6 +3742,7 @@ impl Container {
     /// stale relative to disk; the caller should drop the container
     /// rather than continue using it.
     pub fn restore_header_bytes(&mut self, bytes: &[u8; HEADER_SIZE]) -> Result<(), Error> {
+        self.ensure_writable()?;
         match &mut self.header_storage {
             HeaderStorage::Inline => {
                 self.file.seek(SeekFrom::Start(0))?;
@@ -3683,6 +3765,9 @@ impl Container {
                 if let HeaderStorage::Detached(hf, _) = &mut self.header_storage {
                     *hf = new_hf;
                 }
+            }
+            HeaderStorage::External(store) => {
+                store.store_header(bytes)?;
             }
         }
         // The in-memory header is now out of sync with disk. Mark it
@@ -3754,6 +3839,7 @@ impl Container {
 
     /// Write raw bytes at `offset`. Same contract as `read_at`.
     pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), Error> {
+        self.ensure_writable()?;
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.write_all(buf)?;
         Ok(())
@@ -3769,6 +3855,7 @@ impl Container {
     /// giving back free space at the end of the data area
     /// (`Vfs::shrink`); refuses to cut into the metadata region.
     pub fn truncate_data_file(&mut self, len: u64) -> Result<(), Error> {
+        self.ensure_writable()?;
         if len < self.data_offset() {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -3951,18 +4038,255 @@ impl Container {
         self.anchor_path.as_ref().and(self.anchored_metadata_gen)
     }
 
-    /// Path of the underlying vault file (the `.lbx`).
+    /// Path of the underlying vault file (the `.lbx`), or of the sync
+    /// bundle folder for a container opened with `open_external`.
     pub fn vault_path(&self) -> &Path {
         &self.path
     }
 
     /// Path where the 8 KB header lives. Returns the vault path itself
     /// for inline-header vaults (header occupies the first 8 KB), or the
-    /// detached sidecar path for detached-header vaults.
+    /// detached sidecar path for detached-header vaults. For external
+    /// storage it is the bundle folder: there is no header file to
+    /// write to directly.
     pub fn header_storage_path(&self) -> &Path {
         match &self.header_storage {
-            HeaderStorage::Inline => &self.path,
+            HeaderStorage::Inline | HeaderStorage::External(_) => &self.path,
             HeaderStorage::Detached(_, p) => p,
+        }
+    }
+
+    /// Whether the file at `vault_path` is no longer the file this
+    /// container has open: a sync client (or anything else) replaced it
+    /// with a rename, so every write now lands in an unlinked file that
+    /// disappears when the vault is closed. Unix only (Windows refuses to
+    /// replace a file held open). False for external storage, during a
+    /// rotation, and for in-memory test files.
+    pub fn replaced_on_disk(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if self.is_external() || self.rotation.is_some() {
+                return false;
+            }
+            let Ok(open) = self.file.inode_pair() else {
+                return false;
+            };
+            if open == (0, 0) {
+                return false;
+            }
+            match std::fs::symlink_metadata(&self.path) {
+                Ok(m) => (m.dev(), m.ino()) != open,
+                Err(_) => true,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
+    /// Copy the whole open vault file (as this container sees it, which
+    /// may be an unlinked file) to `dest`, replacing an earlier rescue
+    /// copy at that path. For saving changes after `replaced_on_disk`.
+    pub fn rescue_copy(&mut self, dest: &Path) -> Result<(), Error> {
+        use std::io::Write;
+        let len = self.file.seek(SeekFrom::End(0))?;
+        let tmp = append_extension(dest, "partial");
+        let _ = std::fs::remove_file(&tmp);
+        let mut out = secure_create_new(&tmp)?;
+        let mut buf = vec![0u8; 1 << 20];
+        let mut off = 0u64;
+        while off < len {
+            let n = (len - off).min(buf.len() as u64) as usize;
+            self.file.seek(SeekFrom::Start(off))?;
+            self.file.read_exact(&mut buf[..n])?;
+            out.write_all(&buf[..n])?;
+            off += n as u64;
+        }
+        out.sync_all()?;
+        drop(out);
+        std::fs::rename(&tmp, dest)?;
+        sync_parent_dir(dest)?;
+        Ok(())
+    }
+
+    /// Whether this container was opened with [`Container::open_external`]
+    /// (a sync bundle) rather than from `.lbx` / `.hdr` files.
+    pub fn is_external(&self) -> bool {
+        matches!(self.header_storage, HeaderStorage::External(_))
+    }
+
+    /// Refuse every write from now on (see the `read_only` field). There
+    /// is no way back: a view opened read-only stays read-only.
+    pub fn set_read_only(&mut self) {
+        self.read_only = true;
+    }
+
+    pub fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    fn ensure_writable(&self) -> Result<(), Error> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        Ok(())
+    }
+
+    /// Open a container whose image and header the caller supplies,
+    /// for sync bundles (`luksbox-sync`). `image` serves the
+    /// detached-header layout (metadata region at offset 0, chunk slots
+    /// after it); `header_bytes` is the current header; `store`
+    /// receives every new header state. `display_path` is what
+    /// `vault_path` reports (the bundle folder).
+    ///
+    /// Unlock and HMAC verification are exactly those of
+    /// [`Container::open`]. Nothing is locked, mirrored or written next
+    /// to `display_path`: locking and atomic commits are the store's
+    /// job.
+    pub fn open_external(
+        image: Box<dyn LbxFile>,
+        header_bytes: &[u8; HEADER_SIZE],
+        store: Box<dyn HeaderStore>,
+        display_path: PathBuf,
+        mut material: UnlockMaterial<'_>,
+    ) -> Result<Self, Error> {
+        let (header, mvk) = Self::unlock_external_header(header_bytes, &mut material)?;
+        Ok(Self::assemble_external(
+            image,
+            header,
+            mvk,
+            store,
+            display_path,
+        ))
+    }
+
+    /// [`Container::open_external`] with an already-recovered MVK (the
+    /// sync layer re-opening a snapshot it already unlocked). The header
+    /// HMAC is still verified against `mvk`.
+    pub fn open_external_with_mvk(
+        image: Box<dyn LbxFile>,
+        header_bytes: &[u8; HEADER_SIZE],
+        store: Box<dyn HeaderStore>,
+        display_path: PathBuf,
+        mvk: MasterVolumeKey,
+    ) -> Result<Self, Error> {
+        let header = Self::verify_external_header(header_bytes, &mvk)?;
+        Ok(Self::assemble_external(
+            image,
+            header,
+            mvk,
+            store,
+            display_path,
+        ))
+    }
+
+    /// Check a header for external storage against a master key already
+    /// in hand, instead of unlocking one of its keyslots: the layout, and
+    /// the header HMAC under `mvk`. For the sync layer opening a bundle
+    /// it has just made from an unlocked vault.
+    pub fn verify_external_header(
+        header_bytes: &[u8; HEADER_SIZE],
+        mvk: &MasterVolumeKey,
+    ) -> Result<Header, Error> {
+        let header = Self::parse_external_header(header_bytes)?;
+        header.verify_hmac(header_bytes, mvk)?;
+        Ok(header)
+    }
+
+    /// Unlock a header for external storage without an image: try
+    /// `material` against its keyslots and verify the HMAC. The sync
+    /// layer needs the MVK before it can locate the image (its commits
+    /// are sealed under MVK-derived keys), and may try several header
+    /// versions with the same material; it then opens the container
+    /// with [`Container::open_external_with_mvk`].
+    pub fn unlock_external_header(
+        header_bytes: &[u8; HEADER_SIZE],
+        material: &mut UnlockMaterial<'_>,
+    ) -> Result<(Header, MasterVolumeKey), Error> {
+        let header = Self::parse_external_header(header_bytes)?;
+        let mvk = try_unlock(&header, material)?;
+        header.verify_hmac(header_bytes, &mvk)?;
+        Ok((header, mvk))
+    }
+
+    /// The header of this vault laid out for external storage: the
+    /// detached layout (metadata region at offset 0, data right after
+    /// it), the mirror flags cleared (a bundle has no sidecar mirrors),
+    /// and on header format v3 a new header generation, since it is a
+    /// new header state. Returns the serialized header together with
+    /// the image range of this vault that goes with it:
+    /// `[metadata_offset, end of file)`. The vault itself is unchanged.
+    pub fn export_external_header(&self) -> Result<([u8; HEADER_SIZE], u64), Error> {
+        if self.is_deniable() {
+            return Err(Error::UnsupportedForExternalStorage("a deniable vault"));
+        }
+        let mut h = self.header.clone();
+        let image_start = h.metadata_offset;
+        h.metadata_offset = 0;
+        h.data_offset = h.metadata_size;
+        h.flags &= !(FLAG_HAS_METADATA_MIRROR | FLAG_HAS_HEADER_MIRROR);
+        if h.has_header_generation() {
+            h.header_generation = next_header_generation(h.header_generation)?;
+        }
+        Ok((h.to_bytes(&self.mvk), image_start))
+    }
+
+    /// The inverse of [`Container::export_external_header`], for turning
+    /// a bundle back into a single `.lbx`: the header laid out inline
+    /// (metadata region right after the 8 KiB header) with a new header
+    /// generation on header format v3. The image of this container is
+    /// written after it unchanged.
+    pub fn export_inline_header(&self) -> Result<[u8; HEADER_SIZE], Error> {
+        if self.is_deniable() {
+            return Err(Error::UnsupportedForExternalStorage("a deniable vault"));
+        }
+        if self.header.metadata_offset != 0 {
+            return Err(Error::Crypto(luksbox_core::Error::InvalidField));
+        }
+        let mut h = self.header.clone();
+        h.metadata_offset = HEADER_SIZE as u64;
+        h.data_offset = HEADER_SIZE as u64 + h.metadata_size;
+        if h.has_header_generation() {
+            h.header_generation = next_header_generation(h.header_generation)?;
+        }
+        Ok(h.to_bytes(&self.mvk))
+    }
+
+    /// Parse a header for external storage. Only the detached layout is
+    /// accepted: the image holds no header, so a layout that puts the
+    /// metadata region past offset 0 would leave the image's first 8 KiB
+    /// unaccounted for. Deniable headers never reach this point (they
+    /// have no plaintext structure for `Header::from_bytes` to accept).
+    fn parse_external_header(header_bytes: &[u8; HEADER_SIZE]) -> Result<Header, Error> {
+        let header = Header::from_bytes(header_bytes)?;
+        if header.metadata_offset != 0 || header.data_offset != header.metadata_size {
+            return Err(Error::Crypto(luksbox_core::Error::InvalidField));
+        }
+        Ok(header)
+    }
+
+    fn assemble_external(
+        image: Box<dyn LbxFile>,
+        header: Header,
+        mvk: MasterVolumeKey,
+        store: Box<dyn HeaderStore>,
+        display_path: PathBuf,
+    ) -> Self {
+        Self {
+            file: image,
+            path: display_path,
+            header_storage: HeaderStorage::External(store),
+            header,
+            mvk,
+            header_dirty: false,
+            anchor_path: None,
+            rotation: None,
+            deniable: None,
+            metadata_recovered_from_mirror: false,
+            anchored_metadata_gen: None,
+            read_only: false,
         }
     }
 
@@ -4162,6 +4486,9 @@ impl Container {
         let stale_header_mirror = match &self.header_storage {
             HeaderStorage::Inline => append_extension(&state.committed_data_path, "header-bak"),
             HeaderStorage::Detached(_, hp) => append_extension(hp, "header-bak"),
+            HeaderStorage::External(_) => {
+                unreachable!("external storage never runs a file rotation")
+            }
         };
         for stale in [&stale_meta_mirror, &stale_header_mirror] {
             if stale.exists()
@@ -4251,9 +4578,23 @@ impl Container {
     }
 }
 
+/// How many bytes of the metadata region an external-storage write
+/// refreshes: `needed` rounded up to a power of two, at least 1 MiB, at
+/// most the whole region.
+fn external_metadata_write_len(needed: usize, region_size: usize) -> usize {
+    const MIN_BUCKET: usize = 1 << 20;
+    needed
+        .max(MIN_BUCKET)
+        .checked_next_power_of_two()
+        .unwrap_or(region_size)
+        .min(region_size)
+}
+
 impl Drop for Container {
     fn drop(&mut self) {
-        let _ = self.persist_header();
+        if !self.read_only {
+            let _ = self.persist_header();
+        }
     }
 }
 
@@ -4264,7 +4605,7 @@ impl Drop for Container {
 /// header bytes).
 fn header_mirror_path_for(vault: &Path, storage: &HeaderStorage) -> PathBuf {
     let base = match storage {
-        HeaderStorage::Inline => vault.to_path_buf(),
+        HeaderStorage::Inline | HeaderStorage::External(_) => vault.to_path_buf(),
         HeaderStorage::Detached(_, hp) => hp.clone(),
     };
     append_extension(&base, "header-bak")
@@ -4360,6 +4701,9 @@ fn open_lock_no_header(
         }
         (HeaderStorage::Detached(_, _), None) => {
             unreachable!("Detached header storage requires a header_path")
+        }
+        (HeaderStorage::External(_), _) => {
+            unreachable!("file-backed paths never build External header storage")
         }
     }
     verify_path_inode(&canonical_path, file_inode)?;

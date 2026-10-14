@@ -20,7 +20,7 @@ pub mod metadata;
 pub mod sim_file;
 pub mod unseal_errors;
 
-pub use crate::container::{Container, LbxFile, UnlockMaterial};
+pub use crate::container::{Container, HeaderStore, LbxFile, UnlockMaterial};
 pub use crate::error::Error;
 pub use crate::metadata::{DEFAULT_METADATA_REGION_SIZE, METADATA_OVERHEAD};
 pub use crate::unseal_errors::UnsealErrors;

@@ -77,6 +77,41 @@ mod winfsp;
 ))]
 pub(crate) const LAZY_FLUSH_INTERVAL_SECS: u64 = 30;
 
+/// When the commit hook runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitPoint {
+    /// After a deferred-flush timer save, with the Vfs locked.
+    Periodic,
+    /// After the final save of an unmount.
+    Unmount,
+}
+
+type CommitHook = Box<dyn FnMut(CommitPoint) + Send>;
+static COMMIT_HOOK: std::sync::Mutex<Option<CommitHook>> = std::sync::Mutex::new(None);
+
+/// Install (or clear) a hook the mount calls after its saves. A vault in
+/// a sync bundle uses it to publish what was saved (periodically, and at
+/// unmount). The hook is process-wide and survives the fork of a
+/// background mount, so set it before calling [`mount`].
+pub fn set_commit_hook(hook: Option<CommitHook>) {
+    if let Ok(mut g) = COMMIT_HOOK.lock() {
+        *g = hook;
+    }
+}
+
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "fuse"),
+    all(target_os = "macos", feature = "fuse-t"),
+    all(target_os = "windows", feature = "winfsp"),
+))]
+pub(crate) fn commit_point(p: CommitPoint) {
+    if let Ok(mut g) = COMMIT_HOOK.lock()
+        && let Some(h) = g.as_mut()
+    {
+        h(p);
+    }
+}
+
 /// Final save when a mount ends, shared by the three backends:
 /// `Vfs::finish`, which flushes and then gives back the free space at the
 /// end of the vault if `Vfs::set_shrink_on_close(true)` was called. The
@@ -95,6 +130,21 @@ pub(crate) fn finish_on_unmount(vfs: &mut luksbox_vfs::Vfs) {
         ),
         Err(e) => eprintln!("luksbox-mount: final unmount flush failed: {e}"),
     }
+    commit_point(CommitPoint::Unmount);
+}
+
+/// Flush from the deferred-flush timer, then give the commit hook its
+/// periodic chance, still under the caller's Vfs lock so no write can
+/// slip in between the save and the hook.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "fuse"),
+    all(target_os = "macos", feature = "fuse-t"),
+    all(target_os = "windows", feature = "winfsp"),
+))]
+pub(crate) fn flush_and_commit(vfs: &mut luksbox_vfs::Vfs) -> Result<(), luksbox_vfs::Error> {
+    vfs.flush()?;
+    commit_point(CommitPoint::Periodic);
+    Ok(())
 }
 
 /// Re-export of `winfsp::winfsp_preflight` so the GUI can fail the

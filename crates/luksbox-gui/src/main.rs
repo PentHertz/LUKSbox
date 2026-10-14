@@ -13,6 +13,7 @@ mod fonts;
 mod ops;
 mod preferences;
 mod recent;
+mod sync_gui;
 mod theme;
 #[cfg(target_os = "linux")]
 mod wayland_dnd;
@@ -24,6 +25,17 @@ use app::LuksboxApp;
 const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 fn main() -> eframe::Result<()> {
+    // A file-dialog helper process (see `file_dialog`): it must skip the
+    // hardening below, which keeps the desktop portal from serving it,
+    // and it never reaches vault code or keys.
+    #[cfg(target_os = "linux")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|a| a == file_dialog::HELPER_ARG)
+    {
+        file_dialog::install_logger();
+        std::process::exit(file_dialog::run_helper(std::env::args_os().skip(2)));
+    }
     // Surface rfd's file-dialog errors (and other library warnings) on
     // stderr, and let the GUI tell "dialog failed" from "cancelled".
     file_dialog::install_logger();
