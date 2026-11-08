@@ -32,6 +32,11 @@ Every keyslot kind works as with a `.lbx` (passphrase, FIDO2, TPM,
 Secure Enclave, post-quantum hybrid). Each computer can have its own
 TPM or Secure Enclave keyslot.
 
+The bundle folder can be on any local disk or removable drive the sync
+client watches, including exFAT and FAT32 (a USB stick or SD card shared
+with Windows); on exFAT, which has no hard links, objects are installed
+with an exclusive placeholder and a rename instead.
+
 ## Create one
 
 ```bash
@@ -108,15 +113,26 @@ least 7 days later deletes it if it is still unused, so a device that
 was offline never loses what it was working on. The 7 days also count
 from when this computer first saw the record, whatever the other
 computer's clock said. Pieces of a commit whose upload is still in
-progress elsewhere are kept 90 days. Do not use `--grace-days 0` while
-another computer may be uploading.
+progress elsewhere are kept 90 days. `--grace-days 0` deletes in one
+run and needs `--yes`: do not use it while another computer may be
+uploading. A commit `gc` deleted never comes back into the vault, even
+if the sync service restores it from its own history.
 
 To merge two copies of a regular `.lbx` (for example the "conflicted
-copy" a sync service made):
+copy" a sync service made), give the copy first and the vault second:
 
 ```bash
-luksbox merge mine.lbx "vault (conflicted copy).lbx" -o merged.lbx
+luksbox merge "vault (conflicted copy).lbx" vault.lbx -o merged.lbx
 ```
+
+The result keeps the keyslots and master key of the second file and
+takes the changes of the first. `luksbox merge` refuses copies of
+different vaults or under different master keys (a rotation in
+between), and refuses the files the wrong way round (an older keyslot
+table second, which would bring back a revoked key) with the command to
+run instead. It also checks this computer's rollback anchors: a merge
+whose two copies are both older than what this computer has seen is
+refused.
 
 ## Crashes, power loss, damaged files
 
@@ -132,8 +148,13 @@ luksbox merge mine.lbx "vault (conflicted copy).lbx" -o merged.lbx
   same commit again. Parts of a commit that never completed are removed
   by `sync gc` after 90 days.
 - **On the other computers.** A half-synced folder never opens as a
-  mixed state: a device opens the newest complete version, or opens
-  read-only while something it already saw is missing.
+  mixed state, nor as an older version than one this computer has seen:
+  a device opens the newest complete version that contains what it saw
+  last. If parts of that version have not arrived (or are damaged), it
+  opens read-only on what it saw while newer parts arrive, or refuses to
+  open for writing until they are there; `sync snapshots` and `sync
+  export --snapshot` still read earlier versions. A version that `sync
+  gc` deleted never comes back, even if the sync service restores it.
 - **Damage.** Every part is authenticated: a damaged or altered part is
   refused instead of shown. Earlier versions stay in the folder (30
   days with `sync gc`'s default), so a file can be copied back from one:
@@ -158,8 +179,9 @@ luksbox merge mine.lbx "vault (conflicted copy).lbx" -o merged.lbx
   uploads with nobody watching. An upload that fails is retried, and
   the failure is remembered on this computer: the next open and
   `luksbox sync status` say so ("the last upload from this device
-  failed"). `luksbox umount` returns before the final upload runs;
-  give the sync client a moment before switching off.
+  failed"). `luksbox umount` returns once the mount has saved and
+  published into the bundle folder; the sync client then uploads it, so
+  give it a moment before switching off.
 
 What is not on the bundle side yet: the `.lbx` tools `check`, `extract`
 and header backup / restore (`sync verify` and `sync export` cover
@@ -183,8 +205,22 @@ kept, and so is the folder if they are there.
   is withholding part of the history. Nothing is written until it
   arrives.
 - **"rollback detected"**: the folder shows an older version than this
-  computer has already seen. Check the sync service (restored
-  version, history rollback). The vault is not opened.
+  computer has already seen, or part of the history it saw is gone.
+  Check the sync service (restored version, history rollback). The
+  vault is not opened.
+- **"the newest version this device has seen ... is not complete in the
+  bundle"**: some of its parts are missing or damaged (the sync is still
+  running, or the sync service is withholding or has altered them). The
+  vault is not opened for writing rather than shown as an older
+  version; open it again once the sync has finished. `luksbox sync
+  snapshots` and `luksbox sync export --snapshot` can still read earlier
+  versions (read-only, with a warning).
+- **"N concurrent version(s) were not merged: the version they come from
+  is not complete in the bundle"**: two devices changed the vault at the
+  same time and the version both started from has not fully arrived.
+  They are merged once it has (wait for the sync); until then each
+  device keeps its own version. Changes saved here meanwhile are kept
+  and shown read-only ("cannot be merged yet").
 - **"this credential was revoked"**: the passphrase or key still opens
   an old keyslot table left in the folder, but not the current one.
 - **"two installations used one device identity"**: the same LuksBox
@@ -221,6 +257,10 @@ kept, and so is the folder if they are there.
   included in an export, and uploaded the next time the vault opens
   read-write. Do not delete the bundle or this computer's sync state
   while this shows.
+- **"an area folder was moved or replaced while the bundle was open"**:
+  a folder inside the bundle (`p`, `m`, `t`...) was moved away while the
+  vault was open (by the sync client, or by hand). Nothing was written
+  outside the bundle; close the vault, check the folder, open it again.
 - **"the last upload from this device failed"**: a background upload
   did not complete (network, the sync service, the disk). The changes
   are on this computer and the upload is retried; `luksbox sync push`

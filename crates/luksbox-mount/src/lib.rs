@@ -43,6 +43,14 @@ mod unix_statvfs;
 ))]
 mod mountpoint;
 
+// "The mount is still saving" lock, so `unmount` returns only once the
+// vault is saved and released; used by both Unix mount adapters.
+#[cfg(any(
+    all(any(target_os = "linux", target_os = "macos"), feature = "fuse"),
+    all(target_os = "macos", feature = "fuse-t"),
+))]
+mod busy;
+
 // Shared fork-to-background helpers (`luksbox mount` daemonizes by
 // default), used by both Unix mount adapters.
 #[cfg(any(

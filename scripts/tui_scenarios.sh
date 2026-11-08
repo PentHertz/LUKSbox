@@ -12,10 +12,19 @@
 #   scripts/tui_scenarios.sh target/release/luksbox
 #
 # Runs in a temporary folder used as HOME (the wizard expands `~/`).
-# Needs FUSE for the deniable mount step (skipped without /dev/fuse).
+# Needs FUSE (Linux) or FUSE-T / macFUSE (macOS) for the mount steps,
+# which are skipped without one.
 # Menu positions are those of the current wizard: when a menu changes,
 # update the matching step here.
 set -u
+# Portable to macOS (its stock bash 3.2, BSD tools and FUSE-T) as well as
+# Linux: GNU `timeout`, `mountpoint` and `fusermount3` are not there.
+if command -v timeout >/dev/null 2>&1; then TMO=(timeout 300); else TMO=(perl -e 'alarm shift; exec @ARGV or exit 127' 300); fi
+is_mounted() {
+  mountpoint -q "$1" 2>/dev/null && return 0
+  local d; d=$(cd "$1" 2>/dev/null && pwd -P) || return 1
+  mount | grep -qF " on $d ("
+}
 B=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 D=$(cd "$(dirname "$0")" && pwd)/tui_drive.py
 W=$(mktemp -d "${TMPDIR:-/tmp}/luksbox-tui.XXXXXX")
@@ -27,7 +36,7 @@ PASS=0; FAIL=0
 step() { # name json [expected-text-in-transcript...]
   local name=$1 json=$2; shift 2
   rm -f t.log
-  if PTY_LOG=$W/t.log timeout 300 python3 -I "$D" "$json" -- "$B" "${CMD[@]}" >r.txt 2>&1; then
+  if PTY_LOG=$W/t.log "${TMO[@]}" python3 -I "$D" "$json" -- "$B" "${CMD[@]}" >r.txt 2>&1; then
     local miss=""
     for n in "$@"; do grep -aqF -- "$n" t.log || miss="$miss [$n]"; done
     if [ -z "$miss" ]; then PASS=$((PASS+1)); return; fi
@@ -38,6 +47,18 @@ step() { # name json [expected-text-in-transcript...]
   FAIL=$((FAIL+1))
 }
 DN=$'\x1b[B'; UP=$'\x1b[A'
+# Mounting needs FUSE (Linux) or FUSE-T / macFUSE (macOS). On macOS the
+# wizard first offers a private mountpoint under ~/Library (answered
+# no), and FUSE-T, not luksbox, handles Ctrl-C in a foreground mount.
+MP=(); INTR=("received interrupt, unmounting cleanly")
+case $(uname) in
+  Darwin)
+    MP=("private mountpoint" n)
+    if "$B" --version 2>/dev/null | grep -q 'FUSE backend: fuse-t' && [ -d '/Library/Application Support/fuse-t' ]; then
+      CAN_MOUNT=1; INTR=()
+    elif [ -e /dev/macfuse0 ]; then CAN_MOUNT=1; else CAN_MOUNT=0; fi;;
+  *) if [ -e /dev/fuse ]; then CAN_MOUNT=1; else CAN_MOUNT=0; fi;;
+esac
 menu() { local s=""; for ((i=0;i<$1;i++)); do s+="$DN"; done; printf '%s\r' "$s"; }
 j() { python3 -c 'import json,sys; print(json.dumps([[sys.argv[i], sys.argv[i+1]] for i in range(1, len(sys.argv), 2)]))' "$@"; }
 
@@ -78,7 +99,7 @@ j "What would you like to do" "$(menu 1)" "Path to vault" "~/wiz.lbx"$'\r' "deta
   "rollback-detection anchor" n "Passphrase" "$PW"$'\r' \
   "Vault action" "$(menu 9)" "Verify a rollback-detection anchor" y "Path to the anchor sidecar" "~/no-such.anchor"$'\r' \
   "Proceed with MVK rotation" y \
-  "Vault action" "$(menu 12)" "Mount point" "~/no-such-dir"$'\r' \
+  "Vault action" "$(menu 12)" ${MP[@]+"${MP[@]}"} "Mount point" "~/no-such-dir"$'\r' \
   "Vault action" "$(menu 2)" "Local file path" "in.txt"$'\r' "Destination inside vault" "/after-errors.txt"$'\r' \
   "Vault action" "$(menu 14)" "What would you like to do" "$(menu 10)" > keep.json
 step "wizard: rotate and mount errors keep the vault open" keep.json \
@@ -130,7 +151,7 @@ j "What would you like to do" "$(menu 1)" "Path to vault" "~/wiz.lbx"$'\r' "deta
 step "wizard: aborted PANIC changes nothing" panic.json "panic aborted; the vault was not changed"
 LUKSBOX_PASSPHRASE=$PW "$B" ls wiz.lbx / </dev/null >/dev/null 2>&1 && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL vault does not open after an aborted panic"; }
 
-if [ -e /dev/fuse ]; then
+if [ $CAN_MOUNT = 1 ]; then
   # Two foreground mounts in one wizard run, each ended with Ctrl-C: the
   # second Ctrl-C must unmount the second mountpoint (it used to target
   # the first one, and the wizard then hung on the second mount), and the
@@ -139,17 +160,17 @@ if [ -e /dev/fuse ]; then
   mkdir -p m1 m2
   j "What would you like to do" "$(menu 1)" "Path to vault" "~/wiz.lbx"$'\r' "detached header" n \
     "rollback-detection anchor" n "Passphrase" "$PW"$'\r' "Vault action" "$(menu 12)" \
-    "Mount point" "$W/m1"$'\r' "Mount in background" n "Eager flush" n "<SLEEP>" 3 "in the foreground" $'\x03' \
+    ${MP[@]+"${MP[@]}"} "Mount point" "$W/m1"$'\r' "Mount in background" n "Eager flush" n "<SLEEP>" 3 "in the foreground" $'\x03' \
     "What would you like to do" "$(menu 1)" "Path to vault" "~/wiz.lbx"$'\r' "detached header" n \
     "rollback-detection anchor" n "Passphrase" "$PW"$'\r' "Vault action" "$(menu 12)" \
-    "Mount point" "$W/m2"$'\r' "Eager flush" n "<SLEEP>" 3 "in the foreground" $'\x03' \
+    ${MP[@]+"${MP[@]}"} "Mount point" "$W/m2"$'\r' "Eager flush" n "<SLEEP>" 3 "in the foreground" $'\x03' \
     "What would you like to do" "$(menu 10)" > mounts.json
   CMD=(wizard)
   step "wizard: two foreground mounts, Ctrl-C ends each" mounts.json \
-    "a background mount needs a fresh process" "received interrupt, unmounting cleanly"
-  if mountpoint -q m1 || mountpoint -q m2; then
+    "a background mount needs a fresh process" ${INTR[@]+"${INTR[@]}"}
+  if is_mounted m1 || is_mounted m2; then
     FAIL=$((FAIL+1)); echo "FAIL a wizard mount is still mounted"
-    fusermount3 -u m1 2>/dev/null; fusermount3 -u m2 2>/dev/null
+    "$B" umount m1 </dev/null >/dev/null 2>&1; "$B" umount m2 </dev/null >/dev/null 2>&1
   else
     PASS=$((PASS+1))
   fi
@@ -158,8 +179,8 @@ fi
 CMD=(deniable-init den.dat)
 j "Passphrase:" "$PW"$'\r' "Confirm:" "$PW"$'\r' > den.json
 step "deniable-init through a terminal" den.json "credential: passphrase"
-[ "$(ls den.dat* | wc -l)" = 1 ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL deniable vault left extra files"; }
-if [ -e /dev/fuse ]; then
+[ "$(ls den.dat* | wc -l | tr -d ' ')" = 1 ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL deniable vault left extra files"; }
+if [ $CAN_MOUNT = 1 ]; then
   mkdir -p dm; j "Passphrase:" "$PW"$'\r' > dm.json
   CMD=(deniable-mount den.dat dm); step "deniable-mount" dm.json
   sleep 1; echo "secret deniable data" > dm/note.txt; "$B" umount dm </dev/null >/dev/null 2>&1
@@ -210,7 +231,7 @@ if [ -e /dev/fuse ]; then
   CMD=(deniable-mount den.dat dm); step "deniable-mount after the wizard resize" dm.json; sleep 1
   [ "$(cat dm/note.txt 2>/dev/null)" = "secret deniable data" ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL deniable data lost across the wizard resize"; }
   "$B" umount dm </dev/null >/dev/null 2>&1
-  [ "$(ls den.dat* | wc -l)" = 1 ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL the deniable resize left extra files"; }
+  [ "$(ls den.dat* | wc -l | tr -d ' ')" = 1 ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL the deniable resize left extra files"; }
 fi
 
 echo "TUI SCENARIOS: $PASS passed, $FAIL failed"

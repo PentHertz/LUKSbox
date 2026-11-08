@@ -39,3 +39,29 @@ rustflags = ["-C", "target-feature=+crt-static"]
 # but the flag is harmless if the target isn't built).
 [target.x86_64-pc-windows-gnu]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Hardware AES and carry-less multiply on 64-bit ARM (Apple Silicon,
+# Linux arm64). The `aes` 0.8 and `polyval` 0.6 crates (under
+# AES-256-GCM-SIV, the default suite, and AES-256-GCM through `ghash`)
+# use the ARMv8 AES / PMULL instructions only when built with these
+# cfgs, and otherwise fall back to their constant-time software
+# implementation. With them, on an M5 Max: the default suite writes
+# 148 -> 393 MB/s and reads 167 -> 574 MB/s (`luksbox put` / `get`,
+# 512 MiB), a FUSE-T mount writes 151 -> 423 MiB/s and reads 181 -> 822.
+# Both paths are constant-time and produce identical bytes (the KATs in
+# luksbox-core/tests/aead_kat.rs pass with either), so vaults move
+# freely between builds with and without them. On Linux and macOS the
+# instructions are detected at run time (software fallback on a CPU
+# without them). Not set for aarch64 Windows, where these crates need
+# the `aes` target feature instead of runtime detection.
+#
+# A RUSTFLAGS environment variable replaces these per-target flags
+# entirely; add the two cfgs to it if you set one.
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]
+
+[target.aarch64-unknown-linux-musl]
+rustflags = ["--cfg", "aes_armv8", "--cfg", "polyval_armv8"]

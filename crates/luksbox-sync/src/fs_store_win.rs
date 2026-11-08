@@ -13,7 +13,9 @@
 //!   the path the bundle expects (`<bundle>\<area>\[<shard>\]<leaf>`,
 //!   built from grammar-checked names): a junction anywhere inside the
 //!   bundle resolves elsewhere and is refused.
-//! - Reads are bounded by the expected size and checked for EOF.
+//! - Reads are bounded by the expected size and checked for EOF, and an
+//!   object with more than one name (a hard link someone made to a file
+//!   outside the bundle, or into it) is refused, as on Unix.
 //! - New objects are published with `atomic_secure_create_new` (no
 //!   clobber: `MoveFileExW` without `MOVEFILE_REPLACE_EXISTING`); nothing
 //!   is ever overwritten. Deletions remove the entry itself.
@@ -38,6 +40,43 @@ const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+
+/// `BY_HANDLE_FILE_INFORMATION` (fileapi.h); `FILETIME` is two DWORDs.
+#[repr(C)]
+#[derive(Default)]
+struct ByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: [u32; 2],
+    last_access_time: [u32; 2],
+    last_write_time: [u32; 2],
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetFileInformationByHandle(
+        file: *mut std::ffi::c_void,
+        info: *mut ByHandleFileInformation,
+    ) -> i32;
+}
+
+/// How many names (hard links) the open file has.
+/// (`std::os::windows::fs::MetadataExt::number_of_links` is unstable.)
+fn number_of_links(f: &File) -> std::io::Result<u32> {
+    use std::os::windows::io::AsRawHandle;
+    let mut info = ByHandleFileInformation::default();
+    // SAFETY: a live handle owned by `f`, and a correctly laid out
+    // out-parameter.
+    if unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info.number_of_links)
+}
 
 pub struct FsStore {
     /// The bundle folder as the system resolves it (no junction).
@@ -236,6 +275,14 @@ impl ObjectStore for FsStore {
                 });
             }
         };
+        // A second name for the object: a hard link planted to (or from)
+        // a file the provider or another program controls.
+        if number_of_links(&f)? != 1 {
+            return Err(SyncError::Refused {
+                what,
+                why: "has more than one name (a hard link)",
+            });
+        }
         let size = f.metadata()?.len();
         if !len.allows(size) {
             return Err(SyncError::Refused {

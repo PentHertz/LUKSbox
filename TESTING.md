@@ -454,6 +454,64 @@ holds, added after growing it, merged into a head on the smaller layout
 header fork merging a third device into the newest header's head. `image.rs` unit test
 `discard_unsaved_goes_back_to_the_saved_state`.
 
+### Regression tests from the macOS review (2026-11-08)
+
+Each pins a fix listed in `CHANGELOG.md` (v0.7.0-rc.1) and fails on the
+code before it:
+
+- `crates/luksbox-sync/tests/provider_tampering.rs` (11): a replayed
+  garbage-collected commit never merged nor opened as the head (also
+  with the real head withheld); a fork never merged without its complete
+  base or its base header (a revoke stands); a deleted middle manifest
+  and a withheld object of what the device saw are refused, not shown
+  as an older state; a damaged table block skips its head; a leftover
+  temporary link swept at the next writable open; a publish whose folder
+  sync failed never reuses its sequence number; deleting a bundle never
+  wipes another bundle's local state. `fs_store.rs` unit tests: objects
+  installed without a second link, `reserve_and_rename` (the exFAT
+  install) never replacing an object, a moved shard or area folder never
+  written through; `graph.rs`: collected history, lineage, a 30 000
+  commit chain built in one pass; `lease.rs`: labels sanitized.
+- `crates/luksbox-vfs/tests/vault_io_regressions.rs` (9): deletes,
+  truncates and overwrites of large files in a small region never make
+  saves fail, the free tail dropped from the list, a region shrink
+  counting the free list, a truncate into a full region refused; a
+  failed write or truncate keeping the chunks it rewrote readable, a
+  save in the middle of a write, hidden sizes after a failed write.
+  `crates/luksbox-vfs/tests/symlinked_vault.rs` (2): a rotation and a
+  resize through a symbolic link replace the real file and keep the
+  link.
+- `crates/luksbox-format/tests/resize_recovery.rs` (11): an interrupted
+  detached-header resize changes nothing on a wrong passphrase, never
+  installs an intent without a valid header or with another vault's
+  salt, waits for a verified open to undo; no old-layout mirror after a
+  resize; a deniable rewrite's keyed copy, and a crashed one removed; a
+  grown bundle region holding no data-area bytes.
+- `crates/luksbox-cli/tests/merge_safety.rs` (7): `merge` never brings
+  back a revoked keyslot (both orders), refuses copies under different
+  master keys, needs `--keep-theirs-keyslots` for concurrent keyslot
+  changes, checks anchors (automatic and `--anchor`) without writing
+  them, refuses a rolled-back `sync convert`, `sync gc --grace-days 0`
+  without `--yes`; the conflict-copy hint in merge order, sanitized.
+  `secret_env.rs` unit test: secrets gone from the environment and from
+  the initial environment block (`/proc/self/environ`,
+  `KERN_PROCARGS2`), still readable by the command.
+- `luksbox-mount` `busy.rs`: `umount` waits on the private lock, not on
+  a lock someone else holds on the mountpoint folder.
+- GUI (`luksbox-gui`): the Secure Enclave choice greyed out exactly when
+  the backend is missing; the bundle revoke warning; stale export part
+  files removed, never a live one or a link; the sandboxed FUSE-T helper
+  command's parameters, and (with `LUKSBOX_TEST_HELPER`, macOS) a real
+  mount through `sandbox-exec`; exports, creates and env notes in
+  `ops.rs` / `sync_gui.rs` unit tests.
+
+```bash
+cargo test --release -p luksbox-sync --test provider_tampering
+cargo test --release -p luksbox-vfs --test vault_io_regressions --test symlinked_vault
+cargo test --release -p luksbox-format --test resize_recovery
+cargo test --release -p luksbox-cli --test merge_safety
+```
+
 ## Scenario scripts on a built binary (CLI, TUI, throughput)
 
 Three scripts drive a built `luksbox` the way a user does, with the
@@ -504,6 +562,35 @@ scripts/bench_transfer.sh  target/release/luksbox 512    # MB/s per vault kind
 - **`bench_transfer.sh`**: `put` / `get` throughput of one file per
   vault kind, with a plain copy as reference. Reading the numbers:
   `docs/PERFORMANCE.md`.
+
+**On macOS** the scripts run with the stock `/bin/bash` (3.2) and BSD
+tools; nothing from Homebrew is needed beyond the build dependencies.
+Build the flavour users get, with FUSE-T and the Secure Enclave:
+
+```bash
+cargo build --release -p luksbox-cli --no-default-features --features hardware,fuse-t
+scripts/cli_scenarios.sh target/release/luksbox
+scripts/tui_scenarios.sh target/release/luksbox   # mount steps run through FUSE-T
+```
+
+The binary finds `libfuse-t.dylib` through the rpath its build script
+adds; the Rust test binaries of `luksbox-mount` and the other crates
+still need `DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib` (plus
+`$(brew --prefix libfido2)/lib`), as in CI. With FUSE-T, the TUI script
+answers the macOS-only "private mountpoint" question and does not expect
+luksbox's own Ctrl-C message (FUSE-T handles the signal). Checked on
+macOS 26 / FUSE-T 1.2.9: 233 and 35 steps, 0 failures.
+
+The GUI's opt-in sandbox for its FUSE-T helper has a test that mounts
+through it for real (`sandbox-exec` with the shipped profile, an anchor
+in another folder, a write, unmount, read back); it runs when
+`LUKSBOX_TEST_HELPER` names a `luksbox` binary built with `fuse-t`, and
+is skipped otherwise:
+
+```bash
+LUKSBOX_TEST_HELPER=$PWD/target/release/luksbox cargo test --release -p luksbox-gui \
+  --no-default-features --features hardware,fuse-t helper_command_tests
+```
 
 ## Security regression tests, the hard CI gate
 

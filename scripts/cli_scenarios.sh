@@ -18,6 +18,9 @@
 # kind, each with its 64 MiB metadata region and mirror); the folder is
 # removed when every step passed. Exit status: the number of failures.
 set -u
+# Portable to macOS (its stock bash 3.2 and BSD tools) as well as Linux.
+if command -v sha256sum >/dev/null 2>&1; then SHA=(sha256sum); else SHA=(shasum -a 256); fi
+fsize() { wc -c < "$1" | tr -d ' '; }
 B=$(cd "$(dirname "$1")" && pwd)/$(basename "$1")
 W=$(mktemp -d "${TMPDIR:-/tmp}/luksbox-scenarios.XXXXXX")
 cd "$W"
@@ -33,7 +36,7 @@ ko() { local d=$1 n=$2; shift 3; run "$@"; local rc=$?
 eq() { if [ "$2" = "$3" ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); echo "FAIL eq: $1: '$2' != '$3'"; fi; }
 
 head -c 300000 /dev/urandom > blob.bin; echo "hello vault" > a.txt; printf 'x%.0s' $(seq 1 5000) > b.txt
-SUMB=$(sha256sum < blob.bin)
+SUMB=$("${SHA[@]}" < blob.bin)
 
 # --- create variants -------------------------------------------------------
 for c in aes-256-gcm-siv aes-256-gcm chacha20-poly1305; do ok "create $c" "" -- create v-$c.lbx --cipher $c; done
@@ -48,24 +51,24 @@ ko "create unknown cipher" "cipher" -- create v-x.lbx --cipher rot13
 # --- data commands on each kind -------------------------------------------
 for v in v-aes-256-gcm-siv v-aes-256-gcm v-chacha20-poly1305 v-ph v-det v-anc v-pq; do
   U=(); case $v in v-det) U=(--header v-det.hdr);; v-anc) U=(--anchor v-anc.anchor);; v-pq) U=(--pq-hybrid v-pq.kyber);; esac
-  ok "$v mkdir" "" -- mkdir $v.lbx "${U[@]}" /docs
-  ok "$v put" "wrote 300000 bytes" -- put $v.lbx "${U[@]}" blob.bin /docs/blob.bin
-  ok "$v put small" "" -- put $v.lbx "${U[@]}" a.txt /a.txt
-  ko "$v put existing" "already exists" -- put $v.lbx "${U[@]}" a.txt /a.txt
-  ok "$v ls" "blob.bin" -- ls $v.lbx "${U[@]}" /docs
-  ok "$v get" "" -- get $v.lbx "${U[@]}" /docs/blob.bin out-$v.bin
-  eq "$v get content" "$(sha256sum < out-$v.bin)" "$SUMB"
-  ok "$v cat" "hello vault" -- cat $v.lbx "${U[@]}" /a.txt
-  ok "$v mv" "" -- mv $v.lbx "${U[@]}" /a.txt /docs/a2.txt
-  ok "$v ls after mv" "a2.txt" -- ls $v.lbx "${U[@]}" /docs
-  ko "$v rmdir non-empty" "" -- rmdir $v.lbx "${U[@]}" /docs
-  ok "$v rm" "" -- rm $v.lbx "${U[@]}" /docs/a2.txt
+  ok "$v mkdir" "" -- mkdir $v.lbx ${U[@]+"${U[@]}"} /docs
+  ok "$v put" "wrote 300000 bytes" -- put $v.lbx ${U[@]+"${U[@]}"} blob.bin /docs/blob.bin
+  ok "$v put small" "" -- put $v.lbx ${U[@]+"${U[@]}"} a.txt /a.txt
+  ko "$v put existing" "already exists" -- put $v.lbx ${U[@]+"${U[@]}"} a.txt /a.txt
+  ok "$v ls" "blob.bin" -- ls $v.lbx ${U[@]+"${U[@]}"} /docs
+  ok "$v get" "" -- get $v.lbx ${U[@]+"${U[@]}"} /docs/blob.bin out-$v.bin
+  eq "$v get content" "$("${SHA[@]}" < out-$v.bin)" "$SUMB"
+  ok "$v cat" "hello vault" -- cat $v.lbx ${U[@]+"${U[@]}"} /a.txt
+  ok "$v mv" "" -- mv $v.lbx ${U[@]+"${U[@]}"} /a.txt /docs/a2.txt
+  ok "$v ls after mv" "a2.txt" -- ls $v.lbx ${U[@]+"${U[@]}"} /docs
+  ko "$v rmdir non-empty" "" -- rmdir $v.lbx ${U[@]+"${U[@]}"} /docs
+  ok "$v rm" "" -- rm $v.lbx ${U[@]+"${U[@]}"} /docs/a2.txt
   [ $v = v-det ] || ok "$v info" "" -- info $v.lbx
-  ok "$v check" "" -- check $v.lbx "${U[@]}"
-  ok "$v extract" "" -- extract $v.lbx "${U[@]}" /docs/blob.bin ex-$v.bin --tolerate-errors
-  eq "$v extract content" "$(sha256sum < ex-$v.bin)" "$SUMB"
-  ok "$v size" "" -- size $v.lbx "${U[@]}"
-  ok "$v header-dump" "" -- header-dump $v.lbx "${U[@]}"
+  ok "$v check" "" -- check $v.lbx ${U[@]+"${U[@]}"}
+  ok "$v extract" "" -- extract $v.lbx ${U[@]+"${U[@]}"} /docs/blob.bin ex-$v.bin --tolerate-errors
+  eq "$v extract content" "$("${SHA[@]}" < ex-$v.bin)" "$SUMB"
+  ok "$v size" "" -- size $v.lbx ${U[@]+"${U[@]}"}
+  ok "$v header-dump" "" -- header-dump $v.lbx ${U[@]+"${U[@]}"}
 done
 LUKSBOX_PASSPHRASE=nope ko "wrong passphrase" "" -- ls v-aes-256-gcm.lbx /
 ko "detached vault without --header" "" -- ls v-det.lbx /
@@ -85,7 +88,7 @@ ok "put folder (siv)" "file(s)" -- put v-aes-256-gcm-siv.lbx tree /tree
 ok "ls folder" "deep.txt" -- ls v-aes-256-gcm-siv.lbx /tree/a/b
 ko "put folder over existing" "already exists" -- put v-aes-256-gcm-siv.lbx tree /tree
 ok "get folder" "file(s)" -- get v-aes-256-gcm-siv.lbx /tree tree-out
-eq "folder round trip" "$(cd tree && find . -type f -exec sha256sum {} + | sort | sha256sum)" "$(cd tree-out && find . -type f -exec sha256sum {} + | sort | sha256sum)"
+eq "folder round trip" "$(cd tree && find . -type f -exec "${SHA[@]}" {} + | sort | "${SHA[@]}")" "$(cd tree-out && find . -type f -exec "${SHA[@]}" {} + | sort | "${SHA[@]}")"
 eq "symlink not recreated" "$(ls tree-out/c)" "c.txt"
 ko "get folder over existing" "already exists" -- get v-aes-256-gcm-siv.lbx /tree tree-out
 # "/" or a trailing "/" receives the source under its own name (it used
@@ -114,14 +117,14 @@ rm -f big100.bin
 ok "size shows the file list gauge" "File list:" -- size v-max.lbx
 ok "put before resize" "" -- put v-max.lbx blob.bin /blob.bin
 ok "resize: grow 2M -> 4M" "from 2.0 MB to 4.0 MB" -- size v-max.lbx --metadata-size 4M
-eq "resize: mirror follows the region" "$(stat -c %s v-max.lbx.meta-bak)" $((4*1048576))
+eq "resize: mirror follows the region" "$(fsize v-max.lbx.meta-bak)" $((4*1048576))
 eq "resize: no .rotating left" "$(ls v-max.lbx.rotating 2>/dev/null)" ""
 ok "resize: get after grow" "" -- get v-max.lbx /blob.bin out-rs.bin
-eq "resize: content after grow" "$(sha256sum < out-rs.bin)" "$SUMB"
+eq "resize: content after grow" "$("${SHA[@]}" < out-rs.bin)" "$SUMB"
 ok "resize: shrink with an anchor" "from 64.0 MB to 1.0 MB" -- size v-anc.lbx --anchor v-anc.anchor --metadata-size 1M
 ok "resize: anchor accepts it" "blob.bin" -- ls v-anc.lbx --anchor v-anc.anchor /docs
 ok "resize: get after shrink" "" -- get v-anc.lbx --anchor v-anc.anchor /docs/blob.bin out-rs2.bin
-eq "resize: content after shrink" "$(sha256sum < out-rs2.bin)" "$SUMB"
+eq "resize: content after shrink" "$("${SHA[@]}" < out-rs2.bin)" "$SUMB"
 ko "resize: invalid size" "in steps of 64 KiB" -- size v-max.lbx --metadata-size 100K
 mkdir many; for i in $(seq 1 1500); do echo $i > many/f-$i.txt; done
 ok "resize: fill a file list" "wrote 1500 file(s)" -- put v-max.lbx many /many
@@ -135,7 +138,7 @@ ok "resize: detached header" "from 64.0 MB to 32.0 MB" -- size v-det.lbx --heade
 ok "resize: header sidecar follows" "starts at offset 33554432" -- info v-det.lbx --header v-det.hdr
 eq "resize: no .resizing left" "$(ls v-det.hdr.resizing 2>/dev/null)" ""
 ok "resize: detached get" "" -- get v-det.lbx --header v-det.hdr /docs/blob.bin out-det2.bin
-eq "resize: detached content" "$(sha256sum < out-det2.bin)" "$SUMB"
+eq "resize: detached content" "$("${SHA[@]}" < out-det2.bin)" "$SUMB"
 ko "deniable-resize needs its acknowledgment" "--data-moves-visibly" -- deniable-resize den.dat --metadata-size 16M
 
 # --- keyslots ---------------------------------------------------------------
@@ -149,7 +152,7 @@ LUKSBOX_PASSPHRASE=pw-three ko "revoked refused" "" -- ls v-aes-256-gcm.lbx /
 
 # --- header backup / restore / upgrade / migrate ---------------------------
 ok "header-backup" "" -- header-backup v-chacha20-poly1305.lbx hb.bin
-eq "header-backup size" "$(stat -c %s hb.bin)" 8192
+eq "header-backup size" "$(fsize hb.bin)" 8192
 ok "header-restore" "" -- header-restore v-chacha20-poly1305.lbx hb.bin
 ok "opens after restore" "blob.bin" -- ls v-chacha20-poly1305.lbx /docs
 ok "upgrade-header" "" -- upgrade-header v-aes-256-gcm-siv.lbx

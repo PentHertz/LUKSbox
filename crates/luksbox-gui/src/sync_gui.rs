@@ -50,6 +50,7 @@ pub fn is_bundle(path: &Path) -> bool {
 
 fn local_root() -> Result<PathBuf, String> {
     if let Some(p) = std::env::var_os("LUKSBOX_SYNC_STATE_DIR") {
+        note_state_dir_override();
         return Ok(PathBuf::from(p));
     }
     Ok(data_dir()?.join("luksbox").join("sync"))
@@ -59,21 +60,66 @@ fn local_root() -> Result<PathBuf, String> {
 /// (shared with the command line).
 fn anchors_dir() -> Result<PathBuf, String> {
     if let Some(p) = std::env::var_os("LUKSBOX_SYNC_STATE_DIR") {
+        note_state_dir_override();
         return Ok(PathBuf::from(p).join("anchors"));
     }
     Ok(data_dir()?.join("luksbox").join("anchors"))
 }
 
+/// What the state-folder override warning says (R16-12).
+const STATE_DIR_NOTE: &str = "LUKSBOX_SYNC_STATE_DIR is set: sync state and rollback anchors \
+     are kept there instead of the application data folder. What rollback detection compares \
+     against starts again from what is found there.";
+
+/// Environment warnings (R16-12), shown once per run: pointing the state
+/// folder elsewhere, or turning the automatic anchor off, is never
+/// silent in the window either.
+static ENV_NOTES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static STATE_DIR_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NO_ANCHOR_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn note_state_dir_override() {
+    if !STATE_DIR_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed)
+        && let Ok(mut n) = ENV_NOTES.lock()
+    {
+        n.push(STATE_DIR_NOTE.to_string());
+    }
+}
+
+fn no_auto_anchor_set() -> bool {
+    std::env::var_os(luksbox_sync::cloud::NO_AUTO_ANCHOR_ENV)
+        .is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// The environment warnings not shown yet (taken once, for toasts).
+pub fn take_env_notes() -> Vec<String> {
+    ENV_NOTES
+        .lock()
+        .map(|mut n| std::mem::take(&mut *n))
+        .unwrap_or_default()
+}
+
 /// The application data folder. R16-10: never the working folder as a
 /// fallback, which may be the synced folder itself: the device's state
 /// (sealed unpublished changes, its identity, its rollback anchors) would
-/// then be uploaded to the provider.
+/// then be uploaded to the provider. A relative HOME / XDG_DATA_HOME
+/// would do the same (it resolves against the working folder), so only
+/// an absolute folder is used.
 fn data_dir() -> Result<PathBuf, String> {
-    dirs::data_dir().ok_or_else(|| {
-        "no application data folder is known (HOME / XDG_DATA_HOME / APPDATA is not set); \
-         set LUKSBOX_SYNC_STATE_DIR to a private folder outside any synced folder"
-            .to_string()
-    })
+    match dirs::data_dir() {
+        Some(d) if d.is_absolute() => Ok(d),
+        Some(d) => Err(format!(
+            "the application data folder ({}) is not an absolute path (HOME / XDG_DATA_HOME \
+             is relative), so it would be inside the working folder; set \
+             LUKSBOX_SYNC_STATE_DIR to a private folder outside any synced folder",
+            d.display()
+        )),
+        None => Err(
+            "no application data folder is known (HOME / XDG_DATA_HOME / APPDATA is not set); \
+             set LUKSBOX_SYNC_STATE_DIR to a private folder outside any synced folder"
+                .to_string(),
+        ),
+    }
 }
 
 /// Warnings about a single-file vault in a cloud folder, from the last
@@ -92,6 +138,17 @@ pub fn attach_auto_anchor(cont: &mut Container) -> Result<(), String> {
         return Ok(());
     }
     let mut notes = Vec::new();
+    // R16-12: the opt-out from rollback detection is never silent.
+    if no_auto_anchor_set()
+        && luksbox_sync::cloud::cloud_service(cont.vault_path()).is_some()
+        && !NO_ANCHOR_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        notes.push(format!(
+            "{} is set: an older copy of this vault put back by the sync service is not \
+             detected.",
+            luksbox_sync::cloud::NO_AUTO_ANCHOR_ENV
+        ));
+    }
     if let Some(a) = luksbox_sync::cloud::attach_auto_anchor(cont, &anchors_dir()?)?
         && a.created
     {
@@ -105,20 +162,28 @@ pub fn attach_auto_anchor(cont: &mut Container) -> Result<(), String> {
     let vault = cont.vault_path();
     if luksbox_sync::cloud::cloud_service(vault).is_some() {
         let copies = luksbox_sync::cloud::conflict_copies(vault);
-        if !copies.is_empty() {
+        if let Some(first) = copies.first() {
+            // Names someone else put in the synced folder: shown without
+            // control characters.
             let names: Vec<String> = copies
                 .iter()
                 .map(|p| {
                     format!(
                         "\"{}\"",
-                        p.file_name().unwrap_or_default().to_string_lossy()
+                        luksbox_sync::cloud::printable(
+                            &p.file_name().unwrap_or_default().to_string_lossy()
+                        )
                     )
                 })
                 .collect();
+            // The copy first, the vault second: the result keeps the
+            // vault's keyslots, never the copy's.
             notes.push(format!(
                 "Copies of this vault next to it may hold changes it lacks: {}. Merge one in \
-                 with `luksbox merge` (command line).",
-                names.join(", ")
+                 from the command line with `{}`, check the result, then put it in place of \
+                 the vault.",
+                names.join(", "),
+                luksbox_sync::cloud::merge_command(first, vault)
             ));
         }
     }
@@ -273,10 +338,41 @@ fn describe(r: &OpenReport) -> Vec<String> {
                  time the vault opens read-write."
                     .into()
             }
+            Notice::MergeBaseMissing {
+                heads,
+                local_changes,
+            } => {
+                let mut s = String::new();
+                if *heads > 0 {
+                    s.push_str(&format!(
+                        "{heads} concurrent version(s) were not merged: the version they come \
+                         from is not complete in the bundle (the sync is still running, or the \
+                         provider is withholding or has removed it). They are kept, and merged \
+                         once it is there."
+                    ));
+                }
+                if *local_changes {
+                    if !s.is_empty() {
+                        s.push(' ');
+                    }
+                    s.push_str(
+                        "Changes saved on this computer earlier cannot be merged yet: the \
+                         version they come from is not complete in the bundle. They are shown \
+                         (read-only) and merged once it is there.",
+                    );
+                }
+                s
+            }
+            Notice::OlderThanSeen => {
+                "The newest version this computer has seen is not complete in the bundle \
+                 (files missing or damaged: the sync is still running, or the provider is \
+                 withholding or has altered them). An OLDER version is shown, read-only."
+                    .into()
+            }
         });
     }
     for n in &r.keyslot_notes {
-        out.push(format!("Keyslots: {n}."));
+        out.push(format!("Keyslots: {}.", luksbox_sync::cloud::printable(n)));
     }
     if r.new_identity {
         out.push("This device's identity was in use elsewhere; it took a new one.".into());
@@ -284,9 +380,12 @@ fn describe(r: &OpenReport) -> Vec<String> {
     if r.restored_local_changes {
         out.push("Changes saved on this device earlier were restored.".into());
     }
+    // Device labels in leases come from other devices' sessions: shown
+    // without control characters.
     for (label, w) in &r.open_elsewhere {
         out.push(format!(
-            "Also open on {label}{}.",
+            "Also open on {}{}.",
+            luksbox_sync::cloud::printable(label),
             if *w { " (read-write)" } else { "" }
         ));
     }
@@ -447,7 +546,7 @@ pub fn status_line() -> Option<String> {
     let mut line = format!(
         "sync bundle * commit #{} by {}",
         s.head().m.seq,
-        s.head().m.device_label
+        luksbox_sync::cloud::printable(&s.head().m.device_label)
     );
     if !s.is_writable() {
         line.push_str(" * read-only");
@@ -543,7 +642,14 @@ fn finish_taken(mut a: Active) -> Option<String> {
                 parts.push(format!("{} conflict copie(s) made", r.conflicts));
             }
             for n in &r.keyslot_notes {
-                parts.push(format!("keyslots: {n}"));
+                parts.push(format!("keyslots: {}", luksbox_sync::cloud::printable(n)));
+            }
+            if r.base_missing > 0 {
+                parts.push(format!(
+                    "{} concurrent version(s) not merged yet: the version they come from \
+                     has not fully arrived",
+                    r.base_missing
+                ));
             }
             (!parts.is_empty()).then(|| format!("Sync bundle: {}", parts.join(", ")))
         }
@@ -676,7 +782,7 @@ pub fn versions() -> Result<Vec<Version>, String> {
             hash: v.hash,
             when: bundle::stamp(v.wall_clock_ns),
             age_secs: now.saturating_sub(v.wall_clock_ns / 1_000_000_000),
-            device: v.device_label,
+            device: luksbox_sync::cloud::printable(&v.device_label),
             what: match v.kind {
                 CommitKind::Convert => "created",
                 CommitKind::Commit => "changes",
@@ -718,24 +824,80 @@ pub fn delete_bundle(path: &Path) -> Result<String, String> {
     folder_icon::unset(path);
     let r = bundle::fs::delete(path, &local_root()?).map_err(|e| e.to_string())?;
     let mut msg = format!("deleted the sync bundle {}", path.display());
+    if let Some(id) = &r.local_state_kept {
+        // Header object names are not authenticated: a folder whose
+        // headers name another bundle's id never wipes that bundle's
+        // state on this device.
+        msg.push_str(&format!(
+            "; this device's state for bundle {id}, which the folder's file names point to, \
+             was kept: it is not the bundle this folder was opened as"
+        ));
+    }
     if !r.folder_removed {
         msg.push_str("; its folder was kept because it holds other files");
+        // A name someone else put in the synced folder.
         if let Some(f) = r.foreign_sample.first() {
-            msg.push_str(&format!(" (for example {f})"));
+            msg.push_str(&format!(
+                " (for example {})",
+                luksbox_sync::cloud::printable(f)
+            ));
         }
     }
     Ok(msg)
 }
 
-/// Turn the open file vault into a sync bundle at `dest` (the vault file
-/// is not changed).
-pub fn convert(container: &mut Container, dest: &Path) -> Result<String, String> {
-    convert_in(container, dest, &local_root()?)
+/// What `luksbox revoke` on a sync bundle says (R16-17), in the window.
+pub const BUNDLE_REVOKE_WARNING: &str = "On a sync bundle, revoking a keyslot does not change \
+     the master key, and the sync service keeps the old keyslot table: in the bundle folder \
+     until a clean-up (`luksbox sync gc`), and in its version history for good. Whoever held \
+     that credential can still derive the master key with it and read this vault, including \
+     every later version. For a real revocation: export the bundle to a .lbx file (`luksbox \
+     sync export`), rotate the master key of the exported file (`luksbox rotate-mvk`), convert \
+     it into a new sync bundle (`luksbox sync convert`), and delete this one.";
+
+/// A conversion into a sync bundle that failed.
+#[derive(Debug)]
+pub struct ConvertError {
+    pub message: String,
+    /// This call created the bundle folder (and may have left part of a
+    /// bundle in it). `false` when the folder was already there (it
+    /// appeared after the caller's check, for example synced down from
+    /// another device) or the failure came before it was made: then the
+    /// folder is not this call's to remove.
+    pub created_folder: bool,
 }
 
-fn convert_in(container: &mut Container, dest: &Path, local_root: &Path) -> Result<String, String> {
+impl std::fmt::Display for ConvertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl ConvertError {
+    fn before_folder(message: String) -> Self {
+        Self {
+            message,
+            created_folder: false,
+        }
+    }
+}
+
+/// Turn the open file vault into a sync bundle at `dest` (the vault file
+/// is not changed).
+pub fn convert(container: &mut Container, dest: &Path) -> Result<String, ConvertError> {
+    let root = local_root().map_err(ConvertError::before_folder)?;
+    convert_in(container, dest, &root)
+}
+
+fn convert_in(
+    container: &mut Container,
+    dest: &Path,
+    local_root: &Path,
+) -> Result<String, ConvertError> {
     // Read safely and checked against this vault (never a planted link).
-    let hybrid = bundle::fs::hybrid_sidecar_for(container).map_err(|e| e.to_string())?;
+    let hybrid = bundle::fs::hybrid_sidecar_for(container)
+        .map_err(|e| ConvertError::before_folder(e.to_string()))?;
+    let existed = dest.symlink_metadata().is_ok();
     let bid = bundle::fs::convert(
         container,
         dest,
@@ -746,10 +908,30 @@ fn convert_in(container: &mut Container, dest: &Path, local_root: &Path) -> Resu
             hybrid_sidecar: hybrid,
         },
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(|e| ConvertError {
+        // `FsStore::create` makes the folder exclusively: "already
+        // exists" is its refusal, before anything was written.
+        created_folder: !existed
+            && !matches!(&e, SyncError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists),
+        message: e.to_string(),
+    })?;
     #[cfg(target_os = "linux")]
     folder_icon::set(dest);
     Ok(bid.to_hex())
+}
+
+/// [`convert`], removing what it wrote when it fails halfway (a full
+/// disk), so the next attempt does not find a half bundle that "already
+/// exists". Only a folder this call created is removed: one that
+/// appeared meanwhile (synced down from another device) is never
+/// touched.
+pub fn convert_or_clean_up(container: &mut Container, dest: &Path) -> Result<String, String> {
+    convert(container, dest).map_err(|e| {
+        if e.created_folder && is_bundle(dest) {
+            let _ = delete_bundle(dest);
+        }
+        e.message
+    })
 }
 
 /// The bundle icon on bundle folders (Linux). GNOME Files and the other
@@ -1008,6 +1190,89 @@ mod tests {
         drop(ACTIVE.lock().unwrap().take());
         assert!(versions().is_err());
         assert!(!is_writable());
+    }
+
+    /// F4: a bundle that appeared at the destination (synced down from
+    /// another device after the window's check) makes the conversion
+    /// fail as "not this call's folder", so it is never deleted.
+    #[test]
+    fn a_conversion_never_claims_a_folder_it_did_not_make() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = tmp.path().join("state");
+        let _g = luksbox_format::metadata::set_create_metadata_region_size_override(Some(2 << 20));
+        let kdf = luksbox_core::Argon2idParams {
+            m_cost_kib: 8,
+            t_cost: 1,
+            p_cost: 1,
+        };
+        let mut c = Container::create_with_passphrase(
+            &tmp.path().join("v.lbx"),
+            None,
+            CipherSuite::Aes256GcmSiv,
+            kdf,
+            b"pw",
+        )
+        .unwrap();
+        let dest = tmp.path().join("v.lbxs");
+        std::fs::create_dir_all(dest.join("h")).unwrap();
+        std::fs::write(dest.join("h").join("someone-else"), b"theirs").unwrap();
+        assert!(is_bundle(&dest));
+        let e = convert_in(&mut c, &dest, &state).unwrap_err();
+        assert!(!e.created_folder, "{e}");
+        assert_eq!(
+            std::fs::read(dest.join("h").join("someone-else")).unwrap(),
+            b"theirs"
+        );
+        // A free destination converts.
+        let fresh = tmp.path().join("fresh.lbxs");
+        convert_in(&mut c, &fresh, &state).unwrap();
+        assert!(is_bundle(&fresh));
+    }
+
+    /// F7: a relative HOME (or XDG_DATA_HOME) is not used as the place
+    /// for this device's sync state, and LUKSBOX_SYNC_STATE_DIR is said
+    /// once.
+    #[test]
+    fn environment_overrides_are_never_silent() {
+        let _env = crate::test_env_lock();
+        let saved: Vec<(&str, Option<std::ffi::OsString>)> =
+            ["HOME", "XDG_DATA_HOME", "LUKSBOX_SYNC_STATE_DIR"]
+                .into_iter()
+                .map(|k| (k, std::env::var_os(k)))
+                .collect();
+        // SAFETY: test-only; every test that changes these holds
+        // `crate::test_env_lock()`.
+        unsafe {
+            std::env::set_var("HOME", "relative-home");
+            std::env::set_var("XDG_DATA_HOME", "relative-data");
+            std::env::remove_var("LUKSBOX_SYNC_STATE_DIR");
+        }
+        let relative = data_dir();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("LUKSBOX_SYNC_STATE_DIR", tmp.path());
+        }
+        STATE_DIR_NOTED.store(false, std::sync::atomic::Ordering::Relaxed);
+        let _ = take_env_notes();
+        let root = local_root().unwrap();
+        let anchors = anchors_dir().unwrap();
+        let notes = take_env_notes();
+        for (k, v) in saved {
+            unsafe {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+        // Windows takes APPDATA, which this test does not change.
+        #[cfg(not(windows))]
+        assert!(relative.is_err(), "{relative:?}");
+        let _ = relative;
+        assert_eq!(root, tmp.path());
+        assert_eq!(anchors, tmp.path().join("anchors"));
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("LUKSBOX_SYNC_STATE_DIR"), "{notes:?}");
     }
 
     #[cfg(target_os = "linux")]

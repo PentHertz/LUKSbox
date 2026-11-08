@@ -108,6 +108,21 @@ pub enum SyncError {
     #[error("no complete commit in the bundle yet ({pending} still arriving)")]
     NothingComplete { pending: usize },
 
+    /// The newest version this device has seen (the commit it last
+    /// opened or published, or one descending from it) cannot be opened:
+    /// some of its objects are missing or damaged. Opening an older one
+    /// instead would show the vault as it was before (design invariant
+    /// I5), so a writable open refuses; a read-only open shows the older
+    /// version with `Notice::OlderThanSeen`.
+    #[error(
+        "the newest version this device has seen (commit {seq} from {device}) is not complete \
+         in the bundle: some of its files are missing or damaged (the sync is still running, \
+         or the provider is withholding or has altered them); not opening an older version. \
+         Open it again once the sync has finished; read-only commands (`luksbox sync snapshots`, \
+         `luksbox sync export --snapshot`) can still read earlier versions"
+    )]
+    NewestIncomplete { device: String, seq: u64 },
+
     #[error("{0}")]
     Unsupported(&'static str),
 

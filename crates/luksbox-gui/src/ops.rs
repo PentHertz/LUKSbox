@@ -813,6 +813,21 @@ impl SepFactors {
     }
 }
 
+/// Whether Secure Enclave keyslots can be made here: the backend is
+/// compiled in (`--features hardware` on macOS) and this Mac has an
+/// enclave. Checked once; the GUI greys out the Secure Enclave choices
+/// otherwise, instead of letting a whole create / enroll form be filled
+/// in before `pre_check_sep` refuses it.
+pub fn sep_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(luksbox_sep::SepSealer::available)
+}
+
+/// Hover text of a greyed-out Secure Enclave choice.
+pub const SEP_UNAVAILABLE: &str = "Secure Enclave keyslots are not available: this build has no \
+     Secure Enclave support (build with --features hardware on macOS), or this Mac has no \
+     Secure Enclave.";
+
 /// Probe the local macOS Secure Enclave without sealing anything.
 /// Returns Ok(()) if the enclave is reachable, Err with a friendly
 /// message otherwise. Used by the GUI's create / Add-keyslot click
@@ -2465,6 +2480,17 @@ fn refuse_existing_create_targets(opts: &CreateOpts, kyber: Option<&Path>) -> Re
     if exists(&opts.path) {
         return Err(format!("{} already exists", opts.path.display()));
     }
+    // The files a create writes next to the vault (and that a failed
+    // create removes again): one left from another vault is refused
+    // here, so the clean-up only ever deletes what this create made.
+    for side in created_sidecar_paths(opts) {
+        if exists(&side) {
+            return Err(format!(
+                "{} already exists (left from another vault?); move it aside first",
+                side.display()
+            ));
+        }
+    }
     if let Some(hp) = &opts.header_path
         && exists(hp)
     {
@@ -2487,24 +2513,35 @@ fn refuse_existing_create_targets(opts: &CreateOpts, kyber: Option<&Path>) -> Re
     Ok(())
 }
 
-/// After a create failed midway: remove what it wrote. Only the paths
-/// `refuse_existing_create_targets` checked were free before anything was
-/// written (vault, its mirrors and post-quantum sidecar, detached header,
-/// anchor, seed file), so nothing that existed before is touched.
-fn remove_created_vault_files(opts: &CreateOpts) {
-    let mut paths: Vec<PathBuf> = vec![opts.path.clone()];
-    for ext in ["meta-bak", "header-bak", "hybrid"] {
-        let mut s = opts.path.clone().into_os_string();
+/// The sidecars a create may write next to the vault (and its detached
+/// header): `<vault>.meta-bak`, `<vault>.header-bak`, `<vault>.hybrid`,
+/// `<header>.header-bak`.
+fn created_sidecar_paths(opts: &CreateOpts) -> Vec<PathBuf> {
+    let with_ext = |p: &Path, ext: &str| {
+        let mut s = p.as_os_str().to_os_string();
         s.push(".");
         s.push(ext);
-        paths.push(PathBuf::from(s));
-    }
-    paths.extend(opts.header_path.iter().cloned());
+        PathBuf::from(s)
+    };
+    let mut paths: Vec<PathBuf> = ["meta-bak", "header-bak", "hybrid"]
+        .iter()
+        .map(|ext| with_ext(&opts.path, ext))
+        .collect();
     if let Some(hp) = &opts.header_path {
-        let mut s = hp.clone().into_os_string();
-        s.push(".header-bak");
-        paths.push(PathBuf::from(s));
+        paths.push(with_ext(hp, "header-bak"));
     }
+    paths
+}
+
+/// After a create failed midway: remove what it wrote. Every path here
+/// (vault, its mirrors and post-quantum sidecar, detached header and its
+/// mirror, anchor, seed file) was checked free by
+/// `refuse_existing_create_targets` before anything was written, so
+/// nothing that existed before is touched.
+fn remove_created_vault_files(opts: &CreateOpts) {
+    let mut paths: Vec<PathBuf> = vec![opts.path.clone()];
+    paths.extend(created_sidecar_paths(opts));
+    paths.extend(opts.header_path.iter().cloned());
     paths.extend(opts.anchor_path.iter().cloned());
     paths.extend(opts.hybrid_kyber_path.iter().cloned());
     for p in paths {
@@ -5588,15 +5625,46 @@ pub struct Extracted {
     pub skipped: Vec<(String, &'static str)>,
 }
 
-/// Recursively extract `inner` (must be a directory) into `local`. Creates
-/// `local` if needed. Files are decrypted in 64 KiB chunks via `get_file`;
-/// subdirectories are walked depth-first. An entry this system cannot
-/// name is skipped and reported (a vault made on Linux may hold
-/// `12:30.log`; it used to abort a whole export on Windows).
+/// Recursively extract `inner` (must be a directory) into `local`, a new
+/// folder: like the command line's `get` of a folder, nothing that
+/// already exists is followed, merged into or replaced (`local` itself,
+/// any folder or file inside it). Files are decrypted via
+/// `get_file_as`; subdirectories are walked depth-first. An entry this
+/// system cannot name is skipped and reported (a vault made on Linux may
+/// hold `12:30.log`; it used to abort a whole export on Windows).
 pub fn get_dir_recursive(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<Extracted, String> {
+    let id = vfs.lookup_path(inner).map_err(estr)?;
+    if vfs.stat(id).map_err(estr)?.kind != InodeKind::Directory {
+        return Err(format!("{} is not a directory", display_name(inner)));
+    }
     let mut out = Extracted::default();
+    make_export_dir(local)?;
     get_dir_into(vfs, inner, local, &mut out)?;
     Ok(out)
+}
+
+/// A new folder of an export, mode 0700 on Unix (the plaintext in it is
+/// not world-readable under a default 022 umask). Not recursive and
+/// never through a link: anything already at `dir`, a symlink planted
+/// after the caller's check included, makes the export stop.
+fn make_export_dir(dir: &Path) -> Result<(), String> {
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(dir).map_err(|e| {
+        let shown = display_name(&dir.display().to_string());
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "{shown} already exists: refusing to extract into it (the vault may hold two \
+                 names this file system treats as the same, such as Photos and photos)"
+            )
+        } else {
+            format!("{shown}: {e}")
+        }
+    })
 }
 
 fn get_dir_into(
@@ -5608,11 +5676,8 @@ fn get_dir_into(
     let id = vfs.lookup_path(inner).map_err(estr)?;
     let st = vfs.stat(id).map_err(estr)?;
     if st.kind != InodeKind::Directory {
-        return Err(format!("{inner} is not a directory"));
+        return Err(format!("{} is not a directory", display_name(inner)));
     }
-    // Extracted directories are mode 0700 on Unix so the plaintext
-    // they contain isn't world-readable under a default 022 umask.
-    luksbox_core::file_util::secure_create_dir_all(local).map_err(estr)?;
     let entries = vfs.readdir(id).map_err(estr)?;
     for ent in entries {
         let inner_child = if inner == "/" {
@@ -5655,15 +5720,16 @@ fn get_dir_into(
                 "vault contains an entry name that would escape the destination \
                  directory ('{}'); refusing to extract. This indicates a corrupt \
                  or maliciously-constructed vault.",
-                ent.name
+                display_name(&ent.name)
             ));
         }
         let local_child = local.join(&ent.name);
         match ent.kind {
             InodeKind::File => {
-                out.bytes += get_file(vfs, &inner_child, &local_child)?;
+                out.bytes += get_file_as(vfs, &inner_child, &local_child, ExportCommit::CreateNew)?;
             }
             InodeKind::Directory => {
+                make_export_dir(&local_child)?;
                 get_dir_into(vfs, &inner_child, &local_child, out)?;
             }
             InodeKind::Symlink => {
@@ -5697,16 +5763,19 @@ fn get_dir_into(
                     || target.contains("..")
                 {
                     return Err(format!(
-                        "vault contains a symlink with an escape target ('{target}'); \
-                         refusing to materialise"
+                        "vault contains a symlink with an escape target ('{}'); \
+                         refusing to materialise",
+                        display_name(&target)
                     ));
                 }
                 #[cfg(unix)]
                 {
+                    // Fails on anything already there (EEXIST): never
+                    // replaces a file the export just wrote.
                     if let Err(e) = std::os::unix::fs::symlink(&target, &local_child) {
                         return Err(format!(
                             "failed to materialise symlink {}: {e}",
-                            local_child.display()
+                            display_name(&local_child.display().to_string())
                         ));
                     }
                 }
@@ -5994,11 +6063,44 @@ mod related_vault_files_tests {
     }
 }
 
+/// How an extracted file may land at its destination.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExportCommit {
+    /// The file the user picked in the save dialog: a file already there
+    /// is replaced, in one step once the copy is complete.
+    Replace,
+    /// An entry of a folder export: never replaces anything (fails
+    /// closed, as the command line's `get` of a folder does). On a
+    /// case-insensitive file system (APFS, NTFS) a vault holding `A.txt`
+    /// and `a.txt` otherwise kept only the second, silently.
+    CreateNew,
+}
+
+/// Extract the file `inner` to `local` (the file the user picked; an
+/// existing file there is replaced once the copy is complete).
 pub fn get_file(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<u64, String> {
+    get_file_as(vfs, inner, local, ExportCommit::Replace)
+}
+
+/// The decrypted bytes go to a `.luksbox-export-<pid>-<ns>.part` file
+/// created next to the destination the way the command line's `get`
+/// creates its output (R13-01: the parent folder resolved once, the file
+/// opened relative to it without following a link, mode 0600 on Unix,
+/// system folders refused), then committed under its name: replacing
+/// (`Replace`) or never replacing (`CreateNew`). The part file is removed
+/// on every error; one left behind by a process killed mid-copy is
+/// removed by the next export into that folder
+/// (`sweep_stale_export_parts`).
+fn get_file_as(
+    vfs: &mut Vfs,
+    inner: &str,
+    local: &Path,
+    commit: ExportCommit,
+) -> Result<u64, String> {
     let id = vfs.lookup_path(inner).map_err(estr)?;
     let st = vfs.stat(id).map_err(estr)?;
     if st.kind != InodeKind::File {
-        return Err(format!("{inner} is not a file"));
+        return Err(format!("{} is not a file", display_name(inner)));
     }
     if is_open_vault_file(vfs, local) {
         return Err(format!(
@@ -6006,32 +6108,39 @@ pub fn get_file(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<u64, String>
             local.display()
         ));
     }
-    // An existing file is replaced only once the new content is complete:
-    // the copy goes to a new file next to it, renamed over it at the end.
-    // Truncating it first left a cut-off file, the original already gone,
-    // when the export failed (a damaged chunk, a full disk).
-    let replacing = std::fs::symlink_metadata(local).is_ok();
-    let target = if replacing {
-        let dir = local
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        dir.join(format!(
-            ".luksbox-export-{}-{stamp}.part",
-            std::process::id()
-        ))
-    } else {
-        local.to_path_buf()
-    };
-    // Mode 0600 on Unix - extracted plaintext stays owner-only. Created
-    // new (never through a link, never over something else).
-    let mut dst = luksbox_core::file_util::secure_create_new(&target).map_err(estr)?;
+    let parent = local
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = local
+        .file_name()
+        .ok_or_else(|| format!("{} has no file name", local.display()))?;
+    // Unix: the canonical parent, so the part file and the commit name
+    // the folder `secure_create_or_truncate` checked. Windows refuses
+    // any reparse point on the way instead and keeps the path as given.
+    #[cfg(unix)]
+    let dir = parent
+        .canonicalize()
+        .map_err(|e| format!("{}: {e}", parent.display()))?;
+    #[cfg(not(unix))]
+    let dir = parent.to_path_buf();
+    let dest = dir.join(name);
+    if commit == ExportCommit::CreateNew && dest.symlink_metadata().is_ok() {
+        return Err(export_collision(&dest));
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    #[cfg(unix)]
+    sweep_stale_export_parts(&dir);
+    let part = dir.join(format!(
+        ".luksbox-export-{}-{stamp}.part",
+        std::process::id()
+    ));
+    let mut dst = luksbox_core::file_util::secure_create_or_truncate(&part).map_err(estr)?;
     let copied = (|| -> Result<u64, String> {
-        let mut buf = vec![0u8; 1 << 20];
+        let mut buf = zeroize::Zeroizing::new(vec![0u8; 1 << 20]);
         let mut offset = 0u64;
         while offset < st.size {
             let n = vfs.read(id, offset, &mut buf).map_err(estr)?;
@@ -6045,16 +6154,98 @@ pub fn get_file(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<u64, String>
         Ok(offset)
     })();
     drop(dst);
-    let done = copied.and_then(|n| {
-        if replacing {
-            std::fs::rename(&target, local).map_err(estr)?;
-        }
-        Ok(n)
-    });
+    let done = copied.and_then(|n| commit_export(&part, &dest, commit).map(|()| n));
     if done.is_err() {
-        let _ = std::fs::remove_file(&target);
+        let _ = std::fs::remove_file(&part);
     }
     done
+}
+
+/// Remove the part files (decrypted plaintext, owner-only) that an
+/// export killed mid-copy left in `dir`: exactly our name pattern
+/// (`.luksbox-export-<pid>-<digits>.part`), a regular file (never through
+/// a link) owned by this user, written by a process that no longer runs.
+/// A part of a live process, ours or another's, is left alone. Each
+/// folder is looked at once per run.
+#[cfg(unix)]
+fn sweep_stale_export_parts(dir: &Path) {
+    use std::os::unix::fs::MetadataExt as _;
+    static SWEPT: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    match SWEPT.lock() {
+        Ok(mut done) if !done.iter().any(|d| d == dir) => done.push(dir.to_path_buf()),
+        _ => return,
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    for e in entries.flatten() {
+        let name = e.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix(".luksbox-export-"))
+            .and_then(|n| n.strip_suffix(".part"))
+            .and_then(|n| n.split_once('-'))
+            .filter(|(pid, ns)| {
+                !pid.is_empty()
+                    && !ns.is_empty()
+                    && pid.bytes().all(|b| b.is_ascii_digit())
+                    && ns.bytes().all(|b| b.is_ascii_digit())
+            })
+            .and_then(|(pid, _)| pid.parse::<libc::pid_t>().ok())
+        else {
+            continue;
+        };
+        if pid <= 0 || pid as u32 == std::process::id() {
+            continue;
+        }
+        // SAFETY: signal 0 only checks that the process exists.
+        let gone = unsafe { libc::kill(pid, 0) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        let path = dir.join(&name);
+        let ours = std::fs::symlink_metadata(&path)
+            .is_ok_and(|m| m.file_type().is_file() && m.uid() == uid);
+        if gone && ours {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// Put the complete part file in place under `dest`.
+fn commit_export(part: &Path, dest: &Path, commit: ExportCommit) -> Result<(), String> {
+    match commit {
+        ExportCommit::Replace => std::fs::rename(part, dest).map_err(estr),
+        ExportCommit::CreateNew => {
+            // `link` never replaces (EEXIST for anything at `dest`, a
+            // symlink included) and never follows a link there.
+            match std::fs::hard_link(part, dest) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(part);
+                    Ok(())
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Err(export_collision(dest))
+                }
+                // A file system without hard links (FAT / exFAT drives):
+                // check, then rename.
+                Err(_) => {
+                    if dest.symlink_metadata().is_ok() {
+                        return Err(export_collision(dest));
+                    }
+                    std::fs::rename(part, dest).map_err(estr)
+                }
+            }
+        }
+    }
+}
+
+fn export_collision(dest: &Path) -> String {
+    format!(
+        "{} already exists: refusing to replace it (the vault may hold two names this file \
+         system treats as the same, such as A.txt and a.txt)",
+        display_name(&dest.display().to_string())
+    )
 }
 
 pub fn split_parent_name(vfs: &Vfs, p: &str) -> Result<(luksbox_vfs::FileId, String), String> {
@@ -7575,11 +7766,15 @@ pub fn find_deniable_slots(
     })
 }
 
-pub fn revoke_keyslot(vfs: &mut Vfs, slot: usize) -> Result<(), String> {
+/// Revoke a keyslot. On a sync bundle the revocation is only partial
+/// (R16-17): returns the warning to show then, `None` for a vault file.
+pub fn revoke_keyslot(vfs: &mut Vfs, slot: usize) -> Result<Option<&'static str>, String> {
     let cont = vfs.container_mut();
     cont.revoke_slot(slot).map_err(estr)?;
     cont.persist_header().map_err(estr)?;
-    Ok(())
+    Ok(cont
+        .is_external()
+        .then_some(crate::sync_gui::BUNDLE_REVOKE_WARNING))
 }
 
 /// Crash-safe master-volume-key rotation for vaults whose every
@@ -8493,6 +8688,212 @@ mod browser_ops_tests {
         assert!(move_entry(&mut vfs, "/", "docs", "/docs/sub").is_err());
         assert!(vfs.lookup_path("/docs/c.txt").is_ok());
     }
+
+    fn put(vfs: &mut Vfs, dir: &str, name: &str, body: &[u8]) {
+        let parent = vfs.lookup_path(dir).unwrap();
+        let id = vfs.create(parent, name).unwrap();
+        vfs.write(id, 0, body).unwrap();
+    }
+
+    fn part_files(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with(".luksbox-export-"))
+            .collect()
+    }
+
+    /// A part file a killed export left (plaintext) is removed by the
+    /// next export into that folder; one of a live process, a link with
+    /// the same name pattern and its target, and other files are not.
+    #[cfg(unix)]
+    #[test]
+    fn a_part_file_left_by_a_killed_export_is_removed_by_the_next_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vfs = new_vfs(tmp.path());
+        put(&mut vfs, "/", "a.txt", b"exported");
+        let out = tmp.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        // A process that ran and is gone, and one that runs.
+        let mut dead = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let dead_pid = dead.id();
+        dead.wait().unwrap();
+        let mut live = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let stale = out.join(format!(".luksbox-export-{dead_pid}-123.part"));
+        let running = out.join(format!(".luksbox-export-{}-456.part", live.id()));
+        let target = out.join("target.bin");
+        let link = out.join(format!(".luksbox-export-{dead_pid}-789.part"));
+        std::fs::write(&stale, b"leftover plaintext").unwrap();
+        std::fs::write(&running, b"in progress").unwrap();
+        std::fs::write(&target, b"not ours to delete").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        std::fs::write(out.join(".luksbox-export-notapid.part"), b"x").unwrap();
+
+        super::get_file(&mut vfs, "/a.txt", &out.join("a.txt")).unwrap();
+        let _ = live.kill();
+        let _ = live.wait();
+
+        assert!(!stale.exists(), "the stale part file is still there");
+        assert!(running.exists(), "a live export's part file was removed");
+        assert!(link.symlink_metadata().is_ok(), "a link was removed");
+        assert_eq!(std::fs::read(&target).unwrap(), b"not ours to delete");
+        assert!(out.join(".luksbox-export-notapid.part").exists());
+        assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"exported");
+    }
+
+    /// F5: an entry of a folder export never replaces what is there (a
+    /// vault holding A.txt and a.txt on a case-insensitive file system),
+    /// and the part file is gone afterwards.
+    #[test]
+    fn folder_export_entries_never_replace_existing_files() {
+        use super::{ExportCommit, commit_export, get_file_as};
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vfs = new_vfs(tmp.path());
+        let root = vfs.lookup_path("/").unwrap();
+        vfs.mkdir(root, "d").unwrap();
+        put(&mut vfs, "/d", "a.txt", b"from the vault");
+        let out = tmp.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("a.txt"), b"keep me").unwrap();
+
+        let e = get_file_as(
+            &mut vfs,
+            "/d/a.txt",
+            &out.join("a.txt"),
+            ExportCommit::CreateNew,
+        )
+        .unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"keep me");
+        assert!(part_files(&out).is_empty());
+
+        // The commit itself fails closed too (a file that appeared while
+        // the copy ran).
+        let part = out.join(".luksbox-export-test.part");
+        std::fs::write(&part, b"new").unwrap();
+        let e = commit_export(&part, &out.join("a.txt"), ExportCommit::CreateNew).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"keep me");
+        commit_export(&part, &out.join("b.txt"), ExportCommit::CreateNew).unwrap();
+        assert_eq!(std::fs::read(out.join("b.txt")).unwrap(), b"new");
+        assert!(part_files(&out).is_empty());
+    }
+
+    /// F5: two names one file system treats as the same: the export
+    /// stops instead of keeping only the second.
+    #[test]
+    fn folder_export_stops_on_names_the_file_system_folds_together() {
+        let tmp = tempfile::tempdir().unwrap();
+        let probe = tmp.path().join("Probe");
+        std::fs::write(&probe, b"").unwrap();
+        let case_insensitive = tmp.path().join("probe").exists();
+        let mut vfs = new_vfs(tmp.path());
+        let root = vfs.lookup_path("/").unwrap();
+        vfs.mkdir(root, "c").unwrap();
+        put(&mut vfs, "/c", "A.txt", b"upper");
+        put(&mut vfs, "/c", "a.txt", b"lower");
+        let dest = tmp.path().join("c");
+        let r = super::get_dir_recursive(&mut vfs, "/c", &dest);
+        if case_insensitive {
+            let e = r.unwrap_err();
+            assert!(e.contains("already exists"), "{e}");
+            // The first one extracted is intact, not replaced.
+            let names: Vec<_> = std::fs::read_dir(&dest).unwrap().flatten().collect();
+            assert_eq!(names.len(), 1, "{names:?}");
+            let body = std::fs::read(names[0].path()).unwrap();
+            assert!(body == b"upper" || body == b"lower");
+        } else {
+            r.unwrap();
+            assert_eq!(std::fs::read(dest.join("A.txt")).unwrap(), b"upper");
+            assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"lower");
+        }
+        assert!(part_files(&dest).is_empty());
+    }
+
+    /// F5: the file picked in the save dialog is replaced in one step,
+    /// never written through a link there, and a failed export leaves
+    /// no part file.
+    #[test]
+    fn top_level_export_replaces_atomically_and_cleans_up() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vfs = new_vfs(tmp.path());
+        put(&mut vfs, "/", "a.txt", b"new content");
+        let out = tmp.path().join("out");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::write(out.join("a.txt"), b"old").unwrap();
+        assert_eq!(
+            super::get_file(&mut vfs, "/a.txt", &out.join("a.txt")).unwrap(),
+            11
+        );
+        assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"new content");
+        assert!(part_files(&out).is_empty());
+
+        // A folder at the destination: the commit fails, nothing is left.
+        std::fs::create_dir(out.join("dir")).unwrap();
+        assert!(super::get_file(&mut vfs, "/a.txt", &out.join("dir")).is_err());
+        assert!(out.join("dir").is_dir());
+        assert!(part_files(&out).is_empty());
+
+        #[cfg(unix)]
+        {
+            let victim = tmp.path().join("victim");
+            std::fs::write(&victim, b"untouched").unwrap();
+            std::os::unix::fs::symlink(&victim, out.join("link")).unwrap();
+            super::get_file(&mut vfs, "/a.txt", &out.join("link")).unwrap();
+            assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+            assert!(
+                !std::fs::symlink_metadata(out.join("link"))
+                    .unwrap()
+                    .file_type()
+                    .is_symlink()
+            );
+        }
+    }
+
+    /// F5: a folder export makes its folder itself and refuses one that
+    /// exists, or a link planted where it goes.
+    #[test]
+    fn folder_export_refuses_an_existing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vfs = new_vfs(tmp.path());
+        let root = vfs.lookup_path("/").unwrap();
+        vfs.mkdir(root, "d").unwrap();
+        put(&mut vfs, "/d", "a.txt", b"x");
+        let existing = tmp.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let e = super::get_dir_recursive(&mut vfs, "/d", &existing).unwrap_err();
+        assert!(e.contains("already exists"), "{e}");
+        assert_eq!(std::fs::read_dir(&existing).unwrap().count(), 0);
+        #[cfg(unix)]
+        {
+            let elsewhere = tmp.path().join("elsewhere");
+            std::fs::create_dir(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, tmp.path().join("planted")).unwrap();
+            let e =
+                super::get_dir_recursive(&mut vfs, "/d", &tmp.path().join("planted")).unwrap_err();
+            assert!(e.contains("already exists"), "{e}");
+            assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        }
+        // A new folder works, owner-only on Unix.
+        let fresh = tmp.path().join("fresh");
+        super::get_dir_recursive(&mut vfs, "/d", &fresh).unwrap();
+        assert_eq!(std::fs::read(fresh.join("a.txt")).unwrap(), b"x");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&fresh).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700);
+            let fmode = std::fs::metadata(fresh.join("a.txt"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(fmode & 0o777, 0o600);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -8969,6 +9370,41 @@ mod create_warning_tests {
         assert_eq!(opened.vfs.max_vault_size(), 0);
         put_file_bytes(&mut opened.vfs, "/still-usable.txt", b"ok");
         opened.vfs.flush().unwrap();
+    }
+
+    /// F8: a sidecar left next to the vault path by another vault makes
+    /// the create refuse (before anything is written), and it survives:
+    /// the clean-up of a failed create only removes what it made.
+    #[test]
+    fn a_stale_sidecar_is_refused_and_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("v.lbx");
+        let stale = tmp.path().join("v.lbx.meta-bak");
+        std::fs::write(&stale, b"another vault's mirror").unwrap();
+        let opts = CreateOpts {
+            path: path.clone(),
+            header_path: None,
+            cipher: CipherSuite::Aes256GcmSiv,
+            kind: SlotKindArg::Passphrase,
+            passphrase: Some(Zeroizing::new("correct horse".into())),
+            backup_passphrase: None,
+            pin: None,
+            pad_files: false,
+            hide_sizes: false,
+            anchor_path: None,
+            enable_recovery_passphrase: false,
+            hybrid_kyber_path: None,
+            hybrid_seed_pw: None,
+            kdf: KdfStrength::Interactive,
+            use_deniable: false,
+            use_v3_format: true,
+            header_v3: true,
+            max_size: 0,
+        };
+        let e = create_vault(opts).err().expect("refused");
+        assert!(e.contains("v.lbx.meta-bak already exists"), "{e}");
+        assert!(!path.exists());
+        assert_eq!(std::fs::read(&stale).unwrap(), b"another vault's mirror");
     }
 
     fn put_file_bytes(vfs: &mut Vfs, path: &str, data: &[u8]) {

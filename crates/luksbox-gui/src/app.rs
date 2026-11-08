@@ -2008,7 +2008,9 @@ impl LuksboxApp {
                 return;
             };
             let saved = v.vfs.flush();
-            let pct = v.vfs.metadata_budget_status().used_pct();
+            // What new entries are refused on: the room kept for the free
+            // list never refuses anything (a save drops what does not fit).
+            let pct = v.vfs.metadata_budget_status().entries_used_pct();
             let beyond_tested = v.vfs.is_beyond_tested_size();
             (pct, beyond_tested, saved, v.vfs.file_list_remedy())
         };
@@ -2278,6 +2280,9 @@ impl eframe::App for LuksboxApp {
                 self.toast_ok(n);
             }
             for n in crate::sync_gui::take_cloud_notes() {
+                self.toast_warn(n);
+            }
+            for n in crate::sync_gui::take_env_notes() {
                 self.toast_warn(n);
             }
         }
@@ -2818,7 +2823,7 @@ impl LuksboxApp {
                     }
                     match result {
                         Ok(to) => {
-                            self.toast_ok(format!("restored as {to}"));
+                            self.toast_ok(format!("restored as {}", ops::display_name(&to)));
                             self.refresh_listing();
                         }
                         Err(e) => self.toast_err(format!("restore failed: {e}")),
@@ -2855,8 +2860,9 @@ impl LuksboxApp {
                             self.toast_ok(format!("extracted {} bytes", done.bytes));
                             if let Some((p, why)) = done.skipped.first() {
                                 self.toast_warn(format!(
-                                    "{} entr(ies) not extracted, e.g. {p}: {why}",
-                                    done.skipped.len()
+                                    "{} entr(ies) not extracted, e.g. {}: {why}",
+                                    done.skipped.len(),
+                                    ops::display_name(p)
                                 ));
                             }
                         }
@@ -3728,13 +3734,12 @@ impl LuksboxApp {
         let d = dest.clone();
         std::thread::spawn(move || {
             let mut v = v;
-            let r = crate::sync_gui::convert(v.vfs.container_mut(), &d);
             // A conversion that stopped halfway (a full disk) leaves no
             // half bundle behind to make the next attempt "already
-            // exists": its own objects are removed, nothing else.
-            if r.is_err() && crate::sync_gui::is_bundle(&d) {
-                let _ = crate::sync_gui::delete_bundle(&d);
-            }
+            // exists": its own objects are removed, nothing else. A
+            // bundle that appeared at `d` after the check above (synced
+            // down from another device) is never deleted.
+            let r = crate::sync_gui::convert_or_clean_up(v.vfs.container_mut(), &d);
             let _ = tx.send((v, r));
         });
         self.pending = Some(Pending::MakeBundle { rx, dest });
@@ -3753,7 +3758,10 @@ impl LuksboxApp {
         let converted = opened
             .vfs
             .flush()
-            .map_err(|e| format!("save failed: {e}"))
+            .map_err(|e| crate::sync_gui::ConvertError {
+                message: format!("save failed: {e}"),
+                created_folder: false,
+            })
             .and_then(|_| crate::sync_gui::convert(opened.vfs.container_mut(), &job.dest));
         let mvk = opened.vfs.container().mvk_clone();
         let entry = RecentVault {
@@ -3770,7 +3778,9 @@ impl LuksboxApp {
         drop(opened);
         let _ = std::fs::remove_dir_all(&job.staging);
         if let Err(e) = converted {
-            let leftover = if job.dest.exists() {
+            // Only a folder this conversion made is called incomplete: a
+            // bundle that appeared there meanwhile is someone else's.
+            let leftover = if e.created_folder && job.dest.exists() {
                 format!(
                     " Delete the incomplete folder {} before trying again.",
                     job.dest.display()
@@ -4581,7 +4591,17 @@ impl LuksboxApp {
                 // factor); the variant picker restricts to the plain /
                 // Touch ID kinds there.
                 if cfg!(target_os = "macos") {
-                    ui.radio_value(&mut factor, Factor::Sep, Factor::Sep.label());
+                    let sep_ok = ops::sep_available();
+                    let r = ui.add_enabled(
+                        sep_ok,
+                        egui::RadioButton::new(factor == Factor::Sep, Factor::Sep.label()),
+                    );
+                    if r.clicked() {
+                        factor = Factor::Sep;
+                    }
+                    if !sep_ok {
+                        r.on_disabled_hover_text(ops::SEP_UNAVAILABLE);
+                    }
                 }
                 if factor != prev {
                     self.create.kind = match factor {
@@ -8985,10 +9005,13 @@ impl LuksboxApp {
     fn get_dir_into(&mut self, name: &str, parent_dir: PathBuf) {
         let inner = join_path(&self.cwd, name);
         let local = parent_dir.join(name);
-        if local.exists() {
+        // A quick answer only: `get_dir_recursive` creates the folder
+        // itself and refuses anything already there (a link planted after
+        // this check included).
+        if local.symlink_metadata().is_ok() {
             self.toast_err(format!(
                 "{} already exists in destination - pick another folder or move it aside first",
-                local.display()
+                ops::display_name(&local.display().to_string())
             ));
             return;
         }
@@ -9107,11 +9130,14 @@ impl LuksboxApp {
         let saved = v.vfs.flush().map_err(|e| e.to_string());
         match r.and_then(|n| saved.map(|_| n)) {
             Ok(n) if is_dir => {
-                self.toast_ok(format!("removed {name} ({n} entr(ies))"));
+                self.toast_ok(format!(
+                    "removed {} ({n} entr(ies))",
+                    ops::display_name(name)
+                ));
                 self.refresh_listing();
             }
             Ok(_) => {
-                self.toast_ok(format!("removed {name}"));
+                self.toast_ok(format!("removed {}", ops::display_name(name)));
                 self.refresh_listing();
             }
             Err(e) => {
@@ -9836,7 +9862,13 @@ impl LuksboxApp {
                 });
                 return;
             };
-            ui.label(RichText::new(&st.cwd).monospace().color(theme::DIM));
+            // R15-I4: names come from the vault (a former key holder may
+            // have written them): shown without control characters.
+            ui.label(
+                RichText::new(ops::display_name(&st.cwd))
+                    .monospace()
+                    .color(theme::DIM),
+            );
             if st.cwd != "/" && ui.button("..").on_hover_text("Parent folder").clicked() {
                 let parent = match st.cwd.trim_end_matches('/').rsplit_once('/') {
                     Some(("", _)) | None => "/".to_string(),
@@ -9899,12 +9931,13 @@ impl LuksboxApp {
                             {
                                 restore = Some(path.clone());
                             }
+                            let shown = ops::display_name(name);
                             if *is_dir {
-                                if ui.link(format!("{name}/")).clicked() {
+                                if ui.link(format!("{shown}/")).clicked() {
                                     enter = Some(path.clone());
                                 }
                             } else {
-                                ui.label(name);
+                                ui.label(shown);
                                 ui.label(
                                     RichText::new(format_size(*size))
                                         .small()
@@ -10693,17 +10726,21 @@ impl LuksboxApp {
                     }
                 }
 
+                #[cfg(target_os = "macos")]
+                let sep_ok = ops::sep_available();
                 // Secure Enclave "Add keyslot" buttons only on macOS.
                 // Plain + biometric enroll directly (no modal); the
                 // hybrid variants open a modal to collect the .kyber
                 // path + seed-file passphrase. Each pre-flights the
                 // enclave before doing anything.
                 #[cfg(target_os = "macos")]
-                if ui
-                    .add_sized(
-                        [row_w, 32.0],
-                        ghost_button("+ Add Secure Enclave keyslot (this Mac)"),
-                    )
+                if add_sized_enabled(
+                    ui,
+                    sep_ok,
+                    [row_w, 32.0],
+                    ghost_button("+ Add Secure Enclave keyslot (this Mac)"),
+                    ops::SEP_UNAVAILABLE,
+                )
                     .on_hover_text(
                         "Adds a Secure Enclave-bound keyslot. The wrap key is sealed by this \
                  Mac's Secure Enclave; no passphrase needed. macOS only. Only opens on the \
@@ -10728,11 +10765,13 @@ impl LuksboxApp {
                     }
                 }
                 #[cfg(target_os = "macos")]
-                if ui
-                    .add_sized(
-                        [row_w, 32.0],
-                        ghost_button("+ Add Secure Enclave + Touch ID keyslot"),
-                    )
+                if add_sized_enabled(
+                    ui,
+                    sep_ok,
+                    [row_w, 32.0],
+                    ghost_button("+ Add Secure Enclave + Touch ID keyslot"),
+                    ops::SEP_UNAVAILABLE,
+                )
                     .on_hover_text(
                         "Adds a Secure Enclave keyslot that requires a Touch ID prompt at every \
                  unlock. Same Mac-bound caveat as the plain Secure Enclave slot. Keep a \
@@ -10756,11 +10795,13 @@ impl LuksboxApp {
                     }
                 }
                 #[cfg(target_os = "macos")]
-                if ui
-                    .add_sized(
-                        [row_w, 32.0],
-                        ghost_button("+ Add hybrid Secure Enclave + ML-KEM-768 keyslot"),
-                    )
+                if add_sized_enabled(
+                    ui,
+                    sep_ok,
+                    [row_w, 32.0],
+                    ghost_button("+ Add hybrid Secure Enclave + ML-KEM-768 keyslot"),
+                    ops::SEP_UNAVAILABLE,
+                )
                     .on_hover_text(
                         "2-factor: this Mac's Secure Enclave AND a separate .kyber seed file \
                  (kept on different storage from the .lbx). Closes the quantum-attack gap of \
@@ -10775,11 +10816,13 @@ impl LuksboxApp {
                     }
                 }
                 #[cfg(target_os = "macos")]
-                if ui
-                    .add_sized(
-                        [row_w, 32.0],
-                        ghost_button("+ Add hybrid Secure Enclave + ML-KEM-1024 keyslot"),
-                    )
+                if add_sized_enabled(
+                    ui,
+                    sep_ok,
+                    [row_w, 32.0],
+                    ghost_button("+ Add hybrid Secure Enclave + ML-KEM-1024 keyslot"),
+                    ops::SEP_UNAVAILABLE,
+                )
                     .on_hover_text(
                         "Same 2-factor shape as the ML-KEM-768 variant but uses ML-KEM-1024 \
                  (NIST Cat-5, AES-256-equivalent PQ strength).",
@@ -10793,11 +10836,13 @@ impl LuksboxApp {
                     }
                 }
                 #[cfg(target_os = "macos")]
-                if ui
-                    .add_sized(
-                        [row_w, 32.0],
-                        ghost_button("+ Add fused Secure Enclave keyslot (+ FIDO2 / passphrase)..."),
-                    )
+                if add_sized_enabled(
+                    ui,
+                    sep_ok,
+                    [row_w, 32.0],
+                    ghost_button("+ Add fused Secure Enclave keyslot (+ FIDO2 / passphrase)..."),
+                    ops::SEP_UNAVAILABLE,
+                )
                     .on_hover_text(
                         "Adds a fused Secure Enclave keyslot that ALSO requires a FIDO2 \
                  authenticator and/or a passphrase at every unlock, optionally hybrid with \
@@ -13632,7 +13677,10 @@ impl LuksboxApp {
                         Ok(parent) => match v.vfs.mkdir(parent, &trimmed) {
                             Ok(_) => {
                                 self.flush_and_notify_capacity();
-                                self.toast_ok(format!("created {}", join_path(&cwd, &trimmed)));
+                                self.toast_ok(format!(
+                                    "created {}",
+                                    ops::display_name(&join_path(&cwd, &trimmed))
+                                ));
                                 self.refresh_listing();
                             }
                             Err(e) => self.toast_err(e.to_string()),
@@ -13966,6 +14014,13 @@ impl LuksboxApp {
         let slot_idx = req.slot_idx;
         let slot_kind = req.slot_kind;
         let would_be_last = req.would_be_last_active_slot;
+        // R16-17: on a sync bundle the master key stays and the provider
+        // keeps the old keyslot table, so the revoked credential still
+        // reads the vault with other tools.
+        let on_bundle = self
+            .vault
+            .as_ref()
+            .is_some_and(|v| v.vfs.container().is_external());
         let kind_label = match slot_kind {
             SlotKind::Empty => "(empty)",
             SlotKind::Passphrase => "passphrase",
@@ -14020,13 +14075,27 @@ impl LuksboxApp {
                         .strong(),
                 );
                 ui.add_space(10.0);
-                ui.label(format!(
-                    "This will permanently delete the {kind_label} credential in slot \
-                     {slot_idx}. The wrapped master key for that credential is \
-                     overwritten and cannot be recovered, so the passphrase / \
-                     authenticator that unlocked this slot will no longer open the \
-                     vault."
-                ));
+                if on_bundle {
+                    ui.label(format!(
+                        "This deletes the {kind_label} credential in slot {slot_idx} from \
+                         the bundle's newest keyslot table: LuksBox no longer opens the \
+                         vault with it."
+                    ));
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(crate::sync_gui::BUNDLE_REVOKE_WARNING)
+                            .color(theme::WARN)
+                            .strong(),
+                    );
+                } else {
+                    ui.label(format!(
+                        "This will permanently delete the {kind_label} credential in slot \
+                         {slot_idx}. The wrapped master key for that credential is \
+                         overwritten and cannot be recovered, so the passphrase / \
+                         authenticator that unlocked this slot will no longer open the \
+                         vault."
+                    ));
+                }
                 if would_be_last {
                     ui.add_space(10.0);
                     ui.label(
@@ -14085,7 +14154,11 @@ impl LuksboxApp {
             self.revoke_confirm = None;
             if let Some(v) = self.vault.as_mut() {
                 match ops::revoke_keyslot(&mut v.vfs, slot_idx) {
-                    Ok(()) => self.toast_ok(format!("slot {slot_idx} revoked")),
+                    Ok(None) => self.toast_ok(format!("slot {slot_idx} revoked")),
+                    Ok(Some(bundle_warning)) => {
+                        self.toast_ok(format!("slot {slot_idx} revoked"));
+                        self.toast_warn(bundle_warning);
+                    }
                     Err(e) => self.toast_err(e),
                 }
             }
@@ -14952,11 +15025,25 @@ impl LuksboxApp {
                             "File list",
                             format!(
                                 "{}% full ({} of {})",
-                                file_list.used_pct(),
-                                format_size(file_list.used_bytes as u64),
+                                file_list.entries_used_pct(),
+                                format_size(
+                                    file_list
+                                        .used_bytes
+                                        .saturating_sub(file_list.free_list_bytes)
+                                        as u64
+                                ),
                                 format_size(file_list.budget_bytes as u64)
                             ),
                         );
+                        // Room the list of free space may take: never
+                        // refuses anything (a save shortens it), but a
+                        // smaller region must leave room for it.
+                        if file_list.free_list_bytes > 0 {
+                            row(
+                                "Free-space list",
+                                format!("up to {}", format_size(file_list.free_list_bytes as u64)),
+                            );
+                        }
                         row("Used by files", format_size(report.used));
                         row("Free inside", format_size(report.free_inside));
                         if let Some(f) = free {
@@ -16043,7 +16130,13 @@ fn start_mount_subprocess(
     // 3. Spawn the child. Optionally wrap with macOS sandbox-exec
     // for defense-in-depth (opt-in via LUKSBOX_SANDBOX_HELPER=1
     // until validated end-to-end on macOS hosts).
-    let mut cmd = build_helper_command(&helper, &vault_path, header_path.as_deref(), mountpoint)?;
+    let mut cmd = build_helper_command(
+        &helper,
+        &vault_path,
+        header_path.as_deref(),
+        anchor_path.as_deref(),
+        mountpoint,
+    )?;
     if shrink_on_close {
         cmd.arg("--shrink-on-close");
     }
@@ -16276,6 +16369,26 @@ fn exit_status_is_clean_unmount(status: std::process::ExitStatus) -> bool {
     false
 }
 
+/// `ui.add_sized(size, widget)`, greyed out with `why` on hover unless
+/// `enabled` (a disabled widget never reports a click).
+#[cfg(target_os = "macos")]
+fn add_sized_enabled(
+    ui: &mut egui::Ui,
+    enabled: bool,
+    size: [f32; 2],
+    widget: impl egui::Widget,
+    why: &str,
+) -> egui::Response {
+    let r = ui
+        .add_enabled_ui(enabled, |ui| ui.add_sized(size, widget))
+        .inner;
+    if enabled {
+        r
+    } else {
+        r.on_disabled_hover_text(why)
+    }
+}
+
 /// Construct the `Command` that will spawn the FUSE-T mount helper.
 ///
 /// By default this is a direct invocation:
@@ -16286,27 +16399,28 @@ fn exit_status_is_clean_unmount(status: std::process::ExitStatus) -> bool {
 /// When `LUKSBOX_SANDBOX_HELPER=1` is set in the environment, the
 /// invocation is wrapped with macOS `sandbox-exec` using the
 /// profile shipped at `dist/macos/sandbox/fuse-t-helper.sb`. The
-/// sandbox restricts the helper to:
-/// - File I/O on the vault file's parent directory + the
-///   mountpoint's parent directory only.
-/// - Network bind/connect on `127.0.0.1` only (FUSE-T's NFS
-///   loopback transport).
-/// - Process exec only of binaries under FUSE-T's install paths
-///   and `/sbin/mount{,_nfs,_nfs4}` / `/sbin/umount`.
-/// - No reads outside system dylibs, FUSE-T paths, vault dir,
-///   mountpoint dir, and our own .app bundle.
+/// sandbox restricts the helper (and the FUSE-T processes it starts) to:
+/// - File writes in the folders of the vault, its detached header and
+///   its rollback anchor, plus the temporary folders.
+/// - Reads of those, the mountpoint directory itself, system
+///   libraries, FUSE-T's install and our own .app bundle (and the
+///   metadata of any path, for path resolution).
+/// - Network on localhost only (FUSE-T's NFS loopback transport).
+/// - Exec of this helper, FUSE-T's NFS server and `/sbin/mount`,
+///   `mount_nfs`, `umount` only.
 ///
 /// Defense in depth against a future libfuse-t.dylib vulnerability
 /// (e.g. an RCE in its NFS RPC parser) trying to fork shells,
 /// exfiltrate data, or read other files under the user's UID.
 ///
-/// Opt-in until validated on real macOS hosts. The sandbox profile
-/// language is undocumented (TinyScheme-based, only public examples
-/// are in `/System/Library/Sandbox/Profiles/`), so a too-tight rule
-/// could break mount in subtle ways. Default off ships safe; we'll
-/// flip the default once we have confirmation from CI + manual
-/// macOS testing that the profile permits everything libfuse-t
-/// actually needs.
+/// Opt-in. The sandbox profile language is undocumented (TinyScheme-
+/// based, only public examples are in `/System/Library/Sandbox/Profiles/`)
+/// and the operation names change between macOS releases: the first
+/// profile did not even parse on macOS 26 (an unknown operation stops
+/// the whole profile, so every sandboxed mount failed). The current one
+/// was checked on macOS 26 with FUSE-T 1.2.9 (mount, I/O, unmount, with
+/// an anchor outside the vault folder); flip the default once CI or
+/// more releases confirm it.
 ///
 /// On non-macOS targets the sandbox-wrapping branch is dead code
 /// (FUSE-T is macOS-only), but we keep the function platform-portable
@@ -16315,6 +16429,7 @@ fn build_helper_command(
     helper: &Path,
     vault: &Path,
     header: Option<&Path>,
+    anchor: Option<&Path>,
     mountpoint: &Path,
 ) -> Result<std::process::Command, String> {
     use std::process::Command;
@@ -16328,70 +16443,14 @@ fn build_helper_command(
 
     if cfg!(target_os = "macos") && sandbox_enabled {
         if let Some(profile_path) = locate_sandbox_profile() {
-            let mut cmd = Command::new("/usr/bin/sandbox-exec");
-            // -D <KEY=VAL> injects parameters into the profile,
-            // available via (param "KEY") in Scheme.
-            //
-            // Round 12 fix R12-07: canonicalize vault + mountpoint
-            // (and header, if provided) BEFORE deriving the parent
-            // directory for the sandbox `subpath` rule. If the
-            // user-supplied path contains a symlinked component
-            // (e.g. `~/Documents` is itself a symlink), the
-            // child's later `canonicalize()` resolves to a different
-            // string than the parent passed in, the sandbox rule
-            // doesn't match, and the mount fails closed for confusing
-            // reasons. Resolving upfront keeps the failure modes the
-            // user sees consistent.
-            let vault_canon = vault.canonicalize().unwrap_or_else(|_| vault.to_path_buf());
-            let mp_canon = mountpoint
-                .canonicalize()
-                .unwrap_or_else(|_| mountpoint.to_path_buf());
-            let header_canon: Option<PathBuf> =
-                header.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
-            let vault_dir = vault_canon
-                .parent()
-                .unwrap_or_else(|| Path::new("/"))
-                .to_path_buf();
-            let mp_dir = mp_canon
-                .parent()
-                .unwrap_or_else(|| Path::new("/"))
-                .to_path_buf();
-            // Round 12 fix R12-03 (sandbox profile side): if a
-            // detached header is in use, allow the helper to open
-            // its parent directory. Without this the sandbox would
-            // deny the open even though the helper canonicalized
-            // the path correctly. Falls back to VAULT_DIR (which the
-            // sandbox already allow-lists) when no header is supplied
-            // so the param expansion is always defined.
-            let header_dir = header_canon
-                .as_ref()
-                .and_then(|p| p.parent().map(|q| q.to_path_buf()))
-                .unwrap_or_else(|| vault_dir.clone());
-            let bundle_dir = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.canonicalize().ok())
-                .and_then(|p| p.parent().map(|q| q.to_path_buf()))
-                .unwrap_or_else(|| PathBuf::from("/"));
-            cmd.arg("-D")
-                .arg(format!("VAULT_DIR={}", vault_dir.display()));
-            cmd.arg("-D")
-                .arg(format!("MOUNTPOINT_DIR={}", mp_dir.display()));
-            cmd.arg("-D")
-                .arg(format!("HEADER_DIR={}", header_dir.display()));
-            cmd.arg("-D").arg(format!(
-                "HOME={}",
-                std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
+            return Ok(sandboxed_helper_command(
+                helper,
+                vault,
+                header,
+                anchor,
+                mountpoint,
+                &profile_path,
             ));
-            cmd.arg("-D")
-                .arg(format!("BUNDLE_DIR={}", bundle_dir.display()));
-            cmd.arg("-f").arg(profile_path);
-            cmd.arg(helper);
-            cmd.arg("mount-fuse-t-helper");
-            if let Some(hp) = header {
-                cmd.arg("--header").arg(hp);
-            }
-            cmd.arg(vault).arg(mountpoint);
-            return Ok(cmd);
         }
         // Hard-fail when sandboxing was explicitly requested but the
         // profile is missing. Previously the code logged a warning to
@@ -16419,7 +16478,114 @@ fn build_helper_command(
         cmd.arg("--header").arg(hp);
     }
     cmd.arg(vault).arg(mountpoint);
+    strip_secret_env(&mut cmd);
     Ok(cmd)
+}
+
+/// The helper run under `sandbox-exec` with `profile_path`
+/// (`LUKSBOX_SANDBOX_HELPER=1`): `-D` gives the profile the folders it
+/// opens up, all canonical, and the helper is exec'd by its canonical
+/// path, the only binary of ours the profile lets run.
+fn sandboxed_helper_command(
+    helper: &Path,
+    vault: &Path,
+    header: Option<&Path>,
+    anchor: Option<&Path>,
+    mountpoint: &Path,
+    profile_path: &Path,
+) -> std::process::Command {
+    use std::process::Command;
+    let mut cmd = Command::new("/usr/bin/sandbox-exec");
+    // -D <KEY=VAL> injects parameters into the profile,
+    // available via (param "KEY") in Scheme.
+    //
+    // Round 12 fix R12-07: canonicalize vault + mountpoint
+    // (and header, if provided) BEFORE deriving the parent
+    // directory for the sandbox `subpath` rule. If the
+    // user-supplied path contains a symlinked component
+    // (e.g. `~/Documents` is itself a symlink), the
+    // child's later `canonicalize()` resolves to a different
+    // string than the parent passed in, the sandbox rule
+    // doesn't match, and the mount fails closed for confusing
+    // reasons. Resolving upfront keeps the failure modes the
+    // user sees consistent.
+    let vault_canon = vault.canonicalize().unwrap_or_else(|_| vault.to_path_buf());
+    let mp_canon = mountpoint
+        .canonicalize()
+        .unwrap_or_else(|_| mountpoint.to_path_buf());
+    let header_canon: Option<PathBuf> =
+        header.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+    let anchor_canon: Option<PathBuf> =
+        anchor.map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()));
+    let helper_canon = helper
+        .canonicalize()
+        .unwrap_or_else(|_| helper.to_path_buf());
+    let vault_dir = vault_canon
+        .parent()
+        .unwrap_or_else(|| Path::new("/"))
+        .to_path_buf();
+    // Round 12 fix R12-03 (sandbox profile side): if a
+    // detached header is in use, allow the helper to open
+    // its parent directory. Without this the sandbox would
+    // deny the open even though the helper canonicalized
+    // the path correctly. Falls back to VAULT_DIR (which the
+    // sandbox already allow-lists) when no header is supplied
+    // so the param expansion is always defined.
+    let header_dir = header_canon
+        .as_ref()
+        .and_then(|p| p.parent().map(|q| q.to_path_buf()))
+        .unwrap_or_else(|| vault_dir.clone());
+    // The rollback anchor the helper verifies and rewrites on
+    // every save (`--anchor`, or the automatic one in the
+    // application data folder): the same, else the helper's
+    // open fails with "anchor: Operation not permitted".
+    let anchor_dir = anchor_canon
+        .as_ref()
+        .and_then(|p| p.parent().map(|q| q.to_path_buf()))
+        .unwrap_or_else(|| vault_dir.clone());
+    let bundle_dir = helper_canon
+        .parent()
+        .map(|q| q.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("/"));
+    for (k, v) in [
+        ("VAULT_DIR", &vault_dir),
+        ("HEADER_DIR", &header_dir),
+        ("ANCHOR_DIR", &anchor_dir),
+        ("MOUNTPOINT", &mp_canon),
+        ("BUNDLE_DIR", &bundle_dir),
+        ("HELPER", &helper_canon),
+    ] {
+        cmd.arg("-D").arg(format!("{k}={}", v.display()));
+    }
+    cmd.arg("-f").arg(profile_path);
+    // The canonical path: the profile allows exec of exactly it.
+    cmd.arg(&helper_canon);
+    cmd.arg("mount-fuse-t-helper");
+    if let Some(hp) = header {
+        cmd.arg("--header").arg(hp);
+    }
+    cmd.arg(vault).arg(mountpoint);
+    strip_secret_env(&mut cmd);
+    cmd
+}
+
+/// Unlock secrets the command line reads from the environment. The
+/// helper gets the master key on stdin and needs none of them; a GUI
+/// started from a shell that exported one would otherwise hand it to the
+/// helper and on to FUSE-T's NFS server and mount tool.
+const SECRET_ENV: [&str; 6] = [
+    "LUKSBOX_PASSPHRASE",
+    "LUKSBOX_NEW_PASSPHRASE",
+    "LUKSBOX_SEED_PASSPHRASE",
+    "LUKSBOX_SLOT_PASSPHRASE",
+    "LUKSBOX_TPM_PIN",
+    "LUKSBOX_FIDO2_PIN",
+];
+
+fn strip_secret_env(cmd: &mut std::process::Command) {
+    for k in SECRET_ENV {
+        cmd.env_remove(k);
+    }
 }
 
 /// Find the sandbox profile file that ships in the .app bundle's
@@ -17329,3 +17495,203 @@ mod create_form_tests {
 
 #[cfg(test)]
 mod gui_scenarios;
+
+#[cfg(all(test, target_os = "macos"))]
+mod helper_command_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn args(cmd: &std::process::Command) -> Vec<String> {
+        std::iter::once(cmd.get_program())
+            .chain(cmd.get_args())
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn shipped_profile() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../dist/macos/sandbox/fuse-t-helper.sb")
+    }
+
+    /// The sandboxed helper command gives the shipped profile every
+    /// parameter it uses, as canonical paths (the rules match canonical
+    /// paths only), execs the helper by its canonical path, and hands the
+    /// helper none of the unlock secrets of the GUI's environment.
+    #[test]
+    fn sandboxed_helper_command_gives_the_profile_what_it_needs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for d in ["bin", "v", "h", "a", "mnt"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let helper = root.join("bin/luksbox");
+        let (vault, header, anchor) = (
+            root.join("v/v.lbx"),
+            root.join("h/v.hdr"),
+            root.join("a/v.anchor"),
+        );
+        for f in [&helper, &vault, &header, &anchor] {
+            std::fs::write(f, b"").unwrap();
+        }
+        // Reached through a symlinked folder, as `~/Documents` may be.
+        std::os::unix::fs::symlink(root.join("v"), root.join("link")).unwrap();
+        let profile = shipped_profile();
+        let cmd = sandboxed_helper_command(
+            &helper,
+            &root.join("link/v.lbx"),
+            Some(&header),
+            Some(&anchor),
+            &root.join("mnt"),
+            &profile,
+        );
+        let a = args(&cmd);
+        assert_eq!(a[0], "/usr/bin/sandbox-exec");
+        let params: Vec<(String, String)> = a
+            .windows(2)
+            .filter(|w| w[0] == "-D")
+            .filter_map(|w| {
+                w[1].split_once('=')
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+            })
+            .collect();
+        let get = |k: &str| params.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+        assert_eq!(get("VAULT_DIR"), Some(root.join("v").display().to_string()));
+        assert_eq!(
+            get("HEADER_DIR"),
+            Some(root.join("h").display().to_string())
+        );
+        assert_eq!(
+            get("ANCHOR_DIR"),
+            Some(root.join("a").display().to_string())
+        );
+        assert_eq!(
+            get("MOUNTPOINT"),
+            Some(root.join("mnt").display().to_string())
+        );
+        assert_eq!(
+            get("BUNDLE_DIR"),
+            Some(root.join("bin").display().to_string())
+        );
+        assert_eq!(get("HELPER"), Some(helper.display().to_string()));
+        // Every (param "NAME") of the shipped profile is given.
+        let text = std::fs::read_to_string(&profile).unwrap();
+        for part in text.split("(param \"").skip(1) {
+            let name = part.split('"').next().unwrap();
+            assert!(
+                get(name).is_some(),
+                "profile parameter {name} is not passed"
+            );
+        }
+        // -f <profile>, then the helper by the path the profile allows.
+        let f = a.iter().position(|x| x == "-f").unwrap();
+        assert_eq!(a[f + 1], profile.display().to_string());
+        assert_eq!(a[f + 2], helper.display().to_string());
+        assert_eq!(a[f + 3], "mount-fuse-t-helper");
+        for k in SECRET_ENV {
+            assert!(
+                cmd.get_envs().any(|(n, v)| n == k && v.is_none()),
+                "{k} is not removed from the helper's environment"
+            );
+        }
+    }
+
+    /// The same command, run for real through `sandbox-exec` and FUSE-T, as
+    /// `start_mount_subprocess` runs it: master key on stdin, `--anchor` to
+    /// an anchor outside the vault folder, a file written through the
+    /// mount, unmounted, read back. Needs FUSE-T and the CLI binary in
+    /// `LUKSBOX_TEST_HELPER`; skipped without them (it mounts).
+    #[test]
+    fn sandboxed_helper_mounts_with_an_anchor_elsewhere() {
+        use std::io::Write as _;
+        let Some(helper) = std::env::var_os("LUKSBOX_TEST_HELPER").map(PathBuf::from) else {
+            eprintln!("[skip] set LUKSBOX_TEST_HELPER to a luksbox binary built with fuse-t");
+            return;
+        };
+        if !Path::new("/Library/Application Support/fuse-t").exists() {
+            eprintln!("[skip] FUSE-T is not installed");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (vdir, adir, mnt) = (root.join("vaults"), root.join("usbstick"), root.join("mnt"));
+        for d in [&vdir, &adir, &mnt] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (vault, anchor) = (vdir.join("v.lbx"), adir.join("v.anchor"));
+        let cli = |args: &[&std::ffi::OsStr]| {
+            std::process::Command::new(&helper)
+                .args(args)
+                .env("LUKSBOX_PASSPHRASE", "sandbox-test-pw")
+                .env("LUKSBOX_ACCEPT_WEAK", "1")
+                .env("LUKSBOX_SYNC_STATE_DIR", root.join("state"))
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let o = cli(&[
+            "create".as_ref(),
+            vault.as_os_str(),
+            "--anchor".as_ref(),
+            anchor.as_os_str(),
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let mvk = {
+            let c = luksbox_format::container::Container::open(
+                &vault,
+                None,
+                luksbox_format::container::UnlockMaterial::Passphrase(b"sandbox-test-pw"),
+            )
+            .unwrap();
+            c.mvk_clone()
+        };
+        let mut cmd = sandboxed_helper_command(
+            &helper,
+            &vault,
+            None,
+            Some(&anchor),
+            &mnt,
+            &shipped_profile(),
+        );
+        cmd.arg("--anchor").arg(&anchor);
+        cmd.stdin(std::process::Stdio::piped());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().unwrap();
+        {
+            let mut stdin = child.stdin.take().unwrap();
+            stdin.write_all(&[0x01]).unwrap();
+            stdin.write_all(mvk.as_bytes()).unwrap();
+        }
+        let mounted = || {
+            let out = std::process::Command::new("/sbin/mount").output().unwrap();
+            String::from_utf8_lossy(&out.stdout).contains(&format!(" on {} (", mnt.display()))
+        };
+        let start = Instant::now();
+        while !mounted() {
+            if let Ok(Some(status)) = child.try_wait() {
+                let mut err = String::new();
+                use std::io::Read as _;
+                let _ = child.stderr.take().unwrap().read_to_string(&mut err);
+                panic!("the sandboxed helper exited ({status}) without mounting:\n{err}");
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(20),
+                "not mounted after 20 s"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        std::fs::write(mnt.join("through-the-sandbox.txt"), b"sandboxed write").unwrap();
+        let o = cli(&["umount".as_ref(), mnt.as_os_str()]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let status = child.wait().unwrap();
+        assert!(status.success(), "helper exit: {status}");
+        let o = cli(&[
+            "cat".as_ref(),
+            vault.as_os_str(),
+            "--anchor".as_ref(),
+            anchor.as_os_str(),
+            "/through-the-sandbox.txt".as_ref(),
+        ]);
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        assert_eq!(o.stdout, b"sandboxed write");
+    }
+}

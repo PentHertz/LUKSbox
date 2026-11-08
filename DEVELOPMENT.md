@@ -327,6 +327,9 @@ retries, the script will not run wrong-PIN paths.
 | `LUKSBOX_SUPPRESS_AES_WARNING=1` | Silences the no-AES-NI warning at startup |
 | `LUKSBOX_FAKE_NO_AES=1` | Forces the AES-NI-detection helper to return false; testing only |
 | `LIBFIDO2_LIB_DIR` / `LIBFIDO2_LIB_NAME` / `LIBFIDO2_INCLUDE_DIR` | Override libfido2 link + bindgen include paths (useful for cross-compile or non-standard installs) |
+| `FUSE_T_LIB_DIR` | macOS build: the folder holding `libfuse-t.dylib`, added to the CLI / GUI rpath (default: from `PKG_CONFIG_PATH`, then `/usr/local/lib`, `/opt/homebrew/lib`) |
+| `LUKSBOX_TEST_HELPER=<luksbox>` | macOS tests: runs the GUI test that mounts through the sandboxed FUSE-T helper for real (skipped without it) |
+| `LUKSBOX_SANDBOX_HELPER=1` | GUI on macOS: runs the FUSE-T mount helper under `sandbox-exec` (`dist/macos/sandbox/fuse-t-helper.sb`) |
 
 ---
 

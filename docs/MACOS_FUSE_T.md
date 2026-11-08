@@ -150,28 +150,73 @@ export LUKSBOX_SANDBOX_HELPER=1
 open /Applications/LUKSbox.app
 ```
 
-When enabled, the helper child process can only:
-- Read system dylibs and FUSE-T install paths.
-- Read/write the vault file's parent directory and the
-  mountpoint's parent directory.
-- Bind/connect on `127.0.0.1` only (FUSE-T's NFS loopback). NO
-  internet egress -- if libfuse-t tried to phone home, this
-  blocks it.
-- Exec FUSE-T's helper binaries + `/sbin/mount{,_nfs,_nfs4}` /
-  `/sbin/umount`. NO arbitrary shell execution.
+When enabled, the helper child process (and the FUSE-T NFS server and
+mount tool it starts, which inherit the sandbox) can only:
+- Read system libraries, FUSE-T's install, the folder of the `luksbox`
+  binary, the folders of the vault, its detached header and its
+  rollback anchor, and the mountpoint directory itself (plus the
+  metadata of any path, for path resolution).
+- Write in the folders of the vault, its detached header and its
+  anchor (each is rewritten with a temporary file next to it), and in
+  the temporary folders FUSE-T uses for its sockets.
+- Use the network on localhost only (FUSE-T's NFS loopback). NO
+  internet egress -- if libfuse-t tried to phone home, this blocks it.
+- Exec the helper itself, FUSE-T's NFS server and `/sbin/mount`,
+  `mount_nfs`, `umount`. NO shell.
 
-If a too-tight rule breaks mount in your environment, unset the
-env var to fall back to unsandboxed invocation, and please file
-an issue with the sandbox profile's blocked-syscall log so we can
-loosen it. The opt-in default ships safe; we'll flip to default-on
-once the profile is validated across a broader set of macOS
-versions.
+The GUI passes the paths as `sandbox-exec -D` parameters (`VAULT_DIR`,
+`HEADER_DIR`, `ANCHOR_DIR`, `MOUNTPOINT`, `BUNDLE_DIR`, `HELPER`, all
+canonical). The first version of the profile did not parse on macOS 26
+(operations that no longer exist stop the whole profile, so every
+sandboxed mount failed) and had no rule for an anchor outside the
+vault folder; the current one was checked on macOS 26 with FUSE-T 1.2.9
+(mount, writes and reads through the mount, unmount, an anchor in
+another folder). To check it on another release, mount through it with
+a sandbox log open:
+
+```bash
+log stream --style compact --predicate 'sender == "Sandbox"'
+```
+
+If a rule breaks mount in your environment, unset the env var to fall
+back to unsandboxed invocation, and please file an issue with the
+denials from that log so we can loosen it. The opt-in default ships
+safe; we'll flip to default-on once the profile is validated across a
+broader set of macOS versions.
 
 The profile's full text is heavily commented at
 `dist/macos/sandbox/fuse-t-helper.sb`; the syntax is the same
 TinyScheme-like DSL Apple uses for its own `/System/Library/Sandbox/Profiles/`
 profiles (no public reference docs, those are the only example
 source).
+
+### Saving: `fsync` at close, and `umount`
+
+FUSE-T serves the vault to the macOS NFS client, and that client sends a
+COMMIT, which reaches the adapter as an `fsync`, every time a file is
+closed, not only when an application calls `fsync(2)`. Each save rewrites
+the whole metadata region and its mirror (128 MiB with the default 64 MiB
+region), so saving on every COMMIT made each close cost about 115 ms on
+an SSD (a copy of 1 000 small files took two minutes and wrote about
+125 GiB). Without `--sync`, an `fsync` arriving less than
+`FSYNC_COALESCE` (one second) after the last save asks the flush timer
+for a save within that second instead (`crates/luksbox-mount/src/fuse_t.rs`):
+a burst of closes costs about one save per second, and an `fsync` on a
+FUSE-T mount is durable within a second rather than on return. With
+`--sync` (GUI: Eager flush) every operation is saved before it returns.
+Applications cannot be told apart from the NFS client at this level,
+hence the choice.
+
+`umount` (`/sbin/umount`) returns as soon as the NFS client lets go; the
+final save runs after that, in `destroy()`. Like the libfuse backend, the
+mount process holds shared `flock`s until it has saved and exits
+(`crates/luksbox-mount/src/busy.rs`): on a lock file in the per-user
+temporary folder (`getconf DARWIN_USER_TEMP_DIR`, which only this user
+can open) and on the mountpoint directory. `luksbox umount` waits on the
+first (the second when there is none, as for a mount started by an older
+version), so `luksbox umount mnt && luksbox ls vault.lbx /` works, the
+Mac can be switched off once `umount` returns, and another user cannot
+make `umount` wait by locking the mountpoint folder.
 
 ### The `mount-fuse-t-helper` CLI subcommand
 
@@ -473,13 +518,13 @@ the common path". Items that need attention before Phase 2 / v0.2:
   comment at the bottom of `src/ops.rs::run_mount`. Fix is an
   Atomic-flag-tracked reclamation in the caller.
 
-- **End-to-end mount has not been exercised on a real FUSE-T host
-  by this project's CI yet.** GitHub's macOS runners can install
-  the FUSE-T cask but the mount lifecycle (loopback NFS server
-  startup, mount syscall, unmount) is what needs validation in
-  practice. Phase 1 ships the binding green at compile / link
-  time; Phase 2 adds an integration-test job mirroring the WinFsp
-  test on Windows.
+- **End-to-end mount in CI.** The `test-macos` CI job runs the
+  cross-process mount test on GitHub's runners as non-blocking until a
+  run shows FUSE-T can mount there. On a Mac, the mount lifecycle (CLI
+  daemon, the GUI's helper with `--anchor` / `--sync`, the wizard's
+  foreground mounts ended with Ctrl-C, deniable mounts, a sync bundle
+  mounted and published at unmount) was exercised by hand and by
+  `scripts/tui_scenarios.sh` on macOS 26 / FUSE-T 1.2.9 (2026-11-08).
 
 ## Where the code lives
 

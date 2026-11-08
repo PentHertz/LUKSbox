@@ -47,7 +47,7 @@ without them the default vault writes about 360 MB/s and reads about
 is within run-to-run noise here. The transfer path itself was not
 changed by the resize.
 
-Through a mount (`luksbox mount`, FUSE): writing 512 MiB with
+Through a mount (`luksbox mount`, Linux FUSE; macOS FUSE-T below): writing 512 MiB with
 `dd ... conv=fsync` 152 MB/s, reading it back about 370 MB/s.
 Small files: 20 000 files of 1 KiB created through the mount in 7.1 s
 (about 2 800 files/s), read back in 6.2 s.
@@ -64,6 +64,68 @@ folder and move it with one unlock and one save.
 Every vault kind reads and writes at a few hundred MB/s, far above the
 speed of a USB stick or a network, so these are rarely the limit. The
 exceptions are the costs listed under "What still costs".
+
+## macOS (Apple Silicon, FUSE-T)
+
+Measured 2026-11-08 on macOS 26.6, Apple M5 Max, internal SSD, FUSE-T
+1.2.9, release builds with `--features hardware,fuse-t`; 512 MiB of
+random bytes, times with the unlock (0.3 s here). "main" is v0.6.1, the
+base of this branch; "before" is this branch before the macOS review;
+"now" adds its fixes (hardware AES, bundle syncs, FUSE-T fsync
+coalescing; CHANGELOG).
+
+| `luksbox put` / `get`, MB/s | main | before | now |
+|---|---|---|---|
+| AES-256-GCM-SIV (default) | 59 / 164 | 148 / 167 | 393 / 555 |
+| AES-256-GCM | 63 / 174 | 156 / 177 | 402 / 589 |
+| ChaCha20-Poly1305 | 141 / 356 | 284 / 365 | 286 / 363 |
+| `--hide-sizes` | 42 / 155 | 42 / 157 | 184 / 534 |
+| `--pad-files` | 58 / 163 | 59 / 166 | 245 / 569 |
+| Detached header | 58 / 163 | 147 / 166 | 395 / 569 |
+| Sync bundle, 4 MiB pages | | 56 / 75 | 178 / 215 |
+| Sync bundle, 1 MiB pages | | 35 / 75 | 160 / 215 |
+
+| Through a FUSE-T mount | main | before | now |
+|---|---|---|---|
+| 512 MiB file, write + fsync / read (MiB/s) | 60 / 181 | 151 / 181 | 452 / 820 |
+| 1 000 files of 1 KiB, created | 4 files/s | 9 files/s | 575 files/s |
+| Sync bundle: 512 MiB write / read (MiB/s) | | 66 / 85 | 234 / 267 |
+| Sync bundle: 1 000 files of 1 KiB | | 11 files/s | 626 files/s |
+
+What made the difference on this machine:
+
+- **AES in hardware.** The AES and POLYVAL crates use the ARMv8 AES /
+  PMULL instructions only with the `aes_armv8` / `polyval_armv8` cfgs
+  (`.cargo/config.toml`); without them the default suite ran slower than
+  ChaCha20, which is software either way.
+- **No save per closed file on FUSE-T.** The macOS NFS client sends an
+  `fsync` (COMMIT) at every close; each one rewrote the metadata region
+  and its mirror (128 MiB, about 115 ms). Coalesced to one save per
+  second at most (`docs/MACOS_FUSE_T.md`).
+- **One drive-cache flush per save in bundles.** `F_FULLFSYNC` (what
+  `File::sync_all` does on Apple platforms) cost 4.1 ms per object here,
+  `F_BARRIERFSYNC` 1.0 ms, a plain `fsync` 0.2 ms.
+
+**Against the Linux figures above.** Those come from other hardware (a
+Ryzen AI 9 HX 370 in a VMware VM), so the comparison is rough. Large
+files go 1.5 to 2.5x faster here (default suite 393 / 555 against
+256 / 347 MB/s; through a mount 452 / 820 against 152 / 370), small
+files through a mount about 5x slower (575 against about 2 800 files/s:
+every create and close is an NFS round trip under FUSE-T), bundles
+about the same (every page is written twice). This is not an AES
+difference: x86_64 builds always used AES-NI (the `aes` and `polyval`
+crates detect it by themselves; only 64-bit ARM needs the cfgs), and
+hardware AES runs at several GB/s per core, far above these rates. What
+bounds a transfer is the work around each 4 KiB chunk (a `pwrite`, an OS
+random call for its nonce, a buffer zeroized), which costs more inside a
+VM. ChaCha20-Poly1305, software on both, shows the machine difference:
+286 against 238 MB/s.
+
+Left: each 4 KiB chunk asks the OS for its 12-byte nonce
+(`getentropy`, about as costly as the chunk's `pwrite` in a profile of a
+large `put`); a per-thread buffer of OS randomness, discarded after a
+`fork`, would save about a quarter of the write time. Not done: nonce
+generation is security-critical and the gain is moderate.
 
 ## What was changed
 

@@ -99,6 +99,19 @@ impl Gui {
         self.frames(3);
     }
 
+    /// Run frames for a while in real time: work the app started on its
+    /// own threads (the save and listing refresh after an import) ends in
+    /// wall-clock time, not in the harness' simulated time. In an
+    /// optimized build the next clicks could otherwise land while it
+    /// still changes the browser, and a double-click was seen as two
+    /// single clicks (the scenario failed in --release only).
+    fn settle_background(&mut self) {
+        for _ in 0..20 {
+            std::thread::sleep(Duration::from_millis(20));
+            self.frames(1);
+        }
+    }
+
     fn click_contains(&mut self, label: &str) {
         if !on_screen(self.h.get_by_label_contains(label).rect()) {
             self.h.get_by_label_contains(label).scroll_to_me();
@@ -574,6 +587,7 @@ fn gui_scenarios_end_to_end() {
     check_tree_in_vault(&mut g, "/photos", &files);
 
     // Browse: double-click a folder, back to the parent.
+    g.settle_background();
     g.h.get_by_value("docs").click();
     g.h.get_by_value("docs").click();
     g.frames(3);
@@ -1081,4 +1095,78 @@ fn many_toasts_stay_below_the_header() {
     // The welcome page's buttons near the top right still take clicks.
     g.click("+ Create a new vault");
     assert!(matches!(g.app().view, View::Create));
+}
+
+/// The Secure Enclave choice on the create form is greyed out exactly
+/// when Secure Enclave keyslots cannot be made here (a build without
+/// `--features hardware`, or a Mac without an enclave), instead of the
+/// whole form being filled in before the create is refused.
+#[cfg(target_os = "macos")]
+#[test]
+fn secure_enclave_choice_follows_availability() {
+    let _env = crate::test_env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    isolate_env(tmp.path());
+    let mut g = Gui::new();
+    g.click("+ Create a new vault");
+    let node = g.h.get_by_label(Factor::Sep.label());
+    let disabled = node.accesskit_node().is_disabled();
+    assert_eq!(
+        disabled,
+        !ops::sep_available(),
+        "Secure Enclave available: {}\n{}",
+        ops::sep_available(),
+        dump(&g.h)
+    );
+}
+
+/// R16-17 in the GUI: on a sync bundle, the revoke confirmation says the
+/// master key stays and the sync service keeps the old keyslot table,
+/// instead of promising the credential no longer opens the vault.
+#[test]
+fn revoking_a_bundle_keyslot_says_the_master_key_stays() {
+    let _env = crate::test_env_lock();
+    let tmp = tempfile::tempdir().unwrap();
+    isolate_env(tmp.path());
+    let bundle = tmp.path().join("Dropbox/revoke.lbxs");
+    std::fs::create_dir_all(bundle.parent().unwrap()).unwrap();
+    let mut g = Gui::new();
+    g.click("+ Create a new vault");
+    g.click("Sync bundle (.lbxs folder), experimental");
+    g.type_placeholder(
+        &path_hints::home("Dropbox/secret.lbxs"),
+        &bundle.display().to_string(),
+    );
+    g.finish_create("create bundle");
+    assert!(crate::sync_gui::is_bundle(&bundle));
+    g.click("Keyslots");
+    g.click("+ Add passphrase keyslot");
+    g.type_nth(Role::PasswordInput, 0, PASS2);
+    if g.h.query_all_by_role(Role::PasswordInput).count() > 1 {
+        g.type_nth(Role::PasswordInput, 1, PASS2);
+    }
+    g.click("Enroll");
+    g.wait_until("enroll passphrase", |a| a.pending.is_none());
+    g.assert_saw("enrolled passphrase in slot");
+    // Revoke the slot just added (the last Revoke button).
+    // The enroll left the view scrolled down: bring the button out from
+    // under the header first.
+    g.settle_background();
+    g.h.query_all_by_label("Revoke")
+        .last()
+        .unwrap()
+        .scroll_to_me();
+    g.settle(|h| h.query_all_by_label("Revoke").last().unwrap().rect());
+    g.click_last("Revoke");
+    assert!(g.app().revoke_confirm.is_some(), "{}", dump(&g.h));
+    // Every text on screen, long ones included (`dump` leaves them out).
+    let screen: String =
+        g.h.query_all(By::new())
+            .filter_map(|n| n.accesskit_node().value().map(|v| format!("{v}\n")))
+            .collect();
+    assert!(
+        screen.contains("does not change") && screen.contains("keeps the old keyslot table"),
+        "{screen}"
+    );
+    assert!(!screen.contains("will no longer open the"), "{screen}");
 }

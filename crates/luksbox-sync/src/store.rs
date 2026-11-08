@@ -118,7 +118,23 @@ pub trait ObjectStore: Send {
 
     /// Human-readable location, for messages.
     fn describe(&self) -> String;
+
+    /// Remove temporary files (`.tmp-<hex>`, exact grammar only) that
+    /// interrupted writes left: those older than `min_age_ns` (a synced
+    /// folder can hold another device's write in progress), and those
+    /// with more than one link at any age (an object already published
+    /// under its name, whose temporary name a crash kept; reads refuse
+    /// an object with two links until it is gone). Returns how many were
+    /// removed. Stores without temporary files do nothing.
+    fn sweep_tmp(&mut self, min_age_ns: u64) -> Result<usize> {
+        let _ = min_age_ns;
+        Ok(0)
+    }
 }
+
+/// How old a temporary file must be before `ObjectStore::sweep_tmp`
+/// takes it for a leftover: one hour.
+pub const TMP_SWEEP_AGE_NS: u64 = 3600 * 1_000_000_000;
 
 /// In-memory store. Keys are `(area, shard, leaf)` exactly as a folder
 /// would hold them, so tests can plant foreign entries, misplaced

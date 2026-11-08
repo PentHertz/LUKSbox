@@ -302,7 +302,15 @@ ChaCha20-Poly1305 is constant-time on every platform; AES-256-GCM and
 AES-256-GCM-SIV are constant-time on CPUs with hardware AES (AES-NI on
 x86_64, ARMv8 crypto extension on aarch64). On older / minimal CPUs a
 one-time stderr warning recommends `--cipher chacha`. See round 6
-section I in the audit report.
+section I in the audit report. The `aes` and `polyval` crates detect
+AES-NI / PCLMULQDQ on x86_64 by themselves, but use the ARMv8 AES / PMULL
+instructions only when built with the `aes_armv8` / `polyval_armv8`
+cfgs; `.cargo/config.toml` sets them for macOS and Linux on aarch64
+since 0.7.0-rc.1. Earlier aarch64 builds (Apple Silicon included) ran
+the RustCrypto constant-time software implementation: slower (148 vs
+393 MB/s for `put` on an M5 Max), not less safe. A `RUSTFLAGS`
+variable replaces the per-target flags, so a build that sets one must
+add the two cfgs.
 
 **Why AES-256-GCM-SIV is the default for new vaults**: random 96-bit
 nonces under vanilla AES-GCM have a NIST-recommended bound of 2^32
@@ -481,9 +489,11 @@ get in touch.
     (R16-25): the planned local copy of the base's table blocks and
     metadata pages (`pins/`) is not built; leases pin the base for 90
     days and the retention keeps 30, so this needs a long absence.
-  - *`luksbox umount` returns before the daemon's final upload*
-    (R16-08, remaining half); the failure is now reported at the next
-    open and in `sync status`.
+  - ~~*`luksbox umount` returns before the daemon's final upload*~~
+    (R16-08, remaining half): fixed in the macOS review of 2026-11-08.
+    `umount` now waits until the mount process has saved and published
+    (it holds a lock until it exits, FUSE and FUSE-T alike); a failure is
+    still reported at the next open and in `sync status`.
   - *A revoked keyslot on a bundle does not change the master key*
     (R16-17): epoch keys (phase 3 of `docs/CLOUD_SYNC_DESIGN.md`) are
     the real fix; `revoke` says so and gives the export / rotate /
@@ -1169,7 +1179,7 @@ If you're using LUKSbox to protect material information, please:
     |---|---|---|
     | **Interactive prompt** (default) | only the typing user (and the kernel input subsystem) | Direct CLI use. Most secure. |
     | **Stdin pipe** (`echo pp \| luksbox open ...` or `cat pp.txt \| luksbox ...`) | the writing process and the kernel pipe buffer; **NOT** in `/proc/<pid>/cmdline` or `/proc/<pid>/environ` | Scripts and CI. The writing process controls visibility. |
-    | **`LUKSBOX_PASSPHRASE` env var** | every process running as the same UID via `/proc/<pid>/environ`, plus the parent shell that exported it | Legacy / convenience. Use ONLY when stdin pipe isn't possible. |
+    | **`LUKSBOX_PASSPHRASE` env var** | the parent shell that exported it (and anything it starts), plus, until `luksbox` scrubs it at start-up, every process running as the same UID via `/proc/<pid>/environ` | Legacy / convenience. Use ONLY when stdin pipe isn't possible. Since 0.7.0-rc.1 the CLI moves the secret out of its environment as its first step and overwrites its bytes in the initial environment block, so a long-lived `luksbox mount` and its children no longer expose it. |
 
     LUKSbox **never** accepts a passphrase as an argv flag value
     (would expose it via `ps aux` to every user on the machine).
@@ -1205,11 +1215,11 @@ If you're using LUKSbox to protect material information, please:
     | `LUKSBOX_FORMAT_V2=1` | Forces the legacy v2 on-disk format and suppresses the auto-upgrade to v3 | Honored | Reduces a guarantee. v2 has no header or metadata crash-recovery mirrors. |
     | `LUKSBOX_ACCEPT_WEAK=1` | Auto-confirms the "use this weak passphrase anyway?" prompt | Honored | Skips a nag only. The zxcvbn warning still prints and Argon2id still runs at full strength, so it does not weaken the cryptography, only the guardrail. |
     | `LUKSBOX_TOLERATE_BAD_CHUNK_LISTS=1` | Recovery mode: a file whose chunk-list is corrupt is installed with zero chunks so the rest of the vault still opens | Honored | Recovery only. It silently turns an unreadable file into an empty one. Use it on a copy, mount read-only, and never write. |
-    | `LUKSBOX_PASSPHRASE`, `LUKSBOX_NEW_PASSPHRASE`, `LUKSBOX_FIDO2_PIN` | Supply a secret non-interactively | Honored | Leaks the secret into the process environment, readable via `/proc/<pid>/environ` by the same UID. Prefer the stdin pipe (item 10). Since Round 15 `LUKSBOX_PASSPHRASE` is the *unlock* secret only: `enroll`, `update`, `migrate-to-v3` and the seed-file prompts take their NEW secret from `LUKSBOX_NEW_PASSPHRASE` or the interactive prompt, never from the unlock variable (R15-H1). |
+    | `LUKSBOX_PASSPHRASE`, `LUKSBOX_NEW_PASSPHRASE`, `LUKSBOX_FIDO2_PIN` | Supply a secret non-interactively | Honored | Leaks the secret into the environment of the shell that sets it, readable via `/proc/<pid>/environ` by the same UID. `luksbox` takes it out of its own environment at start-up and overwrites the value in place (0.7.0-rc.1), so its children (a background mount, FUSE-T's NFS server, helpers) never get it; the GUI also strips these variables from its mount helper. Prefer the stdin pipe (item 10). Since Round 15 `LUKSBOX_PASSPHRASE` is the *unlock* secret only: `enroll`, `update`, `migrate-to-v3` and the seed-file prompts take their NEW secret from `LUKSBOX_NEW_PASSPHRASE` or the interactive prompt, never from the unlock variable (R15-H1). |
     | `LUKSBOX_TPM_PIN`, `LUKSBOX_SEED_PASSPHRASE`, `LUKSBOX_SLOT_PASSPHRASE` | Supply, at unlock, the TPM PIN of a PIN-protected TPM slot, a `.kyber` seed-file passphrase that differs from the slot passphrase, and the optional extra passphrase of a hybrid FIDO2 slot | Honored | Same environment exposure as above. The TPM PIN is deliberately never taken from `LUKSBOX_PASSPHRASE` or the stdin pipe: a wrong PIN counts toward the TPM's dictionary-attack lockout, and the PIN is only presented to PIN-protected slots. |
     | `LUKSBOX_NO_FOLLOW_SYMLINKS=1` | Refuses to open a vault reached through a symlink | Honored | Hardening opt-in (protective). |
     | `LUKSBOX_TPM_PIN_SRK=1` | Same as the global `--tpm-pin-srk` flag: new TPM keyslots record the TPM storage root key and refuse a substituted one at unlock (R15-F5) | Honored | Hardening opt-in (protective). Pinned slots need LUKSbox 0.6.0+ to unlock. |
-    | `LUKSBOX_SANDBOX_HELPER=1` | Enables the Linux GUI sandbox helper | Honored | Hardening opt-in (protective). |
+    | `LUKSBOX_SANDBOX_HELPER=1` | Runs the GUI's macOS FUSE-T mount helper under `sandbox-exec` with `fuse-t-helper.sb` (refuses to mount when the profile is missing) | Honored | Hardening opt-in (protective). The profile was rewritten in 0.7.0-rc.1: the earlier one did not parse on macOS 26. See `docs/MACOS_FUSE_T.md`. |
     | `LUKSBOX_FAKE_NO_AES`, `LUKSBOX_SUPPRESS_AES_WARNING` | Force, or hide, the software-AES advisory | Honored | Cosmetic. Neither changes the cipher; the advisory just recommends `--cipher chacha` on CPUs without AES acceleration. |
     | `LUKSBOX_DEBUG_OPEN`, `LUKSBOX_WINFSP_DEBUG` | Verbose open / WinFsp diagnostics to stderr | Honored | Diagnostic. May print structural (not secret) detail, so avoid it in shared logs. |
     | `LUKSBOX_GUI_ZOOM`, `LUKSBOX_GUI_SWRAST_RETRY` | GUI render scale and software-rasterizer relaunch | Honored | No security effect. |

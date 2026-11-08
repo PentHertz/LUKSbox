@@ -13,8 +13,15 @@
 //! 3. The head's own header must open with the same material: a
 //!    credential revoked in a newer header is refused even if an older
 //!    header object is still around (`CredentialRevoked`).
-//! 4. The head must be complete (every table block and page present);
-//!    otherwise its newest complete ancestor opens read-only.
+//! 4. The head must be complete (its header object, every table block
+//!    and page present and its table blocks intact) and must be, or
+//!    descend from, the commit this device last opened or published (its
+//!    anchor): a device never opens a state older than one it has seen.
+//!    Incomplete heads are skipped; when nothing complete descends from
+//!    the anchor yet, its newest complete descendant (the anchor itself
+//!    while the newer objects arrive) opens read-only, and when not even
+//!    that is complete a writable open refuses (`NewestIncomplete`).
+//!    Concurrent heads are merged only over a complete common ancestor.
 //!
 //! Publishing writes every new object first, then records the exact
 //! manifest bytes locally (`manifest-pending`), then writes the manifest,
@@ -22,7 +29,7 @@
 //! nothing visible or is finished at the next open with the same bytes,
 //! so a device never writes two different commits with one number.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -128,6 +135,10 @@ pub struct Session {
     /// Newest commit on the head's first-parent line made by another
     /// device (see `Lease::pin`).
     pub(crate) pin: Option<ManifestRef>,
+    /// A publish whose manifest was reserved (its number taken, maybe
+    /// already in the bundle) but not confirmed written: the next publish
+    /// finishes it first, with the same bytes.
+    pub(crate) unfinished: Option<(Reserved, crate::image::Prepared)>,
 }
 
 fn header_generation(bytes: &[u8; HEADER_SIZE]) -> u64 {
@@ -235,29 +246,277 @@ fn header_frame(h: &Header) -> [u8; 32] {
     d.finalize().into()
 }
 
-/// The complete head of `graph` with the newest header generation, at
-/// least `min` (the first in the graph's order among equals), with its
-/// verified table blocks.
-fn newest_header_head(
+/// The commit a session opens, from `select_head`.
+struct Selection {
+    head: Verified,
+    blocks: Vec<TableBlock>,
+    /// Must be opened read-only: nothing complete descends from this
+    /// device's anchor but the anchor's own line, whose newer commits
+    /// are still arriving (or an older state shown for inspection).
+    read_only: bool,
+    /// Heads skipped because their objects are not all here (or are
+    /// damaged).
+    skipped: usize,
+    /// Older than the newest version this device has seen (read-only
+    /// inspection only).
+    older: bool,
+    /// It is, or descends from, the anchor (always without one).
+    descends: bool,
+}
+
+/// Pick the commit a session opens (or a finishing session merges into).
+///
+/// - The deterministic head: the first complete head in the graph's order
+///   (highest Lamport counter, then hash; R16-03), or, when its header is
+///   older than `max_gen` (the newest this device saw), the complete head
+///   with the newest header at least that new. Every device picks the
+///   same one, so devices merging the same branches converge.
+/// - It must be, or descend from, this device's anchor (`lineage`): never
+///   a state older than one this device has seen. When it does not, a
+///   complete head that does is used instead, unless the session merges
+///   (`will_merge`) and that head merges into the deterministic one over
+///   a complete common ancestor (the normal fork: the merge brings it in).
+/// - Nothing complete descends from the anchor but non-head commits of
+///   its line (newer objects still arriving): the newest of those,
+///   read-only.
+/// - Nothing at all: `NewestIncomplete`, or with `allow_older` (read-only
+///   inspection) the choice made without an anchor, flagged `older`.
+#[allow(clippy::too_many_arguments)]
+fn select_head(
     graph: &Graph,
     store: &SharedStore,
     keys: &BundleKeys,
-    min: u64,
-) -> Result<Option<(Verified, Vec<TableBlock>)>> {
-    let mut newest: Option<(Verified, Vec<TableBlock>)> = None;
+    present: &mut Present,
+    anchor: Option<&ManifestRef>,
+    max_gen: u64,
+    will_merge: bool,
+    allow_older: bool,
+) -> Result<Selection> {
+    let lineage = graph.lineage(anchor)?;
+    let mut heads: Vec<(Verified, Option<Vec<TableBlock>>)> = Vec::with_capacity(graph.heads.len());
     for h in &graph.heads {
-        let v = &graph.all[h];
-        let newer = newest
-            .as_ref()
-            .is_none_or(|(n, _)| v.m.header.generation > n.m.header.generation);
-        if v.m.header.generation >= min
-            && newer
-            && let Some(b) = complete(store, keys, v)?
+        let v = graph.all[h].clone();
+        let b = complete_in(store, keys, present, &v)?;
+        heads.push((v, b));
+    }
+    let skipped = heads.iter().filter(|(_, b)| b.is_none()).count();
+    let selection =
+        |head: Verified, blocks: Vec<TableBlock>, read_only, older, descends| Selection {
+            head,
+            blocks,
+            read_only,
+            skipped,
+            older,
+            descends,
+        };
+    let take = |mut heads: Vec<(Verified, Option<Vec<TableBlock>>)>, i: usize| {
+        let (head, blocks) = heads.swap_remove(i);
+        (head, blocks.expect("complete"))
+    };
+    let t0 = first_complete(&heads, max_gen, &|_| true);
+    let mut older = false;
+    if let Some(lineage) = &lineage {
+        if let Some(i) = t0
+            && lineage.contains(&heads[i].0.hash)
         {
-            newest = Some((v.clone(), b));
+            let (h, b) = take(heads, i);
+            return Ok(selection(h, b, false, false, true));
+        }
+        if let Some(j) = first_complete(&heads, max_gen, &|v| lineage.contains(&v.hash)) {
+            if let Some(i) = t0
+                && will_merge
+                && matches!(
+                    plan_merge(graph, store, keys, present, &heads[i].0, &heads[j].0)?,
+                    MergePlan::Merge { .. }
+                )
+            {
+                let (h, b) = take(heads, i);
+                return Ok(selection(h, b, false, false, false));
+            }
+            let (h, b) = take(heads, j);
+            return Ok(selection(h, b, false, false, true));
+        }
+        // Nothing complete at the tip of this device's line: the newest
+        // complete commit on it (the anchor itself while what was built
+        // on it arrives), read-only until the rest is here.
+        let mut line: Vec<&Verified> = lineage
+            .iter()
+            .filter(|h| !graph.heads.contains(h))
+            .map(|h| &graph.all[h])
+            .collect();
+        line.sort_by_key(|v| std::cmp::Reverse((v.m.lamport, v.hash)));
+        for v in line {
+            if present.check(store, keys, v)?
+                && let Some(b) = complete_in(store, keys, present, v)?
+            {
+                return Ok(selection(v.clone(), b, true, false, true));
+            }
+        }
+        let a = anchor.expect("a lineage has an anchor");
+        if !allow_older {
+            return Err(SyncError::NewestIncomplete {
+                device: a.device.short(),
+                seq: a.seq,
+            });
+        }
+        older = true;
+    }
+    // Without an anchor (first open), or for read-only inspection of an
+    // older state.
+    let descends = lineage.is_none();
+    if let Some(i) = t0 {
+        let (h, b) = take(heads, i);
+        return Ok(selection(h, b, older, older, descends));
+    }
+    // No head is complete: the newest complete ancestor of the first one
+    // (its history only, never collected or pending commits), read-only.
+    let mut cur = graph.heads.first().copied();
+    while let Some(h) = cur {
+        let v = &graph.all[&h];
+        if h != graph.heads[0]
+            && present.check(store, keys, v)?
+            && let Some(b) = complete_in(store, keys, present, v)?
+        {
+            return Ok(selection(v.clone(), b, true, older, descends));
+        }
+        cur =
+            v.m.parents
+                .first()
+                .map(|p| p.hash)
+                .filter(|p| graph.usable.contains(p));
+    }
+    Err(SyncError::NothingComplete {
+        pending: graph.pending() + skipped,
+    })
+}
+
+/// In `heads` (graph order, with their blocks when complete): the first
+/// complete one `pick` accepts, or, when its header is older than
+/// `max_gen`, the accepted complete head with the newest header at least
+/// that new (the first in order among equals), so a device never works
+/// on, or publishes over, a header older than one it saw.
+fn first_complete(
+    heads: &[(Verified, Option<Vec<TableBlock>>)],
+    max_gen: u64,
+    pick: &dyn Fn(&Verified) -> bool,
+) -> Option<usize> {
+    let i = heads.iter().position(|(v, b)| b.is_some() && pick(v))?;
+    if heads[i].0.m.header.generation >= max_gen {
+        return Some(i);
+    }
+    let mut best: Option<usize> = None;
+    for (j, (v, b)) in heads.iter().enumerate() {
+        let g = v.m.header.generation;
+        if b.is_some()
+            && pick(v)
+            && g >= max_gen
+            && best.is_none_or(|k| g > heads[k].0.m.header.generation)
+        {
+            best = Some(j);
         }
     }
-    Ok(newest)
+    Some(best.unwrap_or(i))
+}
+
+/// How the keyslot table of a merge is decided (`plan_merge`).
+pub(crate) enum Keyslots {
+    /// The target's (unchanged on the other side, or the same change).
+    Ours,
+    /// The other side's, which alone changed it.
+    Theirs(Box<[u8; HEADER_SIZE]>),
+    /// Changed on both sides: merged keyslot by keyslot.
+    Merged(Box<Header>, Vec<String>),
+}
+
+/// Whether, and how, `other` merges into `ours`.
+pub(crate) enum MergePlan {
+    Merge {
+        base: Box<Verified>,
+        keyslots: Keyslots,
+    },
+    /// Both sides changed the header in ways that do not merge.
+    HeaderFork,
+    /// The common ancestor is not complete here (objects, or its header
+    /// object, missing or damaged): the merge waits for it.
+    BaseMissing,
+    /// No common ancestor in the bundle.
+    Unrelated,
+}
+
+/// Plan the merge of `other` into `ours`: the base is the newest commit
+/// on both first-parent chains (`common_ancestor`), and it must be
+/// complete with its header object present. Without it, files deleted
+/// on one side since the base would come back (a two-way merge keeps
+/// both sides' files), and a keyslot table could only be chosen by
+/// generation, which can undo a removal: neither is done automatically.
+pub(crate) fn plan_merge(
+    graph: &Graph,
+    store: &SharedStore,
+    keys: &BundleKeys,
+    present: &mut Present,
+    ours: &Verified,
+    other: &Verified,
+) -> Result<MergePlan> {
+    let Some(bh) = common_ancestor(graph, &ours.hash, &other.hash) else {
+        return Ok(MergePlan::Unrelated);
+    };
+    let base = graph.all[&bh].clone();
+    if !present.check(store, keys, &base)? {
+        return Ok(MergePlan::BaseMissing);
+    }
+    let Some(base_b) = present.header(store, &base.m.header)? else {
+        return Ok(MergePlan::BaseMissing);
+    };
+    if ours.m.header.hash == other.m.header.hash {
+        return Ok(MergePlan::Merge {
+            base: Box::new(base),
+            keyslots: Keyslots::Ours,
+        });
+    }
+    let missing = || SyncError::MissingHistory {
+        device: "header".into(),
+        seq: 0,
+    };
+    let ours_b = present.header(store, &ours.m.header)?.ok_or_else(missing)?;
+    let other_b = present
+        .header(store, &other.m.header)?
+        .ok_or_else(missing)?;
+    // Keyslot tables: a change made on one side only is carried into
+    // the merge (a revocation must never be undone by a merge);
+    // different changes on both sides are merged keyslot by keyslot, or
+    // left for the user. Compared by meaning, not bytes.
+    let (sb, so, st) = (
+        header_semantics(&base_b),
+        header_semantics(&ours_b),
+        header_semantics(&other_b),
+    );
+    let keyslots = if so == st {
+        Keyslots::Ours
+    } else {
+        match (sb != so, sb != st) {
+            (true, true) => {
+                let parsed = (
+                    Header::from_bytes(&base_b),
+                    Header::from_bytes(&ours_b),
+                    Header::from_bytes(&other_b),
+                );
+                let merged = match parsed {
+                    (Ok(b), Ok(t), Ok(o)) => merge_keyslot_tables(&b, &t, &o),
+                    _ => None,
+                };
+                match merged {
+                    Some((m, notes)) => Keyslots::Merged(Box::new(m), notes),
+                    None => return Ok(MergePlan::HeaderFork),
+                }
+            }
+            (false, true) => Keyslots::Theirs(Box::new(other_b)),
+            _ => Keyslots::Ours,
+        }
+    };
+    Ok(MergePlan::Merge {
+        base: Box::new(base),
+        keyslots,
+    })
 }
 
 /// Three-way merge of two keyslot tables changed concurrently (`target`
@@ -408,8 +667,14 @@ pub(crate) fn header_candidates(
             }
             _ => {}
         }
-        let Some(bytes) = store.read(Area::Header, &n, LenRule::Exact(HEADER_SIZE))? else {
-            continue;
+        // A header object that is not a plain file of the right size (a
+        // link, a FIFO, a hard link, a truncated copy) is skipped like a
+        // missing one, as manifests are: never read, and never a reason
+        // to refuse the whole bundle.
+        let bytes = match store.read(Area::Header, &n, LenRule::Exact(HEADER_SIZE)) {
+            Ok(Some(b)) => b,
+            Ok(None) | Err(SyncError::Refused { .. }) => continue,
+            Err(e) => return Err(e),
         };
         let bytes: [u8; HEADER_SIZE] = bytes.try_into().expect("exact length");
         out.push((h, bytes));
@@ -454,48 +719,190 @@ pub(crate) fn load_manifests(
     Ok((out, invalid, listing.foreign_count))
 }
 
-/// Whether every object of `v` is present and its table blocks verify.
-/// Returns the decoded blocks on success.
+/// What the bundle holds, listed once per open (or per merge pass)
+/// instead of once per commit checked: the page objects, the header
+/// objects (re-read when one is not found: a commit published since may
+/// name a new one), and what was already found about each table block.
+pub(crate) struct Present {
+    pages: HashSet<[u8; 32]>,
+    headers: Option<Vec<(HeaderName, [u8; HEADER_SIZE])>>,
+    /// `(table object, block index, entries in the image)`: whether the
+    /// block is there, verifies, and every page it names is present.
+    verdicts: std::collections::HashMap<([u8; 32], u64, u64), bool>,
+}
+
+/// An object that is there but cannot be trusted (wrong size or type,
+/// failed authentication, broken content): treated like a missing one,
+/// so one damaged object makes its commits incomplete instead of failing
+/// every open of the bundle.
+fn is_damage(e: &SyncError) -> bool {
+    matches!(
+        e,
+        SyncError::Refused { .. } | SyncError::ObjectAuth { .. } | SyncError::Malformed { .. }
+    )
+}
+
+impl Present {
+    pub(crate) fn load(store: &SharedStore) -> Result<Self> {
+        let pages = store
+            .lock()
+            .expect("store lock")
+            .list(Area::Page)?
+            .names
+            .iter()
+            .filter_map(|n| n.object_id().map(|o| o.0))
+            .collect();
+        Ok(Self {
+            pages,
+            headers: None,
+            verdicts: std::collections::HashMap::new(),
+        })
+    }
+
+    /// The header object `r` names, checked against its hash; `None` if
+    /// it is not in the bundle (or `r` names no object: a detached
+    /// header).
+    pub(crate) fn header(
+        &mut self,
+        store: &SharedStore,
+        r: &HeaderRef,
+    ) -> Result<Option<[u8; HEADER_SIZE]>> {
+        let Some(name) = &r.name else { return Ok(None) };
+        let find = |hs: &[(HeaderName, [u8; HEADER_SIZE])]| {
+            hs.iter()
+                .find(|(n, b)| &n.to_name() == name && sha256(b) == r.hash)
+                .map(|(_, b)| *b)
+        };
+        if let Some(b) = self.headers.as_deref().and_then(find) {
+            return Ok(Some(b));
+        }
+        let (_, hs) = header_candidates(&mut **store.lock().expect("store lock"))?;
+        let found = find(&hs);
+        self.headers = Some(hs);
+        Ok(found)
+    }
+
+    /// What a verdict about table block `b` of a commit with
+    /// `total_pages` pages depends on (only the last block of an image is
+    /// partly past its end).
+    fn verdict_key(r: &ObjRef, b: u64, total_pages: u64) -> ([u8; 32], u64, u64) {
+        let in_image = total_pages
+            .saturating_sub(b * ENTRIES_PER_BLOCK as u64)
+            .min(ENTRIES_PER_BLOCK as u64);
+        (r.oid, b, in_image)
+    }
+
+    /// Table block `b` of a commit with `total_pages` pages, read and
+    /// verified; `None` if it is missing or damaged, or names a page that
+    /// is not here.
+    fn block(
+        &mut self,
+        store: &SharedStore,
+        keys: &BundleKeys,
+        r: &ObjRef,
+        b: u64,
+        total_pages: u64,
+    ) -> Result<Option<TableBlock>> {
+        let key = Self::verdict_key(r, b, total_pages);
+        let in_image = key.2;
+        if self.verdicts.get(&key) == Some(&false) {
+            return Ok(None);
+        }
+        let read = store.lock().expect("store lock").read(
+            Area::Table,
+            &Name::Object(r.object_id()),
+            LenRule::Exact(BLOCK_OBJECT_LEN),
+        );
+        let block = match read.and_then(|o| match o {
+            Some(obj) => TableBlock::open(keys, r, b, &obj).map(Some),
+            None => Ok(None),
+        }) {
+            Ok(Some(block)) => block,
+            Ok(None) => {
+                self.verdicts.insert(key, false);
+                return Ok(None);
+            }
+            Err(e) if is_damage(&e) => {
+                self.verdicts.insert(key, false);
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let ok = block.entries.iter().enumerate().all(|(i, e)| match e {
+            // Past the end of the image: only a misbehaving key holder
+            // writes that; never trusted.
+            Some(_) if i as u64 >= in_image => false,
+            Some(p) => self.pages.contains(&p.oid),
+            None => true,
+        });
+        self.verdicts.insert(key, ok);
+        Ok(ok.then_some(block))
+    }
+
+    /// Whether every object of `v` is here and intact (see `complete_in`),
+    /// without decoding again a table block already found good: commits
+    /// share most of their blocks, so checking a long line of them reads
+    /// each block once.
+    pub(crate) fn check(
+        &mut self,
+        store: &SharedStore,
+        keys: &BundleKeys,
+        v: &Verified,
+    ) -> Result<bool> {
+        if v.m.header.name.is_some() && self.header(store, &v.m.header)?.is_none() {
+            return Ok(false);
+        }
+        let total_pages = page_count(v.m.logical_len, v.m.page_size as u64);
+        for (b, r) in v.m.tables.iter().enumerate() {
+            match self
+                .verdicts
+                .get(&Self::verdict_key(r, b as u64, total_pages))
+            {
+                Some(true) => {}
+                Some(false) => return Ok(false),
+                None => {
+                    if self.block(store, keys, r, b as u64, total_pages)?.is_none() {
+                        return Ok(false);
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Whether every object of `v` is present and intact: its header object
+/// (by name and hash), every table block (which must verify) and every
+/// page they name. Returns the decoded blocks on success. A damaged
+/// object counts as missing (`None`): never trusted, and never a reason
+/// to fail the whole open.
+pub(crate) fn complete_in(
+    store: &SharedStore,
+    keys: &BundleKeys,
+    present: &mut Present,
+    v: &Verified,
+) -> Result<Option<Vec<TableBlock>>> {
+    if v.m.header.name.is_some() && present.header(store, &v.m.header)?.is_none() {
+        return Ok(None);
+    }
+    let total_pages = page_count(v.m.logical_len, v.m.page_size as u64);
+    let mut blocks = Vec::with_capacity(v.m.tables.len());
+    for (b, r) in v.m.tables.iter().enumerate() {
+        match present.block(store, keys, r, b as u64, total_pages)? {
+            Some(block) => blocks.push(block),
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(blocks))
+}
+
+/// `complete_in` with a fresh listing of the bundle.
 pub(crate) fn complete(
     store: &SharedStore,
     keys: &BundleKeys,
     v: &Verified,
 ) -> Result<Option<Vec<TableBlock>>> {
-    let mut s = store.lock().expect("store lock");
-    let pages = s.list(Area::Page)?;
-    let present: std::collections::HashSet<[u8; 32]> = pages
-        .names
-        .iter()
-        .filter_map(|n| n.object_id().map(|o| o.0))
-        .collect();
-    let total_pages = page_count(v.m.logical_len, v.m.page_size as u64);
-    let mut blocks = Vec::with_capacity(v.m.tables.len());
-    for (b, r) in v.m.tables.iter().enumerate() {
-        let Some(obj) = s.read(
-            Area::Table,
-            &Name::Object(r.object_id()),
-            LenRule::Exact(BLOCK_OBJECT_LEN),
-        )?
-        else {
-            return Ok(None);
-        };
-        let block = TableBlock::open(keys, r, b as u64, &obj)?;
-        for (i, e) in block.entries.iter().enumerate() {
-            let idx = b as u64 * ENTRIES_PER_BLOCK as u64 + i as u64;
-            match e {
-                Some(_) if idx >= total_pages => {
-                    return Err(SyncError::Malformed {
-                        name: format!("t/{}", r.object_id().to_hex()),
-                        why: "table entry past the end of the image",
-                    });
-                }
-                Some(p) if !present.contains(&p.oid) => return Ok(None),
-                _ => {}
-            }
-        }
-        blocks.push(block);
-    }
-    Ok(Some(blocks))
+    complete_in(store, keys, &mut Present::load(store)?, v)
 }
 
 pub(crate) fn now_ns() -> u64 {
@@ -505,15 +912,22 @@ pub(crate) fn now_ns() -> u64 {
         .unwrap_or(0)
 }
 
-/// Write a manifest with the crash-safe protocol described in the module
-/// docs, then update the device state.
-fn publish_manifest(
-    store: &SharedStore,
+/// A manifest sealed and recorded locally as being published
+/// (`PENDING_MANIFEST` and `DeviceState::publishing`). From here on its
+/// sequence number is taken: the manifest may reach the bundle at any
+/// later step, so it is finished with these exact bytes, never replaced
+/// by another commit claiming the same number (an equivocation).
+pub(crate) struct Reserved {
+    v: Verified,
+    bytes: Vec<u8>,
+}
+
+fn reserve_manifest(
     local: &mut dyn LocalStore,
     keys: &BundleKeys,
     state: &mut DeviceState,
     m: Manifest,
-) -> Result<Verified> {
+) -> Result<Reserved> {
     // R16-07: what every reader will check, checked here first, so a
     // commit is never published that every device then ignores (which
     // this device would next read as a rollback of its own commit).
@@ -526,20 +940,61 @@ fn publish_manifest(
         hash: sha256(&bytes),
     };
     local.put(PENDING_MANIFEST, &bytes)?;
+    let before = state.publishing;
     state.publishing = Some(r);
-    state.save(keys, local)?;
+    if let Err(e) = state.save(keys, local) {
+        // Not recorded: nothing was written to the bundle, the number
+        // is free again.
+        state.publishing = before;
+        return Err(e);
+    }
+    Ok(Reserved {
+        v: Verified {
+            oid,
+            hash: r.hash,
+            size: bytes.len(),
+            m,
+        },
+        bytes,
+    })
+}
+
+/// Write a reserved manifest to the bundle (again, after a failure:
+/// `create_new` of the same bytes is idempotent), then record it as
+/// published.
+fn write_reserved(
+    store: &SharedStore,
+    local: &mut dyn LocalStore,
+    keys: &BundleKeys,
+    state: &mut DeviceState,
+    res: &Reserved,
+) -> Result<()> {
     {
         let mut s = store.lock().expect("store lock");
-        s.create_new(Area::Manifest, &Name::Object(oid), &bytes)?;
+        s.create_new(Area::Manifest, &Name::Object(res.v.oid), &res.bytes)?;
         s.sync()?;
     }
-    finish_publish(local, keys, state, &r, m.header.generation)?;
-    Ok(Verified {
-        oid,
-        hash: r.hash,
-        size: bytes.len(),
-        m,
-    })
+    finish_publish(
+        local,
+        keys,
+        state,
+        &res.v.as_ref(),
+        res.v.m.header.generation,
+    )
+}
+
+/// Write a manifest with the crash-safe protocol described in the module
+/// docs, then update the device state.
+fn publish_manifest(
+    store: &SharedStore,
+    local: &mut dyn LocalStore,
+    keys: &BundleKeys,
+    state: &mut DeviceState,
+    m: Manifest,
+) -> Result<Verified> {
+    let res = reserve_manifest(local, keys, state, m)?;
+    write_reserved(store, local, keys, state, &res)?;
+    Ok(res.v)
 }
 
 fn finish_publish(
@@ -711,6 +1166,7 @@ pub fn convert(
             header_bytes,
             lease: None,
             pin: None,
+            unfinished: None,
         };
         let mut vfs = luksbox_vfs::Vfs::open(container).map_err(vfs_err)?;
         if vfs.upgrade_header_to_v3().map_err(vfs_err)? {
@@ -744,11 +1200,19 @@ fn head_header(
 /// commit's vault is its first parent's vault plus changes, and a merge
 /// writes into its first parent (the target), giving files copied in from
 /// the other side new ids.
-fn first_parent_chain(graph: &Graph, h: &crate::graph::Hash) -> Vec<crate::graph::Hash> {
+///
+/// Followed by hash through whatever is present, collected history
+/// included: each link is authenticated by the child's manifest, so a
+/// commit below its device's checkpoint that is still here (garbage
+/// collection deletes planned manifests only after a grace period) is
+/// still the true ancestor, and a fine merge base. What the provider
+/// puts back from its version history is reached only if it is.
+pub(crate) fn first_parent_chain(graph: &Graph, h: &crate::graph::Hash) -> Vec<crate::graph::Hash> {
     let mut out = Vec::new();
-    let mut cur = Some(*h);
+    let mut seen = HashSet::new();
+    let mut cur = Some(*h).filter(|x| graph.all.contains_key(x));
     while let Some(x) = cur {
-        if out.contains(&x) {
+        if !seen.insert(x) {
             break;
         }
         out.push(x);
@@ -756,7 +1220,8 @@ fn first_parent_chain(graph: &Graph, h: &crate::graph::Hash) -> Vec<crate::graph
             .all
             .get(&x)
             .and_then(|v| v.m.parents.first())
-            .map(|p| p.hash);
+            .map(|p| p.hash)
+            .filter(|p| graph.all.contains_key(p));
     }
     out
 }
@@ -782,15 +1247,17 @@ fn pin_of(
 /// other parent of a merge could match unrelated files by id. An older
 /// base can only turn already-merged changes into "same content on both
 /// sides", never lose one.
-fn common_ancestor(
+pub(crate) fn common_ancestor(
     graph: &Graph,
     a: &crate::graph::Hash,
     b: &crate::graph::Hash,
 ) -> Option<crate::graph::Hash> {
-    let aa: std::collections::HashSet<_> = first_parent_chain(graph, a).into_iter().collect();
+    // Usable, or collected history still here (see `first_parent_chain`);
+    // never a commit whose own history is pending.
+    let aa: HashSet<_> = first_parent_chain(graph, a).into_iter().collect();
     first_parent_chain(graph, b)
         .into_iter()
-        .filter(|h| aa.contains(h) && graph.usable.contains(h))
+        .filter(|h| aa.contains(h) && (graph.usable.contains(h) || graph.collected.contains(h)))
         .max_by_key(|h| (graph.all[h].m.lamport, *h))
 }
 
@@ -828,6 +1295,10 @@ pub struct FinishReport {
     /// What a merge of concurrent keyslot changes decided (moves,
     /// removals, changes to redo).
     pub keyslot_notes: Vec<String>,
+    /// Concurrent commits left unmerged because the version they come
+    /// from is not complete here, or they share none
+    /// (`Notice::MergeBaseMissing`).
+    pub base_missing: usize,
 }
 
 /// What replaying unpublished local changes onto a newer commit did.
@@ -840,6 +1311,9 @@ enum Rebase {
     },
     /// Kept as is; `recoverable`: they can still be shown.
     Stuck { recoverable: bool },
+    /// Kept as is until the merge base is complete here
+    /// (`MergePlan::BaseMissing` / `Unrelated`); they can be shown.
+    Waiting,
 }
 
 #[derive(Debug, Default)]
@@ -847,6 +1321,8 @@ struct MergeSummary {
     merged: usize,
     conflicts: usize,
     header_forks: usize,
+    /// Heads not merged for want of a complete common ancestor.
+    base_missing: usize,
     header_adopted: bool,
     keyslot_notes: Vec<String>,
 }
@@ -907,6 +1383,13 @@ impl Session {
         opts: &OpenOptions,
     ) -> Result<(Session, Container, OpenReport)> {
         let mut store = store;
+        if !opts.read_only {
+            // Temporary files interrupted writes left (a crash between
+            // linking an object and removing its temporary name leaves
+            // the object with two links, which reads refuse). Best
+            // effort: a failure here shows again in the listings below.
+            let _ = store.sweep_tmp(crate::store::TMP_SWEEP_AGE_NS);
+        }
         let (bid, candidates) = header_candidates(&mut *store)?;
         let store = shared_store(store);
         let local: SharedLocal = Arc::new(Mutex::new(local_for(bid)?));
@@ -992,6 +1475,8 @@ impl Session {
             }
             Err(e) => return Err(e),
         };
+        // What this device last opened or published: nothing older opens.
+        let anchor = state.as_ref().and_then(|s| s.head);
         let mut state = match state {
             Some(s) => s,
             None => DeviceState::new(bid.0, sanitize_label(&opts.device_label))?,
@@ -1004,67 +1489,45 @@ impl Session {
         let mut can_write = writable(&notices) && !opts.read_only;
         report.other_heads = graph.heads.len() - 1;
 
-        // 4. The head: the first complete one in the deterministic order
-        // (highest Lamport counter, then hash). R16-03: a head whose
-        // objects have not all arrived is reported as pending and
-        // skipped, as the design says, instead of making the session
-        // read-only. It may never complete (a device that died
-        // mid-upload, a provider that withholds one object), and a
-        // read-only device cannot publish anything that would outrank
-        // it: every device stayed read-only, for good. Only when no head
-        // is complete does the session open the newest complete ancestor
-        // of the first one, read-only, until the objects arrive.
-        let mut picked = None;
-        let mut skipped = 0usize;
-        for h in &graph.heads {
-            let v = graph.all[h].clone();
-            if let Some(b) = complete(&store, &keys, &v)? {
-                picked = Some((v, b));
-                break;
-            }
-            skipped += 1;
+        // 4. The head (`select_head`): the first complete one in the
+        // deterministic order (highest Lamport counter, then hash), or
+        // the one with the newest header if that one's is older than this
+        // device saw. R16-03: a head whose objects have not all arrived
+        // is reported as pending and skipped, as the design says, instead
+        // of making the session read-only (it may never complete: a
+        // device that died mid-upload). It must be, or descend from, the
+        // commit this device last opened or published (I5), or merge with
+        // one that does; otherwise this device's own line is opened, its
+        // newest complete commit read-only while the rest arrives, and a
+        // writable open refuses when not even that is complete
+        // (`NewestIncomplete`: a withheld or damaged object of what this
+        // device last saw would otherwise show an older vault).
+        let mut present = Present::load(&store)?;
+        let sel = select_head(
+            &graph,
+            &store,
+            &keys,
+            &mut present,
+            anchor.as_ref(),
+            state.max_header_generation,
+            can_write,
+            opts.read_only,
+        )?;
+        if sel.skipped > 0 {
+            report.notices.push(Notice::Pending { count: sel.skipped });
         }
-        if skipped > 0 {
-            report.notices.push(Notice::Pending { count: skipped });
+        if sel.older {
+            report.notices.push(Notice::OlderThanSeen);
         }
-        // A fork whose first head carries an older header than this device
-        // saw (a keyslot change or a file list resize published here while
-        // another device committed on the older header): open on the
-        // complete head with the newest header instead, so this device
-        // never works on, or publishes over, a header older than one it
-        // saw. The merge below brings the other heads into it, or keeps a
-        // header fork. With no such head, the check below refuses it.
-        if let Some((first, _)) = &picked
-            && first.m.header.generation < state.max_header_generation
-            && let Some(newest) =
-                newest_header_head(&graph, &store, &keys, state.max_header_generation)?
-        {
-            picked = Some(newest);
+        if sel.read_only {
+            can_write = false;
         }
-        let (head, blocks) = match picked {
-            Some(p) => p,
-            None => {
-                can_write = false;
-                let mut head = graph.all[&graph.heads[0]].clone();
-                loop {
-                    let Some(p) = head.m.parents.first() else {
-                        return Err(SyncError::NothingComplete {
-                            pending: graph.pending() + skipped,
-                        });
-                    };
-                    head = graph
-                        .all
-                        .get(&p.hash)
-                        .cloned()
-                        .ok_or(SyncError::NothingComplete {
-                            pending: graph.pending() + skipped,
-                        })?;
-                    if let Some(b) = complete(&store, &keys, &head)? {
-                        break (head, b);
-                    }
-                }
-            }
-        };
+        // The anchor only moves forward: to the head opened when it
+        // descends from the anchor (an older state shown for inspection,
+        // or the deterministic head a merge is about to bring this
+        // device's line into, does not).
+        let advance_anchor = sel.descends;
+        let (head, blocks) = (sel.head, sel.blocks);
         if head.m.header.generation < state.max_header_generation {
             return Err(SyncError::RollbackDetected {
                 device: "keyslot table".into(),
@@ -1166,7 +1629,9 @@ impl Session {
         for (_, h) in graph.newest.values() {
             state.see(&graph.head_ref(h));
         }
-        state.head = Some(head_ref);
+        if advance_anchor {
+            state.head = Some(head_ref);
+        }
         state.max_header_generation = state.max_header_generation.max(head.m.header.generation);
         {
             let mut l = local.lock().expect("local lock");
@@ -1192,6 +1657,7 @@ impl Session {
             header_bytes: header_in_use,
             lease: None,
             pin,
+            unfinished: None,
         };
 
         // 8. Replay stale local changes, then merge concurrent heads.
@@ -1200,7 +1666,7 @@ impl Session {
             && can_write
         {
             let mut vfs = luksbox_vfs::Vfs::open(container).map_err(vfs_err)?;
-            let done = session.rebase_local(&graph, &rec, &mut vfs);
+            let done = session.rebase_local(&graph, &mut present, &rec, &mut vfs);
             container = vfs.close().map_err(vfs_err)?;
             match done? {
                 Rebase::Done {
@@ -1238,18 +1704,38 @@ impl Session {
                         .notices
                         .push(Notice::UnmergedLocalChanges { recoverable });
                 }
+                Rebase::Waiting => {
+                    // The version they and the head both come from is
+                    // not complete here: merging without it could bring
+                    // back what the head deleted. Shown, read-only, and
+                    // merged once it is here.
+                    session.writable = false;
+                    container.set_read_only();
+                    drop(container);
+                    container = session.local_view(&graph, &rec)?;
+                    report.notices.push(Notice::MergeBaseMissing {
+                        heads: 0,
+                        local_changes: true,
+                    });
+                }
             }
         }
         if session.writable && graph.heads.len() > 1 {
             let mut vfs = luksbox_vfs::Vfs::open(container).map_err(vfs_err)?;
-            let merged = session.merge_heads(&mut vfs);
+            let merged = session.merge_heads(&mut present, &mut vfs);
             container = vfs.close().map_err(vfs_err)?;
             let sum = merged?;
-            report.other_heads = sum.header_forks;
+            report.other_heads = sum.header_forks + sum.base_missing;
             report.keyslot_notes = sum.keyslot_notes;
             if sum.header_forks > 0 {
                 report.notices.push(Notice::HeaderFork {
                     heads: sum.header_forks + 1,
+                });
+            }
+            if sum.base_missing > 0 {
+                report.notices.push(Notice::MergeBaseMissing {
+                    heads: sum.base_missing,
+                    local_changes: false,
                 });
             }
             if sum.header_adopted {
@@ -1307,35 +1793,40 @@ impl Session {
         self.core.lock().expect("image lock").has_unpublished()
     }
 
-    /// Make the deterministic head (`graph.heads[0]`) this session's head
-    /// and open a writable vault over it, for merging into. Only called
-    /// when nothing is staged.
-    fn retarget(&mut self, graph: &Graph) -> Result<luksbox_vfs::Vfs> {
-        // R16-03: the first complete head, as `open` picks it.
-        let mut target = None;
-        for h in &graph.heads {
-            let v = graph.all[h].clone();
-            if complete(&self.store, &self.keys, &v)?.is_some() {
-                target = Some(v);
-                break;
-            }
-        }
-        let mut target = target.ok_or(SyncError::NothingComplete {
-            pending: graph.heads.len(),
-        })?;
-        // As `open`: never onto a header older than one this device saw.
+    /// Make the head every device would merge into this session's head
+    /// and open a writable vault over it, for merging into: the one
+    /// `open` picks (`select_head`), so never a head older than this
+    /// device's anchor that would not take its line in. `None` when
+    /// nothing complete descends from the anchor yet (the merge waits for
+    /// the next session). Only called when nothing is staged.
+    fn retarget(
+        &mut self,
+        graph: &Graph,
+        present: &mut Present,
+    ) -> Result<Option<luksbox_vfs::Vfs>> {
         let seen = self.state.max_header_generation;
+        let sel = match select_head(
+            graph,
+            &self.store,
+            &self.keys,
+            present,
+            self.state.head.as_ref(),
+            seen,
+            true,
+            false,
+        ) {
+            Ok(sel) if !sel.read_only => sel,
+            Ok(_) | Err(SyncError::NewestIncomplete { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let target = sel.head;
+        // As `open`: never onto a header older than one this device saw.
         if target.m.header.generation < seen {
-            target = match newest_header_head(graph, &self.store, &self.keys, seen)? {
-                Some((v, _)) => v,
-                None => {
-                    return Err(SyncError::RollbackDetected {
-                        device: "keyslot table".into(),
-                        seen,
-                        visible: target.m.header.generation,
-                    });
-                }
-            };
+            return Err(SyncError::RollbackDetected {
+                device: "keyslot table".into(),
+                seen,
+                visible: target.m.header.generation,
+            });
         }
         if target.hash != self.head.hash {
             self.header_bytes = self.read_header_object(&target.m.header)?;
@@ -1343,7 +1834,7 @@ impl Session {
             self.pin = pin_of(graph, &self.head.hash, self.state.device);
         }
         let c = self.reopen_container()?;
-        luksbox_vfs::Vfs::open(c).map_err(vfs_err)
+        luksbox_vfs::Vfs::open(c).map_err(vfs_err).map(Some)
     }
 
     /// A fresh writable container over the session's head (after a merge
@@ -1390,15 +1881,6 @@ impl Session {
         self.open_view(core, &header)
     }
 
-    /// `view`, or `None` when the commit's header object is gone (a merge
-    /// base then merges two-way instead of failing the open).
-    fn view_if_header(&self, v: &Verified) -> Result<Option<luksbox_vfs::Vfs>> {
-        if self.read_header_object(&v.m.header).is_err() {
-            return Ok(None);
-        }
-        self.view(v).map(Some)
-    }
-
     fn open_view(&self, core: ImageCore, header: &[u8; HEADER_SIZE]) -> Result<luksbox_vfs::Vfs> {
         let core = Arc::new(Mutex::new(core));
         let mut c = Container::open_external_with_mvk(
@@ -1419,16 +1901,28 @@ impl Session {
     fn rebase_local(
         &mut self,
         graph: &Graph,
+        present: &mut Present,
         rec: &crate::image::StagedRecord,
         target: &mut luksbox_vfs::Vfs,
     ) -> Result<Rebase> {
         let Some(saved_on_ref) = rec.base else {
             return Ok(Rebase::Stuck { recoverable: false });
         };
-        let Some(saved_on) = graph.all.get(&saved_on_ref.hash).cloned() else {
+        // Named by hash in this device's sealed record: the true commit
+        // they were made on, usable or collected history still here; not
+        // one whose own history has not arrived.
+        let Some(saved_on) = graph
+            .all
+            .get(&saved_on_ref.hash)
+            .filter(|_| {
+                graph.usable.contains(&saved_on_ref.hash)
+                    || graph.collected.contains(&saved_on_ref.hash)
+            })
+            .cloned()
+        else {
             return Ok(Rebase::Stuck { recoverable: false });
         };
-        if complete(&self.store, &self.keys, &saved_on)?.is_none() {
+        if !present.check(&self.store, &self.keys, &saved_on)? {
             return Ok(Rebase::Stuck { recoverable: false });
         }
         // A keyslot change saved here, while the keyslots also changed
@@ -1466,15 +1960,17 @@ impl Session {
             }
         };
         // The merge base must keep inode ids on both sides: the newest
-        // commit on both first-parent chains (see `common_ancestor`).
-        let base = common_ancestor(graph, &saved_on.hash, &self.head.hash)
-            .map(|h| graph.all[&h].clone())
-            .filter(|b| {
-                complete(&self.store, &self.keys, b)
-                    .ok()
-                    .flatten()
-                    .is_some()
-            });
+        // commit on both first-parent chains (see `common_ancestor`). It
+        // must be complete: without it, what the head deleted since would
+        // come back (a two-way merge keeps every file of both sides).
+        let Some(base) =
+            common_ancestor(graph, &saved_on.hash, &self.head.hash).map(|h| graph.all[&h].clone())
+        else {
+            return Ok(Rebase::Waiting);
+        };
+        if !present.check(&self.store, &self.keys, &base)? {
+            return Ok(Rebase::Waiting);
+        }
         let mut local_core = ImageCore::new_view(
             self.keys.clone(),
             self.store.clone(),
@@ -1491,10 +1987,7 @@ impl Session {
             None => self.read_header_object(&saved_on.m.header)?,
         };
         let mut ours = self.open_view(local_core, &ours_header)?;
-        let mut base_view = match &base {
-            Some(b) => self.view_if_header(b)?,
-            None => None,
-        };
+        let mut base_view = Some(self.view(&base)?);
         let keep = self.grow_for_merge(&ours_header, target)?;
         let out = luksbox_merge::merge(
             base_view.as_mut(),
@@ -1512,6 +2005,12 @@ impl Session {
         if let Some(h) = self.settle_layout(staged_header, keep, target, &mut keyslot_notes)? {
             self.core.lock().expect("image lock").stage_header(&h)?;
         }
+        // The local record is the session's from now on, also when the
+        // replay changed nothing (`flush` writes nothing for a clean
+        // tree): left in place, the old record would name outbox objects
+        // that the cleanup below removes, and every later open would
+        // fail reading them.
+        self.core.lock().expect("image lock").stage()?;
         let mut log = to_log(&out.events);
         log.extend(keyslot_notes.iter().map(|n| crate::manifest::MergeEvent {
             path: "(keyslots)".into(),
@@ -1585,94 +2084,58 @@ impl Session {
     }
 
     /// Merge every other head into the vault open in `target`, one merge
-    /// commit per head.
-    fn merge_heads(&mut self, target: &mut luksbox_vfs::Vfs) -> Result<MergeSummary> {
-        let (manifests, _, _) = load_manifests(&self.store, &self.keys)?;
-        let graph = Graph::build(manifests)?;
+    /// commit per head. A head is merged only over a complete common
+    /// ancestor (`plan_merge`); the others are counted and left as they
+    /// are, never merged two-way.
+    fn merge_heads(
+        &mut self,
+        present: &mut Present,
+        target: &mut luksbox_vfs::Vfs,
+    ) -> Result<MergeSummary> {
         let mut sum = MergeSummary::default();
-        let others: Vec<Verified> = graph
-            .heads
-            .iter()
-            .filter(|h| **h != self.head.hash)
-            .map(|h| graph.all[h].clone())
-            .collect();
-        for other in others {
-            if complete(&self.store, &self.keys, &other)?.is_none() {
+        let mut handled: HashSet<crate::graph::Hash> = HashSet::new();
+        loop {
+            // The graph again for every head: each merge publishes a new
+            // head, and a merge base is looked for from it. (With the
+            // graph read once, every head after the first had no common
+            // ancestor with the session's head and merged two-way.)
+            let (manifests, _, _) = load_manifests(&self.store, &self.keys)?;
+            let graph = Graph::build(manifests)?;
+            let Some(other) = graph
+                .heads
+                .iter()
+                .find(|h| **h != self.head.hash && !handled.contains(*h))
+                .map(|h| graph.all[h].clone())
+            else {
+                break;
+            };
+            handled.insert(other.hash);
+            if !present.check(&self.store, &self.keys, &other)? {
                 continue;
             }
-            let base = common_ancestor(&graph, &self.head.hash, &other.hash)
-                .map(|h| graph.all[&h].clone())
-                .filter(|b| {
-                    complete(&self.store, &self.keys, b)
-                        .ok()
-                        .flatten()
-                        .is_some()
-                });
-            // Keyslot tables: a change made on one side only is carried
-            // into the merge (a revocation must never be undone by a
-            // merge); different changes on both sides are left for the
-            // user. Compared by meaning, not bytes.
-            let mut adopt = None;
-            let mut keyslot_notes: Vec<String> = Vec::new();
-            if self.head.m.header.hash != other.m.header.hash {
-                let ours_b = self.read_header_object(&self.head.m.header)?;
-                let other_b = self.read_header_object(&other.m.header)?;
-                let (so, st) = (header_semantics(&ours_b), header_semantics(&other_b));
-                if so != st {
-                    let base_b = base
-                        .as_ref()
-                        .and_then(|b| self.read_header_object(&b.m.header).ok());
-                    let sb = base_b.as_ref().map(header_semantics);
-                    let take_other = match sb {
-                        Some(sb) => match (sb != so, sb != st) {
-                            // Both changed: merge keyslot by keyslot.
-                            (true, true) => {
-                                let parsed = (
-                                    Header::from_bytes(base_b.as_ref().expect("sb implies it")),
-                                    Header::from_bytes(&ours_b),
-                                    Header::from_bytes(&other_b),
-                                );
-                                match parsed {
-                                    (Ok(b), Ok(t), Ok(o)) => {
-                                        merge_keyslot_tables(&b, &t, &o).map(|(m, notes)| {
-                                            adopt = Some(m.to_bytes(&self.mvk));
-                                            keyslot_notes = notes;
-                                            false
-                                        })
-                                    }
-                                    _ => None,
-                                }
-                            }
-                            (false, true) => Some(true),
-                            _ => Some(false),
-                        },
-                        // The base's header is gone: the higher header
-                        // generation wins; a tie is a conflict.
-                        None => match other
-                            .m
-                            .header
-                            .generation
-                            .cmp(&self.head.m.header.generation)
-                        {
-                            std::cmp::Ordering::Greater => Some(true),
-                            std::cmp::Ordering::Less => Some(false),
-                            std::cmp::Ordering::Equal => None,
-                        },
-                    };
-                    match take_other {
-                        None => {
-                            sum.header_forks += 1;
-                            continue;
-                        }
-                        Some(true) => adopt = Some(other_b),
-                        Some(false) => {}
+            let head = self.head.clone();
+            let (base, keyslots) =
+                match plan_merge(&graph, &self.store, &self.keys, present, &head, &other)? {
+                    MergePlan::Merge { base, keyslots } => (base, keyslots),
+                    MergePlan::HeaderFork => {
+                        sum.header_forks += 1;
+                        continue;
                     }
+                    MergePlan::BaseMissing | MergePlan::Unrelated => {
+                        sum.base_missing += 1;
+                        continue;
+                    }
+                };
+            let mut keyslot_notes: Vec<String> = Vec::new();
+            let adopt = match keyslots {
+                Keyslots::Ours => None,
+                Keyslots::Theirs(b) => Some(*b),
+                Keyslots::Merged(m, notes) => {
+                    keyslot_notes = notes;
+                    Some(m.to_bytes(&self.mvk))
                 }
-            }
-            let mut base_view = match &base {
-                Some(b) => self.view_if_header(b)?,
-                None => None,
             };
+            let mut base_view = Some(self.view(&base)?);
             let other_header = self.read_header_object(&other.m.header)?;
             let mut ours = self.view(&other)?;
             let keep = self.grow_for_merge(&other_header, target)?;
@@ -1872,13 +2335,16 @@ impl Session {
             // Merge into the same head every device would pick (highest
             // Lamport counter, then hash), so two devices merging the
             // same branches produce the same result.
-            let mut target = self.retarget(&graph)?;
-            let sum = self.merge_heads(&mut target)?;
-            report.merged = sum.merged;
-            report.conflicts = sum.conflicts;
-            report.header_forks = sum.header_forks;
-            report.keyslot_notes = sum.keyslot_notes;
-            target.container_mut().set_read_only();
+            let mut present = Present::load(&self.store)?;
+            if let Some(mut target) = self.retarget(&graph, &mut present)? {
+                let sum = self.merge_heads(&mut present, &mut target)?;
+                report.merged = sum.merged;
+                report.conflicts = sum.conflicts;
+                report.header_forks = sum.header_forks;
+                report.base_missing = sum.base_missing;
+                report.keyslot_notes = sum.keyslot_notes;
+                target.container_mut().set_read_only();
+            }
         }
         self.close_lease()?;
         Ok(report)
@@ -1953,9 +2419,20 @@ impl Session {
         if !self.writable {
             return Err(SyncError::ReadOnly);
         }
+        // A publish whose commit number is already taken finishes first,
+        // with the same bytes: sealing a new commit now would give it the
+        // same number (an equivocation every device then reports).
+        let mut finished = None;
+        if let Some((res, prepared)) = self.unfinished.take() {
+            if let Err(e) = self.write_reserved_manifest(&res) {
+                self.unfinished = Some((res, prepared));
+                return Err(e);
+            }
+            finished = Some(self.complete_publish(res.v, prepared)?);
+        }
         if kind == CommitKind::Commit && !self.core.lock().expect("image lock").has_saved_changes()
         {
-            return Ok(None);
+            return Ok(finished);
         }
         // Refuse to publish while a commit another device saw is missing
         // here (sync lag or withholding): fail closed.
@@ -1982,7 +2459,7 @@ impl Session {
         // The image is held only to take what to publish and, at the end,
         // to make it the base: the vault keeps working while it uploads.
         let prepared = self.core.lock().expect("image lock").prepare()?;
-        let v = match self.upload_and_commit(
+        let res = match self.upload_and_reserve(
             kind,
             extra_parents,
             merge_log,
@@ -1990,12 +2467,38 @@ impl Session {
             checkpoint_override,
             &prepared,
         ) {
-            Ok(v) => v,
+            Ok(res) => res,
             Err(e) => {
+                // Nothing names what was uploaded: it stays staged and
+                // goes up again with the next publish.
                 self.core.lock().expect("image lock").abort_publish();
                 return Err(e);
             }
         };
+        if let Err(e) = self.write_reserved_manifest(&res) {
+            // The manifest may be in the bundle already (written, then
+            // the folder sync failed): its number is taken. The upload
+            // stays in progress, and the next publish (or, after a crash,
+            // the next open) finishes it with the same bytes.
+            self.unfinished = Some((res, prepared));
+            return Err(e);
+        }
+        self.complete_publish(res.v, prepared).map(Some)
+    }
+
+    /// Write a reserved manifest and record it in the device state.
+    fn write_reserved_manifest(&mut self, res: &Reserved) -> Result<()> {
+        let mut l = self.local.lock().expect("local lock");
+        write_reserved(&self.store, &mut **l, &self.keys, &mut self.state, res)
+    }
+
+    /// After the manifest is written: it becomes the session's head and
+    /// the image's base.
+    fn complete_publish(
+        &mut self,
+        v: Verified,
+        prepared: crate::image::Prepared,
+    ) -> Result<ManifestRef> {
         let r = v.as_ref();
         if let Some(h) = prepared.header {
             self.header_bytes = h;
@@ -2008,11 +2511,12 @@ impl Session {
         if self.lease.is_some() {
             self.write_lease()?;
         }
-        Ok(Some(r))
+        Ok(r)
     }
 
-    /// Upload what `prepared` names, then the commit itself.
-    fn upload_and_commit(
+    /// Upload what `prepared` names, then seal the commit and reserve its
+    /// number (`reserve_manifest`); the caller writes it.
+    fn upload_and_reserve(
         &mut self,
         kind: CommitKind,
         extra_parents: &[Verified],
@@ -2020,7 +2524,7 @@ impl Session {
         gc_plan: Option<crate::manifest::GcPlan>,
         checkpoint_override: Option<BTreeMap<crate::manifest::DeviceId, u64>>,
         prepared: &crate::image::Prepared,
-    ) -> Result<Verified> {
+    ) -> Result<Reserved> {
         for (_, r) in &prepared.pages {
             let obj = crate::image::outbox_object(&self.local, &r.object_id())?;
             self.store.lock().expect("store lock").create_new(
@@ -2110,7 +2614,7 @@ impl Session {
             device_label: self.state.label.clone(),
         };
         let mut l = self.local.lock().expect("local lock");
-        publish_manifest(&self.store, &mut **l, &self.keys, &mut self.state, m)
+        reserve_manifest(&mut **l, &self.keys, &mut self.state, m)
     }
 
     /// Write or refresh this session's lease (also re-pins the head).
@@ -2497,6 +3001,31 @@ pub mod fs {
         pub foreign_sample: Vec<String>,
         /// The bundle folder itself is gone (it held nothing else).
         pub folder_removed: bool,
+        /// The bundle id the folder's header objects name, when this
+        /// device's state for it was left in place: it is not the id the
+        /// path registry records for this folder (or that id is recorded
+        /// for another folder), so it may be another bundle's state
+        /// (header object names are not authenticated).
+        pub local_state_kept: Option<String>,
+    }
+
+    /// The bundle id the path registry records in `entry`, if any.
+    fn registered(entry: &Path) -> Option<BundleId> {
+        std::fs::read(entry)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| BundleId::parse(s.trim()))
+    }
+
+    /// Whether some registry entry other than `except` records `bid`.
+    fn registered_elsewhere(local_root: &Path, bid: BundleId, except: Option<&Path>) -> bool {
+        let Ok(entries) = std::fs::read_dir(local_root.join("paths")) else {
+            return false;
+        };
+        entries.flatten().any(|e| {
+            let p = e.path();
+            Some(p.as_path()) != except && registered(&p) == Some(bid)
+        })
     }
 
     /// Delete the bundle at `path`, without unlocking it: every object
@@ -2509,25 +3038,26 @@ pub mod fs {
     /// after an interruption.
     pub fn delete(path: &Path, local_root: &Path) -> Result<DeleteReport> {
         let mut store = FsStore::open(path)?;
-        // Every bundle id this device associates with the folder: from
-        // the headers, and from the path registry (headers may already
-        // be gone after an interrupted delete).
-        let mut ids: Vec<BundleId> = Vec::new();
-        if let Ok((bid, _)) = header_candidates(&mut store) {
-            ids.push(bid);
-        }
+        let mut report = DeleteReport::default();
+        // Whose local state goes: the bundle the path registry records
+        // for this folder. The id in the header objects' names is not
+        // authenticated (the provider can rename them after another
+        // bundle this device uses), so it is trusted only when it agrees
+        // with the registry, or when the registry has nothing for this
+        // folder and no other folder's entry records that id.
         let entry = registry_entry(local_root, path).ok();
-        if let Some(bid) = entry
-            .as_ref()
-            .and_then(|e| std::fs::read(e).ok())
-            .and_then(|b| String::from_utf8(b).ok())
-            .and_then(|s| BundleId::parse(s.trim()))
-            && !ids.contains(&bid)
+        let recorded = entry.as_deref().and_then(registered);
+        let mut ids: Vec<BundleId> = recorded.into_iter().collect();
+        if let Ok((bid, _)) = header_candidates(&mut store)
+            && Some(bid) != recorded
         {
-            ids.push(bid);
+            if recorded.is_none() && !registered_elsewhere(local_root, bid, entry.as_deref()) {
+                ids.push(bid);
+            } else {
+                report.local_state_kept = Some(bid.to_hex());
+            }
         }
 
-        let mut report = DeleteReport::default();
         for area in [
             Area::Header,
             Area::Lease,

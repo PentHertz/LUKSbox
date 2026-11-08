@@ -15,6 +15,7 @@ use luksbox_vfs::{FileId, InodeKind, Vfs};
 use zeroize::Zeroizing;
 
 mod passphrase;
+mod secret_env;
 mod sync_cmd;
 mod wizard;
 
@@ -1317,13 +1318,24 @@ enum Command {
         cmd: sync_cmd::SyncCommand,
     },
     /// Merge two copies of one vault, for example the "conflicted copy"
-    /// a sync client made of a .lbx. The result is a new file: THEIRS
-    /// with the changes of OURS applied; files changed in both are kept
-    /// twice ("name (conflict ...)"), nothing is dropped.
+    /// a sync client made of a .lbx:
+    /// `luksbox merge "vault (conflicted copy).lbx" vault.lbx -o merged.lbx`.
+    /// The result is a new file: THEIRS (the second file, the vault you
+    /// keep) with the changes of OURS applied; files changed in both are
+    /// kept twice ("name (conflict ...)"), nothing is dropped. The result
+    /// keeps THEIRS' keyslots, so both copies must be the same vault
+    /// under the same master key, and THEIRS' keyslot table must not be
+    /// older than OURS' (a revoked passphrase or key would come back).
+    /// The result must not be older than what this device's rollback
+    /// anchors saw (the automatic one of a vault in a cloud folder, or
+    /// --anchor): one of the copies at least as new, and THEIRS' keyslot
+    /// table not older. Anchors are only compared, never written.
     Merge {
-        /// The copy whose changes are applied.
+        /// The copy whose changes are applied (for example the conflict
+        /// copy).
         ours: PathBuf,
-        /// The copy the result starts from.
+        /// The vault you keep: the result starts from it, keyslots
+        /// included.
         theirs: PathBuf,
         /// The common ancestor, if you have it (a backup from before the
         /// copies diverged). Without it the merge is a union.
@@ -1335,6 +1347,12 @@ enum Command {
         /// Name used in conflict copies (default: OURS's file name).
         #[arg(long)]
         label: Option<String>,
+        /// Merge even though the keyslot tables differ and neither is
+        /// known to be the newer (both changed since the copies split,
+        /// or headers older than v3): the result keeps THEIRS' keyslots,
+        /// so a passphrase or key removed in OURS opens it again.
+        #[arg(long)]
+        keep_theirs_keyslots: bool,
         #[command(flatten)]
         unlock: UnlockArgs,
     },
@@ -1467,6 +1485,11 @@ pub(crate) fn make_fido2_authenticator() -> luksbox_fido2::HidAuthenticator {
 }
 
 fn main() -> ExitCode {
+    // F10: secrets given through the environment leave it before
+    // anything else runs, so no process this one starts (a background
+    // mount's FUSE-T children, fusermount, a helper) inherits them.
+    // SAFETY: first statement of `main`, no other thread exists yet.
+    unsafe { secret_env::take_all() };
     // Process-wide RAM-secret hardening, applied before we touch any
     // keying material. Both calls are best-effort; mlock typically fails
     // for unprivileged users with low RLIMIT_MEMLOCK and we just warn.
@@ -1632,8 +1655,17 @@ fn dispatch_inner(cli: Cli) -> Result<()> {
             base,
             output,
             label,
+            keep_theirs_keyslots,
             unlock,
-        } => sync_cmd::cmd_merge(&ours, &theirs, base.as_deref(), &output, label, &unlock),
+        } => sync_cmd::cmd_merge(
+            &ours,
+            &theirs,
+            base.as_deref(),
+            &output,
+            label,
+            keep_theirs_keyslots,
+            &unlock,
+        ),
         Command::Size {
             path,
             unlock,
@@ -3034,7 +3066,7 @@ fn stdin_ready(timeout_ms: i32) -> bool {
 }
 
 fn read_passphrase(prompt: &str) -> io::Result<Zeroizing<String>> {
-    let env_set = std::env::var_os("LUKSBOX_PASSPHRASE").is_some();
+    let env_set = secret_env::is_set("LUKSBOX_PASSPHRASE");
     if let Some(piped) = piped_passphrase(env_set)? {
         if env_set {
             return Err(io::Error::other(
@@ -3049,8 +3081,8 @@ fn read_passphrase(prompt: &str) -> io::Result<Zeroizing<String>> {
         return Ok(piped);
     }
     // An empty or idle pipe falls through to the env var / prompt.
-    if let Ok(p) = std::env::var("LUKSBOX_PASSPHRASE") {
-        return Ok(Zeroizing::new(p));
+    if let Some(p) = secret_env::var("LUKSBOX_PASSPHRASE") {
+        return Ok(p);
     }
     Ok(Zeroizing::new(prompt_password_tty(prompt)?))
 }
@@ -3082,8 +3114,8 @@ fn read_passphrase_confirmed(prompt: &str, purpose: NewSecretFor) -> io::Result<
     // takes precedence over `LUKSBOX_PASSPHRASE` when both env vars
     // are set; same ambiguity guard fires when real bytes arrive on
     // the pipe AND any of the recognised env vars is set.
-    let env_set = std::env::var_os("LUKSBOX_NEW_PASSPHRASE").is_some()
-        || std::env::var_os("LUKSBOX_PASSPHRASE").is_some();
+    let env_set =
+        secret_env::is_set("LUKSBOX_NEW_PASSPHRASE") || secret_env::is_set("LUKSBOX_PASSPHRASE");
     if let Some(piped) = piped_passphrase(env_set)? {
         if env_set {
             return Err(io::Error::other(
@@ -3097,11 +3129,10 @@ fn read_passphrase_confirmed(prompt: &str, purpose: NewSecretFor) -> io::Result<
         return Ok(piped);
     }
     // An empty or idle pipe falls through to the env var / prompt.
-    if let Ok(p) = std::env::var("LUKSBOX_NEW_PASSPHRASE") {
-        return Ok(Zeroizing::new(p));
+    if let Some(p) = secret_env::var("LUKSBOX_NEW_PASSPHRASE") {
+        return Ok(p);
     }
-    if let Ok(p) = std::env::var("LUKSBOX_PASSPHRASE") {
-        let p = Zeroizing::new(p);
+    if let Some(p) = secret_env::var("LUKSBOX_PASSPHRASE") {
         match purpose {
             NewSecretFor::FreshVault => return Ok(p),
             NewSecretFor::ExistingVault => {
@@ -3261,8 +3292,8 @@ fn inherited_kdf_params(header: &Header, replacing: Option<usize>) -> Option<Arg
 #[cfg(feature = "fido2-hardware")]
 #[allow(dead_code)]
 fn read_new_tpm_pin() -> io::Result<Zeroizing<String>> {
-    if let Ok(p) = std::env::var("LUKSBOX_TPM_PIN") {
-        return Ok(Zeroizing::new(p));
+    if let Some(p) = secret_env::var("LUKSBOX_TPM_PIN") {
+        return Ok(p);
     }
     loop {
         let a = Zeroizing::new(prompt_password_tty("TPM PIN: ")?);
@@ -3280,8 +3311,8 @@ fn read_new_tpm_pin() -> io::Result<Zeroizing<String>> {
 /// where every wrong PIN counts toward the dictionary-attack lockout.
 #[cfg(feature = "fido2-hardware")]
 fn read_tpm_pin(prompt: &str) -> io::Result<Zeroizing<String>> {
-    if let Ok(p) = std::env::var("LUKSBOX_TPM_PIN") {
-        return Ok(Zeroizing::new(p));
+    if let Some(p) = secret_env::var("LUKSBOX_TPM_PIN") {
+        return Ok(p);
     }
     Ok(Zeroizing::new(prompt_password_tty(prompt)?))
 }
@@ -3292,8 +3323,8 @@ fn read_tpm_pin(prompt: &str) -> io::Result<Zeroizing<String>> {
 /// passphrase sources.
 #[cfg(feature = "fido2-hardware")]
 fn read_hybrid_seed_passphrase() -> io::Result<Zeroizing<String>> {
-    if let Ok(p) = std::env::var("LUKSBOX_SEED_PASSPHRASE") {
-        return Ok(Zeroizing::new(p));
+    if let Some(p) = secret_env::var("LUKSBOX_SEED_PASSPHRASE") {
+        return Ok(p);
     }
     read_passphrase(".kyber seed-file passphrase: ")
 }
@@ -3302,8 +3333,8 @@ fn read_hybrid_seed_passphrase() -> io::Result<Zeroizing<String>> {
 /// passphrase. `LUKSBOX_SEED_PASSPHRASE` for scripts, otherwise the
 /// terminal.
 fn read_seed_passphrase() -> io::Result<Zeroizing<String>> {
-    if let Ok(p) = std::env::var("LUKSBOX_SEED_PASSPHRASE") {
-        return Ok(Zeroizing::new(p));
+    if let Some(p) = secret_env::var("LUKSBOX_SEED_PASSPHRASE") {
+        return Ok(p);
     }
     Ok(Zeroizing::new(prompt_password_tty(
         ".kyber seed-file passphrase (differs from the slot passphrase): ",
@@ -3314,8 +3345,8 @@ fn read_seed_passphrase() -> io::Result<Zeroizing<String>> {
 /// scripts, otherwise the terminal). No terminal reads as "none".
 #[cfg(feature = "fido2-hardware")]
 fn read_optional_slot_passphrase(prompt: &str) -> Zeroizing<String> {
-    if let Ok(p) = std::env::var("LUKSBOX_SLOT_PASSPHRASE") {
-        return Zeroizing::new(p);
+    if let Some(p) = secret_env::var("LUKSBOX_SLOT_PASSPHRASE") {
+        return p;
     }
     Zeroizing::new(prompt_password_tty(prompt).unwrap_or_default())
 }
@@ -3354,8 +3385,8 @@ fn read_fido2_pin() -> io::Result<Zeroizing<String>> {
     if cfg!(target_os = "windows") {
         return Ok(Zeroizing::new(String::new()));
     }
-    if let Ok(p) = std::env::var("LUKSBOX_FIDO2_PIN") {
-        return Ok(Zeroizing::new(p));
+    if let Some(p) = secret_env::var("LUKSBOX_FIDO2_PIN") {
+        return Ok(p);
     }
     Ok(Zeroizing::new(prompt_password_tty("FIDO2 PIN: ")?))
 }
@@ -7470,10 +7501,11 @@ fn get_tree(vfs: &mut Vfs, id: FileId, inner: &str, local: &Path) -> Result<()> 
     let mut stats = TreeStats::default();
     let r = get_tree_into(vfs, id, local, &mut stats);
     if !stats.skipped.is_empty() {
+        // The path ends in a vault entry name (F6).
         eprintln!(
             "note: skipped {} symbolic link(s) in the vault (not recreated), e.g. {}",
             stats.skipped.len(),
-            stats.skipped[0].display()
+            sanitize_for_terminal(&stats.skipped[0].display().to_string())
         );
     }
     if let Some((p, why)) = stats.unnamed.first() {
@@ -7507,8 +7539,12 @@ fn get_tree_into(vfs: &mut Vfs, id: FileId, local: &Path, stats: &mut TreeStats)
             use std::os::unix::fs::DirBuilderExt;
             b.mode(0o700);
         }
-        b.create(local)
-            .map_err(|e| format!("{}: {e}", local.display()))?;
+        b.create(local).map_err(|e| {
+            format!(
+                "{}: {e}",
+                sanitize_for_terminal(&local.display().to_string())
+            )
+        })?;
     }
     stats.dirs += 1;
     let mut entries = vfs.readdir(id)?;
@@ -7546,8 +7582,12 @@ fn get_tree_into(vfs: &mut Vfs, id: FileId, local: &Path, stats: &mut TreeStats)
         match e.kind {
             InodeKind::Directory => get_tree_into(vfs, e.id, &dst, stats)?,
             InodeKind::File => {
-                let mut f = luksbox_core::file_util::secure_create_new(&dst)
-                    .map_err(|err| format!("{}: {err}", dst.display()))?;
+                let mut f = luksbox_core::file_util::secure_create_new(&dst).map_err(|err| {
+                    format!(
+                        "{}: {err}",
+                        sanitize_for_terminal(&dst.display().to_string())
+                    )
+                })?;
                 stats.bytes += copy_out(vfs, e.id, &mut f)?;
                 stats.files += 1;
             }
@@ -10597,12 +10637,23 @@ pub(crate) fn print_space_report(
     // How full the file list is: the region holds the names, folders and
     // (for files up to 1 MiB) the chunk lists, and cannot be enlarged.
     if let Some((s, remedy)) = file_list {
+        // "Full" is what new entries are refused on; the room the list of
+        // free space may take is shown apart (a save shortens that list
+        // when it does not fit, so it never refuses anything, but a
+        // smaller region must leave room for it).
         println!(
             "  File list:      {}% full ({} of {})",
-            s.used_pct(),
-            format_size(s.used_bytes as u64),
+            s.entries_used_pct(),
+            format_size(s.used_bytes.saturating_sub(s.free_list_bytes) as u64),
             format_size(s.budget_bytes as u64),
         );
+        if s.free_list_bytes > 0 {
+            println!(
+                "    plus up to {} for the list of free space (a smaller region must leave room \
+                 for it)",
+                format_size(s.free_list_bytes as u64)
+            );
+        }
         if s.near_capacity() {
             println!("    new files will soon be refused: {remedy}");
         }

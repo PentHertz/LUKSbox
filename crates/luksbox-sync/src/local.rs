@@ -49,10 +49,34 @@ fn check_name(name: &str) -> Result<()> {
 }
 
 /// Local folder of one bundle: `<root>/<bundle id>/`.
+///
+/// Every `put` is atomic (temporary file, then rename). Durability: on
+/// Apple platforms `fsync` does not reach the disk's own cache and the
+/// full flush (`F_FULLFSYNC`) costs about 4 ms per MiB, which made every
+/// outbox page of a save pay it. There, an outbox object (`p-...`) is
+/// fsync'd and renamed into place without that flush; every other record
+/// (the staged record that names outbox objects, the device state, the
+/// manifest being published...) first puts an ordering barrier behind
+/// everything written before it (`F_BARRIERFSYNC`: those objects reach
+/// the disk before the record's name does), then flushes the disk's
+/// cache once, so it is durable when `put` returns. A save is therefore
+/// still all or nothing: after a power cut the old record names the old
+/// objects, or the new record names new objects that are all there. An
+/// outbox object no record names yet is only a leftover, removed at the
+/// next writable open. Elsewhere every `put` is `atomic_secure_write`
+/// (fsync, rename, fsync of the folder), as before.
 pub struct FsLocal {
     dir: PathBuf,
     _lock: std::fs::File,
+    /// Apple platforms: outbox objects written since the last record,
+    /// whose renames are not flushed yet.
+    #[cfg(target_vendor = "apple")]
+    unflushed: bool,
 }
+
+/// Names of outbox objects (sealed pages not published yet).
+#[cfg(target_vendor = "apple")]
+const OUTBOX_PREFIX: &str = "p-";
 
 impl FsLocal {
     /// Open (creating 0700) the folder and take its exclusive lock, so
@@ -78,12 +102,70 @@ impl FsLocal {
         Ok(Self {
             dir: dir.to_path_buf(),
             _lock: lock,
+            #[cfg(target_vendor = "apple")]
+            unflushed: false,
         })
     }
 
     fn path(&self, name: &str) -> Result<PathBuf> {
         check_name(name)?;
         Ok(self.dir.join(name))
+    }
+
+    /// `put` on Apple platforms (see the type's docs).
+    #[cfg(target_vendor = "apple")]
+    fn put_ordered(&mut self, name: &str, path: &Path, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        fn fsync(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+            // SAFETY: live fd.
+            if unsafe { libc::fsync(fd) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        /// `fcntl(cmd)`, or the full flush where the file system has no
+        /// such command.
+        fn flush(f: &std::fs::File, cmd: libc::c_int) -> std::io::Result<()> {
+            // SAFETY: live fd.
+            if unsafe { libc::fcntl(f.as_raw_fd(), cmd) } == 0 {
+                return Ok(());
+            }
+            f.sync_all()
+        }
+        let outbox = name.starts_with(OUTBOX_PREFIX);
+        let mut rnd = [0u8; 8];
+        fill_random(&mut rnd)?;
+        let tmp = self
+            .dir
+            .join(format!("{name}.tmp.{}", crate::names::to_hex(&rnd)));
+        let mut f = luksbox_core::file_util::secure_create_new(&tmp)?;
+        let written = f.write_all(bytes).and_then(|()| {
+            if outbox {
+                fsync(f.as_raw_fd())
+            } else {
+                // The renames of the outbox objects written since the
+                // last record, then a barrier behind them and this
+                // record's data.
+                if self.unflushed {
+                    fsync(std::fs::File::open(&self.dir)?.as_raw_fd())?;
+                }
+                flush(&f, libc::F_BARRIERFSYNC)
+            }
+        });
+        drop(f);
+        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
+        if outbox {
+            self.unflushed = true;
+            return Ok(());
+        }
+        flush(&std::fs::File::open(&self.dir)?, libc::F_FULLFSYNC)?;
+        self.unflushed = false;
+        Ok(())
     }
 }
 
@@ -104,8 +186,15 @@ impl LocalStore for FsLocal {
 
     fn put(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
         let p = self.path(name)?;
-        luksbox_core::file_util::atomic_secure_write(&p, bytes)?;
-        Ok(())
+        #[cfg(target_vendor = "apple")]
+        {
+            self.put_ordered(name, &p, bytes)
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        {
+            luksbox_core::file_util::atomic_secure_write(&p, bytes)?;
+            Ok(())
+        }
     }
 
     fn remove(&mut self, name: &str) -> Result<()> {
@@ -264,6 +353,25 @@ mod tests {
         assert!(FsLocal::open(&dir).is_err());
         drop(l);
         assert!(FsLocal::open(&dir).is_ok());
+    }
+
+    /// Outbox objects and records (written differently on Apple
+    /// platforms: see `FsLocal`) replace atomically and leave no
+    /// temporary file behind.
+    #[test]
+    fn outbox_objects_and_records_leave_no_temporary_files() {
+        let d = tempfile::tempdir().unwrap();
+        let mut l = FsLocal::open(&d.path().join("b")).unwrap();
+        l.put("p-0a", b"page").unwrap();
+        l.put("staged", b"record").unwrap();
+        l.put("p-0a", b"page again").unwrap();
+        l.put("staged", b"record 2").unwrap();
+        assert_eq!(
+            l.list().unwrap(),
+            vec!["p-0a".to_string(), "staged".to_string()]
+        );
+        assert_eq!(l.get("p-0a").unwrap().unwrap(), b"page again");
+        assert_eq!(l.get("staged").unwrap().unwrap(), b"record 2");
     }
 
     #[test]

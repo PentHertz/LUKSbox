@@ -67,7 +67,7 @@ impl Lease {
         let display = || format!("l/{}", id.to_hex());
         let pt = codec::open(keys, Kind::Lease, &id, Binding::None, object, display)?;
         let payload = codec::unframe(&pt, display)?;
-        let (l, rest): (Lease, &[u8]) =
+        let (mut l, rest): (Lease, &[u8]) =
             postcard::take_from_bytes(payload).map_err(|_| SyncError::Malformed {
                 name: display(),
                 why: "lease does not decode",
@@ -78,6 +78,12 @@ impl Lease {
                 why: "not a lease of this bundle",
             });
         }
+        // The label is shown to the user ("also open on <label>"): kept
+        // to printable, filename-safe characters and a bounded length, as
+        // a manifest's is, whatever the device that sealed it wrote (no
+        // terminal escapes, line breaks or bidirectional overrides). Not
+        // refused: a lease still pins what it pins.
+        l.label = crate::manifest::sanitize_label(&l.label);
         Ok(l)
     }
 
@@ -112,5 +118,39 @@ impl Lease {
     /// Still pins `base` and `pin` for garbage collection.
     pub fn pins(&self, now: u64) -> bool {
         now.saturating_sub(self.heartbeat_ns) < PIN_NS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::keys::tests::fixed_keys;
+    use luksbox_core::CipherSuite;
+
+    /// A lease's label is shown to the user ("also open on <label>"):
+    /// whatever its sealer wrote, it comes back printable and bounded.
+    #[test]
+    fn a_lease_label_is_sanitized_when_read() {
+        let k = fixed_keys(CipherSuite::Aes256GcmSiv, [1; 16]);
+        let base = ManifestRef {
+            device: DeviceId([2; 16]),
+            seq: 1,
+            oid: [3; 32],
+            hash: [4; 32],
+        };
+        let evil = format!("Laptop\x1b[2J\r\n\u{202e}{}", "x".repeat(500));
+        let l = Lease::new([1; 16], DeviceId([2; 16]), evil, true, base, None, 5);
+        let (id, bytes) = l.seal(&k).unwrap();
+        let back = Lease::open(&k, id, &bytes).unwrap();
+        assert!(back.label.starts_with("Laptop"), "{}", back.label);
+        assert!(
+            !back
+                .label
+                .chars()
+                .any(|c| c.is_control() || c == '\u{202e}')
+        );
+        assert!(back.label.len() <= crate::manifest::MAX_LABEL);
+        // Everything else is as sealed.
+        assert_eq!((back.base, back.writable), (base, true));
     }
 }

@@ -520,3 +520,46 @@ asserting the device never reads bytes it did not write). See
   are launched from absolute paths with fixed arguments; exported and
   extracted files are created no-clobber; `delete` removes only
   grammar-named objects, never recursively.
+
+## Follow-up review on macOS (2026-11-08)
+
+A second pass over the finished branch (`v0.7.x-sync` at 61608cf),
+security and function, on macOS 26 (Apple M5 Max, FUSE-T 1.2.9): three
+independent code reviews (sync crate; vault I/O and mounts; CLI, GUI and
+merge), the test suites and scenario scripts on the Mac, and real FUSE-T
+mounts. Every finding below is fixed in the same revision with a
+regression test unless noted; details and messages in `CHANGELOG.md`
+(v0.7.0-rc.1, entries under "macOS review of 2026-11-08").
+
+| Severity | Finding | Where |
+|---|---|---|
+| HIGH | `luksbox merge` kept the second file's header; the conflict-copy hint put the copy second, so a merge after a revoke (or rotation) gave the result the old keyslots | `luksbox-cli` `sync_cmd.rs` (`cmd_merge`, `same_vault`, `check_keyslots`), `luksbox-sync` `cloud.rs` |
+| HIGH | A garbage-collected manifest replayed by the provider became a live head and was union-merged (or opened writable with the real head withheld) | `luksbox-sync` `graph.rs`, `bundle.rs` (`select_head`, `plan_merge`) |
+| MEDIUM | A merge whose base was incomplete or headerless became a two-way union (deleted files back; keyslots by generation, undoing a revoke) | `bundle.rs` (`plan_merge`, `rebase_local`), `gc.rs` |
+| MEDIUM | The rollback check only tested that seen commits were present: a deleted middle manifest or a withheld head object opened an older state | `graph.rs` (`check`, `lineage`), `bundle.rs` |
+| MEDIUM | `merge` and `sync convert` skipped the anchor checks, then raised the generation past them | `sync_cmd.rs` (`check_merge_anchors`, `open_to_read_checked`) |
+| MEDIUM | The free list could overflow a small metadata region: every save failed from then on | `luksbox-vfs` `vfs.rs` (`fit_free_list`, `reclaim_unlisted_slots`) |
+| MEDIUM | A write failing part way left a chunk it rewrote in place unreadable | `vfs.rs` (`record_rewrite`) |
+| MEDIUM | GUI revoke on a bundle claimed the credential was locked out (R16-17 warning missing) | `luksbox-gui` |
+| MEDIUM (function) | FUSE-T `umount` did not wait for the final save | `luksbox-mount` `busy.rs`, `fuse_t.rs` |
+| LOW | Interrupted-resize recovery trusted the intent before the unlock; stale old-layout `.header-bak`; deniable `<vault>.rotating`; bundle delete wiping another bundle's state; GUI make-bundle cleanup, exports, unsanitized names, silent env overrides, create cleanup; `gc --grace-days 0`; secrets inherited by the mount daemon; damaged object failing every open; `.tmp-` link leftovers; commit-number reuse; quadratic open; mount lock path; Ctrl-C with two mounts | see CHANGELOG |
+| LOW (function) | The opt-in FUSE-T helper sandbox profile did not parse on macOS 26 and had no anchor rule | `dist/macos/sandbox/fuse-t-helper.sb` |
+| INFO | Plaintext tree copies in freed memory; old ciphertext left in a grown bundle region; `readdir` errors truncating listings; lease labels unsanitized | `vfs.rs`, `container.rs`, `fs_store.rs`, `lease.rs` |
+
+Checked and sound: nonces (fresh per chunk, per object, per metadata
+write), AAD binding, object authentication and parsing, the name
+grammar, gc's deletion rules, the FUSE-T helper hand-off (master key on
+stdin, no secrets in argv, no shell or osascript anywhere), destructive
+confirmations, file permissions of local state.
+
+Secrets passed in the environment are also overwritten in the process's
+initial environment block (`/proc/<pid>/environ`, `KERN_PROCARGS2`),
+checked by a test reading that block. Also fixed in this pass: a
+rotation or resize through a symlinked vault path replaced the link and
+left an old-key copy; bundle writes through a shard or area folder moved
+away mid-session; no hard-link check in the Windows bundle store; a
+killed GUI export's plaintext `.part`; another user stalling `umount`
+through a lock on the mountpoint folder. Remaining or accepted:
+concurrent different resizes stay a header fork (owner decision of
+2026-11-08); on a FUSE-T mount an `fsync` is durable within a second,
+not on return, unless `--sync`.

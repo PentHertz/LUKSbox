@@ -232,6 +232,37 @@ fn offline_changes_are_replayed_onto_the_newest_commit() {
     assert_eq!(get(&mut v, "offline.txt").unwrap(), b"written offline");
 }
 
+/// Offline changes that turn out to be in the newest commit already (the
+/// same edit made on another device): replaying them changes nothing.
+/// The old local record used to stay behind while the cleanup removed
+/// the outbox objects it named, and every later open failed ("a staged
+/// page is missing from the outbox").
+#[test]
+fn offline_changes_already_published_elsewhere_leave_the_device_openable() {
+    let dir = TempDir::new().unwrap();
+    let a = Device::new("Laptop");
+    let b = Device::new("Desktop");
+    let store = bundle(&dir, &a);
+    {
+        let (_sb, mut vb, _) = b.open(&store);
+        put(&mut vb, "shared.txt", b"same edit");
+        vb.flush().unwrap();
+        // B goes away without publishing.
+    }
+    {
+        let (mut sa, mut va, _) = a.open(&store);
+        put(&mut va, "shared.txt", b"same edit");
+        va.flush().unwrap();
+        sa.publish().unwrap().unwrap();
+    }
+    for _ in 0..2 {
+        let (s, mut v, r) = b.open(&store);
+        assert!(r.writable, "{:?}", r.notices);
+        assert!(!s.has_unpublished());
+        assert_eq!(get(&mut v, "shared.txt").unwrap(), b"same edit");
+    }
+}
+
 #[test]
 fn a_copied_device_identity_is_detected_and_both_branches_kept() {
     let dir = TempDir::new().unwrap();

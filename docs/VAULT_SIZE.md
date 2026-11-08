@@ -11,7 +11,27 @@ metadata region (64 MiB by default, preallocated) and the data area: one
 one, else a new slot at the end, which grows the file. A deleted or
 truncated file's slots go to the free list (after the next save, see
 copy-on-write in `CRYPTO_SPEC.md` section 15) and are reused; nothing
-ever moves data to close the gaps. `Vfs::space_report` returns the file
+ever moves data to close the gaps.
+
+The free list is saved inside the metadata region, one varint per slot,
+and a file over 1 MiB keeps its chunk list in the data area, so a large
+file costs almost nothing in the region until it is deleted, truncated
+or overwritten. A save never fails on the free list: when the encoded
+file tree does not fit, `fit_free_list` first leaves out the free slots
+at or past the end of the data in use (and lowers the saved
+`next_chunk_id`, as `shrink` does, without truncating; skipped while a
+write holds slots no inode references yet), then keeps only the
+lowest-numbered slots that fit. The slots left out stay free in memory
+for the session, and `Vfs::open` finds them again (`reclaim_unlisted_slots`:
+a bounded bitmap scan run only when referenced plus listed slots fall
+short of `next_chunk_id`, never read-only or in tolerant recovery). New
+entries are refused on the tree alone, never on the free list.
+`metadata_budget_status()` reports both: `entries_used_pct()` (what
+"File list: N% full" shows and what new entries are refused on) and
+`free_list_bytes`, the room the list may take at its largest (free
+slots, slots freed since the last save, every slot of the files whose
+chunk list is outside the region), which `luksbox size` and the GUI
+show on their own line. `Vfs::space_report` returns the file
 size, the fixed part, the slots in use, the free slots and what
 `shrink` could give back.
 
@@ -87,7 +107,9 @@ changes the size of an open vault's metadata region: larger when the
 file list fills up (`luksbox size` and the GUI show "File list: N%
 full"), smaller to make every save cheaper (each save rewrites the
 whole region and its `.meta-bak` mirror). A smaller size is refused
-when the file list does not fit with the usual headroom. The encrypted
+when the file list, plus the room its list of free space may take
+(above), does not fit with the usual headroom; growing is never
+refused. The encrypted
 chunks are moved, never re-encrypted: they are addressed by slot from
 `data_offset` and their AEAD does not depend on where they sit. The
 encrypted file list does not depend on the region's size either (its
@@ -100,9 +122,19 @@ crash or an error leaves a vault that opens:
   random padding, then the data area at its new offset), the file list
   and the header are written into the copy, and the copy is renamed over
   the original, like the master key rotation. Before the rename the
-  original is untouched. A deniable vault's inner header is re-sealed
-  with the new layout. A leftover `.rotating` blocks the next resize
-  until it is removed.
+  original is untouched; the vault's `.meta-bak` and `.header-bak`
+  mirrors are removed durably just before it (an old-layout mirror
+  beside the new vault would open with the wrong data offset), and the
+  next save writes them again. Recovery from a header mirror is refused
+  when its layout does not fit the vault file. A leftover `.rotating`
+  blocks the next resize until it is removed. A deniable vault's inner
+  header is re-sealed with the new layout, and its copy is not
+  `<vault>.rotating` (a LUKSbox-shaped name) but a hidden `.<16 hex>.tmp`
+  in the same folder, the hex an HMAC of the file name under a key from
+  the master key and the per-vault salt; a copy left by a crash, and an
+  older version's `.rotating`, are removed at the next successful unlock
+  or rewrite of that vault under the same file name (if the vault is
+  moved or renamed first, delete the copy by hand).
 - **Detached header**: the same copy, but the header is a second file.
   Before the rename, the new header is written to `<header>.resizing`
   (`header || "LBXRSZ01" || new vault length || old vault length`,
@@ -119,7 +151,17 @@ crash or an error leaves a vault that opens:
   incomplete intent undoes the resize only while the copy is still
   there (it is written before the rename); anything else is refused.
   Every recovery failure is `InterruptedResize`, which is never answered
-  from a header mirror (it may hold the old layout).
+  from a header mirror (it may hold the old layout). The recovery only
+  plans before the unlock (`plan_interrupted_resize`, which writes
+  nothing) and acts after `try_unlock_and_verify` succeeded
+  (`finish_interrupted_resize`; when the intent's header is installed,
+  the unlock is done on that header, so its HMAC is checked first): a
+  wrong passphrase, or a damaged or foreign intent, changes nothing. The
+  intent is read without following links or blocking on a FIFO, at most
+  its expected length + 1, must parse, and must have the live header
+  salt and cipher suite (else it is ignored with a warning and left in
+  place), the same metadata offset and chunk size, a data area that did
+  not shrink, and on header v3 a higher generation.
 - **Sync bundle**: no file to copy. The data area moves inside the paged
   image (the image spills pages to the outbox as usual, so memory stays
   bounded), the new header is staged to go with the next save
@@ -131,7 +173,8 @@ crash or an error leaves a vault that opens:
   for the cleanup after it (a caller undoing it would undo a committed
   state). Every view of another commit (merge sides, base, snapshots,
   changes saved here on an older commit) opens under that commit's own
-  header (a base whose header object is gone merges two-way). Before a
+  header (a base that is incomplete or whose header object is gone is
+  not merged over: the versions stay separate until it is there). Before a
   merge, the target grows to the other side's region when that is
   larger, so the merged list has room; after it, a header taken from the
   other side is staged only over an image with its layout (the target

@@ -131,6 +131,143 @@ export` turns a bundle back into a `.lbx`.
 
 ### Security
 
+- **macOS review of 2026-11-08 (sync bundles, merge, vault I/O, mounts).**
+  The entries below up to the `cargo audit` one come from a security and
+  functional review of this branch on macOS 26 (Apple M5 Max, FUSE-T
+  1.2.9); each has a regression test unless said otherwise.
+- **`luksbox merge` could bring back a revoked keyslot or an old master
+  key.** The result is a copy of the second file (THEIRS) with the
+  first one's changes, header included, and the hint printed next to a
+  vault with conflict copies put the copy second. Following it after a
+  revoke (or a rotation) gave the result the copy's older keyslots: the
+  removed passphrase opened it. `merge` now refuses copies of different
+  vaults or under different master keys (constant-time compare), and
+  refuses when the second file has an older keyslot table (or, at the
+  same generation, keyslots the first lacks, unless
+  `--keep-theirs-keyslots`), printing the command the right way round.
+  The hint (CLI and GUI) gives the copy first, as documented, and the
+  rollback messages no longer suggest deleting the anchor after a
+  rotation. `--header` is refused (one detached header cannot belong to
+  every copy) and a failed merge removes its partial output.
+- **`luksbox merge` and `luksbox sync convert` skipped rollback
+  detection.** They now check this device's anchors (the automatic one
+  of a vault in a cloud folder, and `--anchor`) without writing them: a
+  merge whose two copies are both older than what this device saw, or
+  whose kept keyslot table is older, is refused, as is converting a
+  rolled-back vault, so a rollback can no longer be laundered through
+  `mv merged.lbx vault.lbx`.
+- **Sync bundles: a garbage-collected commit put back by the provider
+  was merged into the vault.** A manifest below its device's checkpoint
+  counted as a live head and was union-merged, bringing back files
+  deleted long ago, and with one page of the real head withheld it
+  opened as the writable head. Collected commits are never opened,
+  merged or offered as snapshots now (still-present ones only serve as
+  merge bases).
+- **Sync bundles: a merge without its common ancestor became a two-way
+  union.** With the base incomplete (a page or its header object
+  deleted by the provider) deleted files came back and the keyslot table
+  was chosen by generation, which could undo a revoke. Concurrent
+  versions are merged only over their complete common ancestor; until
+  it is in the bundle they stay separate with a warning ("N concurrent
+  version(s) were not merged"), and local changes wait read-only.
+  Garbage collection keeps the merge base of commits pinned by a lease.
+- **Sync bundles: a device could open a version older than the newest
+  it had seen.** The rollback check only tested that the commits it saw
+  were present: deleting a manifest mid-history, or withholding one
+  object of the head, opened an older state with notices that read as
+  sync lag. A seen commit that is present but not usable is a rollback
+  error; when nothing complete descends from what this device last
+  opened or published, a writable open refuses ("the newest version
+  this device has seen ... is not complete in the bundle"), and
+  read-only commands show the older version with a warning.
+- **GUI: revoking a keyslot of a sync bundle claimed the credential was
+  locked out.** The master key does not change and the provider keeps
+  the old keyslot table (R16-17): the GUI now says so, as the CLI does,
+  with the export, rotate-mvk, convert procedure.
+- **An interrupted detached-header resize was finished or undone before
+  the unlock**, trusting the `.resizing` intent file: on any open
+  attempt, even with a wrong passphrase, it could delete the header
+  mirrors and write the intent's header over the live one. It now runs
+  only after the vault is unlocked with a verified header (the intent's
+  own header when it is installed); the intent is read without
+  following links or blocking on a FIFO, bounded, and must match the
+  vault's header salt, layout and generation, or it is ignored with a
+  warning.
+- **A resize or MVK rotation could leave an old-layout `.header-bak`**
+  (crash after the rename, or a failed folder sync), which a later
+  header failure would have opened with the wrong data offset. The
+  mirrors are removed durably before the rename, and recovery refuses a
+  header mirror whose layout does not fit the vault file.
+- **Deniable vaults: a resize or MVK rotation wrote `<vault>.rotating`**,
+  a predictable LUKSbox-shaped name that stayed after a crash. The
+  temporary copy is now a hidden file named from the vault key, removed
+  at the next unlock or rewrite (an older version's `.rotating` too).
+- **The rest of the review** (low severity):
+  - deleting a bundle no longer wipes another bundle's local state when
+    the provider renames header objects (only the id this folder is
+    registered with is cleaned up);
+  - the GUI's Make sync bundle no longer deletes a bundle that appeared
+    at the destination after its check;
+  - GUI exports create files the way `luksbox get` does (parent folder
+    bound, no link followed, system folders refused, 0600), commit them
+    when complete and remove the partial file on error; a folder export
+    stops instead of replacing a file when two vault names collide on a
+    case-insensitive file system, and never reuses an existing folder;
+  - names chosen by others (conflict copies, vault entries, device and
+    lease labels) are shown without control characters in the CLI's
+    merge, verify, get, status and conflict messages and in the GUI's
+    Versions view, sync notices and toasts (R15-I4 regression);
+  - the GUI says when `LUKSBOX_SYNC_STATE_DIR` or
+    `LUKSBOX_NO_AUTO_ANCHOR` changes rollback detection, and neither
+    front end keeps sync state under a relative `HOME` /
+    `XDG_DATA_HOME`;
+  - a GUI create refuses a leftover `.meta-bak`, `.header-bak` or
+    `.hybrid` beside the new vault instead of deleting it on failure;
+  - `luksbox sync gc --grace-days 0` needs `--yes` (two runs back to
+    back removed the two-pass safety); `--dry-run` is unchanged;
+  - the CLI moves unlock secrets given in the environment
+    (`LUKSBOX_PASSPHRASE`, `LUKSBOX_NEW_PASSPHRASE`,
+    `LUKSBOX_SEED_PASSPHRASE`, `LUKSBOX_SLOT_PASSPHRASE`,
+    `LUKSBOX_TPM_PIN`, `LUKSBOX_FIDO2_PIN`) out of its environment at
+    start-up, and the GUI strips them from its mount helper's, so a
+    background mount and FUSE-T's NFS server and mount tool no longer
+    inherit them; on Unix the value is also overwritten in the process's
+    initial environment block, which Linux shows to every process of the
+    user in `/proc/<pid>/environ`;
+  - the lock `luksbox umount` waits on is opened with `O_NOFOLLOW` and
+    checked against the inode the mountpoint hardening recorded, and
+    `umount` now waits on a lock file only this user can open (the
+    per-user temporary folder on macOS, `$XDG_RUNTIME_DIR` on Linux):
+    another local user holding a lock on the mountpoint folder made it
+    wait its full two minutes;
+  - an MVK rotation or file list resize of a vault opened through a
+    symbolic link renamed the new copy over the link, leaving the file it
+    points to as it was (after a rotation, a whole copy under the old
+    master key); the copy now replaces that file and the link is kept;
+  - sync bundles: a shard or area folder moved away while the bundle was
+    open received the next writes outside the bundle (the open folder
+    handle was reused); a moved area is refused and a shard is opened
+    again; on Windows an object with a second name (hard link) is now
+    refused when read, as on Unix;
+  - a GUI export killed mid-copy left its `.luksbox-export-*.part`
+    (plaintext, owner-only) behind; the next export into that folder
+    removes it (only ours: owned by this user, a regular file, from a
+    process that no longer runs);
+  - saves no longer leave plaintext copies of the file tree in freed
+    memory, MVK rotation scrubs free slots past the end of the saved
+    data area, and growing a bundle's file list region pads the newly
+    covered part with fresh random bytes;
+  - a folder listing that fails part way is an error, not a short
+    listing (false rollback reports on network or iCloud folders).
+- **macOS: the opt-in sandbox of the GUI's FUSE-T helper
+  (`LUKSBOX_SANDBOX_HELPER=1`) could not work.** The profile did not
+  parse on macOS 26 (operations that no longer exist stop the whole
+  profile) and had no rule for a rollback anchor outside the vault
+  folder. Rewritten with `(param ...)` rules and checked on macOS 26 /
+  FUSE-T 1.2.9 (mount, I/O, unmount, anchor elsewhere): writes only in
+  the folders of the vault, its header and its anchor, the mountpoint
+  itself instead of its parent folder, exec of the helper, FUSE-T's NFS
+  server and the NFS mount tools only.
 - **`cargo audit`: RUSTSEC-2026-0387 (`crypto-bigint` 0.5.5) and
   RUSTSEC-2026-0385 (`ctutils` 0.4.2)**, timing variability in code
   meant to be constant-time. `ctutils` 0.4.8 (via `ml-kem`); `p256`
@@ -191,6 +328,37 @@ export` turns a bundle back into a `.lbx`.
 
 ### Performance
 
+- **Hardware AES on Apple Silicon and Linux arm64.** The `aes` and
+  `polyval` crates under AES-256-GCM-SIV (the default) and AES-256-GCM
+  ran their software implementation on 64-bit ARM: they need the
+  `aes_armv8` / `polyval_armv8` cfgs, now set in `.cargo/config.toml`
+  for `aarch64-apple-darwin` and `aarch64-unknown-linux-{gnu,musl}`. On
+  an M5 Max, 512 MiB: `luksbox put` 148 -> 393 MB/s, `get` 167 -> 574
+  MB/s; a FUSE-T mount writes 151 -> 423 MiB/s and reads 181 -> 822
+  MiB/s; `--hide-sizes` writes 42 -> 184 MB/s. Same bytes on disk (the
+  AEAD known-answer tests pass with both), constant-time either way. A
+  `RUSTFLAGS` variable replaces these per-target flags: add the cfgs to
+  it.
+- **macOS (FUSE-T): closing a file no longer saves the whole vault.**
+  The macOS NFS client behind FUSE-T sends a COMMIT, an `fsync`, at
+  every close, and each one rewrote the metadata region and its mirror
+  (128 MiB with the default region): 8 files/s, about 125 GiB written to
+  copy 1 000 small files. Without `--sync`, an `fsync` that comes less
+  than a second after the last save asks for a save within that second
+  instead: 1 000 files of 1 KiB in 1.7 s (573 files/s). An `fsync` on a
+  FUSE-T mount is therefore durable within a second rather than on
+  return; `--sync` (GUI: Eager flush) keeps every operation durable on
+  return.
+- **Sync bundles on macOS: one drive-cache flush per save instead of
+  per object.** `File::sync_all` is `F_FULLFSYNC` on Apple platforms
+  (4.1 ms per 1 MiB object on an SSD, against 1.0 ms for
+  `F_BARRIERFSYNC`): bundle objects now get `F_BARRIERFSYNC` and each
+  folder sync one `F_FULLFSYNC`, local records likewise, with the same
+  ordering and crash guarantees. 1 MiB pages: saves 46 -> 80 MB/s,
+  publishes 200 -> about 950 MB/s.
+- **Opening a long-lived bundle is linear in its history** (it was
+  quadratic: a fixed-point pass per commit, a linear search per parent,
+  a page listing per completeness check).
 - **`luksbox put` and `get` take whole folders.** A folder goes in or
   out with one unlock and one save: 521 files in 0.8 s, where one `put`
   per file took 0.7 s each (345 s for 500 files), the unlock and the
@@ -217,6 +385,82 @@ export` turns a bundle back into a `.lbx`.
   before, 7 s now.
 
 ### Fixed
+
+- **A vault with a small file list region could stop saving for good.**
+  The list of free space is saved in the region, and deleting,
+  truncating or overwriting a large file (whose chunk list is not in
+  the region) moved all its slots there, with no check: from then on
+  every save failed (`metadata blob is larger than the metadata
+  region`; the file could not even be deleted with `luksbox rm`, and a
+  mount lost every change at unmount). A save that cannot hold the whole
+  list now leaves out the free slots at the end of the data area, then
+  keeps the lowest-numbered slots that fit; the rest stay reusable and
+  are found again at the next open. `luksbox size` shows the room the
+  list may take apart ("plus up to N for the list of free space"),
+  shrinking the region below it is refused up front, and a truncate that
+  would move a large file's chunk list into a full region is refused.
+- **A write that failed part way could make a chunk it already rewrote
+  unreadable** (a full disk, the vault's maximum size, an unreadable
+  chunk further on): the chunk was rewritten in place under a new
+  generation the file never recorded. Each rewritten chunk is recorded
+  as soon as it is written; the file keeps its size and its chunks read
+  back with their old or new contents. Truncate likewise.
+- **macOS (FUSE-T): `luksbox umount` returned before the vault was
+  saved**, so `luksbox umount mnt && luksbox ls vault.lbx /` failed with
+  "vault locked by another process" (about 0.4 s on an SSD, more on slow
+  storage) and switching the Mac off right after `umount` could lose the
+  last changes. The wait added for the libfuse backend (below) now
+  covers FUSE-T: CLI mounts, the wizard and the GUI's mount helper.
+- **Ctrl-C with two mounts in one process (libfuse backend)**: once the
+  first mount ended, a later Ctrl-C exited at once although the other
+  still had unsaved changes. Every mount the process serves is now
+  unmounted and saved on Ctrl-C, SIGTERM or suspend.
+- **Sync bundles could not be kept on exFAT** (the usual format of a USB
+  stick or SD card shared with Windows): exFAT has neither an exclusive
+  rename nor hard links, the two ways the store installs an object
+  without ever replacing one, so `sync convert` failed with "Operation
+  not supported" and nothing could be saved. It now reserves the name
+  with an exclusive create and renames the finished file over its own
+  placeholder (an empty placeholder left by a crash is reused). Checked
+  on exFAT and FAT32 volumes: vaults (put, get, resize, a FUSE-T mount)
+  and bundles shared by two devices.
+- **Sync bundles**:
+  - one damaged object makes its commit incomplete (skipped) instead of
+    failing every open on every device;
+  - a publish that failed after writing its commit is finished with the
+    same commit number at the next publish, never re-numbered (which
+    every device reported as two installations sharing an identity);
+  - objects are installed with an exclusive rename (`renameatx_np` /
+    `renameat2`), and temporary files left by an interrupted write,
+    which could lock a device out of its own object, are removed at the
+    next writable open;
+  - with three or more heads, the later ones were merged two-way (the
+    graph was read once); replaying local changes that changed nothing
+    left a record naming deleted outbox objects, and every later open
+    failed ("a staged page is missing from the outbox");
+  - a newest commit whose merging commits were garbage-collected was
+    seen as a separate head and merged without a base;
+  - versions not merged because their common ancestor has not arrived,
+    and a delete that kept another bundle's local state, are now
+    reported by the CLI and the GUI; an upload that stopped with an
+    internal error during a mount no longer makes the unmount skip its
+    upload in silence (the changes, saved on this device, go up at the
+    next open, and the message says so).
+- **GUI: the Secure Enclave choices were offered when the Secure Enclave
+  could not be used** (a build without `--features hardware`, or a Mac
+  without one): the whole create or enroll form could be filled in
+  before it was refused. They are greyed out, with the reason on hover.
+- **macOS: a locally built FUSE-T binary aborted at launch** ("Library
+  not loaded: @rpath/libfuse-t.dylib") unless `DYLD_FALLBACK_LIBRARY_PATH`
+  was set: the CLI and GUI build scripts add FUSE-T's library folder to
+  the rpath, as FUSE-T's own `fuse-t.pc` asks. Release bundles are
+  unchanged (dylibbundler).
+- **The test scripts ran on Linux only.** `scripts/cli_scenarios.sh`,
+  `scripts/tui_scenarios.sh` and `scripts/bench_transfer.sh` also run
+  with macOS's stock bash 3.2 and BSD tools, and the TUI script runs its
+  mount steps through FUSE-T instead of skipping them. The GUI scenario
+  no longer fails in optimized builds (its double-click landed while the
+  import's background work still changed the browser).
 
 - **GUI: vault path fields** (Unlock vault, the create form's Vault
   path): the text was drawn against the top edge of the field, and the
@@ -423,6 +667,45 @@ export` turns a bundle back into a `.lbx`.
   references); a missing code fence that flipped every later code block
   is fixed. Stale comments in `keyslot.rs`, `deniable.rs` and
   `chunk.rs` corrected.
+- **From the macOS review of 2026-11-08, what scripts and users notice**
+  (details in the entries above):
+  - `luksbox merge` refuses more: copies of different vaults or under
+    different master keys, a second file with an older keyslot table
+    (it prints the command the right way round), differing keyslot
+    tables of one generation unless `--keep-theirs-keyslots` (new flag),
+    a rollback against this device's anchors, and `--header`. It no
+    longer creates or moves anchors, and removes its partial output when
+    it fails. The conflict-copy hint now reads `luksbox merge "<copy>"
+    "<vault>" -o merged.lbx`.
+  - `luksbox sync convert` refuses a rolled-back vault.
+  - `luksbox sync gc --grace-days 0` needs `--yes` (new flag);
+    `--dry-run` does not.
+  - `luksbox size` and the GUI's Vault size: "File list: N% full" counts
+    what new entries are refused on; a second line ("plus up to ... for
+    the list of free space") shows the room the free list may take, and
+    a smaller region must leave room for it, so shrinking can be refused
+    for vaults that held large files. Truncating a file over 1 MiB to
+    1 MiB or less can fail with ENOSPC in a nearly full region.
+  - FUSE-T mounts without `--sync`: an `fsync` is durable within a
+    second instead of on return. `luksbox umount` (FUSE and FUSE-T)
+    returns only once the mount has saved, and for a bundle published,
+    into the folder (up to two minutes).
+  - Sync bundles: a device refuses to open for writing when the newest
+    version it saw is incomplete ("the newest version this device has
+    seen ... is not complete in the bundle"); concurrent versions whose
+    common ancestor has not arrived stay separate with a warning.
+  - The CLI takes unlock secrets given in the environment out of its
+    environment at start-up; a program that wrapped `luksbox` and read
+    them back from its environment no longer can.
+  - The opt-in sandbox for the GUI's FUSE-T helper takes new `-D`
+    parameters (`ANCHOR_DIR`, `MOUNTPOINT`, `HELPER`; `MOUNTPOINT_DIR`
+    is gone): a custom profile must be updated.
+  - A deniable vault's resize or rotation copy is a hidden keyed
+    `.<hex>.tmp`, no longer `<vault>.rotating`.
+  - Builds for 64-bit ARM set `--cfg aes_armv8 --cfg polyval_armv8`
+    (`.cargo/config.toml`); a `RUSTFLAGS` variable replaces them, so a
+    build that sets one must add them (`scripts/static_fido2_tpm_alpine.sh`
+    does).
 
 ## [v0.6.1] - 2026-10-13
 

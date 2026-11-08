@@ -39,6 +39,19 @@ fn next_header_generation(current: u64) -> Result<u64, Error> {
         .ok_or(Error::Crypto(luksbox_core::Error::InvalidField))
 }
 
+/// Where an atomic rewrite (MVK rotation, metadata region resize) puts
+/// its copy: over the vault file itself. A vault opened through a
+/// symbolic link keeps the link; renaming over the link instead replaced
+/// it with the new copy and left the file it points to as it was (after
+/// a rotation, a full copy of the vault under the old master key).
+fn rewrite_target(path: &Path) -> std::io::Result<PathBuf> {
+    if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
+        std::fs::canonicalize(path)
+    } else {
+        Ok(path.to_path_buf())
+    }
+}
+
 fn append_extension(path: &Path, ext: &str) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".");
@@ -493,10 +506,30 @@ fn lock_handles(handles_and_paths: &[(&File, &Path)]) -> Result<(), Error> {
 /// content is still AEAD-verified by the caller under the vault MVK, so
 /// this is defense-in-depth on top of that authentication.
 fn read_metadata_mirror_nofollow(path: &Path, expected_len: usize) -> std::io::Result<Vec<u8>> {
+    let (mut f, len) = open_regular_nofollow(path, "metadata mirror")?;
+    if len != expected_len as u64 {
+        return Err(std::io::Error::other(format!(
+            "metadata mirror {}: {} bytes != expected {}",
+            path.display(),
+            len,
+            expected_len
+        )));
+    }
+    let mut buf = vec![0u8; expected_len];
+    f.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// Open `path` read-only for one of the small files the open reads next
+/// to a vault (mirrors, the resize intent), atomically refusing a
+/// symlink or reparse point at the final component, and refusing
+/// anything but a regular file on the handle (no stat-then-open race).
+/// Returns the handle and the file's length.
+fn open_regular_nofollow(path: &Path, what: &str) -> std::io::Result<(File, u64)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = std::fs::OpenOptions::new()
+        let f = std::fs::OpenOptions::new()
             .read(true)
             // R16-14: `O_NONBLOCK` so opening a planted FIFO returns at
             // once (a plain `open` of a FIFO blocks until a writer
@@ -507,28 +540,18 @@ fn read_metadata_mirror_nofollow(path: &Path, expected_len: usize) -> std::io::R
         let meta = f.metadata()?;
         if !meta.is_file() {
             return Err(std::io::Error::other(format!(
-                "metadata mirror {}: not a regular file (refusing FIFO/device/dir)",
+                "{what} {}: not a regular file (refusing FIFO/device/dir)",
                 path.display()
             )));
         }
-        if meta.len() != expected_len as u64 {
-            return Err(std::io::Error::other(format!(
-                "metadata mirror {}: {} bytes != expected {}",
-                path.display(),
-                meta.len(),
-                expected_len
-            )));
-        }
-        let mut buf = vec![0u8; expected_len];
-        f.read_exact(&mut buf)?;
-        Ok(buf)
+        Ok((f, meta.len()))
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;
         use std::os::windows::fs::OpenOptionsExt as _;
         // FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
-        let mut f = std::fs::OpenOptions::new()
+        let f = std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(0x0020_0000)
             .open(path)?;
@@ -536,27 +559,23 @@ fn read_metadata_mirror_nofollow(path: &Path, expected_len: usize) -> std::io::R
         // FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400
         if meta.file_attributes() & 0x0000_0400 != 0 {
             return Err(std::io::Error::other(format!(
-                "metadata mirror {}: is a reparse point (symlink/junction); refused",
+                "{what} {}: is a reparse point (symlink/junction); refused",
                 path.display()
             )));
         }
-        if meta.len() != expected_len as u64 {
+        if !meta.is_file() {
             return Err(std::io::Error::other(format!(
-                "metadata mirror {}: {} bytes != expected {}",
-                path.display(),
-                meta.len(),
-                expected_len
+                "{what} {}: not a regular file",
+                path.display()
             )));
         }
-        let mut buf = vec![0u8; expected_len];
-        f.read_exact(&mut buf)?;
-        Ok(buf)
+        Ok((f, meta.len()))
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (path, expected_len);
+        let _ = (path, what);
         Err(std::io::Error::other(
-            "metadata mirror read unsupported on this platform",
+            "no-follow open unsupported on this platform",
         ))
     }
 }
@@ -776,6 +795,10 @@ pub struct Container {
 struct RotationState {
     tmp_data_path: PathBuf,
     committed_data_path: PathBuf,
+    /// What the copy is renamed over: `committed_data_path`, or for a
+    /// vault opened through a symbolic link the file the link points to
+    /// (`rewrite_target`).
+    rename_data_path: PathBuf,
     /// `(device, inode)` of the committed vault captured from the held
     /// handle at `begin_atomic_rotation`. Kept as the binding for the
     /// no-follow reopen fallback in `abort_atomic_rotation`, used only
@@ -1753,7 +1776,7 @@ impl Container {
         let mut header_bytes_arr = Box::new([0u8; DENIABLE_HEADER_SIZE]);
         header_bytes_arr.copy_from_slice(&header_buf);
 
-        Ok(Self {
+        let container = Self {
             file: Box::new(file),
             path,
             header_storage: HeaderStorage::Inline,
@@ -1773,7 +1796,10 @@ impl Container {
             metadata_recovered_from_mirror: false,
             anchored_metadata_gen: None,
             read_only: false,
-        })
+        };
+        // L3: unlocked and locked, the copy a crashed rewrite left can go.
+        container.remove_deniable_rewrite_leftovers();
+        Ok(container)
     }
 
     /// **Envelope-only** deniable MVK rotation. Generates a fresh
@@ -2341,7 +2367,7 @@ impl Container {
         synth_header.metadata_size = inner.metadata_size;
         synth_header.header_salt = per_vault_salt;
 
-        Ok(Self {
+        let container = Self {
             file: Box::new(file),
             path: path.to_path_buf(),
             header_storage: HeaderStorage::Inline,
@@ -2361,7 +2387,10 @@ impl Container {
             metadata_recovered_from_mirror: false,
             anchored_metadata_gen: None,
             read_only: false,
-        })
+        };
+        // L3: see `complete_open_v2_deniable_reusable`.
+        container.remove_deniable_rewrite_leftovers();
+        Ok(container)
     }
 
     /// Snapshot of the open-deniable state needed to hand off to a
@@ -2386,13 +2415,27 @@ impl Container {
     /// header parse path used by both `open` and `open_with_mvk`. Stops
     /// just before the MVK source is needed (HMAC verification).
     ///
-    /// Returns `(file, header_storage, header_bytes, header)` so the
-    /// caller can run HMAC verification with whatever MVK they have
-    /// (derived or supplied).
+    /// Returns `(file, header_storage, header_bytes, header, resize)` so
+    /// the caller can run HMAC verification with whatever MVK they have
+    /// (derived or supplied). `resize` is the recovery of an interrupted
+    /// detached-header resize, for the caller to carry out once that
+    /// verification passed (`finish_interrupted_resize`); when it
+    /// installs a header, the header returned is the one from the
+    /// intent. Nothing on disk is changed here.
+    #[allow(clippy::type_complexity)]
     fn load_locked_header(
         path: &Path,
         header_path: Option<&Path>,
-    ) -> Result<(File, HeaderStorage, [u8; HEADER_SIZE], Header), Error> {
+    ) -> Result<
+        (
+            File,
+            HeaderStorage,
+            [u8; HEADER_SIZE],
+            Header,
+            Option<ResizeRecovery>,
+        ),
+        Error,
+    > {
         // Open the actual handles that will back the Container, lock them,
         // and only then read or authenticate the header. This serializes
         // header read/modify/write sequences so a second opener cannot keep
@@ -2445,12 +2488,6 @@ impl Container {
         if let (Some(canon_hp), Some(expected)) = (canonical_header.as_ref(), header_inode) {
             verify_path_inode(canon_hp, expected)?;
         }
-        // Both files are locked: finish or undo a resize a crash
-        // interrupted, before the header is read.
-        if let HeaderStorage::Detached(hf, hp) = &mut header_storage {
-            let hp = hp.clone();
-            recover_interrupted_resize(path, &file, &hp, hf)?;
-        }
 
         let mut header_bytes = [0u8; HEADER_SIZE];
         match (&mut header_storage, header_path) {
@@ -2473,22 +2510,43 @@ impl Container {
                 unreachable!("file-backed paths never build External header storage")
             }
         }
-        let header = Header::from_bytes(&header_bytes)?;
-        // R15-A1: the parser cannot know whether the header is inline
-        // or detached, so it has to admit `metadata_offset == 0` and
-        // puts no lower bound on `data_offset`. We DO know here. For an
-        // inline header both regions must start past the 8 KiB header,
-        // otherwise a valid-HMAC layout (an MVK holder can produce one)
-        // makes the victim's first flush write AEAD ciphertext over the
-        // keyslot table and destroy the header. Same defence-in-depth
-        // class as the parser's existing (a)/(b) layout checks.
-        if matches!(header_storage, HeaderStorage::Inline)
-            && (header.metadata_offset < HEADER_SIZE as u64
-                || header.data_offset < HEADER_SIZE as u64)
+        let live = Header::from_bytes(&header_bytes)
+            .map_err(Error::from)
+            .and_then(|header| {
+                // R15-A1: the parser cannot know whether the header is
+                // inline or detached, so it has to admit
+                // `metadata_offset == 0` and puts no lower bound on
+                // `data_offset`. We DO know here. For an inline header
+                // both regions must start past the 8 KiB header,
+                // otherwise a valid-HMAC layout (an MVK holder can
+                // produce one) makes the victim's first flush write AEAD
+                // ciphertext over the keyslot table and destroy the
+                // header. Same defence-in-depth class as the parser's
+                // existing (a)/(b) layout checks.
+                if matches!(header_storage, HeaderStorage::Inline) && !inline_layout_ok(&header) {
+                    return Err(Error::Crypto(luksbox_core::Error::InvalidField));
+                }
+                Ok(header)
+            });
+        // Both files are locked: plan the recovery of a resize a crash
+        // interrupted. Carried out by the caller after the unlock.
+        let resize = match &header_storage {
+            HeaderStorage::Detached(_, hp) => {
+                plan_interrupted_resize(path, &file, hp, live.as_ref().ok())?
+            }
+            _ => None,
+        };
+        if let Some(ResizeRecovery {
+            action: ResizeAction::Install(candidate),
+            ..
+        }) = &resize
         {
-            return Err(Error::Crypto(luksbox_core::Error::InvalidField));
+            // Checked by the plan.
+            let header = Header::from_bytes(candidate)?;
+            let candidate = **candidate;
+            return Ok((file, header_storage, candidate, header, resize));
         }
-        Ok((file, header_storage, header_bytes, header))
+        Ok((file, header_storage, header_bytes, live?, resize))
     }
 
     /// Open + lock the vault, then attempt the caller-supplied unlock
@@ -2554,11 +2612,24 @@ impl Container {
         match Self::load_locked_header(path, header_path) {
             // Never a mirror for this one: it holds the old layout.
             Err(e @ Error::InterruptedResize(_)) => Err(e),
-            Ok((file, storage, live_bytes, live_header)) => {
-                // Live header parsed cleanly. Surface unlock outcome
-                // directly. NO mirror fallback here -- that would be
-                // the revoke-bypass.
+            Ok((file, mut storage, live_bytes, live_header, resize)) => {
+                // Live header parsed cleanly (or, for an interrupted
+                // resize, the header comes from its intent). Surface
+                // unlock outcome directly. NO mirror fallback here --
+                // that would be the revoke-bypass.
                 let mvk = try_unlock_and_verify(&live_header, &live_bytes)?;
+                // Only now, with the header authenticated, finish or
+                // undo the interrupted resize on disk.
+                if let Some(recovery) = resize {
+                    let intent = recovery.intent.clone();
+                    finish_interrupted_resize(path, &mut storage, recovery).map_err(|e| {
+                        Error::InterruptedResize(format!(
+                            "could not finish or undo the interrupted file list resize \
+                             recorded in {}: {e}; open the vault again",
+                            intent.display()
+                        ))
+                    })?;
+                }
                 Ok((file, storage, live_bytes, live_header, mvk, false))
             }
             Err(live_parse_err) => {
@@ -2568,7 +2639,25 @@ impl Container {
                 // mirror.
                 let (file, storage) = open_lock_no_header(path, header_path)?;
                 let mirror_path = header_mirror_path_for(path, &storage);
-                match try_unlock_via_mirror(&mirror_path, &mut try_unlock_and_verify) {
+                // L2: a mirror left from before a resize has the same
+                // MVK and a valid HMAC but the old layout; never recover
+                // from a mirror that cannot describe this vault file.
+                let vault_len = file.metadata()?.len();
+                let meta_mirror = append_extension(path, "meta-bak");
+                let inline = matches!(storage, HeaderStorage::Inline);
+                let mut fits_then_unlock = |h: &Header, b: &[u8; HEADER_SIZE]| {
+                    if !mirror_layout_fits_vault(h, vault_len, &meta_mirror, inline) {
+                        eprintln!(
+                            "luksbox: warning: not recovering the header from {}: its layout \
+                             does not match the vault file (left by an interrupted file list \
+                             resize?)",
+                            mirror_path.display()
+                        );
+                        return Err(Error::Crypto(luksbox_core::Error::InvalidField));
+                    }
+                    try_unlock_and_verify(h, b)
+                };
+                match try_unlock_via_mirror(&mirror_path, &mut fits_then_unlock) {
                     Some(Ok((m_bytes, m_header, mvk))) => {
                         eprintln!(
                             "luksbox: live header failed to parse; \
@@ -4411,9 +4500,11 @@ impl Container {
     }
 
     /// Begin a crash-safe MVK rotation. Copies the vault file to
-    /// `<path>.rotating`, swaps the open file handle to the temp file,
-    /// and remembers the original path. All subsequent reads/writes go
-    /// to the temp file; the original is untouched until commit.
+    /// `<path>.rotating` (a deniable vault: a keyed name, see
+    /// `deniable_rewrite_temp_path`), swaps the open file handle to the
+    /// temp file, and remembers the original path. All subsequent
+    /// reads/writes go to the temp file; the original is untouched until
+    /// commit.
     ///
     /// Inline mode only. Caller must check `supports_atomic_rotation()`
     /// and fall back to in-place rotation otherwise.
@@ -4437,13 +4528,14 @@ impl Container {
     /// are the rotation's. Inline-header vaults only.
     ///
     /// Inline and deniable vaults commit with the rename alone (a deniable
-    /// vault's inner header is re-sealed with the new layout). A detached
-    /// header is a second file: `commit_atomic_rotation` writes the new
-    /// header to `<header>.resizing` (with both vault lengths) before the
-    /// rename and installs it after, and the next open finishes or undoes
-    /// a resize a crash interrupted between the two
-    /// (`recover_interrupted_resize`). A sync bundle changes in place:
-    /// `relayout_external`.
+    /// vault's inner header is re-sealed with the new layout, and its copy
+    /// has a keyed name, `deniable_rewrite_temp_path`). A detached header
+    /// is a second file: `commit_atomic_rotation` writes the new header to
+    /// `<header>.resizing` (with both vault lengths) before the rename and
+    /// installs it after, and the next verified open finishes or undoes a
+    /// resize a crash interrupted between the two
+    /// (`plan_interrupted_resize`, then `finish_interrupted_resize`). A
+    /// sync bundle changes in place: `relayout_external`.
     pub fn begin_atomic_relayout(&mut self, new_metadata_size: u64) -> Result<(), Error> {
         if self.is_external() {
             return Err(Error::Crypto(luksbox_core::Error::InvalidField));
@@ -4541,6 +4633,15 @@ impl Container {
                 new_data_offset,
                 len.saturating_sub(old_data_offset),
             )?;
+            // A larger region now covers what was the start of the data
+            // area, and the bucketed metadata write refreshes only a
+            // prefix of the region: without this, copies of chunk
+            // ciphertext (deleted files' too) stayed in the region's tail
+            // for the life of the vault. Fresh padding instead, saved
+            // with the move.
+            if new_data_offset > old_data_offset {
+                fill_random_range(&mut *self.file, old_data_offset, new_data_offset)?;
+            }
             self.header.metadata_size = new_metadata_size;
             self.header.data_offset = new_data_offset;
             if self.header.has_header_generation() {
@@ -4583,10 +4684,65 @@ impl Container {
         }
     }
 
+    /// L3: where a deniable vault's atomic rewrite (MVK rotation, metadata
+    /// region resize) puts its copy: `.<16 hex digits>.tmp` in the vault's
+    /// directory, the digits an HMAC of the vault's file name under a key
+    /// derived from the MVK and the per-vault salt. Without the key the
+    /// name looks like any other temporary file, while the key holder
+    /// finds a copy a crash left behind (`remove_deniable_rewrite_leftovers`).
+    /// Computed once per rewrite, before the rotation changes the MVK, and
+    /// kept in `RotationState`.
+    fn deniable_rewrite_temp_path(&self) -> PathBuf {
+        use hmac::{Hmac, Mac};
+        let key = self
+            .mvk
+            .derive_subkey(&self.header.header_salt, DENIABLE_REWRITE_TEMP_INFO);
+        let mut mac = <Hmac<sha2::Sha256> as Mac>::new_from_slice(&key[..])
+            .expect("HMAC accepts any key length");
+        let name = self.path.file_name().unwrap_or_default();
+        mac.update(name.to_string_lossy().as_bytes());
+        let tag = mac.finalize().into_bytes();
+        let hex: String = tag[..8].iter().map(|b| format!("{b:02x}")).collect();
+        self.path.with_file_name(format!(".{hex}.tmp"))
+    }
+
+    /// L3: remove what a crashed rewrite of this deniable vault may have
+    /// left next to it: the keyed copy (`deniable_rewrite_temp_path`) and
+    /// the `<vault>.rotating` copy older versions made. Called with the
+    /// vault locked (after a deniable open, before a rewrite), so no
+    /// rewrite is in flight: such a copy was never renamed over the vault
+    /// and holds nothing the vault lacks. Best effort; a directory at
+    /// either path is left alone.
+    fn remove_deniable_rewrite_leftovers(&self) {
+        if self.deniable.is_none() || self.rotation.is_some() || self.is_external() {
+            return;
+        }
+        // Next to the path the vault was opened by and, for a vault
+        // opened through a link, next to the file it points to (where a
+        // rewrite makes its copy, `rewrite_target`).
+        let keyed = self.deniable_rewrite_temp_path();
+        let mut leftovers = vec![keyed.clone(), append_extension(&self.path, "rotating")];
+        if let Ok(target) = rewrite_target(&self.path)
+            && target != self.path
+        {
+            leftovers.push(target.with_file_name(keyed.file_name().unwrap_or_default()));
+            leftovers.push(append_extension(&target, "rotating"));
+        }
+        for leftover in leftovers {
+            if leftover
+                .symlink_metadata()
+                .is_ok_and(|m| !m.file_type().is_dir())
+                && std::fs::remove_file(&leftover).is_ok()
+            {
+                let _ = sync_parent_dir(&leftover);
+            }
+        }
+    }
+
     /// The temp-file half of an atomic rewrite (rotation, relayout):
-    /// create `<path>.rotating` safely, fill it with `fill(original,
-    /// temp)`, lock it, swap the open handle to it and remember enough
-    /// to commit or abort.
+    /// create `<path>.rotating` (deniable: `deniable_rewrite_temp_path`)
+    /// safely, fill it with `fill(original, temp)`, lock it, swap the
+    /// open handle to it and remember enough to commit or abort.
     fn begin_atomic_rewrite(
         &mut self,
         allow_detached: bool,
@@ -4604,14 +4760,26 @@ impl Container {
             return Err(Error::Crypto(luksbox_core::Error::InvalidField));
         }
         let original = self.path.clone();
-        let mut tmp_os = original.as_os_str().to_owned();
-        tmp_os.push(".rotating");
-        let tmp = PathBuf::from(tmp_os);
+        let target = rewrite_target(&original)?;
+        // L3: a deniable vault's copy gets a name only its key holder can
+        // tell apart from any other temporary file (`<vault>.rotating`
+        // next to a file of random bytes marks it as a LUKSbox vault).
+        // We hold the vault's lock, so no rewrite of it is in flight: a
+        // copy left there by a crash is garbage (the original was never
+        // replaced) and is removed first. Either copy is made next to
+        // the file it replaces (a rename does not cross file systems).
+        let tmp = if self.deniable.is_some() {
+            self.remove_deniable_rewrite_leftovers();
+            let keyed = self.deniable_rewrite_temp_path();
+            target.with_file_name(keyed.file_name().unwrap_or_default())
+        } else {
+            append_extension(&target, "rotating")
+        };
 
         // If a stale .rotating exists from a prior crash, refuse, caller
         // must clean up explicitly so we don't silently overwrite their
         // recovery state.
-        if tmp.exists() {
+        if tmp.symlink_metadata().is_ok() {
             return Err(Error::Io(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!(
@@ -4699,6 +4867,7 @@ impl Container {
         self.rotation = Some(RotationState {
             tmp_data_path: tmp,
             committed_data_path: original,
+            rename_data_path: target,
             committed_inode,
             committed_file: Some(committed_file),
             saved_header: self.header.clone(),
@@ -4731,7 +4900,7 @@ impl Container {
         // Detached-header relayout: the new header, with both vault
         // lengths, goes to `<header>.resizing` before the vault is
         // replaced, so a crash between the rename and the header write
-        // is finished at the next open (`recover_interrupted_resize`).
+        // is finished at the next open (`plan_interrupted_resize`).
         let resizing = match &self.header_storage {
             HeaderStorage::Detached(_, hp) => Some(append_extension(hp, RESIZING_EXT)),
             _ => None,
@@ -4753,6 +4922,30 @@ impl Container {
             state.header_resizing = Some(intent.clone());
         }
 
+        // **CRITICAL**, L2: drop the vault's sidecar mirrors BEFORE the
+        // rename. They describe the vault being replaced: its MVK and
+        // keyslot envelopes for a rotation (recovering a header from
+        // them would present the rolled-away credentials), its layout
+        // for a relayout (the same MVK and a valid HMAC, but every chunk
+        // at the wrong offset). Removed after the rename, a crash in
+        // between, or a failed directory sync returning first, left them
+        // next to the new vault for good: the header mirror is rewritten
+        // only by the next header change. Before the rename the original
+        // vault just goes without mirrors until its next save; the
+        // post-commit save writes fresh ones for the new vault.
+        if let Err(e) = self.remove_vault_mirrors(&state.committed_data_path) {
+            self.rotation = Some(state);
+            return Err(e);
+        }
+        // Through a link, mirrors may also sit next to the real file
+        // (from opens by that path).
+        if state.rename_data_path != state.committed_data_path
+            && let Err(e) = self.remove_vault_mirrors(&state.rename_data_path)
+        {
+            self.rotation = Some(state);
+            return Err(e);
+        }
+
         // R15-C2: on POSIX the original handle (and its flock) is held
         // until the rename has replaced the directory entry, since flock
         // never blocks a rename. Windows cannot replace a file whose
@@ -4765,7 +4958,7 @@ impl Container {
         }
         // Atomic on POSIX (and on Windows when the target is on the same
         // volume, std::fs::rename uses MoveFileExW with REPLACE_EXISTING).
-        if let Err(e) = std::fs::rename(&state.tmp_data_path, &state.committed_data_path) {
+        if let Err(e) = std::fs::rename(&state.tmp_data_path, &state.rename_data_path) {
             // Leave the rotation in flight: the original vault is
             // untouched (and on POSIX still locked by the retained
             // handle), the caller or the user can abort / inspect the
@@ -4779,7 +4972,12 @@ impl Container {
         // newer states written by this session).
         self.path = state.committed_data_path.clone();
         state.committed_file = None;
-        let finished = self.finish_committed_rewrite(&state.tmp_data_path, resizing.as_deref());
+        let finished = (|| {
+            if state.rename_data_path != state.committed_data_path {
+                sync_parent_dir(&state.rename_data_path)?;
+            }
+            self.finish_committed_rewrite(&state.tmp_data_path, resizing.as_deref())
+        })();
         if let Err(e) = finished {
             self.read_only = true;
             return Err(Error::Io(std::io::Error::other(format!(
@@ -4790,8 +4988,29 @@ impl Container {
         Ok(())
     }
 
+    /// Remove the metadata and header mirrors of the vault at
+    /// `data_path` (`commit_atomic_rotation`, before the rename), and
+    /// make the removal durable. `remove_file` unlinks the entry itself,
+    /// never a symlink's target.
+    fn remove_vault_mirrors(&self, data_path: &Path) -> Result<(), Error> {
+        let header_mirror = match &self.header_storage {
+            HeaderStorage::Inline => append_extension(data_path, "header-bak"),
+            HeaderStorage::Detached(_, hp) => append_extension(hp, "header-bak"),
+            HeaderStorage::External(_) => return Ok(()),
+        };
+        for stale in [append_extension(data_path, "meta-bak"), header_mirror] {
+            match std::fs::remove_file(&stale) {
+                Ok(()) => sync_parent_dir(&stale)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
     /// The part of `commit_atomic_rotation` after the rename: durability
-    /// of the rename, stale mirrors, and a detached header's install.
+    /// of the rename and a detached header's install (the stale mirrors
+    /// went before the rename).
     fn finish_committed_rewrite(
         &mut self,
         tmp_data_path: &Path,
@@ -4800,36 +5019,6 @@ impl Container {
         sync_parent_dir(&self.path)?;
         remove_rotation_tmp_mirrors(tmp_data_path);
 
-        // **CRITICAL**: drop the OLD sidecar mirrors that were
-        // written under the PRE-rotation MVK + keyslot envelopes.
-        // If we left them, a later crash mid-write on the post-
-        // rotation live region would let mirror recovery present
-        // a header whose keyslots still unwrap the OLD MVK -- which
-        // is the rolled-away credential the user just removed.
-        // Mirror cleanup at the committed path; the v2 write path
-        // will write fresh mirrors on the next live overwrite.
-        // Best-effort: the rotation itself succeeded; failure to
-        // delete a stale mirror is logged but not propagated, since
-        // the in-place-renamed live region is still authoritative.
-        let stale_meta_mirror = append_extension(&self.path, "meta-bak");
-        let stale_header_mirror = match &self.header_storage {
-            HeaderStorage::Inline => append_extension(&self.path, "header-bak"),
-            HeaderStorage::Detached(_, hp) => append_extension(hp, "header-bak"),
-            HeaderStorage::External(_) => {
-                unreachable!("external storage never runs a file rotation")
-            }
-        };
-        for stale in [&stale_meta_mirror, &stale_header_mirror] {
-            if stale.exists()
-                && let Err(e) = std::fs::remove_file(stale)
-            {
-                eprintln!(
-                    "luksbox: warn: failed to remove stale post-rotation mirror at {}: {}",
-                    stale.display(),
-                    e
-                );
-            }
-        }
         // Also clear the FLAG_HAS_*_MIRROR bits in the in-memory
         // header so the next persist_header / write_metadata
         // treat this as a "first-time mirror init" and re-establish
@@ -4915,6 +5104,9 @@ impl Container {
 
 /// Extension of the detached-header resize intent (`<header>.resizing`).
 const RESIZING_EXT: &str = "resizing";
+/// HKDF label of the key that names a deniable vault's rewrite copy
+/// (`Container::deniable_rewrite_temp_path`).
+const DENIABLE_REWRITE_TEMP_INFO: &[u8] = b"lbx:deniable-rewrite-temp/v1";
 /// Trailer of the intent after the header bytes: magic, new vault
 /// length, old vault length.
 const RESIZING_MAGIC: &[u8; 8] = b"LBXRSZ01";
@@ -4945,65 +5137,101 @@ fn write_resize_intent(
     Ok(())
 }
 
-/// Finish or undo a detached-header resize that a crash interrupted
-/// (`commit_atomic_rotation`), with both files locked. Every failure is
+/// What a detached-header resize that a crash interrupted
+/// (`commit_atomic_rotation`) still needs. Decided from the vault's
+/// length before the unlock (`plan_interrupted_resize`), carried out by
+/// `finish_interrupted_resize` only once the header it goes with has been
+/// unlocked and its HMAC verified, so an open that fails (a wrong
+/// passphrase, a forged intent) changes nothing on disk.
+struct ResizeRecovery {
+    intent: PathBuf,
+    /// `<vault>.rotating`, the copy a crash before the rename leaves.
+    copy: PathBuf,
+    action: ResizeAction,
+}
+
+enum ResizeAction {
+    /// The copy never replaced the vault: remove the intent and the copy.
+    Undo,
+    /// The sidecar already has the new layout (installed before a crash
+    /// or a failure, maybe changed since): remove the intent and any copy.
+    AlreadyInstalled,
+    /// The vault is the new copy, the sidecar still holds the old header:
+    /// the open unlocks this header from the intent, which is installed
+    /// afterwards (old-layout mirrors removed first).
+    Install(Box<[u8; HEADER_SIZE]>),
+}
+
+/// Plan the recovery of an interrupted detached-header resize, with both
+/// files locked, before the header is unlocked; `live` is the sidecar's
+/// header if it parses. Writes nothing. Every failure is
 /// `InterruptedResize`, which the open never answers from a header mirror
 /// (the mirror may hold the old layout).
-fn recover_interrupted_resize(
+fn plan_interrupted_resize(
     vault: &Path,
     vault_file: &File,
     hp: &Path,
-    header_file: &mut File,
-) -> Result<(), Error> {
+    live: Option<&Header>,
+) -> Result<Option<ResizeRecovery>, Error> {
     let intent = append_extension(hp, RESIZING_EXT);
-    let Ok(meta) = intent.symlink_metadata() else {
-        return Ok(());
-    };
-    recover_from_intent(&intent, &meta, vault, vault_file, hp, header_file).map_err(|e| match e {
+    plan_from_intent(&intent, vault, vault_file, live).map_err(|e| match e {
         e @ Error::InterruptedResize(_) => e,
         other => Error::InterruptedResize(format!(
-            "could not finish or undo the interrupted file list resize recorded in {}: \
-             {other}; open the vault again",
+            "could not read the interrupted file list resize recorded in {}: {other}; if \
+             LUKSbox did not write that file, remove it and open the vault again",
             intent.display()
         )),
     })
 }
 
-/// `recover_interrupted_resize` once an intent exists. The vault's length
-/// decides: the old layout's undoes the resize (the copy never replaced
-/// the vault), the new layout's installs the header from the intent
-/// unless the sidecar already has that layout (installed before a crash
-/// or a failure: it may hold later states, never overwritten). Anything
-/// else is refused rather than guessed. A `.rotating` copy next to the
-/// vault is removed either way and never decides anything (a sync client
+/// Read the resize intent at `path`: `None` when there is none. No-follow
+/// and non-blocking (a symlink or a FIFO planted there is refused, never
+/// followed or waited on), a regular file only, and at most one byte more
+/// than an intent so a huge file is not read.
+fn read_resize_intent(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let (f, _) = match open_regular_nofollow(path, "resize intent") {
+        Ok(v) => v,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut buf = Vec::with_capacity(RESIZING_LEN + 1);
+    f.take(RESIZING_LEN as u64 + 1).read_to_end(&mut buf)?;
+    Ok(Some(buf))
+}
+
+/// `plan_interrupted_resize` once the intent path is known. The vault's
+/// length decides: the old layout's undoes the resize (the copy never
+/// replaced the vault), the new layout's installs the header from the
+/// intent unless the sidecar already has that layout (installed before a
+/// crash or a failure: it may hold later states, never overwritten).
+/// Anything else is refused rather than guessed. The intent's header must
+/// parse and belong to this vault: an intent whose header has another
+/// header salt or cipher suite than the sidecar's was not written for this
+/// vault and is ignored (left in place, nothing changed); one of this vault
+/// whose layout, header generation or lengths do not add up is refused. A
+/// `.rotating` copy next to the vault never decides anything (a sync client
 /// may bring an old one back).
-fn recover_from_intent(
+fn plan_from_intent(
     intent: &Path,
-    meta: &std::fs::Metadata,
     vault: &Path,
     vault_file: &File,
-    hp: &Path,
-    header_file: &mut File,
-) -> Result<(), Error> {
-    if !meta.is_file() {
-        return Err(Error::InterruptedResize(format!(
-            "{} is not a regular file; remove it and open the vault again",
-            intent.display()
-        )));
-    }
-    let bytes = std::fs::read(intent)?;
-    let copy = append_extension(vault, "rotating");
-    let copy_exists = copy.symlink_metadata().is_ok();
-    let remove_copy = || {
-        if copy_exists {
-            let _ = std::fs::remove_file(&copy);
-            remove_rotation_tmp_mirrors(&copy);
-        }
+    live: Option<&Header>,
+) -> Result<Option<ResizeRecovery>, Error> {
+    let Some(bytes) = read_resize_intent(intent)? else {
+        return Ok(None);
     };
-    let remove_intent = || -> Result<(), Error> {
-        std::fs::remove_file(intent)?;
-        sync_parent_dir(intent)?;
-        Ok(())
+    // The copy a resize makes is next to the vault file (through a link,
+    // next to the file it points to: `rewrite_target`).
+    let copy = append_extension(
+        &rewrite_target(vault).unwrap_or_else(|_| vault.to_path_buf()),
+        "rotating",
+    );
+    let plan = |action| {
+        Ok(Some(ResizeRecovery {
+            intent: intent.to_path_buf(),
+            copy: copy.clone(),
+            action,
+        }))
     };
     let vault_len = vault_file.metadata()?.len();
     let parsed = (bytes.len() == RESIZING_LEN
@@ -5015,13 +5243,8 @@ fn recover_from_intent(
     let Some((new_len, old_len)) = parsed else {
         // Cut short while it was written, which is before the copy is
         // renamed over the vault: the copy must still be there.
-        if copy_exists {
-            remove_copy();
-            remove_intent()?;
-            eprintln!(
-                "luksbox: an interrupted file list resize was undone; the vault is as it was before"
-            );
-            return Ok(());
+        if copy.symlink_metadata().is_ok() {
+            return plan(ResizeAction::Undo);
         }
         return Err(Error::InterruptedResize(format!(
             "{} is incomplete and the rewritten copy is gone, so it cannot tell which header \
@@ -5031,12 +5254,7 @@ fn recover_from_intent(
         )));
     };
     if vault_len == old_len {
-        remove_copy();
-        remove_intent()?;
-        eprintln!(
-            "luksbox: an interrupted file list resize was undone; the vault is as it was before"
-        );
-        return Ok(());
+        return plan(ResizeAction::Undo);
     }
     if vault_len != new_len {
         return Err(Error::InterruptedResize(format!(
@@ -5046,37 +5264,119 @@ fn recover_from_intent(
             intent.display()
         )));
     }
-    remove_copy();
-    let new_header: &[u8; HEADER_SIZE] = bytes[..HEADER_SIZE].try_into().expect("checked length");
-    let layout = |h: &Header| (h.metadata_offset, h.metadata_size, h.data_offset);
-    let mut live = [0u8; HEADER_SIZE];
-    header_file.seek(SeekFrom::Start(0))?;
-    let live_layout = header_file
-        .read_exact(&mut live)
-        .ok()
-        .and_then(|()| Header::from_bytes(&live).ok())
-        .map(|h| layout(&h));
-    let intent_layout = Header::from_bytes(new_header).ok().map(|h| layout(&h));
-    if intent_layout.is_some() && live_layout == intent_layout {
-        remove_intent()?;
-        return Ok(());
+    let new_bytes: [u8; HEADER_SIZE] = bytes[..HEADER_SIZE].try_into().expect("checked length");
+    let Ok(new_header) = Header::from_bytes(&new_bytes) else {
+        return Err(Error::InterruptedResize(format!(
+            "{} does not hold a valid header, so it cannot tell which header goes with the \
+             vault: keep a copy of the vault, its header and that file, and restore from a \
+             backup",
+            intent.display()
+        )));
+    };
+    if let Some(live) = live {
+        if live.header_salt != new_header.header_salt
+            || live.cipher_suite != new_header.cipher_suite
+        {
+            eprintln!(
+                "luksbox: warning: ignoring {}: it was not written for this vault (remove it to \
+                 resize this vault again)",
+                intent.display()
+            );
+            return Ok(None);
+        }
+        let layout = |h: &Header| (h.metadata_offset, h.metadata_size, h.data_offset);
+        if layout(live) == layout(&new_header) {
+            return plan(ResizeAction::AlreadyInstalled);
+        }
+        // What every resize of this vault satisfies: only the region's
+        // size and the data offset change, the data area moves whole (it
+        // may have grown while the copy was saved, never shrunk), and on
+        // header format v3 the intent is the next header state.
+        let data_len = |len: u64, h: &Header| len.checked_sub(h.data_offset);
+        let lengths = matches!(
+            (data_len(new_len, &new_header), data_len(old_len, live)),
+            (Some(n), Some(o)) if n >= o
+        );
+        let newer = !live.has_header_generation()
+            || (new_header.has_header_generation()
+                && new_header.header_generation > live.header_generation);
+        if new_header.metadata_offset != live.metadata_offset
+            || new_header.chunk_size != live.chunk_size
+            || !lengths
+            || !newer
+        {
+            return Err(Error::InterruptedResize(format!(
+                "{} does not go with this vault's header (its layout, header generation or \
+                 lengths do not follow from a resize of it), so it is not applied: keep a copy \
+                 of the vault, its header and that file, and restore from a backup",
+                intent.display()
+            )));
+        }
+    } else if new_len < new_header.data_offset {
+        return Err(Error::InterruptedResize(format!(
+            "{} describes a layout longer than the vault: keep a copy of the vault, its \
+             header and that file, and restore from a backup",
+            intent.display()
+        )));
     }
-    // Old-layout mirrors go first (a later recovery must never fall back
-    // to them), then the header, then the intent: each step can be redone
-    // after another crash.
-    for stale in [
-        append_extension(hp, "header-bak"),
-        append_extension(vault, "meta-bak"),
-    ] {
-        if stale.symlink_metadata().is_ok() {
-            std::fs::remove_file(&stale)?;
+    plan(ResizeAction::Install(Box::new(new_bytes)))
+}
+
+/// Carry out `recovery` once the open has unlocked the header it goes
+/// with and verified its HMAC. Each step can be redone after another
+/// crash: the intent goes last.
+fn finish_interrupted_resize(
+    vault: &Path,
+    storage: &mut HeaderStorage,
+    recovery: ResizeRecovery,
+) -> Result<(), Error> {
+    let ResizeRecovery {
+        intent,
+        copy,
+        action,
+    } = recovery;
+    if copy.symlink_metadata().is_ok() {
+        let _ = std::fs::remove_file(&copy);
+        remove_rotation_tmp_mirrors(&copy);
+    }
+    let remove_intent = || -> Result<(), Error> {
+        std::fs::remove_file(&intent)?;
+        sync_parent_dir(&intent)?;
+        Ok(())
+    };
+    match action {
+        ResizeAction::Undo => {
+            remove_intent()?;
+            eprintln!(
+                "luksbox: an interrupted file list resize was undone; the vault is as it was before"
+            );
+        }
+        ResizeAction::AlreadyInstalled => remove_intent()?,
+        ResizeAction::Install(header) => {
+            let HeaderStorage::Detached(hf, hp) = storage else {
+                unreachable!("only a detached header has a resize intent")
+            };
+            // Old-layout mirrors first (a later recovery must never fall
+            // back to them), then the header, atomically, then the intent.
+            for stale in [
+                append_extension(hp, "header-bak"),
+                append_extension(vault, "meta-bak"),
+            ] {
+                if stale.symlink_metadata().is_ok() {
+                    std::fs::remove_file(&stale)?;
+                    sync_parent_dir(&stale)?;
+                }
+            }
+            let committed = atomic_secure_write(hp, &header[..])?;
+            // Same re-open and re-lock as `write_standard_header`: the
+            // rename replaced the inode the held handle (and lock) is on.
+            let new_hf = reopen_committed_no_follow(hp, committed)?;
+            lock_handles(&[(&new_hf, hp.as_path())])?;
+            *hf = new_hf;
+            remove_intent()?;
+            eprintln!("luksbox: an interrupted file list resize was finished");
         }
     }
-    header_file.seek(SeekFrom::Start(0))?;
-    header_file.write_all(new_header)?;
-    header_file.sync_all()?;
-    remove_intent()?;
-    eprintln!("luksbox: an interrupted file list resize was finished");
     Ok(())
 }
 
@@ -5097,6 +5397,21 @@ fn move_range(f: &mut dyn LbxFile, from: u64, to: u64, count: u64) -> std::io::R
         f.read_exact_at(src, &mut buf[..n as usize])?;
         f.write_all_at(dst, &buf[..n as usize])?;
         done += n;
+    }
+    Ok(())
+}
+
+/// Overwrite `[from, to)` of an image with random-looking padding (the
+/// metadata region's, `metadata::fill_padding`), 1 MiB at a time.
+fn fill_random_range(f: &mut dyn LbxFile, from: u64, to: u64) -> std::io::Result<()> {
+    const BLOCK: u64 = 1 << 20;
+    let mut buf = vec![0u8; BLOCK.min(to.saturating_sub(from)) as usize];
+    let mut at = from;
+    while at < to {
+        let n = BLOCK.min(to - at) as usize;
+        metadata::fill_padding(&mut buf[..n]);
+        f.write_all_at(at, &buf[..n])?;
+        at += n as u64;
     }
     Ok(())
 }
@@ -5147,6 +5462,48 @@ fn header_mirror_path_for(vault: &Path, storage: &HeaderStorage) -> PathBuf {
         HeaderStorage::Detached(_, hp) => hp.clone(),
     };
     append_extension(&base, "header-bak")
+}
+
+/// R15-A1: an inline header's metadata region and data area must both
+/// start past the 8 KiB header it shares the file with.
+fn inline_layout_ok(h: &Header) -> bool {
+    h.metadata_offset >= HEADER_SIZE as u64 && h.data_offset >= HEADER_SIZE as u64
+}
+
+/// Size of one chunk slot of the data area (`luksbox_vfs::chunk::
+/// CHUNK_SLOT_SIZE`: 12-byte nonce, 4096-byte chunk, 16-byte tag). The
+/// data area is always a whole number of slots: chunks are written slot
+/// by slot and a shrink cuts at a slot boundary.
+const DATA_SLOT_SIZE: u64 = 12 + 4096 + 16;
+
+/// L2: whether the header mirror `h` can describe the vault file it would
+/// be recovered for. A resize moves the data area by a multiple of 64 KiB,
+/// so a `.header-bak` from before one (left by a crash of an older version
+/// between the rename and the mirror removal, or brought back by a sync
+/// client) has the same MVK and a valid HMAC but the old layout:
+/// recovering from it read every chunk at the wrong offset, and the
+/// first save put the metadata region over data or short of it. Refused
+/// when the data area it implies is not a whole number of slots (64 KiB
+/// times k, k <= 1024, is never a multiple of the 4124-byte slot), when
+/// the metadata mirror next to the vault (rewritten by every save) has
+/// another region size, or, for an inline vault, a layout inside the
+/// header. A vault whose last slot was torn by a crash fails the slot
+/// check too: its header mirror is then not used automatically (`luksbox
+/// header restore` still can).
+fn mirror_layout_fits_vault(h: &Header, vault_len: u64, meta_mirror: &Path, inline: bool) -> bool {
+    if inline && !inline_layout_ok(h) {
+        return false;
+    }
+    let Some(data_len) = vault_len.checked_sub(h.data_offset) else {
+        return false;
+    };
+    if !data_len.is_multiple_of(DATA_SLOT_SIZE) {
+        return false;
+    }
+    match meta_mirror.symlink_metadata() {
+        Ok(m) if m.is_file() => m.len() == h.metadata_size,
+        _ => true,
+    }
 }
 
 /// Try to read the header mirror at `mirror_path` and run the caller's

@@ -57,6 +57,13 @@ would need a merge rule for layouts.
 
 ## Decided on 2026-11-08
 
+(Added after the macOS review, same day.) **FUSE-T: an `fsync` is
+durable within a second, not on return, without `--sync`.** The macOS
+NFS client behind FUSE-T sends a COMMIT at every close, and saving on
+each one made small-file copies 9 files/s and wrote 128 MiB per closed
+file; coalesced, 575 files/s. Kept by the user; `--sync` (GUI: Eager
+flush) stays durable on return (`docs/MACOS_FUSE_T.md`).
+
 0. **Transfer performance accepted as is** (user decision after the final
    benchmark, 256 MiB on an SSD, unlock included): default vaults about
    175 MB/s write / 240 MB/s read, `--hide-sizes` 94 / 241, sync bundles
@@ -134,8 +141,48 @@ would need a merge rule for layouts.
    reading only: build and run `cargo test -p luksbox-cli --features
    hardware` on a machine with tpm2-tss, and enroll a hybrid TPM slot
    in the wizard once.
-7. **macOS.** FUSE-T mount helper changes (anchor and eager-flush
-   passed to the helper) were not run on a Mac.
+7. **macOS: done on 2026-11-08** (macOS 26.6, Apple M5 Max, FUSE-T
+   1.2.9). The FUSE-T mount helper with `--anchor` and `--sync` was
+   driven as the GUI drives it (master key on stdin): the anchor moves
+   forward while mounted, a rolled-back vault is refused by the CLI and
+   by the helper. The test suites, `scripts/cli_scenarios.sh` and
+   `scripts/tui_scenarios.sh` (mount steps included) pass on the Mac.
+   Found and fixed there (CHANGELOG): `umount` did not wait for the save
+   on FUSE-T, every file closed on a FUSE-T mount saved the whole vault,
+   the AES suites ran in software on Apple Silicon, the opt-in sandbox
+   profile did not parse and had no rule for an anchor, locally built
+   binaries did not find libfuse-t, and the scripts needed GNU tools.
+   A security review found 2 HIGH, 6 MEDIUM and about 20 LOW / INFO
+   issues in the sync, merge, vault I/O, CLI and GUI code, all fixed
+   with regression tests (`docs/SECURITY_AUDIT_ROUND_16.md`, "Follow-up
+   review on macOS"). Verified after the fixes, on the Mac: workspace
+   822 tests, CLI + mount 113, the cross-process FUSE-T mount, GUI 54
+   (release and debug), `cargo fmt --check`, clippy with no new
+   warning, a Linux `cargo check` of the crates with Linux-only paths,
+   `scripts/cli_scenarios.sh` 233 and `scripts/tui_scenarios.sh` 35 under
+   the stock bash, and real FUSE-T mounts (umount then use, the GUI
+   helper with an anchor, a rolled-back vault refused, two-device
+   bundles, the opt-in sandbox). Speeds: `docs/PERFORMANCE.md`, "macOS".
+   Secure Enclave keyslots on this Mac's enclave (plain, SEP +
+   passphrase, hybrid SEP + ML-KEM-768, a sync bundle unlocked by SEP):
+   enrolled and unlocked with `--sep`, refused on a copy without the
+   slot. GUI (headless): the Secure Enclave choices greyed out exactly
+   when the backend is missing, the bundle revoke warning, and the
+   sandboxed FUSE-T helper command run for real (mount, I/O, unmount,
+   anchor in another folder; `LUKSBOX_TEST_HELPER=<luksbox>`).
+   With the user at the Mac: a Secure Enclave + Touch ID keyslot
+   (enrolled, unlocked with `--sep` after Touch ID), and a YubiKey
+   (FIDO2 keyslot enrolled; a vault and a sync bundle unlocked, written
+   and read with `--fido2`). The GUI on the real display: a window
+   (1180x792) up and stable, and its welcome, create, browser and
+   keyslot screens rendered through wgpu on the Mac's GPU (egui_kittest
+   `wgpu` + `snapshot` enabled temporarily, as in item 4). Removable
+   media: vaults (put, get, resize, a FUSE-T mount) and two-device
+   bundles on exFAT and FAT32 volumes (disk images), which found that
+   bundles could not be kept on exFAT (fixed).
+   Not run, and left out of scope by the user: a vault in iCloud Drive
+   syncing (it would upload to the user's account), macFUSE (kernel
+   extension and reboot), running on Windows (it compiles).
 
 ## Test-suite follow-up
 
@@ -146,6 +193,24 @@ would need a merge rule for layouts.
    again (no child process); 3 consecutive in-process runs passed.
 
 ## Smaller ideas noted on the way
+
+- **Per-chunk cost of writes.** A profile of a large `put` on Apple
+  Silicon (after hardware AES) puts the OS random-number call for each
+  4 KiB chunk's nonce (`getentropy`) about level with the chunk's
+  `pwrite`, and above the AES work; a per-thread buffer of OS randomness,
+  discarded after a `fork` (the mount daemonizes), would save about a
+  quarter of the write time. Nonces need no secrecy, only uniqueness;
+  not done in the review because nonce handling is security-critical.
+  Reusing the per-chunk plaintext buffer would save the next largest
+  cost (allocation + zeroize).
+- **Small files through a FUSE-T mount** stay about 5x slower than
+  through Linux FUSE (575 vs about 2 800 files/s): each create and close
+  is an NFS round trip. Folder `put` / `get` from the CLI does not go
+  through the mount.
+- **A same-hardware Linux comparison** (an arm64 Linux VM on the Mac,
+  e.g. OrbStack) would separate the code from the machine in the
+  PERFORMANCE.md tables; the Linux figures there come from a Ryzen in a
+  VMware VM.
 
 - `luksbox info` does not show how full the metadata region is (the
   only signal is the 75 % / 90 % warning at save time).

@@ -253,7 +253,12 @@ is crash-safe by construction.
     open files; if another device published meanwhile, it publishes its
     own commit as a fork and the merge happens at the next lock.
   - Open the common ancestor, ours and theirs as read-only views. They
-    share all the pages they have in common, so this costs little.
+    share all the pages they have in common, so this costs little. The
+    common ancestor must be complete in the bundle (header object
+    included): without it a merge would bring back files deleted on one
+    side and could only pick a keyslot table by generation, which can
+    undo a removal. Until it is there the two versions stay separate,
+    with a warning ("N concurrent version(s) were not merged").
   - Compare the trees by inode (renames are followed through the
     ancestor's inode ids) and replay theirs' changes onto ours. Content
     is read from one view and written to the other, so it is decrypted
@@ -281,7 +286,10 @@ is crash-safe by construction.
   its base deleted. Old manifests are dropped by
   writing a checkpoint (an authenticated "lowest kept seq per device")
   in a new manifest, so a missing old manifest is legitimate only
-  below a checkpoint.
+  below a checkpoint, and a manifest below a checkpoint is never opened
+  or merged again (one the provider restores from its version history
+  is ignored). The merge base of every commit a lease pins is kept with
+  it.
 - **Page size** is set at creation with an object-count budget in mind.
   Dropbox's desktop client slows down above about 300,000 files.
   - Default: 4 MiB, about 262,000 objects for 1 TiB.
@@ -401,7 +409,11 @@ to 7 are open, see the status in `CLOUD_SYNC_IMPLEMENTATION.md`.)
 
 - **`luksbox merge`:** `luksbox merge ours.lbx theirs.lbx [--base
   base.lbx]`, with a three-way merge as in 4.5 and a two-way union
-  without a base, using the same conflict naming.
+  without a base, using the same conflict naming. The result keeps
+  THEIRS' header, so both copies must be one vault under one master key
+  and THEIRS' keyslot table must not be older than OURS' (a conflict
+  copy goes first, the vault second); every input is checked against
+  this device's rollback anchors.
 - **GUI:** a "Resolve conflict copy" flow, offered by phase 0 item 3.
 - **Same engine as phase 2:** the bundle uses this engine on forks, so
   it gets tested on real conflict copies first.

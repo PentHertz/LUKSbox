@@ -439,37 +439,61 @@ pub struct DirEntry {
 /// (ENOSPC) error fires.
 #[derive(Debug, Clone, Copy)]
 pub struct MetadataBudgetStatus {
-    /// Current encoded size of the in-memory tree in bytes.
+    /// Encoded size of the in-memory tree in bytes, its free list counted
+    /// at its largest (`free_list_bytes`, see `Vfs::metadata_budget_status`).
+    /// What a smaller region must hold (`Vfs::resize_metadata_region`).
     pub used_bytes: usize,
-    /// Hard cap. Once `used_bytes` reaches this, the next write that
-    /// would grow the tree fails with `MetadataBudgetExhausted`.
+    /// Hard cap. Once `used_bytes - free_list_bytes` reaches this, the
+    /// next write that would grow the tree fails with
+    /// `MetadataBudgetExhausted`.
     pub budget_bytes: usize,
+    /// The part of `used_bytes` kept for the free list: what it would
+    /// take if the files whose chunk lists live outside the region (over
+    /// 1 MiB) were deleted or rewritten, on top of the free slots now.
+    /// Nothing is refused on it: a save that cannot hold the whole list
+    /// keeps part of it, and the next open finds the rest again.
+    pub free_list_bytes: usize,
 }
 
 impl MetadataBudgetStatus {
-    /// Usage as percentage 0..=100. Saturates at 100.
+    /// Usage as percentage 0..=100, free-list room included ("File list:
+    /// N% full"). Saturates at 100.
     pub fn used_pct(self) -> u32 {
-        if self.budget_bytes == 0 {
+        Self::pct(self.used_bytes, self.budget_bytes)
+    }
+
+    /// Usage by what new files are refused on (names, folders, inline
+    /// chunk lists, without the free list), 0..=100.
+    pub fn entries_used_pct(self) -> u32 {
+        Self::pct(
+            self.used_bytes.saturating_sub(self.free_list_bytes),
+            self.budget_bytes,
+        )
+    }
+
+    fn pct(used: usize, budget: usize) -> u32 {
+        if budget == 0 {
             return 0;
         }
-        let pct = (self.used_bytes as u128 * 100 / self.budget_bytes as u128) as u32;
+        let pct = (used as u128 * 100 / budget as u128) as u32;
         pct.min(100)
     }
 
-    /// Soft-warning threshold: at or above 75% of capacity. The GUI
-    /// surfaces a non-blocking notification here; the CLI's `info`
-    /// flags the vault as approaching its metadata cap.
+    /// Soft-warning threshold: entries at or above 75% of capacity
+    /// (`entries_used_pct`). The GUI surfaces a non-blocking notification
+    /// here; the CLI's `info` flags the vault as approaching its metadata
+    /// cap.
     pub fn near_capacity(self) -> bool {
-        self.used_pct() >= 75
+        self.entries_used_pct() >= 75
     }
 
-    /// Hard-warning threshold: at or above 90% of capacity. The next
-    /// few writes are likely to start failing with
+    /// Hard-warning threshold: entries at or above 90% of capacity. The
+    /// next few writes are likely to start failing with
     /// `MetadataBudgetExhausted`. The GUI surfaces a blocking
     /// notification recommending the user archive content or
     /// migrate to a new vault.
     pub fn critical_capacity(self) -> bool {
-        self.used_pct() >= 90
+        self.entries_used_pct() >= 90
     }
 }
 
@@ -876,6 +900,269 @@ struct DirectoryTreeV4OnDisk {
     next_chunk_gen: u64,
     free_chunks: Vec<ChunkId>,
     inodes: std::collections::BTreeMap<FileId, InodeV4OnDisk>,
+}
+
+/// The tree a save encodes (`Vfs::flush`): built once, then encoded with
+/// the free list that fits (`Vfs::encode_metadata`).
+enum OnDiskTree {
+    /// LBM2 encodes the in-memory `DirectoryTree` itself.
+    V2,
+    V3(DirectoryTreeV3OnDisk),
+    V4(DirectoryTreeV4OnDisk),
+}
+
+impl OnDiskTree {
+    /// Overwrite the file names and symlink targets this copy of the tree
+    /// holds before it is freed (the in-memory tree keeps its own).
+    fn wipe(self) {
+        use zeroize::Zeroize;
+        match self {
+            OnDiskTree::V2 => {}
+            OnDiskTree::V3(t) => {
+                for (_, od) in t.inodes {
+                    for (mut name, _) in od.children {
+                        name.zeroize();
+                    }
+                }
+            }
+            OnDiskTree::V4(t) => {
+                for (_, od) in t.inodes {
+                    for (mut name, _) in od.children {
+                        name.zeroize();
+                    }
+                    if let Some(mut target) = od.symlink_target {
+                        target.zeroize();
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// What `Vfs::fit_free_list` did to the free list of a save.
+#[derive(Default, Clone, Copy)]
+struct FreeListCut {
+    /// The lowered `next_chunk_id`: the free slots from there on left the
+    /// list.
+    next_chunk_id: Option<ChunkId>,
+    /// Free slots left out of the saved list besides those.
+    left_out: usize,
+}
+
+/// `value` postcard-encoded into a buffer sized up front and wiped when
+/// dropped: `to_allocvec` grows its vector as it goes, and every
+/// reallocation left a copy of the plaintext tree in freed memory.
+fn encode_wiped<T: Serialize + ?Sized>(value: &T) -> Result<Zeroizing<Vec<u8>>, Error> {
+    let len =
+        postcard::experimental::serialized_size(value).map_err(|_| Error::MetadataSerialize)?;
+    let mut buf = Zeroizing::new(vec![0u8; len]);
+    let used = postcard::to_slice(value, &mut buf[..])
+        .map_err(|_| Error::MetadataSerialize)?
+        .len();
+    buf.truncate(used);
+    Ok(buf)
+}
+
+/// Bytes of `v` as a postcard varint.
+fn varint_len(v: u64) -> usize {
+    ((64 - (v | 1).leading_zeros()) as usize).div_ceil(7)
+}
+
+/// Bytes of `list` encoded as a postcard `Vec<u64>`.
+fn free_list_encoded_len(list: &[ChunkId]) -> usize {
+    list.iter()
+        .fold(varint_len(list.len() as u64), |n, &id| n + varint_len(id))
+}
+
+/// Measures the LBM3..LBM6 encoding of the in-memory tree without
+/// building it (`Vfs::project_tree_len`): serializes field for field
+/// what `spill_to_v3_on_disk` / `spill_to_v4_on_disk` would produce,
+/// from borrowed data, with an empty free list. Building the owned shape
+/// for every projection cloned every file name, symlink target and
+/// inline chunk list (O(tree) allocations on each budget check and each
+/// GUI status poll), and left those plaintext copies in freed memory.
+/// `projection_encodes_like_the_saved_tree` checks the bytes match.
+struct TreeProjection<'a> {
+    tree: &'a DirectoryTree,
+    /// LBM4+ inode shape (mode, link count, symlink target).
+    v4: bool,
+    threshold: usize,
+    /// A file whose chunk count is projected as given instead of its own
+    /// (a write or truncate about to change it).
+    target: Option<(FileId, usize)>,
+    /// Stands for the refs that do not exist yet: the target's extra
+    /// chunks, and the head of a chunk-list chain not written yet.
+    placeholder: ChunkRef,
+}
+
+impl Serialize for TreeProjection<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("DirectoryTreeOnDisk", 6)?;
+        st.serialize_field("root", &self.tree.root)?;
+        st.serialize_field("next_file_id", &self.tree.next_file_id)?;
+        st.serialize_field("next_chunk_id", &self.tree.next_chunk_id)?;
+        st.serialize_field("next_chunk_gen", &self.tree.next_chunk_gen)?;
+        st.serialize_field("free_chunks", &[] as &[ChunkId])?;
+        st.serialize_field("inodes", &ProjectedInodes(self))?;
+        st.end()
+    }
+}
+
+struct ProjectedInodes<'a, 'b>(&'b TreeProjection<'a>);
+
+impl Serialize for ProjectedInodes<'_, '_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let p = self.0;
+        let mut map = s.serialize_map(Some(p.tree.inodes.len()))?;
+        for (id, inode) in &p.tree.inodes {
+            let count = match p.target {
+                Some((t, count)) if t == *id => count,
+                _ => inode.chunks.len(),
+            };
+            let chunks = if inode.kind == InodeKind::File && count > p.threshold {
+                ProjectedChunks::External(
+                    inode
+                        .external_list_blocks
+                        .first()
+                        .copied()
+                        .unwrap_or(p.placeholder),
+                    count as u64,
+                )
+            } else {
+                let have = count.min(inode.chunks.len());
+                ProjectedChunks::Inline(&inode.chunks[..have], count - have)
+            };
+            map.serialize_entry(
+                id,
+                &ProjectedInode {
+                    inode,
+                    chunks,
+                    v4: p.v4,
+                    placeholder: p.placeholder,
+                },
+            )?;
+        }
+        map.end()
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProjectedChunks<'a> {
+    /// Inline: these refs, then this many placeholders.
+    Inline(&'a [ChunkRef], usize),
+    /// In a chunk-list chain: head and chunk count.
+    External(ChunkRef, u64),
+}
+
+/// One inode in the `InodeV3OnDisk` / `InodeV4OnDisk` shape.
+struct ProjectedInode<'a> {
+    inode: &'a Inode,
+    chunks: ProjectedChunks<'a>,
+    v4: bool,
+    placeholder: ChunkRef,
+}
+
+impl Serialize for ProjectedInode<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let i = self.inode;
+        let mut st = s.serialize_struct("InodeOnDisk", if self.v4 { 11 } else { 8 })?;
+        st.serialize_field("id", &i.id)?;
+        st.serialize_field("parent", &i.parent)?;
+        st.serialize_field("kind", &i.kind)?;
+        st.serialize_field("size", &i.size)?;
+        st.serialize_field("mtime_ns", &i.mtime_ns)?;
+        match self.chunks {
+            ProjectedChunks::Inline(refs, extra) => {
+                st.serialize_field("chunks", &ProjectedRefs(refs, extra, self.placeholder))?;
+                st.serialize_field("chunks_external", &None::<(ChunkRef, u64)>)?;
+            }
+            ProjectedChunks::External(head, count) => {
+                st.serialize_field("chunks", &[] as &[ChunkRef])?;
+                st.serialize_field("chunks_external", &Some((head, count)))?;
+            }
+        }
+        st.serialize_field("children", &i.children)?;
+        if self.v4 {
+            st.serialize_field("mode", &i.mode)?;
+            st.serialize_field("link_count", &i.link_count)?;
+            st.serialize_field("symlink_target", &i.symlink_target)?;
+        }
+        st.end()
+    }
+}
+
+/// `refs` followed by `extra` copies of a placeholder, as one sequence.
+struct ProjectedRefs<'a>(&'a [ChunkRef], usize, ChunkRef);
+
+impl Serialize for ProjectedRefs<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = s.serialize_seq(Some(self.0.len() + self.1))?;
+        for r in self.0 {
+            seq.serialize_element(r)?;
+        }
+        for _ in 0..self.1 {
+            seq.serialize_element(&self.2)?;
+        }
+        seq.end()
+    }
+}
+
+/// R16 M1: rebuild the free list of a vault whose last save had to leave
+/// part of it out (`Vfs::flush`): every slot below `next_chunk_id` that no
+/// inode references is free. Runs only when slots are unaccounted for
+/// (referenced + listed free < `next_chunk_id`, which also picks up slots
+/// leaked by older versions), and only while `next_chunk_id` is within
+/// reach of the file's `file_slots` whole slots, so a forged counter
+/// cannot make it allocate a huge bitmap. An unlisted slot past the end of
+/// the file (a write that failed on a full disk) stays unlisted: reusing
+/// it would grow the file, past a maximum size too. Returns the number of
+/// slots found.
+fn reclaim_unlisted_slots(tree: &mut DirectoryTree, file_slots: u64) -> u64 {
+    let next = tree.next_chunk_id;
+    let max_slots = file_slots.saturating_add(1 << 20);
+    let referenced: u64 = tree
+        .inodes
+        .values()
+        .map(|i| (i.chunks.len() + i.external_list_blocks.len()) as u64)
+        .sum();
+    let listed = referenced.saturating_add(tree.free_chunks.len() as u64);
+    if listed >= next || next > max_slots {
+        return 0;
+    }
+    let Ok(words) = usize::try_from(next.div_ceil(64)) else {
+        return 0;
+    };
+    let mut used = vec![0u64; words];
+    for c in tree
+        .inodes
+        .values()
+        .flat_map(|i| i.chunks.iter().chain(&i.external_list_blocks))
+    {
+        // Validated below `next_chunk_id` at open.
+        used[(c.id / 64) as usize] |= 1 << (c.id % 64);
+    }
+    let before = tree.free_chunks.len() as u64;
+    // Highest first: `alloc_chunk_id` pops from the end, so the lowest
+    // slots are reused first and the end of the file empties out (where a
+    // save can drop it from the list and `shrink` can give it back).
+    let listed_free: BTreeSet<ChunkId> = tree
+        .free_chunks
+        .iter()
+        .copied()
+        .filter(|&s| s >= file_slots)
+        .collect();
+    tree.free_chunks = (0..next)
+        .rev()
+        .filter(|&s| {
+            used[(s / 64) as usize] & (1 << (s % 64)) == 0
+                && (s < file_slots || listed_free.contains(&s))
+        })
+        .collect();
+    (tree.free_chunks.len() as u64).saturating_sub(before)
 }
 
 fn invalid_metadata<T>() -> Result<T, Error> {
@@ -1550,6 +1837,12 @@ pub struct Vfs {
     /// What `finish` does with the free space at the end of the file
     /// (`set_shrink_on_close`, `shrink_control`).
     shrink: ShrinkControl,
+    /// Set while a `write` or `truncate` holds slots no inode references
+    /// yet (the chunks it appends): a save in its middle (`alloc_slot`)
+    /// must not lower `next_chunk_id` below them (`fit_free_list`).
+    uncommitted_slots: bool,
+    /// The one-shot note that a save left free slots out of the list.
+    warned_free_list_cut: bool,
 }
 
 /// Vault on-disk size beyond which the runtime emits a one-shot
@@ -1946,6 +2239,21 @@ impl Vfs {
         }
         let cow_floor_gen = tree.next_chunk_gen;
         let read_only = container.is_read_only();
+        // R16 M1: free slots a save had to leave out of the list (it did
+        // not fit the region) are found again. Not for a view that never
+        // writes, nor in tolerant recovery mode, where the chunks of the
+        // skipped files look unreferenced but must be kept for recovery.
+        if !read_only && tolerated.is_empty() {
+            let file_slots = container
+                .data_file_len()
+                .unwrap_or(0)
+                .saturating_sub(container.data_offset())
+                / chunk::CHUNK_SLOT_SIZE;
+            let found = reclaim_unlisted_slots(&mut tree, file_slots);
+            if debug && found > 0 {
+                eprintln!("luksbox-debug: {found} unlisted free chunk slot(s) reclaimed");
+            }
+        }
         Ok(Self {
             container,
             tree,
@@ -1966,6 +2274,8 @@ impl Vfs {
             cow_floor_gen,
             max_vault_size: settings.max_vault_size,
             shrink: ShrinkControl::default(),
+            uncommitted_slots: false,
+            warned_free_list_cut: false,
         })
     }
 
@@ -2010,141 +2320,110 @@ impl Vfs {
     }
 
     /// Current metadata-region budget usage in bytes plus the cap.
-    /// The CLI's `info` subcommand surfaces this, and the GUI polls
-    /// it for status display so users get an in-app warning before
-    /// they hit the cap on large file-count vaults (5k+ inodes
-    /// approaching the 64 MiB region).
+    /// The CLI's `info` / `size` subcommands surface this ("File list: N%
+    /// full"), and the GUI polls it for status display so users get an
+    /// in-app warning before they hit the cap on large file-count vaults.
     ///
-    /// O(N) over inodes: serializes a snapshot of the current tree.
-    /// Cheap enough to call periodically (once per CLI `info` /
-    /// once per GUI refresh tick); not cheap enough for hot-path
-    /// callers like statfs.
+    /// `used_bytes` is the encoded tree without its free list plus room
+    /// for the free list at its largest (`free_list_bytes`): the slots
+    /// listed free now, those freed since the last save, and every slot
+    /// of the files whose chunk lists live outside the region (over 1
+    /// MiB; deleting or rewriting them moves up to all of their slots
+    /// into the list, while an inline file's refs take more room than
+    /// its slots do in the list). A region smaller than that is refused
+    /// by `resize_metadata_region`. New entries and writes are refused on
+    /// the tree alone (`MetadataBudgetStatus::entries_used_pct`): the free
+    /// list never blocks them and never makes a save fail, a save that
+    /// cannot hold all of it leaves part out (see `flush`).
+    ///
+    /// O(N) over inodes, without copying the tree. Cheap enough to call
+    /// periodically (once per CLI `info` / once per GUI refresh tick);
+    /// not cheap enough for hot-path callers like statfs.
     pub fn metadata_budget_status(&self) -> MetadataBudgetStatus {
         let budget =
             luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size);
-        // Encode the same logical on-disk shape the next flush would
-        // write, modulo the per-format magic prefix (4 B). For v3+
-        // this must NOT serialize `self.tree` directly: large files
-        // keep their chunk refs materialized in memory, but flush
-        // spills them into external chunk-list blocks and stores only
-        // a compact `(head, count)` stub in metadata. Directly
-        // serializing the in-memory tree can allocate hundreds of MB
-        // in GUI status polling for large vaults and reports a bogus
-        // "near budget" state.
-        let used = self.projected_metadata_payload_len().unwrap_or(0);
-        MetadataBudgetStatus {
-            used_bytes: used,
-            budget_bytes: budget,
-        }
-    }
-
-    fn projected_metadata_payload_len(&self) -> Result<usize, Error> {
-        match self.format {
-            MetadataFormat::V2 => postcard::to_allocvec(&self.tree)
-                .map(|v| v.len())
-                .map_err(|_| Error::MetadataSerialize),
-            MetadataFormat::V3 => postcard::to_allocvec(&self.project_v3_on_disk_for_status())
-                .map(|v| v.len())
-                .map_err(|_| Error::MetadataSerialize),
-            MetadataFormat::V4 | MetadataFormat::V5 => {
-                postcard::to_allocvec(&self.project_v4_on_disk_for_status())
-                    .map(|v| v.len())
-                    .map_err(|_| Error::MetadataSerialize)
-            }
-        }
-    }
-
-    fn project_v3_on_disk_for_status(&self) -> DirectoryTreeV3OnDisk {
+        // A chain not written yet counts at its largest head ref.
         let placeholder = ChunkRef {
             id: u64::MAX,
             generation: u64::MAX,
         };
-        let threshold = self.format.inline_chunk_threshold();
-        let inodes = self
-            .tree
-            .inodes
-            .iter()
-            .map(|(&id, inode)| {
-                let renders_external =
-                    inode.kind == InodeKind::File && inode.chunks.len() > threshold;
-                let od = if renders_external {
-                    let head = inode
-                        .external_list_blocks
-                        .first()
-                        .copied()
-                        .unwrap_or(placeholder);
-                    InodeV3OnDisk {
-                        id: inode.id,
-                        parent: inode.parent,
-                        kind: inode.kind,
-                        size: inode.size,
-                        mtime_ns: inode.mtime_ns,
-                        chunks: Vec::new(),
-                        chunks_external: Some((head, inode.chunks.len() as u64)),
-                        children: inode.children.clone(),
-                    }
-                } else {
-                    InodeV3OnDisk {
-                        id: inode.id,
-                        parent: inode.parent,
-                        kind: inode.kind,
-                        size: inode.size,
-                        mtime_ns: inode.mtime_ns,
-                        chunks: inode.chunks.clone(),
-                        chunks_external: None,
-                        children: inode.children.clone(),
-                    }
-                };
-                (id, od)
-            })
-            .collect();
-        DirectoryTreeV3OnDisk {
-            root: self.tree.root,
-            next_file_id: self.tree.next_file_id,
-            next_chunk_id: self.tree.next_chunk_id,
-            next_chunk_gen: self.tree.next_chunk_gen,
-            free_chunks: self.tree.free_chunks.clone(),
-            inodes,
+        let entries = self.project_tree_len(None, placeholder).unwrap_or(0);
+        let reserve = self.free_list_reserve();
+        MetadataBudgetStatus {
+            used_bytes: entries.saturating_add(reserve),
+            budget_bytes: budget,
+            free_list_bytes: reserve,
         }
     }
 
-    fn project_v4_on_disk_for_status(&self) -> DirectoryTreeV4OnDisk {
-        let v3 = self.project_v3_on_disk_for_status();
-        let inodes = v3
-            .inodes
-            .into_iter()
-            .map(|(id, od)| {
-                let inode = self
-                    .tree
-                    .inodes
-                    .get(&id)
-                    .expect("projected v3 enumerates only in-memory inode ids");
-                (
-                    id,
-                    InodeV4OnDisk {
-                        id: od.id,
-                        parent: od.parent,
-                        kind: od.kind,
-                        size: od.size,
-                        mtime_ns: od.mtime_ns,
-                        chunks: od.chunks,
-                        chunks_external: od.chunks_external,
-                        children: od.children,
-                        mode: inode.mode,
-                        link_count: inode.link_count,
-                        symlink_target: inode.symlink_target.clone(),
-                    },
-                )
+    /// Encoded size of the metadata payload (without its magic) minus the
+    /// free list, which a save shortens to the room left (`flush`), with
+    /// file `target`'s chunk count projected as given. `placeholder`
+    /// stands for the refs that do not exist yet. Measured without
+    /// building the tree (`TreeProjection`).
+    fn project_tree_len(
+        &self,
+        target: Option<(FileId, usize)>,
+        placeholder: ChunkRef,
+    ) -> Result<usize, Error> {
+        let encoded = match self.format {
+            MetadataFormat::V2 => {
+                // Every chunk inline: the tree itself, its free list
+                // replaced by an empty one, and the target's extra chunks
+                // at a worst-case 12 B each (two u64 varints + slack).
+                let full = postcard::experimental::serialized_size(&self.tree)
+                    .map_err(|_| Error::MetadataSerialize)?;
+                let extra = target
+                    .and_then(|(id, count)| {
+                        self.tree
+                            .inodes
+                            .get(&id)
+                            .map(|i| count.saturating_sub(i.chunks.len()))
+                    })
+                    .unwrap_or(0);
+                full.saturating_sub(free_list_encoded_len(&self.tree.free_chunks))
+                    .saturating_add(1)
+                    .saturating_add(extra.saturating_mul(12))
+            }
+            format => postcard::experimental::serialized_size(&TreeProjection {
+                tree: &self.tree,
+                v4: matches!(format, MetadataFormat::V4 | MetadataFormat::V5),
+                threshold: format.inline_chunk_threshold(),
+                target,
+                placeholder,
             })
-            .collect();
-        DirectoryTreeV4OnDisk {
-            root: v3.root,
-            next_file_id: v3.next_file_id,
-            next_chunk_id: v3.next_chunk_id,
-            next_chunk_gen: v3.next_chunk_gen,
-            free_chunks: v3.free_chunks,
-            inodes,
-        }
+            .map_err(|_| Error::MetadataSerialize)?,
+        };
+        Ok(encoded)
+    }
+
+    /// Bytes the free list can come to take in the region beyond the
+    /// empty list the tree projection already counts: every slot listed
+    /// free or freed since the last save, plus every slot (data and
+    /// chunk-list blocks) of the files whose chunk list is stored outside
+    /// the region, at most `next_chunk_id` slots, each at the varint width
+    /// of the highest slot. See `metadata_budget_status`.
+    fn free_list_reserve(&self) -> usize {
+        let threshold = self.format.inline_chunk_threshold();
+        let external: u64 = if matches!(self.format, MetadataFormat::V2) {
+            0
+        } else {
+            self.tree
+                .inodes
+                .values()
+                .filter(|i| i.kind == InodeKind::File && i.chunks.len() > threshold)
+                .map(|i| (i.chunks.len() + i.external_list_blocks.len()) as u64)
+                .sum()
+        };
+        let next = self.tree.next_chunk_id;
+        let entries = ((self.tree.free_chunks.len() + self.pending_free.len()) as u64)
+            .saturating_add(external)
+            .min(next);
+        let width = varint_len(next.saturating_sub(1));
+        (entries as usize)
+            .saturating_mul(width)
+            .saturating_add(varint_len(entries))
+            .saturating_sub(1)
     }
 
     /// Refuse mutation on a recovered (lossy) instance. Keyed on the
@@ -2175,14 +2454,15 @@ impl Vfs {
     /// were checked, so many empty files or folders filled the region
     /// unchecked and the next save failed, losing everything since the
     /// previous one. Deletes are never refused: they are how a full
-    /// vault gets room back.
+    /// vault gets room back. The free list does not count (a save keeps
+    /// only the part that fits, see `flush`): it used to, so a large
+    /// delete in a small region refused every new entry and then made
+    /// every save fail.
     fn ensure_room_for_entry(&self) -> Result<(), Error> {
         self.ensure_writable_data()?;
         let budget =
             luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size);
-        let need = MUTATION_METADATA_BOUND
-            .saturating_add(self.pending_free.len().saturating_mul(10))
-            .saturating_add(BUDGET_SLACK);
+        let need = MUTATION_METADATA_BOUND.saturating_add(BUDGET_SLACK);
         if let Some(projected) = self.budget_projected.get()
             && projected
                 .saturating_add(self.budget_growth.get())
@@ -2196,7 +2476,7 @@ impl Vfs {
             );
             return Ok(());
         }
-        let projected = self.project_metadata_size(self.tree.root, 0)?;
+        let projected = self.project_tree_len(None, BUDGET_PLACEHOLDER)?;
         if projected.saturating_add(need) > budget {
             return Err(Error::MetadataBudgetExhausted);
         }
@@ -2384,106 +2664,51 @@ impl Vfs {
             // Layer 2: same reasoning as the V1->V5 upgrade above.
             self.chunks_dirty.extend(self.tree.inodes.keys().copied());
         }
-        let bytes = match self.format {
-            MetadataFormat::V5 => {
-                // v5: same on-disk shape as v4, lower spill threshold
-                // applied via `self.format.inline_chunk_threshold()`
-                // inside `spill_to_v3_on_disk`. Magic differs so
-                // pre-LBM5 binaries refuse the vault (they'd miss the
-                // sidecar mirror recovery path).
-                let mut v4 = self.spill_to_v4_on_disk()?;
-                // R15-E3: slots freed this session are free in the NEW
-                // metadata (nothing in it references them any more).
-                v4.free_chunks.extend_from_slice(&self.pending_free);
-                let payload = postcard::to_allocvec(&v4).map_err(|_| Error::MetadataSerialize)?;
-                if payload.len() > METADATA_DECODE_LIMIT_BYTES {
-                    return Err(Error::MetadataSerialize);
-                }
-                // LBM6 (LBM5 + vault settings) only while a setting is
-                // set, so a vault without a size limit stays readable by
-                // pre-LBM6 binaries.
-                let settings = VaultSettingsOnDisk {
-                    max_vault_size: self.max_vault_size,
-                };
-                let settings_bytes = if settings == VaultSettingsOnDisk::default() {
-                    None
-                } else {
-                    Some(postcard::to_allocvec(&settings).map_err(|_| Error::MetadataSerialize)?)
-                };
-                let mut bytes = Vec::with_capacity(
-                    METADATA_V5_MAGIC.len()
-                        + payload.len()
-                        + settings_bytes.as_ref().map_or(0, Vec::len),
-                );
-                match &settings_bytes {
-                    Some(tail) => {
-                        bytes.extend_from_slice(METADATA_V6_MAGIC);
-                        bytes.extend_from_slice(&payload);
-                        bytes.extend_from_slice(tail);
-                    }
-                    None => {
-                        bytes.extend_from_slice(METADATA_V5_MAGIC);
-                        bytes.extend_from_slice(&payload);
-                    }
-                }
-                bytes
-            }
-            MetadataFormat::V4 => {
-                // v4: same spill machinery as v3 + per-inode
-                // mode/link_count. spill_to_v4_on_disk reuses
-                // spill_to_v3_on_disk's chunk-list-block handling.
-                let mut v4 = self.spill_to_v4_on_disk()?;
-                v4.free_chunks.extend_from_slice(&self.pending_free); // R15-E3
-                let payload = postcard::to_allocvec(&v4).map_err(|_| Error::MetadataSerialize)?;
-                if payload.len() > METADATA_DECODE_LIMIT_BYTES {
-                    return Err(Error::MetadataSerialize);
-                }
-                let mut bytes = Vec::with_capacity(METADATA_V4_MAGIC.len() + payload.len());
-                bytes.extend_from_slice(METADATA_V4_MAGIC);
-                bytes.extend_from_slice(&payload);
-                bytes
-            }
-            MetadataFormat::V3 => {
-                // v3: spill any inode whose chunk list exceeds
-                // V3_INLINE_CHUNK_THRESHOLD into an external chunk-
-                // list chain, then serialise the spilled tree as
-                // DirectoryTreeV3OnDisk. Spilling writes chunk-list
-                // blocks AND mutates inode.external_list_blocks for
-                // bookkeeping; old external_list_blocks (from a
-                // previous flush) are freed during the spill.
-                let mut v3 = self.spill_to_v3_on_disk()?;
-                v3.free_chunks.extend_from_slice(&self.pending_free); // R15-E3
-                let payload = postcard::to_allocvec(&v3).map_err(|_| Error::MetadataSerialize)?;
-                if payload.len() > METADATA_DECODE_LIMIT_BYTES {
-                    return Err(Error::MetadataSerialize);
-                }
-                let mut bytes = Vec::with_capacity(METADATA_V3_MAGIC.len() + payload.len());
-                bytes.extend_from_slice(METADATA_V3_MAGIC);
-                bytes.extend_from_slice(&payload);
-                bytes
-            }
-            MetadataFormat::V2 => {
-                // v2: plain postcard of the whole tree, all chunks
-                // inline. Inode's mode/link_count fields are
-                // serde-skipped, so the on-disk shape is unchanged
-                // from pre-LBM4 code (preserves backward compat).
-                // R15-E3: serialise the pending frees as free, then put the
-                // in-memory list back the way it was until the write lands.
-                let inline_free_len = self.tree.free_chunks.len();
-                self.tree.free_chunks.extend_from_slice(&self.pending_free);
-                let payload =
-                    postcard::to_allocvec(&self.tree).map_err(|_| Error::MetadataSerialize);
-                self.tree.free_chunks.truncate(inline_free_len);
-                let payload = payload?;
-                if payload.len() > METADATA_DECODE_LIMIT_BYTES {
-                    return Err(Error::MetadataSerialize);
-                }
-                let mut bytes = Vec::with_capacity(METADATA_V2_MAGIC.len() + payload.len());
-                bytes.extend_from_slice(METADATA_V2_MAGIC);
-                bytes.extend_from_slice(&payload);
-                bytes
-            }
+        // v5: same on-disk shape as v4, lower spill threshold applied via
+        // `self.format.inline_chunk_threshold()` inside
+        // `spill_to_v3_on_disk`. Magic differs so pre-LBM5 binaries refuse
+        // the vault (they'd miss the sidecar mirror recovery path). v4:
+        // the v3 spill machinery plus per-inode mode/link_count. v3: any
+        // inode whose chunk list exceeds V3_INLINE_CHUNK_THRESHOLD goes to
+        // an external chunk-list chain; spilling writes chunk-list blocks
+        // AND updates `inode.external_list_blocks` (old blocks from a
+        // previous flush are freed during the spill). v2: plain postcard
+        // of the whole tree, all chunks inline (mode/link_count are
+        // serde-skipped, so the shape is the pre-LBM4 one).
+        let mut on_disk = match self.format {
+            MetadataFormat::V5 | MetadataFormat::V4 => OnDiskTree::V4(self.spill_to_v4_on_disk()?),
+            MetadataFormat::V3 => OnDiskTree::V3(self.spill_to_v3_on_disk()?),
+            MetadataFormat::V2 => OnDiskTree::V2,
         };
+        // R15-E3: slots freed this session are free in the NEW metadata
+        // (nothing in it references them any more). Collected after the
+        // spill, which retires the old chunk lists it rewrote.
+        let mut free: Vec<ChunkId> =
+            Vec::with_capacity(self.tree.free_chunks.len() + self.pending_free.len());
+        free.extend_from_slice(&self.tree.free_chunks);
+        free.extend_from_slice(&self.pending_free);
+        let limit = (self.container.header.metadata_size as usize)
+            .saturating_sub(luksbox_format::METADATA_OVERHEAD);
+        let encoded = (|| -> Result<_, Error> {
+            let mut next_chunk_id = self.tree.next_chunk_id;
+            let mut bytes = self.encode_metadata(&mut on_disk, &mut free, next_chunk_id)?;
+            let mut cut = FreeListCut::default();
+            // R16 M1: the free list never makes a save fail. It is stored
+            // inline (one varint per slot) and a delete, a truncate or a
+            // copy-on-write overwrite can move up to millions of slots into
+            // it, while a large file costs almost nothing in the region
+            // until then (its chunk list lives outside). Every save then
+            // failed ("metadata blob is larger than the metadata region")
+            // and a mount lost every change made after the delete.
+            if bytes.len() > limit && !free.is_empty() {
+                cut = self.fit_free_list(&mut on_disk, &mut free, limit)?;
+                next_chunk_id = cut.next_chunk_id.unwrap_or(next_chunk_id);
+                bytes = self.encode_metadata(&mut on_disk, &mut free, next_chunk_id)?;
+            }
+            Ok((bytes, cut))
+        })();
+        on_disk.wipe();
+        let (bytes, cut) = encoded?;
         // **Durability fence** before the sidecar-mirror commit.
         //
         // `spill_to_v[3-5]_on_disk` above called
@@ -2529,6 +2754,23 @@ impl Vfs {
         // R15-E3: the new metadata is durable and references none of the
         // slots freed during this session, so they may be reused now.
         self.tree.free_chunks.append(&mut self.pending_free);
+        // R16 M1: the saved free list ends where the saved data area does.
+        // The slots left out of it stay free in this session (no durable
+        // metadata references them) and the next open finds them again
+        // (`reclaim_unlisted_slots`).
+        if let Some(keep) = cut.next_chunk_id {
+            self.tree.free_chunks.retain(|&slot| slot < keep);
+            self.tree.next_chunk_id = keep;
+        }
+        if cut.left_out > 0 && !self.warned_free_list_cut {
+            eprintln!(
+                "luksbox: note: {} free chunk slot(s) did not fit in this vault's file list \
+                 region and were left out of the saved list of free space; they stay \
+                 reusable now and are found again the next time the vault is opened",
+                cut.left_out
+            );
+            self.warned_free_list_cut = true;
+        }
         // The tree just saved is what the next projection starts from.
         self.budget_projected.set(None);
         self.budget_growth.set(0);
@@ -2544,16 +2786,22 @@ impl Vfs {
         // CLI-equivalent so headless users get the same heads-up
         // before hitting the hard ENOSPC. State-tracked via the
         // `last_warned_pct` field so the message fires only on
-        // upward threshold crossings, not on every flush.
-        let pct = ((bytes.len() as u128 * 100)
+        // upward threshold crossings, not on every flush. Measured
+        // without the free list, which never refuses anything (a save
+        // keeps the part that fits).
+        let entries_len = bytes
+            .len()
+            .saturating_sub(free_list_encoded_len(&free))
+            .saturating_add(1);
+        let pct = ((entries_len as u128 * 100)
             / luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size)
-                as u128) as u32;
+                .max(1) as u128) as u32;
         let pct = pct.min(100);
         if pct >= 90 && self.last_warned_pct < 90 {
             eprintln!(
                 "luksbox: warn: metadata region at {pct}% capacity ({} / {} bytes). \
                  New files will soon be refused ('no space left on device'): {}.",
-                bytes.len(),
+                entries_len,
                 luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size,),
                 self.file_list_remedy(),
             );
@@ -2564,7 +2812,7 @@ impl Vfs {
                  The metadata region (not the host disk) is the bottleneck for \
                  vaults with very large inode counts; if many more files are \
                  expected: {}.",
-                bytes.len(),
+                entries_len,
                 luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size,),
                 self.file_list_remedy(),
             );
@@ -2605,6 +2853,124 @@ impl Vfs {
         // place for the next attempt.
         self.chunks_dirty.clear();
         Ok(())
+    }
+
+    /// The metadata blob a save writes (magic, payload, vault settings)
+    /// for `on_disk` with `free` as its free list and `next_chunk_id`, in
+    /// plaintext buffers wiped when dropped. `free` is moved into the tree
+    /// for the encoding and back. No decode-limit check here: a first
+    /// encoding with an oversize free list is how `flush` finds out it
+    /// must shorten it, and a blob that fits the region (at most
+    /// `MAX_METADATA_SIZE`) is within `METADATA_DECODE_LIMIT_BYTES`.
+    fn encode_metadata(
+        &mut self,
+        on_disk: &mut OnDiskTree,
+        free: &mut Vec<ChunkId>,
+        next_chunk_id: ChunkId,
+    ) -> Result<Zeroizing<Vec<u8>>, Error> {
+        let payload = match on_disk {
+            OnDiskTree::V4(t) => {
+                std::mem::swap(&mut t.free_chunks, free);
+                t.next_chunk_id = next_chunk_id;
+                let p = encode_wiped(&*t);
+                std::mem::swap(&mut t.free_chunks, free);
+                p
+            }
+            OnDiskTree::V3(t) => {
+                std::mem::swap(&mut t.free_chunks, free);
+                t.next_chunk_id = next_chunk_id;
+                let p = encode_wiped(&*t);
+                std::mem::swap(&mut t.free_chunks, free);
+                p
+            }
+            OnDiskTree::V2 => {
+                // The in-memory tree is the on-disk shape: give it the
+                // save's free list for the encoding, then put its own back
+                // until the write lands.
+                std::mem::swap(&mut self.tree.free_chunks, free);
+                let next = std::mem::replace(&mut self.tree.next_chunk_id, next_chunk_id);
+                let p = encode_wiped(&self.tree);
+                self.tree.next_chunk_id = next;
+                std::mem::swap(&mut self.tree.free_chunks, free);
+                p
+            }
+        };
+        let payload = payload?;
+        // LBM6 (LBM5 + vault settings) only while a setting is set, so a
+        // vault without a size limit stays readable by pre-LBM6 binaries.
+        let settings = VaultSettingsOnDisk {
+            max_vault_size: self.max_vault_size,
+        };
+        let with_settings =
+            self.format == MetadataFormat::V5 && settings != VaultSettingsOnDisk::default();
+        let tail = if with_settings {
+            Some(postcard::to_allocvec(&settings).map_err(|_| Error::MetadataSerialize)?)
+        } else {
+            None
+        };
+        let magic: &[u8; 4] = match (self.format, &tail) {
+            (MetadataFormat::V5, Some(_)) => METADATA_V6_MAGIC,
+            (MetadataFormat::V5, None) => METADATA_V5_MAGIC,
+            (MetadataFormat::V4, _) => METADATA_V4_MAGIC,
+            (MetadataFormat::V3, _) => METADATA_V3_MAGIC,
+            (MetadataFormat::V2, _) => METADATA_V2_MAGIC,
+        };
+        let mut bytes = Zeroizing::new(Vec::with_capacity(
+            magic.len() + payload.len() + tail.as_ref().map_or(0, Vec::len),
+        ));
+        bytes.extend_from_slice(magic);
+        bytes.extend_from_slice(&payload);
+        if let Some(t) = &tail {
+            bytes.extend_from_slice(t);
+        }
+        Ok(bytes)
+    }
+
+    /// R16 M1: what a save keeps of a free list that does not fit in the
+    /// region (`limit` bytes of blob). First the free slots at the end of
+    /// the data area: past the last slot in use every slot is free, so the
+    /// saved `next_chunk_id` drops to it and those slots leave the list
+    /// (like `shrink`, without cutting the file; later writes reuse them
+    /// from there). Not while a write or truncate is in progress
+    /// (`uncommitted_slots`): the slots it appended are referenced by no
+    /// inode yet. Then, if the list still does not fit, only its
+    /// lowest-numbered slots that do (low slots are reused first, so the
+    /// end of the file keeps emptying out). Leaving a free slot out of the
+    /// saved list only stops it from being reused after the vault is
+    /// closed, and the next open finds it again (`reclaim_unlisted_slots`).
+    /// Shortens `free` in place.
+    fn fit_free_list(
+        &mut self,
+        on_disk: &mut OnDiskTree,
+        free: &mut Vec<ChunkId>,
+        limit: usize,
+    ) -> Result<FreeListCut, Error> {
+        let mut cut = FreeListCut::default();
+        let mut next = self.tree.next_chunk_id;
+        if !self.uncommitted_slots {
+            let keep = self.first_unused_tail_slot();
+            if keep < next {
+                free.retain(|&slot| slot < keep);
+                next = keep;
+                cut.next_chunk_id = Some(keep);
+            }
+        }
+        // Room for the list: the blob without one, whose empty list takes
+        // one byte. A tree that does not fit even so leaves no room, and
+        // `write_metadata` refuses the save as before.
+        let mut none = Vec::new();
+        let base = self.encode_metadata(on_disk, &mut none, next)?.len();
+        let room = limit.saturating_sub(base).saturating_add(1);
+        if free_list_encoded_len(free) > room {
+            let width = free.iter().copied().max().map_or(1, varint_len);
+            let kept = (room.saturating_sub(varint_len(free.len() as u64)) / width).min(free.len());
+            if kept < free.len() {
+                free.select_nth_unstable(kept);
+            }
+            cut.left_out = free.len() - kept;
+            free.truncate(kept);
+        }
+        Ok(cut)
     }
 
     /// The LUKSBOX1 -> LUKSBOX2 + LBM5 step of the v0.2.1 auto-upgrade
@@ -2878,7 +3244,8 @@ impl Vfs {
             next_file_id: self.tree.next_file_id,
             next_chunk_id: self.tree.next_chunk_id,
             next_chunk_gen: self.tree.next_chunk_gen,
-            free_chunks: self.tree.free_chunks.clone(),
+            // Filled in by `encode_metadata` with the list the save keeps.
+            free_chunks: Vec::new(),
             inodes: on_disk_inodes,
         })
     }
@@ -2979,6 +3346,8 @@ impl Vfs {
     /// have just barely fit, user gets ENOSPC, recoverable); false
     /// negatives are NOT (chunks land on disk, metadata can't address
     /// them, silent loss).
+    ///
+    /// The free list is not part of it (see `ensure_room_for_entry`).
     fn check_metadata_budget_for_chunks(
         &self,
         id: FileId,
@@ -2988,9 +3357,6 @@ impl Vfs {
         // honored on every open). Constant for the life of this Vfs.
         let region_size = self.container.header.metadata_size;
         let budget = luksbox_format::metadata::payload_budget_for(region_size);
-        // Slots freed this session are serialized as free at the next
-        // flush: count them (a full varint each).
-        let pending = self.pending_free.len().saturating_mul(10);
         let request = extra_chunks.saturating_mul(CHUNK_REF_METADATA_BOUND);
         // Fast path: the last exact projection plus an upper bound of
         // everything since (see `budget_growth`) still fits.
@@ -2998,7 +3364,6 @@ impl Vfs {
             let bound = projected
                 .saturating_add(self.budget_growth.get())
                 .saturating_add(request)
-                .saturating_add(pending)
                 .saturating_add(BUDGET_SLACK);
             if bound <= budget {
                 self.budget_growth
@@ -3006,12 +3371,14 @@ impl Vfs {
                 return Ok(());
             }
         }
-        let projected = self.project_metadata_size(id, extra_chunks)?;
-        if projected
-            .saturating_add(pending)
-            .saturating_add(BUDGET_SLACK)
-            > budget
-        {
+        let count = self
+            .tree
+            .inodes
+            .get(&id)
+            .map_or(0, |i| i.chunks.len())
+            .saturating_add(extra_chunks);
+        let projected = self.project_tree_len(Some((id, count)), BUDGET_PLACEHOLDER)?;
+        if projected.saturating_add(BUDGET_SLACK) > budget {
             return Err(Error::MetadataBudgetExhausted);
         }
         // The projection includes this request.
@@ -3020,147 +3387,23 @@ impl Vfs {
         Ok(())
     }
 
-    /// Exact serialized size of the metadata if file `id` grew by
-    /// `extra_chunks` chunks (placeholder references for the new ones).
-    fn project_metadata_size(&self, id: FileId, extra_chunks: usize) -> Result<usize, Error> {
-        if matches!(self.format, MetadataFormat::V2) {
-            // v2: every chunk is inline. Same logic as before the fix.
-            let current = postcard::to_allocvec(&self.tree)
-                .map_err(|_| Error::MetadataSerialize)?
-                .len();
-            return Ok(current.saturating_add(extra_chunks.saturating_mul(12)));
+    /// `check_metadata_budget_for_chunks` for a truncate that leaves file
+    /// `id` with `count` chunks, fewer than it has: refused when they no
+    /// longer spill out of the region and their inline list does not fit.
+    /// Always exact (a shrink is rare); the projection then describes the
+    /// tree after the truncate, which is what the fast path needs: the
+    /// earlier one, made while the list was outside the region, no longer
+    /// bounds the tree.
+    fn check_metadata_budget_for_count(&self, id: FileId, count: usize) -> Result<(), Error> {
+        let budget =
+            luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size);
+        let projected = self.project_tree_len(Some((id, count)), BUDGET_PLACEHOLDER)?;
+        if projected.saturating_add(BUDGET_SLACK) > budget {
+            return Err(Error::MetadataBudgetExhausted);
         }
-
-        // v3: estimate the size of the SPILLED tree. We serialize a
-        // DirectoryTreeV3OnDisk that mirrors `self.tree` with each
-        // inode rendered in its on-disk form (inline if under
-        // threshold, External stub if over). For the file `id` that's
-        // about to grow, project the post-add chunk count and use
-        // that projected count when deciding inline vs external.
-        //
-        // The serialisation is bounded by inode count + per-inode
-        // fixed overhead (~100 B in postcard, plus children and
-        // path-name bytes for directories). Even with 100k tiny
-        // files the projection is well under the 16 MiB budget.
-        //
-        // We don't actually need to BUILD spill blocks here -- the
-        // estimate is just an InodeV3OnDisk with empty inline chunks
-        // and a placeholder (ChunkRef, count). The placeholder bytes
-        // postcard-encode identically to the real values (same shape).
-        let placeholder = ChunkRef {
-            id: 0,
-            generation: 1,
-        };
-        let mut on_disk_inodes: std::collections::BTreeMap<FileId, InodeV3OnDisk> =
-            std::collections::BTreeMap::new();
-        for (&inode_id, inode) in self.tree.inodes.iter() {
-            // Project the chunks vec for this file: target file `id`
-            // gets `chunks.len() + extra_chunks`; everyone else is
-            // current size.
-            let projected_chunk_count = if inode_id == id {
-                inode.chunks.len().saturating_add(extra_chunks)
-            } else {
-                inode.chunks.len()
-            };
-            let renders_external = inode.kind == InodeKind::File
-                && projected_chunk_count > self.format.inline_chunk_threshold();
-            on_disk_inodes.insert(
-                inode_id,
-                if renders_external {
-                    InodeV3OnDisk {
-                        id: inode.id,
-                        parent: inode.parent,
-                        kind: inode.kind,
-                        size: inode.size,
-                        mtime_ns: inode.mtime_ns,
-                        chunks: Vec::new(),
-                        chunks_external: Some((placeholder, projected_chunk_count as u64)),
-                        children: inode.children.clone(),
-                    }
-                } else {
-                    // Inline path: count the PROJECTED chunks as if
-                    // they were already in the vec. We approximate
-                    // each projected ChunkRef as the placeholder; for
-                    // a file that's currently inline and won't spill
-                    // even after growing, this gives a slight under-
-                    // estimate (the real new ChunkRefs will have
-                    // larger varint encodings as id/gen grow). Add
-                    // 12 B per projected chunk (same upper bound as
-                    // the v2 path) as the worst-case correction.
-                    let chunks = if inode_id == id {
-                        let mut v = inode.chunks.clone();
-                        v.extend(std::iter::repeat_n(placeholder, extra_chunks));
-                        v
-                    } else {
-                        inode.chunks.clone()
-                    };
-                    InodeV3OnDisk {
-                        id: inode.id,
-                        parent: inode.parent,
-                        kind: inode.kind,
-                        size: inode.size,
-                        mtime_ns: inode.mtime_ns,
-                        chunks,
-                        chunks_external: None,
-                        children: inode.children.clone(),
-                    }
-                },
-            );
-        }
-        // v4 / v5 (every current vault) save each inode with its mode,
-        // link count and symlink target too (`spill_to_v4_on_disk`).
-        // Projecting the v3 shape left those out: a few bytes per file
-        // and a whole target per symlink, so a region filled with small
-        // files passed the check and the save then overflowed it.
-        if matches!(self.format, MetadataFormat::V4 | MetadataFormat::V5) {
-            let inodes = on_disk_inodes
-                .into_iter()
-                .map(|(id, od)| {
-                    let inode = &self.tree.inodes[&id];
-                    (
-                        id,
-                        InodeV4OnDisk {
-                            id: od.id,
-                            parent: od.parent,
-                            kind: od.kind,
-                            size: od.size,
-                            mtime_ns: od.mtime_ns,
-                            chunks: od.chunks,
-                            chunks_external: od.chunks_external,
-                            children: od.children,
-                            mode: inode.mode,
-                            link_count: inode.link_count,
-                            symlink_target: inode.symlink_target.clone(),
-                        },
-                    )
-                })
-                .collect();
-            let projected_tree = DirectoryTreeV4OnDisk {
-                root: self.tree.root,
-                next_file_id: self.tree.next_file_id,
-                next_chunk_id: self.tree.next_chunk_id,
-                next_chunk_gen: self.tree.next_chunk_gen,
-                free_chunks: self.tree.free_chunks.clone(),
-                inodes,
-            };
-            return Ok(postcard::to_allocvec(&projected_tree)
-                .map_err(|_| Error::MetadataSerialize)?
-                .len());
-        }
-        let projected_tree = DirectoryTreeV3OnDisk {
-            root: self.tree.root,
-            next_file_id: self.tree.next_file_id,
-            next_chunk_id: self.tree.next_chunk_id,
-            next_chunk_gen: self.tree.next_chunk_gen,
-            free_chunks: self.tree.free_chunks.clone(),
-            inodes: on_disk_inodes,
-        };
-        // Slack for varint growth on placeholder values being smaller
-        // than the real values we'll write at flush time is added by the
-        // caller (`BUDGET_SLACK`).
-        Ok(postcard::to_allocvec(&projected_tree)
-            .map_err(|_| Error::MetadataSerialize)?
-            .len())
+        self.budget_projected.set(Some(projected));
+        self.budget_growth.set(0);
+        Ok(())
     }
 
     /// Whether `name` is accepted for a new entry (`create`, `mkdir`...),
@@ -3643,222 +3886,224 @@ impl Vfs {
         // Allocate any missing chunks up to target_count as zero-filled.
         // Covers file extension, sparse holes (write past EOF), and pow2
         // padding. New refs accumulate in `appended` (bounded by how far
-        // the write extends the file) and are NOT written into the inode
-        // until every disk write below has succeeded, so an error partway
-        // through leaves the inode exactly as it was -- identical
-        // roll-back semantics to the previous clone-then-discard code.
+        // the write extends the file) and are added to the inode only once
+        // every disk write below has succeeded: after a failure nothing
+        // refers to them and their slots are handed back (R15-E6).
+        //
+        // Rewrites of chunks the file already has are different: one in
+        // place (`rewrite_target`) destroys the old ciphertext, so its new
+        // ref is recorded in the inode as soon as its write lands
+        // (`record_rewrite`), never batched for the end. Batching them
+        // left a failure later in the same call (ENOSPC on a later chunk's
+        // copy-on-write slot, a save inside `alloc_slot` failing, an I/O
+        // or AEAD error on a later chunk) with the inode still holding the
+        // OLD generation of a slot that now held ciphertext under the new
+        // one: that chunk failed its AEAD check for good. A save in the
+        // middle of the call (`alloc_slot`) persisted the same stale
+        // reference. So a failed write may have changed part of the
+        // file's existing bytes; it never changes the file's size, and
+        // every byte reads back as either its old or its new value (but
+        // for a chunk whose own write in place fails midway, an I/O
+        // error, which no copy protects).
         let zero = vec![0u8; CHUNK_PLAINTEXT_SIZE];
         // R15-E6: no `with_capacity(target_count - cur_len)` here. One
         // 1-byte write at an offset near MAX_FILE_SIZE made that a 64 GiB
         // reservation and aborted the process (the whole mount) before a
         // single chunk was written. Grow incrementally instead.
         let mut appended: Vec<ChunkRef> = Vec::new();
-        while cur_len + appended.len() < target_count {
-            let slot = match self.alloc_slot(1) {
-                Ok(slot) => slot,
-                Err(e) => {
-                    // At the maximum size: hand back the slots this call
-                    // allocated so far (R15-E6).
-                    self.pending_free.extend(appended.iter().map(|c| c.id));
-                    return Err(e);
-                }
-            };
-            let cref = ChunkRef {
-                id: slot,
-                generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
-            };
-            let chunk_idx = (cur_len + appended.len()) as u32;
-            // A new chunk this write covers is written below with its
-            // data, starting from zeros: writing (and later reading back)
-            // an encrypted zero chunk first cost two more AEAD operations
-            // and two more I/Os per 4 KiB of every file transfer. Only the
-            // chunks the write does not cover (a hole before it, pow2
-            // padding after it) are written as zeros here. A reused free
-            // slot is overwritten either way before anything refers to it.
-            let covered = (first_chunk..=last_chunk).contains(&(chunk_idx as usize));
-            if covered {
-                appended.push(cref);
-                continue;
-            }
-            if let Err(e) =
-                chunk::write_chunk(&mut self.container, &key, id, chunk_idx, cref, &zero)
-            {
-                // R15-E6: hand back the slots this call allocated but never
-                // recorded (ENOSPC mid-extension) instead of leaking them
-                // for the life of the vault.
-                self.pending_free.push(cref.id);
-                self.pending_free.extend(appended.iter().map(|c| c.id));
-                return Err(e);
-            }
-            appended.push(cref);
-        }
-
-        // Copy just the *existing* chunk refs this write covers (again
-        // O(write-length), not O(file-length)). Refs at index >= cur_len
-        // live in `appended`; indices below cur_len come from here.
-        let existing_hi = (last_chunk + 1).min(cur_len);
-        let covered_existing: Vec<ChunkRef> = if first_chunk < existing_hi {
-            let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?;
-            inode.chunks[first_chunk..existing_hi].to_vec()
-        } else {
-            Vec::new()
-        };
-
-        // Read-modify-write over the covered range. Each rewrite gets a
-        // fresh generation counter (replay protection) and, for a chunk
-        // the durable metadata references, a fresh slot (copy-on-write,
-        // see `rewrite_target`). The new ref is recorded only AFTER its
-        // write succeeds: updates to existing chunks go in `updates`,
-        // updates to freshly-appended chunks are applied to `appended` in
-        // place. The slots rewrites retire go in `retired`, freed once the
-        // inode is committed (on an error the inode still references them).
-        let mut updates: Vec<(usize, ChunkRef)> = Vec::new();
+        // Slots that copy-on-write rewrites of existing chunks retired: the
+        // inode stops referring to each as soon as its rewrite is recorded,
+        // they are freed at the end whatever happens.
         let mut retired: Vec<ChunkId> = Vec::new();
-
-        // R15-E2: a write past EOF opens a hole [old_real, offset). The
-        // EXISTING chunks covering it (pow2 padding, or what a previous
-        // shrink left in place) may still hold bytes that were truncated
-        // away; POSIX says the hole reads as zeros, and the old code let
-        // the discarded content resurface. Scrub the part of the hole in
-        // chunks BEFORE the write's first chunk here; the first chunk's
-        // share is scrubbed inside the RMW loop below.
-        if offset > old_real && cur_len > 0 {
-            let (gap_first, _) = file_to_chunk(old_real, hide_size)?;
-            let gap_end = first_chunk.min(cur_len);
-            for idx in gap_first..gap_end {
-                let (cfs, cfe) = chunk_file_range(idx, hide_size)?;
-                let zs = old_real.max(cfs).saturating_sub(cfs) as usize;
-                let ze = offset.min(cfe).saturating_sub(cfs) as usize;
-                if zs >= ze {
-                    continue;
+        // Existing chunks rewritten (and recorded) so far.
+        let mut rewritten = 0usize;
+        self.uncommitted_slots = true;
+        let result = (|| -> Result<(), Error> {
+            while cur_len + appended.len() < target_count {
+                let generation = self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?;
+                // At the maximum size this fails: the slots allocated so far
+                // are handed back below (R15-E6).
+                let slot = self.alloc_slot(1)?;
+                let cref = ChunkRef {
+                    id: slot,
+                    generation,
+                };
+                let chunk_idx = (cur_len + appended.len()) as u32;
+                appended.push(cref);
+                // A new chunk this write covers is written below with its
+                // data, starting from zeros: writing (and later reading back)
+                // an encrypted zero chunk first cost two more AEAD operations
+                // and two more I/Os per 4 KiB of every file transfer. Only
+                // the chunks the write does not cover (a hole before it, pow2
+                // padding after it) are written as zeros here. A reused free
+                // slot is overwritten either way before anything refers to
+                // it.
+                if !(first_chunk..=last_chunk).contains(&(chunk_idx as usize)) {
+                    chunk::write_chunk(&mut self.container, &key, id, chunk_idx, cref, &zero)?;
                 }
-                let ds = if hide_size && idx == 0 {
+            }
+
+            // Copy just the *existing* chunk refs this write covers (again
+            // O(write-length), not O(file-length)). Refs at index >= cur_len
+            // live in `appended`; indices below cur_len come from here. The
+            // hole scrub below only rewrites chunks before `first_chunk`.
+            let existing_hi = (last_chunk + 1).min(cur_len);
+            let covered_existing: Vec<ChunkRef> = if first_chunk < existing_hi {
+                let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?;
+                inode.chunks[first_chunk..existing_hi].to_vec()
+            } else {
+                Vec::new()
+            };
+
+            // R15-E2: a write past EOF opens a hole [old_real, offset). The
+            // EXISTING chunks covering it (pow2 padding, or what a previous
+            // shrink left in place) may still hold bytes that were
+            // truncated away; POSIX says the hole reads as zeros, and the
+            // old code let the discarded content resurface. Scrub the part
+            // of the hole in chunks BEFORE the write's first chunk here; the
+            // first chunk's share is scrubbed inside the RMW loop below.
+            if offset > old_real && cur_len > 0 {
+                let (gap_first, _) = file_to_chunk(old_real, hide_size)?;
+                let gap_end = first_chunk.min(cur_len);
+                for idx in gap_first..gap_end {
+                    let (cfs, cfe) = chunk_file_range(idx, hide_size)?;
+                    let zs = old_real.max(cfs).saturating_sub(cfs) as usize;
+                    let ze = offset.min(cfe).saturating_sub(cfs) as usize;
+                    if zs >= ze {
+                        continue;
+                    }
+                    let ds = if hide_size && idx == 0 {
+                        SIZE_HEADER_LEN
+                    } else {
+                        0
+                    };
+                    let cur_ref = self.tree.inodes.get(&id).ok_or(Error::NotFound)?.chunks[idx];
+                    let mut pt =
+                        chunk::read_chunk(&mut self.container, &key, id, idx as u32, cur_ref)?;
+                    if pt[ds + zs..ds + ze].iter().all(|&b| b == 0) {
+                        continue;
+                    }
+                    pt[ds + zs..ds + ze].fill(0);
+                    self.record_rewrite(&key, id, idx, cur_ref, &pt, &mut retired)?;
+                    rewritten += 1;
+                }
+            }
+
+            // Read-modify-write over the covered range. Each rewrite gets a
+            // fresh generation counter (replay protection) and, for a chunk
+            // the durable metadata references, a fresh slot (copy-on-write,
+            // see `rewrite_target`).
+            let mut buf_pos = 0usize;
+            for chunk_idx in first_chunk..=last_chunk {
+                let (chunk_file_start, chunk_file_end) = chunk_file_range(chunk_idx, hide_size)?;
+                let in_chunk_offset = offset
+                    .max(chunk_file_start)
+                    .saturating_sub(chunk_file_start);
+                let in_chunk_end = new_end.min(chunk_file_end).saturating_sub(chunk_file_start);
+                let len_here = (in_chunk_end - in_chunk_offset) as usize;
+                let data_start = if hide_size && chunk_idx == 0 {
                     SIZE_HEADER_LEN
                 } else {
                     0
                 };
-                let cur_ref = self.tree.inodes.get(&id).ok_or(Error::NotFound)?.chunks[idx];
-                let mut pt = chunk::read_chunk(&mut self.container, &key, id, idx as u32, cur_ref)?;
-                if pt[ds + zs..ds + ze].iter().all(|&b| b == 0) {
-                    continue;
-                }
-                pt[ds + zs..ds + ze].fill(0);
-                let (new_ref, old) = self.rewrite_chunk(&key, id, idx as u32, cur_ref, &pt)?;
-                retired.extend(old);
-                updates.push((idx, new_ref));
-            }
-        }
-        let mut buf_pos = 0usize;
-        for chunk_idx in first_chunk..=last_chunk {
-            let (chunk_file_start, chunk_file_end) = chunk_file_range(chunk_idx, hide_size)?;
-            let in_chunk_offset = offset
-                .max(chunk_file_start)
-                .saturating_sub(chunk_file_start);
-            let in_chunk_end = new_end.min(chunk_file_end).saturating_sub(chunk_file_start);
-            let len_here = (in_chunk_end - in_chunk_offset) as usize;
-            let data_start = if hide_size && chunk_idx == 0 {
-                SIZE_HEADER_LEN
-            } else {
-                0
-            };
-            let pt_start = data_start + in_chunk_offset as usize;
-            let pt_end = data_start + in_chunk_end as usize;
+                let pt_start = data_start + in_chunk_offset as usize;
+                let pt_end = data_start + in_chunk_end as usize;
 
-            let cur_ref = if chunk_idx < cur_len {
-                covered_existing[chunk_idx - first_chunk]
-            } else {
-                appended[chunk_idx - cur_len]
-            };
-            // A chunk this call appended is new: its plaintext is zeros
-            // (nothing written to its slot yet, see the extension loop).
-            let mut pt = if chunk_idx < cur_len {
-                chunk::read_chunk(&mut self.container, &key, id, chunk_idx as u32, cur_ref)?
-            } else {
-                Zeroizing::new(vec![0u8; CHUNK_PLAINTEXT_SIZE])
-            };
-            // R15-E2: this chunk's share of the hole left by a write past
-            // EOF (see above) is scrubbed in the same rewrite.
-            if chunk_idx == first_chunk && chunk_idx < cur_len && offset > old_real {
-                let hole_start = old_real
-                    .max(chunk_file_start)
-                    .saturating_sub(chunk_file_start) as usize;
-                let hole_end = in_chunk_offset as usize;
-                if hole_start < hole_end {
-                    pt[data_start + hole_start..data_start + hole_end].fill(0);
-                }
-            }
-            pt[pt_start..pt_end].copy_from_slice(&buf[buf_pos..buf_pos + len_here]);
-            // If this is chunk 0 in hide-size mode, refresh the size header
-            // (the write may have grown the file).
-            if hide_size && chunk_idx == 0 {
-                install_size_header(&mut pt, new_real);
-            }
-            // New nonce + generation. A chunk this call appended is
-            // referenced by no metadata yet (even if a flush ran since),
-            // so it is rewritten in place; an existing one copy-on-write.
-            let (new_ref, old) = if chunk_idx < cur_len {
-                self.rewrite_chunk(&key, id, chunk_idx as u32, cur_ref, &pt)?
-            } else {
-                match self.rewrite_in_place(&key, id, chunk_idx as u32, cur_ref, &pt) {
-                    Ok(r) => (r, None),
-                    Err(e) => {
-                        // R15-E6: nothing refers to the slots this call
-                        // appended; hand them back instead of leaking them.
-                        self.pending_free.extend(appended.iter().map(|c| c.id));
-                        return Err(e);
+                let existing = chunk_idx < cur_len;
+                let cur_ref = if existing {
+                    covered_existing[chunk_idx - first_chunk]
+                } else {
+                    appended[chunk_idx - cur_len]
+                };
+                // A chunk this call appended is new: its plaintext is zeros
+                // (nothing written to its slot yet, see the extension loop).
+                let mut pt = if existing {
+                    chunk::read_chunk(&mut self.container, &key, id, chunk_idx as u32, cur_ref)?
+                } else {
+                    Zeroizing::new(vec![0u8; CHUNK_PLAINTEXT_SIZE])
+                };
+                // R15-E2: this chunk's share of the hole left by a write past
+                // EOF (see above) is scrubbed in the same rewrite.
+                if chunk_idx == first_chunk && existing && offset > old_real {
+                    let hole_start = old_real
+                        .max(chunk_file_start)
+                        .saturating_sub(chunk_file_start)
+                        as usize;
+                    let hole_end = in_chunk_offset as usize;
+                    if hole_start < hole_end {
+                        pt[data_start + hole_start..data_start + hole_end].fill(0);
                     }
                 }
-            };
-            retired.extend(old);
-            if chunk_idx < cur_len {
-                updates.push((chunk_idx, new_ref));
-            } else {
-                appended[chunk_idx - cur_len] = new_ref;
+                pt[pt_start..pt_end].copy_from_slice(&buf[buf_pos..buf_pos + len_here]);
+                // Chunk 0 in hide-size mode carries the real size. An
+                // existing chunk 0 keeps the old size until the refresh
+                // below, the last step: recorded right away, a new size
+                // would outlive a failure that drops the chunks this call
+                // appends (more size than chunks), or show bytes of later
+                // chunks this call never got to write.
+                if hide_size && chunk_idx == 0 {
+                    install_size_header(&mut pt, if existing { old_real } else { new_real });
+                }
+                // New nonce + generation. A chunk this call appended is
+                // referenced by no metadata yet (even if a flush ran since),
+                // so it is rewritten in place; an existing one copy-on-write.
+                if existing {
+                    self.record_rewrite(&key, id, chunk_idx, cur_ref, &pt, &mut retired)?;
+                    rewritten += 1;
+                } else {
+                    appended[chunk_idx - cur_len] =
+                        self.rewrite_in_place(&key, id, chunk_idx as u32, cur_ref, &pt)?;
+                }
+                buf_pos += len_here;
             }
-            buf_pos += len_here;
+
+            // Hide-size: refresh chunk 0's size header when the file grew,
+            // unless the loop above wrote it (a chunk 0 this call appended).
+            // Chunk 0 is an existing chunk when the file was non-empty, or a
+            // just-appended one when the write started past a hole into a
+            // previously-empty file.
+            if hide_size
+                && new_real != old_real
+                && target_count > 0
+                && !(first_chunk == 0 && cur_len == 0)
+            {
+                // Start from the inode's current ref: the hole scrub or the
+                // loop above may already have rewritten chunk 0.
+                let cur0 = if cur_len > 0 {
+                    self.tree.inodes.get(&id).ok_or(Error::NotFound)?.chunks[0]
+                } else {
+                    appended[0]
+                };
+                let mut pt = chunk::read_chunk(&mut self.container, &key, id, 0, cur0)?;
+                install_size_header(&mut pt, new_real);
+                if cur_len > 0 {
+                    self.record_rewrite(&key, id, 0, cur0, &pt, &mut retired)?;
+                    rewritten += 1;
+                } else {
+                    appended[0] = self.rewrite_in_place(&key, id, 0, cur0, &pt)?;
+                }
+            }
+            Ok(())
+        })();
+        self.uncommitted_slots = false;
+
+        // The inode no longer references the slots the rewrites retired.
+        self.pending_free.extend(retired);
+        if let Err(e) = result {
+            // R15-E6: nothing refers to the slots this call appended; hand
+            // them back instead of leaking them. The rewrites of existing
+            // chunks that landed are recorded (see above).
+            self.pending_free.extend(appended.iter().map(|c| c.id));
+            if rewritten > 0
+                && let Some(inode) = self.tree.inodes.get_mut(&id)
+            {
+                inode.mtime_ns = Self::now_ns();
+            }
+            return Err(e);
         }
 
-        // If hide-size and chunk 0 wasn't in the rewritten range but the
-        // file grew, refresh chunk 0's size header. Chunk 0 is an
-        // existing chunk when the file was non-empty, or a just-appended
-        // one when the write started past a hole into a previously-empty
-        // file.
-        if hide_size && new_real != old_real && first_chunk > 0 && target_count > 0 {
-            // The hole scrub above may already have rewritten chunk 0 in
-            // this call: start from that ref, not the inode's pre-write
-            // one (whose slot the scrub may have overwritten, or whose
-            // contents predate the scrub).
-            let scrubbed0 = updates.iter().rev().find(|(i, _)| *i == 0).map(|(_, r)| *r);
-            let cur0 = if let Some(r) = scrubbed0 {
-                r
-            } else if cur_len > 0 {
-                self.tree.inodes.get(&id).ok_or(Error::NotFound)?.chunks[0]
-            } else {
-                appended[0]
-            };
-            let mut pt = chunk::read_chunk(&mut self.container, &key, id, 0, cur0)?;
-            install_size_header(&mut pt, new_real);
-            let (new0, old) = if cur_len > 0 {
-                self.rewrite_chunk(&key, id, 0, cur0, &pt)?
-            } else {
-                (self.rewrite_in_place(&key, id, 0, cur0, &pt)?, None)
-            };
-            retired.extend(old);
-            if cur_len > 0 {
-                updates.push((0, new0));
-            } else {
-                appended[0] = new0;
-            }
-        }
-
-        // Every disk write succeeded: commit the ref changes to the inode
-        // in a single pass. Existing-chunk generation bumps first (their
-        // indices are all < cur_len, valid before the extend), then the
-        // freshly-appended tail.
+        // Every disk write succeeded: add the freshly-appended tail.
         let inode_mut = self.tree.inodes.get_mut(&id).unwrap();
-        for (idx, r) in &updates {
-            inode_mut.chunks[*idx] = *r;
-        }
         inode_mut.chunks.extend_from_slice(&appended);
         // In hide-size mode, inode.size is padded chunk capacity (not
         // real size); cached_real_size carries the truth for in-memory
@@ -3880,8 +4125,6 @@ impl Vfs {
         // next spill_to_v3_on_disk re-encrypts its chunk-list chain
         // instead of reusing the existing on-disk blocks.
         self.chunks_dirty.insert(id);
-        // The inode no longer references the slots the rewrites retired.
-        self.pending_free.extend(retired);
         Ok(buf.len())
     }
 
@@ -3896,8 +4139,11 @@ impl Vfs {
             return Err(Error::FileSizeExceedsCap);
         }
         let old_real = self.real_size(id)?;
-        let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?.clone();
-        if inode.kind != InodeKind::File {
+        let (kind, cur_len) = {
+            let inode = self.tree.inodes.get(&id).ok_or(Error::NotFound)?;
+            (inode.kind, inode.chunks.len())
+        };
+        if kind != InodeKind::File {
             return Err(Error::NotAFile);
         }
         let hide_size = self.container.header.hide_size_header();
@@ -3906,100 +4152,109 @@ impl Vfs {
         let new_chunk_count = padded_chunk_count(needed, padding_on);
 
         let key = chunk::file_key(&self.container, id);
-        let mut chunks = inode.chunks.clone();
 
-        // Collect the ids of chunks being dropped, but do NOT return them
-        // to the free-list until every fallible write below has succeeded
-        // and the inode is committed (commit-last discipline, matching
-        // `write`). Freeing eagerly (as an earlier version did) meant a
-        // failure in the hide-size chunk-0 rewrite below would leave those
-        // ids in `free_chunks` while the still-uncommitted `inode.chunks`
-        // continued to reference them; a later allocation could then reuse
-        // an id an existing file still points at -- an AEAD-failing read,
-        // or a free/live collision that `validate_metadata_tree` rejects
-        // at the next open. Fail-safe either way, but the inconsistency is
-        // avoidable.
-        let mut freed_ids: Vec<ChunkId> = Vec::new();
-        while chunks.len() > new_chunk_count {
-            let cref = chunks.pop().unwrap();
-            freed_ids.push(cref.id);
+        // Same metadata-budget pre-flight as `write` for the truncate-up
+        // branch. A shrink frees slots (the free list never makes a save
+        // fail, see `flush`), but a file whose chunk list lives outside the
+        // region (more than the inline threshold) and is cut to at most
+        // the threshold moves its whole list INTO the region: refused up
+        // front when that does not fit, instead of every later save
+        // failing.
+        if cur_len < new_chunk_count {
+            self.check_metadata_budget_for_chunks(id, new_chunk_count - cur_len)?;
+        } else if self.format != MetadataFormat::V2
+            && cur_len > self.format.inline_chunk_threshold()
+            && new_chunk_count > 0
+            && new_chunk_count <= self.format.inline_chunk_threshold()
+        {
+            self.check_metadata_budget_for_count(id, new_chunk_count)?;
         }
 
-        // Same metadata-budget pre-flight as `write`. Only relevant
-        // for the truncate-up branch (shrinks never grow the chunk
-        // list).
-        if chunks.len() < new_chunk_count {
-            self.check_metadata_budget_for_chunks(id, new_chunk_count - chunks.len())?;
-        }
-
-        // R15-E2: POSIX requires [old_size, new_size) to read as zeros
-        // after an extension. Existing chunks in that range (the partly
-        // used last chunk, pow2 padding, or what an earlier shrink left
-        // in place) still hold discarded bytes; scrub them so truncated
-        // content can never resurface through `truncate` up.
-        // Slots retired by copy-on-write rewrites below; freed with
-        // `freed_ids`, once the inode is committed.
+        // Nothing is dropped from the inode, appended to it or freed until
+        // every fallible write below has succeeded (commit-last, matching
+        // `write`): freeing the dropped ids eagerly let a failure in the
+        // hide-size chunk-0 rewrite leave them in the free list while the
+        // inode still referenced them. Rewrites of chunks the inode keeps
+        // are recorded as each one lands (`record_rewrite`; see `write`
+        // for why a batch at the end corrupted chunks rewritten in place).
+        let mut appended: Vec<ChunkRef> = Vec::new();
         let mut retired: Vec<ChunkId> = Vec::new();
-        if new_size > old_real {
-            self.zero_fill_existing_range(
-                id,
-                &key,
-                &mut chunks,
-                old_real,
-                new_size,
-                hide_size,
-                &mut retired,
-            )?;
-        }
-
-        let zero = vec![0u8; CHUNK_PLAINTEXT_SIZE];
-        let grow_from = chunks.len();
-        while chunks.len() < new_chunk_count {
-            let slot = match self.alloc_slot(1) {
-                Ok(slot) => slot,
-                Err(e) => {
-                    // At the maximum size: hand back the slots this call
-                    // allocated so far (R15-E6).
-                    self.pending_free
-                        .extend(chunks[grow_from..].iter().map(|c| c.id));
-                    return Err(e);
-                }
-            };
-            let cref = ChunkRef {
-                id: slot,
-                generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
-            };
-            let chunk_idx = chunks.len() as u32;
-            if let Err(e) =
-                chunk::write_chunk(&mut self.container, &key, id, chunk_idx, cref, &zero)
-            {
-                // R15-E6: return the slots allocated by this call to the
-                // deferred free list instead of leaking them.
-                self.pending_free.push(cref.id);
-                self.pending_free
-                    .extend(chunks[grow_from..].iter().map(|c| c.id));
-                return Err(e);
+        let kept = cur_len.min(new_chunk_count);
+        self.uncommitted_slots = true;
+        let result = (|| -> Result<(), Error> {
+            // R15-E2: POSIX requires [old_size, new_size) to read as zeros
+            // after an extension. Existing chunks in that range (the partly
+            // used last chunk, pow2 padding, or what an earlier shrink left
+            // in place) still hold discarded bytes; scrub them so truncated
+            // content can never resurface through `truncate` up.
+            if new_size > old_real {
+                self.zero_fill_existing_range(
+                    id,
+                    &key,
+                    kept,
+                    old_real,
+                    new_size,
+                    hide_size,
+                    &mut retired,
+                )?;
             }
-            chunks.push(cref);
+
+            let zero = vec![0u8; CHUNK_PLAINTEXT_SIZE];
+            while kept + appended.len() < new_chunk_count {
+                let generation = self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?;
+                // At the maximum size this fails: the slots allocated so far
+                // are handed back below (R15-E6).
+                let slot = self.alloc_slot(1)?;
+                let cref = ChunkRef {
+                    id: slot,
+                    generation,
+                };
+                let chunk_idx = (kept + appended.len()) as u32;
+                appended.push(cref);
+                chunk::write_chunk(&mut self.container, &key, id, chunk_idx, cref, &zero)?;
+            }
+
+            // In hide-size mode, refresh the chunk-0 size header. Last
+            // fallible step, so the size it records never outlives a
+            // failure: a smaller size fits the chunks either way, a larger
+            // one only once the appended chunks are committed below.
+            if hide_size && new_chunk_count > 0 {
+                if kept > 0 {
+                    let cur0 = self.tree.inodes.get(&id).ok_or(Error::NotFound)?.chunks[0];
+                    let mut pt = chunk::read_chunk(&mut self.container, &key, id, 0, cur0)?;
+                    install_size_header(&mut pt, new_size);
+                    self.record_rewrite(&key, id, 0, cur0, &pt, &mut retired)?;
+                } else {
+                    // Chunk 0 was appended (as zeros) by this call: no
+                    // metadata refers to it, rewrite it in place.
+                    let mut pt = Zeroizing::new(vec![0u8; CHUNK_PLAINTEXT_SIZE]);
+                    install_size_header(&mut pt, new_size);
+                    appended[0] = self.rewrite_in_place(&key, id, 0, appended[0], &pt)?;
+                }
+            }
+            Ok(())
+        })();
+        self.uncommitted_slots = false;
+
+        // The inode no longer references the slots the rewrites retired.
+        self.pending_free.extend(retired);
+        if let Err(e) = result {
+            // R15-E6: return the slots allocated by this call to the
+            // deferred free list instead of leaking them.
+            self.pending_free.extend(appended.iter().map(|c| c.id));
+            return Err(e);
         }
 
-        // In hide-size mode, refresh the chunk-0 size header.
-        if hide_size && !chunks.is_empty() {
-            let mut pt = chunk::read_chunk(&mut self.container, &key, id, 0, chunks[0])?;
-            install_size_header(&mut pt, new_size);
-            let (new0, old) = self.rewrite_chunk(&key, id, 0, chunks[0], &pt)?;
-            retired.extend(old);
-            chunks[0] = new0;
-        }
-
-        let inode_size_field = if hide_size {
-            chunks.len() as u64 * CHUNK_PLAINTEXT_SIZE as u64
+        let inode_mut = self.tree.inodes.get_mut(&id).unwrap();
+        // The inode no longer references the dropped chunks: their ids go
+        // to the free list (after the next save, R15-E3).
+        let dropped: Vec<ChunkId> = inode_mut.chunks.drain(kept..).map(|c| c.id).collect();
+        inode_mut.chunks.extend_from_slice(&appended);
+        inode_mut.size = if hide_size {
+            inode_mut.chunks.len() as u64 * CHUNK_PLAINTEXT_SIZE as u64
         } else {
             new_size
         };
-        let inode_mut = self.tree.inodes.get_mut(&id).unwrap();
-        inode_mut.chunks = chunks;
-        inode_mut.size = inode_size_field;
         if hide_size {
             inode_mut.cached_real_size = Some(new_size);
         }
@@ -4008,13 +4263,7 @@ impl Vfs {
         self.dirty = true;
         // Layer 2: same reasoning as `write` -- chunks vec mutated.
         self.chunks_dirty.insert(id);
-        // All writes succeeded and the inode no longer references the
-        // dropped chunks: now it is safe to return their ids to the
-        // free-list (see the note at the shrink loop above).
-        for freed in freed_ids {
-            self.pending_free.push(freed);
-        }
-        self.pending_free.extend(retired);
+        self.pending_free.extend(dropped);
         Ok(())
     }
 
@@ -4145,7 +4394,16 @@ impl Vfs {
         }
         let data_offset = self.container.data_offset();
         let mut buf = vec![0u8; chunk::CHUNK_SLOT_SIZE as usize];
-        for id in 0..self.tree.next_chunk_id {
+        // Up to the end of the file, not just `next_chunk_id`: the slots
+        // past it are the free tail a save dropped from the list
+        // (`fit_free_list`) or a crash in `shrink` left, and hold deleted
+        // content as much as the free list does.
+        let file_slots = self
+            .container
+            .data_file_len()?
+            .saturating_sub(data_offset)
+            .div_ceil(chunk::CHUNK_SLOT_SIZE);
+        for id in 0..self.tree.next_chunk_id.max(file_slots) {
             if live.contains(&id) {
                 continue;
             }
@@ -4285,8 +4543,9 @@ impl Vfs {
     /// vault to `new_size` bytes (64 KiB..=64 MiB, in steps of 64 KiB):
     /// larger when it fills up, smaller to make every save cheaper.
     ///
-    /// A vault file is rewritten into `<vault>.rotating` with the new
-    /// layout (the encrypted chunks are copied unchanged, only the file
+    /// A vault file is rewritten into `<vault>.rotating` (a deniable
+    /// vault: a temporary file whose name derives from its key, see
+    /// `Container::begin_atomic_relayout`) with the new layout (the encrypted chunks are copied unchanged, only the file
     /// list is re-encrypted into the new region) and renamed over the
     /// original, like the master key rotation: a crash or an error before
     /// the rename leaves the original vault as it was. Needs free disk
@@ -4332,13 +4591,17 @@ impl Vfs {
             return Ok(());
         }
         self.flush()?;
-        // The file list must fit, with the same headroom new entries are
-        // refused at.
+        // A smaller region must hold the file list with the same headroom
+        // new entries are refused at, AND the free list at its largest
+        // (`metadata_budget_status`): a large file costs almost nothing in
+        // the region until it is deleted or rewritten, and checking only
+        // today's list accepted a region its own deletes overflowed (R16
+        // M1). A larger region is never refused: it only adds room.
         let used = self.metadata_budget_status().used_bytes;
         let needed = used
             .saturating_add(MUTATION_METADATA_BOUND)
             .saturating_add(BUDGET_SLACK);
-        if needed > luksbox_format::metadata::payload_budget_for(new_size) {
+        if new_size < old_size && needed > luksbox_format::metadata::payload_budget_for(new_size) {
             let needed_region = (needed as u64)
                 .saturating_add(luksbox_format::METADATA_OVERHEAD as u64 + 8)
                 .div_ceil(STEP)
@@ -4527,7 +4790,15 @@ impl Vfs {
             .values()
             .map(|inode| (inode.chunks.len() + inode.external_list_blocks.len()) as u64)
             .sum();
-        let free_slots = (self.tree.free_chunks.len() + self.pending_free.len()) as u64;
+        // Whole slots of the file past `next_chunk_id` are free too: the
+        // next new slots go there (a save that left the free tail out of
+        // the list, see `fit_free_list`, or a crash in the middle of
+        // `shrink`).
+        let past_end = file_size
+            .saturating_sub(chunk::slot_offset(fixed_size, self.tree.next_chunk_id)?)
+            / chunk::CHUNK_SLOT_SIZE;
+        let free_slots = ((self.tree.free_chunks.len() + self.pending_free.len()) as u64)
+            .saturating_add(past_end);
         let keep = chunk::slot_offset(fixed_size, self.first_unused_tail_slot())?;
         Ok(SpaceReport {
             file_size,
@@ -4616,31 +4887,59 @@ impl Vfs {
         Ok((new_ref, retired))
     }
 
-    /// R15-E2: zero the bytes of file range `[from, to)` that live in
-    /// chunks ALREADY present in `chunks` (new chunks are allocated
+    /// `rewrite_chunk` for chunk `idx` of file `id`, a chunk its inode
+    /// keeps, and record the new ref in the inode as soon as the write has
+    /// landed; the retired slot, if any, goes to `retired` (the inode no
+    /// longer refers to it). Recording right away is what keeps a chunk
+    /// rewritten in place readable: its slot now holds ciphertext under
+    /// the new generation only, so an inode left with the old one (a
+    /// failure later in the same call, or a save in the middle of it from
+    /// `alloc_slot`) would fail that chunk's AEAD check for good.
+    fn record_rewrite(
+        &mut self,
+        key: &luksbox_core::SubKey,
+        id: FileId,
+        idx: usize,
+        cur: ChunkRef,
+        pt: &[u8],
+        retired: &mut Vec<ChunkId>,
+    ) -> Result<(), Error> {
+        let (new_ref, old) = self.rewrite_chunk(key, id, idx as u32, cur, pt)?;
+        retired.extend(old);
+        let inode = self.tree.inodes.get_mut(&id).ok_or(Error::NotFound)?;
+        inode.chunks[idx] = new_ref;
+        self.dirty = true;
+        // Layer 2: the chunk list changed (a save must not reuse the
+        // external chain, which still holds the old ref).
+        self.chunks_dirty.insert(id);
+        Ok(())
+    }
+
+    /// R15-E2: zero the bytes of file range `[from, to)` that live in the
+    /// first `kept` chunks of file `id` (new chunks are allocated
     /// zero-filled by the caller). Rewritten chunks get a fresh
     /// generation (and, copy-on-write, usually a fresh slot: see
-    /// `rewrite_target`) and their refs are updated in place in
-    /// `chunks`; the slots they retire are added to `retired`, for the
-    /// caller to free once the inode is committed. Chunks whose share of
-    /// the range is already zero are left alone.
+    /// `rewrite_target`), recorded in the inode as each write lands
+    /// (`record_rewrite`); the slots they retire are added to `retired`,
+    /// for the caller to free. Chunks whose share of the range is already
+    /// zero are left alone.
     #[allow(clippy::too_many_arguments)]
     fn zero_fill_existing_range(
         &mut self,
         id: FileId,
         key: &luksbox_core::SubKey,
-        chunks: &mut [ChunkRef],
+        kept: usize,
         from: u64,
         to: u64,
         hide_size: bool,
         retired: &mut Vec<ChunkId>,
     ) -> Result<(), Error> {
-        if from >= to || chunks.is_empty() {
+        if from >= to || kept == 0 {
             return Ok(());
         }
         let (first, _) = file_to_chunk(from, hide_size)?;
         let (last, _) = file_to_chunk(to - 1, hide_size)?;
-        for idx in first..=last.min(chunks.len() - 1) {
+        for idx in first..=last.min(kept - 1) {
             let (cfs, cfe) = chunk_file_range(idx, hide_size)?;
             let zs = from.max(cfs).saturating_sub(cfs) as usize;
             let ze = to.min(cfe).saturating_sub(cfs) as usize;
@@ -4652,15 +4951,13 @@ impl Vfs {
             } else {
                 0
             };
-            let cur = chunks[idx];
+            let cur = self.tree.inodes.get(&id).ok_or(Error::NotFound)?.chunks[idx];
             let mut pt = chunk::read_chunk(&mut self.container, key, id, idx as u32, cur)?;
             if pt[ds + zs..ds + ze].iter().all(|&b| b == 0) {
                 continue;
             }
             pt[ds + zs..ds + ze].fill(0);
-            let (new_ref, old) = self.rewrite_chunk(key, id, idx as u32, cur, &pt)?;
-            retired.extend(old);
-            chunks[idx] = new_ref;
+            self.record_rewrite(key, id, idx, cur, &pt, retired)?;
         }
         Ok(())
     }
@@ -5614,6 +5911,14 @@ const CHUNK_REF_METADATA_BOUND: usize = 20;
 /// Margin for varint growth between a projection's placeholder values
 /// and the real ones written at flush time.
 const BUDGET_SLACK: usize = 4096;
+
+/// Stands for the chunk refs a budget projection counts before they exist
+/// (`Vfs::project_tree_len`): its varints are the shortest, the real ones'
+/// extra bytes are covered by `BUDGET_SLACK`.
+const BUDGET_PLACEHOLDER: ChunkRef = ChunkRef {
+    id: 0,
+    generation: 1,
+};
 
 /// R15-E7: `validate_name` plus a control-character ban, applied to
 /// every name that enters the tree through the API (`create`, `mkdir`,
@@ -7445,6 +7750,94 @@ mod tests {
             status.used_bytes,
             direct_in_memory_len
         );
+    }
+
+    /// The borrowed projection the budget checks and the status measure
+    /// (`TreeProjection`) must encode byte for byte like the tree a save
+    /// writes, free list aside, in both inode shapes.
+    #[test]
+    fn projection_encodes_like_the_saved_tree() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("proj.lbx");
+        let mut vfs = Vfs::open(create_container(&path)).unwrap();
+        let root = vfs.root_id();
+        let small = vfs.create(root, "small").unwrap();
+        vfs.write(small, 0, &vec![1u8; 3 * CHUNK_PLAINTEXT_SIZE])
+            .unwrap();
+        let big = vfs.create(root, "big").unwrap();
+        vfs.write(big, 0, &vec![2u8; 300 * CHUNK_PLAINTEXT_SIZE])
+            .unwrap();
+        let sub = vfs.mkdir(root, "sub dir").unwrap();
+        vfs.chmod(sub, 0o700).unwrap();
+        vfs.symlink(sub, "link", "hard").unwrap();
+        vfs.link(small, sub, "hard").unwrap();
+        vfs.unlink(root, "small").unwrap();
+        vfs.flush().unwrap();
+        assert!(!vfs.tree.free_chunks.is_empty() || vfs.tree.next_chunk_id > 0);
+        let placeholder = ChunkRef {
+            id: 0,
+            generation: 1,
+        };
+        let threshold = vfs.format.inline_chunk_threshold();
+        for v4 in [true, false] {
+            let projected = postcard::to_allocvec(&TreeProjection {
+                tree: &vfs.tree,
+                v4,
+                threshold,
+                target: None,
+                placeholder,
+            })
+            .unwrap();
+            let owned = if v4 {
+                let mut t = vfs.spill_to_v4_on_disk().unwrap();
+                t.free_chunks.clear();
+                postcard::to_allocvec(&t).unwrap()
+            } else {
+                let mut t = vfs.spill_to_v3_on_disk().unwrap();
+                t.free_chunks.clear();
+                postcard::to_allocvec(&t).unwrap()
+            };
+            assert_eq!(projected, owned, "v4 = {v4}");
+        }
+        // A projected count: the target's extra chunks as placeholders.
+        let hard = vfs.lookup_path("/sub dir/hard").unwrap();
+        let grown = postcard::experimental::serialized_size(&TreeProjection {
+            tree: &vfs.tree,
+            v4: true,
+            threshold,
+            target: Some((hard, 5)),
+            placeholder,
+        })
+        .unwrap();
+        let base = vfs.project_tree_len(None, placeholder).unwrap();
+        assert_eq!(grown, base + 2 * 2, "two placeholder refs of 2 bytes");
+    }
+
+    #[test]
+    fn free_list_length_matches_postcard() {
+        for v in [
+            0u64,
+            1,
+            127,
+            128,
+            16_383,
+            16_384,
+            1 << 21,
+            (1 << 28) + 5,
+            u64::MAX,
+        ] {
+            assert_eq!(
+                varint_len(v),
+                postcard::to_allocvec(&v).unwrap().len(),
+                "{v}"
+            );
+        }
+        let list: Vec<u64> = (0..300).chain([1 << 20, 1 << 40]).collect();
+        assert_eq!(
+            free_list_encoded_len(&list),
+            postcard::to_allocvec(&list).unwrap().len()
+        );
+        assert_eq!(free_list_encoded_len(&[]), 1);
     }
 
     #[test]

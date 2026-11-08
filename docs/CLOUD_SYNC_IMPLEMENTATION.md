@@ -114,7 +114,17 @@ R16-03); a session that cannot publish is a view that still shows this
 device's unpublished saved changes and reports them (R16-04); a failed
 publish is kept in the device state until one succeeds (R16-08); and
 `luksbox sync export --snapshot` exports any earlier complete version
-(R16-22). Still open from that round: a salvage mode for a lost or
+(R16-22). The macOS review of 2026-11-08 (same report, "Follow-up review
+on macOS") changed it again: a manifest below its device's checkpoint is
+collected history (never opened, merged or offered as a snapshot); the
+head a session opens must be, or descend from, the commit this device
+last opened or published (else a writable open refuses, a read-only one
+shows the older version with a warning), which closes the replay and
+withholding cases R16-03 opened; a merge needs its complete common
+ancestor, header object included (else the versions stay separate); a
+damaged object makes its commit incomplete instead of failing the open;
+objects are installed on exFAT too (no hard links); and a publish that
+failed after its manifest may be there finishes with the same bytes. Still open from that round: a salvage mode for a lost or
 damaged page every commit inherits, automatic collection before the
 manifest cap, a `--no-lease` opt-out, the `pins/` folder below (a
 device whose base was collected cannot rebuild its unpublished
@@ -529,6 +539,11 @@ For an ordinary vault it reveals what `recent.json` already does.
      a banner.
    - Pending heads only (objects still arriving): open the newest
      complete one and say what is pending.
+   - As built (2026-11-08): whatever is opened must be, or descend from,
+     the commit this device last opened or published (I5); when no
+     complete commit does, a writable open refuses (`NewestIncomplete`)
+     and a read-only one shows the older version with a warning. Two
+     heads merge only over a complete common ancestor.
 8. **Record what was seen.** After opening, write the new `seen` to
    local state (atomically) before any write is accepted.
 
@@ -706,7 +721,11 @@ For an ordinary vault it reveals what `recent.json` already does.
 
 `luksbox merge ours.lbx theirs.lbx -o merged.lbx` without `--base` is a
 union: each path present on one side is kept, and each path present on
-both with different content gets a conflict copy. It is phase 1 of the
+both with different content gets a conflict copy. The result starts as
+THEIRS, header included (keyslots, master key, KDF settings), so the
+inputs must be one vault under one master key and THEIRS' keyslot table
+must not be older than OURS' (else a revoked keyslot comes back); a
+conflict copy goes first, the vault second. It is phase 1 of the
 design and exercises the engine on real conflict copies before bundles
 exist.
 
@@ -825,7 +844,7 @@ Each invariant has a mechanism and a test that must fail if it breaks.
 | I2 | Every encryption key is used for exactly one object. | per-object HKDF from a 256-bit `oid` drawn inside `codec::seal_new`, the only sealing entry point; no store can overwrite an object, so a lease refresh is a new object (as built: no seal registry) | `fresh_ids_for_identical_plaintexts`, `never_overwrites_and_foreign_entries`, `a_heartbeat_replaces_the_lease_with_a_new_object` |
 | I3 | An object moved to another kind, position, bundle or version fails. | associated data plus table hashes | cut-and-paste tests for every pair of kinds and positions |
 | I4 | The opened state is exactly one verified manifest's image. | Merkle chain manifest -> tables -> pages, plus inner integrity | simulation: random partial, mixed and reordered objects never open as a mix |
-| I5 | No device opens a state older than one it has seen, for any device. | local state and witness checks (5.2.4) | simulation rollback, freeze and delete faults, 100% detected |
+| I5 | No device opens a state older than one it has seen, for any device. | local state and witness checks (5.2.4); the opened head must contain the device's anchor; collected history is never opened | simulation rollback, freeze and delete faults, 100% detected; `provider_tampering` (replayed collected commit, deleted middle manifest, withheld head object) |
 | I6 | Hiding one device's commits from another is detected once any manifest that saw them is visible. | `seen` checks (5.2.5) | simulation fork and withholding faults |
 | I7 | Nothing is overwritten, followed through a link, or opened outside the bundle. | `bundle_dir` (section 4) | hostile-folder suite: symlinks, junctions, FIFOs, hard links, renames during reads |
 | I8 | No object reachable from a root is deleted. | two-phase GC with grace (section 8) | model check plus simulation with offline devices |

@@ -156,6 +156,12 @@ for archive in "$PREFIX"/lib/*.a /usr/lib/libcrypto.a /usr/lib/libz.a; do
     group="$group -C link-arg=$archive"
 done
 group="$group -C link-arg=-Wl,--end-group"
+# RUSTFLAGS replaces the per-target rustflags of .cargo/config.toml,
+# including the cfgs that let the AES / POLYVAL crates use the ARMv8
+# instructions: without them an arm64 build runs AES in software.
+case "$TARGET" in
+    aarch64-*) group="$group --cfg aes_armv8 --cfg polyval_armv8" ;;
+esac
 RUSTFLAGS="-C target-feature=+crt-static $group" cargo build --locked \
     --profile release-hardened -p luksbox-cli \
     --no-default-features --features hardware,fuse --target "$TARGET"

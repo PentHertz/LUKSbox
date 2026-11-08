@@ -261,6 +261,32 @@ cargo build --release -p luksbox-gui
 If `cargo build` complains it can't find `fido.h`, your
 `PKG_CONFIG_PATH` isn't set, re-export it.
 
+The flavour release builds ship, with FUSE-T and the Secure Enclave
+(the Secure Enclave backend needs `swiftc`, from the Xcode Command Line
+Tools; without it the build silently falls back to a stub that refuses
+Secure Enclave keyslots at run time):
+
+```bash
+cargo build --release -p luksbox-cli -p luksbox-gui --no-default-features \
+  --features luksbox-cli/hardware,luksbox-cli/fuse-t,luksbox-gui/hardware,luksbox-gui/fuse-t
+```
+
+- **FUSE-T library path.** `libfuse-t.dylib` is installed as
+  `@rpath/libfuse-t.dylib`; the CLI and GUI build scripts add FUSE-T's
+  library folder (from `FUSE_T_LIB_DIR`, `PKG_CONFIG_PATH`,
+  `/usr/local/lib` or `/opt/homebrew/lib`) to the binaries' rpath, so a
+  local build runs as is. Before 0.7.0-rc.1 it aborted with "Library not
+  loaded: @rpath/libfuse-t.dylib" unless `DYLD_FALLBACK_LIBRARY_PATH`
+  was set. Test binaries of other crates linking FUSE-T still need
+  `DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib` (as in CI). Release
+  bundles rewrite the reference with dylibbundler.
+- **Hardware AES on Apple Silicon.** `.cargo/config.toml` builds the
+  `aes` / `polyval` crates with `--cfg aes_armv8 --cfg polyval_armv8`
+  for `aarch64-apple-darwin` (and Linux aarch64), without which they
+  run in software: about 2.7x slower for the default cipher. A
+  `RUSTFLAGS` environment variable replaces those per-target flags;
+  if you set one, add the two cfgs to it.
+
 ### Universal binary (Intel + Apple Silicon in one)
 
 ```bash

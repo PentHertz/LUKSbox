@@ -20,6 +20,30 @@ use sha2::{Digest, Sha256};
 /// automatic anchor.
 pub const NO_AUTO_ANCHOR_ENV: &str = "LUKSBOX_NO_AUTO_ANCHOR";
 
+/// A file name (or path) as it may be shown to the user: control
+/// characters (newline, carriage return, ESC, ...) replaced, so a name
+/// someone else put in the synced folder cannot rewrite or hide lines
+/// of a message.
+pub fn printable(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
+        .collect()
+}
+
+/// The command that merges a conflict copy into the vault kept at
+/// `vault`: the copy first, the vault second. The result keeps the
+/// second file's keyslots, so the copy (which anyone who can write to
+/// the synced folder can put there) never brings its keyslot table
+/// with it; `luksbox merge` refuses when the copy's keyslots are the
+/// newer ones and says to swap.
+pub fn merge_command(copy: &Path, vault: &Path) -> String {
+    format!(
+        "luksbox merge \"{}\" \"{}\" -o merged.lbx",
+        printable(&copy.display().to_string()),
+        printable(&vault.display().to_string())
+    )
+}
+
 /// The sync service a path appears to live under, if any.
 pub fn cloud_service(path: &Path) -> Option<&'static str> {
     let abs = std::path::absolute(path).ok()?;
@@ -209,16 +233,28 @@ pub fn attach_auto_anchor(
                 "ROLLBACK DETECTED: this device has already seen keyslot table generation \
                  {anchor_header_gen} of this vault, but the file in the {service} folder has \
                  generation {header_gen} (older). An older keyslot table can bring back a \
-                 revoked passphrase or key. {} Refusing to open. To accept this copy as it is, \
-                 delete {} (or set {NO_AUTO_ANCHOR_ENV}=1).",
+                 revoked passphrase or key. {} Refusing to open. Accept this copy as it is \
+                 only if you put it back yourself and no passphrase or key was revoked since: \
+                 then delete {} (or set {NO_AUTO_ANCHOR_ENV}=1).",
                 restore_hint(&vault, service),
                 path.display()
             )),
+            // F1: never advise accepting this as the normal way out. The
+            // file is not under the master key this device last saw:
+            // either the key was rotated on another device, or this is
+            // a copy from BEFORE a rotation, readable (and openable) by
+            // every passphrase or key removed since.
             Err(e) => Err(format!(
-                "this device's rollback anchor for this vault ({}) does not verify ({e}). \
-                 Either the master key was rotated on another device (then delete that file \
-                 and open again), or the {service} folder holds a copy from before such a \
-                 rotation. To open without it, set {NO_AUTO_ANCHOR_ENV}=1.",
+                "this device's rollback anchor for this vault ({}) does not verify ({e}): the \
+                 file in the {service} folder is not under the master key this device last \
+                 saw. Refusing to open. If the master key was rotated on THIS device, this \
+                 file is an older copy from before the rotation: every passphrase or key \
+                 removed since can open and read it, so do not accept it; get the newer \
+                 version back instead (the {service} version history, or a copy next to the \
+                 vault). Only if the master key was rotated on another device and its sync \
+                 has finished: delete {} and open again. ({NO_AUTO_ANCHOR_ENV}=1 opens without \
+                 the anchor.)",
+                path.display(),
                 path.display()
             )),
         };
@@ -257,7 +293,7 @@ fn restore_hint(vault: &Path, service: &str) -> String {
         "Either {service} kept an older copy after a sync conflict, or restored an old \
          version, or someone put an old copy back."
     );
-    if !copies.is_empty() {
+    if let Some(first) = copies.first() {
         s.push_str(" Copies next to the vault that may hold the newer changes: ");
         s.push_str(
             &copies
@@ -265,15 +301,66 @@ fn restore_hint(vault: &Path, service: &str) -> String {
                 .map(|p| {
                     format!(
                         "\"{}\"",
-                        p.file_name().unwrap_or_default().to_string_lossy()
+                        printable(&p.file_name().unwrap_or_default().to_string_lossy())
                     )
                 })
                 .collect::<Vec<_>>()
                 .join(", "),
         );
-        s.push_str("; merge them with `luksbox merge`.");
+        s.push_str(&format!(
+            "; merge one in with `{}`, check the result, then put it in place of the vault.",
+            merge_command(first, vault)
+        ));
     }
     s
+}
+
+/// What this device's automatic anchor for a vault recorded.
+#[derive(Debug, Clone)]
+pub struct SeenAnchor {
+    pub path: PathBuf,
+    /// The newest metadata generation this device saw.
+    pub metadata_generation: u64,
+    /// The newest keyslot-table generation this device saw (header v3).
+    pub header_generation: Option<u64>,
+}
+
+/// This device's automatic anchor for the vault file at `vault`, read
+/// and verified under `cont`'s key, without creating or moving
+/// anything: for commands that only read a copy of a vault (`luksbox
+/// merge`, `luksbox sync convert`), which must compare it with what
+/// this device saw but never record a copy as "seen". `cont` is an
+/// unlocked copy of that vault (same header salt and master key);
+/// `None` when this device keeps no anchor for that path (or the
+/// opt-out is set).
+pub fn peek_auto_anchor(
+    cont: &Container,
+    vault: &Path,
+    anchors_dir: &Path,
+) -> Result<Option<SeenAnchor>, String> {
+    if cont.is_deniable() || cont.is_external() || env_opt_out() {
+        return Ok(None);
+    }
+    let path = auto_anchor_file(anchors_dir, vault, cont.header_salt());
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Ok(None);
+    }
+    let a = luksbox_format::anchor::read_and_verify(&path, &cont.mvk_clone(), cont.header_salt())
+        .map_err(|e| {
+        format!(
+            "this device's rollback anchor for {} ({}) does not verify ({e}): that file is \
+                 not under the master key this device last saw for it. A copy from before a \
+                 master-key rotation can be opened and read by every passphrase or key removed \
+                 since; refusing to use it",
+            printable(&vault.display().to_string()),
+            path.display()
+        )
+    })?;
+    Ok(Some(SeenAnchor {
+        path,
+        metadata_generation: a.generation,
+        header_generation: a.header_generation,
+    }))
 }
 
 /// Whether the vault's anchor is an automatic one (kept in `anchors_dir`).
@@ -305,8 +392,8 @@ pub fn settle_auto_anchor(vfs: &mut Vfs, anchors_dir: &Path) -> Result<(), Strin
         return Err(format!(
             "ROLLBACK DETECTED: this device has already seen generation {seen} of this vault, \
              but the file in the {service} folder is at generation {now} (older). {} Refusing \
-             to open. To accept this copy as it is, delete {anchor} (or set \
-             {NO_AUTO_ANCHOR_ENV}=1).",
+             to open. To accept this older copy as it is (what was saved since is lost), \
+             delete {anchor} (or set {NO_AUTO_ANCHOR_ENV}=1).",
             restore_hint(&vault, service)
         ));
     }
@@ -345,6 +432,20 @@ mod tests {
             Some("OneDrive")
         );
         assert_eq!(cloud_service(Path::new("/home/a/documents/v.lbx")), None);
+    }
+
+    #[test]
+    fn names_are_shown_without_control_characters() {
+        assert_eq!(printable("a\nb\x1b[2Jc"), "a\u{FFFD}b\u{FFFD}[2Jc");
+        // The copy comes first, the vault second.
+        let cmd = merge_command(
+            Path::new("d/v (conflicted copy\r).lbx"),
+            Path::new("d/v.lbx"),
+        );
+        assert_eq!(
+            cmd,
+            "luksbox merge \"d/v (conflicted copy\u{FFFD}).lbx\" \"d/v.lbx\" -o merged.lbx"
+        );
     }
 
     #[test]

@@ -150,9 +150,12 @@ fn r16_03_an_incomplete_head_is_skipped_so_the_bundle_stays_writable() {
     commit(&mut sa, &mut va);
     drop((va, sa, vb, sb));
 
-    // Which head would every device pick first? Look without merging.
+    // Which head would every device pick first? Look without merging,
+    // from a probe device: a device that has seen that head never goes
+    // back to an older or concurrent state without it (checked below).
+    let local_probe = MemLocal::default();
     let local_c = MemLocal::default();
-    let (sc, vc, r) = open_as(&store, &local_c, true).unwrap();
+    let (sc, vc, r) = open_as(&store, &local_probe, true).unwrap();
     assert_eq!(r.other_heads, 1, "{:?}", r.notices);
     let first = sc.head().clone();
     let other = sc
@@ -174,7 +177,24 @@ fn r16_03_an_incomplete_head_is_skipped_so_the_bundle_stays_writable() {
         .expect("the table block exists");
     assert!(store.with(|m| m.remove(Area::Table, &doomed).unwrap()));
 
-    // Before R16-03: read-only, head = the convert commit, forever.
+    // The probe saw `first`: it refuses to open writable without it
+    // (opening `other` would show a vault without what it saw), and a
+    // read-only look says it is older than what it saw.
+    assert!(matches!(
+        open_as(&store, &local_probe, false),
+        Err(SyncError::NewestIncomplete { .. })
+    ));
+    {
+        let (_s, _v, r) = open_as(&store, &local_probe, true).unwrap();
+        assert!(
+            r.notices.contains(&Notice::OlderThanSeen),
+            "{:?}",
+            r.notices
+        );
+    }
+
+    // Before R16-03: read-only, head = the convert commit, forever. A
+    // device that never saw `first` complete opens `other`, writable.
     let (mut sc, mut vc, r) = open_as(&store, &local_c, false).unwrap();
     assert!(r.writable, "a complete head exists: {:?}", r.notices);
     assert_eq!(sc.head().hash, other, "the first complete head is used");

@@ -37,7 +37,10 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use crate::bundle::{Session, complete, header_candidates, load_manifests, now_ns, stamp, vfs_err};
+use crate::bundle::{
+    Present, Session, common_ancestor, complete, complete_in, first_parent_chain,
+    header_candidates, load_manifests, now_ns, stamp, vfs_err,
+};
 use crate::error::{Result, SyncError};
 use crate::graph::{Graph, writable};
 use crate::keys::BundleKeys;
@@ -363,13 +366,14 @@ impl Session {
     fn reachable(
         &self,
         v: &Verified,
+        present: &mut Present,
         out: &mut HashSet<Obj>,
         tables_done: &mut HashSet<[u8; 32]>,
     ) -> Result<()> {
         out.insert((area_tag(Area::Manifest), v.oid.0));
-        let blocks = complete(&self.store, &self.keys, v)?.ok_or(SyncError::Unsupported(
-            "a kept commit is incomplete; collect later",
-        ))?;
+        let blocks = complete_in(&self.store, &self.keys, present, v)?.ok_or(
+            SyncError::Unsupported("a kept commit is incomplete; collect later"),
+        )?;
         for (r, block) in v.m.tables.iter().zip(blocks) {
             out.insert((area_tag(Area::Table), r.oid));
             if !tables_done.insert(r.oid) {
@@ -425,6 +429,7 @@ impl Session {
         // Leases pin their base (and the commit before it another device
         // made) for PIN_NS; older ones are removed below.
         let mut expired_leases: Vec<Name> = Vec::new();
+        let mut pinned: Vec<[u8; 32]> = Vec::new();
         {
             let mut s = self.store.lock().expect("store lock");
             let leases = s.list(Area::Lease)?;
@@ -443,13 +448,44 @@ impl Session {
                 {
                     if l.pins(now) {
                         roots.insert(l.base.hash);
+                        pinned.push(l.base.hash);
                         if let Some(p) = l.pin {
                             roots.insert(p.hash);
+                            pinned.push(p.hash);
                         }
                     } else {
                         expired_leases.push(*n);
                     }
                 }
+            }
+        }
+        // One listing of the bundle for every root, not one each.
+        let mut present = Present::load(&self.store)?;
+        // A device working on what a lease pins will merge it with this
+        // head over the newest commit on both first-parent chains
+        // (`bundle::common_ancestor`). When the pinned commit came in
+        // through a merge's second parent, that base is older than it:
+        // keep it (and its objects) and the manifests linking it to both,
+        // or the merge would have no base and wait for good (a merge is
+        // never made without one).
+        let mut links: HashSet<[u8; 32]> = HashSet::new();
+        for p in &pinned {
+            if !graph.all.contains_key(p) {
+                continue;
+            }
+            let Some(base) = common_ancestor(&graph, &self.head.hash, p) else {
+                continue;
+            };
+            for side in [self.head.hash, *p] {
+                for h in first_parent_chain(&graph, &side) {
+                    links.insert(h);
+                    if h == base {
+                        break;
+                    }
+                }
+            }
+            if present.check(&self.store, &self.keys, &graph.all[&base])? {
+                roots.insert(base);
             }
         }
         report.roots = roots.len();
@@ -459,7 +495,7 @@ impl Session {
         let mut header_names: HashSet<String> = HashSet::new();
         for h in &roots {
             let Some(v) = graph.all.get(h) else { continue };
-            self.reachable(v, &mut keep, &mut tables_done)?;
+            self.reachable(v, &mut present, &mut keep, &mut tables_done)?;
             if let Some(n) = &v.m.header.name {
                 header_names.insert(n.clone());
             }
@@ -493,6 +529,9 @@ impl Session {
             if v.m.seq >= floor || plan_pending {
                 keep.insert((area_tag(Area::Manifest), v.oid.0));
             }
+        }
+        for h in &links {
+            keep.insert((area_tag(Area::Manifest), graph.all[h].oid.0));
         }
 
         // Everything present that no root reaches.

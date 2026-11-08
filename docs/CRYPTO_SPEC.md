@@ -337,6 +337,20 @@ What fills the region:
   to external chunk-list blocks in the data area and carry only
   a small `(head_ref, count)` stub in the inode.
 
+- **Free list**: one varint per free data slot (the slots of deleted
+  or truncated files and of copy-on-write overwrites, reused before the
+  file grows). A file over the spill threshold costs almost nothing in
+  the region until it is deleted, when all its slots join the list. A
+  save never fails on it: when the encoded tree does not fit, the free
+  slots at or past the end of the data in use are left out (the saved
+  `next_chunk_id` lowered, as `shrink` does), then only the
+  lowest-numbered slots that fit are kept; the slots left out stay free
+  for the session and are found again at the next open (a bounded scan
+  for slots below `next_chunk_id` that nothing references or lists).
+  New entries are refused on the tree alone (the percentages below),
+  never on the free list; a region resize must leave room for the list
+  at its largest (`docs/VAULT_SIZE.md`).
+
 In practice the metadata region holds order ~500k typical-shape
 files before approaching the 64 MiB cap. Pathological inputs
 (extremely long filenames, deeply nested directories with huge
@@ -1660,7 +1674,8 @@ which generates a new MVK, re-wraps it under all surviving slots, and
 re-encrypts every file chunk under the new MVK-derived per-file key.
 Since Round 15 it also overwrites every chunk slot that no file
 references any more (free list, slots freed in the session, ids leaked
-by failed writes) with random bytes, so content deleted or truncated
+by failed writes, slots past the end of the saved data area up to the
+end of the file) with random bytes, so content deleted or truncated
 before the rotation is not left decryptable under the old MVK
 (R15-C3). That operation is O(vault size).
 
@@ -1668,7 +1683,14 @@ Crash safety: with an inline header the whole rotation happens in a
 `<vault>.lbx.rotating` copy that is renamed over the vault only at
 commit, the vault stays exclusively locked for the whole window, and an
 abort restores the in-memory header and MVK so nothing never-committed
-can be written back (R15-C1/C2). With a **detached** header there is no
+can be written back (R15-C1/C2). The copy is made next to the vault file
+itself and renamed over it: for a vault opened through a symbolic link,
+over the file the link points to (renaming over the link left that file
+under the old MVK). The vault's `.meta-bak` / `.header-bak` mirrors are
+removed durably before the rename, so no old-key mirror can outlive it.
+A deniable vault's copy is not `.rotating` but a hidden
+`.<16 hex>.tmp` keyed by the vault (an HMAC of the file name under an
+MVK-derived key), removed at the next unlock if a crash left it. With a **detached** header there is no
 such copy: chunks are re-keyed in place and a crash mid-way leaves data
 under a new MVK that was never persisted. A backup of the header alone
 cannot recover that (it only restores the OLD MVK's keyslots); back up
@@ -2665,6 +2687,21 @@ the header generation (16 hex, a hint only), `rnd` 16 random bytes.
 Names are matched exactly; anything else is foreign: counted, never
 parsed, never deleted.
 
+An object is written to a `.tmp-<rnd>` file and installed under its
+name without ever replacing an entry: an exclusive rename
+(`renameatx_np(RENAME_EXCL)` on Apple platforms, `renameat2(RENAME_NOREPLACE)`
+on Linux), else `linkat` plus `unlinkat` of the temporary name, else (no
+hard links either: exFAT) an exclusive create of an empty placeholder
+under the name followed by `renameat` of the complete file over it (an
+empty placeholder can never be an object, so one a crash left is
+reused). A reader refuses anything but a regular file with one link and
+the exact size. A writable open removes `.tmp-` files that still have a
+second link, or are older than an hour. Folder handles kept open for a
+session are checked against the names before use: a moved area folder
+is refused, a moved or re-made shard folder opened again. On Apple
+platforms each object gets `F_BARRIERFSYNC` and each folder sync one
+`F_FULLFSYNC` (pages, then the manifest, as in 22.9).
+
 ### 22.2 Image
 
 The image is the container in the detached-header layout (metadata
@@ -2760,23 +2797,38 @@ folder on the way to these is created 0700 (R16-09).
 1. Header objects (one bundle id only, at most 1024: R16-05) are tried
    newest generation first; the first the credential opens gives the
    MVK and keys.
-2. Every manifest is verified. A manifest is usable if its device's
-   sequence numbers are contiguous up to it (from the checkpoint) and
-   every parent is usable (or below the parent device's checkpoint).
-   Two manifests with one `(device, seq)` are an equivocation: both
-   kept, reported; the device involved takes a new identity.
+2. Every manifest is verified. A manifest below its device's
+   checkpoint is *collected* history (garbage collection deleted it, or
+   will, or the provider put it back from its version history): never
+   usable, never a head, never offered as a snapshot. A manifest is
+   usable if its device's sequence numbers are contiguous up to it (from
+   the checkpoint) and every parent is usable (or below the parent
+   device's checkpoint). Two manifests with one `(device, seq)` are an
+   equivocation: both kept, reported; the device involved takes a new
+   identity. The graph is built in one topological pass.
 3. Against the device state: every recorded `(device, seq, hash)` at
-   or above the checkpoint must be present with that hash
+   or above the checkpoint must be present with that hash and usable
    (`RollbackDetected`, `Equivocation`); this device's own newest
    commit must be one it wrote (`IdentityConflict` → new identity).
    Every `parents` / `seen` entry of every verified manifest, usable or
    not, must be present; a missing one makes the session read-only
    (`Missing`).
 4. Heads (usable, nobody's parent) are ordered by `(lamport, hash)`.
-   The first complete one (all table blocks verify, all pages
-   present) is the head; incomplete heads before it are reported as
-   pending and skipped (R16-03). Only when no head is complete does
-   the newest complete ancestor of the first open, read-only.
+   A commit is complete when all its table blocks verify, its pages and
+   its header object are present (a damaged object makes it incomplete,
+   never fails the open). The deterministic head is the first complete
+   one (incomplete heads before it are reported as pending and skipped,
+   R16-03), or, when its header is older than the newest this device
+   saw, the complete head with the newest header. It must be, or
+   descend from, the *anchor* (the commit this device last opened or
+   published; design invariant I5): otherwise a complete head that does
+   is opened instead, unless it merges into the deterministic one over a
+   complete common ancestor (the normal fork). When nothing complete
+   descends from the anchor, the newest complete commit of its line is
+   opened read-only if there is one (newer objects still arriving);
+   otherwise a writable open fails (`NewestIncomplete`) and a read-only
+   one (inspection, export) shows the older version with a warning
+   (`OlderThanSeen`).
 5. The head's header must open with the same credential
    (`CredentialRevoked` otherwise); its generation must be at least
    the highest seen.
@@ -2785,7 +2837,10 @@ folder on the way to these is created 0700 (R16-09).
    staged changes made on an older commit are merged onto the head
    (22.10) and published by a writable session.
 7. Other complete heads are merged into the head, one merge commit
-   each (22.10).
+   each (22.10), the graph read again for each. A head that a later
+   garbage-collection commit covers (its newest commits stay as roots
+   while the commits that merged them are collected) is an ancestor,
+   not a head to merge.
 
 A device that has just converted a vault it holds unlocked opens the
 new bundle with that vault's MVK instead of a credential
@@ -2811,7 +2866,10 @@ seen of the other devices); validate it as a reader would (R16-07; `seen` lists 
 most recently active devices); write `manifest-pending` and record it
 in `state`; upload the manifest; finalize `state`. A crash after the
 record re-uploads the same manifest bytes at the next open, so a
-device never writes two commits with one sequence number. If another
+device never writes two commits with one sequence number; a publish that
+failed after its manifest may be in the folder (a failed folder sync)
+keeps that upload in progress, and the next publish writes the same
+bytes again before sealing anything new. If another
 device published meanwhile, the commit is published anyway as a
 second branch; the next open or `finish` merges.
 
@@ -2824,7 +2882,16 @@ inode id when they exist in the base, by path otherwise. The base is
 the newest commit (by `(lamport, hash)`) on **both first-parent
 chains**: inode ids are preserved exactly along first parents (a
 merge writes into its first parent and gives copied-in files new
-ids), so only such a base matches files by id safely. The target is
+ids), so only such a base matches files by id safely. The chains are
+followed by hash through what is present, collected history included
+(each link is authenticated by the child), so a replayed old manifest is
+reached only if it is that ancestor. The base must be complete, header
+object included: without it a merge would bring back what one side
+deleted (both sides' files kept) and could only choose a keyslot table
+by generation, which can undo a removal. Two heads without a complete
+base are not merged (`MergeBaseMissing`: each device goes on with its
+own branch until the base arrives), and changes saved here on an older
+commit wait, read-only, until their base is there. The target is
 always the head every device would pick, so two devices merging the
 same branches produce the same tree. Rules: one-sided changes apply;
 same content on both sides is one file; different content keeps the
@@ -2865,7 +2932,9 @@ garbage collection removes older leases.
 Garbage collection (explicit, one head, nothing missing) keeps as
 roots every device's newest commit, every commit younger than
 the retention or among the last `keep_last`, and every commit a lease
-pins (`base` and `pin`).
+pins (`base` and `pin`), with the merge base of each pinned commit and
+the commits linking it to that base, so a device that was offline still
+merges over a complete ancestor.
 Unreachable pages, table blocks, header and hybrid objects, and
 manifests below the new checkpoints are recorded in a `Gc` commit (at
 most 24 000 objects); a later pass, once the plan is at least the

@@ -43,11 +43,11 @@ use crate::daemon::{assert_single_threaded_for_fork, detach_from_terminal};
 /// to `luksbox mount`. The interval constant lives in the crate root
 /// (`crate::LAZY_FLUSH_INTERVAL_SECS`) and is shared with the FUSE-T
 /// and WinFsp adapters, which run the same timer thread. One known
-/// divergence: the FUSE-T adapter's `flush()` callback (close(2))
-/// stays eager regardless of `--sync` -- FUSE-T bridges the macOS
-/// NFS client, whose COMMIT expects data to be stable when it
-/// returns -- so write+close workloads on FUSE-T see only part of
-/// the Layer-1 win.
+/// divergence: FUSE-T bridges the macOS NFS client, which sends a
+/// COMMIT (an `fsync`) at every close(2); without `--sync` the FUSE-T
+/// adapter coalesces those into at most one save per
+/// `fuse_t::FSYNC_COALESCE`, so an `fsync` there is durable within that
+/// delay rather than on return.
 pub fn mount(vfs: Vfs, mountpoint: &Path, daemonize: bool, sync_mode: bool) -> std::io::Result<()> {
     // AutoUnmount intentionally NOT used: on Linux it implies allow_other,
     // which kernel rejects for non-root unless /etc/fuse.conf has
@@ -91,80 +91,16 @@ pub fn mount(vfs: Vfs, mountpoint: &Path, daemonize: bool, sync_mode: bool) -> s
         // R12-08: re-verify the mountpoint inode immediately before the
         // mount syscall to catch a swap in the window since the probe.
         crate::mountpoint::reverify_mountpoint(mountpoint, probe_inode)?;
-        let _busy = MountBusy::hold(mountpoint);
-        // `mount2` does Session::new + run() in one call. Blocks until
-        // the FS is unmounted (kernel signals EOF on /dev/fuse fd).
-        let r = fuser::mount2(fs, mountpoint, &config);
-        set_served_mountpoint(None);
+        // Held until this mount returns, after the final save
+        // (crate::busy): `luksbox umount` waits for it.
+        let busy = crate::busy::MountBusy::hold(mountpoint, probe_inode);
+        let r = busy.and_then(|_busy| {
+            // `mount2` does Session::new + run() in one call. Blocks until
+            // the FS is unmounted (kernel signals EOF on /dev/fuse fd).
+            fuser::mount2(fs, mountpoint, &config)
+        });
+        stop_serving(mountpoint);
         r
-    }
-}
-
-/// While a mount serves a vault, a shared `flock` on the directory it
-/// is mounted on (opened before the mount covers it). The mount holds it
-/// until its process ends, after the final save at unmount; `unmount`
-/// takes it exclusively once the kernel has let go of the mountpoint,
-/// so it returns only when the vault is saved and released. Before,
-/// `luksbox umount mnt && luksbox ls vault.lbx /` failed with "vault
-/// locked by another process", and a computer switched off right after
-/// `umount` could lose the last 30 s of changes. Nothing is written to
-/// disk; on a file system without `flock` this is skipped.
-struct MountBusy {
-    /// Held only for its lock, released when dropped.
-    _locked: Option<std::fs::File>,
-}
-
-impl MountBusy {
-    fn hold(mountpoint: &Path) -> Self {
-        use std::os::fd::AsRawFd;
-        let Ok(dir) = std::fs::File::open(mountpoint) else {
-            return Self { _locked: None };
-        };
-        // SAFETY: a valid fd we own.
-        if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
-            return Self { _locked: None };
-        }
-        Self { _locked: Some(dir) }
-    }
-}
-
-/// How long `unmount` waits for the mount to save and release the vault.
-const UNMOUNT_SAVE_WAIT: Duration = Duration::from_secs(120);
-
-/// After the kernel unmount: wait until the mount process has saved and
-/// released the vault (it holds `MountBusy` until it exits).
-fn wait_for_mount_to_finish(mountpoint: &Path) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    let Ok(dir) = std::fs::File::open(mountpoint) else {
-        return Ok(());
-    };
-    let start = std::time::Instant::now();
-    let mut said = false;
-    loop {
-        // SAFETY: a valid fd we own.
-        if unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            // Released at once: we only wanted to know it was free.
-            // SAFETY: as above.
-            unsafe { libc::flock(dir.as_raw_fd(), libc::LOCK_UN) };
-            return Ok(());
-        }
-        let e = std::io::Error::last_os_error();
-        if e.raw_os_error() != Some(libc::EWOULDBLOCK) {
-            // No flock here (ENOLCK, ...): nothing to wait on.
-            return Ok(());
-        }
-        if start.elapsed() >= UNMOUNT_SAVE_WAIT {
-            return Err(std::io::Error::other(format!(
-                "unmounted, but the vault was still being saved after {} s; wait before \
-                 opening it or switching the computer off",
-                UNMOUNT_SAVE_WAIT.as_secs()
-            )));
-        }
-        if !said && start.elapsed() >= Duration::from_secs(1) {
-            eprintln!("waiting for the vault to be saved...");
-            said = true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
@@ -211,7 +147,13 @@ fn run_daemonized(
                 std::process::exit(1);
             }
             // Released when this process exits, after the final save.
-            let _busy = MountBusy::hold(mountpoint);
+            let _busy = match crate::busy::MountBusy::hold(mountpoint, probe_inode) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("luksbox: {e}");
+                    std::process::exit(1);
+                }
+            };
             let res = fuser::mount2(fs, mountpoint, &config);
             std::process::exit(if res.is_ok() { 0 } else { 1 });
         }
@@ -229,52 +171,72 @@ fn run_daemonized(
     }
 }
 
-/// The mountpoint this process serves, for the Ctrl-C / SIGTERM handler
+/// The mountpoints this process serves, for the Ctrl-C / SIGTERM handler
 /// and the suspend listener. Both are installed once per process (a
 /// signal handler can only be set once): they used to be installed per
 /// mount, so in a process that mounted twice (the wizard, the GUI) the
 /// second install failed and Ctrl-C unmounted the first mountpoint,
-/// leaving the second one mounted and the process waiting on it.
-static SERVED_MOUNTPOINT: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+/// leaving the second one mounted and the process waiting on it. A list,
+/// not one slot: with two mounts at once (the GUI), the first one ending
+/// must not make a later Ctrl-C exit while the other still has unsaved
+/// changes.
+static SERVED_MOUNTPOINTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
-fn served_mountpoint() -> Option<PathBuf> {
-    SERVED_MOUNTPOINT.lock().ok().and_then(|g| g.clone())
+fn served_mountpoints() -> Vec<PathBuf> {
+    SERVED_MOUNTPOINTS
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default()
 }
 
-fn set_served_mountpoint(mp: Option<&Path>) {
-    if let Ok(mut g) = SERVED_MOUNTPOINT.lock() {
-        *g = mp.map(Path::to_path_buf);
+fn start_serving(mp: &Path) {
+    if let Ok(mut g) = SERVED_MOUNTPOINTS.lock()
+        && !g.iter().any(|p| p == mp)
+    {
+        g.push(mp.to_path_buf());
+    }
+}
+
+fn stop_serving(mp: &Path) {
+    if let Ok(mut g) = SERVED_MOUNTPOINTS.lock() {
+        g.retain(|p| p != mp);
+    }
+}
+
+/// Unmount every mountpoint this process serves (signal, suspend); each
+/// mount then saves and returns from `mount2`.
+fn unmount_served(why: &str) {
+    let prog = match resolved_unmount_program() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("warning: cannot unmount on {why}: {e}");
+            return;
+        }
+    };
+    for mp in served_mountpoints() {
+        match canonical_unmount_target(&mp) {
+            Ok(target) => {
+                let _ = std::process::Command::new(&prog)
+                    .args(unmount_args())
+                    .arg(&target)
+                    .status();
+            }
+            Err(e) => eprintln!("warning: cannot resolve mountpoint for {why} unmount: {e}"),
+        }
     }
 }
 
 fn install_signal_handler(mountpoint: &Path) {
-    set_served_mountpoint(Some(mountpoint));
+    start_serving(mountpoint);
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let r = ctrlc::set_handler(|| {
-            // No mount served (it ended): behave as an interrupt does.
-            let Some(mp) = served_mountpoint() else {
+            // No mount served (they ended): behave as an interrupt does.
+            if served_mountpoints().is_empty() {
                 std::process::exit(130);
-            };
-            eprintln!("\nreceived interrupt, unmounting cleanly...");
-            match resolved_unmount_program() {
-                Ok(prog) => {
-                    let target = match canonical_unmount_target(&mp) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("warning: cannot resolve mountpoint for signal unmount: {e}");
-                            return;
-                        }
-                    };
-                    let _ = std::process::Command::new(&prog)
-                        .args(unmount_args())
-                        .arg(&target)
-                        .status();
-                }
-                Err(e) => {
-                    eprintln!("warning: cannot unmount on signal: {e}");
-                }
             }
+            eprintln!("\nreceived interrupt, unmounting cleanly...");
+            unmount_served("signal");
         });
         if let Err(e) = r {
             eprintln!("warning: could not install signal handler: {e}");
@@ -366,7 +328,7 @@ pub(crate) fn canonical_unmount_target(mountpoint: &Path) -> std::io::Result<Pat
 
 #[cfg(target_os = "linux")]
 fn spawn_suspend_listener(mountpoint: &Path) {
-    set_served_mountpoint(Some(mountpoint));
+    start_serving(mountpoint);
     // One listener per process; it unmounts whatever is served when the
     // system suspends.
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -396,32 +358,9 @@ fn listen_for_suspend() -> Result<(), Box<dyn std::error::Error>> {
     let signals = proxy.receive_signal("PrepareForSleep")?;
     for msg in signals {
         let about_to_sleep: bool = msg.body().deserialize()?;
-        let Some(mp) = served_mountpoint() else {
-            continue;
-        };
-        let mp = mp.as_path();
-        if about_to_sleep {
+        if about_to_sleep && !served_mountpoints().is_empty() {
             eprintln!("luksbox: system suspending, unmounting cleanly...");
-            match resolved_unmount_program() {
-                Ok(prog) => {
-                    let target = match canonical_unmount_target(mp) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!(
-                                "luksbox: cannot resolve mountpoint for suspend unmount: {e}"
-                            );
-                            continue;
-                        }
-                    };
-                    let _ = std::process::Command::new(&prog)
-                        .args(unmount_args())
-                        .arg(&target)
-                        .status();
-                }
-                Err(e) => {
-                    eprintln!("luksbox: cannot unmount on suspend: {e}");
-                }
-            }
+            unmount_served("suspend");
         }
     }
     Ok(())
@@ -440,7 +379,7 @@ pub fn unmount(mountpoint: &Path) -> std::io::Result<()> {
             status
         )));
     }
-    wait_for_mount_to_finish(&target)
+    crate::busy::wait_for_mount_to_finish(&target)
 }
 
 /// fuser 0.17 takes `&self` on every Filesystem method (vs `&mut self`

@@ -245,7 +245,7 @@ pub fn write_metadata_opts(
 /// indistinguishable from uniform bytes, which is all the padding needs.
 /// The zero IV is safe because the key is never reused, and the region
 /// (at most `MAX_METADATA_SIZE`) is far below ChaCha20's 256 GiB limit.
-fn fill_padding(region: &mut [u8]) {
+pub(crate) fn fill_padding(region: &mut [u8]) {
     use chacha20::cipher::{KeyIvInit, StreamCipher};
     let mut key = Zeroizing::new([0u8; 32]);
     OsRng

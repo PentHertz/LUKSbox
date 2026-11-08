@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use luksbox_fuse_t::{
     DirEntry as FtDirEntry, Errno, FileAttr, Filesystem, MountOptions, S_IFDIR, S_IFLNK, S_IFREG,
@@ -70,6 +70,10 @@ fn mount_foreground(
     // R12-08: re-verify the mountpoint inode immediately before the
     // mount call to catch a swap in the window since the probe.
     crate::mountpoint::reverify_mountpoint(mountpoint, probe_inode)?;
+    // Held until the session returns, after `destroy()` saved the vault
+    // (and, for a daemon or the GUI helper, until the process exits):
+    // `unmount` below waits for it, as on the libfuse backend.
+    let _busy = crate::busy::MountBusy::hold(mountpoint, probe_inode)?;
     luksbox_fuse_t::mount(fs, mountpoint, &options)
         .map_err(|e| super::MountError::Io(std::io::Error::other(format!("FUSE-T: {e}"))))
 }
@@ -160,9 +164,17 @@ fn wait_for_daemon_mount(
     }
 }
 
+/// `/sbin/umount`, then wait until the mount process has saved and
+/// released the vault: `umount` returns as soon as the NFS client lets
+/// go, while the final save runs after that in `destroy()`, so
+/// `luksbox umount mnt && luksbox ls vault.lbx /` used to fail with
+/// "vault locked by another process" (and switching the Mac off right
+/// after `umount` could lose the last changes).
 pub fn unmount(mountpoint: &Path) -> Result<(), super::MountError> {
     luksbox_fuse_t::unmount(mountpoint)
-        .map_err(|e| super::MountError::Io(std::io::Error::other(format!("FUSE-T: {e}"))))
+        .map_err(|e| super::MountError::Io(std::io::Error::other(format!("FUSE-T: {e}"))))?;
+    crate::busy::wait_for_mount_to_finish(mountpoint)?;
+    Ok(())
 }
 
 struct LuksboxFuseTFs {
@@ -187,11 +199,31 @@ struct LuksboxFuseTFs {
     /// returns. Default is `false` -- ops mark the Vfs dirty and
     /// return; the timer thread below catches up.
     sync_mode: bool,
-    /// Wakes / shuts down the deferred-flush timer thread. Dropping
-    /// the sender (or sending on it) causes the timer's `recv_timeout`
-    /// to return `Disconnected` immediately and the thread exits.
+    /// Talks to the deferred-flush timer thread: `SaveSoon` from a
+    /// coalesced `fsync`; dropping the sender makes the timer's
+    /// `recv_timeout` return `Disconnected` and the thread exits.
     /// `None` when `sync_mode == true` (no timer was spawned).
-    timer_stop_tx: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    timer_tx: Mutex<Option<std::sync::mpsc::Sender<TimerMsg>>>,
+    /// When the vault was last saved by `fsync` or the timer. When both
+    /// are held, the Vfs lock is taken first.
+    saved_at: Arc<Mutex<Instant>>,
+}
+
+/// An `fsync` arriving less than this long after the last save does not
+/// save again at once: it asks the timer for a save at most this long
+/// after the previous one. FUSE-T serves the vault to the macOS NFS
+/// client, which sends a COMMIT, i.e. an `fsync`, every time a file is
+/// closed; each save rewrites the whole metadata region and its mirror
+/// (128 MiB with the default 64 MiB region), so a copy of 1 000 small
+/// files took two minutes and wrote about 125 GiB. Coalesced, a burst of
+/// closes costs about one save per second, and an `fsync` is durable
+/// within this delay instead of on return. `--sync` keeps every
+/// operation durable before it returns.
+const FSYNC_COALESCE: Duration = Duration::from_secs(1);
+
+enum TimerMsg {
+    /// Save within `FSYNC_COALESCE` of the last save.
+    SaveSoon,
 }
 
 impl LuksboxFuseTFs {
@@ -204,34 +236,54 @@ impl LuksboxFuseTFs {
             .parent()
             .map(|p| p.to_path_buf());
         let vfs = Arc::new(Mutex::new(vfs));
-        let timer_stop_tx = if sync_mode {
+        let saved_at = Arc::new(Mutex::new(Instant::now()));
+        let timer_tx = if sync_mode {
             None
         } else {
             // Background flush timer: wakes every
-            // LAZY_FLUSH_INTERVAL_SECS, briefly takes the Vfs lock and
-            // calls `vfs.flush()`. `recv_timeout` returns `Disconnected`
-            // either when the FS is dropped (Sender dropped) OR when
-            // `destroy()` sends a stop signal; either way the thread
-            // exits within microseconds rather than after another
-            // sleep. Mirrors the fuse.rs (libfuse3) implementation.
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            // LAZY_FLUSH_INTERVAL_SECS (or when a coalesced fsync is due),
+            // briefly takes the Vfs lock and saves. `recv_timeout`
+            // returns `Disconnected` when the FS is dropped or
+            // `destroy()` drops the sender; the thread then exits within
+            // microseconds rather than after another sleep. Mirrors the
+            // fuse.rs (libfuse3) implementation.
+            let (tx, rx) = std::sync::mpsc::channel::<TimerMsg>();
             let timer_vfs = Arc::clone(&vfs);
+            let timer_saved_at = Arc::clone(&saved_at);
             let _ = std::thread::Builder::new()
                 .name("luksbox-flush-timer".to_string())
                 .spawn(move || {
+                    use std::sync::mpsc::RecvTimeoutError;
+                    let mut due: Option<Instant> = None;
                     loop {
-                        match rx.recv_timeout(Duration::from_secs(LAZY_FLUSH_INTERVAL_SECS)) {
-                            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                break;
+                        let wait = due.map_or(Duration::from_secs(LAZY_FLUSH_INTERVAL_SECS), |d| {
+                            d.saturating_duration_since(Instant::now())
+                        });
+                        match rx.recv_timeout(wait) {
+                            Ok(TimerMsg::SaveSoon) => {
+                                let at = timer_saved_at
+                                    .lock()
+                                    .map(|t| *t + FSYNC_COALESCE)
+                                    .unwrap_or_else(|_| Instant::now());
+                                due = Some(due.map_or(at, |d| d.min(at)));
                             }
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                                if let Ok(mut v) = timer_vfs.lock()
-                                    && let Err(e) = crate::flush_and_commit(&mut v)
-                                {
-                                    // Same rationale as the FUSE3
-                                    // adapter: no syscall to report
-                                    // to from a timer tick, so log.
-                                    eprintln!("luksbox-mount: deferred flush failed: {e}");
+                            Err(RecvTimeoutError::Disconnected) => break,
+                            Err(RecvTimeoutError::Timeout) => {
+                                due = None;
+                                if let Ok(mut v) = timer_vfs.lock() {
+                                    match crate::flush_and_commit(&mut v) {
+                                        Ok(()) => {
+                                            if let Ok(mut t) = timer_saved_at.lock() {
+                                                *t = Instant::now();
+                                            }
+                                        }
+                                        // Same rationale as the FUSE3
+                                        // adapter: no syscall to report
+                                        // to from a timer tick, so log.
+                                        Err(e) => {
+                                            eprintln!("luksbox-mount: deferred flush failed: {e}")
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -245,7 +297,8 @@ impl LuksboxFuseTFs {
             gid,
             vault_parent,
             sync_mode,
-            timer_stop_tx: Mutex::new(timer_stop_tx),
+            timer_tx: Mutex::new(timer_tx),
+            saved_at,
         }
     }
 
@@ -517,11 +570,33 @@ impl Filesystem for LuksboxFuseTFs {
     }
 
     fn fsync(&self, _path: &Path, _datasync: bool) -> Result<(), Errno> {
-        // Always durable, as in fuse.rs. Under FUSE-T this also runs on
-        // the NFS COMMITs the macOS client sends on its own during a
-        // large write; `MountOptions::rwsize` keeps those rare.
+        // Under FUSE-T this runs on every NFS COMMIT, which the macOS
+        // client sends at each close(2) and on its own during a large
+        // write (`MountOptions::rwsize` keeps the latter rare), not only
+        // on an application's fsync(2). With --sync: always durable on
+        // return. Otherwise saved at once unless the vault was saved
+        // less than FSYNC_COALESCE ago; then the timer saves it within
+        // FSYNC_COALESCE of that save (see FSYNC_COALESCE).
         let mut vfs = self.vfs.lock().map_err(|_| Errno::EIO)?;
-        vfs.flush().map_err(|e| Self::vfs_errno(&e))
+        if !self.sync_mode {
+            let recent = self
+                .saved_at
+                .lock()
+                .map(|t| t.elapsed() < FSYNC_COALESCE)
+                .unwrap_or(false);
+            if recent
+                && let Ok(g) = self.timer_tx.lock()
+                && let Some(tx) = g.as_ref()
+                && tx.send(TimerMsg::SaveSoon).is_ok()
+            {
+                return Ok(());
+            }
+        }
+        vfs.flush().map_err(|e| Self::vfs_errno(&e))?;
+        if let Ok(mut t) = self.saved_at.lock() {
+            *t = Instant::now();
+        }
+        Ok(())
     }
 
     fn release(&self, _path: &Path) -> Result<(), Errno> {
@@ -542,7 +617,7 @@ impl Filesystem for LuksboxFuseTFs {
         // `Disconnected` immediately rather than waiting out the
         // remaining sleep period. Same Mutex<Option<_>>::take()
         // pattern as the libfuse3 adapter.
-        if let Ok(mut tx) = self.timer_stop_tx.lock()
+        if let Ok(mut tx) = self.timer_tx.lock()
             && let Some(tx) = tx.take()
         {
             drop(tx);
