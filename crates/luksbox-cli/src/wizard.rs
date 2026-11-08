@@ -83,10 +83,15 @@ fn ask_max_size(theme: &ColorfulTheme, vault: &Path, minimum: u64, current: u64)
         ),
         None => "Maximum vault size (e.g. 6G, 500M; 0 = unlimited)".to_string(),
     };
+    // The current limit, exactly (Enter must keep it): a rounded display
+    // value like "1.5G" for 1500M changed the limit by 110 MB, or failed
+    // validation when it rounded below the minimum.
     let default = if current == 0 {
         "0".to_string()
+    } else if current.is_multiple_of(MIB) {
+        format!("{}M", current / MIB)
     } else {
-        format_size(current)
+        current.to_string()
     };
     let answer: String = Input::with_theme(theme)
         .with_prompt(prompt)
@@ -1006,12 +1011,9 @@ fn create_den_tpm(
     // counter. The CLI's `mount-deniable` subcommand selects the
     // unseal variant from `--tpm-pin`; we surface the same toggle
     // here so the seal/unseal sides stay symmetric.
-    let pin_input = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("TPM PIN (leave blank for no PIN)")
-            .allow_empty_password(true)
-            .interact()?,
-    );
+    // Asked twice: the deniable vault has this one envelope slot, so a
+    // mistyped PIN made it unopenable for good.
+    let pin_input = ask_new_optional_tpm_pin(theme)?;
     let pin_bytes: Option<&[u8]> = if pin_input.is_empty() {
         None
     } else {
@@ -2079,15 +2081,40 @@ fn ask_path(theme: &ColorfulTheme, prompt: &str) -> Result<PathBuf> {
     let s: String = Input::with_theme(theme)
         .with_prompt(prompt)
         .interact_text()?;
-    Ok(PathBuf::from(s))
+    Ok(typed_path(&s))
 }
 
 fn ask_path_with_default(theme: &ColorfulTheme, prompt: &str, default: &str) -> Result<PathBuf> {
+    // A default (Enter keeps it, typing replaces it), not pre-filled
+    // text: typing a path after pre-filled `vault.lbx` used to produce
+    // `vault.lbx/home/me/notes.lbx` unless the user erased it first.
     let s: String = Input::with_theme(theme)
         .with_prompt(prompt)
-        .with_initial_text(default)
+        .default(default.to_string())
         .interact_text()?;
-    Ok(PathBuf::from(s))
+    Ok(typed_path(&s))
+}
+
+/// A path as the user typed or pasted it: surrounding quotes (what a
+/// file manager's "copy path" or a drag into the terminal adds) are
+/// removed and a leading `~/` is the home folder, as a shell would do.
+/// The prompts' own examples use `~`; it used to be taken literally,
+/// so `~/notes.dat` failed (or created a folder named `~`).
+fn typed_path(s: &str) -> PathBuf {
+    let t = s.trim();
+    let t = ['\'', '"']
+        .iter()
+        .find_map(|q| t.strip_prefix(*q).and_then(|r| r.strip_suffix(*q)))
+        .unwrap_or(t);
+    if let Some(rest) = t
+        .strip_prefix("~/")
+        .or(if t == "~" { Some("") } else { None })
+        && let Some(home) = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
+            .filter(|h| !h.is_empty())
+    {
+        return PathBuf::from(home).join(rest);
+    }
+    PathBuf::from(t)
 }
 
 /// Prompt the user for a mount target. On macOS+FUSE-T this offers a
@@ -3644,6 +3671,17 @@ fn create_single_slot_tpm_vault(
         }
         eprintln!("  anchor file initialized at {}", ap.display());
     }
+    // The maximum size the user gave, as `finish_create` applies it for
+    // every other kind (it was silently ignored here).
+    if opts.max_size != 0 {
+        let mut vfs = Vfs::open(cont)?;
+        vfs.set_max_vault_size(opts.max_size)?;
+        cont = vfs.close()?;
+        eprintln!(
+            "  maximum size {}",
+            luksbox_core::size::describe_size(opts.max_size)
+        );
+    }
     println!(
         "OK created {} (single-slot TPM vault; no recovery if any factor is lost)",
         vault.display()
@@ -4069,11 +4107,32 @@ fn maybe_mount_now(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Resu
 
 // ---- open wizard -----------------------------------------------------------
 
+/// Finishes the sync-bundle session (publish, release the lease) however
+/// `open_wizard` returns. Several error returns after the unlock used to
+/// leave the lease held and the session installed until the next open.
+/// A no-op when the session was already finished.
+struct FinishSessionOnExit;
+
+impl Drop for FinishSessionOnExit {
+    fn drop(&mut self) {
+        if let Err(e) = crate::sync_cmd::finish_active_session() {
+            eprintln!("warning: finishing the sync bundle session: {e}");
+        }
+    }
+}
+
 fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
+    let _finish_session = FinishSessionOnExit;
     let vault = ask_path(theme, "Path to vault")?;
     let header_path = ask_detached_header(theme, false)?;
 
-    let anchor_path = if Confirm::with_theme(theme)
+    // A bundle keeps its own rollback state on each device; an anchor
+    // file (the .lbx it came from has the same key) would be moved on by
+    // the bundle's generations and then refuse the .lbx (the CLI refuses
+    // `--anchor` on a bundle too).
+    let anchor_path = if crate::sync_cmd::is_bundle(&vault) {
+        None
+    } else if Confirm::with_theme(theme)
         .with_prompt("Verify against a rollback-detection anchor sidecar?")
         .default(false)
         .interact()?
@@ -4509,7 +4568,9 @@ fn info_wizard(theme: &ColorfulTheme) -> Result<()> {
     let detached = header.metadata_offset == 0;
     println!(
         "  layout:        {} (metadata at offset {}, data at {})",
-        if detached {
+        if crate::sync_cmd::is_bundle(&path) {
+            "sync bundle (header and pages are objects in the folder)"
+        } else if detached {
             "DETACHED header"
         } else {
             "inline header"
@@ -4545,7 +4606,7 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
                 "Make a directory",
                 "Remove a file",
                 "Remove a directory",
-                "Rename a file or directory (same parent dir)",
+                "Rename or move a file or directory",
                 "Manage keyslots",
                 "Rotate master volume key",
                 "Upgrade header to format v3 (rollback-detectable keyslot table)",
@@ -4556,6 +4617,12 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
             ])
             .default(0)
             .interact()?;
+        // Recovery mode exists only for the open that installed the broken
+        // files as placeholders: an action that closes and reopens the
+        // vault would hit the same parse error and end the session.
+        let in_recovery = !vfs.tolerated_inodes().is_empty();
+        const RECOVERY_ONLY_COPY: &str = "not available in recovery mode: copy the readable \
+                                          files out first (Copy a file out / Mount)";
         let r: Result<()> = match choice {
             0 => list_action(theme, &mut vfs),
             1 => cat_action(theme, &mut vfs),
@@ -4565,6 +4632,7 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
             5 => rm_action(theme, &mut vfs),
             6 => rmdir_action(theme, &mut vfs),
             7 => mv_action(theme, &mut vfs),
+            8 | 9 if in_recovery => Err(RECOVERY_ONLY_COPY.into()),
             8 => {
                 vfs.flush()?;
                 let cont = vfs.close()?;
@@ -4572,31 +4640,44 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
                 vfs = Vfs::open(cont)?;
                 Ok(())
             }
-            9 => {
-                vfs.flush()?;
-                let cont = vfs.close()?;
-                // Offer the same rollback-detection anchor verification the
-                // CLI `--anchor` flag gives: verify before rotating, and the
-                // rotation rewrites the anchor under the new MVK afterward.
-                let anchor = if Confirm::with_theme(theme)
-                    .with_prompt("Verify a rollback-detection anchor sidecar before rotating?")
-                    .default(false)
-                    .interact()?
-                {
-                    Some(ask_path(theme, "Path to the anchor sidecar")?)
-                } else {
-                    None
-                };
-                let cont = rotate_mvk_action(theme, cont, anchor)?;
-                vfs = Vfs::open(cont)?;
-                Ok(())
-            }
+            9 if crate::sync_cmd::is_bundle(vault) => Err(
+                "rotate-mvk is not available for a sync bundle; export it first \
+                 (`luksbox sync export`), rotate the .lbx, then convert it again"
+                    .into(),
+            ),
+            // Questions are asked while the vault is still open, and a
+            // rotation that stops before re-encrypting hands the container
+            // back: an error here keeps the session.
+            9 => match ask_rotation_anchor(theme) {
+                Err(e) => Err(e),
+                Ok(anchor) => {
+                    vfs.flush()?;
+                    let cont = vfs.close()?;
+                    match rotate_mvk_keep(theme, cont, anchor) {
+                        Ok(cont) => {
+                            vfs = Vfs::open(cont)?;
+                            Ok(())
+                        }
+                        Err((Some(cont), e)) => {
+                            vfs = Vfs::open(*cont)?;
+                            Err(e)
+                        }
+                        // Failed during the re-encryption itself: the
+                        // container is gone, and so is the session.
+                        Err((None, e)) => return Err(e),
+                    }
+                }
+            },
             10 => upgrade_header_action(theme, &mut vfs),
             11 => vault_size_action(theme, &mut vfs, vault),
-            12 => {
-                vfs.flush()?;
-                return mount_action(theme, vfs, vault);
-            }
+            // A mistyped mountpoint used to close the vault: ask first.
+            12 => match ask_mount_options(theme, vault) {
+                Err(e) => Err(e),
+                Ok(opts) => {
+                    vfs.flush()?;
+                    return mount_with(vfs, vault, opts);
+                }
+            },
             13 if crate::sync_cmd::is_bundle(vault) => Err(
                 "panic is not available for a sync bundle yet: delete the bundle folder \
                  (and empty the sync service's trash) instead"
@@ -4605,10 +4686,17 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
             13 => {
                 vfs.flush()?;
                 let cont = vfs.close()?;
+                // `panic_action` takes the vault either way (it releases it
+                // before overwriting): Ok(true) destroyed, Ok(false) the
+                // user backed out.
                 if panic_action(theme, cont, vault)? {
-                    return Ok(());
+                    println!("OK the vault's keys were destroyed");
+                } else {
+                    println!(
+                        "panic aborted; the vault was not changed (open it again to continue)"
+                    );
                 }
-                return Err("vault was destroyed".into());
+                return Ok(());
             }
             14 => {
                 vfs.flush()?;
@@ -4723,7 +4811,7 @@ fn upgrade_header_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
 fn list_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
     let inner: String = Input::with_theme(theme)
         .with_prompt("Directory to list")
-        .with_initial_text("/")
+        .default("/".to_string())
         .interact_text()?;
     let id = vfs.lookup_path(&inner)?;
     if vfs.stat(id)?.kind != InodeKind::Directory {
@@ -4741,7 +4829,12 @@ fn list_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
         } else {
             "-"
         };
-        println!("  {} {:>10} {}", kind, s.size, e.name);
+        println!(
+            "  {} {:>10} {}",
+            kind,
+            s.size,
+            crate::sanitize_for_terminal(&e.name)
+        );
     }
     Ok(())
 }
@@ -4773,9 +4866,17 @@ fn put_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
     if vfs.lookup(parent, &name).is_ok() {
         return Err(format!("{inner} already exists in vault").into());
     }
-    let f = vfs.create(parent, &name)?;
     let mut src = File::open(&local)?;
-    let n = copy_into(vfs, f, &mut src)?;
+    let f = vfs.create(parent, &name)?;
+    let n = match copy_into(vfs, f, &mut src) {
+        Ok(n) => n,
+        Err(e) => {
+            // A failed copy (size limit, full disk, read error) must not
+            // leave a truncated file that the next save would keep.
+            let _ = vfs.unlink(parent, &name);
+            return Err(e);
+        }
+    };
     vfs.flush()?;
     println!("OK wrote {n} bytes to {inner}");
     Ok(())
@@ -4789,6 +4890,14 @@ fn get_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
     let id = vfs.lookup_path(&inner)?;
     if vfs.stat(id)?.kind != InodeKind::File {
         return Err(format!("{inner} is not a file").into());
+    }
+    if std::fs::symlink_metadata(&local).is_ok()
+        && !Confirm::with_theme(theme)
+            .with_prompt(format!("{} exists. Overwrite it?", local.display()))
+            .default(false)
+            .interact()?
+    {
+        return Ok(());
     }
     // Mode 0600 - see cmd_get in main.rs for rationale.
     let mut dst = luksbox_core::file_util::secure_create_or_truncate(&local)?;
@@ -4852,7 +4961,39 @@ fn mv_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
     Ok(())
 }
 
+/// Set once this wizard run mounted a vault in the foreground.
+static FOREGROUND_MOUNTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Offer the same rollback-detection anchor verification the CLI
+/// `--anchor` flag gives: verify before rotating, and the rotation
+/// rewrites the anchor under the new MVK afterward.
+fn ask_rotation_anchor(theme: &ColorfulTheme) -> Result<Option<PathBuf>> {
+    if Confirm::with_theme(theme)
+        .with_prompt("Verify a rollback-detection anchor sidecar before rotating?")
+        .default(false)
+        .interact()?
+    {
+        Ok(Some(ask_path(theme, "Path to the anchor sidecar")?))
+    } else {
+        Ok(None)
+    }
+}
+
 fn mount_action(theme: &ColorfulTheme, vfs: Vfs, vault: &Path) -> Result<()> {
+    let opts = ask_mount_options(theme, vault)?;
+    mount_with(vfs, vault, opts)
+}
+
+/// The mount questions, answered before the vault is handed to the
+/// mount.
+struct MountOptions {
+    mp_abs: PathBuf,
+    daemonize: bool,
+    sync_mode: bool,
+}
+
+fn ask_mount_options(theme: &ColorfulTheme, vault: &Path) -> Result<MountOptions> {
     let mp = ask_mountpoint(theme, vault)?;
     #[cfg(not(target_os = "windows"))]
     {
@@ -4863,6 +5004,15 @@ fn mount_action(theme: &ColorfulTheme, vfs: Vfs, vault: &Path) -> Result<()> {
     let daemonize = if cfg!(target_os = "windows") {
         // WinFsp's mount lifetime is tied to the holding process; no
         // daemonize path on Windows.
+        false
+    } else if FOREGROUND_MOUNTED.load(std::sync::atomic::Ordering::Relaxed) {
+        // A foreground mount earlier in this run left its signal and
+        // suspend threads; a process with threads cannot fork safely, so
+        // the background mount was refused after all the questions.
+        eprintln!(
+            "note: this wizard already mounted a vault in the foreground; a background \
+             mount needs a fresh process (`luksbox mount`). Mounting in the foreground."
+        );
         false
     } else {
         Confirm::with_theme(theme)
@@ -4878,14 +5028,6 @@ fn mount_action(theme: &ColorfulTheme, vfs: Vfs, vault: &Path) -> Result<()> {
     let mp_abs = std::path::absolute(&mp)?;
     #[cfg(target_os = "windows")]
     let mp_abs = mp.clone();
-    if !daemonize {
-        eprintln!(
-            "mounted {} at {} (foreground)\n  unmount: luksbox umount {}  (or Ctrl-C, clean either way)",
-            vault.display(),
-            mp_abs.display(),
-            mp_abs.display(),
-        );
-    }
     // Eager-flush opt-in. Same prompt + default as the open-and-mount
     // path above; see the comment there for the trade-off rationale.
     let sync_mode = Confirm::with_theme(theme)
@@ -4895,8 +5037,48 @@ fn mount_action(theme: &ColorfulTheme, vfs: Vfs, vault: &Path) -> Result<()> {
         )
         .default(false)
         .interact()?;
+    Ok(MountOptions {
+        mp_abs,
+        daemonize,
+        sync_mode,
+    })
+}
+
+fn mount_with(vfs: Vfs, vault: &Path, opts: MountOptions) -> Result<()> {
+    let MountOptions {
+        mp_abs,
+        daemonize,
+        sync_mode,
+    } = opts;
     crate::sync_cmd::install_mount_hook();
+    if daemonize && luksbox_mount::FUSE_BACKEND != "fuse-t" {
+        // The background mount forks: the mount lives on in the child
+        // and this process exits (FUSE-T instead runs a helper and comes
+        // back to the menu).
+        eprintln!(
+            "note: the wizard ends here; the vault stays mounted in the background \
+             until `luksbox umount {}`",
+            mp_abs.display()
+        );
+    }
+    if !daemonize {
+        // After the last question (it used to be printed before it, and
+        // before the mount, which can still fail).
+        eprintln!(
+            "mounting {} at {} in the foreground\n  unmount: luksbox umount {}  (or Ctrl-C, \
+             clean either way)",
+            vault.display(),
+            mp_abs.display(),
+            mp_abs.display(),
+        );
+        FOREGROUND_MOUNTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     luksbox_mount::mount(vfs, &mp_abs, daemonize, sync_mode)?;
+    // R16-13, as in `cmd_mount`: a background mount that returns here
+    // (FUSE-T) left the bundle session to its child process.
+    if daemonize {
+        crate::sync_cmd::forget_active_session();
+    }
     Ok(())
 }
 
@@ -4916,22 +5098,107 @@ pub(crate) fn run_rotate_mvk_interactive(
 
 fn rotate_mvk_action(
     theme: &ColorfulTheme,
-    mut cont: Container,
+    cont: Container,
     anchor: Option<PathBuf>,
 ) -> Result<Container> {
+    rotate_mvk_keep(theme, cont, anchor).map_err(|(_, e)| e)
+}
+
+/// A rotation error, with the container when the rotation stopped before
+/// the vault was reopened for it.
+type RotateError = (Option<Box<Container>>, Box<dyn std::error::Error>);
+
+/// What the rotation questions collected, ready to apply.
+enum RotatePlan {
+    Standard(StandardRotatePlan),
+    Deniable(DeniableRotatePlan),
+}
+
+struct StandardRotatePlan {
+    credentials: Vec<SlotCredential>,
+    anchor_gen: Option<u64>,
+    rotate_kdf: luksbox_core::Argon2idParams,
+    slots: usize,
+}
+
+struct DeniableRotatePlan {
+    creds: Vec<luksbox_vfs::DeniableRotationCredential>,
+    anchor_gen: Option<u64>,
+    slot_idx: usize,
+}
+
+/// `rotate_mvk_action` that keeps the session alive: the questions and
+/// the checks that need no re-encryption only borrow the container, so a
+/// refused slot kind, a wrong anchor or an aborted prompt hands it back
+/// to the wizard's open loop (it used to drop the vault and send the
+/// user back to unlock it again).
+fn rotate_mvk_keep(
+    theme: &ColorfulTheme,
+    mut cont: Container,
+    anchor: Option<PathBuf>,
+) -> std::result::Result<Container, RotateError> {
+    let prev_anchor = cont.anchor_path().map(Path::to_path_buf);
     // Deniable vaults have no enumerable slots in `header.keyslots`
     // (synthetic header with all Empty entries); their slot envelopes
     // live in `self.deniable.bytes` and rotation goes through the
     // deniable-specific path. Dispatch here so the standard-slot
-    // walker below doesn't silently no-op on deniable vaults.
-    if cont.is_deniable() {
-        return rotate_mvk_deniable_action(theme, cont, anchor);
+    // walker doesn't silently no-op on deniable vaults.
+    let plan = if cont.is_deniable() {
+        rotate_mvk_deniable_prepare(theme, &mut cont, anchor).map(|p| p.map(RotatePlan::Deniable))
+    } else {
+        rotate_mvk_prepare(theme, &mut cont, anchor).map(|p| p.map(RotatePlan::Standard))
+    };
+    match plan {
+        Ok(None) => Ok(cont),
+        Ok(Some(RotatePlan::Standard(p))) => rotate_mvk_apply(cont, p).map_err(|e| (None, e)),
+        Ok(Some(RotatePlan::Deniable(p))) => {
+            rotate_mvk_deniable_apply(cont, p).map_err(|e| (None, e))
+        }
+        Err(e) => {
+            // The rotation's anchor may already be armed: give the
+            // session back the one it was opened with.
+            if cont.anchor_path() != prev_anchor.as_deref()
+                && let Err(e2) = cont.set_anchor(prev_anchor)
+            {
+                eprintln!("WARN could not re-attach the session's anchor: {e2}");
+            }
+            Err((Some(Box::new(cont)), e))
+        }
     }
+}
+
+/// The questions of a standard rotation. `Ok(None)`: the user declined.
+fn rotate_mvk_prepare(
+    theme: &ColorfulTheme,
+    cont: &mut Container,
+    anchor: Option<PathBuf>,
+) -> Result<Option<StandardRotatePlan>> {
     for (i, s) in cont.header.keyslots.iter().enumerate() {
         if s.kind == SlotKind::Fido2DerivedMvk {
             return Err(format!(
                 "slot {i} is fido2-direct; the MVK is derived from the authenticator itself \
                  and can't be rotated. Revoke the slot first or recreate the vault."
+            )
+            .into());
+        }
+        // Every kind this flow cannot re-wrap is refused here, before any
+        // passphrase is typed or authenticator touched for the other
+        // slots (it used to stop only on reaching such a slot).
+        if !matches!(
+            s.kind,
+            SlotKind::Empty | SlotKind::Passphrase | SlotKind::Fido2HmacSecret
+        ) {
+            let what = if s.kind.is_tpm2() {
+                "TPM-bound"
+            } else if s.kind.is_sep() {
+                "Secure Enclave-bound"
+            } else {
+                "a hybrid post-quantum slot"
+            };
+            return Err(format!(
+                "slot {i} is {what}; rotation of such slots is not supported yet. \
+                 Workaround: `luksbox revoke <vault> --slot {i}`, rotate, then enroll it \
+                 again with the matching `--kind`."
             )
             .into());
         }
@@ -4969,7 +5236,7 @@ fn rotate_mvk_action(
         .default(false)
         .interact()?
     {
-        return Ok(cont);
+        return Ok(None);
     }
 
     // Verify the rollback-detection anchor (if supplied) BEFORE we
@@ -5002,7 +5269,7 @@ fn rotate_mvk_action(
                     passphrase: pp,
                 }
             }
-            SlotKind::Fido2HmacSecret => collect_fido2_credential_for_rotate(theme, &cont, *idx)?,
+            SlotKind::Fido2HmacSecret => collect_fido2_credential_for_rotate(theme, cont, *idx)?,
             SlotKind::Fido2DerivedMvk => unreachable!("rejected above"),
             SlotKind::HybridPqKemPassphrase
             | SlotKind::HybridPqKemFido2
@@ -5059,6 +5326,23 @@ fn rotate_mvk_action(
     // the rotation weaker than it went in (was: the interactive preset,
     // which re-wrapped a `--kdf sensitive` vault at 256 MiB).
     let rotate_kdf = crate::kdf_params_for_existing(&cont.header, None, None);
+    Ok(Some(StandardRotatePlan {
+        credentials,
+        anchor_gen,
+        rotate_kdf,
+        slots: populated.len(),
+    }))
+}
+
+/// Re-encrypt the vault under a new MVK: from here on the container is
+/// consumed.
+fn rotate_mvk_apply(cont: Container, plan: StandardRotatePlan) -> Result<Container> {
+    let StandardRotatePlan {
+        credentials,
+        anchor_gen,
+        rotate_kdf,
+        slots,
+    } = plan;
     let mut vfs = Vfs::open(cont)?;
     // Rollback check: refuse to rotate a vault that has been rolled back
     // past the anchor. Rotating a stale vault and then advancing the
@@ -5087,10 +5371,7 @@ fn rotate_mvk_action(
     );
     vfs.rotate_mvk(credentials, rotate_kdf)?;
     vfs.flush()?;
-    println!(
-        "OK MVK rotated. {} keyslot(s) rebuilt with fresh salts.",
-        populated.len()
-    );
+    println!("OK MVK rotated. {slots} keyslot(s) rebuilt with fresh salts.");
     if anchor_gen.is_some() {
         println!("OK anchor re-bound to the new MVK and advanced to the current generation.");
     }
@@ -5098,19 +5379,19 @@ fn rotate_mvk_action(
     Ok(cont)
 }
 
-/// Deniable counterpart to `rotate_mvk_action`. Dispatched when the
+/// Deniable counterpart to `rotate_mvk_prepare`. Dispatched when the
 /// container is deniable. v1 supports passphrase-only deniable slots
 /// (the most common deniable setup). The user must remember the
 /// Argon2 params they used at create time -- those aren't persisted
 /// anywhere on disk for deniable vaults (the format requires every
 /// byte to look random; storing the KDF params would be a beacon).
-fn rotate_mvk_deniable_action(
+fn rotate_mvk_deniable_prepare(
     theme: &ColorfulTheme,
-    mut cont: Container,
+    cont: &mut Container,
     anchor: Option<PathBuf>,
-) -> Result<Container> {
+) -> Result<Option<DeniableRotatePlan>> {
     use luksbox_format::deniable_header::DeniableMaterial;
-    use luksbox_vfs::{DeniableRotationCredential, Vfs};
+    use luksbox_vfs::DeniableRotationCredential;
 
     let slot_idx = cont.deniable_unlocked_slot().ok_or(
         "container is deniable but no unlocked-slot index is set; cannot identify \
@@ -5134,7 +5415,7 @@ fn rotate_mvk_deniable_action(
         .default(false)
         .interact()?
     {
-        return Ok(cont);
+        return Ok(None);
     }
 
     // Verify the rollback-detection anchor (deniable AEAD format) before
@@ -5171,7 +5452,20 @@ fn rotate_mvk_deniable_action(
         unsealed: None,
         mlkem_shared: None,
     }];
+    Ok(Some(DeniableRotatePlan {
+        creds,
+        anchor_gen,
+        slot_idx,
+    }))
+}
 
+/// Deniable counterpart to `rotate_mvk_apply`.
+fn rotate_mvk_deniable_apply(cont: Container, plan: DeniableRotatePlan) -> Result<Container> {
+    let DeniableRotatePlan {
+        creds,
+        anchor_gen,
+        slot_idx,
+    } = plan;
     let mut vfs = Vfs::open(cont)?;
     // Rollback check (same fail-closed policy as the standard path).
     if let Some(ag) = anchor_gen {
@@ -5540,313 +5834,371 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
             _ => unreachable!(),
         };
 
-        let r: Result<()> = match action {
-            0 => {
-                // Deniable vaults have no visible slot table; the
-                // admin must pick a target index explicitly so they
-                // don't overwrite another user's slot. Standard
-                // vaults auto-pick first-free.
-                if cont.is_deniable() {
-                    let slot_idx = ask_deniable_slot_idx(theme, &cont)?;
-                    let pw = ask_new_passphrase(theme, "New passphrase")?;
-                    let kdf = ask_kdf_strength(theme, "Argon2id strength", 0)?;
-                    eprintln!("Stretching with Argon2id...");
-                    let idx = cont.enroll_passphrase_deniable(slot_idx, pw.as_bytes(), kdf)?;
-                    cont.persist_header()?;
-                    println!("OK enrolled passphrase in slot {idx}");
-                    Ok(())
-                } else {
-                    let pw = ask_new_passphrase(theme, "New passphrase")?;
-                    let kdf = ask_kdf_strength(theme, "Argon2id strength", 0)?;
-                    eprintln!("Stretching with Argon2id...");
-                    let idx = cont.enroll_passphrase(pw.as_bytes(), kdf)?;
-                    cont.persist_header()?;
-                    println!("OK enrolled passphrase in slot {idx}");
-                    Ok(())
+        if action == 15 {
+            return Ok(cont);
+        }
+        // A sync bundle keeps its post-quantum sidecar inside the bundle;
+        // these helpers write the `.hybrid` file next to the vault path,
+        // so a slot added here could never unlock (the CLI refuses too).
+        if cont.is_external() && menu[choice].0.contains("ML-KEM") {
+            eprintln!(
+                "FAIL adding a post-quantum keyslot is not available for a sync bundle; \
+                 export it (`luksbox sync export`), enroll on the .lbx, then convert again"
+            );
+            continue;
+        }
+        // Every arm runs inside this closure so that an error in one of
+        // them (`?`) is reported and the keyslot menu shown again, instead
+        // of leaving this function and closing the whole vault session.
+        let r: Result<()> = (|| -> Result<()> {
+            match action {
+                0 => {
+                    // Deniable vaults have no visible slot table; the
+                    // admin must pick a target index explicitly so they
+                    // don't overwrite another user's slot. Standard
+                    // vaults auto-pick first-free.
+                    if cont.is_deniable() {
+                        let slot_idx = ask_deniable_slot_idx(theme, &cont)?;
+                        let pw = ask_new_passphrase(theme, "New passphrase")?;
+                        let kdf = ask_kdf_strength(theme, "Argon2id strength", 0)?;
+                        eprintln!("Stretching with Argon2id...");
+                        let idx = cont.enroll_passphrase_deniable(slot_idx, pw.as_bytes(), kdf)?;
+                        cont.persist_header()?;
+                        println!("OK enrolled passphrase in slot {idx}");
+                        Ok(())
+                    } else {
+                        let pw = ask_new_passphrase(theme, "New passphrase")?;
+                        // Default to the vault's strongest existing cost,
+                        // as `luksbox enroll` does (R15-H3): Enter used to
+                        // add a weaker slot to a "sensitive" vault.
+                        let existing = crate::kdf_params_for_existing(&cont.header, None, None);
+                        let default_idx = if existing.m_cost_kib >= 1024 * 1024 {
+                            2
+                        } else if existing.m_cost_kib >= 512 * 1024 {
+                            1
+                        } else {
+                            0
+                        };
+                        let kdf = ask_kdf_strength(theme, "Argon2id strength", default_idx)?;
+                        eprintln!("Stretching with Argon2id...");
+                        let idx = cont.enroll_passphrase(pw.as_bytes(), kdf)?;
+                        cont.persist_header()?;
+                        println!("OK enrolled passphrase in slot {idx}");
+                        Ok(())
+                    }
                 }
-            }
-            1 => {
-                if cont.is_deniable() {
-                    enroll_fido2_deniable_into(theme, &mut cont)
-                } else {
-                    enroll_fido2_into(theme, &mut cont)
+                1 => {
+                    if cont.is_deniable() {
+                        enroll_fido2_deniable_into(theme, &mut cont)
+                    } else {
+                        enroll_fido2_into(theme, &mut cont)
+                    }
                 }
-            }
-            // ===== pure-PQ rows (no TPM, all platforms) =====
-            // Actions 2..=5 cover the 4 pure-PQ variants. They
-            // mirror the GUI buttons of the same names. No
-            // `#[cfg(target_os = "linux")]` because there's
-            // nothing OS-specific about ML-KEM or about FIDO2
-            // (Linux/macOS use libfido2, Windows uses
-            // webauthn.dll).
-            2 => {
-                let vp = cont.vault_path().to_path_buf();
-                if cont.is_deniable() {
-                    enroll_hybrid_pq_passphrase_deniable_into(
-                        theme,
-                        &mut cont,
-                        &vp,
-                        luksbox_pq::PqParams::Ml768,
-                    )
-                } else {
-                    enroll_hybrid_pq_passphrase_into(
-                        theme,
-                        &mut cont,
-                        &vp,
-                        luksbox_pq::PqParams::Ml768,
-                    )
+                // ===== pure-PQ rows (no TPM, all platforms) =====
+                // Actions 2..=5 cover the 4 pure-PQ variants. They
+                // mirror the GUI buttons of the same names. No
+                // `#[cfg(target_os = "linux")]` because there's
+                // nothing OS-specific about ML-KEM or about FIDO2
+                // (Linux/macOS use libfido2, Windows uses
+                // webauthn.dll).
+                2 => {
+                    let vp = cont.vault_path().to_path_buf();
+                    if cont.is_deniable() {
+                        enroll_hybrid_pq_passphrase_deniable_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml768,
+                        )
+                    } else {
+                        enroll_hybrid_pq_passphrase_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml768,
+                        )
+                    }
                 }
-            }
-            3 => {
-                let vp = cont.vault_path().to_path_buf();
-                if cont.is_deniable() {
-                    enroll_hybrid_pq_passphrase_deniable_into(
-                        theme,
-                        &mut cont,
-                        &vp,
-                        luksbox_pq::PqParams::Ml1024,
-                    )
-                } else {
-                    enroll_hybrid_pq_passphrase_into(
-                        theme,
-                        &mut cont,
-                        &vp,
-                        luksbox_pq::PqParams::Ml1024,
-                    )
+                3 => {
+                    let vp = cont.vault_path().to_path_buf();
+                    if cont.is_deniable() {
+                        enroll_hybrid_pq_passphrase_deniable_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml1024,
+                        )
+                    } else {
+                        enroll_hybrid_pq_passphrase_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml1024,
+                        )
+                    }
                 }
-            }
-            4 => {
-                let vp = cont.vault_path().to_path_buf();
-                if cont.is_deniable() {
-                    enroll_hybrid_pq_fido2_deniable_into(
-                        theme,
-                        &mut cont,
-                        &vp,
-                        luksbox_pq::PqParams::Ml768,
-                    )
-                } else {
-                    enroll_hybrid_pq_fido2_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml768)
+                4 => {
+                    let vp = cont.vault_path().to_path_buf();
+                    if cont.is_deniable() {
+                        enroll_hybrid_pq_fido2_deniable_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml768,
+                        )
+                    } else {
+                        enroll_hybrid_pq_fido2_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml768,
+                        )
+                    }
                 }
-            }
-            5 => {
-                let vp = cont.vault_path().to_path_buf();
-                if cont.is_deniable() {
-                    enroll_hybrid_pq_fido2_deniable_into(
-                        theme,
-                        &mut cont,
-                        &vp,
-                        luksbox_pq::PqParams::Ml1024,
-                    )
-                } else {
-                    enroll_hybrid_pq_fido2_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml1024)
+                5 => {
+                    let vp = cont.vault_path().to_path_buf();
+                    if cont.is_deniable() {
+                        enroll_hybrid_pq_fido2_deniable_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml1024,
+                        )
+                    } else {
+                        enroll_hybrid_pq_fido2_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml1024,
+                        )
+                    }
                 }
-            }
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            6 => {
-                if cont.is_deniable() {
-                    enroll_tpm2_deniable_into(theme, &mut cont)
-                } else {
-                    enroll_tpm2_into(theme, &mut cont)
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                6 => {
+                    if cont.is_deniable() {
+                        enroll_tpm2_deniable_into(theme, &mut cont)
+                    } else {
+                        enroll_tpm2_into(theme, &mut cont)
+                    }
                 }
-            }
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            7 => {
-                if cont.is_deniable() {
-                    // The deniable slot envelope has no separate "TPM
-                    // policy with PIN" variant - the envelope
-                    // passphrase already acts as a knowledge factor on
-                    // top of the TPM unseal. Use action 6 (TPM) for
-                    // the equivalent posture in deniable vaults.
-                    Err(
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                7 => {
+                    if cont.is_deniable() {
+                        // The deniable slot envelope has no separate "TPM
+                        // policy with PIN" variant - the envelope
+                        // passphrase already acts as a knowledge factor on
+                        // top of the TPM unseal. Use action 6 (TPM) for
+                        // the equivalent posture in deniable vaults.
+                        Err(
                         "TPM-PIN deniable enroll is not exposed: the deniable envelope already \
                          requires a passphrase, so 'TPM' gives the same knowledge+TPM \
                          requirement without a second PIN."
                             .into(),
                     )
-                } else {
-                    enroll_tpm2_pin_into(theme, &mut cont)
+                    } else {
+                        enroll_tpm2_pin_into(theme, &mut cont)
+                    }
                 }
-            }
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            8 => {
-                if cont.is_deniable() {
-                    enroll_tpm2_fido2_deniable_into(theme, &mut cont)
-                } else {
-                    enroll_tpm2_fido2_into(theme, &mut cont)
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                8 => {
+                    if cont.is_deniable() {
+                        enroll_tpm2_fido2_deniable_into(theme, &mut cont)
+                    } else {
+                        enroll_tpm2_fido2_into(theme, &mut cont)
+                    }
                 }
-            }
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            9 => {
-                let vp = cont.vault_path().to_path_buf();
-                if cont.is_deniable() {
-                    enroll_hybrid_pq_tpm2_deniable_into(
-                        theme,
-                        &mut cont,
-                        &vp,
-                        luksbox_pq::PqParams::Ml768,
-                    )
-                } else {
-                    enroll_hybrid_pq_tpm2_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml768)
-                }
-            }
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            10 => {
-                let vp = cont.vault_path().to_path_buf();
-                if cont.is_deniable() {
-                    enroll_hybrid_pq_tpm2_deniable_into(
-                        theme,
-                        &mut cont,
-                        &vp,
-                        luksbox_pq::PqParams::Ml1024,
-                    )
-                } else {
-                    enroll_hybrid_pq_tpm2_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml1024)
-                }
-            }
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            11 => {
-                let vp = cont.vault_path().to_path_buf();
-                if cont.is_deniable() {
-                    enroll_hybrid_pq_tpm2_fido2_deniable_into(
-                        theme,
-                        &mut cont,
-                        &vp,
-                        luksbox_pq::PqParams::Ml768,
-                    )
-                } else {
-                    enroll_hybrid_pq_tpm2_fido2_into(
-                        theme,
-                        &mut cont,
-                        &vp,
-                        luksbox_pq::PqParams::Ml768,
-                    )
-                }
-            }
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            12 => {
-                let vp = cont.vault_path().to_path_buf();
-                if cont.is_deniable() {
-                    enroll_hybrid_pq_tpm2_fido2_deniable_into(
-                        theme,
-                        &mut cont,
-                        &vp,
-                        luksbox_pq::PqParams::Ml1024,
-                    )
-                } else {
-                    enroll_hybrid_pq_tpm2_fido2_into(
-                        theme,
-                        &mut cont,
-                        &vp,
-                        luksbox_pq::PqParams::Ml1024,
-                    )
-                }
-            }
-            #[cfg(target_os = "macos")]
-            16 => {
-                if cont.is_deniable() {
-                    Err(
-                        "Secure Enclave keyslots are not supported on deniable vaults: \
-                         deniable slots are fixed at creation time and Secure Enclave \
-                         is not a deniable credential."
-                            .into(),
-                    )
-                } else {
-                    enroll_sep_into(theme, &mut cont, false)
-                }
-            }
-            #[cfg(target_os = "macos")]
-            17 => {
-                if cont.is_deniable() {
-                    Err(
-                        "Secure Enclave keyslots are not supported on deniable vaults: \
-                         deniable slots are fixed at creation time and Secure Enclave \
-                         is not a deniable credential."
-                            .into(),
-                    )
-                } else {
-                    enroll_sep_into(theme, &mut cont, true)
-                }
-            }
-            #[cfg(target_os = "macos")]
-            18 => {
-                let vp = cont.vault_path().to_path_buf();
-                if cont.is_deniable() {
-                    Err(
-                        "Secure Enclave keyslots are not supported on deniable vaults: \
-                         deniable slots are fixed at creation time and Secure Enclave \
-                         is not a deniable credential."
-                            .into(),
-                    )
-                } else {
-                    enroll_hybrid_pq_sep_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml768)
-                }
-            }
-            #[cfg(target_os = "macos")]
-            19 => {
-                let vp = cont.vault_path().to_path_buf();
-                if cont.is_deniable() {
-                    Err(
-                        "Secure Enclave keyslots are not supported on deniable vaults: \
-                         deniable slots are fixed at creation time and Secure Enclave \
-                         is not a deniable credential."
-                            .into(),
-                    )
-                } else {
-                    enroll_hybrid_pq_sep_into(theme, &mut cont, &vp, luksbox_pq::PqParams::Ml1024)
-                }
-            }
-            // ===== fused Secure Enclave rows (macOS) =====
-            // Actions 20..=28 cover SEP+FIDO2 / +passphrase / +both,
-            // plain and hybrid (ML-KEM-768/1024). Generalized through
-            // enroll_sep_fused_into.
-            #[cfg(target_os = "macos")]
-            20..=28 => {
-                if cont.is_deniable() {
-                    Err(
-                        "Secure Enclave keyslots are not supported on deniable vaults: \
-                         deniable slots are fixed at creation time and Secure Enclave \
-                         is not a deniable credential."
-                            .into(),
-                    )
-                } else {
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                9 => {
                     let vp = cont.vault_path().to_path_buf();
-                    let (factors, params) = match action {
-                        20 => (crate::SepFactors::Fido2, None),
-                        21 => (crate::SepFactors::Passphrase, None),
-                        22 => (crate::SepFactors::Fido2Passphrase, None),
-                        23 => (crate::SepFactors::Fido2, Some(luksbox_pq::PqParams::Ml768)),
-                        24 => (crate::SepFactors::Fido2, Some(luksbox_pq::PqParams::Ml1024)),
-                        25 => (
-                            crate::SepFactors::Passphrase,
-                            Some(luksbox_pq::PqParams::Ml768),
-                        ),
-                        26 => (
-                            crate::SepFactors::Passphrase,
-                            Some(luksbox_pq::PqParams::Ml1024),
-                        ),
-                        27 => (
-                            crate::SepFactors::Fido2Passphrase,
-                            Some(luksbox_pq::PqParams::Ml768),
-                        ),
-                        28 => (
-                            crate::SepFactors::Fido2Passphrase,
-                            Some(luksbox_pq::PqParams::Ml1024),
-                        ),
-                        _ => unreachable!(),
-                    };
-                    enroll_sep_fused_into(theme, &mut cont, &vp, factors, params)
+                    if cont.is_deniable() {
+                        enroll_hybrid_pq_tpm2_deniable_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml768,
+                        )
+                    } else {
+                        enroll_hybrid_pq_tpm2_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml768,
+                        )
+                    }
                 }
-            }
-            13 => update_keyslot_action(theme, &mut cont),
-            14 => {
-                if cont.is_deniable() {
-                    // Deniable vaults don't expose a populated/empty
-                    // slot table (it's all opaque ciphertext); admin
-                    // picks an index directly. The current unlock slot
-                    // is rejected inside `clear_deniable_slot` to
-                    // prevent self-lockout.
-                    let slot_idx = ask_deniable_slot_idx(theme, &cont)?;
-                    if Confirm::with_theme(theme)
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                10 => {
+                    let vp = cont.vault_path().to_path_buf();
+                    if cont.is_deniable() {
+                        enroll_hybrid_pq_tpm2_deniable_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml1024,
+                        )
+                    } else {
+                        enroll_hybrid_pq_tpm2_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml1024,
+                        )
+                    }
+                }
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                11 => {
+                    let vp = cont.vault_path().to_path_buf();
+                    if cont.is_deniable() {
+                        enroll_hybrid_pq_tpm2_fido2_deniable_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml768,
+                        )
+                    } else {
+                        enroll_hybrid_pq_tpm2_fido2_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml768,
+                        )
+                    }
+                }
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                12 => {
+                    let vp = cont.vault_path().to_path_buf();
+                    if cont.is_deniable() {
+                        enroll_hybrid_pq_tpm2_fido2_deniable_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml1024,
+                        )
+                    } else {
+                        enroll_hybrid_pq_tpm2_fido2_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml1024,
+                        )
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                16 => {
+                    if cont.is_deniable() {
+                        Err(
+                            "Secure Enclave keyslots are not supported on deniable vaults: \
+                         deniable slots are fixed at creation time and Secure Enclave \
+                         is not a deniable credential."
+                                .into(),
+                        )
+                    } else {
+                        enroll_sep_into(theme, &mut cont, false)
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                17 => {
+                    if cont.is_deniable() {
+                        Err(
+                            "Secure Enclave keyslots are not supported on deniable vaults: \
+                         deniable slots are fixed at creation time and Secure Enclave \
+                         is not a deniable credential."
+                                .into(),
+                        )
+                    } else {
+                        enroll_sep_into(theme, &mut cont, true)
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                18 => {
+                    let vp = cont.vault_path().to_path_buf();
+                    if cont.is_deniable() {
+                        Err(
+                            "Secure Enclave keyslots are not supported on deniable vaults: \
+                         deniable slots are fixed at creation time and Secure Enclave \
+                         is not a deniable credential."
+                                .into(),
+                        )
+                    } else {
+                        enroll_hybrid_pq_sep_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml768,
+                        )
+                    }
+                }
+                #[cfg(target_os = "macos")]
+                19 => {
+                    let vp = cont.vault_path().to_path_buf();
+                    if cont.is_deniable() {
+                        Err(
+                            "Secure Enclave keyslots are not supported on deniable vaults: \
+                         deniable slots are fixed at creation time and Secure Enclave \
+                         is not a deniable credential."
+                                .into(),
+                        )
+                    } else {
+                        enroll_hybrid_pq_sep_into(
+                            theme,
+                            &mut cont,
+                            &vp,
+                            luksbox_pq::PqParams::Ml1024,
+                        )
+                    }
+                }
+                // ===== fused Secure Enclave rows (macOS) =====
+                // Actions 20..=28 cover SEP+FIDO2 / +passphrase / +both,
+                // plain and hybrid (ML-KEM-768/1024). Generalized through
+                // enroll_sep_fused_into.
+                #[cfg(target_os = "macos")]
+                20..=28 => {
+                    if cont.is_deniable() {
+                        Err(
+                            "Secure Enclave keyslots are not supported on deniable vaults: \
+                         deniable slots are fixed at creation time and Secure Enclave \
+                         is not a deniable credential."
+                                .into(),
+                        )
+                    } else {
+                        let vp = cont.vault_path().to_path_buf();
+                        let (factors, params) = match action {
+                            20 => (crate::SepFactors::Fido2, None),
+                            21 => (crate::SepFactors::Passphrase, None),
+                            22 => (crate::SepFactors::Fido2Passphrase, None),
+                            23 => (crate::SepFactors::Fido2, Some(luksbox_pq::PqParams::Ml768)),
+                            24 => (crate::SepFactors::Fido2, Some(luksbox_pq::PqParams::Ml1024)),
+                            25 => (
+                                crate::SepFactors::Passphrase,
+                                Some(luksbox_pq::PqParams::Ml768),
+                            ),
+                            26 => (
+                                crate::SepFactors::Passphrase,
+                                Some(luksbox_pq::PqParams::Ml1024),
+                            ),
+                            27 => (
+                                crate::SepFactors::Fido2Passphrase,
+                                Some(luksbox_pq::PqParams::Ml768),
+                            ),
+                            28 => (
+                                crate::SepFactors::Fido2Passphrase,
+                                Some(luksbox_pq::PqParams::Ml1024),
+                            ),
+                            _ => unreachable!(),
+                        };
+                        enroll_sep_fused_into(theme, &mut cont, &vp, factors, params)
+                    }
+                }
+                13 => update_keyslot_action(theme, &mut cont),
+                14 => {
+                    if cont.is_deniable() {
+                        // Deniable vaults don't expose a populated/empty
+                        // slot table (it's all opaque ciphertext); admin
+                        // picks an index directly. The current unlock slot
+                        // is rejected inside `clear_deniable_slot` to
+                        // prevent self-lockout.
+                        let slot_idx = ask_deniable_slot_idx(theme, &cont)?;
+                        if Confirm::with_theme(theme)
                         .with_prompt(format!(
                             "Clear deniable slot {slot_idx}? Whatever credential was there will \
                              no longer unlock this vault."
@@ -5858,16 +6210,16 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                         cont.persist_header()?;
                         println!("OK deniable slot {slot_idx} cleared");
                     }
-                    Ok(())
-                } else {
-                    let labels: Vec<String> = (0..MAX_KEYSLOTS)
-                        .map(|i| format_slot(i, &cont.header.keyslots[i], false))
-                        .collect();
-                    let pick = Select::with_theme(theme)
-                        .with_prompt("Slot to revoke")
-                        .items(&labels)
-                        .interact()?;
-                    if Confirm::with_theme(theme)
+                        Ok(())
+                    } else {
+                        let labels: Vec<String> = (0..MAX_KEYSLOTS)
+                            .map(|i| format_slot(i, &cont.header.keyslots[i], false))
+                            .collect();
+                        let pick = Select::with_theme(theme)
+                            .with_prompt("Slot to revoke")
+                            .items(&labels)
+                            .interact()?;
+                        if Confirm::with_theme(theme)
                         .with_prompt(format!(
                             "Revoke slot {pick}? If this is your last keyslot you will be locked out."
                         ))
@@ -5877,13 +6229,24 @@ fn keyslot_loop(theme: &ColorfulTheme, mut cont: Container) -> Result<Container>
                         cont.revoke_slot(pick)?;
                         cont.persist_header()?;
                         println!("OK slot {pick} revoked");
+                        if cont.is_external() {
+                            // R16-17, as `luksbox revoke` says it.
+                            eprintln!(
+                                "warning: on a sync bundle, revoking a keyslot does not change \
+                                 the master key, and the sync service keeps the old keyslot \
+                                 table in its history. Whoever held that credential can still \
+                                 read this vault with it. For a real revocation: `luksbox sync \
+                                 export`, `luksbox rotate-mvk` on the exported file, then \
+                                 `luksbox sync convert` it into a new bundle and delete this one."
+                            );
+                        }
                     }
-                    Ok(())
+                        Ok(())
+                    }
                 }
+                _ => unreachable!(),
             }
-            15 => return Ok(cont),
-            _ => unreachable!(),
-        };
+        })();
         if let Err(e) = r {
             eprintln!("FAIL {e}");
         }
@@ -6121,12 +6484,9 @@ fn enroll_tpm2_deniable_into(theme: &ColorfulTheme, c: &mut Container) -> Result
     // an explicit "leave blank for no PIN" hint so callers can't
     // accidentally seal-with-empty-string and trip the same
     // asymmetry on the unseal side.
-    let pin_input = zeroize::Zeroizing::new(
-        Password::with_theme(theme)
-            .with_prompt("TPM PIN (leave blank for no PIN)")
-            .allow_empty_password(true)
-            .interact()?,
-    );
+    // Asked twice: the deniable vault has this one envelope slot, so a
+    // mistyped PIN made it unopenable for good.
+    let pin_input = ask_new_optional_tpm_pin(theme)?;
     let pin_bytes: Option<&[u8]> = if pin_input.is_empty() {
         None
     } else {
@@ -6238,8 +6598,15 @@ fn enroll_hybrid_pq_tpm2_deniable_into(
         hmac_salt: None,
         tpm_blob,
     };
+    // The seed file first (a bad path fails before anything changed);
+    // the keyslot table is saved last, after the sidecar.
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )?;
     let idx = c.enroll_credential_v2_deniable(slot_idx, &cred, &material)?;
-    c.persist_header()?;
 
     // Merge with existing sidecar entries, replacing any stale
     // entry for this slot index. Without the filter the sidecar
@@ -6269,13 +6636,11 @@ fn enroll_hybrid_pq_tpm2_deniable_into(
     // to peek, deniable readers use `read` (which ignores bindings),
     // and a binding would hard-link the sidecar to the vault. See
     // the `hybrid_sidecar::write` docs.
-    hybrid_sidecar::write(&sidecar_path, &entries)?;
-    seed_file::write(
-        &kyber_path,
-        &seed,
-        seed_pw.as_bytes(),
-        seed_file::KdfParams::default(),
-    )?;
+    if let Err(e) = hybrid_sidecar::write(&sidecar_path, &entries) {
+        let _ = std::fs::remove_file(&kyber_path);
+        return Err(e.into());
+    }
+    c.persist_header()?;
 
     println!("OK deniable hybrid-PQ+TPM slot enrolled at index {idx}");
     println!("  .kyber seed:    {}", kyber_path.display());
@@ -6350,8 +6715,15 @@ fn enroll_hybrid_pq_tpm2_fido2_deniable_into(
         hmac_salt: Some(hmac_salt),
         tpm_blob,
     };
+    // The seed file first (a bad path fails before anything changed);
+    // the keyslot table is saved last, after the sidecar.
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )?;
     let idx = c.enroll_credential_v2_deniable(slot_idx, &cred, &material)?;
-    c.persist_header()?;
 
     // Merge with existing sidecar entries; see comment in the
     // sibling `enroll_hybrid_pq_tpm2_deniable_into` above.
@@ -6378,13 +6750,11 @@ fn enroll_hybrid_pq_tpm2_fido2_deniable_into(
     // to peek, deniable readers use `read` (which ignores bindings),
     // and a binding would hard-link the sidecar to the vault. See
     // the `hybrid_sidecar::write` docs.
-    hybrid_sidecar::write(&sidecar_path, &entries)?;
-    seed_file::write(
-        &kyber_path,
-        &seed,
-        seed_pw.as_bytes(),
-        seed_file::KdfParams::default(),
-    )?;
+    if let Err(e) = hybrid_sidecar::write(&sidecar_path, &entries) {
+        let _ = std::fs::remove_file(&kyber_path);
+        return Err(e.into());
+    }
+    c.persist_header()?;
 
     println!("OK deniable 4-factor slot enrolled at index {idx}");
     println!("  .kyber seed:    {}", kyber_path.display());
@@ -6691,6 +7061,32 @@ fn unlock_via_hybrid_pq_fido2(
 // The corresponding `unlock_via_tpm*` helpers are inverses, used by
 // the open-wizard's unlock-method menu when the vault has TPM slots.
 
+/// A new TPM PIN that may be left blank (no PIN), asked twice.
+#[allow(dead_code)]
+fn ask_new_optional_tpm_pin(theme: &ColorfulTheme) -> Result<zeroize::Zeroizing<String>> {
+    loop {
+        let a = zeroize::Zeroizing::new(
+            Password::with_theme(theme)
+                .with_prompt("TPM PIN (leave blank for no PIN)")
+                .allow_empty_password(true)
+                .interact()?,
+        );
+        if a.is_empty() {
+            return Ok(a);
+        }
+        let b = zeroize::Zeroizing::new(
+            Password::with_theme(theme)
+                .with_prompt("confirm")
+                .allow_empty_password(true)
+                .interact()?,
+        );
+        if *a == *b {
+            return Ok(a);
+        }
+        eprintln!("PINs do not match, try again");
+    }
+}
+
 /// Prompt for a TPM PIN with confirmation. Same shape as
 /// `ask_new_passphrase` but skips the strength check (PIN is bound
 /// to the chip's dictionary-attack lockout, not Argon2id, so 4-6
@@ -6870,6 +7266,17 @@ fn enroll_hybrid_pq_sep_into(
     let (ct, pq_shared) =
         encapsulate_with(params, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
 
+    // The seed file first: a bad seed path (a missing folder, an existing
+    // file) then fails before anything changed. The keyslot table is
+    // saved last, once the sidecar is written too, so a failure in
+    // between never leaves a slot that can not unlock on disk.
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )
+    .map_err(|e| format!("write kyber seed: {e}"))?;
     let idx = c.enroll_sep(
         kind,
         &sep_shared,
@@ -6881,7 +7288,6 @@ fn enroll_hybrid_pq_sep_into(
         &[],
         [0u8; 32],
     )?;
-    c.persist_header()?;
 
     let sidecar = hybrid_sidecar::sidecar_path(vault);
     let mut entries = if sidecar.exists() {
@@ -6899,16 +7305,12 @@ fn enroll_hybrid_pq_sep_into(
         pubkey: pk,
         ciphertext: ct,
     });
-    hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt())
-        .map_err(|e| format!("write hybrid sidecar: {e}"))?;
-
-    seed_file::write(
-        &kyber_path,
-        &seed,
-        seed_pw.as_bytes(),
-        seed_file::KdfParams::default(),
-    )
-    .map_err(|e| format!("write kyber seed: {e}"))?;
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
+        let _ = std::fs::remove_file(&kyber_path);
+        let _ = c.revoke_slot(idx);
+        return Err(format!("write hybrid sidecar: {e}").into());
+    }
+    c.persist_header()?;
 
     println!(
         "OK enrolled hybrid Secure Enclave + {level_label} keyslot in slot {idx}\n  \
@@ -7243,11 +7645,21 @@ fn enroll_hybrid_pq_tpm2_into(
     let (ct, pq_shared) =
         encapsulate_with(params, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
 
+    // The seed file first: a bad seed path (a missing folder, an existing
+    // file) then fails before anything changed. The keyslot table is
+    // saved last, once the sidecar is written too, so a failure in
+    // between never leaves a slot that can not unlock on disk.
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )
+    .map_err(|e| format!("write kyber seed: {e}"))?;
     let idx = match params {
         PqParams::Ml768 => c.enroll_hybrid_pq_tpm2(&tpm_kek, &pq_shared, &blob_bytes)?,
         PqParams::Ml1024 => c.enroll_hybrid_pq_1024_tpm2(&tpm_kek, &pq_shared, &blob_bytes)?,
     };
-    c.persist_header()?;
 
     let sidecar = hybrid_sidecar::sidecar_path(vault);
     let mut entries = if sidecar.exists() {
@@ -7265,16 +7677,12 @@ fn enroll_hybrid_pq_tpm2_into(
         pubkey: pk,
         ciphertext: ct,
     });
-    hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt())
-        .map_err(|e| format!("write hybrid sidecar: {e}"))?;
-
-    seed_file::write(
-        &kyber_path,
-        &seed,
-        seed_pw.as_bytes(),
-        seed_file::KdfParams::default(),
-    )
-    .map_err(|e| format!("write kyber seed: {e}"))?;
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
+        let _ = std::fs::remove_file(&kyber_path);
+        let _ = c.revoke_slot(idx);
+        return Err(format!("write hybrid sidecar: {e}").into());
+    }
+    c.persist_header()?;
 
     println!(
         "OK enrolled hybrid TPM 2.0 + {level_label} keyslot in slot {idx}\n  \
@@ -7359,6 +7767,17 @@ fn enroll_hybrid_pq_tpm2_fido2_into(
     let (ct, pq_shared) =
         encapsulate_with(params, &pk).map_err(|e| format!("ML-KEM encapsulate: {e}"))?;
 
+    // The seed file first: a bad seed path (a missing folder, an existing
+    // file) then fails before anything changed. The keyslot table is
+    // saved last, once the sidecar is written too, so a failure in
+    // between never leaves a slot that can not unlock on disk.
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )
+    .map_err(|e| format!("write kyber seed: {e}"))?;
     let idx = match params {
         PqParams::Ml768 => c.enroll_hybrid_pq_tpm2_fido2(
             &tpm_unsealed,
@@ -7377,7 +7796,6 @@ fn enroll_hybrid_pq_tpm2_fido2_into(
             hmac_salt,
         )?,
     };
-    c.persist_header()?;
 
     let sidecar = hybrid_sidecar::sidecar_path(vault);
     let mut entries = if sidecar.exists() {
@@ -7395,16 +7813,12 @@ fn enroll_hybrid_pq_tpm2_fido2_into(
         pubkey: pk,
         ciphertext: ct,
     });
-    hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt())
-        .map_err(|e| format!("write hybrid sidecar: {e}"))?;
-
-    seed_file::write(
-        &kyber_path,
-        &seed,
-        seed_pw.as_bytes(),
-        seed_file::KdfParams::default(),
-    )
-    .map_err(|e| format!("write kyber seed: {e}"))?;
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
+        let _ = std::fs::remove_file(&kyber_path);
+        let _ = c.revoke_slot(idx);
+        return Err(format!("write hybrid sidecar: {e}").into());
+    }
+    c.persist_header()?;
 
     println!(
         "OK enrolled three-factor TPM + FIDO2 + {level_label} keyslot in slot {idx}\n  \
@@ -7466,6 +7880,17 @@ fn enroll_hybrid_pq_passphrase_into(
     // R15-H3: the vault's strongest passphrase cost, not a fixed preset.
     let slot_kdf = crate::kdf_params_for_existing(&c.header, None, None);
     crate::warn_if_weak_kdf(&slot_kdf);
+    // The seed file first: a bad seed path (a missing folder, an existing
+    // file) then fails before anything changed. The keyslot table is
+    // saved last, once the sidecar is written too, so a failure in
+    // between never leaves a slot that can not unlock on disk.
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )
+    .map_err(|e| format!("write kyber seed: {e}"))?;
     let idx = match params {
         PqParams::Ml768 => {
             c.enroll_hybrid_pq_passphrase(slot_pw.as_bytes(), &pq_shared, slot_kdf)?
@@ -7474,7 +7899,6 @@ fn enroll_hybrid_pq_passphrase_into(
             c.enroll_hybrid_pq_1024_passphrase(slot_pw.as_bytes(), &pq_shared, slot_kdf)?
         }
     };
-    c.persist_header()?;
 
     // Drop any stale sidecar entry at the same slot index. Standard
     // mode uses `first_free_slot()` so this is normally a no-op,
@@ -7498,16 +7922,12 @@ fn enroll_hybrid_pq_passphrase_into(
         pubkey: pk,
         ciphertext: ct,
     });
-    hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt())
-        .map_err(|e| format!("write hybrid sidecar: {e}"))?;
-
-    seed_file::write(
-        &kyber_path,
-        &seed,
-        seed_pw.as_bytes(),
-        seed_file::KdfParams::default(),
-    )
-    .map_err(|e| format!("write kyber seed: {e}"))?;
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
+        let _ = std::fs::remove_file(&kyber_path);
+        let _ = c.revoke_slot(idx);
+        return Err(format!("write hybrid sidecar: {e}").into());
+    }
+    c.persist_header()?;
 
     println!(
         "OK enrolled hybrid passphrase + {level_label} keyslot in slot {idx}\n  \
@@ -7555,8 +7975,18 @@ fn enroll_hybrid_pq_passphrase_deniable_into(
         mlkem_shared: &pq_shared,
     };
     let material = DeniableMaterial::passphrase_only();
+    // The seed file first: a bad seed path (a missing folder, an existing
+    // file) then fails before anything changed. The keyslot table is
+    // saved last, once the sidecar is written too, so a failure in
+    // between never leaves a slot that can not unlock on disk.
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )
+    .map_err(|e| format!("write kyber seed: {e}"))?;
     let idx = c.enroll_credential_v2_deniable(slot_idx, &cred, &material)?;
-    c.persist_header()?;
 
     // Drop any stale sidecar entry for this slot index before
     // appending the new one. Deniable mode lets the user pick an
@@ -7586,15 +8016,11 @@ fn enroll_hybrid_pq_passphrase_deniable_into(
     // to peek, deniable readers use `read` (which ignores bindings),
     // and a binding would hard-link the sidecar to the vault. See
     // the `hybrid_sidecar::write` docs.
-    hybrid_sidecar::write(&sidecar, &entries).map_err(|e| format!("write hybrid sidecar: {e}"))?;
-
-    seed_file::write(
-        &kyber_path,
-        &seed,
-        seed_pw.as_bytes(),
-        seed_file::KdfParams::default(),
-    )
-    .map_err(|e| format!("write kyber seed: {e}"))?;
+    if let Err(e) = hybrid_sidecar::write(&sidecar, &entries) {
+        let _ = std::fs::remove_file(&kyber_path);
+        return Err(format!("write hybrid sidecar: {e}").into());
+    }
+    c.persist_header()?;
 
     println!(
         "OK enrolled deniable hybrid passphrase + {level_label} keyslot in slot {idx}\n  \
@@ -7674,6 +8100,17 @@ fn enroll_hybrid_pq_fido2_into(
     } else {
         kdf_params()
     };
+    // The seed file first: a bad seed path (a missing folder, an existing
+    // file) then fails before anything changed. The keyslot table is
+    // saved last, once the sidecar is written too, so a failure in
+    // between never leaves a slot that can not unlock on disk.
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )
+    .map_err(|e| format!("write kyber seed: {e}"))?;
     let idx = match params {
         PqParams::Ml768 => c.enroll_hybrid_pq_fido2(
             slot_pw_opt,
@@ -7692,7 +8129,6 @@ fn enroll_hybrid_pq_fido2_into(
             slot_kdf,
         )?,
     };
-    c.persist_header()?;
 
     // Drop any stale entry at this slot index (defensive; standard
     // mode uses first_free_slot which is normally Empty + has no
@@ -7715,16 +8151,12 @@ fn enroll_hybrid_pq_fido2_into(
         pubkey: pk,
         ciphertext: ct,
     });
-    hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt())
-        .map_err(|e| format!("write hybrid sidecar: {e}"))?;
-
-    seed_file::write(
-        &kyber_path,
-        &seed,
-        seed_pw.as_bytes(),
-        seed_file::KdfParams::default(),
-    )
-    .map_err(|e| format!("write kyber seed: {e}"))?;
+    if let Err(e) = hybrid_sidecar::write_with_binding(&sidecar, &entries, c.header_salt()) {
+        let _ = std::fs::remove_file(&kyber_path);
+        let _ = c.revoke_slot(idx);
+        return Err(format!("write hybrid sidecar: {e}").into());
+    }
+    c.persist_header()?;
 
     println!(
         "OK enrolled hybrid FIDO2 + {level_label} keyslot in slot {idx}\n  \
@@ -7804,8 +8236,18 @@ fn enroll_hybrid_pq_fido2_deniable_into(
         hmac_salt: Some(hmac_salt),
         tpm_blob: Vec::new(),
     };
+    // The seed file first: a bad seed path (a missing folder, an existing
+    // file) then fails before anything changed. The keyslot table is
+    // saved last, once the sidecar is written too, so a failure in
+    // between never leaves a slot that can not unlock on disk.
+    seed_file::write(
+        &kyber_path,
+        &seed,
+        seed_pw.as_bytes(),
+        seed_file::KdfParams::default(),
+    )
+    .map_err(|e| format!("write kyber seed: {e}"))?;
     let idx = c.enroll_credential_v2_deniable(slot_idx, &cred, &material)?;
-    c.persist_header()?;
 
     // Drop any stale entry at this slot index. Deniable mode lets
     // the user pick an occupied index and `install_slot_v2`
@@ -7833,15 +8275,11 @@ fn enroll_hybrid_pq_fido2_deniable_into(
     // to peek, deniable readers use `read` (which ignores bindings),
     // and a binding would hard-link the sidecar to the vault. See
     // the `hybrid_sidecar::write` docs.
-    hybrid_sidecar::write(&sidecar, &entries).map_err(|e| format!("write hybrid sidecar: {e}"))?;
-
-    seed_file::write(
-        &kyber_path,
-        &seed,
-        seed_pw.as_bytes(),
-        seed_file::KdfParams::default(),
-    )
-    .map_err(|e| format!("write kyber seed: {e}"))?;
+    if let Err(e) = hybrid_sidecar::write(&sidecar, &entries) {
+        let _ = std::fs::remove_file(&kyber_path);
+        return Err(format!("write hybrid sidecar: {e}").into());
+    }
+    c.persist_header()?;
 
     println!(
         "OK enrolled deniable hybrid FIDO2 + {level_label} keyslot in slot {idx}\n  \

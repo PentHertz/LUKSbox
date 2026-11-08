@@ -857,10 +857,12 @@ impl FileSystemInterface for LuksboxFs {
             }
             WriteMode::WriteToEOF => vfs.stat(ctx.file_id).map_err(|e| vfs_err_to_nt(&e))?.size,
         };
-        vfs.write(ctx.file_id, offset, buffer)
+        // R16-19: report what the vault took, not what was offered.
+        let n = vfs
+            .write(ctx.file_id, offset, buffer)
             .map_err(|e| vfs_err_to_nt(&e))?;
         let info = make_file_info(&mut vfs, ctx.file_id)?;
-        Ok((buffer.len(), info))
+        Ok((n, info))
     }
 
     /// Overwrite (truncate + reset) an existing file. WinFsp dispatches

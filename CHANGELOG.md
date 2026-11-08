@@ -31,6 +31,20 @@ export` turns a bundle back into a `.lbx`.
 
 ### Added
 
+- **GUI: the size of the file list region at create** (On-disk format,
+  advanced), as `luksbox create --metadata-size`. Every save rewrites
+  this region twice in full, so a smaller one (16, 4 or 1 MiB instead
+  of 64) makes saves faster on a USB stick or SD card, at the cost of
+  how many files the vault can hold (about 20 000 short-named files per
+  MiB; the region cannot grow later). The default is unchanged.
+- **Headless GUI scenarios** (`crates/luksbox-gui/src/app/gui_scenarios.rs`):
+  the real app driven through its widgets without a display
+  (egui_kittest, a test-only dependency): create a vault file, a sync
+  bundle and a detached-header + anchor + hidden-sizes vault from the
+  form, a deniable vault, every browser action, keyslots, lock and
+  unlock, mount, bundle conversion and versions, checking the vault and
+  extracted files.
+
 - **Sync bundles (`.lbxs`), experimental.** A vault kept as a folder in
   Dropbox, Google Drive, OneDrive, iCloud Drive, Nextcloud or
   Syncthing: only changed parts upload (a few MiB per small edit,
@@ -76,8 +90,240 @@ export` turns a bundle back into a `.lbx`.
   - the first open on each device says the folder is synced and points
     at sync bundles.
 
+### Security
+
+- **Audit round 16** (sync bundles and a full-workspace sweep; report in
+  `docs/SECURITY_AUDIT_ROUND_16.md`). Fixed in this revision:
+  - a header recovered from its `.header-bak` mirror was written back
+    as a new header state (generation + 1), so an attacker who corrupted
+    the live header and planted a pre-revocation mirror got the old
+    keyslot table past the rollback anchor on the second open (R16-01;
+    the recovered header is now re-established byte for byte);
+  - `shrink` (or shrink on close) after a write that failed on the size
+    limit or a full disk left a free-list entry past the end of the
+    file, and the vault refused to open afterwards (R16-02);
+  - a FIFO planted at a mirror, hybrid sidecar or anchor path stalled
+    the open (R16-14); `rescue_if_replaced` copied a vault opened
+    through a symlink after every save (R16-16); `export_external_header`
+    accepted a header with a gap between its metadata region and its
+    data (R16-15); the all-zero hardware-factor check is constant time
+    (R16-20).
+  - Sync bundles: an incomplete commit (a device that died mid-upload,
+    an object the service never delivered) no longer locks every device
+    read-only for good, the first complete head is used and the pending
+    one reported (R16-03); a session that cannot publish (read-only, or
+    a commit is missing) shows the changes this device saved and never
+    uploaded, reports them, and includes them in an export (R16-04);
+    a publish that failed in a background mount is remembered and
+    reported at the next open and in `sync status` (R16-08); header
+    objects are capped (R16-05), lease listings are not silently cut
+    (R16-06), more than 256 device identities no longer produce a
+    commit every reader rejects (R16-07), every per-device state folder
+    is private (R16-09), no state is ever written under the working
+    folder when no data folder is known (R16-10), the rollback-detection
+    opt-outs (`LUKSBOX_NO_AUTO_ANCHOR`, `LUKSBOX_SYNC_STATE_DIR`) are
+    announced (R16-12), the FUSE-T background mount's parent no longer
+    publishes or closes the lease under the running mount (R16-13), and
+    the "cannot be rebuilt, discard" message no longer tells a user in
+    the middle of a sync to discard changes (R16-18).
+  - `luksbox merge` refuses a base that is newer than one of the copies
+    (R16-11): with such a base the merge silently took the base's older
+    content and dropped files, then raised the generation past the
+    anchor.
+  - `luksbox revoke` on a bundle says that the master key is unchanged
+    and how to rotate it (R16-17).
+- **`luksbox sync export --snapshot <id>`** writes an earlier version
+  of a bundle to a `.lbx`: the way out when the newest version's objects
+  arrived damaged (R16-22).
+- New regression tests (`round16_findings.rs` in `luksbox-format`,
+  `luksbox-vfs`, `luksbox-sync`; one in `luksbox-merge`), six fuzz
+  targets for the sync layer with AFL++ mirrors, and
+  `scripts/fuzz_sync.sh`.
+
+### Performance
+
+- **`luksbox put` and `get` take whole folders.** A folder goes in or
+  out with one unlock and one save: 521 files in 0.8 s, where one `put`
+  per file took 0.7 s each (345 s for 500 files), the unlock and the
+  128 MiB save being paid for every file. Symbolic links and special
+  files are skipped, never followed; names from the vault that could
+  leave the destination folder are refused; `get` writes a new folder
+  (0700, files 0600) and refuses an existing one.
+- **Writing into a vault is about 1.5x faster.** A new 4 KiB chunk was
+  first written encrypted as zeros, read back and decrypted, then
+  encrypted and written again with its data: three encryptions and
+  three disk operations per 4 KiB. A chunk a write covers is now
+  written once. Vault I/O also uses positioned reads and writes (one
+  system call per chunk instead of a seek plus a read or write).
+  512 MiB through `luksbox put`: 169 MB/s before, 241 MB/s now
+  (AES-256-GCM-SIV, unlock included); figures for every vault kind in
+  `docs/PERFORMANCE.md`.
+- **Writing no longer slows down as a vault fills up.** Every write that
+  grew a file re-serialized the whole directory tree to check that the
+  metadata would still fit, so its cost grew with the number of files:
+  importing many files was quadratic. The exact check now runs only
+  when a conservative upper bound of the growth since the last one
+  could reach the limit. In a vault of 20 000 files, `put` of 64 MiB:
+  5.0 s before, 0.96 s now; 20 000 small files through a mount: 45 s
+  before, 7 s now.
+
 ### Fixed
 
+- **`luksbox umount` returned before the vault was saved.** The mount
+  saves and releases the vault after the kernel lets go of the
+  mountpoint, so `luksbox umount mnt && luksbox ls vault.lbx /` failed
+  with "vault locked by another process", and switching the computer
+  off right after `umount` could lose the last changes. `umount` now
+  waits (up to 2 minutes) until the mount has saved and released the
+  vault.
+- **A passphrase in `LUKSBOX_PASSPHRASE` could still hang the command.**
+  With stdin an open pipe that sends nothing (an `ssh` session, a CI
+  step, a `while read` loop), the CLI waited forever for a passphrase
+  line on stdin. It now reads stdin only when data is waiting there;
+  the "ambiguous passphrase source" error (both a pipe and the
+  variable) says to use `< /dev/null` in loops.
+- **`luksbox extract` on a `--hide-sizes` vault kept the padding.** The
+  recovered file had the zeros of the size padding after its content,
+  even when every chunk was intact; it is now cut to the real size
+  whenever chunk 0 (which holds it) is readable.
+- **Terminal prompts without a terminal** (deniable commands, which
+  read secrets from the terminal only, run from a script) failed with
+  "No such device or address (os error 6)"; they now say a terminal is
+  needed.
+- **Wizard (`luksbox wizard`):**
+  - a background mount of a sync bundle no longer has the parent
+    process publish and close the lease under the running mount
+    (macOS FUSE-T);
+  - "Rotate master volume key" and adding a post-quantum keyslot are
+    refused for a sync bundle (rotation wrote pages under keys the
+    bundle does not use; the post-quantum sidecar went outside the
+    bundle and the slot could never unlock), and revoking on a bundle
+    shows the same warning as `luksbox revoke`;
+  - an aborted PANIC no longer reports "vault was destroyed";
+  - a failed "Copy a local file in" (size limit, full disk) no longer
+    leaves a truncated file that the next save keeps;
+  - an error in "Manage keyslots" (for example declining the "I have
+    stored the passphrase" question) returns to the keyslot menu
+    instead of closing the vault;
+  - path prompts accept `~/` and pasted quotes, and prompts with a
+    default no longer pre-fill it (typing a path after the pre-filled
+    `vault.lbx` produced `vault.lbx/home/...`);
+  - "Copy a file out" asks before replacing an existing local file;
+  - directory listings are sanitized like `luksbox ls` (terminal
+    escape sequences in file names);
+  - the anchor question is skipped for a sync bundle (the CLI refuses
+    `--anchor` there);
+  - creating a deniable TPM vault asks for the TPM PIN twice;
+  - the maximum size chosen for a single-slot TPM vault is applied
+    (it was ignored);
+  - adding a post-quantum keyslot writes the `.kyber` seed first and
+    the keyslot table last: a seed path that fails (a missing folder)
+    no longer leaves a keyslot that can never unlock;
+  - a second foreground mount in one run is ended by Ctrl-C (Ctrl-C
+    unmounted the first mountpoint and the wizard hung on the second);
+    a background mount after a foreground one says why it mounts in the
+    foreground instead of failing after all the questions;
+  - the "mounting in the foreground" line comes after the last
+    question; Enter at the maximum-size question keeps the exact
+    current limit (it stored a rounded value); a new passphrase keyslot
+    defaults to the vault's strongest key-derivation preset, as
+    `luksbox enroll` does; rotation refuses TPM, Secure Enclave and
+    post-quantum slots before asking for any credential; an error after
+    unlocking a sync bundle no longer leaves its session and lease open;
+  - a rotation stopped before re-encrypting (a wrong anchor, a refused
+    slot, an aborted question) and a mistyped mountpoint keep the vault
+    open (both closed it, so the user had to unlock again); the mount
+    questions are asked before the vault is handed to the mount;
+  - in recovery mode, "Manage keyslots" and "Rotate" are refused with a
+    reason (they reopened the vault without recovery mode, hit the same
+    damage and closed it);
+  - a background mount on Linux says that the wizard ends there (the
+    mount lives on in its own process).
+- **`luksbox get` of a folder on Windows** skips, and reports, vault
+  entries whose names Windows cannot create (`12:30.log` from a Linux
+  vault, `?`, `*`, reserved names such as `CON`) instead of stopping.
+  The rules live in one function shared with the GUI
+  (`luksbox_core::file_util::windows_name_problem`), unit-tested on
+  every platform.
+- **`luksbox enroll --kind tpm2-pin`** asks for the PIN as a PIN
+  (twice, no passphrase strength check, `LUKSBOX_TPM_PIN` for scripts).
+- **GUI:**
+  - dropping a folder that contains the open vault onto the browser no
+    longer imports the vault into itself (the copy never ended and
+    filled the disk on Linux and macOS);
+  - creating a vault asks for the passphrase twice (a typo made a
+    vault nobody could open);
+  - closing the window while an operation runs waits for it instead of
+    killing it halfway (an in-place master-key rotation of a
+    detached-header vault was left half re-encrypted), and closing with
+    a vault open locks it first, so a sync bundle uploads its last
+    changes and releases its lease;
+  - Esc cancels only the authenticator-touch waits; for any other job
+    it showed "cancelled" while the job went on with the vault;
+  - Delete asks for confirmation and removes a folder with its content;
+  - an export replaces an existing file only once the new copy is
+    complete, and a failed export no longer leaves a partial file;
+  - a sync bundle publishes on schedule while the window is idle;
+  - master-key rotation is no longer offered for a sync bundle;
+  - "Make sync bundle..." runs in the background (it froze the window
+    for minutes on a large vault), and a conversion that fails removes
+    its half-made bundle folder;
+  - Lock uploads a sync bundle's last changes in the background (the
+    window froze for the whole upload); quitting waits for that upload;
+  - large folders scroll smoothly (only the rows in view are drawn,
+    and the listing is no longer copied on every repaint); the vault
+    size dialog and the recent list no longer recompute or stat on
+    every repaint (an unreachable network share stalled the window);
+  - an import skips, and reports, entries whose name already exists or
+    is not accepted by the vault instead of stopping at the first one;
+  - a folder entry that cannot be read is listed (size 0) and reported
+    instead of hiding every entry after it;
+  - the macOS FUSE-T mount helper is given the vault's anchor and the
+    "Eager flush" choice (both were dropped, leaving a gap in rollback
+    detection for writes made through that mount);
+  - "Mount as volume..." is disabled in a build without mount support
+    (the failed mount closed the vault);
+  - a vault whose header-v3 switch or maximum size failed at create is
+    opened and added to Recent, with a warning saying what to redo (it
+    was reported as a failed create, and a sync bundle being created was
+    deleted);
+  - a folder export on Windows skips, and reports, entries Windows
+    cannot name (and symbolic links) instead of stopping at the first;
+  - "+ Add folder..." imports a folder with its content (until now only
+    by drag and drop), "+ Add files..." takes several files selected
+    together in the dialog (it took one per dialog), and names sort
+    without regard to case;
+  - a toast no longer blocks clicks: its invisible area covered about
+    600 x 400 px in the lower right, so for five seconds after each
+    operation the buttons and rows there did nothing;
+  - every page opens at its top: the pages shared one scroll position,
+    so Keyslots opened scrolled to wherever the create form had been
+    left, with the slot list and its buttons out of sight;
+  - "New folder" takes the name at once and Enter creates it (it needed
+    a click in the field and on Create), and the message names the full
+    path in a subfolder;
+  - "Make sync bundle..." asks for the folder as a typed path when no
+    file dialog is available (it only showed an error);
+  - the "file list is full" warnings no longer suggest a region larger
+    than 64 MiB, the maximum;
+  - the Keyslots page of a deniable vault says why its master key
+    cannot be rotated (it said "No populated keyslots", or pointed at
+    the CLI, which cannot rotate one either).
+- **Filling a vault's metadata region lost the last import.** New
+  files were refused only when data was written, using a size estimate
+  that left out what current vaults store for each entry (mode, link
+  count, symlink target). Thousands of small files, or any number of
+  empty files and folders, filled the region unnoticed, and the save
+  at the end failed with "metadata blob is larger than the metadata
+  region", dropping everything since the previous save. The estimate
+  now matches what is saved, and new files, folders and links are
+  refused ("no space left on device") while the region still holds
+  them; deletes are never refused.
+- **`luksbox put` into a folder.** A destination of `/` or ending with
+  `/` receives the file or folder under its own name (`put vault.lbx
+  photo.jpg /` failed with "empty inner path"). An existing folder
+  named without the `/` is still refused, now with a hint to add it, so
+  running the same folder `put` twice cannot nest a second copy.
 - **GUI vault header on narrow windows.** The vault name, folder and
   cipher no longer run into the buttons: the name is shortened with an
   ellipsis next to Lock, and the buttons wrap onto a row of their own.

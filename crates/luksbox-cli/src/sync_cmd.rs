@@ -43,20 +43,36 @@ pub(crate) fn is_bundle(path: &Path) -> bool {
 /// `<data dir>/luksbox/sync` (`$XDG_DATA_HOME` or `~/.local/share` on
 /// Linux, `~/Library/Application Support` on macOS, `%APPDATA%` on
 /// Windows).
-pub(crate) fn local_root() -> PathBuf {
+pub(crate) fn local_root() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("LUKSBOX_SYNC_STATE_DIR") {
-        return PathBuf::from(p);
+        note_state_dir_override();
+        return Ok(PathBuf::from(p));
     }
-    data_dir().join("luksbox").join("sync")
+    Ok(data_dir()?.join("luksbox").join("sync"))
 }
 
 /// This device's automatic rollback anchors for vaults in cloud folders:
 /// `$LUKSBOX_SYNC_STATE_DIR/anchors`, else `<data dir>/luksbox/anchors`.
-pub(crate) fn anchors_dir() -> PathBuf {
+pub(crate) fn anchors_dir() -> Result<PathBuf> {
     if let Some(p) = std::env::var_os("LUKSBOX_SYNC_STATE_DIR") {
-        return PathBuf::from(p).join("anchors");
+        note_state_dir_override();
+        return Ok(PathBuf::from(p).join("anchors"));
     }
-    data_dir().join("luksbox").join("anchors")
+    Ok(data_dir()?.join("luksbox").join("anchors"))
+}
+
+static STATE_DIR_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// R16-12: the state folder holds what rollback detection compares
+/// against; pointing it elsewhere starts from "trust what is there".
+/// Said once, so it is never silent.
+fn note_state_dir_override() {
+    if !STATE_DIR_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        eprintln!(
+            "note: LUKSBOX_SYNC_STATE_DIR is set: sync state and rollback anchors are kept \
+             there instead of the application data folder"
+        );
+    }
 }
 
 /// Set by `luksbox merge`, which opens the copies on purpose.
@@ -70,7 +86,18 @@ pub(crate) fn attach_auto_anchor(cont: &mut Container) -> Result<()> {
     if cont.is_external() || cont.is_deniable() {
         return Ok(());
     }
-    if let Some(a) = luksbox_sync::cloud::attach_auto_anchor(cont, &anchors_dir())?
+    // R16-12: an opt-out from rollback detection is never silent.
+    if std::env::var_os(luksbox_sync::cloud::NO_AUTO_ANCHOR_ENV)
+        .is_some_and(|v| !v.is_empty() && v != "0")
+        && luksbox_sync::cloud::cloud_service(cont.vault_path()).is_some()
+    {
+        eprintln!(
+            "warning: {} is set: an older copy of this vault put back by the sync service \
+             is not detected",
+            luksbox_sync::cloud::NO_AUTO_ANCHOR_ENV
+        );
+    }
+    if let Some(a) = luksbox_sync::cloud::attach_auto_anchor(cont, &anchors_dir()?)?
         && a.created
     {
         eprintln!(
@@ -109,39 +136,52 @@ pub(crate) fn attach_auto_anchor(cont: &mut Container) -> Result<()> {
 /// The metadata half of the automatic anchor, once the vault is open
 /// (no-op for any other anchor).
 pub(crate) fn settle_auto_anchor(vfs: &mut Vfs) -> Result<()> {
-    Ok(luksbox_sync::cloud::settle_auto_anchor(
-        vfs,
-        &anchors_dir(),
-    )?)
+    let dir = anchors_dir()?;
+    Ok(luksbox_sync::cloud::settle_auto_anchor(vfs, &dir)?)
 }
 
 pub(crate) fn is_auto_anchor(cont: &Container) -> bool {
-    luksbox_sync::cloud::is_auto_anchor(cont, &anchors_dir())
+    anchors_dir()
+        .map(|d| luksbox_sync::cloud::is_auto_anchor(cont, &d))
+        .unwrap_or(false)
 }
 
-fn data_dir() -> PathBuf {
+/// The application data folder. R16-10: never the working folder as a
+/// fallback. `cd ~/Dropbox && env -i luksbox ...` (or a service unit
+/// without HOME) would otherwise put the device's sealed unpublished
+/// changes, its identity and its rollback anchors inside the synced
+/// folder, where the provider gets them.
+fn data_dir() -> Result<PathBuf> {
+    data_dir_opt().ok_or_else(|| {
+        "no application data folder is known (HOME / XDG_DATA_HOME / APPDATA is not set); \
+         set LUKSBOX_SYNC_STATE_DIR to a private folder outside any synced folder"
+            .into()
+    })
+}
+
+fn data_dir_opt() -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        if let Some(h) = std::env::var_os("HOME") {
-            return PathBuf::from(h).join("Library").join("Application Support");
+        if let Some(h) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(h).join("Library").join("Application Support"));
         }
     }
     #[cfg(windows)]
     {
-        if let Some(a) = std::env::var_os("APPDATA") {
-            return PathBuf::from(a);
+        if let Some(a) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(a));
         }
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
         if let Some(x) = std::env::var_os("XDG_DATA_HOME").filter(|v| !v.is_empty()) {
-            return PathBuf::from(x);
+            return Some(PathBuf::from(x));
         }
-        if let Some(h) = std::env::var_os("HOME") {
-            return PathBuf::from(h).join(".local").join("share");
+        if let Some(h) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return Some(PathBuf::from(h).join(".local").join("share"));
         }
     }
-    PathBuf::from(".")
+    None
 }
 
 /// How this device names itself in commits and conflict copies:
@@ -271,8 +311,21 @@ fn print_report(path: &Path, r: &OpenReport) {
             ),
             Notice::UnmergedLocalChanges { recoverable: false } => eprintln!(
                 "warning: changes saved on this device earlier were made on a version that \
-                 is no longer in the bundle and cannot be rebuilt; the vault is read-only \
-                 until they are discarded (`luksbox sync discard-local --yes`)"
+                 is not in the bundle here. If the sync is still running, wait for it to \
+                 finish and open the vault again: they are merged then. They are gone only \
+                 if that version was removed by `luksbox sync gc` after a long time offline; \
+                 discard them (`luksbox sync discard-local --yes`) only when you are sure \
+                 of that. The vault is read-only until then"
+            ),
+            Notice::UnpublishedLocalChanges { shown: true } => eprintln!(
+                "note: changes saved on this device earlier are not uploaded yet; they are \
+                 shown (read-only) and included in an export, and upload the next time the \
+                 vault opens read-write"
+            ),
+            Notice::UnpublishedLocalChanges { shown: false } => eprintln!(
+                "note: changes saved on this device earlier are not uploaded yet and are \
+                 not shown here (they were made on an older version); they upload the next \
+                 time the vault opens read-write"
             ),
         }
     }
@@ -326,13 +379,36 @@ pub(crate) fn open_with_material(
         device_label: device_label(),
         read_only: OPEN_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed),
     };
+    let root = local_root()
+        .map_err(|e| luksbox_format::Error::Io(std::io::Error::other(e.to_string())))?;
     let (session, container, report) =
-        bundle::fs::open(path, &local_root(), &mut material, &opts).map_err(sync_to_format)?;
+        bundle::fs::open(path, &root, &mut material, &opts).map_err(sync_to_format)?;
     print_report(path, &report);
+    // R16-08: an upload that failed where nobody saw it (a background
+    // mount) is reported here, at the next open.
+    if let Ok(Some(e)) = session.last_publish_error() {
+        eprintln!(
+            "warning: the last upload from this device failed ({e}); the changes are kept \
+             here and the upload is retried"
+        );
+    }
     if let Ok(mut g) = SESSION.lock() {
         *g = Some(session);
     }
     Ok(container)
+}
+
+/// Let go of the bundle session without publishing or closing its lease:
+/// for the parent of a background mount, whose child process now owns
+/// the session (R16-13). Without this the parent published (possibly a
+/// merge) and closed the lease under the running mount, from the same
+/// device identity.
+pub(crate) fn forget_active_session() {
+    if let Ok(mut g) = SESSION.lock()
+        && let Some(s) = g.take()
+    {
+        std::mem::forget(s);
+    }
 }
 
 /// End of a command: publish what the bundle session saved, merge
@@ -439,6 +515,11 @@ pub(crate) enum SyncCommand {
         bundle: PathBuf,
         /// The .lbx file to create (must not exist).
         output: PathBuf,
+        /// Export an earlier version instead of the newest (a prefix of
+        /// its id from `luksbox sync snapshots`): the way out when the
+        /// newest version's files arrived damaged.
+        #[arg(long)]
+        snapshot: Option<String>,
         #[command(flatten)]
         unlock: UnlockArgs,
     },
@@ -538,6 +619,20 @@ fn when(ns: u64) -> String {
     }
 }
 
+/// The one snapshot whose id starts with `prefix`.
+fn snapshot_by_prefix(s: &mut Session, prefix: &str) -> Result<[u8; 32]> {
+    let snaps = s.snapshots()?;
+    let m: Vec<_> = snaps
+        .iter()
+        .filter(|x| hex8(&x.hash).starts_with(prefix))
+        .collect();
+    match m.as_slice() {
+        [one] => Ok(one.hash),
+        [] => Err("no snapshot with that id".into()),
+        _ => Err("that id prefix matches several snapshots".into()),
+    }
+}
+
 fn with_session<T>(f: impl FnOnce(&mut Session) -> Result<T>) -> Result<T> {
     let mut g = SESSION.lock().map_err(|_| "sync session lock poisoned")?;
     let s = g.as_mut().ok_or("not a sync bundle")?;
@@ -568,7 +663,7 @@ pub(crate) fn cmd_sync(cmd: SyncCommand) -> Result<()> {
             let bid = bundle::fs::convert(
                 &mut c,
                 &dest,
-                &local_root(),
+                &local_root()?,
                 &ConvertOptions {
                     page_size: ps,
                     device_label: device_label(),
@@ -587,13 +682,30 @@ pub(crate) fn cmd_sync(cmd: SyncCommand) -> Result<()> {
         SyncCommand::Export {
             bundle: src,
             output,
+            snapshot,
             unlock,
         } => {
             require_bundle(&src)?;
-            let mut c = crate::open_container(&src, &unlock)?;
-            bundle::export(&mut c, &output)?;
-            c.set_read_only();
-            drop(c);
+            match snapshot {
+                None => {
+                    let mut c = crate::open_container(&src, &unlock)?;
+                    bundle::export(&mut c, &output)?;
+                    c.set_read_only();
+                    drop(c);
+                }
+                Some(prefix) => {
+                    // Only reads: no merge, no publish, and the newest
+                    // version's own objects are never opened.
+                    OPEN_READ_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let c = crate::open_container(&src, &unlock)?;
+                    drop(c);
+                    let hash = with_session(|s| snapshot_by_prefix(s, &prefix))?;
+                    let view = with_session(|s| Ok(s.snapshot_view(&hash)?))?;
+                    let mut c = view.close()?;
+                    bundle::export(&mut c, &output)?;
+                    drop(c);
+                }
+            }
             eprintln!("exported {} to {}", src.display(), output.display());
             Ok(())
         }
@@ -618,6 +730,9 @@ pub(crate) fn cmd_sync(cmd: SyncCommand) -> Result<()> {
                     "unpublished {}",
                     if s.has_unpublished() { "yes" } else { "no" }
                 );
+                if let Some(e) = s.last_publish_error()? {
+                    println!("last upload error: {e}");
+                }
                 for (label, w) in s.fresh_leases()? {
                     println!(
                         "open on     {label}{}",
@@ -683,18 +798,7 @@ pub(crate) fn cmd_sync(cmd: SyncCommand) -> Result<()> {
                 Some(prefix) => {
                     let inner = path.ok_or("--restore needs --path <path inside the vault>")?;
                     let mut live = Vfs::open(c)?;
-                    let snap_hash = with_session(|s| {
-                        let snaps = s.snapshots()?;
-                        let m: Vec<_> = snaps
-                            .iter()
-                            .filter(|x| hex8(&x.hash).starts_with(&prefix))
-                            .collect();
-                        match m.as_slice() {
-                            [one] => Ok(one.hash),
-                            [] => Err("no snapshot with that id".into()),
-                            _ => Err("that id prefix matches several snapshots".into()),
-                        }
-                    })?;
+                    let snap_hash = with_session(|s| snapshot_by_prefix(s, &prefix))?;
                     let mut view = with_session(|s| Ok(s.snapshot_view(&snap_hash)?))?;
                     let restored = luksbox_sync::gc::restore_path(&mut view, &mut live, &inner)?;
                     live.flush()?;

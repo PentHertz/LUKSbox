@@ -48,26 +48,32 @@ pub fn is_bundle(path: &Path) -> bool {
     bundle::fs::is_bundle(path)
 }
 
-fn local_root() -> PathBuf {
+fn local_root() -> Result<PathBuf, String> {
     if let Some(p) = std::env::var_os("LUKSBOX_SYNC_STATE_DIR") {
-        return PathBuf::from(p);
+        return Ok(PathBuf::from(p));
     }
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("luksbox")
-        .join("sync")
+    Ok(data_dir()?.join("luksbox").join("sync"))
 }
 
 /// This device's automatic rollback anchors for vaults in cloud folders
 /// (shared with the command line).
-fn anchors_dir() -> PathBuf {
+fn anchors_dir() -> Result<PathBuf, String> {
     if let Some(p) = std::env::var_os("LUKSBOX_SYNC_STATE_DIR") {
-        return PathBuf::from(p).join("anchors");
+        return Ok(PathBuf::from(p).join("anchors"));
     }
-    dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("luksbox")
-        .join("anchors")
+    Ok(data_dir()?.join("luksbox").join("anchors"))
+}
+
+/// The application data folder. R16-10: never the working folder as a
+/// fallback, which may be the synced folder itself: the device's state
+/// (sealed unpublished changes, its identity, its rollback anchors) would
+/// then be uploaded to the provider.
+fn data_dir() -> Result<PathBuf, String> {
+    dirs::data_dir().ok_or_else(|| {
+        "no application data folder is known (HOME / XDG_DATA_HOME / APPDATA is not set); \
+         set LUKSBOX_SYNC_STATE_DIR to a private folder outside any synced folder"
+            .to_string()
+    })
 }
 
 /// Warnings about a single-file vault in a cloud folder, from the last
@@ -86,7 +92,7 @@ pub fn attach_auto_anchor(cont: &mut Container) -> Result<(), String> {
         return Ok(());
     }
     let mut notes = Vec::new();
-    if let Some(a) = luksbox_sync::cloud::attach_auto_anchor(cont, &anchors_dir())?
+    if let Some(a) = luksbox_sync::cloud::attach_auto_anchor(cont, &anchors_dir()?)?
         && a.created
     {
         notes.push(format!(
@@ -125,7 +131,7 @@ pub fn attach_auto_anchor(cont: &mut Container) -> Result<(), String> {
 /// The metadata half of the automatic anchor, once the vault is open
 /// (no-op for any other anchor).
 pub fn settle_auto_anchor(vfs: &mut luksbox_vfs::Vfs) -> Result<(), String> {
-    luksbox_sync::cloud::settle_auto_anchor(vfs, &anchors_dir())
+    luksbox_sync::cloud::settle_auto_anchor(vfs, &anchors_dir()?)
 }
 
 /// Cloud-folder warnings from the last unlock (taken once).
@@ -247,9 +253,24 @@ fn describe(r: &OpenReport) -> Vec<String> {
                     .into()
             }
             Notice::UnmergedLocalChanges { recoverable: false } => {
-                "Changes saved on this computer earlier were made on a version that is no \
-                 longer in the bundle and cannot be rebuilt. The vault stays read-only until \
-                 they are discarded (`luksbox sync discard-local --yes`)."
+                "Changes saved on this computer earlier were made on a version that is not \
+                 in the bundle here. If the sync is still running, wait for it to finish and \
+                 open the vault again: they are merged then. They are gone only if that \
+                 version was removed by `luksbox sync gc` after a long time offline; discard \
+                 them (`luksbox sync discard-local --yes`) only when you are sure of that. \
+                 The vault stays read-only until then."
+                    .into()
+            }
+            Notice::UnpublishedLocalChanges { shown: true } => {
+                "Changes saved on this computer earlier have not been uploaded yet. They are \
+                 shown (read-only) and included in an export; they upload the next time the \
+                 vault opens read-write."
+                    .into()
+            }
+            Notice::UnpublishedLocalChanges { shown: false } => {
+                "Changes saved on this computer earlier have not been uploaded yet, and are \
+                 not shown here (they were made on an older version). They upload the next \
+                 time the vault opens read-write."
                     .into()
             }
         });
@@ -295,8 +316,9 @@ pub fn open_with_material(
         device_label: device_label(),
         read_only: false,
     };
+    let root = local_root().map_err(|e| luksbox_format::Error::Io(std::io::Error::other(e)))?;
     let (session, container, report) =
-        bundle::fs::open(path, &local_root(), &mut material, &opts).map_err(to_format)?;
+        bundle::fs::open(path, &root, &mut material, &opts).map_err(to_format)?;
     #[cfg(target_os = "linux")]
     folder_icon::set(path);
     install(session, &report);
@@ -315,7 +337,7 @@ pub fn open_new_bundle(
         read_only: false,
     };
     let (session, container, report) =
-        bundle::fs::open_with_key(path, &local_root(), mvk, &opts).map_err(|e| e.to_string())?;
+        bundle::fs::open_with_key(path, &local_root()?, mvk, &opts).map_err(|e| e.to_string())?;
     let vfs = luksbox_vfs::Vfs::open(container).map_err(|e| e.to_string())?;
     install(session, &report);
     Ok(vfs)
@@ -405,6 +427,12 @@ pub fn tick() {
     }
 }
 
+/// Whether a bundle session is open or finishing (both need frames: the
+/// publishing tick, and the toast when the finish ends).
+pub fn session_active() -> bool {
+    ACTIVE.lock().map(|g| g.is_some()).unwrap_or(false) || finishing()
+}
+
 /// One line for the browser header, if the open vault is a bundle.
 pub fn status_line() -> Option<String> {
     let g = ACTIVE.lock().ok()?;
@@ -437,7 +465,59 @@ pub fn status_line() -> Option<String> {
 /// Publish, merge concurrent commits, remove the lease (waiting for an
 /// upload in progress first). Returns a summary for a toast.
 pub fn finish_active_session() -> Option<String> {
-    let mut a = ACTIVE.lock().ok()?.take()?;
+    wait_finishing();
+    let a = ACTIVE.lock().ok()?.take()?;
+    finish_taken(a)
+}
+
+/// A session being finished in the background (`finish_in_background`).
+static FINISHING: Mutex<Option<std::thread::JoinHandle<Option<String>>>> = Mutex::new(None);
+
+/// `finish_active_session` on a thread: Lock returns at once while the
+/// last upload and merge run (they used to freeze the window for as long
+/// as the upload took). Returns whether a session was being finished.
+pub fn finish_in_background() -> bool {
+    wait_finishing();
+    let Some(a) = ACTIVE.lock().ok().and_then(|mut g| g.take()) else {
+        return false;
+    };
+    let h = std::thread::spawn(move || finish_taken(a));
+    if let Ok(mut g) = FINISHING.lock() {
+        *g = Some(h);
+    }
+    true
+}
+
+/// Whether a background finish is still running.
+pub fn finishing() -> bool {
+    FINISHING
+        .lock()
+        .map(|g| g.as_ref().is_some_and(|h| !h.is_finished()))
+        .unwrap_or(false)
+}
+
+/// The outcome of a background finish that has ended, once.
+pub fn poll_finishing() -> Option<Option<String>> {
+    let mut g = FINISHING.lock().ok()?;
+    if g.as_ref().is_some_and(|h| h.is_finished()) {
+        let h = g.take()?;
+        return Some(h.join().unwrap_or_else(|_| {
+            Some("Sync bundle: the upload at lock stopped; changes stay on this device".into())
+        }));
+    }
+    None
+}
+
+/// Wait for a background finish (before opening a bundle again: the
+/// finishing session still holds this device's state for it).
+fn wait_finishing() {
+    let h = FINISHING.lock().ok().and_then(|mut g| g.take());
+    if let Some(h) = h {
+        let _ = h.join();
+    }
+}
+
+fn finish_taken(mut a: Active) -> Option<String> {
     if let Some(w) = a.worker.take() {
         let _ = w.join();
     }
@@ -513,7 +593,7 @@ pub fn install_mount_hook() {
 /// that then becomes a sync bundle (New vault > Sync bundle). Folders an
 /// interrupted creation left behind more than a day ago are removed.
 pub fn new_staging_dir() -> std::io::Result<PathBuf> {
-    staging_dir_in(&local_root())
+    staging_dir_in(&local_root().map_err(std::io::Error::other)?)
 }
 
 fn staging_dir_in(local_root: &Path) -> std::io::Result<PathBuf> {
@@ -636,7 +716,7 @@ pub fn restore(
 pub fn delete_bundle(path: &Path) -> Result<String, String> {
     #[cfg(target_os = "linux")]
     folder_icon::unset(path);
-    let r = bundle::fs::delete(path, &local_root()).map_err(|e| e.to_string())?;
+    let r = bundle::fs::delete(path, &local_root()?).map_err(|e| e.to_string())?;
     let mut msg = format!("deleted the sync bundle {}", path.display());
     if !r.folder_removed {
         msg.push_str("; its folder was kept because it holds other files");
@@ -650,7 +730,7 @@ pub fn delete_bundle(path: &Path) -> Result<String, String> {
 /// Turn the open file vault into a sync bundle at `dest` (the vault file
 /// is not changed).
 pub fn convert(container: &mut Container, dest: &Path) -> Result<String, String> {
-    convert_in(container, dest, &local_root())
+    convert_in(container, dest, &local_root()?)
 }
 
 fn convert_in(container: &mut Container, dest: &Path, local_root: &Path) -> Result<String, String> {
@@ -857,6 +937,8 @@ mod tests {
     /// back from it into the open vault.
     #[test]
     fn versions_are_listed_opened_and_restored_from() {
+        // Sets and clears the process-wide open session.
+        let _env = crate::test_env_lock();
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("state");
         let _g = luksbox_format::metadata::set_create_metadata_region_size_override(Some(2 << 20));

@@ -668,7 +668,10 @@ enum Command {
         unlock: UnlockArgs,
         inner: String,
     },
-    /// Copy a local file into the container.
+    /// Copy a local file, or a folder with everything in it, into the
+    /// container. A folder goes in with one unlock and one save, so
+    /// moving many files is far faster than one `put` per file. Symbolic
+    /// links and special files in a folder are skipped (never followed).
     Put {
         path: PathBuf,
         #[command(flatten)]
@@ -676,7 +679,9 @@ enum Command {
         local: PathBuf,
         inner: String,
     },
-    /// Copy a file out of the container.
+    /// Copy a file, or a folder with everything in it, out of the
+    /// container. A folder is written as a new local folder (it must not
+    /// exist yet); files are created mode 0600 on Unix.
     Get {
         path: PathBuf,
         #[command(flatten)]
@@ -2478,6 +2483,15 @@ fn cmd_extract(
     // forensic recovery path).
     let hide_size = vfs.container().header.hide_size_header();
     let data_offset = vfs.container().data_offset();
+    // The file's real length: the inode's, or in hide-size mode the one
+    // chunk 0 records (readable unless chunk 0 itself is damaged). The
+    // output used to keep the hide-size padding even when every chunk
+    // was fine, so a recovered file was not the file that was stored.
+    let real_size = if hide_size {
+        vfs.stat(id).ok().map(|s| s.size)
+    } else {
+        Some(stored_size)
+    };
 
     let mut dst = luksbox_core::file_util::secure_create_or_truncate(local)
         .map_err(|e| format!("creating {}: {e}", local.display()))?;
@@ -2537,10 +2551,17 @@ fn cmd_extract(
     // hide-size mode the stored_size is the padded chunk capacity, so
     // truncating to it is a no-op and we leak the hide-size padding,
     // which is acceptable in this mode for the recovery path).
-    if !hide_size && stored_size < bytes_written {
-        dst.set_len(stored_size)
-            .map_err(|e| format!("truncating {} to {}: {e}", local.display(), stored_size))?;
-        bytes_written = stored_size;
+    if let Some(real) = real_size
+        && real < bytes_written
+    {
+        dst.set_len(real)
+            .map_err(|e| format!("truncating {} to {}: {e}", local.display(), real))?;
+        bytes_written = real;
+    } else if hide_size && real_size.is_none() {
+        eprintln!(
+            "note: chunk 0 holds this file's real size and could not be read; the output \
+             keeps the padding (zeros) after the content"
+        );
     }
     dst.flush()
         .map_err(|e| format!("flushing {}: {e}", local.display()))?;
@@ -2830,29 +2851,79 @@ fn read_passphrase_from_stdin_pipe() -> io::Result<Zeroizing<String>> {
 /// precedence bug. An empty/closed stdin pipe (`Command::output()`
 /// auto-pipes but writes nothing, the common test pattern) falls
 /// through to the env var so existing harnesses keep working.
-fn read_passphrase(prompt: &str) -> io::Result<Zeroizing<String>> {
+/// The passphrase piped on stdin, if stdin is not a terminal and one is
+/// there. With a passphrase environment variable set (`env_set`), stdin
+/// is only read if it already holds data or is closed: an idle pipe that
+/// stays open (an `ssh` session, a CI step, the `while read` loop of a
+/// script) used to block the command forever waiting for a line that was
+/// never coming, although the variable was there to use, and inside a
+/// loop it consumed the loop's own input. Without the variable, piping
+/// the passphrase stays the documented way, so the read blocks as before.
+fn piped_passphrase(env_set: bool) -> io::Result<Option<Zeroizing<String>>> {
     use std::io::IsTerminal;
-    let env_set = std::env::var_os("LUKSBOX_PASSPHRASE").is_some();
-    if !io::stdin().is_terminal() {
-        let piped = read_passphrase_from_stdin_pipe()?;
-        if !piped.is_empty() {
-            if env_set {
-                return Err(io::Error::other(
-                    "ambiguous passphrase source: both stdin pipe and \
-                     LUKSBOX_PASSPHRASE are providing input. Unset \
-                     one to disambiguate (the env var is visible via \
-                     /proc/<pid>/environ, the pipe is not).",
-                ));
-            }
-            return Ok(piped);
-        }
-        // Empty pipe (e.g. `Command::output()` with no write to
-        // child.stdin) - fall through to env var / prompt.
+    if io::stdin().is_terminal() {
+        return Ok(None);
     }
+    if env_set && !stdin_ready(PIPED_PASSPHRASE_GRACE_MS) {
+        return Ok(None);
+    }
+    let piped = read_passphrase_from_stdin_pipe()?;
+    Ok((!piped.is_empty()).then_some(piped))
+}
+
+/// How long a command with `LUKSBOX_PASSPHRASE` set waits for a
+/// passphrase on a stdin pipe before using the variable instead.
+const PIPED_PASSPHRASE_GRACE_MS: i32 = 200;
+
+/// Whether stdin has data to read, or is at end of file, within
+/// `timeout_ms`. Non-Unix: always true (the previous, blocking behaviour).
+fn stdin_ready(timeout_ms: i32) -> bool {
+    #[cfg(unix)]
+    {
+        let mut pfd = libc::pollfd {
+            fd: 0,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: one valid pollfd for this process's fd 0.
+            let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+            if r >= 0 {
+                return r > 0;
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                // Cannot tell: read as before.
+                return true;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = timeout_ms;
+        true
+    }
+}
+
+fn read_passphrase(prompt: &str) -> io::Result<Zeroizing<String>> {
+    let env_set = std::env::var_os("LUKSBOX_PASSPHRASE").is_some();
+    if let Some(piped) = piped_passphrase(env_set)? {
+        if env_set {
+            return Err(io::Error::other(
+                "ambiguous passphrase source: both stdin pipe and \
+                 LUKSBOX_PASSPHRASE are providing input. Unset \
+                 one to disambiguate (the env var is visible via \
+                 /proc/<pid>/environ, the pipe is not), or run the \
+                 command with `< /dev/null` when its stdin carries \
+                 other data (a `while read` loop).",
+            ));
+        }
+        return Ok(piped);
+    }
+    // An empty or idle pipe falls through to the env var / prompt.
     if let Ok(p) = std::env::var("LUKSBOX_PASSPHRASE") {
         return Ok(Zeroizing::new(p));
     }
-    Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
+    Ok(Zeroizing::new(prompt_password_tty(prompt)?))
 }
 
 /// Round 12 follow-up: explicit empty-passphrase confirmation in
@@ -2882,23 +2953,21 @@ fn read_passphrase_confirmed(prompt: &str, purpose: NewSecretFor) -> io::Result<
     // takes precedence over `LUKSBOX_PASSPHRASE` when both env vars
     // are set; same ambiguity guard fires when real bytes arrive on
     // the pipe AND any of the recognised env vars is set.
-    use std::io::IsTerminal;
     let env_set = std::env::var_os("LUKSBOX_NEW_PASSPHRASE").is_some()
         || std::env::var_os("LUKSBOX_PASSPHRASE").is_some();
-    if !io::stdin().is_terminal() {
-        let piped = read_passphrase_from_stdin_pipe()?;
-        if !piped.is_empty() {
-            if env_set {
-                return Err(io::Error::other(
-                    "ambiguous passphrase source: both stdin pipe and \
-                     LUKSBOX_NEW_PASSPHRASE or LUKSBOX_PASSPHRASE \
-                     are providing input. Unset the env var(s) or \
-                     close stdin to disambiguate.",
-                ));
-            }
-            return Ok(piped);
+    if let Some(piped) = piped_passphrase(env_set)? {
+        if env_set {
+            return Err(io::Error::other(
+                "ambiguous passphrase source: both stdin pipe and \
+                 LUKSBOX_NEW_PASSPHRASE or LUKSBOX_PASSPHRASE \
+                 are providing input. Unset the env var(s), or run \
+                 the command with `< /dev/null` when its stdin \
+                 carries other data (a `while read` loop).",
+            ));
         }
+        return Ok(piped);
     }
+    // An empty or idle pipe falls through to the env var / prompt.
     if let Ok(p) = std::env::var("LUKSBOX_NEW_PASSPHRASE") {
         return Ok(Zeroizing::new(p));
     }
@@ -2917,8 +2986,8 @@ fn read_passphrase_confirmed(prompt: &str, purpose: NewSecretFor) -> io::Result<
         }
     }
     loop {
-        let a = Zeroizing::new(rpassword::prompt_password(prompt)?);
-        let b = Zeroizing::new(rpassword::prompt_password("confirm: ")?);
+        let a = Zeroizing::new(prompt_password_tty(prompt)?);
+        let b = Zeroizing::new(prompt_password_tty("confirm: ")?);
         if *a != *b {
             eprintln!("passphrases do not match, try again");
             continue;
@@ -3058,6 +3127,24 @@ fn inherited_kdf_params(header: &Header, replacing: Option<usize>) -> Option<Arg
         .max_by_key(passphrase::kdf_work)
 }
 
+/// A new TPM PIN at enroll: `LUKSBOX_TPM_PIN` for scripts, otherwise the
+/// terminal, twice (a typo would lock the slot for good).
+#[cfg(feature = "fido2-hardware")]
+#[allow(dead_code)]
+fn read_new_tpm_pin() -> io::Result<Zeroizing<String>> {
+    if let Ok(p) = std::env::var("LUKSBOX_TPM_PIN") {
+        return Ok(Zeroizing::new(p));
+    }
+    loop {
+        let a = Zeroizing::new(prompt_password_tty("TPM PIN: ")?);
+        let b = Zeroizing::new(prompt_password_tty("confirm: ")?);
+        if *a == *b {
+            return Ok(a);
+        }
+        eprintln!("PINs do not match, try again");
+    }
+}
+
 /// Read a TPM PIN at unlock. `LUKSBOX_TPM_PIN` for scripts, otherwise
 /// the terminal. Deliberately not `read_passphrase`: a piped vault
 /// passphrase or `LUKSBOX_PASSPHRASE` must not be presented to the TPM,
@@ -3067,7 +3154,7 @@ fn read_tpm_pin(prompt: &str) -> io::Result<Zeroizing<String>> {
     if let Ok(p) = std::env::var("LUKSBOX_TPM_PIN") {
         return Ok(Zeroizing::new(p));
     }
-    Ok(Zeroizing::new(rpassword::prompt_password(prompt)?))
+    Ok(Zeroizing::new(prompt_password_tty(prompt)?))
 }
 
 /// The `.kyber` seed-file passphrase for the hybrid unlocks that ask for
@@ -3089,7 +3176,7 @@ fn read_seed_passphrase() -> io::Result<Zeroizing<String>> {
     if let Ok(p) = std::env::var("LUKSBOX_SEED_PASSPHRASE") {
         return Ok(Zeroizing::new(p));
     }
-    Ok(Zeroizing::new(rpassword::prompt_password(
+    Ok(Zeroizing::new(prompt_password_tty(
         ".kyber seed-file passphrase (differs from the slot passphrase): ",
     )?))
 }
@@ -3101,7 +3188,7 @@ fn read_optional_slot_passphrase(prompt: &str) -> Zeroizing<String> {
     if let Ok(p) = std::env::var("LUKSBOX_SLOT_PASSPHRASE") {
         return Zeroizing::new(p);
     }
-    Zeroizing::new(rpassword::prompt_password(prompt).unwrap_or_default())
+    Zeroizing::new(prompt_password_tty(prompt).unwrap_or_default())
 }
 
 /// Decrypt the `.kyber` seed with the slot passphrase, the usual setup
@@ -3141,7 +3228,7 @@ fn read_fido2_pin() -> io::Result<Zeroizing<String>> {
     if let Ok(p) = std::env::var("LUKSBOX_FIDO2_PIN") {
         return Ok(Zeroizing::new(p));
     }
-    Ok(Zeroizing::new(rpassword::prompt_password("FIDO2 PIN: ")?))
+    Ok(Zeroizing::new(prompt_password_tty("FIDO2 PIN: ")?))
 }
 
 /// Salt-prehash conventions to try, in order, when unlocking a FIDO2
@@ -5888,7 +5975,10 @@ fn cmd_enroll_tpm2_pin(path: &Path, unlock: &UnlockArgs) -> Result<()> {
         "TPM PIN: any string up to 64 bytes. Wrong PINs count toward the chip's \
          dictionary-attack lockout, so even short PINs (4-6 digits) are secure."
     );
-    let pin = read_passphrase_confirmed("TPM PIN: ", NewSecretFor::ExistingVault)?;
+    // A PIN, not a passphrase: `LUKSBOX_TPM_PIN` or the terminal, asked
+    // twice; no passphrase strength gate (the TPM's lockout protects a
+    // short PIN) and no `LUKSBOX_NEW_PASSPHRASE` (that is a passphrase).
+    let pin = read_new_tpm_pin()?;
     if pin.is_empty() {
         return Err("PIN cannot be empty (use --kind tpm2 for the no-PIN variant)".into());
     }
@@ -6673,6 +6763,20 @@ fn cmd_revoke(path: &Path, unlock: &UnlockArgs, slot: usize) -> Result<()> {
     c.revoke_slot(slot)?;
     c.persist_header()?;
     println!("revoked slot {slot}");
+    // R16-17: on a bundle the master key stays the same, the provider
+    // keeps the old keyslot table in its version history (and in the
+    // folder until `sync gc`), and `rotate-mvk` is not available: the
+    // revoked credential still derives the master key with its own
+    // tools. Say so every time.
+    if sync_cmd::is_bundle(path) {
+        eprintln!(
+            "warning: on a sync bundle, revoking a keyslot does not change the master key, \
+             and the sync service keeps the old keyslot table in its history. Whoever held \
+             that credential can still read this vault with it. For a real revocation: \
+             `luksbox sync export`, `luksbox rotate-mvk` on the exported file, then \
+             `luksbox sync convert` it into a new bundle and delete this one."
+        );
+    }
     Ok(())
 }
 
@@ -6862,7 +6966,7 @@ fn update_fido2_at(_c: &mut Container, _slot: usize) -> Result<()> {
 /// authored by a former MVK holder). Replace C0/C1 control characters
 /// (newline, carriage return, ESC, ...) before they reach the terminal
 /// so a name cannot rewrite or hide lines of a listing.
-fn sanitize_for_terminal(name: &str) -> String {
+pub(crate) fn sanitize_for_terminal(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_control() { '\u{FFFD}' } else { c })
         .collect()
@@ -6898,9 +7002,15 @@ fn cmd_mkdir(path: &Path, unlock: &UnlockArgs, inner: &str) -> Result<()> {
 }
 
 fn cmd_put(path: &Path, unlock: &UnlockArgs, local: &Path, inner: &str) -> Result<()> {
+    if std::fs::symlink_metadata(local).is_ok_and(|m| m.is_dir()) {
+        return cmd_put_tree(path, unlock, local, inner);
+    }
     let mut src = File::open(local)?;
     let mut vfs = open_vfs(path, unlock)?;
-    let (parent, name) = split_parent_name(&vfs, inner)?;
+    if is_open_vault_file(&vfs, local) {
+        return Err(format!("{} is this vault's own file", local.display()).into());
+    }
+    let (parent, name, inner) = put_target(&vfs, inner, local)?;
     if vfs.lookup(parent, &name).is_ok() {
         return Err(format!("{inner} already exists").into());
     }
@@ -6911,10 +7021,54 @@ fn cmd_put(path: &Path, unlock: &UnlockArgs, local: &Path, inner: &str) -> Resul
     Ok(())
 }
 
+/// Where `put` writes `local`: a destination of `/` or ending with `/`
+/// is a vault folder that receives it under its own name (`put v.lbx
+/// photo.jpg /` used to fail with "empty inner path"). An existing
+/// folder named without the trailing `/` is still refused, as any
+/// existing name is, with a hint: running the same folder `put` twice
+/// must not nest a second copy inside the first. Returns the parent
+/// folder, the new entry's name and its full path for messages.
+fn put_target(vfs: &Vfs, inner: &str, local: &Path) -> Result<(FileId, String, String)> {
+    let into_folder = inner.trim_start_matches('/').is_empty() || inner.ends_with('/');
+    if !into_folder
+        && vfs
+            .lookup_path(inner)
+            .and_then(|id| vfs.inode_kind(id))
+            .is_ok_and(|kind| kind == InodeKind::Directory)
+    {
+        return Err(format!(
+            "{inner} already exists (a folder): to put {} inside it, write {inner}/",
+            local.display()
+        )
+        .into());
+    }
+    if !into_folder {
+        let (parent, name) = split_parent_name(vfs, inner)?;
+        return Ok((parent, name, inner.to_string()));
+    }
+    let name = local
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            format!(
+                "cannot tell the name to give {} in the vault: give the full destination \
+                 path (for example /folder/name)",
+                local.display()
+            )
+        })?
+        .to_string();
+    let parent = vfs.lookup_path(inner.trim_end_matches('/'))?;
+    let full = format!("{}/{name}", inner.trim_end_matches('/'));
+    Ok((parent, name, full))
+}
+
 fn cmd_get(path: &Path, unlock: &UnlockArgs, inner: &str, local: &Path) -> Result<()> {
     let mut vfs = open_vfs(path, unlock)?;
     let id = vfs.lookup_path(inner)?;
     let st = vfs.stat(id)?;
+    if st.kind == InodeKind::Directory {
+        return get_tree(&mut vfs, id, inner, local);
+    }
     if st.kind != InodeKind::File {
         return Err(format!("{inner} is not a file").into());
     }
@@ -6925,6 +7079,220 @@ fn cmd_get(path: &Path, unlock: &UnlockArgs, inner: &str, local: &Path) -> Resul
     let mut dst = luksbox_core::file_util::secure_create_or_truncate(local)?;
     let n = copy_out(&mut vfs, id, &mut dst)?;
     println!("wrote {n} bytes to {}", local.display());
+    Ok(())
+}
+
+/// Whether `local` is the open vault's own file (copying it into the
+/// vault would read a file that grows with every write, without end).
+fn is_open_vault_file(vfs: &Vfs, local: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Some(own) = vfs.container().data_file_identity()
+            && let Ok(m) = std::fs::metadata(local)
+        {
+            return (m.dev(), m.ino()) == own;
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (vfs, local);
+        false
+    }
+}
+
+/// `put` of a folder: everything in it, one unlock and one save. A file
+/// that fails is removed again and the import stops; what was copied
+/// before it is saved and counted, so the command can be repeated into
+/// a fresh destination.
+fn cmd_put_tree(path: &Path, unlock: &UnlockArgs, local: &Path, inner: &str) -> Result<()> {
+    let mut vfs = open_vfs(path, unlock)?;
+    let (parent, name, inner) = put_target(&vfs, inner, local)?;
+    let inner = inner.as_str();
+    if vfs.lookup(parent, &name).is_ok() {
+        return Err(format!("{inner} already exists").into());
+    }
+    let mut stats = TreeStats::default();
+    let r = (|| -> Result<()> {
+        let dir = vfs.mkdir(parent, &name)?;
+        stats.dirs += 1;
+        put_tree_into(&mut vfs, dir, local, &mut stats)
+    })();
+    vfs.flush()?;
+    let summary = format!(
+        "{} file(s), {} folder(s), {} bytes into {inner}",
+        stats.files, stats.dirs, stats.bytes
+    );
+    if !stats.skipped.is_empty() {
+        eprintln!(
+            "note: skipped {} symbolic link(s) or special file(s) (not followed), e.g. {}",
+            stats.skipped.len(),
+            stats.skipped[0].display()
+        );
+    }
+    match r {
+        Ok(()) => {
+            println!("wrote {summary}");
+            Ok(())
+        }
+        Err(e) => Err(format!("stopped after {summary}: {e}").into()),
+    }
+}
+
+#[derive(Default)]
+struct TreeStats {
+    files: u64,
+    dirs: u64,
+    bytes: u64,
+    skipped: Vec<PathBuf>,
+    /// `get`: vault entries this system cannot name (Windows), left out.
+    unnamed: Vec<(String, &'static str)>,
+}
+
+/// Why this system cannot create a file called `name`, if it cannot.
+/// Only Windows restricts names beyond the vault's own rules; a vault
+/// made on Linux may hold `12:30.log`, which an export skips there.
+fn host_cannot_name(name: &str) -> Option<&'static str> {
+    if cfg!(windows) {
+        luksbox_core::file_util::windows_name_problem(name)
+    } else {
+        None
+    }
+}
+
+fn put_tree_into(vfs: &mut Vfs, dir: FileId, local: &Path, stats: &mut TreeStats) -> Result<()> {
+    let mut children: Vec<PathBuf> = std::fs::read_dir(local)
+        .and_then(|rd| rd.map(|e| e.map(|e| e.path())).collect())
+        .map_err(|e| format!("{}: {e}", local.display()))?;
+    children.sort();
+    for child in children {
+        let name = child
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| format!("{}: the name is not valid UTF-8", child.display()))?
+            .to_string();
+        let ft = std::fs::symlink_metadata(&child)
+            .map_err(|e| format!("{}: {e}", child.display()))?
+            .file_type();
+        if ft.is_dir() {
+            let sub = vfs.mkdir(dir, &name)?;
+            stats.dirs += 1;
+            put_tree_into(vfs, sub, &child, stats)?;
+        } else if ft.is_file() && !is_open_vault_file(vfs, &child) {
+            let mut src = File::open(&child).map_err(|e| format!("{}: {e}", child.display()))?;
+            let f = vfs.create(dir, &name)?;
+            match copy_into(vfs, f, &mut src) {
+                Ok(n) => {
+                    stats.bytes += n;
+                    stats.files += 1;
+                }
+                Err(e) => {
+                    let _ = vfs.unlink(dir, &name);
+                    return Err(format!("{}: {e}", child.display()).into());
+                }
+            }
+        } else {
+            stats.skipped.push(child);
+        }
+    }
+    Ok(())
+}
+
+/// `get` of a folder: a new local folder with everything in it. Names
+/// come from the vault, which a former key holder may have written: one
+/// that could leave the destination (a separator, `..`) is refused.
+fn get_tree(vfs: &mut Vfs, id: FileId, inner: &str, local: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(local).is_ok() {
+        return Err(format!("{} already exists", local.display()).into());
+    }
+    let mut stats = TreeStats::default();
+    let r = get_tree_into(vfs, id, local, &mut stats);
+    if !stats.skipped.is_empty() {
+        eprintln!(
+            "note: skipped {} symbolic link(s) in the vault (not recreated), e.g. {}",
+            stats.skipped.len(),
+            stats.skipped[0].display()
+        );
+    }
+    if let Some((p, why)) = stats.unnamed.first() {
+        eprintln!(
+            "note: {} entr(ies) not extracted because this system cannot name them, e.g. {p} \
+             ({why}); rename them in the vault to extract them",
+            stats.unnamed.len()
+        );
+    }
+    let summary = format!(
+        "{} file(s), {} folder(s), {} bytes from {inner} to {}",
+        stats.files,
+        stats.dirs,
+        stats.bytes,
+        local.display()
+    );
+    match r {
+        Ok(()) => {
+            println!("wrote {summary}");
+            Ok(())
+        }
+        Err(e) => Err(format!("stopped after {summary}: {e}").into()),
+    }
+}
+
+fn get_tree_into(vfs: &mut Vfs, id: FileId, local: &Path, stats: &mut TreeStats) -> Result<()> {
+    {
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        b.create(local)
+            .map_err(|e| format!("{}: {e}", local.display()))?;
+    }
+    stats.dirs += 1;
+    let mut entries = vfs.readdir(id)?;
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
+    for e in entries {
+        let n = e.name.as_str();
+        if n.is_empty()
+            || n == "."
+            || n == ".."
+            || n.contains('/')
+            || n.contains('\\')
+            || n.contains('\0')
+        {
+            return Err(format!(
+                "refusing vault entry name {:?}: it could leave the destination folder",
+                sanitize_for_terminal(n)
+            )
+            .into());
+        }
+        // Also covers `:` on Windows (drive prefix, alternate data
+        // stream): never joined, only reported.
+        if let Some(why) = host_cannot_name(n) {
+            stats.unnamed.push((
+                format!(
+                    "{}{}{}",
+                    local.display(),
+                    std::path::MAIN_SEPARATOR,
+                    sanitize_for_terminal(n)
+                ),
+                why,
+            ));
+            continue;
+        }
+        let dst = local.join(n);
+        match e.kind {
+            InodeKind::Directory => get_tree_into(vfs, e.id, &dst, stats)?,
+            InodeKind::File => {
+                let mut f = luksbox_core::file_util::secure_create_new(&dst)
+                    .map_err(|err| format!("{}: {err}", dst.display()))?;
+                stats.bytes += copy_out(vfs, e.id, &mut f)?;
+                stats.files += 1;
+            }
+            InodeKind::Symlink => stats.skipped.push(dst),
+        }
+    }
     Ok(())
 }
 
@@ -7272,6 +7640,12 @@ fn cmd_mount(
     // the mount, which a background mount runs in its own process).
     sync_cmd::install_mount_hook();
     luksbox_mount::mount(vfs, &mp_abs, !foreground, sync_mode)?;
+    // R16-13: a background mount that returns here (FUSE-T) left the
+    // vault and the bundle session to its child process; this process
+    // must not publish or close the lease on its way out.
+    if !foreground {
+        sync_cmd::forget_active_session();
+    }
     Ok(())
 }
 
@@ -8327,6 +8701,32 @@ fn cmd_deniable_mount(
 // secrets don't end up in shell history / ps argv. File paths
 // (.kyber / .tpm-blob) come via --flag.
 
+/// `rpassword::prompt_password`, with a clear error when there is no
+/// terminal to ask on. rpassword opens `/dev/tty`; without one (a script,
+/// cron, `ssh host cmd`, a service) the error was a bare "No such device
+/// or address (os error 6)". Prompts that also accept a pipe or an
+/// environment variable try those first; this is the last resort, and
+/// the only source for the deniable commands, which never read a secret
+/// from the environment.
+fn prompt_password_tty(prompt: impl ToString) -> io::Result<String> {
+    rpassword::prompt_password(prompt).map_err(|e| {
+        #[cfg(unix)]
+        let no_tty = matches!(e.raw_os_error(), Some(libc::ENXIO) | Some(libc::ENOTTY));
+        #[cfg(not(unix))]
+        let no_tty = false;
+        if no_tty || e.kind() == io::ErrorKind::NotFound {
+            io::Error::new(
+                e.kind(),
+                "a passphrase or PIN is needed and there is no terminal to ask on; run the \
+                 command in a terminal (deniable commands always ask there), or give it \
+                 through LUKSBOX_PASSPHRASE / a pipe where the command supports that",
+            )
+        } else {
+            e
+        }
+    })
+}
+
 fn prompt_pass_twice(p1: &str, p2: &str) -> Result<zeroize::Zeroizing<String>> {
     // Wrap both reads in `Zeroizing` immediately so the heap allocation
     // returned by `rpassword` is scrubbed on every drop path -- panic,
@@ -8334,8 +8734,8 @@ fn prompt_pass_twice(p1: &str, p2: &str) -> Result<zeroize::Zeroizing<String>> {
     // form left the confirmation `b` as a plain `String` from prompt to
     // end-of-scope, so a panic between the two prompts would have leaked
     // the confirmation copy to ordinary heap memory.
-    let a = zeroize::Zeroizing::new(rpassword::prompt_password(p1)?);
-    let b = zeroize::Zeroizing::new(rpassword::prompt_password(p2)?);
+    let a = zeroize::Zeroizing::new(prompt_password_tty(p1)?);
+    let b = zeroize::Zeroizing::new(prompt_password_tty(p2)?);
     if *a != *b {
         return Err(cli_err!("passphrases do not match"));
     }
@@ -8365,15 +8765,13 @@ fn prompt_pass_twice(p1: &str, p2: &str) -> Result<zeroize::Zeroizing<String>> {
 /// a typo here locks the vault for good.
 #[cfg(all(feature = "hardware", target_os = "macos"))]
 fn prompt_deniable_seed_pw(envelope: &str) -> Result<zeroize::Zeroizing<String>> {
-    let a = zeroize::Zeroizing::new(rpassword::prompt_password(
+    let a = zeroize::Zeroizing::new(prompt_password_tty(
         "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
     )?);
     if a.is_empty() {
         return Ok(zeroize::Zeroizing::new(envelope.to_owned()));
     }
-    let b = zeroize::Zeroizing::new(rpassword::prompt_password(
-        "Confirm seed-file passphrase: ",
-    )?);
+    let b = zeroize::Zeroizing::new(prompt_password_tty("Confirm seed-file passphrase: ")?);
     if *a != *b {
         return Err(cli_err!("seed-file passphrases do not match"));
     }
@@ -8632,7 +9030,7 @@ fn cli_open_deniable_v2(
     // hinted with the user's intended slot kind. Wrap immediately so
     // the `rpassword`-returned `String` heap allocation is scrubbed
     // even if the envelope-open step below panics.
-    let pass_zeroizing = zeroize::Zeroizing::new(rpassword::prompt_password("Passphrase: ")?);
+    let pass_zeroizing = zeroize::Zeroizing::new(prompt_password_tty("Passphrase: ")?);
     let env_cred = DeniableCredential::Passphrase {
         passphrase: pass_zeroizing.as_bytes(),
         argon2,
@@ -9092,7 +9490,7 @@ fn cli_pq_decap_with_fallback(
     } else {
         "Seed-file passphrase: "
     };
-    let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(prompt_text)?);
+    let typed_seed_pw = zeroize::Zeroizing::new(prompt_password_tty(prompt_text)?);
     let seed_pw_bytes: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
         match envelope_pw {
             Some(env) => zeroize::Zeroizing::new(env.to_vec()),
@@ -9272,7 +9670,7 @@ fn cli_create_pq_fido2_deniable_v2(
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
     let pin = read_fido2_pin()?;
     // Blank = reuse envelope passphrase (aligns with GUI/wizard).
-    let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(
+    let typed_seed_pw = zeroize::Zeroizing::new(prompt_password_tty(
         "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
     )?);
     let seed_pw: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
@@ -9355,7 +9753,7 @@ fn cli_create_tpm_deniable_v2(
     // Optional TPM userAuth. Empty input means "no PIN" -- the
     // unlock side must then use `unseal` (no PIN) or the TPM
     // rejects with TPM_RC_AUTH_FAIL and bumps the DA counter.
-    let pin_in = zeroize::Zeroizing::new(rpassword::prompt_password("TPM PIN (empty for none): ")?);
+    let pin_in = zeroize::Zeroizing::new(prompt_password_tty("TPM PIN (empty for none): ")?);
     let pin_bytes: Option<&[u8]> = if pin_in.is_empty() {
         None
     } else {
@@ -9435,7 +9833,7 @@ fn cli_create_pq_tpm_deniable_v2(
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
     let (secret, blob) = cli_tpm_seal_to_bytes(None)?;
     // Blank = reuse envelope passphrase (aligns with GUI/wizard).
-    let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(
+    let typed_seed_pw = zeroize::Zeroizing::new(prompt_password_tty(
         "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
     )?);
     let seed_pw: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {
@@ -9503,7 +9901,7 @@ fn cli_create_pq_tpm_fido2_deniable_v2(
     let pass = prompt_pass_twice("Passphrase: ", "Confirm:    ")?;
     let pin = read_fido2_pin()?;
     // Blank = reuse envelope passphrase (aligns with GUI/wizard).
-    let typed_seed_pw = zeroize::Zeroizing::new(rpassword::prompt_password(
+    let typed_seed_pw = zeroize::Zeroizing::new(prompt_password_tty(
         "Seed-file passphrase (leave blank to reuse the envelope passphrase): ",
     )?);
     let seed_pw: zeroize::Zeroizing<Vec<u8>> = if typed_seed_pw.is_empty() {

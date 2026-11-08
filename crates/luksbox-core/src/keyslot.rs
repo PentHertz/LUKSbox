@@ -1134,7 +1134,11 @@ impl Keyslot {
     /// derivation -- defense in depth on top of the AEAD wrap, which
     /// already fails to recover the MVK under any wrong KEK.
     fn reject_null_factor(factor: &[u8; KEY_LEN]) -> Result<(), Error> {
-        if factor.iter().all(|&b| b == 0) {
+        // R16-20: compared in constant time; the factor is a secret.
+        if bool::from(subtle::ConstantTimeEq::ct_eq(
+            &factor[..],
+            &[0u8; KEY_LEN][..],
+        )) {
             return Err(Error::InvalidField);
         }
         Ok(())

@@ -91,6 +91,7 @@ luksbox sync verify    vault.lbxs   # read and check every file (changes nothing
 luksbox sync snapshots vault.lbxs   # list versions
 luksbox sync snapshots vault.lbxs --restore <id> --path /report.pdf
 luksbox sync export    vault.lbxs vault.lbx   # back to a single file
+luksbox sync export    vault.lbxs old.lbx --snapshot <id>   # an earlier version
 luksbox sync gc        vault.lbxs   # delete what no kept version needs
 luksbox sync discard-local --yes vault.lbxs   # drop changes that could not be merged
 ```
@@ -132,6 +133,26 @@ luksbox merge mine.lbx "vault (conflicted copy).lbx" -o merged.lbx
   **Versions** in the GUI, or `luksbox sync snapshots`. `luksbox sync
   verify` reads and checks everything; `luksbox sync export` makes a
   `.lbx` copy to keep apart.
+- **If the sync service loses or damages a file.** Each part of the
+  vault is stored once, and the versions share the parts that did not
+  change. A part the service lost (or delivered damaged) therefore
+  affects every version made since it was written, and the vault does
+  not open through those versions on the devices the loss reached (a
+  sync client that deletes a file in the cloud deletes it on every
+  computer too). What still works: the device that wrote the part has
+  it in its own copy of the folder until the sync client removes it;
+  any earlier version whose parts are all present opens, and
+  `luksbox sync export --snapshot <id> rescued.lbx` writes it out as
+  a single file (`luksbox sync snapshots` lists the versions; a
+  damaged newest version still lists them). Keep a regular
+  `luksbox sync export` of anything that matters: the folder is one
+  copy, the export is a second one.
+- **Uploads that fail unseen.** A vault mounted in the background
+  uploads with nobody watching. An upload that fails is retried, and
+  the failure is remembered on this computer: the next open and
+  `luksbox sync status` say so ("the last upload from this device
+  failed"). `luksbox umount` returns before the final upload runs;
+  give the sync client a moment before switching off.
 
 What is not on the bundle side yet: the `.lbx` tools `check`, `extract`
 and header backup / restore (`sync verify` and `sync export` cover
@@ -178,7 +199,21 @@ kept, and so is the folder if they are there.
 - **"changes saved on this device earlier could not be merged"**: the
   vault opens read-only. If it says they are shown, copy out what you
   need (or `luksbox sync export`), then `luksbox sync discard-local
-  --yes <bundle>` lets this computer write again.
+  --yes <bundle>` lets this computer write again. If it says the
+  version they were made on "is not in the bundle here", wait for the
+  sync to finish and open again: they are merged then. They are gone
+  only if that version was deleted by `sync gc` after this computer
+  was offline for a long time (90 days); discard them only then.
+- **"changes saved on this device earlier are not uploaded yet"** (a
+  vault opened read-only, or while a commit is missing): they are kept
+  on this computer, shown when they were made on the version you see,
+  included in an export, and uploaded the next time the vault opens
+  read-write. Do not delete the bundle or this computer's sync state
+  while this shows.
+- **"the last upload from this device failed"**: a background upload
+  did not complete (network, the sync service, the disk). The changes
+  are on this computer and the upload is retried; `luksbox sync push`
+  retries it now.
 
 ## A single `.lbx` in a cloud folder
 
@@ -231,13 +266,32 @@ accepts it in place of the vault.
   browser, or `luksbox mount` in a terminal); on Windows only with
   `--foreground`.
 - **Revoking a lost device**: revoking its keyslot stops LuksBox from
-  opening the vault with it, but a copy of an old keyslot table may
-  survive in the sync service's version history. Until key epochs land
-  (see `docs/CLOUD_SYNC_DESIGN.md`), the only complete protection is to
-  export, rotate the master key, and convert again.
-- The provider can still see when you work on the vault and roughly
-  how much changed, and could refuse to deliver new versions to a
-  device that never hears from the others.
+  opening the vault with it, but the master key does not change, the
+  old keyslot table stays in the folder until `sync gc` and in the
+  sync service's version history for good, and whoever has the revoked
+  credential can derive the master key from it with their own tools
+  and read every later version. Until key epochs land (see
+  `docs/CLOUD_SYNC_DESIGN.md`), the only complete protection is to
+  export, rotate the master key (`luksbox rotate-mvk` on the exported
+  file), convert again into a new bundle and delete the old one.
+  `luksbox revoke` on a bundle says so.
+- **What the provider sees**: the bundle id and the keyslot-table
+  generation (in the names of the header files), the 8 KiB header
+  itself (cipher, key-derivation settings, which kinds of keyslots and
+  how many, FIDO2 credential ids: the same as for any `.lbx` file), the
+  size of the vault rounded to a page, how many parts each change
+  touched (roughly how much changed, and over time the size class of
+  the folder tree), when changes happen, and when the vault is open on
+  how many computers (a small lease file is refreshed every few minutes
+  while it is open; it cannot be turned off yet). It does not see file
+  names, sizes, how many files, the folder structure, which file
+  changed, or which computer made a change. It could also refuse to
+  deliver new versions to a device that never hears from the others.
+- **Local traces**: this computer's sync state (`luksbox/sync/` in the
+  application data folder, private to your account), the folder icon
+  record on Linux (see above), and the GUI's recent list name the
+  bundle. Deniable vaults cannot become bundles and leave none of
+  these.
 
 How it works and what it protects against:
 `docs/CLOUD_SYNC_DESIGN.md`, `docs/CLOUD_SYNC_IMPLEMENTATION.md`,

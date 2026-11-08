@@ -100,7 +100,10 @@ fn open_anchor_for_read(path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        // R16-14: `O_NONBLOCK` so a FIFO planted at the anchor path is
+        // refused below instead of stalling the open; no effect on the
+        // regular file an anchor is.
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -111,6 +114,14 @@ fn open_anchor_for_read(path: &Path) -> std::io::Result<File> {
         opts.custom_flags(0x0020_0000);
     }
     let f = opts.open(path)?;
+    // R16-14: an anchor is a regular file; anything else (FIFO, device,
+    // directory) is refused before a byte is read.
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "anchor file is not a regular file; refused",
+        ));
+    }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt as _;

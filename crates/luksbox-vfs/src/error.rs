@@ -78,7 +78,10 @@ pub enum Error {
     /// format-level cap (`MAX_METADATA_SIZE`) in this version --
     /// sufficient for roughly 8-10 GiB of stored content per
     /// vault. Larger vaults need a format-version bump.
-    #[error("metadata region exhausted (vault holds too many chunks for its metadata budget)")]
+    #[error(
+        "the vault's metadata region is full (too many files or chunk references): delete \
+         files to make room, or move some to a new vault"
+    )]
     MetadataBudgetExhausted,
 
     /// Refused a mutation because this Vfs instance recovered one

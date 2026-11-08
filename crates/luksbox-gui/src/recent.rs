@@ -116,13 +116,13 @@ mod tests {
     /// umask would yield 0755 / 0644.
     #[test]
     fn save_writes_file_0600_and_dir_0700_under_022_umask() {
+        let _env = crate::test_env_lock();
         let tmp = tempfile::tempdir().unwrap();
         // Force a permissive umask so a non-secure helper would fail.
         unsafe {
             libc::umask(0o022);
-            // SAFETY: this test mutates a process-global env var.
-            // The luksbox-gui binary has no other tests that read
-            // XDG_DATA_HOME, so there's no parallel-test race here.
+            // SAFETY: this test mutates a process-global env var; the
+            // GUI scenario tests that also do hold the same lock.
             std::env::set_var("XDG_DATA_HOME", tmp.path());
         }
 

@@ -686,6 +686,9 @@ pub struct OpenedVault {
     /// this as a modal listing the broken file paths + original
     /// sizes after the open completes.
     pub tolerated_inodes: Vec<luksbox_vfs::ToleratedInode>,
+    /// A step after the create itself (header v3, maximum size) failed:
+    /// the vault exists and is open, the user is told what to redo.
+    pub create_warning: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1016,6 +1019,7 @@ pub fn create_vault_tpm2_only(
         deniable_fido2_recovery: None,
         deniable_tpm_blob_path,
         tolerated_inodes: Vec::new(),
+        create_warning: None,
     })
 }
 
@@ -1326,6 +1330,7 @@ pub fn create_vault_with_tpm_factors_deniable(
         deniable_fido2_recovery,
         deniable_tpm_blob_path,
         tolerated_inodes: Vec::new(),
+        create_warning: None,
     })
 }
 
@@ -1622,6 +1627,7 @@ pub fn create_vault_with_tpm_factors_only(
         deniable_fido2_recovery: None,
         deniable_tpm_blob_path: None,
         tolerated_inodes: Vec::new(),
+        create_warning: None,
     })
 }
 
@@ -2353,6 +2359,7 @@ fn create_sep_passphrase_deniable(
         deniable_fido2_recovery: None,
         deniable_tpm_blob_path: None,
         tolerated_inodes: Vec::new(),
+        create_warning: None,
     })
 }
 
@@ -2437,6 +2444,7 @@ pub fn create_vault_sep_only(opts: CreateOpts, biometric: bool) -> Result<Opened
         deniable_fido2_recovery: None,
         deniable_tpm_blob_path: None,
         tolerated_inodes: Vec::new(),
+        create_warning: None,
     })
 }
 
@@ -2477,6 +2485,31 @@ fn refuse_existing_create_targets(opts: &CreateOpts, kyber: Option<&Path>) -> Re
         ));
     }
     Ok(())
+}
+
+/// After a create failed midway: remove what it wrote. Only the paths
+/// `refuse_existing_create_targets` checked were free before anything was
+/// written (vault, its mirrors and post-quantum sidecar, detached header,
+/// anchor, seed file), so nothing that existed before is touched.
+fn remove_created_vault_files(opts: &CreateOpts) {
+    let mut paths: Vec<PathBuf> = vec![opts.path.clone()];
+    for ext in ["meta-bak", "header-bak", "hybrid"] {
+        let mut s = opts.path.clone().into_os_string();
+        s.push(".");
+        s.push(ext);
+        paths.push(PathBuf::from(s));
+    }
+    paths.extend(opts.header_path.iter().cloned());
+    if let Some(hp) = &opts.header_path {
+        let mut s = hp.clone().into_os_string();
+        s.push(".header-bak");
+        paths.push(PathBuf::from(s));
+    }
+    paths.extend(opts.anchor_path.iter().cloned());
+    paths.extend(opts.hybrid_kyber_path.iter().cloned());
+    for p in paths {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// R15-I4: vault entry names are attacker-controlled (a hostile vault
@@ -2790,19 +2823,39 @@ pub fn create_vault(opts: CreateOpts) -> Result<OpenedVault, String> {
             )?
         }
     };
-    if let Some(ap) = opts.anchor_path.as_ref() {
-        cont.init_anchor(ap.clone(), 1).map_err(estr)?;
+    // The vault file (and any sidecar) exists from here on. If a later
+    // step fails, remove what this create wrote: leaving it made every
+    // retry fail with "already exists" (the targets were checked to be
+    // free before anything was written, so nothing else is removed).
+    if let Some(ap) = opts.anchor_path.as_ref()
+        && let Err(e) = cont.init_anchor(ap.clone(), 1)
+    {
+        drop(cont);
+        remove_created_vault_files(&opts);
+        return Err(estr(e));
     }
     if let Some(bp) = opts.backup_passphrase.as_ref() {
-        cont.enroll_passphrase(bp.as_bytes(), kdf_params)
-            .map_err(estr)?;
-        cont.persist_header().map_err(estr)?;
+        let r = cont
+            .enroll_passphrase(bp.as_bytes(), kdf_params)
+            .map_err(estr)
+            .and_then(|_| cont.persist_header().map_err(estr));
+        if let Err(e) = r {
+            drop(cont);
+            remove_created_vault_files(&opts);
+            return Err(e);
+        }
     }
     let has_fido2 = header_has_fido2(&cont.header);
     let has_hybrid_pq = header_has_hybrid_pq(&cont.header);
     let has_tpm = header_has_tpm(&cont.header);
     let cipher = cipher_label(cont.header.cipher_suite).to_string();
-    let vfs = Vfs::open(cont).map_err(estr)?;
+    let vfs = match Vfs::open(cont) {
+        Ok(v) => v,
+        Err(e) => {
+            remove_created_vault_files(&opts);
+            return Err(estr(e));
+        }
+    };
     Ok(OpenedVault {
         vfs,
         vault_path: opts.path,
@@ -2815,6 +2868,7 @@ pub fn create_vault(opts: CreateOpts) -> Result<OpenedVault, String> {
         deniable_fido2_recovery: captured_fido2_recovery,
         deniable_tpm_blob_path: None,
         tolerated_inodes: Vec::new(),
+        create_warning: None,
     })
 }
 
@@ -3606,6 +3660,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
             deniable_fido2_recovery: None,
             deniable_tpm_blob_path: None,
             tolerated_inodes,
+            create_warning: None,
         });
     }
     let mut cont = match opts.method {
@@ -3803,6 +3858,7 @@ pub fn unlock_vault(opts: UnlockOpts) -> Result<OpenedVault, String> {
         deniable_fido2_recovery: None,
         deniable_tpm_blob_path: None,
         tolerated_inodes,
+        create_warning: None,
     })
 }
 
@@ -5310,9 +5366,38 @@ pub fn put_file(vfs: &mut Vfs, local: &Path, inner: &str) -> Result<u64, String>
     if vfs.lookup(parent, &name).is_ok() {
         return Err(format!("{inner} already exists"));
     }
+    if is_open_vault_file(vfs, local) {
+        return Err(format!(
+            "{} is this vault's own file; it cannot be copied into itself",
+            local.display()
+        ));
+    }
     let n = copy_file_in(vfs, parent, &name, local)?;
     vfs.flush().map_err(estr)?;
     Ok(n)
+}
+
+/// Whether `local` is the open vault's own file. Importing it (a folder
+/// holding the vault dropped onto the browser) read the vault while every
+/// write made it longer: the copy never reached the end and filled the
+/// disk (the vault's lock is advisory on Unix). Windows refuses the read
+/// (the lock is mandatory there), so this only matters on Unix.
+fn is_open_vault_file(vfs: &Vfs, local: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Some(own) = vfs.container().data_file_identity()
+            && let Ok(m) = std::fs::metadata(local)
+        {
+            return (m.dev(), m.ino()) == own;
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (vfs, local);
+        false
+    }
 }
 
 /// Encrypt `local` into a new file `name` under `parent`. On a read or
@@ -5357,15 +5442,22 @@ pub struct PutSummary {
     /// cannot pull in files from outside the dropped tree or loop),
     /// sockets, FIFOs and device nodes.
     pub skipped: Vec<PathBuf>,
+    /// Entries left out because the vault folder already has that name,
+    /// or the vault does not accept the name (a backslash or a control
+    /// character, legal in Linux file names): `(local path, why)`. The
+    /// import goes on with the next entry; it used to stop at the first
+    /// one, and dropping the same folder again then stopped at once.
+    pub not_imported: Vec<(PathBuf, String)>,
     pub error: Option<String>,
 }
 
 /// Import local files and folders (e.g. dropped onto the browser)
 /// into the vault directory `inner_dir`. Folders are copied
-/// recursively. A name that already exists in the vault stops the
-/// import rather than being merged or overwritten. The vault is
-/// flushed once at the end, also after an error, so what the summary
-/// reports as imported is what is on disk.
+/// recursively. An entry whose name already exists in the vault is
+/// left out and reported (`not_imported`), never merged or overwritten,
+/// and the import goes on. The vault is flushed once at the end, also
+/// after an error, so what the summary reports as imported is what is
+/// on disk.
 pub fn put_paths(vfs: &mut Vfs, locals: &[PathBuf], inner_dir: &str) -> PutSummary {
     let mut sum = PutSummary::default();
     let r = vfs.lookup_path(inner_dir).map_err(estr).and_then(|parent| {
@@ -5397,9 +5489,19 @@ fn put_tree(
         return Ok(());
     }
     if vfs.lookup(parent, &name).is_ok() {
-        return Err(format!("{name} already exists in the vault folder"));
+        sum.not_imported
+            .push((local.to_path_buf(), "already in the vault folder".into()));
+        return Ok(());
+    }
+    if let Err(e) = luksbox_vfs::Vfs::check_new_name(&name) {
+        sum.not_imported.push((local.to_path_buf(), estr(e)));
+        return Ok(());
     }
     if ft.is_file() {
+        if is_open_vault_file(vfs, local) {
+            sum.skipped.push(local.to_path_buf());
+            return Ok(());
+        }
         sum.bytes += copy_file_in(vfs, parent, &name, local)?;
         sum.files += 1;
         return Ok(());
@@ -5416,6 +5518,33 @@ fn put_tree(
     children
         .iter()
         .try_for_each(|child| put_tree(vfs, dir, child, sum))
+}
+
+/// Remove `name` from the vault directory `parent`: a file, or a folder
+/// with everything in it. Returns how many entries were removed. Does
+/// not flush.
+pub fn remove_entry(
+    vfs: &mut Vfs,
+    parent: luksbox_vfs::FileId,
+    name: &str,
+    is_dir: bool,
+) -> Result<u64, String> {
+    if !is_dir {
+        vfs.unlink(parent, name).map_err(estr)?;
+        return Ok(1);
+    }
+    let dir = vfs.lookup(parent, name).map_err(estr)?;
+    let mut removed = 0u64;
+    for e in vfs.readdir(dir).map_err(estr)? {
+        removed += remove_entry(
+            vfs,
+            dir,
+            &e.name,
+            e.kind == luksbox_vfs::InodeKind::Directory,
+        )?;
+    }
+    vfs.rmdir(parent, name).map_err(estr)?;
+    Ok(removed + 1)
 }
 
 /// Move `name` from the vault directory `from_dir` into `to_dir`,
@@ -5448,11 +5577,34 @@ pub fn rename_entry(vfs: &mut Vfs, dir: &str, old: &str, new: &str) -> Result<()
     vfs.flush().map_err(estr)
 }
 
+/// What an extract wrote.
+#[derive(Debug, Default)]
+pub struct Extracted {
+    /// Decrypted bytes written.
+    pub bytes: u64,
+    /// Vault paths left out, with the reason: names this system cannot
+    /// create (Windows: `:`, `?`, `*`, reserved device names, ...) and,
+    /// on Windows, symbolic links.
+    pub skipped: Vec<(String, &'static str)>,
+}
+
 /// Recursively extract `inner` (must be a directory) into `local`. Creates
 /// `local` if needed. Files are decrypted in 64 KiB chunks via `get_file`;
-/// subdirectories are walked depth-first. Returns total decrypted-byte
-/// count across every file written.
-pub fn get_dir_recursive(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<u64, String> {
+/// subdirectories are walked depth-first. An entry this system cannot
+/// name is skipped and reported (a vault made on Linux may hold
+/// `12:30.log`; it used to abort a whole export on Windows).
+pub fn get_dir_recursive(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<Extracted, String> {
+    let mut out = Extracted::default();
+    get_dir_into(vfs, inner, local, &mut out)?;
+    Ok(out)
+}
+
+fn get_dir_into(
+    vfs: &mut Vfs,
+    inner: &str,
+    local: &Path,
+    out: &mut Extracted,
+) -> Result<(), String> {
     let id = vfs.lookup_path(inner).map_err(estr)?;
     let st = vfs.stat(id).map_err(estr)?;
     if st.kind != InodeKind::Directory {
@@ -5462,8 +5614,20 @@ pub fn get_dir_recursive(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<u64
     // they contain isn't world-readable under a default 022 umask.
     luksbox_core::file_util::secure_create_dir_all(local).map_err(estr)?;
     let entries = vfs.readdir(id).map_err(estr)?;
-    let mut total = 0u64;
     for ent in entries {
+        let inner_child = if inner == "/" {
+            format!("/{}", ent.name)
+        } else {
+            format!("{}/{}", inner.trim_end_matches('/'), ent.name)
+        };
+        // A name that is fine in the vault but not on this system: left
+        // out and reported. Traversal-shaped names still abort below.
+        if !is_traversal_name(&ent.name)
+            && let Some(why) = host_cannot_name(&ent.name)
+        {
+            out.skipped.push((inner_child, why));
+            continue;
+        }
         // Zip-slip / tar-slip defense-in-depth. luksbox-vfs's
         // `validate_name` already rejects `/`, `\`, NUL, `.`, `..`
         // and over-long names both at create-time AND at metadata-
@@ -5494,18 +5658,13 @@ pub fn get_dir_recursive(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<u64
                 ent.name
             ));
         }
-        let inner_child = if inner == "/" {
-            format!("/{}", ent.name)
-        } else {
-            format!("{}/{}", inner.trim_end_matches('/'), ent.name)
-        };
         let local_child = local.join(&ent.name);
         match ent.kind {
             InodeKind::File => {
-                total += get_file(vfs, &inner_child, &local_child)?;
+                out.bytes += get_file(vfs, &inner_child, &local_child)?;
             }
             InodeKind::Directory => {
-                total += get_dir_recursive(vfs, &inner_child, &local_child)?;
+                get_dir_into(vfs, &inner_child, &local_child, out)?;
             }
             InodeKind::Symlink => {
                 // Symlinks: re-create on the host filesystem with
@@ -5553,15 +5712,29 @@ pub fn get_dir_recursive(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<u64
                 }
                 #[cfg(not(unix))]
                 {
-                    return Err(format!(
-                        "vault contains a symlink ({inner_child}) but this host \
-                         does not support symlink creation in the extract path"
-                    ));
+                    out.skipped
+                        .push((inner_child, "symbolic link; not created on this system"));
                 }
             }
         }
     }
-    Ok(total)
+    Ok(())
+}
+
+/// Empty, `.`, `..` or a name holding a path separator: never valid in a
+/// well-formed vault, so an extract refuses it rather than skipping it.
+fn is_traversal_name(name: &str) -> bool {
+    name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\'])
+}
+
+/// Why this system cannot create a file called `name`, if it cannot.
+/// Only Windows restricts names beyond the vault's own rules.
+pub(crate) fn host_cannot_name(name: &str) -> Option<&'static str> {
+    if cfg!(windows) {
+        luksbox_core::file_util::windows_name_problem(name)
+    } else {
+        None
+    }
 }
 
 /// Returns true if joining `name` to a directory path could possibly
@@ -5827,19 +6000,61 @@ pub fn get_file(vfs: &mut Vfs, inner: &str, local: &Path) -> Result<u64, String>
     if st.kind != InodeKind::File {
         return Err(format!("{inner} is not a file"));
     }
-    // Mode 0600 on Unix - extracted plaintext stays owner-only.
-    let mut dst = luksbox_core::file_util::secure_create_or_truncate(local).map_err(estr)?;
-    let mut buf = vec![0u8; 64 * 1024];
-    let mut offset = 0u64;
-    while offset < st.size {
-        let n = vfs.read(id, offset, &mut buf).map_err(estr)?;
-        if n == 0 {
-            break;
-        }
-        dst.write_all(&buf[..n]).map_err(estr)?;
-        offset += n as u64;
+    if is_open_vault_file(vfs, local) {
+        return Err(format!(
+            "{} is this vault's own file; pick another destination",
+            local.display()
+        ));
     }
-    Ok(offset)
+    // An existing file is replaced only once the new content is complete:
+    // the copy goes to a new file next to it, renamed over it at the end.
+    // Truncating it first left a cut-off file, the original already gone,
+    // when the export failed (a damaged chunk, a full disk).
+    let replacing = std::fs::symlink_metadata(local).is_ok();
+    let target = if replacing {
+        let dir = local
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        dir.join(format!(
+            ".luksbox-export-{}-{stamp}.part",
+            std::process::id()
+        ))
+    } else {
+        local.to_path_buf()
+    };
+    // Mode 0600 on Unix - extracted plaintext stays owner-only. Created
+    // new (never through a link, never over something else).
+    let mut dst = luksbox_core::file_util::secure_create_new(&target).map_err(estr)?;
+    let copied = (|| -> Result<u64, String> {
+        let mut buf = vec![0u8; 1 << 20];
+        let mut offset = 0u64;
+        while offset < st.size {
+            let n = vfs.read(id, offset, &mut buf).map_err(estr)?;
+            if n == 0 {
+                break;
+            }
+            dst.write_all(&buf[..n]).map_err(estr)?;
+            offset += n as u64;
+        }
+        dst.sync_all().map_err(estr)?;
+        Ok(offset)
+    })();
+    drop(dst);
+    let done = copied.and_then(|n| {
+        if replacing {
+            std::fs::rename(&target, local).map_err(estr)?;
+        }
+        Ok(n)
+    });
+    if done.is_err() {
+        let _ = std::fs::remove_file(&target);
+    }
+    done
 }
 
 pub fn split_parent_name(vfs: &Vfs, p: &str) -> Result<(luksbox_vfs::FileId, String), String> {
@@ -6420,33 +6635,49 @@ pub fn enroll_hybrid_pq_tpm2_fido2_deniable(
 /// a create path just produced (every create path funnels through this,
 /// so the individual creators stay untouched). An attached anchor is
 /// advanced to the new header generation by the upgrade itself.
+///
+/// A failure here does not fail the create: the vault exists and is
+/// opened as usual, with `create_warning` telling the user what to redo
+/// (it used to be reported as a create error, so the new vault was
+/// neither opened nor added to Recent).
 pub fn apply_header_v3(mut opened: OpenedVault, header_v3: bool) -> Result<OpenedVault, String> {
-    if header_v3 {
-        opened.vfs.upgrade_header_to_v3().map_err(|e| {
+    if header_v3 && let Err(e) = opened.vfs.upgrade_header_to_v3() {
+        add_create_warning(
+            &mut opened,
             format!(
-                "vault created, but switching it to header format v3 failed: {e}. The vault \
-                 is usable as is; retry from Manage keyslots > Upgrade header."
-            )
-        })?;
+                "vault created, but switching it to header format v3 failed: {e}. \
+                 Retry from Manage keyslots > Upgrade header."
+            ),
+        );
     }
     Ok(opened)
 }
 
-/// Set the new vault's maximum size (0 = unlimited) and save it.
+/// Set the new vault's maximum size (0 = unlimited) and save it. As for
+/// `apply_header_v3`, a failure is a warning on a vault that was created.
 pub fn apply_max_size(mut opened: OpenedVault, max_size: u64) -> Result<OpenedVault, String> {
-    if max_size != 0 {
-        opened
+    if max_size != 0
+        && let Err(e) = opened
             .vfs
             .set_max_vault_size(max_size)
             .and_then(|()| opened.vfs.flush())
-            .map_err(|e| {
-                format!(
-                    "vault created, but setting its maximum size failed: {e}. The vault is \
-                     usable as is; set the size again from Vault size."
-                )
-            })?;
+    {
+        add_create_warning(
+            &mut opened,
+            format!(
+                "vault created, but setting its maximum size failed: {e}. Set it again \
+                 from Vault size."
+            ),
+        );
     }
     Ok(opened)
+}
+
+fn add_create_warning(opened: &mut OpenedVault, warning: String) {
+    opened.create_warning = Some(match opened.create_warning.take() {
+        Some(prev) => format!("{prev}\n{warning}"),
+        None => warning,
+    });
 }
 
 /// R15-D1: switch the open vault to header format v3. `Ok(false)` if it
@@ -8138,7 +8369,7 @@ mod browser_ops_tests {
     }
 
     #[test]
-    fn put_paths_stops_on_existing_name_and_keeps_earlier_imports() {
+    fn put_paths_skips_an_existing_name_and_imports_the_rest() {
         let tmp = tempfile::tempdir().unwrap();
         let a = tmp.path().join("a.txt");
         let b = tmp.path().join("b.txt");
@@ -8149,14 +8380,18 @@ mod browser_ops_tests {
         let id = vfs.create(root, "b.txt").unwrap();
         vfs.write(id, 0, b"old b").unwrap();
 
-        let sum = put_paths(&mut vfs, &[a.clone(), b.clone()], "/");
-        assert!(sum.error.unwrap().contains("b.txt already exists"));
+        // b.txt first: the clash used to stop the import there.
+        let sum = put_paths(&mut vfs, &[b.clone(), a.clone()], "/");
+        assert!(sum.error.is_none(), "{:?}", sum.error);
         assert_eq!(sum.files, 1);
+        assert_eq!(sum.not_imported.len(), 1);
+        assert_eq!(sum.not_imported[0].0, b);
+        assert!(sum.not_imported[0].1.contains("already"));
         // The clash neither overwrote nor merged the existing file.
         assert_eq!(read_all(&mut vfs, "/b.txt"), b"old b");
         drop(vfs);
 
-        // a.txt was flushed despite the error.
+        // a.txt, after the clash, is imported and on disk.
         let cont = crate::sync_gui::open_with_material(
             &tmp.path().join("v.lbx"),
             None,
@@ -8641,5 +8876,54 @@ mod deniable_keyslots_tests {
             .unwrap();
         let e = find_deniable_slots(snapshot, "weak", KdfStrength::Interactive).unwrap_err();
         assert!(e.contains("no slot opens"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod create_warning_tests {
+    use super::*;
+
+    /// A maximum size the new vault cannot honour does not fail the
+    /// create: the vault comes back open, with a warning saying what to
+    /// redo (it used to be reported as a create error, and the vault was
+    /// neither opened nor added to Recent).
+    #[test]
+    fn a_failed_size_step_is_a_warning_on_an_open_vault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let opts = CreateOpts {
+            path: tmp.path().join("v.lbx"),
+            header_path: None,
+            cipher: CipherSuite::Aes256GcmSiv,
+            kind: SlotKindArg::Passphrase,
+            passphrase: Some(Zeroizing::new("correct horse".into())),
+            backup_passphrase: None,
+            pin: None,
+            pad_files: false,
+            hide_sizes: false,
+            anchor_path: None,
+            enable_recovery_passphrase: false,
+            hybrid_kyber_path: None,
+            hybrid_seed_pw: None,
+            kdf: KdfStrength::Interactive,
+            use_deniable: false,
+            use_v3_format: true,
+            header_v3: true,
+            max_size: 1,
+        };
+        let mut opened = create_vault(opts)
+            .and_then(|o| apply_header_v3(o, true))
+            .and_then(|o| apply_max_size(o, 1))
+            .expect("the create itself succeeded");
+        let w = opened.create_warning.take().expect("a warning");
+        assert!(w.contains("maximum size failed"), "{w}");
+        assert_eq!(opened.vfs.max_vault_size(), 0);
+        put_file_bytes(&mut opened.vfs, "/still-usable.txt", b"ok");
+        opened.vfs.flush().unwrap();
+    }
+
+    fn put_file_bytes(vfs: &mut Vfs, path: &str, data: &[u8]) {
+        let root = vfs.lookup_path("/").unwrap();
+        let id = vfs.create(root, path.trim_start_matches('/')).unwrap();
+        vfs.write(id, 0, data).unwrap();
     }
 }

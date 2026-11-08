@@ -74,6 +74,17 @@ about). A target listed only in `fuzz/` is libfuzzer-only.
 | **`slot_payload_roundtrip`** | `SlotPayload::new` -> `encode` -> `decode` with attacker-controlled length triples | Encoder/decoder symmetry; constructor rejections always justified | OK | OK |
 | **`chunk_aead_decrypt`** | `aead::open` at the production chunk callsite with constructed AAD (`file_id || chunk_idx || generation`) | Per-chunk decrypt with attacker-controlled nonce + ct + tag (raw block device / NFS middlebox / ZFS snapshot rollback threat). Every read from a mounted vault flows through this AEAD call; previously only fuzzed transitively via `vfs_ops` with locally-produced ct. Added 2026-05. | OK | OK |
 | **`anchor_parse`** | `anchor::read_and_verify` (48 B standard) + `anchor::deniable_read_and_verify` (256 B deniable) | Random bytes through both readers; truncation, magic-match-but-garbage, AEAD-fail. Added after the O_NOFOLLOW hardening in 2026-05 - defenses are most useful when fuzzed. | OK | OK |
+| **`sync_object_open`** | `luksbox_sync::codec::open` + `unframe` | Every bundle object is provider-controlled bytes: commitment check, AEAD, framing, for all three suites and four object kinds | OK | OK |
+| **`sync_manifest_decode`** | `Manifest::open` on sealed arbitrary plaintext | Post-AEAD postcard decode + `validate` (a misbehaving key holder) | OK | OK |
+| **`sync_lease_decode`** | `Lease::open` on sealed arbitrary plaintext | Post-AEAD decode of leases; re-seal round trip. Added Round 16. | OK | OK |
+| **`sync_table_decode`** | `TableBlock::decode` | 1024-entry page-table blocks, hole rule, encode symmetry | OK | OK |
+| **`sync_name_grammar`** | `names::{Name, HeaderName}::parse` | Object-name grammar: a parsed name prints back unchanged, everything else is foreign | OK | OK |
+| **`sync_graph_build`** | `Graph::build` + `check` | Arbitrary commit histories (cycles, gaps, duplicates, dangling parents, checkpoints) against a device state | OK | OK |
+| **`sync_local_state_decode`** | `DeviceState::load` | The per-device state record, raw and after authentication. Added Round 16. | OK | OK |
+| `sync_listing_classify` | `MemStore::list` with planted entries | Folder listings: misplaced shards, look-alike names, temp files; what is listed parses back and sits in its shard. Added Round 16. | OK | - |
+| `sync_fs_store_hostile` | `FsStore` on a real folder with planted symlinks, hard links, FIFOs, folders and misplaced files | Invariant I7: nothing outside the bundle is read or followed, no operation panics. Added Round 16. | OK | - |
+| `sync_keyslot_merge` | `bundle::merge_keyslot_tables` with fuzzer-chosen per-slot changes on both sides | A removal is never undone, no slot is invented, the merged generation is newer. Added Round 16. | OK | - |
+| `sync_bundle_open_adversarial` | `Session::open_with_key` + `Vfs::open_read_only` on a real bundle after fuzzer-chosen faults (delete, damage, truncate, duplicate, swap, plant) | The evil provider end to end: never a panic, never a byte the device did not write (I1, I4, I5). Added Round 16. | OK | - |
 | **`deniable_envelope_multi_slot`** | `try_open_envelope_v2` on real headers with fuzzer-selected slot occupancy | Multi-slot deniable open: builds a valid deniable header with a fuzzer-chosen subset of the 8 slots enrolled under a shared envelope passphrase, then drives the envelope-discovery loop with an attacker-supplied passphrase / cipher. Catches regressions to a NON-OPAQUE error variant or a panic on the multi-slot path. Added Round 12 (R12-01). | OK | OK |
 
 `auth_then_process` is special: it requires a known MVK to encrypt
@@ -110,6 +121,15 @@ is measured separately by the dudect bench
 `crates/luksbox-format/benches/dudect_deniable_envelope.rs` - run
 `cargo bench --bench dudect_deniable_envelope -p luksbox-format` to
 reproduce.
+
+The sync-bundle targets (Round 16) cover the surface the sync design
+calls hostile input: the bundle folder as written by the sync client on
+the provider's behalf. The first seven take raw bytes and run under both
+engines; the last four build real state per iteration (a folder, a
+header table, a bundle) and are libFuzzer-only. `scripts/fuzz_sync.sh`
+runs the whole set (`scripts/fuzz_sync.sh --build` just builds them,
+`scripts/fuzz_sync.sh 3600 8` is an hour per target on 8 workers); run
+it after any change to `crates/luksbox-sync`.
 
 ### Constant-time verification (dudect benches)
 

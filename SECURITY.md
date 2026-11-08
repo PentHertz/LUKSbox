@@ -450,7 +450,37 @@ get in touch.
   --no-verify`. Test `v2_revoked_credential_does_not_unlock_via_mirror`
   pins this gating; the `v2_mirror_recovery` libFuzzer target
   fuzzes the property under arbitrary corruption + mirror
-  substitution patterns.
+  substitution patterns. Round 16 (R16-01) closed the other half:
+  a header recovered from the mirror is re-established byte for byte
+  (same generation), never persisted as a new state, so a planted
+  pre-revocation mirror stays detectable by the anchor on every open.
+- **Sync bundles: open items from audit round 16**
+  (`docs/SECURITY_AUDIT_ROUND_16.md`; the format is experimental):
+  - *No salvage mode* (R16-22). Every part of a bundle is stored once
+    and shared by the versions that did not change it; a part the
+    sync service loses or damages makes every later version
+    incomplete and the vault does not open through them. `luksbox
+    sync export --snapshot <id>` rescues the newest complete earlier
+    version; a `--salvage` open (missing parts read as zeros, the
+    affected files reported, everything else readable) is the next
+    step. Keep regular exports.
+  - *Manifest cap without automatic collection* (R16-23). A bundle
+    with more than 100 000 commits refuses to open and `gc` needs an
+    open session; years of use without `sync gc`. Needs the
+    verified-manifest cache and a periodic collection pass.
+  - *Leases cannot be turned off* (R16-24): the provider learns when
+    the vault is open. The planned `--no-lease` is not built.
+  - *Unpublished changes whose base commit is gone cannot be rebuilt*
+    (R16-25): the planned local copy of the base's table blocks and
+    metadata pages (`pins/`) is not built; leases pin the base for 90
+    days and the retention keeps 30, so this needs a long absence.
+  - *`luksbox umount` returns before the daemon's final upload*
+    (R16-08, remaining half); the failure is now reported at the next
+    open and in `sync status`.
+  - *A revoked keyslot on a bundle does not change the master key*
+    (R16-17): epoch keys (phase 3 of `docs/CLOUD_SYNC_DESIGN.md`) are
+    the real fix; `revoke` says so and gives the export / rotate /
+    convert procedure.
 - **Metadata-budget capacity notification is in-process only.**
   The 75% / 90% warnings are emitted on the `Vfs` instance's
   stderr (CLI) or via a one-shot toast on the AppState (GUI).
@@ -650,6 +680,18 @@ get in touch.
   it stays unlocked.
 
 ### Cryptographic gaps
+
+- **Chunk AEAD is not bound to a fork of the vault (R16-21).** The
+  chunk AAD is `file_id || chunk_idx || generation` and the file key
+  is derived from the file id, so two copies of one `.lbx` edited
+  independently (a sync service's "conflicted copy") can produce a
+  chunk with the same AAD under the same key and different plaintext;
+  an adversary holding both copies can transplant such a slot between
+  them and the AEAD passes. Only the user's own bytes can move between
+  the user's own forks, and sync bundles are not affected (every page
+  is sealed under its own key and bound to its position; merges
+  re-encrypt). A per-instance fork id in the chunk AAD, refreshed on
+  merge and rescue, goes into the next format bump.
 
 - **No plausible-deniability hidden volumes.** A user under coercion has no
   way to reveal a "duress" passphrase that opens a different (decoy) vault.
@@ -1192,6 +1234,7 @@ for the full per-round log.
 | 11 | Deniable v2 cryptographic sweep | 3 fixes (per-vault salt in inner-header AAD, `Zeroizing` for envelope plaintext, propagated `Zeroizing<[u8;32]>` through `deniable_pq_decap`); 5 new workflow tests + 3 new fuzz targets |
 | 12 | FUSE-T subprocess + deniable v2 timing + filesystem TOCTOU + memory safety | 1 CRITICAL + 5 HIGH + 7 MEDIUM + 6 LOW; **all 19 findings shipped fixes in the same revision** (R12-14 formally superseded by R12-11). Full report + Fix-status table at [docs/SECURITY_AUDIT_ROUND_12.md](docs/SECURITY_AUDIT_ROUND_12.md). Headline fix: R12-01's deniable envelope discovery loop is now constant-time via `subtle::Choice`-driven byte selection + single-shot `SlotPayload::decode` on the chosen slot. New regression coverage: `dudect_deniable_envelope` bench + `deniable_envelope_multi_slot` libFuzzer + AFL++ target + `round12_findings.rs` deterministic regression suite (7 tests, 0 `#[ignore]`d). |
 | 15 | Full-workspace white-box sweep (every crate, GUI, CI/release pipeline, installer) | 0 CRITICAL + 5 HIGH + 14 MEDIUM + 29 LOW; **43 fixed in the same revision, 6 accepted/documented**. Full report at [docs/SECURITY_AUDIT_ROUND_15.md](docs/SECURITY_AUDIT_ROUND_15.md). Headline fixes: an aborted MVK rotation no longer bricks the vault (R15-C1), `rename` + `rmdir` no longer wedges every later flush (R15-E1), the GUI no longer deletes other vaults' files on a failed create (R15-I1), the anchor now sees metadata-only rollbacks (R15-D1), the Apple signing key is no longer exposed to third-party build scripts (R15-J1). |
+| 16 | Sync bundles (`luksbox-sync`, `luksbox-merge`, the `Storage` refactor) + full-workspace sweep, with "what does a faulty sync service cost the user" as a question | 0 CRITICAL + 3 HIGH + 8 MEDIUM + 22 LOW + 10 INFO; **2 HIGH, 5 MEDIUM, 10 LOW and 2 INFO fixed in the same revision, 2 mitigated, the rest accepted / documented**. Full report at [docs/SECURITY_AUDIT_ROUND_16.md](docs/SECURITY_AUDIT_ROUND_16.md). Headline fixes: a header recovered from its mirror no longer re-persists as a new generation (R16-01, a rollback-detection bypass for revoked keyslots), `shrink` after a failed write no longer locks the vault out (R16-02), an incomplete commit no longer freezes every device read-only for good (R16-03), read-only sessions show and export the device's unpublished changes (R16-04), failed background uploads are reported at the next open (R16-08), `luksbox merge` refuses a base that is not an ancestor (R16-11), `luksbox sync export --snapshot` rescues an earlier version when the newest arrived damaged (R16-22). New coverage: 19 regression tests, 6 fuzz targets + 7 AFL++ mirrors, `scripts/fuzz_sync.sh`. |
 | 13 | Local filesystem boundary races + header durability + sidecar DoS + secret-copy hygiene | 0 CRITICAL + 2 HIGH + 5 MEDIUM + 2 LOW + 1 INFO; **all 9 findings shipped fixes in the same revision**. Full report + Fix-status table at [docs/SECURITY_AUDIT_ROUND_13.md](docs/SECURITY_AUDIT_ROUND_13.md). Headline fixes: R13-01 closes the intermediate-directory symlink swap in `secure_create_or_truncate` via `openat(parent_dir_fd, basename, O_NOFOLLOW)`; R13-02 routes `luksbox header restore` through the container's verified handle (`Container::restore_header_bytes`); R13-04 promotes `persist_header` from `flush()` to `sync_all()` + `atomic_secure_write` on detached headers. New regression coverage: 4 test files (14 tests total, 0 `#[ignore]`d). |
 
 **Ad-hoc improvements** since the audit log was last updated:

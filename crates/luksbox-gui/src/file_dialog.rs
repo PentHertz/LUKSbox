@@ -34,6 +34,14 @@ pub enum Picked {
     Unavailable(String),
 }
 
+/// Outcome of a multi-file dialog ([`pick_files`]).
+pub enum PickedFiles {
+    /// At least one file.
+    Paths(Vec<PathBuf>),
+    Cancelled,
+    Unavailable(String),
+}
+
 /// rfd error records logged since the last dialog started.
 static DIALOG_ERRORS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
@@ -142,6 +150,8 @@ impl Dialog {
 #[derive(Clone, Copy)]
 enum Op {
     PickFile,
+    /// Several files at once (the reply lists them).
+    PickFiles,
     PickFolder,
     SaveFile,
 }
@@ -151,34 +161,65 @@ impl Op {
     fn name(self) -> &'static str {
         match self {
             Op::PickFile => "pick-file",
+            Op::PickFiles => "pick-files",
             Op::PickFolder => "pick-folder",
             Op::SaveFile => "save-file",
         }
     }
 
     fn parse(name: &str) -> Option<Self> {
-        [Op::PickFile, Op::PickFolder, Op::SaveFile]
+        [Op::PickFile, Op::PickFiles, Op::PickFolder, Op::SaveFile]
             .into_iter()
             .find(|op| op.name() == name)
     }
 }
 
+fn take_dialog_errors() -> Vec<String> {
+    DIALOG_ERRORS
+        .lock()
+        .map(|mut e| std::mem::take(&mut *e))
+        .unwrap_or_default()
+}
+
 /// Show the dialog in this process.
 fn show_here(op: Op, dialog: &Dialog) -> Picked {
-    let take = || {
-        DIALOG_ERRORS
-            .lock()
-            .map(|mut e| std::mem::take(&mut *e))
-            .unwrap_or_default()
-    };
-    take();
+    take_dialog_errors();
     let d = dialog.to_rfd();
     let result = match op {
         Op::PickFile => d.pick_file(),
+        Op::PickFiles => d.pick_files().and_then(|v| v.into_iter().next()),
         Op::PickFolder => d.pick_folder(),
         Op::SaveFile => d.save_file(),
     };
-    classify(result, take())
+    classify(result, take_dialog_errors())
+}
+
+/// The multi-file dialog in this process.
+fn show_here_files(dialog: &Dialog) -> PickedFiles {
+    take_dialog_errors();
+    let result = dialog.to_rfd().pick_files().filter(|v| !v.is_empty());
+    let first = result.as_ref().and_then(|v| v.first().cloned());
+    match classify(first, take_dialog_errors()) {
+        Picked::Path(_) => PickedFiles::Paths(result.unwrap_or_default()),
+        Picked::Cancelled => PickedFiles::Cancelled,
+        Picked::Unavailable(r) => PickedFiles::Unavailable(r),
+    }
+}
+
+/// Pick one or more files (one dialog, several selected).
+pub fn pick_files(dialog: Dialog) -> PickedFiles {
+    if typed_paths_forced() {
+        return PickedFiles::Unavailable(
+            "the system file dialog is disabled by LUKSBOX_GUI_TYPED_PATHS".into(),
+        );
+    }
+    #[cfg(target_os = "linux")]
+    if dialog.filters.is_empty()
+        && let Some(picked) = helper::show_files(&dialog)
+    {
+        return picked;
+    }
+    show_here_files(&dialog)
 }
 
 fn show(op: Op, dialog: Dialog) -> Picked {
@@ -233,7 +274,7 @@ mod helper {
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
 
-    use super::{Dialog, Op, Picked, show_here};
+    use super::{Dialog, Op, Picked, PickedFiles, show_here, show_here_files};
 
     /// First argument that makes `luksbox-gui` a dialog helper:
     /// `--file-dialog-helper <op> <title> <file name>` (empty: not set).
@@ -247,6 +288,40 @@ mod helper {
     /// `None` if the helper did not run or report (the caller then shows
     /// the dialog itself).
     pub(super) fn show(op: Op, dialog: &Dialog) -> Option<Picked> {
+        let (code, stdout) = run(op, dialog)?;
+        parse_reply(code, stdout)
+    }
+
+    /// [`super::pick_files`] through the helper: the reply lists the
+    /// paths separated by NUL bytes (a path cannot contain one).
+    pub(super) fn show_files(dialog: &Dialog) -> Option<PickedFiles> {
+        let (code, stdout) = run(Op::PickFiles, dialog)?;
+        parse_files_reply(code, stdout)
+    }
+
+    fn parse_files_reply(code: Option<i32>, stdout: Vec<u8>) -> Option<PickedFiles> {
+        match code? {
+            PICKED => {
+                let paths: Vec<PathBuf> = stdout
+                    .split(|&b| b == 0)
+                    .filter(|p| !p.is_empty())
+                    .map(|p| PathBuf::from(OsString::from_vec(p.to_vec())))
+                    .collect();
+                Some(if paths.is_empty() {
+                    PickedFiles::Cancelled
+                } else {
+                    PickedFiles::Paths(paths)
+                })
+            }
+            CANCELLED => Some(PickedFiles::Cancelled),
+            UNAVAILABLE => Some(PickedFiles::Unavailable(
+                String::from_utf8_lossy(&stdout).into_owned(),
+            )),
+            _ => None,
+        }
+    }
+
+    fn run(op: Op, dialog: &Dialog) -> Option<(Option<i32>, Vec<u8>)> {
         // This very binary, even if the file was replaced since.
         let mut cmd = Command::new("/proc/self/exe");
         if let Some(argv0) = std::env::args_os().next() {
@@ -262,7 +337,7 @@ mod helper {
             .stderr(Stdio::inherit())
             .output()
             .ok()?;
-        parse_reply(out.status.code(), out.stdout)
+        Some((out.status.code(), out.stdout))
     }
 
     fn parse_reply(code: Option<i32>, stdout: Vec<u8>) -> Option<Picked> {
@@ -293,10 +368,25 @@ mod helper {
             file_name: text(name),
             filters: Vec::new(),
         };
-        let (code, reply) = match show_here(op, &dialog) {
-            Picked::Path(p) => (PICKED, p.into_os_string().into_vec()),
-            Picked::Cancelled => (CANCELLED, Vec::new()),
-            Picked::Unavailable(reason) => (UNAVAILABLE, reason.into_bytes()),
+        let (code, reply) = if matches!(op, Op::PickFiles) {
+            match show_here_files(&dialog) {
+                PickedFiles::Paths(paths) => {
+                    let mut reply = Vec::new();
+                    for p in paths {
+                        reply.extend_from_slice(&p.into_os_string().into_vec());
+                        reply.push(0);
+                    }
+                    (PICKED, reply)
+                }
+                PickedFiles::Cancelled => (CANCELLED, Vec::new()),
+                PickedFiles::Unavailable(reason) => (UNAVAILABLE, reason.into_bytes()),
+            }
+        } else {
+            match show_here(op, &dialog) {
+                Picked::Path(p) => (PICKED, p.into_os_string().into_vec()),
+                Picked::Cancelled => (CANCELLED, Vec::new()),
+                Picked::Unavailable(reason) => (UNAVAILABLE, reason.into_bytes()),
+            }
         };
         let mut out = std::io::stdout().lock();
         match out.write_all(&reply).and_then(|()| out.flush()) {
@@ -329,6 +419,25 @@ mod helper {
             assert!(parse_reply(Some(101), Vec::new()).is_none());
             assert!(parse_reply(Some(USAGE), Vec::new()).is_none());
             assert!(parse_reply(None, Vec::new()).is_none());
+        }
+
+        #[test]
+        fn several_files_are_read_back() {
+            let r = parse_files_reply(Some(PICKED), b"/a b\0/c\nd\0".to_vec());
+            assert!(matches!(
+                r,
+                Some(PickedFiles::Paths(v))
+                    if v == vec![PathBuf::from("/a b"), PathBuf::from("/c\nd")]
+            ));
+            assert!(matches!(
+                parse_files_reply(Some(PICKED), Vec::new()),
+                Some(PickedFiles::Cancelled)
+            ));
+            assert!(matches!(
+                parse_files_reply(Some(UNAVAILABLE), b"no portal".to_vec()),
+                Some(PickedFiles::Unavailable(r)) if r == "no portal"
+            ));
+            assert!(parse_files_reply(Some(101), Vec::new()).is_none());
         }
 
         #[test]

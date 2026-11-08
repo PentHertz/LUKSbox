@@ -58,18 +58,16 @@ impl FsLocal {
     /// Open (creating 0700) the folder and take its exclusive lock, so
     /// only one process on this device works on the bundle at a time.
     pub fn open(dir: &Path) -> Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        create_dir_all_private(dir)?;
+        let lock_path = dir.join("lock");
+        let mut o = std::fs::OpenOptions::new();
+        o.create(true).truncate(false).write(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
         }
-        let lock_path = dir.join("lock");
-        let lock = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&lock_path)?;
+        let lock = o.open(&lock_path)?;
         use fs2::FileExt;
         lock.try_lock_exclusive().map_err(|_| {
             SyncError::Io(std::io::Error::new(
@@ -133,6 +131,28 @@ impl LocalStore for FsLocal {
         out.sort();
         Ok(out)
     }
+}
+
+/// `create_dir_all`, with every folder it creates private (0700), the
+/// existing ones left as they are. R16-09: the per-device state lives
+/// under `<data dir>/luksbox/sync/`; with a plain `create_dir_all` the
+/// intermediate folders took the umask (0755 as a rule), so another
+/// account on the machine could list which bundles this one uses.
+pub fn create_dir_all_private(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(())
 }
 
 /// Open for reading without following a link at the final component

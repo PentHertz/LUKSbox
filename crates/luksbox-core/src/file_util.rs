@@ -1357,6 +1357,93 @@ impl RecoveryMirrors {
     }
 }
 
+/// Why Windows cannot create a file or folder called `name`, if it
+/// cannot: a character it forbids, a trailing dot or space (dropped by
+/// the Win32 layer), or a reserved device name (`CON`, `NUL`, `COM1`...,
+/// with or without an extension). Compiled everywhere so the rules are
+/// tested on every platform; exports call it on Windows only, where a
+/// vault made on Linux or macOS may hold such names (`12:30.log`).
+pub fn windows_name_problem(name: &str) -> Option<&'static str> {
+    if name
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') || (c as u32) < 0x20)
+    {
+        return Some("character not allowed in a Windows file name");
+    }
+    if name.ends_with('.') || name.ends_with(' ') {
+        return Some("Windows drops a trailing dot or space");
+    }
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches(' ')
+        .to_ascii_uppercase();
+    let numbered = |prefix: &str| {
+        stem.len() == 4 && stem.starts_with(prefix) && matches!(stem.as_bytes()[3], b'1'..=b'9')
+    };
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL") || numbered("COM") || numbered("LPT")
+    {
+        return Some("reserved device name on Windows");
+    }
+    None
+}
+
+#[cfg(test)]
+mod windows_name_tests {
+    use super::windows_name_problem;
+
+    #[test]
+    fn names_windows_refuses() {
+        for bad in [
+            "12:30.log",
+            "what?.txt",
+            "a*b",
+            "x<y",
+            "x>y",
+            "pipe|d",
+            "quote\"d",
+            "tab\there",
+            "trailing.",
+            "trailing ",
+            "CON",
+            "con.txt",
+            "Nul",
+            "aux.tar.gz",
+            "COM1",
+            "lpt9.log",
+            "PRN ",
+        ] {
+            assert!(
+                windows_name_problem(bad).is_some(),
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn names_windows_accepts() {
+        for good in [
+            "report.pdf",
+            "COM0",
+            "COM10",
+            "console.log",
+            "connect",
+            "LPT",
+            "nul_file",
+            "été 2026.jpg",
+            ".hidden",
+            "a.b.c",
+            "日本語.txt",
+        ] {
+            assert!(
+                windows_name_problem(good).is_none(),
+                "{good:?} should be accepted"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

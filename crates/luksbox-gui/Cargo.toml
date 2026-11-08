@@ -116,6 +116,9 @@ raw-window-handle = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
+# Headless GUI scenarios (`gui_scenarios.rs`): drives the real app
+# through its widgets via AccessKit, no display needed.
+egui_kittest = "0.34"
 # Used by the recents-permissions test (Unix-only) which sets
 # umask in the test process via `libc::umask`.
 [target.'cfg(unix)'.dev-dependencies]

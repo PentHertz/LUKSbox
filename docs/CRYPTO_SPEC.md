@@ -2750,12 +2750,16 @@ Records are sealed with `R_local` (random 12-byte nonce, AAD
 `"lbx:sync/local-record/v1" || bid || name`) and written with
 `atomic_secure_write`; the folder is 0700 and locked (one process per
 device). `<data dir>/luksbox/sync/paths/<sha256(canonical path)>`
-holds the bundle id last seen at a path (`BundleReplaced`).
+holds the bundle id last seen at a path (`BundleReplaced`). A
+`last-publish-error` record (sealed the same way) holds the error of
+the last publish that failed, until one succeeds (R16-08). Every
+folder on the way to these is created 0700 (R16-09).
 
 ### 22.8 Opening
 
-1. Header objects (one bundle id only) are tried newest generation
-   first; the first the credential opens gives the MVK and keys.
+1. Header objects (one bundle id only, at most 1024: R16-05) are tried
+   newest generation first; the first the credential opens gives the
+   MVK and keys.
 2. Every manifest is verified. A manifest is usable if its device's
    sequence numbers are contiguous up to it (from the checkpoint) and
    every parent is usable (or below the parent device's checkpoint).
@@ -2770,12 +2774,16 @@ holds the bundle id last seen at a path (`BundleReplaced`).
    (`Missing`).
 4. Heads (usable, nobody's parent) are ordered by `(lamport, hash)`.
    The first complete one (all table blocks verify, all pages
-   present) is the head, else its newest complete ancestor, read-only.
+   present) is the head; incomplete heads before it are reported as
+   pending and skipped (R16-03). Only when no head is complete does
+   the newest complete ancestor of the first open, read-only.
 5. The head's header must open with the same credential
    (`CredentialRevoked` otherwise); its generation must be at least
    the highest seen.
-6. Staged changes made on this head are restored; staged changes made
-   on an older commit are merged onto the head (22.10) and published.
+6. Staged changes made on this head are restored, in a read-only
+   session too (shown and exportable, never published: R16-04);
+   staged changes made on an older commit are merged onto the head
+   (22.10) and published by a writable session.
 7. Other complete heads are merged into the head, one merge commit
    each (22.10).
 
@@ -2799,8 +2807,9 @@ staged pages and new
 table blocks (`create_new`, no clobber, identical bytes accepted);
 upload a staged header as a new `h/` object; seal the manifest
 (`seq = own + 1`, `parents = [head]` (+ merged heads), `seen` = newest
-seen of the other devices); write `manifest-pending` and record it in
-`state`; upload the manifest; finalize `state`. A crash after the
+seen of the other devices); validate it as a reader would (R16-07; `seen` lists at most the 256
+most recently active devices); write `manifest-pending` and record it
+in `state`; upload the manifest; finalize `state`. A crash after the
 record re-uploads the same manifest bytes at the next open, so a
 device never writes two commits with one sequence number. If another
 device published meanwhile, the commit is published anyway as a

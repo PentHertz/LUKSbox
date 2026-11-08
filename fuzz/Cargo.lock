@@ -1161,6 +1161,7 @@ dependencies = [
 name = "luksbox-fuzz"
 version = "0.0.0"
 dependencies = [
+ "libc",
  "libfuzzer-sys",
  "luksbox-core",
  "luksbox-fido2",

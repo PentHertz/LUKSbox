@@ -349,6 +349,87 @@ LUKSBOX_TEST_FAST_KDF=1 LUKSBOX_PASSPHRASE=pw \
 
 ---
 
+## GUI scenarios without a display
+
+(Checks still to run after the 2026-11 pass: `docs/OPEN_ITEMS.md`.)
+
+`crates/luksbox-gui/src/app/gui_scenarios.rs` drives the real GUI
+(`LuksboxApp`) through its widgets with
+[egui_kittest](https://docs.rs/egui_kittest) (AccessKit), headless: no
+X11, Wayland or GPU needed. Each step clicks or types into a widget
+found by its label or placeholder, waits for the job the app started,
+and checks the vault contents and extracted files. File dialogs are
+replaced by the typed-path prompt (`LUKSBOX_GUI_TYPED_PATHS=1`), and
+HOME and the XDG folders point at a temporary folder.
+
+```bash
+cargo test -p luksbox-gui --bin luksbox-gui gui_scenarios_end_to_end \
+  --config 'profile.dev.package.argon2.opt-level=3' \
+  --config 'profile.dev.package.blake2.opt-level=3' -- --ignored --nocapture
+```
+
+The default `cargo test -p luksbox-gui` runs it too, through
+`gui_scenarios_end_to_end_in_its_own_process`, which starts the test
+binary again filtered to this one test: it uses process-wide state (the
+open sync bundle session, HOME and XDG variables) that other tests of
+the same binary also touch from parallel threads. The command above
+runs it directly, with its output.
+
+The two `--config` lines optimise only Argon2id, which takes about
+30 s per unlock at the real preset in an unoptimised build (the whole
+run then takes about 3 min). `LUKSBOX_GUI_SCENARIO_MIB=64` makes the
+imported tree larger for timings (use `--release` for meaningful ones).
+Covered: a vault file (create, new folder, add file, add folder,
+browse, rename, download a file and a folder, delete with confirmation,
+vault size, add a keyslot, lock with "give back free space", unlock
+with the new keyslot from Recent, mount, write through the mount,
+unmount, make a sync bundle), a sync bundle created from the form (add
+folder, versions, lock and publish, reopen), a vault with a detached
+header, an anchor, hidden sizes and a 4 MiB file list region, and a
+deniable vault (create, add a file, rotation refused with its reason,
+reopen by typed path).
+`a_toast_does_not_block_clicks_under_it` guards the toast fix.
+A FUSE mount step is skipped without `/dev/fuse`.
+
+## Scenario scripts on a built binary (CLI, TUI, throughput)
+
+Three scripts drive a built `luksbox` the way a user does, with the
+real Argon2id preset of a release build. They complement the Rust
+suites above: they cover every vault kind side by side, the
+interactive paths, and transfer speed. Run them before a release and
+after changes to the CLI, the wizard, the vault I/O path or the mount.
+
+```bash
+cargo build --release -p luksbox-cli
+scripts/cli_scenarios.sh   target/release/luksbox        # ~190 steps, ~3 min
+scripts/tui_scenarios.sh   target/release/luksbox        # wizard + deniable, ~2 min
+scripts/bench_transfer.sh  target/release/luksbox 512    # MB/s per vault kind
+```
+
+- **`cli_scenarios.sh`**: every vault kind (three cipher suites,
+  padding and hidden sizes, detached header, anchor, size limit,
+  post-quantum hybrid), every data command on each with content
+  checks, folder `put` / `get` round trips, keyslot enroll / update /
+  revoke, header backup / restore / upgrade, anchor rollback detection, sync bundles on two devices with
+  status / verify / snapshots / export / gc, `merge` (and a refused
+  non-ancestor base), `panic`, and the failures that must be refused.
+  Exit status is the number of failed steps; failures print the
+  command and its output.
+- **`tui_scenarios.sh`**: `luksbox wizard` and the terminal-only
+  deniable commands in a pseudo-terminal (`scripts/tui_drive.py`):
+  create, open and every file action, an error inside the keyslot menu,
+  a stopped rotation and a mistyped mountpoint that must keep the vault
+  open, a sync bundle's refusals and its publish on close, Ctrl-C on an
+  open bundle (the change must survive and publish at the next open),
+  an aborted PANIC,
+  two foreground mounts in one run each ended with Ctrl-C, deniable
+  create / mount / remount. Uses a temporary HOME. Menu
+  positions are those of the current wizard: when a menu changes,
+  update the matching step.
+- **`bench_transfer.sh`**: `put` / `get` throughput of one file per
+  vault kind, with a plain copy as reference. Reading the numbers:
+  `docs/PERFORMANCE.md`.
+
 ## Security regression tests, the hard CI gate
 
 These are the **26 tests added during the 3-round fuzz audit** that

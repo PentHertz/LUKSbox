@@ -89,6 +89,19 @@ pub trait LbxFile: std::io::Read + std::io::Write + std::io::Seek + Send {
     /// never run on the real-filesystem rotation path) return a
     /// sentinel.
     fn inode_pair(&self) -> std::io::Result<(u64, u64)>;
+    /// Read exactly `buf.len()` bytes at `offset`. The default seeks then
+    /// reads; a real file does it in one positioned read (`pread`): the
+    /// vault reads and writes 4 KiB chunk slots, so the seek doubled the
+    /// system calls of every file transfer.
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.seek(std::io::SeekFrom::Start(offset))?;
+        self.read_exact(buf)
+    }
+    /// Write all of `buf` at `offset` (`pwrite` for a real file).
+    fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> std::io::Result<()> {
+        self.seek(std::io::SeekFrom::Start(offset))?;
+        self.write_all(buf)
+    }
 }
 
 impl LbxFile for std::fs::File {
@@ -100,6 +113,14 @@ impl LbxFile for std::fs::File {
     }
     fn inode_pair(&self) -> std::io::Result<(u64, u64)> {
         inode_of(self)
+    }
+    #[cfg(unix)]
+    fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        std::os::unix::fs::FileExt::read_exact_at(self, buf, offset)
+    }
+    #[cfg(unix)]
+    fn write_all_at(&mut self, offset: u64, buf: &[u8]) -> std::io::Result<()> {
+        std::os::unix::fs::FileExt::write_all_at(self, buf, offset)
     }
 }
 
@@ -470,7 +491,11 @@ fn read_metadata_mirror_nofollow(path: &Path, expected_len: usize) -> std::io::R
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut f = std::fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            // R16-14: `O_NONBLOCK` so opening a planted FIFO returns at
+            // once (a plain `open` of a FIFO blocks until a writer
+            // appears, before the regular-file check below can run); it
+            // has no effect on the regular file this must be.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
         let meta = f.metadata()?;
         if !meta.is_file() {
@@ -674,6 +699,14 @@ pub struct Container {
     pub header: Header,
     mvk: MasterVolumeKey,
     header_dirty: bool,
+    /// R16-01: the header as recovered from the `.header-bak` mirror
+    /// when the live header failed to parse, still to be written back
+    /// to the live region. `persist_header` writes it byte for byte
+    /// (same generation), never as a new header state: a recovered
+    /// header is what the vault already had, and bumping its generation
+    /// would let a rolled-back mirror pass the anchor's header check on
+    /// the next open.
+    recovered_header: Option<Box<[u8; HEADER_SIZE]>>,
     /// If set, every metadata-blob write also writes an updated
     /// anchor file at this path. See `crate::anchor` for the format
     /// and threat model.
@@ -1066,6 +1099,7 @@ impl Container {
             header,
             mvk,
             header_dirty: false,
+            recovered_header: None,
             anchor_path: None,
             rotation: None,
             deniable: None,
@@ -1546,6 +1580,7 @@ impl Container {
             header: synth_header,
             mvk,
             header_dirty: false,
+            recovered_header: None,
             anchor_path: None,
             rotation: None,
             deniable: Some(DeniableState {
@@ -1706,6 +1741,7 @@ impl Container {
             header: synth_header,
             mvk: result.mvk,
             header_dirty: false,
+            recovered_header: None,
             anchor_path: None,
             rotation: None,
             deniable: Some(DeniableState {
@@ -2072,6 +2108,7 @@ impl Container {
             header,
             mvk,
             header_dirty: false,
+            recovered_header: None,
             anchor_path: None,
             rotation: None,
             deniable: None,
@@ -2090,7 +2127,7 @@ impl Container {
         header_path: Option<&Path>,
         mut material: UnlockMaterial<'_>,
     ) -> Result<Self, Error> {
-        let (file, header_storage, _header_bytes, header, mvk, recovered) =
+        let (file, header_storage, header_bytes, header, mvk, recovered) =
             Self::open_locked_with_header_recovery(path, header_path, |h, b| {
                 let mvk = try_unlock(h, &mut material)?;
                 h.verify_hmac(b, &mvk)?;
@@ -2102,11 +2139,13 @@ impl Container {
             header_storage,
             header,
             mvk,
-            // If the header was recovered from a sidecar mirror, force
-            // a header flush on next clean shutdown so the live region
-            // is re-established. Avoids the next crash leaving the
-            // vault with no live header AND no recovered mirror.
-            header_dirty: recovered,
+            // If the header was recovered from a sidecar mirror, write
+            // it back to the live region on the next persist (R16-01:
+            // byte for byte, same generation) so the next crash does
+            // not leave the vault with no live header AND no recovered
+            // mirror.
+            header_dirty: false,
+            recovered_header: recovered.then(|| Box::new(header_bytes)),
             anchor_path: None,
             rotation: None,
             deniable: None,
@@ -2148,7 +2187,7 @@ impl Container {
         // We return a clone of the input MVK on success so the helper
         // signature stays uniform with the keyslot-bearing path.
         let mvk_for_closure = mvk.clone();
-        let (file, header_storage, _header_bytes, header, recovered_mvk, recovered) =
+        let (file, header_storage, header_bytes, header, recovered_mvk, recovered) =
             Self::open_locked_with_header_recovery(path, header_path, move |h, b| {
                 h.verify_hmac(b, &mvk_for_closure)?;
                 Ok(mvk_for_closure.clone())
@@ -2162,7 +2201,9 @@ impl Container {
             header_storage,
             header,
             mvk,
-            header_dirty: recovered,
+            // R16-01: see `Container::open`.
+            header_dirty: false,
+            recovered_header: recovered.then(|| Box::new(header_bytes)),
             anchor_path: None,
             rotation: None,
             deniable: None,
@@ -2288,6 +2329,7 @@ impl Container {
             header: synth_header,
             mvk,
             header_dirty: false,
+            recovered_header: None,
             anchor_path: None,
             rotation: None,
             deniable: Some(DeniableState {
@@ -3516,8 +3558,20 @@ impl Container {
     /// generation that is not on disk.
     pub fn persist_header(&mut self) -> Result<(), Error> {
         if !self.header_dirty {
+            // R16-01: re-establish a header recovered from the mirror
+            // byte for byte. It is the state the vault already had, so
+            // it keeps its generation: an anchor that recorded a newer
+            // one still refuses it at the next open, and a failed open
+            // never rewrites the live header as a fresh state.
+            if let Some(bytes) = self.recovered_header.take() {
+                self.ensure_writable()?;
+                return self.restore_header_bytes(&bytes);
+            }
             return Ok(());
         }
+        // A real change supersedes the recovered copy: the header is
+        // written as a new state below.
+        self.recovered_header = None;
         self.ensure_writable()?;
         if let Some(deniable) = &self.deniable {
             // Deniable-mode persist: write the cached 36 KiB header
@@ -3832,16 +3886,14 @@ impl Container {
     /// Read raw bytes at `offset` (caller is responsible for ensuring `offset`
     /// is within the data region, `offset >= self.data_offset()`).
     pub fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.read_exact(buf)?;
+        self.file.read_exact_at(offset, buf)?;
         Ok(())
     }
 
     /// Write raw bytes at `offset`. Same contract as `read_at`.
     pub fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<(), Error> {
         self.ensure_writable()?;
-        self.file.seek(SeekFrom::Start(offset))?;
-        self.file.write_all(buf)?;
+        self.file.write_all_at(offset, buf)?;
         Ok(())
     }
 
@@ -4040,6 +4092,17 @@ impl Container {
 
     /// Path of the underlying vault file (the `.lbx`), or of the sync
     /// bundle folder for a container opened with `open_external`.
+    /// Identity of the open vault file (`inode_key`: device and inode on
+    /// Unix), `None` for external storage (a bundle) or when unknown. For
+    /// front ends that copy local files in: the vault file itself must
+    /// never be one of them (it would grow while being read).
+    pub fn data_file_identity(&self) -> Option<(u64, u64)> {
+        if self.is_external() {
+            return None;
+        }
+        self.file.inode_pair().ok().filter(|&p| p != (0, 0))
+    }
+
     pub fn vault_path(&self) -> &Path {
         &self.path
     }
@@ -4075,7 +4138,12 @@ impl Container {
             if open == (0, 0) {
                 return false;
             }
-            match std::fs::symlink_metadata(&self.path) {
+            // R16-16: follow a link at the path on purpose. The vault may
+            // legitimately be opened through one (`~/vault.lbx` ->
+            // `/mnt/usb/vault.lbx`); comparing the link's own inode
+            // reported every such vault as replaced, and a rescue copy
+            // was then written after every save.
+            match std::fs::metadata(&self.path) {
                 Ok(m) => (m.dev(), m.ino()) != open,
                 Err(_) => true,
             }
@@ -4223,6 +4291,14 @@ impl Container {
             return Err(Error::UnsupportedForExternalStorage("a deniable vault"));
         }
         let mut h = self.header.clone();
+        // R16-15: the external layout puts the data right after the
+        // metadata region; a vault whose data area starts anywhere else
+        // would have every chunk slot mis-addressed in the bundle.
+        if h.metadata_offset.checked_add(h.metadata_size) != Some(h.data_offset) {
+            return Err(Error::UnsupportedForExternalStorage(
+                "a vault with a gap between its metadata region and its data",
+            ));
+        }
         let image_start = h.metadata_offset;
         h.metadata_offset = 0;
         h.data_offset = h.metadata_size;
@@ -4281,6 +4357,7 @@ impl Container {
             header,
             mvk,
             header_dirty: false,
+            recovered_header: None,
             anchor_path: None,
             rotation: None,
             deniable: None,

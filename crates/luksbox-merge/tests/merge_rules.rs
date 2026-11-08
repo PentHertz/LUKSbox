@@ -166,6 +166,28 @@ fn run(
     (f, out)
 }
 
+/// R16-11: a base newer than one of the sides is not their common
+/// ancestor; replaying against it would take the base's older content
+/// for every untouched file and drop what the side "lacks".
+#[test]
+fn a_base_newer_than_a_side_is_refused() {
+    let s = setup(base_files);
+    {
+        let mut t = open(&s.theirs);
+        put(&mut t, "/edit.txt", b"theirs");
+        t.flush().unwrap();
+    }
+    // `theirs` (newer) presented as the base of two unchanged copies.
+    let mut fake_base = open_ro(&s.theirs);
+    let mut ours = open_ro(&s.ours);
+    let mut target = open(&s.base);
+    let r = merge(Some(&mut fake_base), &mut ours, &mut target, &opts());
+    assert!(
+        matches!(r, Err(luksbox_merge::Error::NotDescendants { .. })),
+        "{r:?}"
+    );
+}
+
 fn base_files(v: &mut Vfs) {
     put(v, "/keep.txt", b"keep");
     put(v, "/edit.txt", b"original");

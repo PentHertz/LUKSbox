@@ -18,6 +18,17 @@ mod theme;
 #[cfg(target_os = "linux")]
 mod wayland_dnd;
 
+/// Held by every test that changes process-wide state: environment
+/// variables (HOME, XDG folders, sync state folder) or the open sync
+/// bundle session (`sync_gui`'s `ACTIVE`). Tests run in parallel threads
+/// of one process and would otherwise swap each other's folders or
+/// session.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 use app::LuksboxApp;
 
 /// PNGs embedded at compile time. Replace the files in

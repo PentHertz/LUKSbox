@@ -397,3 +397,77 @@ fn verify_is_read_only() {
     let o = ok(run(d, &["ls", "v.lbxs", "/"]), "ls");
     assert!(manifests(d) > before, "ls did not merge:\n{}", err(&o));
 }
+
+/// Round 16: when the newest version arrived damaged, an earlier one can
+/// still be written out (`sync export --snapshot`), and `revoke` on a
+/// bundle says that the master key is unchanged.
+#[test]
+fn an_earlier_version_exports_and_revoke_warns_on_a_bundle() {
+    let tmp = tempdir().unwrap();
+    let d = tmp.path();
+    ok(
+        run(d, &["create", "v.lbx", "--metadata-size", "2M"]),
+        "create",
+    );
+    let a = file(d, "a.txt", "first");
+    ok(run(d, &["put", "v.lbx", &a, "/a.txt"]), "put");
+    ok(
+        run(
+            d,
+            &["sync", "convert", "v.lbx", "v.lbxs", "--page-size", "1M"],
+        ),
+        "convert",
+    );
+    let b = file(d, "b.txt", "second");
+    ok(run(d, &["put", "v.lbxs", &b, "/b.txt"]), "put into bundle");
+
+    // The oldest version (listed last) has a.txt only.
+    let o = ok(run(d, &["sync", "snapshots", "v.lbxs"]), "snapshots");
+    let oldest = out(&o)
+        .lines()
+        .last()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+    ok(
+        run(
+            d,
+            &["sync", "export", "v.lbxs", "old.lbx", "--snapshot", &oldest],
+        ),
+        "export --snapshot",
+    );
+    let o = ok(run(d, &["ls", "old.lbx", "/"]), "ls exported snapshot");
+    assert!(
+        out(&o).contains("a.txt") && !out(&o).contains("b.txt"),
+        "{}",
+        out(&o)
+    );
+    // An unknown id is refused, nothing is written.
+    fails_with(
+        run(
+            d,
+            &[
+                "sync",
+                "export",
+                "v.lbxs",
+                "none.lbx",
+                "--snapshot",
+                "ffffffff",
+            ],
+        ),
+        "no snapshot with that id",
+        "export --snapshot (unknown)",
+    );
+    assert!(!d.join("none.lbx").exists());
+
+    // Revoking on a bundle: done, with the warning.
+    ok(run(d, &["enroll", "v.lbxs"]), "enroll");
+    let o = ok(run(d, &["revoke", "v.lbxs", "--slot", "1"]), "revoke");
+    assert!(
+        err(&o).contains("does not change the master key"),
+        "{}",
+        err(&o)
+    );
+}

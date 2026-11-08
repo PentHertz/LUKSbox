@@ -428,7 +428,15 @@ impl Session {
         {
             let mut s = self.store.lock().expect("store lock");
             let leases = s.list(Area::Lease)?;
-            for n in leases.names.iter().take(1000) {
+            // R16-06: every lease counts (a pin past a silent cap would
+            // have been ignored, and its commit collected); a flooded
+            // lease folder refuses to collect instead.
+            if leases.names.len() > crate::bundle::MAX_LEASES {
+                return Err(SyncError::Limit(
+                    "too many leases in the bundle; collect once the folder is sane",
+                ));
+            }
+            for n in leases.names.iter() {
                 let Some(id) = n.object_id() else { continue };
                 if let Ok(Some(b)) = s.read(Area::Lease, n, LenRule::Exact(LEASE_LEN))
                     && let Ok(l) = Lease::open(&self.keys, id, &b)

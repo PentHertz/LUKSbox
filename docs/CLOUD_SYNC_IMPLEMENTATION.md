@@ -105,6 +105,21 @@ folder".
   `gc` removes leases older than that. A device offline mid-upload for
   more than 90 days can still lose that commit.
 
+Audit round 16 (2026-11-07, `docs/SECURITY_AUDIT_ROUND_16.md`) changed
+the built behaviour in four places: the head is the first *complete*
+head in `(lamport, hash)` order, as section 5.2 step 7 says, and
+incomplete heads are reported as pending instead of making the session
+read-only (an incomplete head could otherwise never be outranked:
+R16-03); a session that cannot publish is a view that still shows this
+device's unpublished saved changes and reports them (R16-04); a failed
+publish is kept in the device state until one succeeds (R16-08); and
+`luksbox sync export --snapshot` exports any earlier complete version
+(R16-22). Still open from that round: a salvage mode for a lost or
+damaged page every commit inherits, automatic collection before the
+manifest cap, a `--no-lease` opt-out, the `pins/` folder below (a
+device whose base was collected cannot rebuild its unpublished
+changes), and `umount` waiting for the daemon's final publish.
+
 Not done yet: the external witness file (5.4), `forget-device`,
 recipient keyslots and epoch keys (phase 3), MVK rotation, panic and
 post-quantum enrollment on a bundle, bundles with a detached header,

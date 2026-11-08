@@ -90,7 +90,10 @@ pub fn read_sidecar_bytes(path: &Path) -> std::io::Result<Vec<u8>> {
         use std::os::unix::fs::OpenOptionsExt as _;
         let mut f = fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            // R16-14: `O_NONBLOCK` so a planted FIFO is refused by the
+            // check below instead of stalling the open until a writer
+            // appears; no effect on a regular file.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)?;
         let meta = f.metadata()?;
         if !meta.is_file() {
@@ -374,7 +377,8 @@ fn peek_vault_header_salt(
         use std::os::unix::fs::OpenOptionsExt as _;
         let f = fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
+            // R16-14: `O_NONBLOCK`, see `read_sidecar_bytes`.
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(src)?;
         if !f.metadata()?.is_file() {
             return Err(Error::Io(std::io::Error::other(format!(

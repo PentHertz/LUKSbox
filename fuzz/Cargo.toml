@@ -32,6 +32,8 @@ luksbox-sep = { path = "../crates/luksbox-sep" }
 # commit graph, all fed provider-controlled bytes in real use.
 luksbox-sync = { path = "../crates/luksbox-sync" }
 tempfile = "3"
+# `mkfifo` in `sync_fs_store_hostile`.
+libc = "0.2"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 
@@ -291,6 +293,48 @@ bench = false
 [[bin]]
 name = "sync_graph_build"
 path = "fuzz_targets/sync_graph_build.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_lease_decode"
+path = "fuzz_targets/sync_lease_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_local_state_decode"
+path = "fuzz_targets/sync_local_state_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_listing_classify"
+path = "fuzz_targets/sync_listing_classify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_fs_store_hostile"
+path = "fuzz_targets/sync_fs_store_hostile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_keyslot_merge"
+path = "fuzz_targets/sync_keyslot_merge.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sync_bundle_open_adversarial"
+path = "fuzz_targets/sync_bundle_open_adversarial.rs"
 test = false
 doc = false
 bench = false

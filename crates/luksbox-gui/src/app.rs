@@ -375,6 +375,15 @@ struct CreateForm {
     /// in a private staging folder and converted (`BundleCreate`).
     as_bundle: bool,
     path: String,
+    /// Size of the encrypted metadata region, MiB. Every save rewrites it
+    /// in full (twice, with its mirror), so a smaller one makes saves
+    /// cheaper on slow storage, at the cost of how many files the vault
+    /// can ever hold (the region cannot grow later).
+    metadata_mib: u64,
+    /// Second entry of the new passphrase: a typo at creation made a vault
+    /// nobody can open (the form opens the vault right after, so the
+    /// mistake showed only at the next unlock).
+    passphrase_confirm: Zeroizing<String>,
     use_detached: bool,
     header_path: String,
     cipher: CipherChoice,
@@ -462,10 +471,12 @@ impl Default for CreateForm {
         Self {
             as_bundle: false,
             path: String::new(),
+            metadata_mib: 64,
             use_detached: false,
             header_path: String::new(),
             cipher: CipherChoice::AesSiv,
             kind: CreateKind::Passphrase,
+            passphrase_confirm: Zeroizing::default(),
             passphrase: Zeroizing::default(),
             backup_passphrase: Zeroizing::default(),
             pin: Zeroizing::default(),
@@ -982,6 +993,11 @@ enum VersionsMsg {
 }
 
 enum Pending {
+    /// Make sync bundle... (the whole vault copied into the bundle).
+    MakeBundle {
+        rx: std::sync::mpsc::Receiver<(OpenedVault, Result<String, String>)>,
+        dest: PathBuf,
+    },
     /// Background re-enumeration of FIDO2 devices. Result is the
     /// fresh `(path, label)` list. Triggered at startup and when the
     /// user clicks "Refresh FIDO2" or the device dropdown's
@@ -1028,7 +1044,7 @@ enum Pending {
         dest: String,
     },
     GetFile {
-        rx: Receiver<VaultRet<u64>>,
+        rx: Receiver<VaultRet<ops::Extracted>>,
     },
     /// Copying a file or folder from an earlier version of a sync
     /// bundle back into the vault; the version's view comes back too.
@@ -1133,7 +1149,8 @@ impl Pending {
                 ..
             } => format!("creating vault + sealing under the local {slot_label}..."),
             Pending::PutFile { .. } => "encrypting file...".to_string(),
-            Pending::PutPaths { .. } => "encrypting the dropped files...".to_string(),
+            Pending::PutPaths { .. } => "encrypting the files...".to_string(),
+            Pending::MakeBundle { .. } => "making the sync bundle...".to_string(),
             Pending::FindDeniableSlots { .. } => {
                 "deriving the key from that passphrase (Argon2id) to find its slot...".to_string()
             }
@@ -1292,6 +1309,10 @@ pub struct LuksboxApp {
     /// Triggers the confirm-forget modal. The path is the recent
     /// entry to remove; cleared on Cancel or after Forget runs.
     pending_forget_recent: Option<ForgetRecentState>,
+    /// A browser entry waiting for the user to confirm its deletion:
+    /// `(name in the current folder, is a folder)`. Delete used to act at
+    /// once, with no undo outside sync-bundle versions.
+    pending_delete: Option<(String, bool)>,
     /// The sync bundle the pending create turns into, if any.
     creating_bundle: Option<BundleCreate>,
     /// The Versions view, while shown.
@@ -1369,6 +1390,12 @@ pub struct LuksboxApp {
     rename_target: Option<RenameTarget>,
     /// Highlighted row of the vault browser (entry name in `cwd`).
     browser_selected: Option<String>,
+    /// The page drawn last frame, and a counter bumped whenever the page
+    /// changes: the main scroll areas take it in their id, so every page
+    /// opens at its top (they shared one scroll position, so Keyslots
+    /// opened scrolled to wherever the create form had been left).
+    page_seen: View,
+    page_visit: u64,
     /// Keyslots view state for a deniable vault.
     deniable_keyslots: DeniableKeyslotsUi,
     mount_status: Option<MountStatus>,
@@ -1397,6 +1424,9 @@ pub struct LuksboxApp {
     /// The user picked "Unmount and quit" in the close modal: close
     /// the window as soon as the mount session ends.
     quit_after_unmount: bool,
+    /// The window was closed while a job ran on the vault: leave once it
+    /// is done instead of killing it halfway (an import, a rotation).
+    quit_after_pending: bool,
     /// The user picked "Quit without unmounting": let the next close
     /// request through unchallenged.
     force_close: bool,
@@ -1410,6 +1440,12 @@ pub struct LuksboxApp {
     prefs: preferences::Preferences,
     /// "Vault size" dialog of the open vault.
     size_dialog: Option<SizeDialog>,
+    /// The vault size report the size dialog shows, recomputed at most
+    /// every second: `space_report` walks every chunk reference, and the
+    /// dialog ran it on every frame.
+    space_report_cache: Option<(std::time::Instant, luksbox_vfs::SpaceReport)>,
+    /// `draw_recent_item`'s per-path `(checked at, is a bundle, missing)`.
+    recent_state_cache: std::collections::HashMap<PathBuf, (std::time::Instant, bool, bool)>,
     /// "Give back free space?" asked before locking a vault (Ask mode).
     shrink_prompt: Option<ShrinkPrompt>,
     /// Free space on the disk of the last directory asked, refreshed
@@ -1591,6 +1627,10 @@ struct PathPrompt {
 enum PathPromptAction {
     MountAt,
     AddFile,
+    /// Recursive import of a typed local folder.
+    AddFolder,
+    /// Folder to put the sync bundle made from the open vault in.
+    MakeBundleIn,
     /// Recursive extract of the named directory into a typed folder.
     ExtractDirInto(String),
     /// Extract the named file to a typed destination path.
@@ -1862,6 +1902,7 @@ impl LuksboxApp {
             tested_size_advisory_shown: false,
             recovery_report: None,
             pending_forget_recent: None,
+            pending_delete: None,
             creating_bundle: None,
             versions: None,
             active_vault_path: None,
@@ -1883,6 +1924,8 @@ impl LuksboxApp {
             mkdir_input: None,
             rename_target: None,
             browser_selected: None,
+            page_seen: View::Welcome,
+            page_visit: 0,
             deniable_keyslots: DeniableKeyslotsUi::default(),
             mount_status: None,
             pending_picker: None,
@@ -1890,10 +1933,13 @@ impl LuksboxApp {
             nav_after_unmount: None,
             close_confirm: false,
             quit_after_unmount: false,
+            quit_after_pending: false,
             force_close: false,
             clipboard_guard: None,
             prefs: preferences::load(),
             size_dialog: None,
+            space_report_cache: None,
+            recent_state_cache: std::collections::HashMap::new(),
             shrink_prompt: None,
             free_space_cache: None,
             pending_clipboard_warning: None,
@@ -1937,28 +1983,33 @@ impl LuksboxApp {
         // Collect everything off `v` first so the mutable borrow on
         // self.vault is released before any toast_warn call (which
         // also borrows &mut self).
-        let (pct, beyond_tested) = {
+        let (pct, beyond_tested, saved) = {
             let Some(v) = self.vault.as_mut() else {
                 return;
             };
-            let _ = v.vfs.flush();
+            let saved = v.vfs.flush();
             let pct = v.vfs.metadata_budget_status().used_pct();
             let beyond_tested = v.vfs.is_beyond_tested_size();
-            (pct, beyond_tested)
+            (pct, beyond_tested, saved)
         };
+        // A failed save was ignored: the success toast of the operation
+        // stood while the change was not on disk.
+        if let Err(e) = saved {
+            self.toast_err(format!("the change could not be saved: {e}"));
+        }
         if pct >= 90 && self.metadata_warned_pct < 90 {
             self.metadata_warned_pct = pct;
             self.toast_warn(format!(
-                "Vault metadata region at {pct}% capacity. \
-                 Further writes may fail. Consider archiving content \
-                 or migrating to a new vault with a larger --metadata-size."
+                "This vault's file list is {pct}% full: new files will soon be \
+                 refused. Delete files, or move some to a new vault (a file list \
+                 region cannot be enlarged; 64 MiB, the default, is the maximum)."
             ));
         } else if pct >= 75 && self.metadata_warned_pct < 75 {
             self.metadata_warned_pct = pct;
             self.toast_warn(format!(
-                "Vault metadata region at {pct}% capacity. \
-                 If many more files are expected, plan a migration to a \
-                 vault created with a larger --metadata-size."
+                "This vault's file list is {pct}% full. If many more files are \
+                 expected, plan to move some to a new vault (64 MiB, the default \
+                 file list region, is the maximum)."
             ));
         }
         // Tested-boundary advisory. v0.2.1 was ground-truth tested up
@@ -2099,25 +2150,40 @@ impl LuksboxApp {
         match v.vfs.lookup_path(&self.cwd) {
             Ok(id) => match v.vfs.readdir(id) {
                 Ok(mut entries) => {
-                    // Folders first, then by name, like file managers.
-                    entries.sort_by(|a, b| {
-                        (a.kind != InodeKind::Directory)
-                            .cmp(&(b.kind != InodeKind::Directory))
-                            .then_with(|| a.name.cmp(&b.name))
+                    // Folders first, then by name ignoring case, like file
+                    // managers (exact name as the tie-break).
+                    entries.sort_by_cached_key(|e| {
+                        (
+                            e.kind != InodeKind::Directory,
+                            e.name.to_lowercase(),
+                            e.name.clone(),
+                        )
                     });
+                    // An entry whose size cannot be read (a damaged chunk 0
+                    // in a hide-size vault) is listed with size 0 and
+                    // reported; it used to stop the listing there, hiding
+                    // every entry after it.
+                    let mut unreadable = 0usize;
+                    let mut first_err = None;
                     for ent in entries {
-                        let st = match v.vfs.stat(ent.id) {
-                            Ok(s) => s,
+                        let size = match v.vfs.stat(ent.id) {
+                            Ok(s) => s.size,
                             Err(e) => {
-                                self.listing_err = Some(e.to_string());
-                                return;
+                                unreadable += 1;
+                                first_err.get_or_insert_with(|| format!("{}: {e}", ent.name));
+                                0
                             }
                         };
                         self.listing.push(DirEntry {
                             name: ent.name,
                             kind: ent.kind,
-                            size: st.size,
+                            size,
                         });
+                    }
+                    if let Some(e) = first_err {
+                        self.listing_err = Some(format!(
+                            "{unreadable} entr(ies) could not be read (shown with size 0), e.g. {e}"
+                        ));
                     }
                 }
                 Err(e) => self.listing_err = Some(e.to_string()),
@@ -2238,6 +2304,59 @@ impl eframe::App for LuksboxApp {
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.close_confirm = true;
+        } else if ctx.input(|i| i.viewport().close_requested())
+            && self.pending.is_some()
+            && !self.force_close
+        {
+            // A job holds the vault (import, extract, rotation, enroll,
+            // create...): closing now killed it halfway, which for an
+            // in-place rotation of a detached-header vault corrupts it.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            if !self.quit_after_pending {
+                self.toast_ok("an operation is in progress; LUKSbox closes when it is done");
+            }
+            self.quit_after_pending = true;
+        } else if ctx.input(|i| i.viewport().close_requested())
+            && self.mount_status.is_none()
+            && !self.force_close
+            && (self.vault.is_some() || crate::sync_gui::finishing())
+        {
+            // Quitting with a vault open: save it and, for a sync bundle,
+            // publish what was saved and release the lease, as Lock does.
+            // Quitting used to skip that, so the last changes were not
+            // uploaded and other devices kept seeing the vault as open.
+            // The upload runs in the background; the window closes when
+            // it is done.
+            if self.vault.is_some() {
+                self.lock_and_drop_vault();
+            }
+            if crate::sync_gui::finishing() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.toast_ok("uploading the last changes; LUKSbox closes when they are uploaded");
+                self.quit_after_pending = true;
+            }
+        }
+        if let Some(msg) = crate::sync_gui::poll_finishing()
+            && let Some(msg) = msg
+        {
+            self.toast_ok(msg);
+        }
+        if self.quit_after_pending && self.pending.is_none() && !crate::sync_gui::finishing() {
+            self.quit_after_pending = false;
+            if self.vault.is_some() && self.mount_status.is_none() {
+                self.lock_and_drop_vault();
+            }
+            if !crate::sync_gui::finishing() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.quit_after_pending = true;
+            }
+        }
+        // A sync bundle publishes from `sync_gui::tick`, which runs in a
+        // frame: keep frames coming while one is open, or an idle window
+        // never uploaded its last change.
+        if crate::sync_gui::session_active() {
+            ctx.request_repaint_after(Duration::from_secs(5));
         }
         if self.quit_after_unmount && self.mount_status.is_none() {
             // The unmount requested from the close modal has finished
@@ -2299,6 +2418,10 @@ impl eframe::App for LuksboxApp {
         // ui.horizontal at the top, easier to reason about than nested
         // Panel::bottom calls and not subject to egui panel-layout
         // surprises.
+        if self.view != self.page_seen {
+            self.page_seen = self.view;
+            self.page_visit += 1;
+        }
         egui::CentralPanel::default()
             .frame(Frame::default().fill(theme::BG).inner_margin(Margin {
                 left: 8,
@@ -2372,10 +2495,16 @@ impl LuksboxApp {
                 Err(_) => {}
             },
             Pending::Create { rx, needs_touch } => match rx.try_recv() {
-                Ok(Ok(opened)) if self.creating_bundle.is_some() => {
-                    self.finish_bundle_create(opened);
+                Ok(Ok(mut opened)) if self.creating_bundle.is_some() => {
+                    let warning = opened.create_warning.take();
+                    if self.finish_bundle_create(opened)
+                        && let Some(w) = warning
+                    {
+                        self.toast_err(w);
+                    }
                 }
-                Ok(Ok(opened)) => {
+                Ok(Ok(mut opened)) => {
+                    let warning = opened.create_warning.take();
                     // R15-I2: `recent::upsert` never records a deniable
                     // vault; the create paths label it with the plain
                     // cipher name, so mark it here from the container.
@@ -2419,6 +2548,9 @@ impl LuksboxApp {
                     });
                     self.recent_list = recent::load();
                     self.toast_ok("vault created");
+                    if let Some(w) = warning {
+                        self.toast_err(w);
+                    }
                 }
                 Ok(Err(e)) => {
                     self.discard_bundle_staging();
@@ -2440,10 +2572,16 @@ impl LuksboxApp {
                 needs_touch,
                 slot_label,
             } => match rx.try_recv() {
-                Ok(Ok(opened)) if self.creating_bundle.is_some() => {
-                    self.finish_bundle_create(opened);
+                Ok(Ok(mut opened)) if self.creating_bundle.is_some() => {
+                    let warning = opened.create_warning.take();
+                    if self.finish_bundle_create(opened)
+                        && let Some(w) = warning
+                    {
+                        self.toast_err(w);
+                    }
                 }
-                Ok(Ok(opened)) => {
+                Ok(Ok(mut opened)) => {
+                    let warning = opened.create_warning.take();
                     // R15-I2: `recent::upsert` never records a deniable
                     // vault; the create paths label it with the plain
                     // cipher name, so mark it here from the container.
@@ -2483,6 +2621,9 @@ impl LuksboxApp {
                     });
                     self.recent_list = recent::load();
                     self.toast_ok(format!("vault created with {slot_label} keyslot"));
+                    if let Some(w) = warning {
+                        self.toast_err(w);
+                    }
                 }
                 Ok(Err(e)) => {
                     self.discard_bundle_staging();
@@ -2591,6 +2732,23 @@ impl LuksboxApp {
                 }
                 Err(_) => self.toast_err("keyslot identification crashed"),
             },
+            Pending::MakeBundle { rx, dest } => match rx.try_recv() {
+                Ok((vault, result)) => {
+                    self.vault = Some(vault);
+                    match result {
+                        Ok(_) => self.toast_ok(format!(
+                            "Sync bundle created at {}. Lock this vault and open the bundle \
+                             (Welcome > Open sync bundle) to use it from now on.",
+                            dest.display()
+                        )),
+                        Err(e) => self.toast_err(format!("could not create the sync bundle: {e}")),
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Pending::MakeBundle { rx, dest });
+                }
+                Err(_) => self.toast_err("sync bundle task crashed"),
+            },
             Pending::PutPaths { rx, dest } => match rx.try_recv() {
                 Ok((vault, sum)) => {
                     self.vault = Some(vault);
@@ -2614,9 +2772,17 @@ impl LuksboxApp {
                     }
                     if !sum.skipped.is_empty() {
                         self.toast_warn(format!(
-                            "skipped {} symlink(s) or special file(s) (not followed), e.g. {}",
+                            "skipped {} entr(ies): symlinks and special files (not followed), \
+                             or the vault's own file, e.g. {}",
                             sum.skipped.len(),
                             sum.skipped[0].display()
+                        ));
+                    }
+                    if let Some((p, why)) = sum.not_imported.first() {
+                        self.toast_warn(format!(
+                            "{} entr(ies) not imported, e.g. {}: {why}",
+                            sum.not_imported.len(),
+                            p.display()
                         ));
                     }
                     self.refresh_listing();
@@ -2649,7 +2815,15 @@ impl LuksboxApp {
                 Ok((vault, result)) => {
                     self.vault = Some(vault);
                     match result {
-                        Ok(bytes) => self.toast_ok(format!("extracted {bytes} bytes")),
+                        Ok(done) => {
+                            self.toast_ok(format!("extracted {} bytes", done.bytes));
+                            if let Some((p, why)) = done.skipped.first() {
+                                self.toast_warn(format!(
+                                    "{} entr(ies) not extracted, e.g. {p}: {why}",
+                                    done.skipped.len()
+                                ));
+                            }
+                        }
                         Err(e) => self.toast_err(e),
                     }
                 }
@@ -3161,10 +3335,19 @@ impl LuksboxApp {
     }
 
     fn draw_recent_item(&mut self, ui: &mut egui::Ui, r: &RecentVault) {
-        // Cheap stat: the path-not-found state is one or two syscalls
-        // per recent entry per repaint, only about 20 entries max, so OK.
-        let is_bundle = crate::sync_gui::is_bundle(&r.path);
-        let missing = !is_bundle && !r.path.is_file();
+        // Whether the entry still exists, checked at most every 5 s per
+        // path: a stat on every repaint stalled the whole window when an
+        // entry lives on a network share that does not answer.
+        let (is_bundle, missing) = match self.recent_state_cache.get(&r.path) {
+            Some((t, b, m)) if t.elapsed() < Duration::from_secs(5) => (*b, *m),
+            _ => {
+                let b = crate::sync_gui::is_bundle(&r.path);
+                let m = !b && !r.path.is_file();
+                self.recent_state_cache
+                    .insert(r.path.clone(), (std::time::Instant::now(), b, m));
+                (b, m)
+            }
+        };
         let mut want_forget = false;
         let mut want_delete = false;
         let mut want_open = false;
@@ -3455,6 +3638,27 @@ impl LuksboxApp {
     /// Copy the open file vault into a new sync bundle folder inside a
     /// folder the user picks (named after the vault, `.lbxs`).
     fn make_sync_bundle(&mut self) {
+        if self.vault.is_none() {
+            return;
+        }
+        match file_dialog::pick_folder(
+            file_dialog::Dialog::new()
+                .set_title("Folder to put the sync bundle in (for example your Dropbox)"),
+        ) {
+            Picked::Path(p) => self.make_sync_bundle_in(p),
+            Picked::Cancelled => {}
+            // Typed path, as for every other action (it only showed an
+            // error, so without a working file dialog no bundle could be
+            // made from an open vault).
+            Picked::Unavailable(reason) => self.open_path_prompt(
+                "Make sync bundle: folder to put it in (for example your Dropbox)",
+                reason,
+                PathPromptAction::MakeBundleIn,
+            ),
+        }
+    }
+
+    fn make_sync_bundle_in(&mut self, parent: PathBuf) {
         let Some(v) = self.vault.as_mut() else { return };
         if let Err(e) = v.vfs.flush() {
             self.toast_err(format!("save before converting failed: {e}"));
@@ -3465,31 +3669,32 @@ impl LuksboxApp {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "vault".into());
-        let parent = match file_dialog::pick_folder(
-            file_dialog::Dialog::new()
-                .set_title("Folder to put the sync bundle in (for example your Dropbox)"),
-        ) {
-            Picked::Path(p) => p,
-            Picked::Cancelled => return,
-            Picked::Unavailable(reason) => {
-                self.toast_err(file_dialog::unavailable_message(&reason));
-                return;
-            }
-        };
         let dest = parent.join(format!("{stem}.lbxs"));
         if dest.exists() {
             self.toast_err(format!("{} already exists", dest.display()));
             return;
         }
-        let Some(v) = self.vault.as_mut() else { return };
-        match crate::sync_gui::convert(v.vfs.container_mut(), &dest) {
-            Ok(_) => self.toast_ok(format!(
-                "Sync bundle created at {}. Lock this vault and open the bundle \
-                 (Welcome > Open sync bundle) to use it from now on.",
-                dest.display()
-            )),
-            Err(e) => self.toast_err(format!("could not create the sync bundle: {e}")),
+        if self.pending.is_some() {
+            self.toast_err("busy: wait for the current operation to finish");
+            return;
         }
+        // On a worker: it reads, encrypts and writes the whole vault, which
+        // froze the window for minutes on a large one.
+        let Some(v) = self.vault.take() else { return };
+        let (tx, rx) = std::sync::mpsc::channel::<(OpenedVault, Result<String, String>)>();
+        let d = dest.clone();
+        std::thread::spawn(move || {
+            let mut v = v;
+            let r = crate::sync_gui::convert(v.vfs.container_mut(), &d);
+            // A conversion that stopped halfway (a full disk) leaves no
+            // half bundle behind to make the next attempt "already
+            // exists": its own objects are removed, nothing else.
+            if r.is_err() && crate::sync_gui::is_bundle(&d) {
+                let _ = crate::sync_gui::delete_bundle(&d);
+            }
+            let _ = tx.send((v, r));
+        });
+        self.pending = Some(Pending::MakeBundle { rx, dest });
     }
 
     /// Second half of New vault > Sync bundle: convert the vault just
@@ -3497,9 +3702,10 @@ impl LuksboxApp {
     /// staging copy, and open the bundle with the vault's master key
     /// (nothing is asked again). Falls back to the bundle's unlock form
     /// if that open fails.
-    fn finish_bundle_create(&mut self, mut opened: ops::OpenedVault) {
+    /// `true` once the bundle exists (opened or not).
+    fn finish_bundle_create(&mut self, mut opened: ops::OpenedVault) -> bool {
         let Some(job) = self.creating_bundle.take() else {
-            return;
+            return false;
         };
         let converted = opened
             .vfs
@@ -3530,7 +3736,7 @@ impl LuksboxApp {
                 String::new()
             };
             self.toast_err(format!("could not create the sync bundle: {e}.{leftover}"));
-            return;
+            return false;
         }
         self.create = CreateForm::default();
         recent::upsert(entry.clone());
@@ -3549,6 +3755,7 @@ impl LuksboxApp {
                     deniable_fido2_recovery: None,
                     deniable_tpm_blob_path: None,
                     tolerated_inodes: Vec::new(),
+                    create_warning: None,
                 });
                 self.cwd = "/".into();
                 self.refresh_listing();
@@ -3564,6 +3771,7 @@ impl LuksboxApp {
                 ));
             }
         }
+        true
     }
 
     /// Drop the staging folder of a bundle creation that failed or was
@@ -3703,11 +3911,10 @@ impl LuksboxApp {
             }
         }
         // A sync bundle publishes what was saved (and merges what other
-        // devices published) once the vault is closed.
-        if self.mount_status.is_none()
-            && let Some(msg) = crate::sync_gui::finish_active_session()
-        {
-            self.toast_ok(msg);
+        // devices published) once the vault is closed, in the background:
+        // the result arrives as a toast (`poll_finishing` in `ui`).
+        if self.mount_status.is_none() && crate::sync_gui::finish_in_background() {
+            self.toast_ok("Sync bundle: uploading the last changes in the background");
         }
         self.cwd = "/".into();
         self.listing.clear();
@@ -3728,6 +3935,8 @@ impl LuksboxApp {
         // the next session without a stale modal anchored to a
         // previously-pending path.
         self.pending_forget_recent = None;
+        // Same for a delete still waiting for its confirmation.
+        self.pending_delete = None;
     }
 
     /// Entry point for any UI action that would abandon the
@@ -3791,6 +4000,7 @@ impl LuksboxApp {
 impl LuksboxApp {
     fn draw_welcome(&mut self, ui: &mut egui::Ui) {
         ScrollArea::vertical()
+            .id_salt(("page", self.page_visit))
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 ui.add_space(40.0);
@@ -4142,7 +4352,10 @@ impl LuksboxApp {
             self.submit_create();
         }
 
-        ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+        ScrollArea::vertical()
+            .id_salt(("page", self.page_visit))
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
             section(ui, "Vault type", |ui| {
                 let was_bundle = self.create.as_bundle;
                 ui.radio_value(&mut self.create.as_bundle, false, "Vault file (.lbx)");
@@ -4512,6 +4725,7 @@ impl LuksboxApp {
                             .password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         strength_meter(ui, &self.create.passphrase);
+                        confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                         ui.add_space(6.0);
                         if ui
                             .add_sized([form_width(ui), CONTROL_H], ghost_button("Generate strong passphrase..."))
@@ -4533,6 +4747,7 @@ impl LuksboxApp {
                                 .password(true);
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
+                            confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                             ui.add_space(6.0);
                             if ui
                                 .add_sized(
@@ -4653,6 +4868,7 @@ impl LuksboxApp {
                             .password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         strength_meter(ui, &self.create.passphrase);
+                        confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                         if self.create.use_deniable {
                             ui.add_space(6.0);
                             ui.label(
@@ -4756,6 +4972,7 @@ impl LuksboxApp {
                         let te = egui::TextEdit::singleline(&mut *self.create.passphrase).password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         strength_meter(ui, &self.create.passphrase);
+                        confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                         if self.create.use_deniable {
                             ui.add_space(6.0);
                             ui.label(
@@ -4851,6 +5068,7 @@ impl LuksboxApp {
                                 .password(true);
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
+                            confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                             ui.add_space(6.0);
                             if ui
                                 .add_sized(
@@ -4895,6 +5113,7 @@ impl LuksboxApp {
                                     .password(true);
                                 ui.add_sized([form_width(ui), CONTROL_H], te);
                                 strength_meter(ui, &self.create.passphrase);
+                                confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                                 ui.add_space(6.0);
                                 if ui
                                     .add_sized([form_width(ui), CONTROL_H], ghost_button("Generate strong passphrase..."))
@@ -4928,6 +5147,7 @@ impl LuksboxApp {
                                 .password(true);
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
+                            confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                             ui.add_space(6.0);
                             if ui
                                 .add_sized(
@@ -4963,6 +5183,7 @@ impl LuksboxApp {
                                     .password(true);
                                 ui.add_sized([form_width(ui), CONTROL_H], te);
                                 strength_meter(ui, &self.create.passphrase);
+                                confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                                 ui.add_space(6.0);
                                 if ui
                                     .add_sized(
@@ -5003,6 +5224,7 @@ impl LuksboxApp {
                                 .password(true);
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
+                            confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                             ui.add_space(6.0);
                             if ui
                                 .add_sized(
@@ -5043,6 +5265,7 @@ impl LuksboxApp {
                                     .password(true);
                                 ui.add_sized([form_width(ui), CONTROL_H], te);
                                 strength_meter(ui, &self.create.passphrase);
+                                confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                                 ui.add_space(6.0);
                                 if ui
                                     .add_sized(
@@ -5092,6 +5315,7 @@ impl LuksboxApp {
                                 .password(true);
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
+                            confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                             ui.add_space(6.0);
                             if ui
                                 .add_sized(
@@ -5127,6 +5351,7 @@ impl LuksboxApp {
                                     .password(true);
                                 ui.add_sized([form_width(ui), CONTROL_H], te);
                                 strength_meter(ui, &self.create.passphrase);
+                                confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                                 ui.add_space(6.0);
                                 if ui
                                     .add_sized([form_width(ui), CONTROL_H], ghost_button("Generate strong passphrase..."))
@@ -5227,6 +5452,7 @@ impl LuksboxApp {
                                 .password(true);
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
+                            confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                             ui.add_space(6.0);
                             if ui
                                 .add_sized(
@@ -5270,6 +5496,7 @@ impl LuksboxApp {
                                 .password(true);
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
+                            confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                             ui.add_space(6.0);
                             if ui
                                 .add_sized(
@@ -5401,6 +5628,7 @@ impl LuksboxApp {
                                 .password(true);
                             ui.add_sized([form_width(ui), CONTROL_H], te);
                             strength_meter(ui, &self.create.passphrase);
+                            confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                             ui.add_space(6.0);
                             if ui
                                 .add_sized(
@@ -5446,6 +5674,7 @@ impl LuksboxApp {
                             .password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         strength_meter(ui, &self.create.passphrase);
+                        confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                         ui.add_space(6.0);
                         if ui
                             .add_sized(
@@ -5545,6 +5774,7 @@ impl LuksboxApp {
                             .password(true);
                         ui.add_sized([form_width(ui), CONTROL_H], te);
                         strength_meter(ui, &self.create.passphrase);
+                        confirm_field(ui, &mut self.create.passphrase_confirm, &self.create.passphrase);
                         ui.add_space(6.0);
                         if ui
                             .add_sized(
@@ -5821,6 +6051,36 @@ impl LuksboxApp {
                                              format keeps the v2 header for old LUKSbox versions.",
                                         );
                                 }
+                                // Same choice as `luksbox create --metadata-size`.
+                                ui.horizontal(|ui| {
+                                    ui.label("File list (metadata) region:");
+                                    egui::ComboBox::from_id_salt("metadata-region-size")
+                                        .selected_text(format!("{} MiB", self.create.metadata_mib))
+                                        .show_ui(ui, |ui| {
+                                            for (mib, what) in [
+                                                (64, "64 MiB (default): about a million files"),
+                                                (16, "16 MiB: about 300 000 files"),
+                                                (4, "4 MiB: about 80 000 files"),
+                                                (1, "1 MiB: about 20 000 files"),
+                                            ] {
+                                                ui.selectable_value(
+                                                    &mut self.create.metadata_mib,
+                                                    mib,
+                                                    what,
+                                                );
+                                            }
+                                        });
+                                })
+                                .response
+                                .on_hover_text(
+                                    "Every save rewrites this region in full, twice (the vault \
+                                     and its .meta-bak mirror), with fresh random padding so two \
+                                     copies of the vault never reveal how many files it holds. \
+                                     A smaller region makes every save faster on a USB stick or \
+                                     SD card. It caps how many files the vault can hold (counts \
+                                     for short names; long names hold fewer) and cannot be \
+                                     enlarged later.",
+                                );
                                 if !self.create.use_v3_format {
                                     ui.label(
                                         RichText::new(
@@ -5956,6 +6216,10 @@ impl LuksboxApp {
             ) && !tpm_only
                 && !sep_only
                 && !three_factor_no_passphrase);
+        if needs_passphrase && *self.create.passphrase != *self.create.passphrase_confirm {
+            self.toast_err("the two passphrases do not match");
+            return;
+        }
         if needs_passphrase
             && self.create.passphrase.is_empty()
             && self.empty_passphrase_confirm.is_none()
@@ -6027,6 +6291,27 @@ impl LuksboxApp {
         } else {
             PathBuf::from(self.create.path.trim())
         };
+        // Checked before the literal below moves the passphrase and the
+        // PIN out of the form: a failed check used to clear what the user
+        // had typed.
+        if self.create.use_anchor && self.create.anchor_path.trim().is_empty() {
+            self.toast_err("anchor path required");
+            return;
+        }
+        if matches!(
+            self.create.kind,
+            CreateKind::HybridPq
+                | CreateKind::HybridPqFido2
+                | CreateKind::HybridPq1024
+                | CreateKind::HybridPq1024Fido2
+        ) && self.create.hybrid_kyber_path.trim().is_empty()
+        {
+            self.toast_err("hybrid mode requires a path for the .kyber seed file");
+            return;
+        }
+        // `None` keeps the library default (64 MiB).
+        let metadata_size =
+            (self.create.metadata_mib != 64).then_some(self.create.metadata_mib << 20);
         let opts = ops::CreateOpts {
             path: vault_path,
             header_path: if self.create.use_detached && !self.create.header_path.trim().is_empty() {
@@ -6056,6 +6341,7 @@ impl LuksboxApp {
             // shared secret. FIDO2-direct uses `backup_passphrase`
             // separately because it has no primary passphrase factor.
             passphrase: if needs_passphrase {
+                self.create.passphrase_confirm = Zeroizing::default();
                 Some(std::mem::take(&mut self.create.passphrase))
             } else {
                 None
@@ -6198,6 +6484,10 @@ impl LuksboxApp {
             let header_v3 = opts.header_v3;
             let max_size = opts.max_size;
             let rx = ops::spawn(move || {
+                // Thread-local: set on the worker that creates the vault.
+                let _md = luksbox_format::metadata::set_create_metadata_region_size_override(
+                    metadata_size,
+                );
                 ops::create_vault_tpm2_only(opts, pin_opt)
                     .and_then(|o| ops::apply_header_v3(o, header_v3))
                     .and_then(|o| ops::apply_max_size(o, max_size))
@@ -6303,6 +6593,10 @@ impl LuksboxApp {
             let header_v3 = opts.header_v3;
             let max_size = opts.max_size;
             let rx = ops::spawn(move || {
+                // Thread-local: set on the worker that creates the vault.
+                let _md = luksbox_format::metadata::set_create_metadata_region_size_override(
+                    metadata_size,
+                );
                 ops::create_vault_with_tpm_bootstrap(opts, kind)
                     .and_then(|o| ops::apply_header_v3(o, header_v3))
                     .and_then(|o| ops::apply_max_size(o, max_size))
@@ -6331,6 +6625,10 @@ impl LuksboxApp {
             let header_v3 = opts.header_v3;
             let max_size = opts.max_size;
             let rx = ops::spawn(move || {
+                // Thread-local: set on the worker that creates the vault.
+                let _md = luksbox_format::metadata::set_create_metadata_region_size_override(
+                    metadata_size,
+                );
                 ops::create_vault_sep_only(opts, biometric)
                     .and_then(|o| ops::apply_header_v3(o, header_v3))
                     .and_then(|o| ops::apply_max_size(o, max_size))
@@ -6441,6 +6739,10 @@ impl LuksboxApp {
             let header_v3 = opts.header_v3;
             let max_size = opts.max_size;
             let rx = ops::spawn(move || {
+                // Thread-local: set on the worker that creates the vault.
+                let _md = luksbox_format::metadata::set_create_metadata_region_size_override(
+                    metadata_size,
+                );
                 ops::create_vault_with_sep_bootstrap(opts, kind)
                     .and_then(|o| ops::apply_header_v3(o, header_v3))
                     .and_then(|o| ops::apply_max_size(o, max_size))
@@ -6457,6 +6759,9 @@ impl LuksboxApp {
 
         let max_size = opts.max_size;
         let rx = ops::spawn(move || {
+            // Thread-local: set on the worker that creates the vault.
+            let _md =
+                luksbox_format::metadata::set_create_metadata_region_size_override(metadata_size);
             ops::create_vault(opts)
                 .and_then(|o| ops::apply_header_v3(o, header_v3))
                 .and_then(|o| ops::apply_max_size(o, max_size))
@@ -6554,6 +6859,8 @@ impl LuksboxApp {
         match prompt.action {
             PathPromptAction::MountAt => self.mount_at(path),
             PathPromptAction::AddFile => self.add_file_from(path),
+            PathPromptAction::AddFolder => self.import_paths(vec![path]),
+            PathPromptAction::MakeBundleIn => self.make_sync_bundle_in(path),
             PathPromptAction::ExtractDirInto(name) => self.get_dir_into(&name, path),
             PathPromptAction::SaveFileAs(name) => self.get_file_to(&name, path),
         }
@@ -6763,6 +7070,7 @@ impl LuksboxApp {
         }
 
         ScrollArea::vertical()
+            .id_salt(("page", self.page_visit))
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 let total_w = ui.available_width();
@@ -8072,8 +8380,22 @@ impl LuksboxApp {
             if ui.add(ghost_button("+ Folder")).clicked() {
                 self.mkdir_input = Some(String::new());
             }
-            if ui.add(ghost_button("+ Add file...")).clicked() {
+            if ui
+                .add(ghost_button("+ Add files..."))
+                .on_hover_text("One file, or several selected together in the dialog.")
+                .clicked()
+            {
                 self.add_file_picker();
+            }
+            if ui
+                .add(ghost_button("+ Add folder..."))
+                .on_hover_text(
+                    "Import a folder with everything in it (several files: + Add files..., \
+                     or drag them onto the list).",
+                )
+                .clicked()
+            {
+                self.add_folder_picker();
             }
             if ui.add(ghost_button("Keyslots")).clicked() {
                 self.view = View::Keyslots;
@@ -8153,9 +8475,15 @@ impl LuksboxApp {
                  `brew install --cask fuse-t`) or macFUSE (macOS, kext-based, \
                  approve on first install) or libfuse3 (Linux)."
             };
+            // A build without a mount backend refuses the mount only after
+            // the vault was handed over, which closed it: say so up front.
+            let can_mount = luksbox_mount::FUSE_BACKEND != "none";
             if ui
-                .add(ghost_button("Mount as volume..."))
+                .add_enabled(can_mount, ghost_button("Mount as volume..."))
                 .on_hover_text(mount_tooltip)
+                .on_disabled_hover_text(
+                    "This build of LUKSbox has no mount support (no FUSE / WinFsp backend).",
+                )
                 .clicked()
             {
                 self.start_mount_picker(false);
@@ -8234,7 +8562,9 @@ impl LuksboxApp {
             ui.add_space(8.0);
         }
 
-        let entries = self.listing.clone();
+        // Borrowed for the frame (put back below), not cloned: a folder of
+        // tens of thousands of entries was copied on every repaint.
+        let entries = std::mem::take(&mut self.listing);
         let selected = self.browser_selected.clone();
         let show_empty_hint = entries.is_empty() && self.listing_err.is_none();
         let mut rename = self.rename_target.take();
@@ -8248,10 +8578,36 @@ impl LuksboxApp {
             .inner_margin(0)
             .show(ui, |ui| {
                 ScrollArea::vertical()
+                    .id_salt(("page", self.page_visit, self.cwd.as_str()))
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        for ent in &entries {
+                        // A large folder draws only the rows in view (all
+                        // rows are BROWSER_ROW_H high) and reserves the
+                        // space of the others: laying out every row on
+                        // every frame made the window lag on mouse moves.
+                        let (first, last) = if entries.len() > 200 {
+                            let top = ui.min_rect().top();
+                            let clip = ui.clip_rect();
+                            let first =
+                                ((clip.top() - top) / BROWSER_ROW_H).floor().max(0.0) as usize;
+                            let last = (((clip.bottom() - top) / BROWSER_ROW_H).ceil().max(0.0)
+                                as usize
+                                + 1)
+                            .min(entries.len());
+                            (first.min(last), last)
+                        } else {
+                            (0, entries.len())
+                        };
+                        if first > 0 {
+                            ui.add_space(first as f32 * BROWSER_ROW_H);
+                        }
+                        // A rename in progress on a row out of view stays
+                        // in progress.
+                        rename_row_seen |= rename
+                            .as_ref()
+                            .is_some_and(|rt| entries.iter().any(|e| e.name == rt.old_name));
+                        for ent in &entries[first..last] {
                             let row_rename = rename.as_mut().filter(|rt| rt.old_name == ent.name);
                             rename_row_seen |= row_rename.is_some();
                             let is_selected = selected.as_deref() == Some(ent.name.as_str());
@@ -8265,6 +8621,9 @@ impl LuksboxApp {
                             ) {
                                 rename_done = Some(done);
                             }
+                        }
+                        if last < entries.len() {
+                            ui.add_space((entries.len() - last) as f32 * BROWSER_ROW_H);
                         }
                         // The empty area below the rows: clears the
                         // selection on click, offers the folder-level
@@ -8293,7 +8652,7 @@ impl LuksboxApp {
                                 actions.push(BrowserAction::NewFolder);
                                 ui.close();
                             }
-                            if ui.button("Add file...").clicked() {
+                            if ui.button("Add files...").clicked() {
                                 actions.push(BrowserAction::AddFile);
                                 ui.close();
                             }
@@ -8306,6 +8665,10 @@ impl LuksboxApp {
                         add_scroll_edge_padding(ui);
                     });
             });
+        // Put the listing back unless an action of this frame replaced it.
+        if self.listing.is_empty() {
+            self.listing = entries;
+        }
 
         if os_drag_hover {
             let r = panel.response.rect;
@@ -8361,7 +8724,8 @@ impl LuksboxApp {
             if f2 {
                 actions.push(BrowserAction::Rename(sel.clone()));
             } else if enter
-                && entries
+                && self
+                    .listing
                     .iter()
                     .any(|e| &e.name == sel && e.kind == InodeKind::Directory)
             {
@@ -8385,7 +8749,7 @@ impl LuksboxApp {
                 BrowserAction::Download(name) => self.start_get_file(&name),
                 BrowserAction::DownloadDir(name) => self.start_get_dir(&name),
                 BrowserAction::Rename(name) => self.begin_rename(name),
-                BrowserAction::Delete(name, is_dir) => self.delete_entry(&name, is_dir),
+                BrowserAction::Delete(name, is_dir) => self.pending_delete = Some((name, is_dir)),
                 BrowserAction::Move {
                     from_dir,
                     name,
@@ -8464,11 +8828,11 @@ impl LuksboxApp {
         }
     }
 
-    /// Import local files / folders (dropped onto the browser) into the
-    /// current vault folder on a worker thread.
+    /// Import local files / folders (dropped onto the browser, or a picked
+    /// folder) into the current vault folder on a worker thread.
     fn import_paths(&mut self, paths: Vec<PathBuf>) {
         if self.pending.is_some() || self.vault.is_none() {
-            self.toast_err("busy: wait for the current operation to finish, then drop again");
+            self.toast_err("busy: wait for the current operation to finish, then try again");
             return;
         }
         let Some(v) = self.vault.take() else {
@@ -8485,14 +8849,32 @@ impl LuksboxApp {
         self.pending = Some(Pending::PutPaths { rx, dest });
     }
 
+    /// One file, or several selected in the same dialog (they used to be
+    /// added one dialog at a time, or by drag and drop).
     fn add_file_picker(&mut self) {
-        match file_dialog::pick_file(file_dialog::Dialog::new().set_title("Add file to vault")) {
-            Picked::Path(local) => self.add_file_from(local),
-            Picked::Cancelled => {}
-            Picked::Unavailable(reason) => self.open_path_prompt(
+        match file_dialog::pick_files(file_dialog::Dialog::new().set_title("Add files to vault")) {
+            file_dialog::PickedFiles::Paths(mut paths) if paths.len() == 1 => {
+                self.add_file_from(paths.remove(0))
+            }
+            file_dialog::PickedFiles::Paths(paths) => self.import_paths(paths),
+            file_dialog::PickedFiles::Cancelled => {}
+            file_dialog::PickedFiles::Unavailable(reason) => self.open_path_prompt(
                 "Add file to vault: path of the file",
                 reason,
                 PathPromptAction::AddFile,
+            ),
+        }
+    }
+
+    fn add_folder_picker(&mut self) {
+        match file_dialog::pick_folder(file_dialog::Dialog::new().set_title("Add folder to vault"))
+        {
+            Picked::Path(local) => self.import_paths(vec![local]),
+            Picked::Cancelled => {}
+            Picked::Unavailable(reason) => self.open_path_prompt(
+                "Add folder to vault: path of the folder",
+                reason,
+                PathPromptAction::AddFolder,
             ),
         }
     }
@@ -8531,6 +8913,12 @@ impl LuksboxApp {
         // `x:Zone.Identifier` (ADS) could escape the chosen folder. Apply
         // the same guard here. POSIX names are unaffected (the `:` rule
         // is windows-gated inside the helper).
+        if let Some(why) = ops::host_cannot_name(name) {
+            self.toast_err(format!(
+                "cannot extract {name:?} on this system ({why}); rename it in the vault first"
+            ));
+            return;
+        }
         if ops::name_escapes_directory(name) {
             self.toast_err(format!(
                 "refusing to extract {name:?}: the name would escape the chosen destination folder"
@@ -8565,7 +8953,7 @@ impl LuksboxApp {
             Some(v) => v,
             None => return,
         };
-        let (tx, rx) = std::sync::mpsc::channel::<VaultRet<u64>>();
+        let (tx, rx) = std::sync::mpsc::channel::<VaultRet<ops::Extracted>>();
         std::thread::spawn(move || {
             let mut v = v;
             let r = ops::get_dir_recursive(&mut v.vfs, &inner, &local);
@@ -8645,10 +9033,13 @@ impl LuksboxApp {
             Some(v) => v,
             None => return,
         };
-        let (tx, rx) = std::sync::mpsc::channel::<VaultRet<u64>>();
+        let (tx, rx) = std::sync::mpsc::channel::<VaultRet<ops::Extracted>>();
         std::thread::spawn(move || {
             let mut v = v;
-            let r = ops::get_file(&mut v.vfs, &inner, &local);
+            let r = ops::get_file(&mut v.vfs, &inner, &local).map(|bytes| ops::Extracted {
+                bytes,
+                skipped: Vec::new(),
+            });
             let _ = tx.send((v, r));
         });
         self.pending = Some(Pending::GetFile { rx });
@@ -8666,18 +9057,88 @@ impl LuksboxApp {
                 return;
             }
         };
-        let r = if is_dir {
-            v.vfs.rmdir(parent_id, name).map_err(|e| e.to_string())
-        } else {
-            v.vfs.unlink(parent_id, name).map_err(|e| e.to_string())
-        };
-        match r {
-            Ok(()) => {
-                let _ = v.vfs.flush();
+        // A folder goes with everything in it (rmdir alone refused any
+        // folder that was not empty, so it had to be emptied file by file).
+        let r = ops::remove_entry(&mut v.vfs, parent_id, name, is_dir);
+        // Saved even after a partial failure: what was removed is gone.
+        let saved = v.vfs.flush().map_err(|e| e.to_string());
+        match r.and_then(|n| saved.map(|_| n)) {
+            Ok(n) if is_dir => {
+                self.toast_ok(format!("removed {name} ({n} entr(ies))"));
+                self.refresh_listing();
+            }
+            Ok(_) => {
                 self.toast_ok(format!("removed {name}"));
                 self.refresh_listing();
             }
-            Err(e) => self.toast_err(e),
+            Err(e) => {
+                self.toast_err(e);
+                self.refresh_listing();
+            }
+        }
+    }
+
+    fn draw_delete_confirm_modal(&mut self, ctx: &egui::Context) {
+        let Some((name, is_dir)) = self.pending_delete.clone() else {
+            return;
+        };
+        let mut confirm = false;
+        let mut cancel = false;
+        let modal = egui::Modal::new(egui::Id::new("delete-entry-modal"))
+            .frame(
+                Frame::default()
+                    .fill(theme::PANEL)
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(20),
+            )
+            .show(ctx, |ui| {
+                ui.set_min_width(capped_width(ui, 420.0));
+                ui.label(
+                    RichText::new(if is_dir {
+                        "Delete this folder?"
+                    } else {
+                        "Delete this file?"
+                    })
+                    .size(15.0)
+                    .strong(),
+                );
+                ui.add_space(8.0);
+                ui.label(RichText::new(&name).strong().monospace().size(13.0));
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(if is_dir {
+                        "The folder and everything in it are removed from the vault. \
+                         This cannot be undone."
+                    } else {
+                        "The file is removed from the vault. This cannot be undone."
+                    })
+                    .color(theme::DANGER),
+                );
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_sized([120.0, 30.0], primary_button("Delete"))
+                        .clicked()
+                    {
+                        confirm = true;
+                    }
+                    if ui
+                        .add_sized([120.0, 30.0], ghost_button("Cancel"))
+                        .clicked()
+                    {
+                        cancel = true;
+                    }
+                });
+            });
+        if modal.backdrop_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if confirm {
+            self.pending_delete = None;
+            self.delete_entry(&name, is_dir);
+        } else if cancel {
+            self.pending_delete = None;
         }
     }
 
@@ -8822,7 +9283,8 @@ impl LuksboxApp {
         let mut shrink = None;
         let backend = if luksbox_mount::FUSE_BACKEND == "fuse-t" {
             let give_back = shrink_mode == ShrinkOnFinish::GiveBack;
-            match start_mount_subprocess(opened, &mountpoint, give_back) {
+            let sync_mode = std::mem::take(&mut self.mount_sync_mode);
+            match start_mount_subprocess(opened, &mountpoint, give_back, sync_mode) {
                 Ok((child, stderr)) => MountBackend::Subprocess { child, stderr },
                 Err(e) => {
                     self.toast_err(format!("could not start mount helper: {e}"));
@@ -9687,6 +10149,7 @@ impl LuksboxApp {
             &header.keyslots
         };
         ScrollArea::vertical()
+            .id_salt(("page", self.page_visit))
             .auto_shrink([false; 2])
             .show(ui, |ui| {
                 if let Some(unlocked) = deniable_unlocked {
@@ -10360,11 +10823,23 @@ impl LuksboxApp {
                     .iter()
                     .any(|s| s.kind.is_tpm2() || s.kind.is_sep());
 
+                // A sync bundle cannot rotate its master key (the library
+                // refuses it); offering it only led to an error that also
+                // closed the vault.
+                let is_bundle = self
+                    .vault
+                    .as_ref()
+                    .is_some_and(|v| v.vfs.container().is_external());
+                let is_deniable = self
+                    .vault
+                    .as_ref()
+                    .is_some_and(|v| v.vfs.container().is_deniable());
                 let can_rotate_in_gui = has_passphrase
                     && !has_fido2_wrap
                     && !has_fido2_direct
                     && !has_hybrid
-                    && !has_hw_bound;
+                    && !has_hw_bound
+                    && !is_bundle;
 
                 if can_rotate_in_gui {
                     if ui
@@ -10398,9 +10873,27 @@ impl LuksboxApp {
                     // Rotation isn't available in the GUI for this vault's
                     // slot mix. Show why and point at the CLI.
                     let _ = ui.add_enabled_ui(false, |ui| {
-                        ui.add_sized([row_w, 32.0], ghost_button("Rotate master key  (use CLI)"));
+                        let label = if is_deniable || is_bundle {
+                            "Rotate master key  (not available)"
+                        } else {
+                            "Rotate master key  (use CLI)"
+                        };
+                        ui.add_sized([row_w, 32.0], ghost_button(label));
                     });
-                    let reason = if has_fido2_direct {
+                    // A deniable vault's slot table is encrypted, so the
+                    // one above is a placeholder: it used to say "No
+                    // populated keyslots" (or "use the CLI", which cannot
+                    // rotate one either).
+                    let reason = if is_deniable {
+                        "A deniable vault's master key cannot be rotated yet: the passphrase \
+                 typed for the new wrap cannot be checked against the encrypted slot \
+                 first, so a typo would lock the vault for good. To change keys, create \
+                 a new deniable vault and copy the files across."
+                    } else if is_bundle {
+                        "A sync bundle cannot rotate its master key yet. Export it to a .lbx \
+                 (Versions or `luksbox sync export`), rotate that file, then make a new \
+                 sync bundle from it and delete this one."
+                    } else if has_fido2_direct {
                         "FIDO2-direct slots can't be rotated, the master key IS the authenticator \
                  output, not wrapped. Revoke the slot and recreate the vault to \
                  change keys."
@@ -11127,9 +11620,14 @@ impl LuksboxApp {
         // from the in-flight FIDO2 op; the background thread runs
         // to completion on its own time but the user is free.
         let mut cancel_requested = false;
-        // Esc cancels too. Checked outside the overlay so the input
-        // probe runs even if the Area is hot-blocking other input.
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        // Esc cancels too, for the touch-wait operations only (the ones
+        // the Cancel button is shown for). Checked outside the overlay so
+        // the input probe runs even if the Area is hot-blocking other
+        // input. Any other job (import, extract, rotation, enroll...)
+        // keeps running with the vault whatever the UI does: "cancelling"
+        // it only detached the view, said "cancelled" while the job went
+        // on, and left the vault locked by the hidden worker.
+        if needs_touch && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             cancel_requested = true;
         }
 
@@ -11272,6 +11770,7 @@ impl LuksboxApp {
         self.draw_deniable_recovery_modal(ctx);
         self.draw_recovery_report_modal(ctx);
         self.draw_forget_recent_modal(ctx);
+        self.draw_delete_confirm_modal(ctx);
 
         // Add-passphrase modal
         let mut close_pp = false;
@@ -12980,7 +13479,15 @@ impl LuksboxApp {
                 .show(ctx, |ui| {
                     ui.label(RichText::new("Folder name").color(theme::DIM).size(12.0));
                     let te = egui::TextEdit::singleline(buf).hint_text("name");
-                    ui.add_sized([capped_width(ui, 280.0), CONTROL_H], te);
+                    let resp = ui.add_sized([capped_width(ui, 280.0), CONTROL_H], te);
+                    // Typing goes straight into the name, and Enter
+                    // creates the folder (it needed a click in the field
+                    // and on Create).
+                    if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        submit_mk = true;
+                    } else if ui.memory(|m| m.focused().is_none()) {
+                        resp.request_focus();
+                    }
                     ui.add_space(8.0);
                     ui.horizontal(|ui| {
                         if ui.add(ghost_button("Cancel")).clicked() {
@@ -13002,7 +13509,7 @@ impl LuksboxApp {
                         Ok(parent) => match v.vfs.mkdir(parent, &trimmed) {
                             Ok(_) => {
                                 self.flush_and_notify_capacity();
-                                self.toast_ok(format!("created /{trimmed}"));
+                                self.toast_ok(format!("created {}", join_path(&cwd, &trimmed)));
                                 self.refresh_listing();
                             }
                             Err(e) => self.toast_err(e.to_string()),
@@ -13259,6 +13766,7 @@ impl LuksboxApp {
                     self.toast_ok("passphrase ready, paste it where you need it");
                 }
                 PassgenTarget::CreatePrimary => {
+                    *self.create.passphrase_confirm = value.clone();
                     *self.create.passphrase = value;
                     self.toast_ok("passphrase filled in");
                 }
@@ -13972,8 +14480,14 @@ impl LuksboxApp {
             .order(egui::Order::Tooltip)
             .interactable(false)
             .show(ctx, |ui| {
-                ui.with_layout(Layout::bottom_up(Align::Max), |ui| {
-                    for t in toasts.iter().rev() {
+                // Top-down, oldest first, left-aligned: the area keeps the
+                // size of the toasts (it is anchored to the bottom right).
+                // A bottom-up, right-aligned layout stretched it to the
+                // space available, about 600 x 400 px, and that invisible
+                // area took the clicks meant for the buttons and rows under
+                // it for as long as a toast was shown.
+                ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                    for t in toasts.iter() {
                         let color = match t.kind {
                             ToastKind::Ok => theme::OK,
                             ToastKind::Err => theme::DANGER,
@@ -14192,6 +14706,7 @@ enum ShrinkPromptTarget {
 
 impl LuksboxApp {
     fn open_size_dialog(&mut self) {
+        self.space_report_cache = None;
         if let Some(v) = &self.vault {
             self.size_dialog = Some(SizeDialog {
                 input: SizeLimitInput::new(v.vfs.max_vault_size()),
@@ -14231,13 +14746,24 @@ impl LuksboxApp {
         let Some(v) = self.vault.as_mut() else {
             return;
         };
-        let report = match v.vfs.space_report() {
-            Ok(r) => r,
-            Err(e) => {
-                self.size_dialog = None;
-                self.toast_err(format!("could not read the vault's size: {e}"));
-                return;
-            }
+        let cached = self
+            .space_report_cache
+            .as_ref()
+            .filter(|(t, _)| t.elapsed() < Duration::from_secs(1))
+            .map(|(_, r)| *r);
+        let report = match cached {
+            Some(r) => r,
+            None => match v.vfs.space_report() {
+                Ok(r) => {
+                    self.space_report_cache = Some((std::time::Instant::now(), r));
+                    r
+                }
+                Err(e) => {
+                    self.size_dialog = None;
+                    self.toast_err(format!("could not read the vault's size: {e}"));
+                    return;
+                }
+            },
         };
         let shrinkable = can_shrink(&v.vfs);
         let deniable = v.vfs.container().is_deniable();
@@ -14968,6 +15494,25 @@ fn shorten_middle(s: &str, max_chars: usize) -> String {
 /// Coloured bar (red->green) + numeric estimate. Drawn under a passphrase
 /// field. Empty input renders nothing, keeps the form quiet until the
 /// user starts typing.
+/// "Confirm" entry under a new passphrase, with a mismatch hint.
+fn confirm_field(ui: &mut egui::Ui, confirm: &mut String, passphrase: &str) {
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Confirm passphrase")
+            .color(theme::DIM)
+            .size(12.0),
+    );
+    let te = egui::TextEdit::singleline(confirm).password(true);
+    ui.add_sized([form_width(ui), CONTROL_H], te);
+    if !confirm.is_empty() && confirm != passphrase {
+        ui.label(
+            RichText::new("does not match")
+                .color(theme::WARN)
+                .size(12.0),
+        );
+    }
+}
+
 fn strength_meter(ui: &mut egui::Ui, passphrase: &str) {
     if passphrase.is_empty() {
         return;
@@ -15169,6 +15714,7 @@ fn start_mount_subprocess(
     opened: OpenedVault,
     mountpoint: &Path,
     shrink_on_close: bool,
+    sync_mode: bool,
 ) -> Result<
     (
         std::process::Child,
@@ -15190,6 +15736,11 @@ fn start_mount_subprocess(
     // 1. Pull out everything we'll need AFTER the OpenedVault drops.
     let vault_path = opened.vault_path.clone();
     let header_path = opened.header_path.clone();
+    // The anchor the vault was opened with (`--anchor`, or the automatic
+    // one of a vault in a cloud folder), as the CLI hands it on: without
+    // it the helper's writes did not move the anchor forward, a gap in
+    // rollback detection.
+    let anchor_path = opened.vfs.container().anchor_path().map(Path::to_path_buf);
     let mvk = opened.vfs.container().mvk_clone();
     // Deniable handoff state (None for standard vaults). Captured
     // before the drop so we still have access to the open container.
@@ -15224,6 +15775,13 @@ fn start_mount_subprocess(
     let mut cmd = build_helper_command(&helper, &vault_path, header_path.as_deref(), mountpoint)?;
     if shrink_on_close {
         cmd.arg("--shrink-on-close");
+    }
+    if let Some(a) = &anchor_path {
+        cmd.arg("--anchor").arg(a);
+    }
+    // "Eager flush (--sync)" was only honoured by the in-process mount.
+    if sync_mode {
+        cmd.arg("--sync");
     }
     cmd.stdin(Stdio::piped());
     // stdout is irrelevant - the helper doesn't print anything on
@@ -16497,3 +17055,6 @@ mod create_form_tests {
         assert_eq!(swap_vault_extension("", true), "");
     }
 }
+
+#[cfg(test)]
+mod gui_scenarios;

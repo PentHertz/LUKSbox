@@ -1449,6 +1449,20 @@ pub struct Vfs {
     container: Container,
     tree: DirectoryTree,
     dirty: bool,
+    /// The last exact metadata-size projection (`check_metadata_budget_
+    /// for_chunks`), cleared by every flush. See `budget_growth`.
+    budget_projected: std::cell::Cell<Option<usize>>,
+    /// Upper bound of how much the serialized metadata may have grown
+    /// since `budget_projected` was computed: every structural change
+    /// (`ensure_writable`) counts as the largest one there is
+    /// (`MUTATION_METADATA_BOUND`), every chunk a write covers as two
+    /// full varints. While the projection plus this bound fits the
+    /// budget, a growing write needs no new projection. The exact one
+    /// walks and serializes the whole tree: run on every write, it made
+    /// writing cost O(files in the vault), so importing many files was
+    /// quadratic and a 64 MiB file took 5 s instead of 1 s in a vault of
+    /// 20 000 files.
+    budget_growth: std::cell::Cell<usize>,
     /// On-disk metadata format for this vault. New vaults default
     /// to V5 (v0.2.1+ shape: lower spill threshold, paired with
     /// LUKSBOX2 header and sidecar mirrors). Existing V2/V3 vaults
@@ -1947,6 +1961,8 @@ impl Vfs {
             // entries here as they touch chunks.
             chunks_dirty: std::collections::BTreeSet::new(),
             pending_free: Vec::new(),
+            budget_projected: std::cell::Cell::new(None),
+            budget_growth: std::cell::Cell::new(0),
             cow_floor_gen,
             max_vault_size: settings.max_vault_size,
             shrink: ShrinkControl::default(),
@@ -2141,10 +2157,71 @@ impl Vfs {
     /// recovery session can never dirty the tree (writes would also
     /// recycle the broken files' chunk slots on disk immediately).
     fn ensure_writable(&self) -> Result<(), Error> {
+        self.ensure_writable_data()?;
+        // Any structural change may grow the metadata by at most this
+        // much (a symlink with the longest target and name); see
+        // `budget_growth`.
+        self.budget_growth.set(
+            self.budget_growth
+                .get()
+                .saturating_add(MUTATION_METADATA_BOUND),
+        );
+        Ok(())
+    }
+
+    /// `ensure_writable` for a change that adds an entry (create, mkdir,
+    /// symlink, link, rename): refused with `MetadataBudgetExhausted` once
+    /// the metadata region could no longer hold one more. Only writes
+    /// were checked, so many empty files or folders filled the region
+    /// unchecked and the next save failed, losing everything since the
+    /// previous one. Deletes are never refused: they are how a full
+    /// vault gets room back.
+    fn ensure_room_for_entry(&self) -> Result<(), Error> {
+        self.ensure_writable_data()?;
+        let budget =
+            luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size);
+        let need = MUTATION_METADATA_BOUND
+            .saturating_add(self.pending_free.len().saturating_mul(10))
+            .saturating_add(BUDGET_SLACK);
+        if let Some(projected) = self.budget_projected.get()
+            && projected
+                .saturating_add(self.budget_growth.get())
+                .saturating_add(need)
+                <= budget
+        {
+            self.budget_growth.set(
+                self.budget_growth
+                    .get()
+                    .saturating_add(MUTATION_METADATA_BOUND),
+            );
+            return Ok(());
+        }
+        let projected = self.project_metadata_size(self.tree.root, 0)?;
+        if projected.saturating_add(need) > budget {
+            return Err(Error::MetadataBudgetExhausted);
+        }
+        self.budget_projected.set(Some(projected));
+        self.budget_growth.set(MUTATION_METADATA_BOUND);
+        Ok(())
+    }
+
+    /// `ensure_writable` for `write` and `truncate`, which account for
+    /// their own metadata growth chunk by chunk.
+    fn ensure_writable_data(&self) -> Result<(), Error> {
         if self.read_only || !self.tolerated_inodes.is_empty() {
             return Err(Error::ReadOnlyMount);
         }
         Ok(())
+    }
+
+    /// Account `chunks` chunk references rewritten or added by a write:
+    /// at most two full varints each in the serialized metadata.
+    fn note_chunk_metadata_growth(&self, chunks: usize) {
+        self.budget_growth.set(
+            self.budget_growth
+                .get()
+                .saturating_add(chunks.saturating_mul(CHUNK_REF_METADATA_BOUND)),
+        );
     }
 
     /// After a save: if the vault file was replaced on disk while open (a
@@ -2452,6 +2529,9 @@ impl Vfs {
         // R15-E3: the new metadata is durable and references none of the
         // slots freed during this session, so they may be reused now.
         self.tree.free_chunks.append(&mut self.pending_free);
+        // The tree just saved is what the next projection starts from.
+        self.budget_projected.set(None);
+        self.budget_growth.set(0);
         // The live metadata region has been re-established. Clear the
         // recovery flag so subsequent clean flushes (when the tree is
         // not dirty) take the fast path.
@@ -2472,9 +2552,9 @@ impl Vfs {
         if pct >= 90 && self.last_warned_pct < 90 {
             eprintln!(
                 "luksbox: warn: metadata region at {pct}% capacity ({} / {} bytes). \
-                 Further writes may fail with 'no space left on device'. \
-                 Consider archiving content or migrating to a new vault \
-                 (create with --metadata-size larger than the default 64 MiB).",
+                 New files will soon be refused ('no space left on device'). \
+                 Delete files, or move some to a new vault: a vault's metadata \
+                 region cannot be enlarged (64 MiB, the default, is the maximum).",
                 bytes.len(),
                 luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size,),
             );
@@ -2484,7 +2564,8 @@ impl Vfs {
                 "luksbox: note: metadata region at {pct}% capacity ({} / {} bytes). \
                  The metadata region (not the host disk) is the bottleneck for \
                  vaults with very large inode counts; if many more files are \
-                 expected, consider re-creating with a larger --metadata-size.",
+                 expected, plan to move some to a new vault (a region cannot be \
+                 enlarged; 64 MiB, the default, is the maximum).",
                 bytes.len(),
                 luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size,),
             );
@@ -2908,17 +2989,47 @@ impl Vfs {
         // honored on every open). Constant for the life of this Vfs.
         let region_size = self.container.header.metadata_size;
         let budget = luksbox_format::metadata::payload_budget_for(region_size);
+        // Slots freed this session are serialized as free at the next
+        // flush: count them (a full varint each).
+        let pending = self.pending_free.len().saturating_mul(10);
+        let request = extra_chunks.saturating_mul(CHUNK_REF_METADATA_BOUND);
+        // Fast path: the last exact projection plus an upper bound of
+        // everything since (see `budget_growth`) still fits.
+        if let Some(projected) = self.budget_projected.get() {
+            let bound = projected
+                .saturating_add(self.budget_growth.get())
+                .saturating_add(request)
+                .saturating_add(pending)
+                .saturating_add(BUDGET_SLACK);
+            if bound <= budget {
+                self.budget_growth
+                    .set(self.budget_growth.get().saturating_add(request));
+                return Ok(());
+            }
+        }
+        let projected = self.project_metadata_size(id, extra_chunks)?;
+        if projected
+            .saturating_add(pending)
+            .saturating_add(BUDGET_SLACK)
+            > budget
+        {
+            return Err(Error::MetadataBudgetExhausted);
+        }
+        // The projection includes this request.
+        self.budget_projected.set(Some(projected));
+        self.budget_growth.set(0);
+        Ok(())
+    }
 
+    /// Exact serialized size of the metadata if file `id` grew by
+    /// `extra_chunks` chunks (placeholder references for the new ones).
+    fn project_metadata_size(&self, id: FileId, extra_chunks: usize) -> Result<usize, Error> {
         if matches!(self.format, MetadataFormat::V2) {
             // v2: every chunk is inline. Same logic as before the fix.
             let current = postcard::to_allocvec(&self.tree)
                 .map_err(|_| Error::MetadataSerialize)?
                 .len();
-            let projected = current.saturating_add(extra_chunks.saturating_mul(12));
-            if projected > budget {
-                return Err(Error::MetadataBudgetExhausted);
-            }
-            return Ok(());
+            return Ok(current.saturating_add(extra_chunks.saturating_mul(12)));
         }
 
         // v3: estimate the size of the SPILLED tree. We serialize a
@@ -2997,6 +3108,46 @@ impl Vfs {
                 },
             );
         }
+        // v4 / v5 (every current vault) save each inode with its mode,
+        // link count and symlink target too (`spill_to_v4_on_disk`).
+        // Projecting the v3 shape left those out: a few bytes per file
+        // and a whole target per symlink, so a region filled with small
+        // files passed the check and the save then overflowed it.
+        if matches!(self.format, MetadataFormat::V4 | MetadataFormat::V5) {
+            let inodes = on_disk_inodes
+                .into_iter()
+                .map(|(id, od)| {
+                    let inode = &self.tree.inodes[&id];
+                    (
+                        id,
+                        InodeV4OnDisk {
+                            id: od.id,
+                            parent: od.parent,
+                            kind: od.kind,
+                            size: od.size,
+                            mtime_ns: od.mtime_ns,
+                            chunks: od.chunks,
+                            chunks_external: od.chunks_external,
+                            children: od.children,
+                            mode: inode.mode,
+                            link_count: inode.link_count,
+                            symlink_target: inode.symlink_target.clone(),
+                        },
+                    )
+                })
+                .collect();
+            let projected_tree = DirectoryTreeV4OnDisk {
+                root: self.tree.root,
+                next_file_id: self.tree.next_file_id,
+                next_chunk_id: self.tree.next_chunk_id,
+                next_chunk_gen: self.tree.next_chunk_gen,
+                free_chunks: self.tree.free_chunks.clone(),
+                inodes,
+            };
+            return Ok(postcard::to_allocvec(&projected_tree)
+                .map_err(|_| Error::MetadataSerialize)?
+                .len());
+        }
         let projected_tree = DirectoryTreeV3OnDisk {
             root: self.tree.root,
             next_file_id: self.tree.next_file_id,
@@ -3005,17 +3156,19 @@ impl Vfs {
             free_chunks: self.tree.free_chunks.clone(),
             inodes: on_disk_inodes,
         };
-        let projected = postcard::to_allocvec(&projected_tree)
-            .map_err(|_| Error::MetadataSerialize)?
-            .len();
         // Slack for varint growth on placeholder values being smaller
-        // than the real values we'll write at flush time. Even the
-        // worst-case correction (a few KiB) is dwarfed by the budget.
-        let slack = 4096;
-        if projected.saturating_add(slack) > budget {
-            return Err(Error::MetadataBudgetExhausted);
-        }
-        Ok(())
+        // than the real values we'll write at flush time is added by the
+        // caller (`BUDGET_SLACK`).
+        Ok(postcard::to_allocvec(&projected_tree)
+            .map_err(|_| Error::MetadataSerialize)?
+            .len())
+    }
+
+    /// Whether `name` is accepted for a new entry (`create`, `mkdir`...),
+    /// without creating anything: for front ends that copy many local
+    /// files in and want to skip the names a vault refuses.
+    pub fn check_new_name(name: &str) -> Result<(), Error> {
+        validate_new_name(name)
     }
 
     pub fn close(mut self) -> Result<Container, Error> {
@@ -3245,7 +3398,7 @@ impl Vfs {
     }
 
     pub fn mkdir(&mut self, parent: FileId, name: &str) -> Result<FileId, Error> {
-        self.ensure_writable()?;
+        self.ensure_room_for_entry()?;
         validate_new_name(name)?;
         self.require_dir(parent)?;
         if self.tree.inodes[&parent].children.contains_key(name) {
@@ -3302,7 +3455,7 @@ impl Vfs {
         name: &str,
         mode: u32,
     ) -> Result<FileId, Error> {
-        self.ensure_writable()?;
+        self.ensure_room_for_entry()?;
         validate_new_name(name)?;
         self.require_dir(parent)?;
         if self.tree.inodes[&parent].children.contains_key(name) {
@@ -3420,7 +3573,7 @@ impl Vfs {
         // Gated even before the empty-buf fast path: write() rewrites
         // existing chunks on disk at call time, so on a recovered
         // instance it must fail loudly, not depend on flush.
-        self.ensure_writable()?;
+        self.ensure_writable_data()?;
         if buf.is_empty() {
             return Ok(0);
         }
@@ -3484,6 +3637,9 @@ impl Vfs {
         if cur_len < target_count {
             self.check_metadata_budget_for_chunks(id, target_count - cur_len)?;
         }
+        // Rewritten chunk references take fresh generations (their
+        // varints may grow): accounted for the budget bound.
+        self.note_chunk_metadata_growth(last_chunk + 1 - first_chunk);
 
         // Allocate any missing chunks up to target_count as zero-filled.
         // Covers file extension, sparse holes (write past EOF), and pow2
@@ -3513,6 +3669,18 @@ impl Vfs {
                 generation: self.tree.alloc_chunk_gen().ok_or(Error::IdSpaceExhausted)?,
             };
             let chunk_idx = (cur_len + appended.len()) as u32;
+            // A new chunk this write covers is written below with its
+            // data, starting from zeros: writing (and later reading back)
+            // an encrypted zero chunk first cost two more AEAD operations
+            // and two more I/Os per 4 KiB of every file transfer. Only the
+            // chunks the write does not cover (a hole before it, pow2
+            // padding after it) are written as zeros here. A reused free
+            // slot is overwritten either way before anything refers to it.
+            let covered = (first_chunk..=last_chunk).contains(&(chunk_idx as usize));
+            if covered {
+                appended.push(cref);
+                continue;
+            }
             if let Err(e) =
                 chunk::write_chunk(&mut self.container, &key, id, chunk_idx, cref, &zero)
             {
@@ -3602,8 +3770,13 @@ impl Vfs {
             } else {
                 appended[chunk_idx - cur_len]
             };
-            let mut pt =
-                chunk::read_chunk(&mut self.container, &key, id, chunk_idx as u32, cur_ref)?;
+            // A chunk this call appended is new: its plaintext is zeros
+            // (nothing written to its slot yet, see the extension loop).
+            let mut pt = if chunk_idx < cur_len {
+                chunk::read_chunk(&mut self.container, &key, id, chunk_idx as u32, cur_ref)?
+            } else {
+                Zeroizing::new(vec![0u8; CHUNK_PLAINTEXT_SIZE])
+            };
             // R15-E2: this chunk's share of the hole left by a write past
             // EOF (see above) is scrubbed in the same rewrite.
             if chunk_idx == first_chunk && chunk_idx < cur_len && offset > old_real {
@@ -3627,10 +3800,15 @@ impl Vfs {
             let (new_ref, old) = if chunk_idx < cur_len {
                 self.rewrite_chunk(&key, id, chunk_idx as u32, cur_ref, &pt)?
             } else {
-                (
-                    self.rewrite_in_place(&key, id, chunk_idx as u32, cur_ref, &pt)?,
-                    None,
-                )
+                match self.rewrite_in_place(&key, id, chunk_idx as u32, cur_ref, &pt) {
+                    Ok(r) => (r, None),
+                    Err(e) => {
+                        // R15-E6: nothing refers to the slots this call
+                        // appended; hand them back instead of leaking them.
+                        self.pending_free.extend(appended.iter().map(|c| c.id));
+                        return Err(e);
+                    }
+                }
             };
             retired.extend(old);
             if chunk_idx < cur_len {
@@ -4217,6 +4395,13 @@ impl Vfs {
         let keep = self.first_unused_tail_slot();
         if keep < self.tree.next_chunk_id {
             self.tree.free_chunks.retain(|&slot| slot < keep);
+            // R16-02: slots handed back by a failed write or truncate
+            // (R15-E6) wait in `pending_free` with the tree clean, so the
+            // flush above did not fold them into the free list. The ones
+            // past the cut would be serialised below as free slots at or
+            // beyond `next_chunk_id`, which the validator rejects at the
+            // next open: the vault would not open any more.
+            self.pending_free.retain(|&slot| slot < keep);
             self.tree.next_chunk_id = keep;
             self.dirty = true;
             self.flush()?;
@@ -4385,7 +4570,7 @@ impl Vfs {
     /// result stays within the vault root could be added later as
     /// an opt-in.
     pub fn symlink(&mut self, parent: FileId, name: &str, target: &str) -> Result<FileId, Error> {
-        self.ensure_writable()?;
+        self.ensure_room_for_entry()?;
         validate_new_name(name)?;
         if !is_safe_symlink_target(target) {
             return Err(Error::InvalidPath(target.to_string()));
@@ -4464,7 +4649,7 @@ impl Vfs {
         new_parent: FileId,
         new_name: &str,
     ) -> Result<(), Error> {
-        self.ensure_writable()?;
+        self.ensure_room_for_entry()?;
         validate_new_name(new_name)?;
 
         // Validate target. Only regular files can be hardlinked
@@ -4568,7 +4753,7 @@ impl Vfs {
         new_parent: FileId,
         new_name: &str,
     ) -> Result<(), Error> {
-        self.ensure_writable()?;
+        self.ensure_room_for_entry()?;
         validate_name(old_name)?;
         validate_new_name(new_name)?;
 
@@ -5239,6 +5424,19 @@ impl Vfs {
 /// containing `\` cannot be added to a vault, which we accept as
 /// a security/portability win.
 const MAX_NAME_LEN_BYTES: usize = 255;
+
+/// Most one structural change (create, mkdir, symlink, link, rename,
+/// unlink, chmod, a setting...) can add to the serialized metadata: a
+/// new inode with the longest name and the longest symlink target, with
+/// room to spare. Used to bound `Vfs::budget_growth`.
+const MUTATION_METADATA_BOUND: usize =
+    crate::tree::MAX_SYMLINK_TARGET_LEN + MAX_NAME_LEN_BYTES + 256;
+/// Most one chunk reference adds to the serialized metadata (two full
+/// u64 varints).
+const CHUNK_REF_METADATA_BOUND: usize = 20;
+/// Margin for varint growth between a projection's placeholder values
+/// and the real ones written at flush time.
+const BUDGET_SLACK: usize = 4096;
 
 /// R15-E7: `validate_name` plus a control-character ban, applied to
 /// every name that enters the tree through the API (`create`, `mkdir`,

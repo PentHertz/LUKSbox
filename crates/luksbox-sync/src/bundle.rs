@@ -35,10 +35,10 @@ use crate::image::{
     BundleHeaderStore, ImageCore, PagedImage, SharedLocal, SharedStore, load_record,
 };
 use crate::keys::{BundleKeys, Kind};
-use crate::local::LocalStore;
+use crate::local::{LocalStore, open_local, seal_local};
 use crate::manifest::{
-    CommitKind, FORMAT, HeaderRef, MANIFEST_SIZES, Manifest, ManifestRef, NamedRef, PAGE_SIZES,
-    Seen, Verified, sanitize_label,
+    CommitKind, FORMAT, HeaderRef, MANIFEST_SIZES, MAX_DEVICES, Manifest, ManifestRef, NamedRef,
+    PAGE_SIZES, Seen, Verified, sanitize_label,
 };
 use crate::names::{Area, BundleId, HeaderName, Name};
 use crate::state::{DeviceState, PENDING_MANIFEST};
@@ -47,6 +47,19 @@ use crate::table::{BLOCK_OBJECT_LEN, ENTRIES_PER_BLOCK, ObjRef, TableBlock, page
 
 /// Most manifests an open will read (retention keeps far fewer).
 pub const MAX_MANIFESTS: usize = 100_000;
+/// Most header objects an open will read. Every keyslot change adds one
+/// (8 KiB, read unauthenticated before the credential is tried) until
+/// `gc` removes the superseded ones; the folder is provider-controlled,
+/// so without a cap a flood of well-named files was a memory and
+/// Argon2 denial of service (R16-05).
+pub const MAX_HEADER_OBJECTS: usize = 1024;
+/// Most leases a listing considers. Past it, garbage collection refuses
+/// rather than ignore pins (R16-06).
+pub const MAX_LEASES: usize = 10_000;
+/// Local record: the error of the last publish attempt on this device,
+/// kept until one succeeds, so a failure nobody saw (a background mount
+/// writes to /dev/null) is reported at the next open (R16-08).
+const LAST_PUBLISH_ERROR: &str = "last-publish-error";
 /// Largest hybrid sidecar object accepted.
 const MAX_HYBRID: usize = 1 << 20;
 /// Default page size: 4 MiB.
@@ -238,7 +251,11 @@ fn header_frame(h: &Header) -> [u8; 32] {
 /// `None` if the rest of the header changed on both sides (format,
 /// cipher, flags...): that is still a fork for the user. Returns the
 /// merged header (new generation) and what the user should know.
-pub(crate) fn merge_keyslot_tables(
+///
+/// Public for the `sync_keyslot_merge` fuzz target, which checks the
+/// rules above over arbitrary slot changes; not a stable API.
+#[doc(hidden)]
+pub fn merge_keyslot_tables(
     base: &Header,
     target: &Header,
     other: &Header,
@@ -327,12 +344,32 @@ pub(crate) fn merge_keyslot_tables(
     Some((merged, notes))
 }
 
+/// R16-07: a manifest holds at most `MAX_DEVICES` observations. Past
+/// that (identities churn on copied profiles and restored VMs), keep the
+/// most recently active devices (highest sequence numbers), so the
+/// manifest every reader validates stays valid; the local state keeps
+/// every observation for this device's own checks. Sorted by device,
+/// as the manifest lists them.
+pub(crate) fn cap_seen(seen: &mut Vec<Seen>) {
+    if seen.len() > MAX_DEVICES {
+        seen.sort_by_key(|s| std::cmp::Reverse((s.seq, s.device)));
+        seen.truncate(MAX_DEVICES);
+    }
+    seen.sort_by_key(|s| s.device);
+}
+
 /// Header objects of the bundle, newest generation first. All must
 /// belong to one bundle id.
 pub(crate) fn header_candidates(
     store: &mut dyn ObjectStore,
 ) -> Result<(BundleId, Vec<(HeaderName, [u8; HEADER_SIZE])>)> {
     let listing = store.list(Area::Header)?;
+    if listing.names.len() > MAX_HEADER_OBJECTS {
+        return Err(SyncError::Limit(
+            "too many header objects in the bundle; run `luksbox sync gc` from a device \
+             that opens it, or remove the planted ones",
+        ));
+    }
     let mut bid: Option<BundleId> = None;
     let mut out = Vec::new();
     for n in listing.names {
@@ -452,6 +489,10 @@ fn publish_manifest(
     state: &mut DeviceState,
     m: Manifest,
 ) -> Result<Verified> {
+    // R16-07: what every reader will check, checked here first, so a
+    // commit is never published that every device then ignores (which
+    // this device would next read as a rollback of its own commit).
+    m.validate(keys.bundle(), &|| "the commit being published".into())?;
     let (oid, bytes) = m.seal(keys)?;
     let r = ManifestRef {
         device: m.device,
@@ -938,27 +979,52 @@ impl Session {
         let mut can_write = writable(&notices) && !opts.read_only;
         report.other_heads = graph.heads.len() - 1;
 
-        // 4. The head (highest Lamport counter), falling back to its
-        // newest complete ancestor while objects are still arriving.
-        let mut head = graph.all[&graph.heads[0]].clone();
-        let blocks = loop {
-            if let Some(b) = complete(&store, &keys, &head)? {
-                break b;
+        // 4. The head: the first complete one in the deterministic order
+        // (highest Lamport counter, then hash). R16-03: a head whose
+        // objects have not all arrived is reported as pending and
+        // skipped, as the design says, instead of making the session
+        // read-only. It may never complete (a device that died
+        // mid-upload, a provider that withholds one object), and a
+        // read-only device cannot publish anything that would outrank
+        // it: every device stayed read-only, for good. Only when no head
+        // is complete does the session open the newest complete ancestor
+        // of the first one, read-only, until the objects arrive.
+        let mut picked = None;
+        let mut skipped = 0usize;
+        for h in &graph.heads {
+            let v = graph.all[h].clone();
+            if let Some(b) = complete(&store, &keys, &v)? {
+                picked = Some((v, b));
+                break;
             }
-            can_write = false;
-            report.notices.push(Notice::Pending { count: 1 });
-            let Some(p) = head.m.parents.first() else {
-                return Err(SyncError::NothingComplete {
-                    pending: graph.pending() + 1,
-                });
-            };
-            head = graph
-                .all
-                .get(&p.hash)
-                .cloned()
-                .ok_or(SyncError::NothingComplete {
-                    pending: graph.pending() + 1,
-                })?;
+            skipped += 1;
+        }
+        if skipped > 0 {
+            report.notices.push(Notice::Pending { count: skipped });
+        }
+        let (head, blocks) = match picked {
+            Some(p) => p,
+            None => {
+                can_write = false;
+                let mut head = graph.all[&graph.heads[0]].clone();
+                loop {
+                    let Some(p) = head.m.parents.first() else {
+                        return Err(SyncError::NothingComplete {
+                            pending: graph.pending() + skipped,
+                        });
+                    };
+                    head = graph
+                        .all
+                        .get(&p.hash)
+                        .cloned()
+                        .ok_or(SyncError::NothingComplete {
+                            pending: graph.pending() + skipped,
+                        })?;
+                    if let Some(b) = complete(&store, &keys, &head)? {
+                        break (head, b);
+                    }
+                }
+            }
         };
         if head.m.header.generation < state.max_header_generation {
             return Err(SyncError::RollbackDetected {
@@ -992,15 +1058,33 @@ impl Session {
         // very head are restored; ones made on an older commit are
         // replayed by a merge below.
         let head_ref = head.as_ref();
-        let mut core = ImageCore::new(
-            keys.clone(),
-            store.clone(),
-            if can_write { Some(local.clone()) } else { None },
-            head.m.page_size as u64,
-            head.m.logical_len,
-            Some(head_ref),
-            head.m.tables.clone(),
-        );
+        // R16-04: a session that cannot publish (opened read-only, or a
+        // commit another device saw is missing here) is a view, but one
+        // that still shows the changes this device saved on this very
+        // commit and never published: they can be read and exported,
+        // and the session reports them, instead of silently showing a
+        // vault without them while `has_unpublished` said no.
+        let mut core = if can_write {
+            ImageCore::new(
+                keys.clone(),
+                store.clone(),
+                Some(local.clone()),
+                head.m.page_size as u64,
+                head.m.logical_len,
+                Some(head_ref),
+                head.m.tables.clone(),
+            )
+        } else {
+            ImageCore::new_view(
+                keys.clone(),
+                store.clone(),
+                Some(local.clone()),
+                head.m.page_size as u64,
+                head.m.logical_len,
+                Some(head_ref),
+                head.m.tables.clone(),
+            )
+        };
         core.seed_blocks(blocks);
         let mut stale_record = None;
         {
@@ -1008,11 +1092,21 @@ impl Session {
             if let Some(rec) = load_record(&keys, &mut **l)? {
                 let has_changes =
                     !rec.pages.is_empty() || rec.header.is_some() || rec.len != rec.base_len;
-                if has_changes && rec.base == Some(head_ref) && can_write {
+                if has_changes && rec.base == Some(head_ref) {
                     core.restore_record(&rec)?;
                     report.restored_local_changes = true;
+                    if !can_write {
+                        report
+                            .notices
+                            .push(Notice::UnpublishedLocalChanges { shown: true });
+                    }
                 } else if has_changes && rec.base != Some(head_ref) {
                     stale_record = Some(rec);
+                    if !can_write {
+                        report
+                            .notices
+                            .push(Notice::UnpublishedLocalChanges { shown: false });
+                    }
                 }
             }
         }
@@ -1178,10 +1272,18 @@ impl Session {
     /// and open a writable vault over it, for merging into. Only called
     /// when nothing is staged.
     fn retarget(&mut self, graph: &Graph) -> Result<luksbox_vfs::Vfs> {
-        let target = graph.all[&graph.heads[0]].clone();
-        if complete(&self.store, &self.keys, &target)?.is_none() {
-            return Err(SyncError::NothingComplete { pending: 1 });
+        // R16-03: the first complete head, as `open` picks it.
+        let mut target = None;
+        for h in &graph.heads {
+            let v = graph.all[h].clone();
+            if complete(&self.store, &self.keys, &v)?.is_some() {
+                target = Some(v);
+                break;
+            }
         }
+        let target = target.ok_or(SyncError::NothingComplete {
+            pending: graph.heads.len(),
+        })?;
         if target.hash != self.head.hash {
             self.header_bytes = self.read_header_object(&target.m.header)?;
             self.head = target;
@@ -1617,6 +1719,55 @@ impl Session {
         gc_plan: Option<crate::manifest::GcPlan>,
         checkpoint_override: Option<BTreeMap<crate::manifest::DeviceId, u64>>,
     ) -> Result<Option<ManifestRef>> {
+        let r = self.publish_inner(kind, extra_parents, merge_log, gc_plan, checkpoint_override);
+        // R16-08: a failure is kept for the next open (the caller may be
+        // a background mount nobody watches); a success clears it.
+        match &r {
+            Err(e) => self.note_publish_error(e),
+            Ok(Some(_)) => self.clear_publish_error(),
+            Ok(None) => {}
+        }
+        r
+    }
+
+    /// The error of the last publish that failed on this device, until a
+    /// later one succeeds ("<UTC time> <error>").
+    pub fn last_publish_error(&self) -> Result<Option<String>> {
+        let mut l = self.local.lock().expect("local lock");
+        let Some(sealed) = l.get(LAST_PUBLISH_ERROR)? else {
+            return Ok(None);
+        };
+        let pt = open_local(&self.keys, LAST_PUBLISH_ERROR, &sealed)?;
+        Ok(Some(String::from_utf8_lossy(&pt).into_owned()))
+    }
+
+    fn note_publish_error(&self, e: &SyncError) {
+        let text = format!("{} UTC: {e}", stamp(now_ns()));
+        if let Ok(sealed) = seal_local(&self.keys, LAST_PUBLISH_ERROR, text.as_bytes()) {
+            let _ = self
+                .local
+                .lock()
+                .expect("local lock")
+                .put(LAST_PUBLISH_ERROR, &sealed);
+        }
+    }
+
+    fn clear_publish_error(&self) {
+        let _ = self
+            .local
+            .lock()
+            .expect("local lock")
+            .remove(LAST_PUBLISH_ERROR);
+    }
+
+    fn publish_inner(
+        &mut self,
+        kind: CommitKind,
+        extra_parents: &[Verified],
+        merge_log: Vec<crate::manifest::MergeEvent>,
+        gc_plan: Option<crate::manifest::GcPlan>,
+        checkpoint_override: Option<BTreeMap<crate::manifest::DeviceId, u64>>,
+    ) -> Result<Option<ManifestRef>> {
         if !self.writable {
             return Err(SyncError::ReadOnly);
         }
@@ -1729,7 +1880,7 @@ impl Session {
                 hash: *hash,
             })
             .collect();
-        seen.sort_by_key(|s| s.device);
+        cap_seen(&mut seen);
         let mut parents = vec![self.head.as_ref()];
         parents.extend(extra_parents.iter().map(|v| v.as_ref()));
         let lamport = std::iter::once(&self.head)
@@ -1830,7 +1981,7 @@ impl Session {
         let mut s = self.store.lock().expect("store lock");
         let listing = s.list(Area::Lease)?;
         let mut removed = false;
-        for n in listing.names.iter().take(1000) {
+        for n in listing.names.iter().take(MAX_LEASES) {
             let Some(id) = n.object_id() else { continue };
             if Some(id) == own {
                 continue;
@@ -1883,7 +2034,7 @@ impl Session {
         let mut s = self.store.lock().expect("store lock");
         let listing = s.list(Area::Lease)?;
         let mut out = Vec::new();
-        for n in listing.names.iter().take(1000) {
+        for n in listing.names.iter().take(MAX_LEASES) {
             let Some(id) = n.object_id() else { continue };
             if Some(id) == own {
                 continue;
@@ -2023,7 +2174,7 @@ pub mod fs {
 
     fn remember(local_root: &Path, bundle_path: &Path, bid: BundleId) -> Result<()> {
         let e = registry_entry(local_root, bundle_path)?;
-        std::fs::create_dir_all(e.parent().expect("has parent"))?;
+        crate::local::create_dir_all_private(e.parent().expect("has parent"))?;
         luksbox_core::file_util::atomic_secure_write(&e, bid.to_hex().as_bytes())?;
         Ok(())
     }
@@ -2272,6 +2423,58 @@ pub mod fs {
         }
         report.folder_removed = std::fs::remove_dir(path).is_ok();
         Ok(report)
+    }
+}
+
+#[cfg(test)]
+mod seen_cap_tests {
+    use super::*;
+    use crate::manifest::DeviceId;
+
+    fn seen(n: usize) -> Vec<Seen> {
+        (0..n)
+            .map(|i| Seen {
+                device: DeviceId([
+                    (i % 251) as u8,
+                    (i / 251) as u8,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                ]),
+                seq: (i as u64) + 1,
+                hash: [i as u8; 32],
+            })
+            .collect()
+    }
+
+    /// R16-07: more devices than a manifest may list keep the most
+    /// recently active ones, and the result validates.
+    #[test]
+    fn more_devices_than_a_manifest_holds_keep_the_most_active() {
+        let mut s = seen(MAX_DEVICES + 40);
+        cap_seen(&mut s);
+        assert_eq!(s.len(), MAX_DEVICES);
+        // The 40 least active (lowest seq) are the ones dropped.
+        assert!(s.iter().all(|x| x.seq > 40));
+        assert!(s.windows(2).all(|w| w[0].device < w[1].device));
+        let mut m = crate::manifest::tests::sample([1; 16]);
+        m.seen = s;
+        assert!(m.validate(BundleId([1; 16]), &|| "t".into()).is_ok());
+        // Within the limit nothing is dropped.
+        let mut few = seen(3);
+        cap_seen(&mut few);
+        assert_eq!(few.len(), 3);
     }
 }
 

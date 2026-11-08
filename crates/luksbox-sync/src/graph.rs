@@ -69,6 +69,13 @@ pub enum Notice {
     /// out or exported first; otherwise the commit they were made on is
     /// no longer in the bundle and they cannot be rebuilt.
     UnmergedLocalChanges { recoverable: bool },
+    /// Changes saved on this device and never published, in a session
+    /// that cannot publish them (opened read-only, or a commit another
+    /// device saw is missing here). `shown`: they were saved on the
+    /// commit this session shows and are part of what it shows (so they
+    /// can be read and exported); otherwise they were saved on an older
+    /// commit and wait for a writable session to replay them (R16-04).
+    UnpublishedLocalChanges { shown: bool },
 }
 
 impl Graph {

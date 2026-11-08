@@ -223,13 +223,10 @@ pub fn attach_auto_anchor(
             )),
         };
     }
-    std::fs::create_dir_all(anchors_dir).map_err(|e| anchor_dir_err(anchors_dir, &e))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(anchors_dir, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| anchor_dir_err(anchors_dir, &e))?;
-    }
+    // R16-09: every folder created on the way is private, not only the
+    // last one.
+    crate::local::create_dir_all_private(anchors_dir)
+        .map_err(|e| anchor_dir_err(anchors_dir, &e))?;
     // Generation 0 for now: the metadata generation is only known once
     // the vault is open, and `settle_auto_anchor` moves it there.
     cont.init_anchor(path.clone(), 0).map_err(|e| {

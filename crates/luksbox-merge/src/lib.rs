@@ -55,6 +55,20 @@ pub enum Error {
     Vfs(#[from] luksbox_vfs::Error),
     #[error("the target of a merge must be writable")]
     TargetReadOnly,
+    /// R16-11: the vault-generation counter only grows along a lineage,
+    /// so a version whose counter is below the base's did not descend
+    /// from it. Replaying against such a base would silently take the
+    /// base's (older) content for every file the other side did not
+    /// touch, and drop what it lacks as "deleted".
+    #[error(
+        "{what} (generation {found}) is older than the merge base (generation {base}): \
+         the base is not a common ancestor of the versions merged"
+    )]
+    NotDescendants {
+        what: &'static str,
+        found: u64,
+        base: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -401,6 +415,21 @@ pub fn merge(
 ) -> Result<Outcome> {
     if target.is_read_only() {
         return Err(Error::TargetReadOnly);
+    }
+    if let Some(b) = base.as_deref() {
+        let base_gen = b.vault_generation();
+        for (what, found) in [
+            ("ours", ours.vault_generation()),
+            ("theirs", target.vault_generation()),
+        ] {
+            if found < base_gen {
+                return Err(Error::NotDescendants {
+                    what,
+                    found,
+                    base: base_gen,
+                });
+            }
+        }
     }
     let (base_idx, base_next) = match base {
         Some(b) => (index(b)?, b.tree_counters().next_file_id),

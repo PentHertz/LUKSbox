@@ -36,6 +36,9 @@ luksbox-vfs = { path = "../crates/luksbox-vfs" }
 # stays OFF: parser types compile on every host (CryptoKit FFI ops are
 # cfg-gated to macOS), so the SEP harnesses run on a Linux fuzz server.
 luksbox-sep = { path = "../crates/luksbox-sep" }
+# Sync bundles (Round 16): object codec, names, page tables, manifests,
+# leases, the commit graph and the per-device state record.
+luksbox-sync = { path = "../crates/luksbox-sync" }
 tempfile = "3"
 # bincode kept for any legacy harness that hasn't migrated yet;
 # new harnesses prefer postcard to match the production decoder.
@@ -113,3 +116,31 @@ codegen-units = 1       # better instrumentation density
 # This crate is intentionally NOT in the workspace, AFL build flags
 # would otherwise contaminate the main `cargo build`.
 [workspace]
+
+[[bin]]
+name = "sync_graph_build"
+path = "src/bin/sync_graph_build.rs"
+
+[[bin]]
+name = "sync_lease_decode"
+path = "src/bin/sync_lease_decode.rs"
+
+[[bin]]
+name = "sync_local_state_decode"
+path = "src/bin/sync_local_state_decode.rs"
+
+[[bin]]
+name = "sync_manifest_decode"
+path = "src/bin/sync_manifest_decode.rs"
+
+[[bin]]
+name = "sync_name_grammar"
+path = "src/bin/sync_name_grammar.rs"
+
+[[bin]]
+name = "sync_object_open"
+path = "src/bin/sync_object_open.rs"
+
+[[bin]]
+name = "sync_table_decode"
+path = "src/bin/sync_table_decode.rs"
