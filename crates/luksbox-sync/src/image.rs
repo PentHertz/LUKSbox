@@ -578,16 +578,21 @@ impl ImageCore {
             u.saved_cut = Some(u.cut);
         }
         // Only after the record no longer names them, and never while a
-        // publish reads them (`published` removes those).
+        // publish reads them (`published` removes those). The record is
+        // written: the save succeeded, so a removal that fails is retried
+        // at the next save instead of failing it (a caller undoing a
+        // "failed" save would undo a committed one).
+        let mut keep = Vec::new();
         for oid in std::mem::take(&mut self.superseded) {
-            if !self
+            let in_upload = self
                 .upload
                 .as_ref()
-                .is_some_and(|u| u.objects.contains(&oid))
-            {
-                local.remove(&outbox_name(&oid))?;
+                .is_some_and(|u| u.objects.contains(&oid));
+            if !in_upload && local.remove(&outbox_name(&oid)).is_err() {
+                keep.push(oid);
             }
         }
+        self.superseded = keep;
         Ok(())
     }
 
@@ -614,6 +619,46 @@ impl ImageCore {
             postcard::to_allocvec(&rec).map_err(|_| SyncError::Limit("staged record"))?,
         );
         local.put(RECORD_NAME, &seal_local(&self.keys, RECORD_NAME, &pt)?)
+    }
+
+    /// A new header state saved by the next `stage`, together with the
+    /// pages, never on its own (`HeaderStore::store_header_with_next_save`,
+    /// for a layout change).
+    pub(crate) fn stage_header_with_next_save(&mut self, bytes: &[u8; HEADER_SIZE]) -> Result<()> {
+        if !self.stage_enabled {
+            return Err(SyncError::ReadOnly);
+        }
+        self.pending_header = Some(*bytes);
+        Ok(())
+    }
+
+    /// Throw away every change since the last save (`stage`): the live
+    /// state becomes the saved one again (`LbxFile::discard_unsaved`).
+    /// Objects sealed since then are removed at the next save. A
+    /// truncation made while a publish was in progress is not undone in
+    /// what that publish carries over; the relayout that uses this never
+    /// truncates before it saves.
+    pub(crate) fn discard_unsaved(&mut self) {
+        let keep: HashSet<ObjectId> = self.saved.pages.values().map(|r| r.object_id()).collect();
+        let sealed_since: Vec<ObjectId> = self
+            .staged
+            .values()
+            .map(|r| r.object_id())
+            .filter(|o| !keep.contains(o))
+            .collect();
+        for oid in sealed_since {
+            if !self.superseded.contains(&oid) {
+                self.superseded.push(oid);
+            }
+        }
+        self.superseded.retain(|o| !keep.contains(o));
+        self.staged = self.saved.pages.clone();
+        self.dirty.clear();
+        self.cache = PageCache::default();
+        self.len = self.saved.len;
+        self.cut = self.saved.cut;
+        self.cut_since_save = None;
+        self.pending_header = self.saved.header;
     }
 
     /// Record a new header state durably (from `HeaderStore`). Only the
@@ -890,6 +935,10 @@ impl LbxFile for PagedImage {
         // Bundles never take the file-rotation path that uses this.
         Ok((0, 0))
     }
+    fn discard_unsaved(&mut self) -> std::io::Result<()> {
+        self.core().discard_unsaved();
+        Ok(())
+    }
 }
 
 /// `HeaderStore` of a bundle session: a new header state is staged in
@@ -904,6 +953,13 @@ impl luksbox_format::HeaderStore for BundleHeaderStore {
             .lock()
             .expect("image lock")
             .stage_header(bytes)
+            .map_err(io_err)
+    }
+    fn store_header_with_next_save(&mut self, bytes: &[u8; HEADER_SIZE]) -> std::io::Result<()> {
+        self.core
+            .lock()
+            .expect("image lock")
+            .stage_header_with_next_save(bytes)
             .map_err(io_err)
     }
 }
@@ -986,6 +1042,58 @@ mod tests {
         img.seek(SeekFrom::Start(0)).unwrap();
         img.read_exact(&mut b).unwrap();
         assert_eq!(b, [8, 8, 8, 8, 7, 7, 7, 7]);
+    }
+
+    /// The relayout of a bundle (`Container::relayout_external`) relies on
+    /// these: unsaved changes, spilled or not, are thrown away with what
+    /// they sealed, and a header staged for the next save is saved with
+    /// the pages, never before.
+    #[test]
+    fn discard_unsaved_goes_back_to_the_saved_state() {
+        let page = 4096u64;
+        let (c, _s, local) = core(page);
+        let mut img = PagedImage::new(c.clone());
+        let outbox = || {
+            local
+                .0
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|n| n.starts_with("p-"))
+                .count()
+        };
+        img.write_all(&vec![1u8; 4 * page as usize]).unwrap();
+        img.sync_all().unwrap();
+        assert_eq!(outbox(), 4);
+        // Rewrite and grow past the spill threshold, stage a header.
+        img.seek(SeekFrom::Start(0)).unwrap();
+        img.write_all(&vec![2u8; 20 * page as usize]).unwrap();
+        c.lock()
+            .unwrap()
+            .stage_header_with_next_save(&[5u8; HEADER_SIZE])
+            .unwrap();
+        assert!(outbox() > 4, "spilled");
+        img.discard_unsaved().unwrap();
+        assert_eq!(c.lock().unwrap().len(), 4 * page);
+        assert_eq!(c.lock().unwrap().pending_header(), None);
+        c.lock().unwrap().cache = PageCache::default();
+        let mut b = vec![0u8; 4 * page as usize];
+        img.seek(SeekFrom::Start(0)).unwrap();
+        img.read_exact(&mut b).unwrap();
+        assert!(b.iter().all(|&x| x == 1), "the saved content is back");
+        // The next save drops what the discarded changes sealed.
+        img.sync_all().unwrap();
+        assert_eq!(outbox(), 4);
+
+        img.seek(SeekFrom::Start(0)).unwrap();
+        img.write_all(&[3u8; 10]).unwrap();
+        c.lock()
+            .unwrap()
+            .stage_header_with_next_save(&[5u8; HEADER_SIZE])
+            .unwrap();
+        assert_eq!(c.lock().unwrap().saved.header, None, "not saved on its own");
+        img.sync_all().unwrap();
+        assert_eq!(c.lock().unwrap().saved.header, Some([5u8; HEADER_SIZE]));
     }
 
     #[test]

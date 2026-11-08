@@ -28,6 +28,25 @@ alone is faster than the MB/s shown.
 | Sync bundle, 1 MiB pages | 141 MB/s | 243 MB/s | 587 MiB of objects |
 | Sync bundle, 16 MiB pages | 142 MB/s | 218 MB/s | 609 MiB of objects |
 
+Re-run after the metadata region resize change (2026-11-08), 256 MiB
+(less free disk than a 512 MiB run needs), times with the unlock; a
+second run after the bundle and deniable resize work gave the same
+numbers within 5 %:
+
+| Vault kind | put | get |
+|---|---|---|
+| AES-256-GCM-SIV / AES-256-GCM / detached header | 1.44 s (177 MB/s) | 1.00-1.04 s (246-257 MB/s) |
+| ChaCha20-Poly1305 | 1.49 s (171 MB/s) | 1.13 s (226 MB/s) |
+| `--pad-files` / `--hide-sizes` | 2.03 s / 2.75 s | 1.08 s / 1.07 s |
+| Sync bundle, 1 / 4 / 16 MiB pages | 2.20 / 2.02 / 2.36 s | 1.53 / 1.62 / 1.63 s |
+
+The MB/s are lower than in the 512 MiB table only because the fixed
+costs (unlock about 0.55 s, save about 0.15 s) weigh twice as much:
+without them the default vault writes about 360 MB/s and reads about
+580 MB/s, against about 380 and 540 MB/s from the 512 MiB run, which
+is within run-to-run noise here. The transfer path itself was not
+changed by the resize.
+
 Through a mount (`luksbox mount`, FUSE): writing 512 MiB with
 `dd ... conv=fsync` 152 MB/s, reading it back about 370 MB/s.
 Small files: 20 000 files of 1 KiB created through the mount in 7.1 s
@@ -64,6 +83,41 @@ The metadata check matters most for large vaults: its cost grew with
 the number of files, so importing many files into a big vault was
 quadratic, through the CLI, the GUI and a mount alike.
 
+## GUI transfers (headless scenario, release build)
+
+The GUI end-to-end scenario run on an optimized build with a 67 MB
+tree (120 small files and one 64 MiB file), through the real widgets:
+
+```bash
+LUKSBOX_GUI_SCENARIO_MIB=64 cargo test --release -p luksbox-gui \
+  --bin luksbox-gui gui_scenarios_end_to_end -- --nocapture
+```
+
+| GUI path | Time | Throughput |
+|---|---|---|
+| Create a vault file (Interactive KDF) | 0.94 s | |
+| Vault file: + Add folder | 0.34 s | 195 MB/s |
+| Vault file: Download (recursive) | 0.23 s | 295 MB/s |
+| Create a sync bundle | 1.39 s | |
+| Sync bundle: + Add folder | 0.35 s | 190 MB/s |
+| Sync bundle: Lock (publish) | 0.10 s | |
+| Detached header + anchor + hidden sizes: + Add folder | 0.59 s | 115 MB/s |
+| Deniable vault: rotate master key | 1.40 s | |
+
+With a 135 MB tree (`LUKSBOX_GUI_SCENARIO_MIB=128`) the fixed cost of
+the save (unlock, 128 MiB metadata rewrite) weighs less:
+
+| GUI path, 135 MB tree | Time | Throughput |
+|---|---|---|
+| Vault file: + Add folder | 0.44 s | 307 MB/s |
+| Vault file: Download (recursive) | 0.27 s | 493 MB/s |
+| Sync bundle: + Add folder | 0.53 s | 254 MB/s |
+| Sync bundle: Lock (publish) | 0.13 s | |
+| Detached header + anchor + hidden sizes: + Add folder | 0.95 s | 142 MB/s |
+
+The GUI imports and exports at the CLI's speed (same code path); the
+hidden-sizes vault writes its padding, hence about half the rate.
+
 ## What still costs
 
 - **Every save rewrites 128 MiB.** A save (the end of every CLI command
@@ -83,21 +137,25 @@ quadratic, through the CLI, the GUI and a mount alike.
   at create time (and, in the GUI, "File list (metadata) region" under
   On-disk format) makes every save cheaper for vaults with few files.
 
-  How many files a region holds, with names of about 20 characters
-  (measured for 1 MiB with `luksbox put` of 5 000-file folders until
-  the vault refused more, about 52 bytes per file; the larger sizes
-  are scaled from it; longer names hold fewer):
+  How many files a region holds depends on their size: files up to
+  1 MiB keep their chunk list in the region, larger ones keep it in the
+  data area. Measured with a 256 KiB region (`luksbox put` of folders
+  until the vault refused more), scaled up; names of about 20
+  characters:
 
-  | Region | Files | Writes per save |
-  |---|---|---|
-  | 1 MiB | about 20 000 | 2 MiB |
-  | 4 MiB | about 80 000 | 8 MiB |
-  | 16 MiB | about 300 000 | 32 MiB |
-  | 64 MiB (default, maximum) | over a million | 128 MiB |
+  | Files of | Per MiB of region | 16 MiB | 64 MiB (default, maximum) |
+  |---|---|---|---|
+  | under 4 KiB | about 25 000 | about 400 000 | about 1.6 million |
+  | 512 KiB | about 1 400 | about 22 000 | about 88 000 |
+  | 1 MiB | about 700 | about 11 000 | about 45 000 |
+  | over 1 MiB | over 6 900 (disk full first) | over 110 000 | over 440 000 |
 
-  A 16 MiB default would make every save four times cheaper and still
-  hold about 300 000 files; the region of an existing vault cannot be
-  enlarged, so the default is left to the maintainers.
+  Writes per save: 2 x the region (32 MiB for 16 MiB, 128 MiB for
+  64 MiB). A collection of documents of a few hundred KB fills a
+  16 MiB region at 10 000 to 25 000 files, so the default stays 64 MiB
+  (decision of 2026-11-08); users on slow storage pick a smaller region
+  at create (GUI "File list (metadata) region", `--metadata-size`), and
+  `luksbox size` / the GUI's Vault size show how full it is.
 - **Padding modes write the padding.** `--pad-files` and `--hide-sizes`
   round every file up to a power of two of 4 KiB chunks, and those
   padding chunks are written (encrypted) too: up to 2x the disk use and

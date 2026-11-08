@@ -49,7 +49,7 @@ j "What would you like to do" "$(menu 0)" "Path for the new vault" "~/wiz.lbx"$'
   "Passphrase \\(most familiar" $'\r' "Pad each file" n "Hide exact file sizes" n \
   "Use header format v3" y "rollback-detection anchor" n "(?i)max" $'\r' \
   "Generate a strong random passphrase" n "Passphrase" "$PW"$'\r' "Confirm" "$PW"$'\r' \
-  "Open and mount this vault now" n "What would you like to do" "$(menu 8)" > create.json
+  "Open and mount this vault now" n "What would you like to do" "$(menu 10)" > create.json
 step "wizard: create (~ expanded, default path not pre-filled)" create.json "OK created $W/wiz.lbx"
 
 j "What would you like to do" "$(menu 1)" "Path to vault" "~/wiz.lbx"$'\r' "detached header" n \
@@ -65,7 +65,7 @@ j "What would you like to do" "$(menu 1)" "Path to vault" "~/wiz.lbx"$'\r' "deta
   "Keyslot action" "$UP"$'\r' \
   "Vault action" "$(menu 5)" "File to remove" "/sub/moved.txt"$'\r' "Remove /sub/moved.txt" y \
   "Vault action" "$(menu 6)" "(?i)directory" "/sub"$'\r' \
-  "Vault action" "$(menu 14)" "What would you like to do" "$(menu 8)" > open.json
+  "Vault action" "$(menu 14)" "What would you like to do" "$(menu 10)" > open.json
 step "wizard: open and every file action" open.json \
   "OK wrote 17 bytes to /docs-in.txt" "OK created /sub" "OK renamed /docs-in.txt -> /sub/moved.txt" \
   "OK wrote 17 bytes to out-exists.txt" "FAIL aborted (passphrase not saved)" "OK removed /sub/moved.txt" "OK removed /sub"
@@ -80,9 +80,24 @@ j "What would you like to do" "$(menu 1)" "Path to vault" "~/wiz.lbx"$'\r' "deta
   "Proceed with MVK rotation" y \
   "Vault action" "$(menu 12)" "Mount point" "~/no-such-dir"$'\r' \
   "Vault action" "$(menu 2)" "Local file path" "in.txt"$'\r' "Destination inside vault" "/after-errors.txt"$'\r' \
-  "Vault action" "$(menu 14)" "What would you like to do" "$(menu 8)" > keep.json
+  "Vault action" "$(menu 14)" "What would you like to do" "$(menu 10)" > keep.json
 step "wizard: rotate and mount errors keep the vault open" keep.json \
   "is not a directory" "OK wrote 17 bytes to /after-errors.txt"
+
+# Vault size > change the file list region (64 MiB -> 32 MiB). The entry
+# sits just above "Back" (the default), whether or not "Give back" shows.
+LUKSBOX_PASSPHRASE=$PW "$B" create rz.lbx </dev/null >/dev/null 2>&1
+LUKSBOX_PASSPHRASE=$PW "$B" put rz.lbx in.txt /in.txt </dev/null >/dev/null 2>&1
+j "What would you like to do" "$(menu 1)" "Path to vault" "~/rz.lbx"$'\r' "detached header" n \
+  "rollback-detection anchor" n "Passphrase" "$PW"$'\r' \
+  "Vault action" "$(menu 11)" "Change the file list region \\(now 64" "$UP"$'\r' \
+  "New file list region size" "$(menu 1)" "Change the file list region \\(now 32" $'\r' \
+  "Vault action" "$(menu 14)" "What would you like to do" "$(menu 10)" > resize.json
+step "wizard: resize the file list region" resize.json \
+  "OK file list region resized from 64.0 MB to 32.0 MB" "File list:"
+LUKSBOX_PASSPHRASE=$PW "$B" size rz.lbx </dev/null 2>/dev/null | grep -qF "Metadata:       32.0 MB" \
+  && [ "$(LUKSBOX_PASSPHRASE=$PW "$B" cat rz.lbx /in.txt </dev/null 2>/dev/null)" = "tui file content" ] \
+  && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL resized vault: region or content"; }
 
 LUKSBOX_PASSPHRASE=$PW "$B" sync convert wiz.lbx wiz.lbxs --page-size 1M </dev/null >/dev/null 2>&1
 j "What would you like to do" "$(menu 1)" "Path to vault" "~/wiz.lbxs"$'\r' "detached header" n "Passphrase" "$PW"$'\r' \
@@ -90,7 +105,7 @@ j "What would you like to do" "$(menu 1)" "Path to vault" "~/wiz.lbxs"$'\r' "det
   "Vault action" "$(menu 8)" "Keyslot action" "$(menu 2)" "Keyslot action" "$UP"$'\r' \
   "Vault action" "$(menu 13)" \
   "Vault action" "$(menu 2)" "Local file path" "in.txt"$'\r' "Destination inside vault" "/from-wizard.txt"$'\r' \
-  "Vault action" "$(menu 14)" "What would you like to do" "$(menu 8)" > bundle.json
+  "Vault action" "$(menu 14)" "What would you like to do" "$(menu 10)" > bundle.json
 step "wizard: sync bundle refusals and publish" bundle.json \
   "rotate-mvk is not available for a sync bundle" "adding a post-quantum keyslot is not available" \
   "panic is not available for a sync bundle" "published commit"
@@ -111,7 +126,7 @@ if grep -q before-ctrl-c.txt ls.txt; then PASS=$((PASS+1)); else
 j "What would you like to do" "$(menu 1)" "Path to vault" "~/wiz.lbx"$'\r' "detached header" n \
   "rollback-detection anchor" n "Passphrase" "$PW"$'\r' "Vault action" "$(menu 13)" \
   "ALSO overwrite the entire vault data area" n "(?i)type literally" "not the phrase"$'\r' \
-  "What would you like to do" "$(menu 8)" > panic.json
+  "What would you like to do" "$(menu 10)" > panic.json
 step "wizard: aborted PANIC changes nothing" panic.json "panic aborted; the vault was not changed"
 LUKSBOX_PASSPHRASE=$PW "$B" ls wiz.lbx / </dev/null >/dev/null 2>&1 && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL vault does not open after an aborted panic"; }
 
@@ -128,7 +143,7 @@ if [ -e /dev/fuse ]; then
     "What would you like to do" "$(menu 1)" "Path to vault" "~/wiz.lbx"$'\r' "detached header" n \
     "rollback-detection anchor" n "Passphrase" "$PW"$'\r' "Vault action" "$(menu 12)" \
     "Mount point" "$W/m2"$'\r' "Eager flush" n "<SLEEP>" 3 "in the foreground" $'\x03' \
-    "What would you like to do" "$(menu 8)" > mounts.json
+    "What would you like to do" "$(menu 10)" > mounts.json
   CMD=(wizard)
   step "wizard: two foreground mounts, Ctrl-C ends each" mounts.json \
     "a background mount needs a fresh process" "received interrupt, unmounting cleanly"
@@ -151,6 +166,51 @@ if [ -e /dev/fuse ]; then
   step "deniable-mount again" dm.json; sleep 1
   [ "$(cat dm/note.txt 2>/dev/null)" = "secret deniable data" ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL deniable data lost across remount"; }
   "$B" umount dm </dev/null >/dev/null 2>&1
+  # Rotate its master key: refused without the acknowledgment, then a
+  # wrong passphrase changes nothing, then the right one; the data stays
+  # readable with the same passphrase.
+  CMD=(deniable-rotate den.dat); j "<EXIT>" 1 > dr0.json
+  step "deniable-rotate without --other-slots-stop-working" dr0.json "every other slot"
+  CMD=(deniable-rotate den.dat --other-slots-stop-working)
+  j "Passphrase:" "Not-The-Right-One-12"$'\r' "<EXIT>" 1 > drbad.json
+  step "deniable-rotate with a wrong passphrase" drbad.json
+  j "Passphrase:" "$PW"$'\r' > dr.json
+  step "deniable-rotate" dr.json "OK master key rotated"
+  CMD=(deniable-mount den.dat dm); step "deniable-mount after rotation" dm.json; sleep 1
+  [ "$(cat dm/note.txt 2>/dev/null)" = "secret deniable data" ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL deniable data lost across rotation"; }
+  "$B" umount dm </dev/null >/dev/null 2>&1
+  # The same through the wizard's menu (a second rotation).
+  CMD=(wizard)
+  j "What would you like to do" "$(menu 7)" "Path to the deniable vault" "~/den.dat"$'\r' \
+    "Cipher suite used at create time" $'\r' "(?i)argon2id params" "$UP"$'\r' \
+    "deniable anchor sidecar first" n "Rotate, knowing the other slots stop working" y \
+    "Passphrase:" "$PW"$'\r' "What would you like to do" "$(menu 10)" > drw.json
+  step "wizard: rotate a deniable vault" drw.json "OK master key rotated"
+  CMD=(deniable-mount den.dat dm); step "deniable-mount after the wizard rotation" dm.json; sleep 1
+  [ "$(cat dm/note.txt 2>/dev/null)" = "secret deniable data" ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL deniable data lost across the wizard rotation"; }
+  "$B" umount dm </dev/null >/dev/null 2>&1
+  # Resize its file list region: refused without the acknowledgment,
+  # then 64 -> 16 MiB from the command line and 16 -> 32 MiB from the
+  # wizard; the data stays readable and no other file appears.
+  CMD=(deniable-resize den.dat --metadata-size 16M); j "<EXIT>" 1 > drs0.json
+  step "deniable-resize without --data-moves-visibly" drs0.json "--data-moves-visibly"
+  CMD=(deniable-resize den.dat --metadata-size 16M --data-moves-visibly)
+  j "Passphrase:" "$PW"$'\r' > drs.json
+  step "deniable-resize" drs.json "OK file list region resized from 64.0 MB to 16.0 MB"
+  CMD=(deniable-mount den.dat dm); step "deniable-mount after the resize" dm.json; sleep 1
+  [ "$(cat dm/note.txt 2>/dev/null)" = "secret deniable data" ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL deniable data lost across the resize"; }
+  "$B" umount dm </dev/null >/dev/null 2>&1
+  CMD=(wizard)
+  j "What would you like to do" "$(menu 8)" "Path to the deniable vault" "~/den.dat"$'\r' \
+    "Cipher suite used at create time" $'\r' "(?i)argon2id params" "$UP"$'\r' \
+    "deniable anchor sidecar first" n "New file list region size" "$(menu 1)" \
+    "Resize, knowing the change can be seen" y \
+    "Passphrase:" "$PW"$'\r' "What would you like to do" "$(menu 10)" > drsw.json
+  step "wizard: resize a deniable vault" drsw.json "OK file list region resized from 16.0 MB to 32.0 MB"
+  CMD=(deniable-mount den.dat dm); step "deniable-mount after the wizard resize" dm.json; sleep 1
+  [ "$(cat dm/note.txt 2>/dev/null)" = "secret deniable data" ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL deniable data lost across the wizard resize"; }
+  "$B" umount dm </dev/null >/dev/null 2>&1
+  [ "$(ls den.dat* | wc -l)" = 1 ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL the deniable resize left extra files"; }
 fi
 
 echo "TUI SCENARIOS: $PASS passed, $FAIL failed"

@@ -7720,7 +7720,57 @@ pub fn rotate_mvk_passphrase_only(
 /// user picks the right one. (Note: this is a latent issue for the
 /// envelope-only rewrap too -- adding a real-time verification step
 /// during rotation is on the roadmap.)
+/// Deniable rotation re-wraps the unlocked slot with the passphrase the
+/// user types, and nothing in the format checks it: a typo would lock
+/// the vault for good. Check first that it opens that slot today, as a
+/// passphrase-only slot, under one of the KDF presets, and return that
+/// preset: the new wrap keeps it, so the vault unlocks exactly as before.
+/// Reads the slot table from the file (no lock needed, nothing written).
+pub fn verify_deniable_rotation_passphrase(
+    vfs: &Vfs,
+    passphrase: &str,
+) -> Result<KdfStrength, String> {
+    let c = vfs.container();
+    let slot = c
+        .deniable_unlocked_slot()
+        .ok_or("this deniable vault has no unlocked-slot index; reopen it")?;
+    let path = c.vault_path().to_path_buf();
+    let cipher = c.header.cipher_suite;
+    for kdf in [
+        KdfStrength::Interactive,
+        KdfStrength::Moderate,
+        KdfStrength::Sensitive,
+    ] {
+        if let Ok(slots) = identify_deniable_slots(&path, passphrase, cipher, kdf)
+            && slots.iter().any(|&(i, tag)| {
+                i == slot && tag == luksbox_core::deniable::DeniableKindTag::Passphrase
+            })
+        {
+            return Ok(kdf);
+        }
+    }
+    Err(format!(
+        "this passphrase does not open slot {slot}, the one this vault was unlocked with \
+         (passphrase alone, standard KDF strength); nothing was changed"
+    ))
+}
+
 fn rotate_mvk_deniable_passphrase_only(
+    vfs: &mut Vfs,
+    creds: Vec<(usize, zeroize::Zeroizing<String>)>,
+    _kdf: KdfStrength,
+) -> Result<(), String> {
+    let pass = creds
+        .first()
+        .map(|(_, p)| p.clone())
+        .ok_or("no passphrase given")?;
+    let kdf = verify_deniable_rotation_passphrase(vfs, &pass)?;
+    rotate_mvk_deniable_verified(vfs, creds, kdf)
+}
+
+/// The deniable rotation, once `verify_deniable_rotation_passphrase`
+/// accepted the passphrase and found its KDF preset.
+pub fn rotate_mvk_deniable_verified(
     vfs: &mut Vfs,
     creds: Vec<(usize, zeroize::Zeroizing<String>)>,
     kdf: KdfStrength,

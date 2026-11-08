@@ -79,6 +79,77 @@ control of an in-process mount and answers from its prompt; the data is
 already saved before the question, so a GUI that goes away loses
 nothing.
 
+## Resizing the metadata region (file list)
+
+`Vfs::resize_metadata_region(bytes)` (64 KiB to 64 MiB, in steps of
+64 KiB; `resize_metadata_region_allow_deniable` for a deniable vault)
+changes the size of an open vault's metadata region: larger when the
+file list fills up (`luksbox size` and the GUI show "File list: N%
+full"), smaller to make every save cheaper (each save rewrites the
+whole region and its `.meta-bak` mirror). A smaller size is refused
+when the file list does not fit with the usual headroom. The encrypted
+chunks are moved, never re-encrypted: they are addressed by slot from
+`data_offset` and their AEAD does not depend on where they sit. The
+encrypted file list does not depend on the region's size either (its
+AAD is the header salt and its length). How each kind commits, so a
+crash or an error leaves a vault that opens:
+
+- **Vault file, inline header** (and **deniable**): the vault is copied
+  into `<vault>.rotating` with the new layout (header bytes, then the
+  region left for the next metadata write, which fills it in full with
+  random padding, then the data area at its new offset), the file list
+  and the header are written into the copy, and the copy is renamed over
+  the original, like the master key rotation. Before the rename the
+  original is untouched. A deniable vault's inner header is re-sealed
+  with the new layout. A leftover `.rotating` blocks the next resize
+  until it is removed.
+- **Detached header**: the same copy, but the header is a second file.
+  Before the rename, the new header is written to `<header>.resizing`
+  (`header || "LBXRSZ01" || new vault length || old vault length`,
+  little-endian, created new and synced); after the rename it is
+  installed (mirror first, then the sidecar, atomically) and the intent
+  removed. If anything fails after the rename, the container turns
+  read-only for the rest of the session, so a half-installed header or
+  a leftover intent never meets newer states. `Container::open` with
+  both files locked reads the intent before the header, and the vault's
+  length alone decides: the old length undoes the resize (intent and any
+  `.rotating` removed); the new length installs the header from the
+  intent, unless the sidecar already has the new layout (then it may
+  hold later states and is kept), and removes the old-layout mirrors; an
+  incomplete intent undoes the resize only while the copy is still
+  there (it is written before the rename); anything else is refused.
+  Every recovery failure is `InterruptedResize`, which is never answered
+  from a header mirror (it may hold the old layout).
+- **Sync bundle**: no file to copy. The data area moves inside the paged
+  image (the image spills pages to the outbox as usual, so memory stays
+  bounded), the new header is staged to go with the next save
+  (`HeaderStore::store_header_with_next_save`), and one `sync_all`
+  writes the staged record with both: before it, the record still holds
+  the last save and a crash leaves that; a failure discards the moved
+  pages (`LbxFile::discard_unsaved`). The next publish uploads it as an
+  ordinary commit. A save that wrote its record never reports failure
+  for the cleanup after it (a caller undoing it would undo a committed
+  state). Every view of another commit (merge sides, base, snapshots,
+  changes saved here on an older commit) opens under that commit's own
+  header (a base whose header object is gone merges two-way). Before a
+  merge, the target grows to the other side's region when that is
+  larger, so the merged list has room; after it, a header taken from the
+  other side is staged only over an image with its layout (the target
+  is resized to it, or, when the merged list does not fit, the header
+  keeps the target's layout at a new generation: "the file list region
+  stays ..."), and a target that only grew for the merge goes back to
+  its size when the list fits. Two different resizes made at the same
+  time stay a header fork; the open and the session's finish both work
+  on the complete head with the newest header this device saw, never an
+  older one. A smaller region gives back the end of the image in a later
+  save.
+
+An armed rollback anchor is detached during the resize and moved on
+after the commit, so an abort never leaves it ahead of the vault.
+Deniable vaults need an explicit acknowledgment in every interface: the
+data area moves by the size difference (and a smaller region shrinks the
+file), which anyone holding an older copy of the file can see.
+
 ## Interfaces
 
 - Sizes: `luksbox_core::size::parse_size` / `format_size`, shared by
@@ -86,6 +157,12 @@ nothing.
   decimals; plain numbers are bytes; `0`, `unlimited`, `none`, `off`
   mean no limit. Display is 1024-based with KB/MB/GB labels, so a value
   shown can be typed back.
+- Metadata region: `create --metadata-size`, `luksbox size
+  --metadata-size SIZE` (vault files, detached headers, bundles),
+  `luksbox deniable-resize --metadata-size SIZE --data-moves-visibly`;
+  the wizard's Vault size > "Change the file list region" and main menu
+  "Resize a deniable vault's file list region"; the GUI's Vault size >
+  File list region (with an "I understand" box for a deniable vault).
 - CLI: `create --max-size`, `luksbox size [--max SIZE] [--shrink]`,
   `mount --shrink-on-close` (forwarded to the background / FUSE-T
   helper process). Never prompts; `rm` prints a hint when at least

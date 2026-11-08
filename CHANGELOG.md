@@ -35,15 +35,54 @@ export` turns a bundle back into a `.lbx`.
   advanced), as `luksbox create --metadata-size`. Every save rewrites
   this region twice in full, so a smaller one (16, 4 or 1 MiB instead
   of 64) makes saves faster on a USB stick or SD card, at the cost of
-  how many files the vault can hold (about 20 000 short-named files per
-  MiB; the region cannot grow later). The default is unchanged.
+  how many files the vault can hold (about 700 files of 1 MB per MiB,
+  far more large or tiny files; the region cannot grow later). The
+  default is unchanged.
+- **How full the file list is** ("File list: 42% full (27 MB of
+  64 MB)") in `luksbox size`, the wizard's Vault size and the GUI's
+  Vault size dialog. It was only reported at 75 % and 90 % during a
+  save.
+- **Resizing the file list (metadata) region of an existing vault**:
+  `luksbox size <vault> --metadata-size 32M` (64K to 64M, steps of
+  64K), the wizard's Vault size > "Change the file list region", the
+  GUI's Vault size > File list region > Resize, for every kind of
+  vault (protocols in `docs/VAULT_SIZE.md`). A vault file is rewritten
+  next to itself with the new layout (the encrypted chunks are copied
+  unchanged, only the file list is re-encrypted) and renamed over the
+  original, like the master key rotation: a crash before the rename
+  leaves it as it was. A detached header is installed after the rename
+  from a `<header>.resizing` intent that the next open finishes or
+  undoes after a crash. A sync bundle changes in place, saves pages and
+  header together, and publishes the result as a new commit that other
+  devices merge with their changes. Deniable vaults:
+  `luksbox deniable-resize --data-moves-visibly`, a wizard entry and
+  the GUI, each with an acknowledgment (the data moves visibly). A
+  smaller region is refused when the file list does not fit; an armed
+  anchor is moved on only after the commit. The 75 % / 90 % "file list"
+  warnings and the "metadata region is full" error now suggest
+  enlarging the region when the vault is under 64 MiB.
+- **Sync bundles, merges across a layout change**: every view of
+  another commit (merge sides, base, snapshots, changes saved on an
+  older commit) now opens under that commit's own header instead of the
+  session head's, and a header taken from the other side of a merge is
+  staged only over an image with its layout. When a fork's first head
+  carries an older header than this device saw (a keyslot change or a
+  resize published here while another device committed on the older
+  header), the open now uses the complete head with the newest header
+  instead of refusing the bundle as a rollback (a session's finish does
+  the same); the device never works on, or publishes over, an older
+  header than one it saw, and a header that is really gone is still a
+  rollback. A save whose record is written no longer fails on the
+  cleanup after it, and a merge base whose header object is gone merges
+  two-way instead of failing the open.
 - **Headless GUI scenarios** (`crates/luksbox-gui/src/app/gui_scenarios.rs`):
   the real app driven through its widgets without a display
   (egui_kittest, a test-only dependency): create a vault file, a sync
   bundle and a detached-header + anchor + hidden-sizes vault from the
-  form, a deniable vault, every browser action, keyslots, lock and
-  unlock, mount, bundle conversion and versions, checking the vault and
-  extracted files.
+  form, a deniable vault (master key rotation, a wrong passphrase
+  refused), every browser action, keyslots, lock and unlock, mount,
+  bundle conversion and versions, checking the vault and extracted
+  files.
 
 - **Sync bundles (`.lbxs`), experimental.** A vault kept as a folder in
   Dropbox, Google Drive, OneDrive, iCloud Drive, Nextcloud or
@@ -91,6 +130,16 @@ export` turns a bundle back into a `.lbx`.
     at sync bundles.
 
 ### Security
+
+- **`cargo audit`: RUSTSEC-2026-0387 (`crypto-bigint` 0.5.5) and
+  RUSTSEC-2026-0385 (`ctutils` 0.4.2)**, timing variability in code
+  meant to be constant-time. `ctutils` 0.4.8 (via `ml-kem`); `p256`
+  0.14 (crypto-bigint 0.7.10) for the FIDO2 PIN-protocol key agreement
+  in `luksbox-fido2::protocol` (the hardware path uses libfido2, which
+  does its own); and `tss-esapi` without its default `abstraction`
+  feature, which the TPM keyslot never used and which pulled
+  `elliptic-curve` 0.13 / `ecdsa` / `x509-cert` (on the 0.13 line with
+  crypto-bigint 0.5). The `fuzz/` lockfile follows.
 
 - **Audit round 16** (sync bundles and a full-workspace sweep; report in
   `docs/SECURITY_AUDIT_ROUND_16.md`). Fixed in this revision:
@@ -168,6 +217,11 @@ export` turns a bundle back into a `.lbx`.
   before, 7 s now.
 
 ### Fixed
+
+- **GUI: vault path fields** (Unlock vault, the create form's Vault
+  path): the text was drawn against the top edge of the field, and the
+  unlock screen's path was in a small monospace font. Both now use the
+  body font, centered in the field with a margin.
 
 - **`luksbox umount` returned before the vault was saved.** The mount
   saves and releases the vault after the kernel lets go of the
@@ -293,9 +347,13 @@ export` turns a bundle back into a `.lbx`.
     by drag and drop), "+ Add files..." takes several files selected
     together in the dialog (it took one per dialog), and names sort
     without regard to case;
-  - a toast no longer blocks clicks: its invisible area covered about
-    600 x 400 px in the lower right, so for five seconds after each
-    operation the buttons and rows there did nothing;
+  - toasts no longer take the clicks meant for the page: their area
+    stretched to about 600 x 400 px in the lower right, and a stack of
+    several toasts (long ones wrapped) climbed to the top of the window,
+    so for five seconds Lock, Unlock and the rows under them did nothing
+    (egui gives a click to the topmost widget under the pointer, even in
+    a non-interactive area). The area now keeps the size of the toasts,
+    at most the three newest and 400 px wide;
   - every page opens at its top: the pages shared one scroll position,
     so Keyslots opened scrolled to wherever the create form had been
     left, with the slot list and its buttons out of sight;
@@ -306,9 +364,20 @@ export` turns a bundle back into a `.lbx`.
     file dialog is available (it only showed an error);
   - the "file list is full" warnings no longer suggest a region larger
     than 64 MiB, the maximum;
-  - the Keyslots page of a deniable vault says why its master key
-    cannot be rotated (it said "No populated keyslots", or pointed at
-    the CLI, which cannot rotate one either).
+  - a deniable vault's master key can be rotated (Keyslots > Rotate
+    master key; in the CLI `luksbox deniable-rotate` and in the wizard,
+    both new): the code existed but the button was never offered (the
+    page said "No populated keyslots", or pointed at the CLI, which
+    cannot rotate one either). The passphrase is typed twice and checked
+    against the encrypted slot before anything changes, because the
+    format re-wraps the slot with whatever is typed and a typo would
+    lock the vault for good; the KDF strength stays the one the vault
+    unlocks with. A refused rotation leaves the vault open. The modal
+    says, and asks to confirm, that every other slot of the vault stops
+    working (rotation keeps only the slots whose credentials it has, and
+    a deniable vault cannot show whether others exist);
+  - the create form's size note and minimum follow the chosen file list
+    region (they always assumed 64 MiB).
 - **Filling a vault's metadata region lost the last import.** New
   files were refused only when data was written, using a size estimate
   that left out what current vaults store for each entry (mode, link

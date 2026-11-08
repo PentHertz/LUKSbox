@@ -263,6 +263,28 @@ wizard, the GUI); `--header-v2` keeps the pre-v3 inner header. Existing
 vaults: `luksbox deniable-upgrade-header` (one-way), the wizard or the
 GUI. Nothing about a v3 header is visible without the MVK.
 
+## Master key rotation
+
+`luksbox deniable-rotate <vault> --other-slots-stop-working` (also in
+the wizard, "Rotate a deniable vault's master key", and the GUI's
+Keyslots > Rotate master key) re-encrypts every chunk, chunk-list block
+and the metadata under a new MVK and per-vault salt, and re-wraps the
+slot the passphrase opens with the same passphrase and Argon2id
+settings, so the vault opens exactly as before. Passphrase-only slots.
+
+- The passphrase is proven first: the CLI and the wizard open the vault
+  with it (cipher, Argon2id settings and passphrase must match), the GUI
+  checks it against the unlocked slot under each KDF preset. A typo
+  changes nothing; the format itself re-wraps with whatever it is given.
+- **Every other slot stops working.** `rotate_mvk_v2` keeps only the
+  slots whose credentials it receives and fills the rest with fresh
+  random bytes, so the before/after diff shows nothing about which slots
+  were used. A deniable vault cannot show whether other slots exist, so
+  the CLI refuses without `--other-slots-stop-working`, and the wizard
+  and the GUI ask for an explicit confirmation. Enroll the other
+  credentials again after a rotation.
+- An anchor (`--anchor`) is verified before and re-bound to the new key.
+
 ## Per-credential KEK derivation
 
 All KEKs are 32 bytes. All derivations use explicit domain-separation
@@ -645,6 +667,7 @@ and a FIDO2 hmac-output, derived KEKs MUST be unequal.
 | File extension (`.lbx`) | User can rename freely; format is content-agnostic. |
 | File size pattern `36864 + N x 4096 + tag overhead` | None (a size-padding option is not implemented). Deniable vaults are never shrunk on their own, so the size does not drop after deletions; the GUI's explicit "Give back ... anyway" does reveal them (see `docs/VAULT_SIZE.md`). |
 | High file entropy (8.0 bits/byte) | Inherent to AEAD storage; stego carrier is a separate feature. |
+| Resizing the metadata region moves the data area by the size difference (a smaller region also shrinks the file), so two copies of the file from before and after show the same bytes at shifted offsets | Never done on its own: `deniable-resize --data-moves-visibly`, the wizard and the GUI each ask for an explicit acknowledgment. The new region is filled with fresh random padding and no sidecar file is created (`docs/VAULT_SIZE.md`). |
 | Per-chunk 4 KiB stride in data area | Same as standard mode; not addressed here. |
 | TPM / PQ-hybrid sidecar files identify credential type if found alongside vault | Documented; user instructed to store sidecar on separate device. |
 | Same passphrase across users -> same KEK -> multiple slots decrypt | Minor: one bit (">=2 users use this passphrase") only if the passphrase is already broken. |

@@ -235,6 +235,31 @@ fn header_frame(h: &Header) -> [u8; 32] {
     d.finalize().into()
 }
 
+/// The complete head of `graph` with the newest header generation, at
+/// least `min` (the first in the graph's order among equals), with its
+/// verified table blocks.
+fn newest_header_head(
+    graph: &Graph,
+    store: &SharedStore,
+    keys: &BundleKeys,
+    min: u64,
+) -> Result<Option<(Verified, Vec<TableBlock>)>> {
+    let mut newest: Option<(Verified, Vec<TableBlock>)> = None;
+    for h in &graph.heads {
+        let v = &graph.all[h];
+        let newer = newest
+            .as_ref()
+            .is_none_or(|(n, _)| v.m.header.generation > n.m.header.generation);
+        if v.m.header.generation >= min
+            && newer
+            && let Some(b) = complete(store, keys, v)?
+        {
+            newest = Some((v.clone(), b));
+        }
+    }
+    Ok(newest)
+}
+
 /// Three-way merge of two keyslot tables changed concurrently (`target`
 /// is the side merged into). Keyslots are independent wrappings of the
 /// same master key, so they merge one by one:
@@ -1002,6 +1027,20 @@ impl Session {
         if skipped > 0 {
             report.notices.push(Notice::Pending { count: skipped });
         }
+        // A fork whose first head carries an older header than this device
+        // saw (a keyslot change or a file list resize published here while
+        // another device committed on the older header): open on the
+        // complete head with the newest header instead, so this device
+        // never works on, or publishes over, a header older than one it
+        // saw. The merge below brings the other heads into it, or keeps a
+        // header fork. With no such head, the check below refuses it.
+        if let Some((first, _)) = &picked
+            && first.m.header.generation < state.max_header_generation
+            && let Some(newest) =
+                newest_header_head(&graph, &store, &keys, state.max_header_generation)?
+        {
+            picked = Some(newest);
+        }
         let (head, blocks) = match picked {
             Some(p) => p,
             None => {
@@ -1281,9 +1320,23 @@ impl Session {
                 break;
             }
         }
-        let target = target.ok_or(SyncError::NothingComplete {
+        let mut target = target.ok_or(SyncError::NothingComplete {
             pending: graph.heads.len(),
         })?;
+        // As `open`: never onto a header older than one this device saw.
+        let seen = self.state.max_header_generation;
+        if target.m.header.generation < seen {
+            target = match newest_header_head(graph, &self.store, &self.keys, seen)? {
+                Some((v, _)) => v,
+                None => {
+                    return Err(SyncError::RollbackDetected {
+                        device: "keyslot table".into(),
+                        seen,
+                        visible: target.m.header.generation,
+                    });
+                }
+            };
+        }
         if target.hash != self.head.hash {
             self.header_bytes = self.read_header_object(&target.m.header)?;
             self.head = target;
@@ -1320,8 +1373,11 @@ impl Session {
         )?)
     }
 
-    /// A read-only view of commit `v` (for merges and snapshots).
+    /// A read-only view of commit `v` (for merges and snapshots), under
+    /// its own header: commits on either side of a file list resize have
+    /// different layouts.
     pub fn view(&self, v: &Verified) -> Result<luksbox_vfs::Vfs> {
+        let header = self.read_header_object(&v.m.header)?;
         let core = ImageCore::new_view(
             self.keys.clone(),
             self.store.clone(),
@@ -1331,14 +1387,23 @@ impl Session {
             Some(v.as_ref()),
             v.m.tables.clone(),
         );
-        self.open_view(core)
+        self.open_view(core, &header)
     }
 
-    fn open_view(&self, core: ImageCore) -> Result<luksbox_vfs::Vfs> {
+    /// `view`, or `None` when the commit's header object is gone (a merge
+    /// base then merges two-way instead of failing the open).
+    fn view_if_header(&self, v: &Verified) -> Result<Option<luksbox_vfs::Vfs>> {
+        if self.read_header_object(&v.m.header).is_err() {
+            return Ok(None);
+        }
+        self.view(v).map(Some)
+    }
+
+    fn open_view(&self, core: ImageCore, header: &[u8; HEADER_SIZE]) -> Result<luksbox_vfs::Vfs> {
         let core = Arc::new(Mutex::new(core));
         let mut c = Container::open_external_with_mvk(
             Box::new(PagedImage::new(core.clone())),
-            &self.header_bytes,
+            header,
             Box::new(BundleHeaderStore { core }),
             self.display.clone(),
             self.mvk.clone(),
@@ -1420,11 +1485,17 @@ impl Session {
             saved_on.m.tables.clone(),
         );
         local_core.restore_record(rec)?;
-        let mut ours = self.open_view(local_core)?;
+        // Under the header those changes were saved with (their layout).
+        let ours_header = match local_core.pending_header() {
+            Some(h) => h,
+            None => self.read_header_object(&saved_on.m.header)?,
+        };
+        let mut ours = self.open_view(local_core, &ours_header)?;
         let mut base_view = match &base {
-            Some(b) => Some(self.view(b)?),
+            Some(b) => self.view_if_header(b)?,
             None => None,
         };
+        let keep = self.grow_for_merge(&ours_header, target)?;
         let out = luksbox_merge::merge(
             base_view.as_mut(),
             &mut ours,
@@ -1438,8 +1509,8 @@ impl Session {
         drop(ours);
         drop(base_view);
         target.flush().map_err(vfs_err)?;
-        if let Some(h) = &staged_header {
-            self.core.lock().expect("image lock").stage_header(h)?;
+        if let Some(h) = self.settle_layout(staged_header, keep, target, &mut keyslot_notes)? {
+            self.core.lock().expect("image lock").stage_header(&h)?;
         }
         let mut log = to_log(&out.events);
         log.extend(keyslot_notes.iter().map(|n| crate::manifest::MergeEvent {
@@ -1599,10 +1670,12 @@ impl Session {
                 }
             }
             let mut base_view = match &base {
-                Some(b) => Some(self.view(b)?),
+                Some(b) => self.view_if_header(b)?,
                 None => None,
             };
+            let other_header = self.read_header_object(&other.m.header)?;
             let mut ours = self.view(&other)?;
+            let keep = self.grow_for_merge(&other_header, target)?;
             let out = luksbox_merge::merge(
                 base_view.as_mut(),
                 &mut ours,
@@ -1616,7 +1689,7 @@ impl Session {
             drop(ours);
             drop(base_view);
             target.flush().map_err(vfs_err)?;
-            if let Some(h) = adopt {
+            if let Some(h) = self.settle_layout(adopt, keep, target, &mut keyslot_notes)? {
                 self.core.lock().expect("image lock").stage_header(&h)?;
                 sum.header_adopted = true;
             }
@@ -1632,6 +1705,115 @@ impl Session {
             sum.keyslot_notes.extend(keyslot_notes);
         }
         Ok(sum)
+    }
+
+    /// A header from the other side of a merge (adopted, or saved here on
+    /// an older commit) made to fit the image open in `target`: a header
+    /// may only be staged over an image with its layout. When a file list
+    /// resize on one side changed it, `target` is resized to that layout;
+    /// if the merged file list does not fit, the header keeps the
+    /// target's layout instead (noted in the merge log).
+    fn fit_header_layout(
+        &self,
+        h: [u8; HEADER_SIZE],
+        target: &mut luksbox_vfs::Vfs,
+        notes: &mut Vec<String>,
+    ) -> Result<[u8; HEADER_SIZE]> {
+        let mut theirs = Header::from_bytes(&h).map_err(|_| SyncError::Malformed {
+            name: "header".into(),
+            why: "a merged header does not parse",
+        })?;
+        let ours = target.container().header.clone();
+        let layout = |x: &Header| (x.metadata_offset, x.metadata_size, x.data_offset);
+        if layout(&theirs) == layout(&ours) {
+            return Ok(h);
+        }
+        if theirs.metadata_offset == ours.metadata_offset {
+            match target.resize_metadata_region(theirs.metadata_size) {
+                Ok(()) => return Ok(h),
+                Err(
+                    luksbox_vfs::Error::ResizeTooSmall { .. }
+                    | luksbox_vfs::Error::ResizeInvalidSize
+                    | luksbox_vfs::Error::VaultSizeLimit { .. },
+                ) => {}
+                Err(e) => return Err(vfs_err(e)),
+            }
+        }
+        notes.push(format!(
+            "the file list region stays {}: the merged file list does not fit {}",
+            luksbox_core::size::format_size(ours.metadata_size),
+            luksbox_core::size::format_size(theirs.metadata_size)
+        ));
+        theirs.metadata_offset = ours.metadata_offset;
+        theirs.metadata_size = ours.metadata_size;
+        theirs.data_offset = ours.data_offset;
+        // A different header: never at a generation another one has.
+        if theirs.has_header_generation() {
+            theirs.header_generation = theirs
+                .header_generation
+                .max(ours.header_generation)
+                .saturating_add(1);
+        }
+        Ok(theirs.to_bytes(&self.mvk))
+    }
+
+    /// Before merging another side (whose header is `other`) into
+    /// `target`: grow `target`'s file list region to that side's when it
+    /// is larger, so the merged list has room (merging into the smaller
+    /// one fails as "file list full" at every open). Returns `target`'s
+    /// region size before, for `settle_layout`.
+    fn grow_for_merge(
+        &self,
+        other: &[u8; HEADER_SIZE],
+        target: &mut luksbox_vfs::Vfs,
+    ) -> Result<u64> {
+        let before = target.container().header.metadata_size;
+        if let Ok(h) = Header::from_bytes(other)
+            && h.metadata_offset == target.container().header.metadata_offset
+            && h.metadata_size > before
+        {
+            match target.resize_metadata_region(h.metadata_size) {
+                Ok(())
+                | Err(
+                    luksbox_vfs::Error::ResizeInvalidSize
+                    | luksbox_vfs::Error::VaultSizeLimit { .. },
+                ) => {}
+                Err(e) => return Err(vfs_err(e)),
+            }
+        }
+        Ok(before)
+    }
+
+    /// After a merge: the header taken from the other side made to fit
+    /// `target` (`fit_header_layout`), or with none, `target` brought back
+    /// to the region size it had (`keep`) when the merged list fits it.
+    fn settle_layout(
+        &self,
+        staged: Option<[u8; HEADER_SIZE]>,
+        keep: u64,
+        target: &mut luksbox_vfs::Vfs,
+        notes: &mut Vec<String>,
+    ) -> Result<Option<[u8; HEADER_SIZE]>> {
+        if let Some(h) = staged {
+            return self.fit_header_layout(h, target, notes).map(Some);
+        }
+        let now = target.container().header.metadata_size;
+        if now != keep {
+            match target.resize_metadata_region(keep) {
+                Ok(()) => {}
+                Err(
+                    luksbox_vfs::Error::ResizeTooSmall { .. }
+                    | luksbox_vfs::Error::ResizeInvalidSize
+                    | luksbox_vfs::Error::VaultSizeLimit { .. },
+                ) => notes.push(format!(
+                    "the file list region grows to {}: the merged file list does not fit {}",
+                    luksbox_core::size::format_size(now),
+                    luksbox_core::size::format_size(keep)
+                )),
+                Err(e) => return Err(vfs_err(e)),
+            }
+        }
+        Ok(None)
     }
 
     /// Bytes of a header object a commit names, checked against it.

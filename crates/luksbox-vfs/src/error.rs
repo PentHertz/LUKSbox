@@ -80,7 +80,9 @@ pub enum Error {
     /// vault. Larger vaults need a format-version bump.
     #[error(
         "the vault's metadata region is full (too many files or chunk references): delete \
-         files to make room, or move some to a new vault"
+         files to make room, enlarge the region if it is under 64 MiB (`luksbox size <vault> \
+         --metadata-size 64M`, or Vault size in the wizard or the GUI), or move some files \
+         to a new vault"
     )]
     MetadataBudgetExhausted,
 
@@ -122,4 +124,31 @@ pub enum Error {
     /// time hints that data was deleted from it.
     #[error("deniable vaults are not shrunk: a shrinking file would reveal deletions")]
     ShrinkDeniable,
+    /// `Vfs::resize_metadata_region` on a deniable vault, which needs the
+    /// user's acknowledgment (`resize_metadata_region_allow_deniable`).
+    #[error(
+        "resizing a deniable vault moves its data by the size difference: anyone who has an \
+         older copy of the file (backups, sync history, disk images) can see that it changed \
+         shape. Confirm to resize it anyway"
+    )]
+    ResizeDeniable,
+    /// `Vfs::resize_metadata_region` to a size outside 64 KiB..=64 MiB or
+    /// not a multiple of 64 KiB.
+    #[error("a metadata region is 64 KiB to 64 MiB, in steps of 64 KiB")]
+    ResizeInvalidSize,
+    /// `Vfs::resize_metadata_region` to a region the file list does not
+    /// fit in.
+    #[error(
+        "the file list needs {} with some room to spare; choose a larger region",
+        luksbox_core::size::format_size(*needed)
+    )]
+    ResizeTooSmall { needed: u64 },
+    /// `Vfs::resize_metadata_region` needs room for a second copy of the
+    /// vault while it runs.
+    #[error(
+        "resizing writes a new copy of the vault next to it: needs {} free, the disk has {}",
+        luksbox_core::size::format_size(*needed),
+        luksbox_core::size::format_size(*free)
+    )]
+    ResizeNeedsDiskSpace { needed: u64, free: u64 },
 }

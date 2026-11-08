@@ -2552,11 +2552,10 @@ impl Vfs {
         if pct >= 90 && self.last_warned_pct < 90 {
             eprintln!(
                 "luksbox: warn: metadata region at {pct}% capacity ({} / {} bytes). \
-                 New files will soon be refused ('no space left on device'). \
-                 Delete files, or move some to a new vault: a vault's metadata \
-                 region cannot be enlarged (64 MiB, the default, is the maximum).",
+                 New files will soon be refused ('no space left on device'): {}.",
                 bytes.len(),
                 luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size,),
+                self.file_list_remedy(),
             );
             self.last_warned_pct = pct;
         } else if pct >= 75 && self.last_warned_pct < 75 {
@@ -2564,10 +2563,10 @@ impl Vfs {
                 "luksbox: note: metadata region at {pct}% capacity ({} / {} bytes). \
                  The metadata region (not the host disk) is the bottleneck for \
                  vaults with very large inode counts; if many more files are \
-                 expected, plan to move some to a new vault (a region cannot be \
-                 enlarged; 64 MiB, the default, is the maximum).",
+                 expected: {}.",
                 bytes.len(),
                 luksbox_format::metadata::payload_budget_for(self.container.header.metadata_size,),
+                self.file_list_remedy(),
             );
             self.last_warned_pct = pct;
         }
@@ -4256,6 +4255,184 @@ impl Vfs {
         self.container
             .data_offset()
             .saturating_add(chunk::CHUNK_SLOT_SIZE)
+    }
+
+    /// Whether `resize_metadata_region` can run on this vault: anything
+    /// writable that is not opened in recovery mode (a deniable vault
+    /// through `resize_metadata_region_allow_deniable`).
+    pub fn can_resize_metadata_region(&self) -> bool {
+        self.tolerated_inodes.is_empty() && !self.container.is_read_only()
+    }
+
+    /// What to do about a filling file list, for warnings: enlarging the
+    /// region when this vault can be resized and is under the maximum.
+    pub fn file_list_remedy(&self) -> &'static str {
+        if !self.can_resize_metadata_region()
+            || self.container.header.metadata_size >= luksbox_core::header::MAX_METADATA_SIZE
+        {
+            "delete files, or move some to a new vault (this vault's file list region is at \
+             its 64 MiB maximum)"
+        } else if self.container.is_deniable() {
+            "enlarge the file list region (Vault size in the wizard or the GUI, or `luksbox \
+             deniable-resize`), delete files, or move some to a new vault"
+        } else {
+            "enlarge the file list region (`luksbox size <vault> --metadata-size 64M`, or Vault \
+             size in the wizard or the GUI), delete files, or move some to a new vault"
+        }
+    }
+
+    /// Change the size of the metadata region ("file list") of an open
+    /// vault to `new_size` bytes (64 KiB..=64 MiB, in steps of 64 KiB):
+    /// larger when it fills up, smaller to make every save cheaper.
+    ///
+    /// A vault file is rewritten into `<vault>.rotating` with the new
+    /// layout (the encrypted chunks are copied unchanged, only the file
+    /// list is re-encrypted into the new region) and renamed over the
+    /// original, like the master key rotation: a crash or an error before
+    /// the rename leaves the original vault as it was. Needs free disk
+    /// space for that copy. A detached header is installed after the
+    /// rename from a `<header>.resizing` intent, which the next open
+    /// finishes or undoes after a crash. A vault in a sync bundle changes
+    /// in place and saves once (`Container::relayout_external`); the next
+    /// publish uploads it as a new commit. An armed rollback anchor is
+    /// moved on only after the commit, so an abort cannot make the vault
+    /// look rolled back. Deniable vaults: `resize_metadata_region_allow_deniable`.
+    pub fn resize_metadata_region(&mut self, new_size: u64) -> Result<(), Error> {
+        self.resize_metadata_region_impl(new_size, false)
+    }
+
+    /// `resize_metadata_region` for a deniable vault too, once the user
+    /// accepted what it shows: the data area moves by the size difference
+    /// (and a smaller region shrinks the file), which anyone holding an
+    /// older copy of the file can see.
+    pub fn resize_metadata_region_allow_deniable(&mut self, new_size: u64) -> Result<(), Error> {
+        self.resize_metadata_region_impl(new_size, true)
+    }
+
+    fn resize_metadata_region_impl(
+        &mut self,
+        new_size: u64,
+        allow_deniable: bool,
+    ) -> Result<(), Error> {
+        self.ensure_writable_data()?;
+        if !self.tolerated_inodes.is_empty() {
+            return Err(Error::ReadOnlyMount);
+        }
+        if self.container.is_deniable() && !allow_deniable {
+            return Err(Error::ResizeDeniable);
+        }
+        const STEP: u64 = 64 * 1024;
+        if !(STEP..=luksbox_core::header::MAX_METADATA_SIZE).contains(&new_size)
+            || !new_size.is_multiple_of(STEP)
+        {
+            return Err(Error::ResizeInvalidSize);
+        }
+        let old_size = self.container.header.metadata_size;
+        if new_size == old_size {
+            return Ok(());
+        }
+        self.flush()?;
+        // The file list must fit, with the same headroom new entries are
+        // refused at.
+        let used = self.metadata_budget_status().used_bytes;
+        let needed = used
+            .saturating_add(MUTATION_METADATA_BOUND)
+            .saturating_add(BUDGET_SLACK);
+        if needed > luksbox_format::metadata::payload_budget_for(new_size) {
+            let needed_region = (needed as u64)
+                .saturating_add(luksbox_format::METADATA_OVERHEAD as u64 + 8)
+                .div_ceil(STEP)
+                .saturating_mul(STEP);
+            return Err(Error::ResizeTooSmall {
+                needed: needed_region,
+            });
+        }
+        let file_len = self.container.data_file_len()?;
+        let new_len = file_len - old_size + new_size;
+        if self.max_vault_size != 0 && new_size > old_size && new_len > self.max_vault_size {
+            return Err(Error::VaultSizeLimit {
+                limit: self.max_vault_size,
+            });
+        }
+        let dir = self
+            .container
+            .vault_path()
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // A file vault is copied next to itself; a bundle's pages are
+        // written to this device's outbox (its own folder).
+        if !self.container.is_external()
+            && let Ok(free) = luksbox_format::available_disk_space(&dir)
+        {
+            let margin = 16 * 1024 * 1024;
+            if free < new_len.saturating_add(margin) {
+                return Err(Error::ResizeNeedsDiskSpace {
+                    needed: new_len.saturating_add(margin),
+                    free,
+                });
+            }
+        }
+        // Keep the anchor out of the uncommitted copy (see above).
+        let anchor = self
+            .container
+            .anchor_path()
+            .map(std::path::Path::to_path_buf);
+        if anchor.is_some() {
+            self.container.set_anchor(None)?;
+        }
+        let restore_anchor = |c: &mut luksbox_format::Container| -> Result<(), Error> {
+            if let Some(a) = &anchor {
+                c.set_anchor(Some(a.clone()))?;
+            }
+            Ok(())
+        };
+        if self.container.is_external() {
+            let moved = self.container.relayout_external(new_size);
+            self.budget_projected.set(None);
+            self.budget_growth.set(0);
+            restore_anchor(&mut self.container)?;
+            moved?;
+            // Refresh the region (fresh padding) as a normal save.
+            self.dirty = true;
+            return self.flush();
+        }
+        if let Err(e) = self.container.begin_atomic_relayout(new_size) {
+            restore_anchor(&mut self.container)?;
+            return Err(e.into());
+        }
+        let rewrite = (|| -> Result<(), Error> {
+            self.dirty = true;
+            self.flush()?;
+            self.container.persist_header()?;
+            Ok(())
+        })();
+        match rewrite.and_then(|()| {
+            self.container
+                .commit_atomic_rotation()
+                .map_err(Error::Format)
+        }) {
+            Ok(()) => {
+                self.budget_projected.set(None);
+                self.budget_growth.set(0);
+                restore_anchor(&mut self.container)?;
+                // The commit dropped the old-size mirrors: write the
+                // metadata and header mirrors (and the anchor) again for
+                // the committed vault.
+                self.dirty = true;
+                self.flush()?;
+                self.container.persist_header()?;
+                Ok(())
+            }
+            Err(e) => {
+                let _ = self.container.abort_atomic_rotation();
+                self.budget_projected.set(None);
+                self.budget_growth.set(0);
+                let _ = restore_anchor(&mut self.container);
+                Err(e)
+            }
+        }
     }
 
     /// Limit the size of the vault file to `bytes`; 0 removes the limit.

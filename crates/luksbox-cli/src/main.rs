@@ -508,12 +508,16 @@ enum Command {
         /// PREALLOCATED at create time regardless of how much data you
         /// store, so an otherwise-empty vault is already ~64 MiB on
         /// disk (a v3 vault also writes a same-size `.lbx.meta-bak`
-        /// mirror, so ~128 MiB total). The region holds the encrypted
-        /// directory tree; 64 MiB gives headroom for thousands of
-        /// files / many GiB of chunk references. Lower it (e.g. `4M`,
-        /// `1M`) for small vaults to shrink the footprint -- this only
-        /// caps how many files/chunks the vault can hold, not the data
-        /// size of any one file. Higher values are rejected here at the
+        /// mirror, so ~128 MiB total), and every save rewrites both.
+        /// The region holds the encrypted directory tree: about 1.5 KB
+        /// per file of 1 MB (files up to 1 MiB keep their chunk list
+        /// there), about 150 bytes per larger file, about 40 bytes per
+        /// tiny one, so 64 MiB holds about 45 000 files of 1 MB and far
+        /// more large or tiny files. Lower it (e.g. `16M`, `4M`) for
+        /// small vaults, or for vaults on slow storage (USB stick, SD
+        /// card) to make every save cheaper -- this only caps how many
+        /// files/chunks the vault can hold, not the data size of any
+        /// one file. `luksbox size` shows how full it is. Higher values are rejected here at the
         /// CLI boundary because the on-disk parser would also reject
         /// them. Stored in the header at create time and used unchanged
         /// on every later open; you cannot resize an existing vault.
@@ -586,6 +590,17 @@ enum Command {
         /// would reveal deletions).
         #[arg(long)]
         shrink: bool,
+        /// Change the size of the metadata region ("file list"), 64K to
+        /// 64M in steps of 64K: larger when it is filling up (the report
+        /// shows how full it is), smaller to make every save cheaper.
+        /// A vault file is rewritten next to itself and renamed over the
+        /// original, so it needs free space for that copy; a crash before
+        /// the rename leaves the vault as it was (with a detached header,
+        /// the next open finishes or undoes an interrupted resize). A
+        /// sync bundle changes in place and publishes it as a new commit.
+        /// Deniable vaults: `deniable-resize`.
+        #[arg(long, value_name = "BYTES")]
+        metadata_size: Option<String>,
     },
     /// Show container header / keyslot summary (no unlock required).
     Info {
@@ -1003,6 +1018,76 @@ enum Command {
         /// advanced to the new header generation.
         #[arg(long)]
         anchor: Option<PathBuf>,
+    },
+    /// `size --metadata-size` for a deniable vault: change the size of its
+    /// metadata region ("file list"), 64K to 64M in steps of 64K. The data
+    /// area moves by the size difference (and a smaller region shrinks
+    /// the file): anyone who has an older copy of the file can see that it
+    /// changed shape, so `--data-moves-visibly` is required. Same cipher /
+    /// Argon2 / credential arguments as `deniable-info`.
+    #[command(name = "deniable-resize")]
+    DeniableResize {
+        path: PathBuf,
+        /// New size of the metadata region, e.g. `16M`.
+        #[arg(long, value_name = "BYTES")]
+        metadata_size: String,
+        /// Required: confirms that the change of shape may be seen by
+        /// anyone comparing the file with an older copy.
+        #[arg(long)]
+        data_moves_visibly: bool,
+        /// Cipher suite. Must match what was used at init.
+        #[arg(long, default_value = "aes")]
+        cipher: String,
+        /// Argon2id memory cost in KiB. Must match init.
+        #[arg(long, default_value_t = 262_144)]
+        argon2_m: u32,
+        /// Argon2id iteration count. Must match init.
+        #[arg(long, default_value_t = 3)]
+        argon2_t: u32,
+        /// Argon2id parallelism. Must match init.
+        #[arg(long, default_value_t = 4)]
+        argon2_p: u32,
+        /// Credential type. Must match init.
+        #[arg(long, default_value = "passphrase")]
+        credential: String,
+        /// `.kyber` seed file path (pq-* combos).
+        #[arg(long)]
+        kyber_path: Option<PathBuf>,
+        /// The vault's deniable anchor, verified before the resize and
+        /// moved on after it.
+        #[arg(long)]
+        anchor: Option<PathBuf>,
+    },
+    /// Rotate a deniable vault's master key: every chunk and the metadata
+    /// are re-encrypted under a new key, and the slot your passphrase
+    /// opens is re-wrapped with the same passphrase and Argon2id
+    /// settings. EVERY OTHER SLOT OF THE VAULT STOPS WORKING (rotation
+    /// keeps only the slots whose credentials it has, and a deniable
+    /// vault cannot show whether others exist): enroll them again after.
+    /// Passphrase slots only. Asks for the passphrase on the terminal.
+    #[command(name = "deniable-rotate")]
+    DeniableRotate {
+        path: PathBuf,
+        /// Cipher suite. Must match what was used at init.
+        #[arg(long, default_value = "aes")]
+        cipher: String,
+        /// Argon2id memory cost in KiB. Must match init.
+        #[arg(long, default_value_t = 262_144)]
+        argon2_m: u32,
+        /// Argon2id iteration count. Must match init.
+        #[arg(long, default_value_t = 3)]
+        argon2_t: u32,
+        /// Argon2id parallelism. Must match init.
+        #[arg(long, default_value_t = 4)]
+        argon2_p: u32,
+        /// The vault's deniable anchor, verified before the rotation and
+        /// re-bound to the new key.
+        #[arg(long)]
+        anchor: Option<PathBuf>,
+        /// Required: confirms that every other slot of the vault stops
+        /// working.
+        #[arg(long)]
+        other_slots_stop_working: bool,
     },
     /// Interactive wizard. Walks you through create / open / mount / keyslot
     /// management with prompts. Supports every option the regular subcommands
@@ -1453,7 +1538,9 @@ fn refuse_bundles_where_unsupported(cmd: &Command) -> Result<()> {
         Command::DeniableInit { path, .. }
         | Command::DeniableMount { path, .. }
         | Command::DeniableInfo { path, .. }
-        | Command::DeniableUpgradeHeader { path, .. } => (path, "a deniable vault"),
+        | Command::DeniableUpgradeHeader { path, .. }
+        | Command::DeniableResize { path, .. }
+        | Command::DeniableRotate { path, .. } => (path, "a deniable vault"),
         Command::MountFuseTHelper { vault, .. } => (vault, "the FUSE-T mount helper"),
         Command::Create { path, .. } if path.extension().is_some_and(|e| e == "lbxs") => {
             return Err(cli_err!(
@@ -1552,7 +1639,14 @@ fn dispatch_inner(cli: Cli) -> Result<()> {
             unlock,
             max,
             shrink,
-        } => cmd_size(&path, &unlock, max.as_deref(), shrink),
+            metadata_size,
+        } => cmd_size(
+            &path,
+            &unlock,
+            max.as_deref(),
+            shrink,
+            metadata_size.as_deref(),
+        ),
         Command::Enroll {
             kind, kdf: Some(_), ..
         } if !kind.has_passphrase_factor() => Err(cli_err!(
@@ -1789,6 +1883,21 @@ fn dispatch_inner(cli: Cli) -> Result<()> {
             kyber_path.as_deref(),
         ),
         Command::UpgradeHeader { path, unlock } => cmd_upgrade_header(&path, &unlock),
+        Command::DeniableRotate {
+            path,
+            cipher,
+            argon2_m,
+            argon2_t,
+            argon2_p,
+            anchor,
+            other_slots_stop_working,
+        } => deniable_rotate(
+            &path,
+            parse_deniable_cipher(&cipher)?,
+            parse_deniable_argon2(argon2_m, argon2_t, argon2_p)?,
+            anchor.as_deref(),
+            other_slots_stop_working,
+        ),
         Command::DeniableUpgradeHeader {
             path,
             cipher,
@@ -1804,6 +1913,26 @@ fn dispatch_inner(cli: Cli) -> Result<()> {
             argon2_m,
             argon2_t,
             argon2_p,
+            &credential,
+            kyber_path.as_deref(),
+            anchor.as_deref(),
+        ),
+        Command::DeniableResize {
+            path,
+            metadata_size,
+            data_moves_visibly,
+            cipher,
+            argon2_m,
+            argon2_t,
+            argon2_p,
+            credential,
+            kyber_path,
+            anchor,
+        } => cmd_deniable_resize(
+            &path,
+            &metadata_size,
+            data_moves_visibly,
+            (&cipher, argon2_m, argon2_t, argon2_p),
             &credential,
             kyber_path.as_deref(),
             anchor.as_deref(),
@@ -3778,6 +3907,73 @@ fn cmd_upgrade_header(path: &Path, unlock: &UnlockArgs) -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// `deniable-rotate`, also behind the wizard's menu entry. The open
+/// proves that this passphrase and these Argon2id settings unlock a
+/// passphrase slot; the rotation re-wraps that slot with the same
+/// values, so the vault opens exactly as before, and nothing is changed
+/// when the open fails. Every other slot gets random bytes.
+pub(crate) fn deniable_rotate(
+    path: &Path,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+    anchor: Option<&Path>,
+    other_slots_stop_working: bool,
+) -> Result<()> {
+    use luksbox_core::deniable::{DeniableCredential, DeniableKindTag};
+    if !other_slots_stop_working {
+        return Err(cli_err!(
+            "a rotation keeps only the slot your passphrase opens: every other slot of this \
+             vault (another passphrase, a backup, a security key, a second person) stops \
+             working and must be enrolled again, and LUKSbox cannot tell whether such slots \
+             exist. Rerun with --other-slots-stop-working to go ahead"
+        ));
+    }
+    let pass = zeroize::Zeroizing::new(prompt_password_tty("Passphrase: ")?);
+    let cred = DeniableCredential::Passphrase {
+        passphrase: pass.as_bytes(),
+        argon2,
+    };
+    let envelope = Container::try_open_envelope_v2_deniable(
+        path,
+        None,
+        &cred,
+        cipher,
+        Some(DeniableKindTag::Passphrase),
+    )?;
+    if envelope.payload().kind != DeniableKindTag::Passphrase {
+        return Err(cli_err!(
+            "this passphrase opens a slot that also needs another factor; deniable-rotate \
+             (and the GUI rotation) handle passphrase-only slots"
+        ));
+    }
+    let mut container = Container::complete_open_v2_deniable(envelope, &cred)?;
+    if let Some(ap) = anchor {
+        container.set_anchor(Some(ap.to_path_buf()))?;
+    }
+    let trusted_anchor_gen = container.anchored_metadata_generation();
+    let slot_idx = container
+        .deniable_unlocked_slot()
+        .ok_or("the deniable open did not report its slot")?;
+    let mut vfs = Vfs::open(container)?;
+    check_anchor_generation(trusted_anchor_gen, &vfs)?;
+    vfs.rotate_mvk_deniable(vec![luksbox_vfs::DeniableRotationCredential {
+        slot_idx,
+        kind: DeniableKindTag::Passphrase,
+        passphrase: zeroize::Zeroizing::new(pass.as_bytes().to_vec()),
+        argon2,
+        material: luksbox_format::deniable_header::DeniableMaterial::passphrase_only(),
+        hmac_secret_output: None,
+        unsealed: None,
+        mlkem_shared: None,
+    }])?;
+    drop(vfs.close()?);
+    println!(
+        "OK master key rotated; slot {slot_idx} keeps the same passphrase and Argon2id \
+         settings, every other slot of this vault no longer opens it"
+    );
+    Ok(())
+}
+
 fn cmd_deniable_upgrade_header(
     path: &Path,
     cipher: &str,
@@ -3805,6 +4001,71 @@ fn cmd_deniable_upgrade_header(
         eprintln!("  LUKSbox versions before 0.6.0 can no longer open this vault.");
     } else {
         println!("OK deniable vault already uses header format v3");
+    }
+    Ok(())
+}
+
+fn cmd_deniable_resize(
+    path: &Path,
+    metadata_size: &str,
+    data_moves_visibly: bool,
+    (cipher, m, t, p): (&str, u32, u32, u32),
+    credential: &str,
+    kyber_path: Option<&Path>,
+    anchor: Option<&Path>,
+) -> Result<()> {
+    if !data_moves_visibly {
+        return Err(cli_err!(
+            "resizing a deniable vault moves its data by the size difference (and a smaller \
+             region shrinks the file): anyone who has an older copy of the file (backups, sync \
+             history, disk images) can see that it changed shape. Rerun with \
+             --data-moves-visibly to go ahead"
+        ));
+    }
+    deniable_resize(
+        path,
+        parse_byte_size(metadata_size)?,
+        parse_deniable_cipher(cipher)?,
+        parse_deniable_argon2(m, t, p)?,
+        credential,
+        kyber_path,
+        anchor,
+    )
+}
+
+/// Open a deniable vault (asking for its secrets on the terminal) and
+/// resize its metadata region; the caller has the user's acknowledgment.
+pub(crate) fn deniable_resize(
+    path: &Path,
+    bytes: u64,
+    cipher: luksbox_core::CipherSuite,
+    argon2: luksbox_core::Argon2idParams,
+    credential: &str,
+    kyber_path: Option<&Path>,
+    anchor: Option<&Path>,
+) -> Result<()> {
+    let cred = parse_cli_den_cred(credential)?;
+    let mut container = cli_open_deniable_v2(path, cipher, argon2, cred, kyber_path)?;
+    if let Some(ap) = anchor {
+        container.set_anchor(Some(ap.to_path_buf()))?;
+    }
+    let trusted_anchor_gen = container.anchored_metadata_generation();
+    let mut vfs = Vfs::open(container)?;
+    check_anchor_generation(trusted_anchor_gen, &vfs)?;
+    let old = vfs.container().header.metadata_size;
+    vfs.resize_metadata_region_allow_deniable(bytes)?;
+    drop(vfs.close()?);
+    if bytes == old {
+        println!(
+            "OK the file list region is already {}",
+            luksbox_core::size::format_size(old)
+        );
+    } else {
+        println!(
+            "OK file list region resized from {} to {}",
+            luksbox_core::size::format_size(old),
+            luksbox_core::size::format_size(bytes)
+        );
     }
     Ok(())
 }
@@ -10263,8 +10524,26 @@ fn check_new_vault_max_size(
 /// `luksbox size`: show where the vault file's size goes, and optionally
 /// set its maximum size (`--max`) or give back the free space at its end
 /// (`--shrink`).
-fn cmd_size(path: &Path, unlock: &UnlockArgs, max: Option<&str>, shrink: bool) -> Result<()> {
+fn cmd_size(
+    path: &Path,
+    unlock: &UnlockArgs,
+    max: Option<&str>,
+    shrink: bool,
+    metadata_size: Option<&str>,
+) -> Result<()> {
     let mut vfs = open_vfs(path, unlock)?;
+    if let Some(s) = metadata_size {
+        let bytes = parse_byte_size(s)?;
+        let old = vfs.container().header.metadata_size;
+        vfs.resize_metadata_region(bytes)?;
+        if bytes != old {
+            println!(
+                "Resized the file list region from {} to {}.",
+                luksbox_core::size::format_size(old),
+                luksbox_core::size::format_size(bytes)
+            );
+        }
+    }
     if let Some(s) = max {
         let bytes = parse_size_option("--max", s)?;
         if let Err(e) = vfs.set_max_vault_size(bytes) {
@@ -10278,6 +10557,8 @@ fn cmd_size(path: &Path, unlock: &UnlockArgs, max: Option<&str>, shrink: bool) -
     }
     let freed = if shrink { Some(vfs.shrink()?) } else { None };
     let report = vfs.space_report()?;
+    let file_list = vfs.metadata_budget_status();
+    let remedy = vfs.file_list_remedy();
     // Saves a changed maximum size.
     vfs.close()?;
 
@@ -10286,7 +10567,7 @@ fn cmd_size(path: &Path, unlock: &UnlockArgs, max: Option<&str>, shrink: bool) -
         Some(n) => println!("Gave back {}.", luksbox_core::size::format_size(n)),
         None => {}
     }
-    print_space_report(path, &report, true);
+    print_space_report(path, &report, Some((file_list, remedy)), true);
     Ok(())
 }
 
@@ -10300,7 +10581,12 @@ pub(crate) fn parent_dir(path: &Path) -> &Path {
 
 /// The `luksbox size` report, shared with the wizard. `cli` adds the
 /// command that gives back the free space at the end.
-pub(crate) fn print_space_report(path: &Path, report: &luksbox_vfs::SpaceReport, cli: bool) {
+pub(crate) fn print_space_report(
+    path: &Path,
+    report: &luksbox_vfs::SpaceReport,
+    file_list: Option<(luksbox_vfs::MetadataBudgetStatus, &str)>,
+    cli: bool,
+) {
     use luksbox_core::size::{describe_size, format_size};
     println!("{}", path.display());
     println!("  File size:      {}", format_size(report.file_size));
@@ -10308,6 +10594,19 @@ pub(crate) fn print_space_report(path: &Path, report: &luksbox_vfs::SpaceReport,
         "  Metadata:       {} (header and encrypted file tree, fixed)",
         format_size(report.fixed_size)
     );
+    // How full the file list is: the region holds the names, folders and
+    // (for files up to 1 MiB) the chunk lists, and cannot be enlarged.
+    if let Some((s, remedy)) = file_list {
+        println!(
+            "  File list:      {}% full ({} of {})",
+            s.used_pct(),
+            format_size(s.used_bytes as u64),
+            format_size(s.budget_bytes as u64),
+        );
+        if s.near_capacity() {
+            println!("    new files will soon be refused: {remedy}");
+        }
+    }
     println!("  Used by files:  {}", format_size(report.used));
     let tail = match (report.reclaimable, cli) {
         (0, _) => String::new(),

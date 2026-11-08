@@ -365,31 +365,94 @@ HOME and the XDG folders point at a temporary folder.
 ```bash
 cargo test -p luksbox-gui --bin luksbox-gui gui_scenarios_end_to_end \
   --config 'profile.dev.package.argon2.opt-level=3' \
-  --config 'profile.dev.package.blake2.opt-level=3' -- --ignored --nocapture
+  --config 'profile.dev.package.blake2.opt-level=3' -- --nocapture
 ```
 
-The default `cargo test -p luksbox-gui` runs it too, through
-`gui_scenarios_end_to_end_in_its_own_process`, which starts the test
-binary again filtered to this one test: it uses process-wide state (the
-open sync bundle session, HOME and XDG variables) that other tests of
-the same binary also touch from parallel threads. The command above
-runs it directly, with its output.
+The default `cargo test -p luksbox-gui` runs it with the other tests
+(tests that change process-wide state, HOME / XDG variables or the open
+sync bundle session, hold `crate::test_env_lock()`); the command above
+runs it alone, with its output and timings.
 
 The two `--config` lines optimise only Argon2id, which takes about
 30 s per unlock at the real preset in an unoptimised build (the whole
 run then takes about 3 min). `LUKSBOX_GUI_SCENARIO_MIB=64` makes the
 imported tree larger for timings (use `--release` for meaningful ones).
 Covered: a vault file (create, new folder, add file, add folder,
-browse, rename, download a file and a folder, delete with confirmation,
-vault size, add a keyslot, lock with "give back free space", unlock
+browse, rename, download a file and a folder, resizing its file list
+region from 64 to 32 MiB in the Vault size dialog with every file read
+back (the bundle, the detached-header vault and the deniable vault are
+resized too, each reopened and checked; the deniable one only after its
+acknowledgment), delete with confirmation, vault size, add a keyslot, lock with "give back free space", unlock
 with the new keyslot from Recent, mount, write through the mount,
 unmount, make a sync bundle), a sync bundle created from the form (add
 folder, versions, lock and publish, reopen), a vault with a detached
 header, an anchor, hidden sizes and a 4 MiB file list region, and a
-deniable vault (create, add a file, rotation refused with its reason,
-reopen by typed path).
-`a_toast_does_not_block_clicks_under_it` guards the toast fix.
+deniable vault (create, add a file, a rotation with a wrong passphrase
+refused with the vault left open, a rotation, reopen by typed path).
+`a_toast_does_not_block_clicks_under_it` and
+`many_toasts_stay_below_the_header` guard the toast fix, and the
+ignored `bundle_lock_and_reopen_cycles` locks and reopens a sync bundle
+`LUKSBOX_GUI_CYCLES` times (default 15), counting clicks on Lock or
+Unlock that start nothing (the toast bug lost one within four cycles;
+0 in 30 after the fix).
 A FUSE mount step is skipped without `/dev/fuse`.
+
+### The real GUI binary on a virtual X display
+
+Without a desktop, Xvfb and xdotool (downloadable without root:
+`apt-get download xvfb xdotool libxdo3`, then `dpkg-deb -x` each into a
+folder) run the real `luksbox-gui` with its OpenGL renderer:
+
+```bash
+Xvfb :97 -screen 0 1280x800x24 -nolisten tcp &
+DISPLAY=:97 LIBGL_ALWAYS_SOFTWARE=1 DBUS_SESSION_BUS_ADDRESS=unix:path=/nonexistent \
+  HOME=$PWD/h XDG_DATA_HOME=$PWD/h/data target/release/luksbox-gui &
+xdotool search --name '^LUKSbox$'        # window id, then: xdotool windowfocus --sync <id>
+xdotool mousemove 349 212 click 1        # "+ Create a new vault" at 1180x760
+xwd -root -display :97 > shot.xwd        # screenshot (24-bit ZPixmap, BGR)
+```
+
+There is no window manager: give the window keyboard focus with
+`windowfocus` before typing. For HiDPI, start Xvfb at 2560x1600 and the
+GUI with `WINIT_X11_SCALE_FACTOR=2` (coordinates double). The invalid D-Bus address makes the file
+dialogs fall back to zenity on the virtual display (with the session
+bus they go to the desktop portal of the real session).
+
+### Metadata region resize
+
+`crates/luksbox-vfs/tests/metadata_resize.rs` (10 tests): grow then
+shrink with every file read back and the `.meta-bak` mirror at the new
+size; a full file list that takes new files again after growing; a
+too-small region refused with the vault byte-for-byte unchanged; a
+stale `<vault>.rotating` refusing the resize; an anchored vault that
+still verifies after it; invalid sizes refused; a crash before the
+rename (a child process aborts after writing the new copy; the original
+is unchanged byte for byte); a detached-header vault resized both ways
+with its sidecar and mirror following; every crash state of a
+detached-header resize rebuilt from real files (renamed but header not
+installed: finished; copy still there, old length, or a cut intent:
+undone; a `.rotating` brought back after a finished rename: the length
+decides; a leftover intent over a header that moved on since (a slot
+enrolled after the resize): kept; an incomplete intent with no copy and
+a length matching neither layout: refused, no mirror used); a
+deniable vault (pre-v3 and v3) refused without the acknowledgment, then
+resized both ways, with no zero block and no extra file left.
+
+`crates/luksbox-sync/tests/bundle_resize.rs` (10 tests): a bundle
+resized, published and reopened, both ways; a resize saved but not
+published, restored at the next open and published then; another
+device's commit on the old layout merged with a resize, whichever
+device merges; offline changes on the old layout replayed onto a
+resized commit; an offline resize replayed onto a newer commit; an
+offline shrink the merged file list does not fit (the larger region is
+kept, with a note, no file lost); a withheld resize commit still
+detected as a rollback; two different resizes at the same time kept as
+a header fork, the device with the newer header opening on its own head
+even when the other head comes first; more files than the old region
+holds, added after growing it, merged into a head on the smaller layout
+(offline, and as a fork from either device); a session's finish after a
+header fork merging a third device into the newest header's head. `image.rs` unit test
+`discard_unsaved_goes_back_to_the_saved_state`.
 
 ## Scenario scripts on a built binary (CLI, TUI, throughput)
 
@@ -401,8 +464,8 @@ after changes to the CLI, the wizard, the vault I/O path or the mount.
 
 ```bash
 cargo build --release -p luksbox-cli
-scripts/cli_scenarios.sh   target/release/luksbox        # ~190 steps, ~3 min
-scripts/tui_scenarios.sh   target/release/luksbox        # wizard + deniable, ~2 min
+scripts/cli_scenarios.sh   target/release/luksbox        # 233 steps, ~3 min
+scripts/tui_scenarios.sh   target/release/luksbox        # 35 steps: wizard + deniable, ~2 min
 scripts/bench_transfer.sh  target/release/luksbox 512    # MB/s per vault kind
 ```
 
@@ -410,7 +473,13 @@ scripts/bench_transfer.sh  target/release/luksbox 512    # MB/s per vault kind
   padding and hidden sizes, detached header, anchor, size limit,
   post-quantum hybrid), every data command on each with content
   checks, folder `put` / `get` round trips, keyslot enroll / update /
-  revoke, header backup / restore / upgrade, anchor rollback detection, sync bundles on two devices with
+  revoke, header backup / restore / upgrade, file list region resize
+  (grow and shrink with content and mirror checks, an anchored vault, a
+  detached header with its sidecar following, a sync bundle seen and
+  written by a second device, and the refusals: too small for the file
+  list, invalid size, a leftover `.rotating`, `deniable-resize` without
+  its acknowledgment), anchor
+  rollback detection, sync bundles on two devices with
   status / verify / snapshots / export / gc, `merge` (and a refused
   non-ancestor base), `panic`, and the failures that must be refused.
   Exit status is the number of failed steps; failures print the
@@ -421,7 +490,13 @@ scripts/bench_transfer.sh  target/release/luksbox 512    # MB/s per vault kind
   a stopped rotation and a mistyped mountpoint that must keep the vault
   open, a sync bundle's refusals and its publish on close, Ctrl-C on an
   open bundle (the change must survive and publish at the next open),
-  an aborted PANIC,
+  Vault size > change the file list region (64 -> 32 MiB, checked with
+  `size` and `cat` afterwards), an aborted PANIC, `deniable-resize`
+  (refused without `--data-moves-visibly`, then 64 -> 16 MiB) and the
+  wizard's deniable resize (16 -> 32 MiB), each followed by a remount
+  and a read of the data, `deniable-rotate` (refused without its
+  acknowledgment, a wrong passphrase changes nothing, then a rotation
+  and a second one through the wizard, the data read back each time),
   two foreground mounts in one run each ended with Ctrl-C, deniable
   create / mount / remount. Uses a temporary HOME. Menu
   positions are those of the current wizard: when a menu changes,

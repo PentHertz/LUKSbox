@@ -28,7 +28,7 @@ use aes::cipher::{BlockDecrypt, BlockEncrypt};
 use hmac::{Hmac, Mac};
 use p256::PublicKey;
 use p256::ecdh::EphemeralSecret;
-use rand_core::OsRng;
+use p256::elliptic_curve::Generate;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroize;
 
@@ -44,7 +44,9 @@ pub struct PlatformKeyAgreement {
 
 impl PlatformKeyAgreement {
     pub fn generate() -> Self {
-        let secret = EphemeralSecret::random(&mut OsRng);
+        // The system RNG (getrandom); panics on RNG failure, like the
+        // `OsRng` it replaces.
+        let secret = EphemeralSecret::generate();
         let public = secret.public_key();
         Self { secret, public }
     }

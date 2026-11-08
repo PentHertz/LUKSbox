@@ -126,4 +126,10 @@ pub enum Error {
     /// this one lives in a sync bundle.
     #[error("{0} is not supported for a vault in a sync bundle")]
     UnsupportedForExternalStorage(&'static str),
+
+    /// A metadata region resize of a detached-header vault was
+    /// interrupted and the vault file's length matches neither layout,
+    /// so the open cannot tell which header goes with it.
+    #[error("{0}")]
+    InterruptedResize(String),
 }

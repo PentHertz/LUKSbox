@@ -192,6 +192,19 @@ pub fn reseal_inner_v3(
     Ok(v3)
 }
 
+/// Re-seal the inner header of a pre-v3 deniable vault with a fresh
+/// nonce, after its layout changed (`Container::begin_atomic_relayout`).
+/// A v3 vault is re-sealed by `persist_header` anyway.
+pub fn reseal_inner_v2(
+    header_bytes: &mut [u8; DENIABLE_HEADER_SIZE],
+    inner: &DeniableInnerHeader,
+    mvk: &MasterVolumeKey,
+    per_vault_salt: &[u8; DENIABLE_SALT_SIZE],
+    cipher_suite: CipherSuite,
+) -> Result<(), Error> {
+    seal_inner_into(header_bytes, inner, None, mvk, per_vault_salt, cipher_suite)
+}
+
 /// Decrypt the inner-header region (nonce || ct || tag) under `mvk`,
 /// trying the v3 label first and then the v2 one. Returns the v3 fields
 /// when the v3 label matched. Every failure is `OpaqueUnlockFailed`.

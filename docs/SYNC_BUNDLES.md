@@ -82,6 +82,13 @@ Changes are saved on this computer first and uploaded:
 before an upload, the changes are uploaded the next time the vault is
 opened on it.
 
+The file list (metadata) region of a bundle can be resized like a
+vault file's: `luksbox size ~/Dropbox/vault.lbxs --metadata-size 16M`,
+or Vault size in the wizard or the GUI. The vault's pages are rewritten
+on this computer and uploaded as a new version; other computers merge
+their own changes into it. If two computers resize differently at the
+same time, both versions are kept (as for other header changes).
+
 ## Other commands
 
 ```bash
@@ -196,6 +203,10 @@ kept, and so is the folder if they are there.
   work. "Changed differently on two devices" means one of the two
   changes was kept: redo the other. A key removed on one computer stays
   removed.
+- **"the file list region stays N: the merged file list does not fit
+  M"**: one computer made the file list region smaller while another
+  added files; the merged list did not fit the smaller size, so the
+  larger one was kept. Nothing was lost.
 - **"changes saved on this device earlier could not be merged"**: the
   vault opens read-only. If it says they are shown, copy out what you
   need (or `luksbox sync export`), then `luksbox sync discard-local

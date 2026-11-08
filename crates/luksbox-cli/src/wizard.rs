@@ -276,6 +276,8 @@ pub(crate) fn run() -> Result<()> {
                 "Create a deniable vault (advanced)",
                 "Mount a deniable vault (advanced)",
                 "Verify a deniable header (advanced)",
+                "Rotate a deniable vault's master key (advanced)",
+                "Resize a deniable vault's file list region (advanced)",
                 "PANIC: irreversibly destroy a vault by header path",
                 "Quit",
             ])
@@ -289,8 +291,10 @@ pub(crate) fn run() -> Result<()> {
             4 => create_deniable_wizard(&theme),
             5 => mount_deniable_wizard(&theme),
             6 => info_deniable_wizard(&theme),
-            7 => panic_by_path(&theme),
-            8 => return Ok(()),
+            7 => rotate_deniable_wizard(&theme),
+            8 => resize_deniable_wizard(&theme),
+            9 => panic_by_path(&theme),
+            10 => return Ok(()),
             _ => unreachable!(),
         };
         if let Err(e) = r {
@@ -1280,6 +1284,97 @@ fn info_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
 /// builds a Vfs over it, and hands off to `luksbox_mount::mount`
 /// (foreground). Unmount via Ctrl-C or the standard wizard / CLI
 /// umount flow.
+/// Rotate a deniable vault's master key (`luksbox deniable-rotate`).
+fn rotate_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
+    let path = ask_path(theme, "Path to the deniable vault")?;
+    let cipher_suite = ask_den_cipher(theme, "Cipher suite used at create time")?;
+    let argon2_params = ask_den_kdf(theme, "Argon2id params used at create time")?;
+    let anchor = if Confirm::with_theme(theme)
+        .with_prompt("Verify a deniable anchor sidecar first?")
+        .default(false)
+        .interact()?
+    {
+        Some(ask_path(theme, "Path to the deniable anchor sidecar")?)
+    } else {
+        None
+    };
+    eprintln!(
+        "Only the slot your passphrase opens is kept: every other slot of this vault \
+         (another passphrase, a backup, a security key, a second person) stops working and \
+         must be enrolled again. LUKSbox cannot tell whether such slots exist."
+    );
+    if !Confirm::with_theme(theme)
+        .with_prompt("Rotate, knowing the other slots stop working?")
+        .default(false)
+        .interact()?
+    {
+        println!("rotation cancelled; nothing was changed");
+        return Ok(());
+    }
+    crate::deniable_rotate(&path, cipher_suite, argon2_params, anchor.as_deref(), true)
+}
+
+/// `deniable-resize` from the menu (passphrase slots, like the rotation).
+fn resize_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
+    const MIB: u64 = 1024 * 1024;
+    let path = ask_path(theme, "Path to the deniable vault")?;
+    let cipher_suite = ask_den_cipher(theme, "Cipher suite used at create time")?;
+    let argon2_params = ask_den_kdf(theme, "Argon2id params used at create time")?;
+    let anchor = if Confirm::with_theme(theme)
+        .with_prompt("Verify a deniable anchor sidecar first?")
+        .default(false)
+        .interact()?
+    {
+        Some(ask_path(theme, "Path to the deniable anchor sidecar")?)
+    } else {
+        None
+    };
+    let choices = [
+        (64 * MIB, "45 000"),
+        (32 * MIB, "22 000"),
+        (16 * MIB, "11 000"),
+        (8 * MIB, "5 600"),
+        (4 * MIB, "2 800"),
+        (MIB, "700"),
+    ];
+    let labels: Vec<String> = choices
+        .iter()
+        .map(|&(s, files)| {
+            format!(
+                "{}: about {files} files of 1 MB",
+                luksbox_core::size::format_size(s)
+            )
+        })
+        .collect();
+    let i = Select::with_theme(theme)
+        .with_prompt("New file list region size")
+        .items(&labels)
+        .default(0)
+        .interact()?;
+    eprintln!(
+        "The data moves by the size difference (and a smaller region shrinks the file): \
+         anyone who has an older copy of the file (backups, sync history, disk images) can \
+         see that it changed shape."
+    );
+    if !Confirm::with_theme(theme)
+        .with_prompt("Resize, knowing the change can be seen?")
+        .default(false)
+        .interact()?
+    {
+        println!("resize cancelled; nothing was changed");
+        return Ok(());
+    }
+    crate::deniable_resize(
+        &path,
+        choices[i].0,
+        cipher_suite,
+        argon2_params,
+        "passphrase",
+        None,
+        anchor.as_deref(),
+    )
+}
+
 fn mount_deniable_wizard(theme: &ColorfulTheme) -> Result<()> {
     use luksbox_vfs::Vfs;
 
@@ -4719,35 +4814,128 @@ fn vault_size_action(theme: &ColorfulTheme, vfs: &mut Vfs, vault: &Path) -> Resu
     use luksbox_core::size::format_size;
     loop {
         let report = vfs.space_report()?;
-        crate::print_space_report(vault, &report, false);
+        crate::print_space_report(
+            vault,
+            &report,
+            Some((vfs.metadata_budget_status(), vfs.file_list_remedy())),
+            false,
+        );
         let can_shrink = report.reclaimable > 0
             && !vfs.container().is_deniable()
             && vfs.tolerated_inodes().is_empty();
-        let mut items = vec!["Change the maximum size".to_string()];
+        // The file list region can be resized in place for an inline-
+        // header vault (see `Vfs::resize_metadata_region`).
+        let can_resize = vfs.can_resize_metadata_region();
+        enum Act {
+            Max,
+            Shrink,
+            Resize,
+            Back,
+        }
+        let mut items = vec![("Change the maximum size".to_string(), Act::Max)];
         if can_shrink {
-            items.push(format!(
-                "Give back {} at the end of the vault",
-                format_size(report.reclaimable)
+            items.push((
+                format!(
+                    "Give back {} at the end of the vault",
+                    format_size(report.reclaimable)
+                ),
+                Act::Shrink,
             ));
         }
-        items.push("Back".to_string());
+        if can_resize {
+            items.push((
+                format!(
+                    "Change the file list region (now {})",
+                    format_size(vfs.container().header.metadata_size)
+                ),
+                Act::Resize,
+            ));
+        }
+        items.push(("Back".to_string(), Act::Back));
+        let labels: Vec<&str> = items.iter().map(|(l, _)| l.as_str()).collect();
         let choice = Select::with_theme(theme)
             .with_prompt("Vault size")
-            .items(&items)
+            .items(&labels)
             .default(items.len() - 1)
             .interact()?;
-        if choice == 0 {
-            let minimum = vfs.minimum_vault_size();
-            let bytes = ask_max_size(theme, vault, minimum, report.max_size)?;
-            vfs.set_max_vault_size(bytes)?;
-            vfs.flush()?;
-        } else if can_shrink && choice == 1 {
-            let freed = vfs.shrink()?;
-            println!("OK gave back {}", format_size(freed));
-        } else {
-            return Ok(());
+        match items[choice].1 {
+            Act::Max => {
+                let minimum = vfs.minimum_vault_size();
+                let bytes = ask_max_size(theme, vault, minimum, report.max_size)?;
+                vfs.set_max_vault_size(bytes)?;
+                vfs.flush()?;
+            }
+            Act::Shrink => {
+                let freed = vfs.shrink()?;
+                println!("OK gave back {}", format_size(freed));
+            }
+            Act::Resize => resize_file_list_action(theme, vfs)?,
+            Act::Back => return Ok(()),
         }
     }
+}
+
+/// Resize the vault's file list (metadata) region.
+fn resize_file_list_action(theme: &ColorfulTheme, vfs: &mut Vfs) -> Result<()> {
+    use luksbox_core::size::format_size;
+    const MIB: u64 = 1024 * 1024;
+    let current = vfs.container().header.metadata_size;
+    // Same counts as the GUI (about 700 files of 1 MB per MiB).
+    let choices = [
+        (64 * MIB, "45 000"),
+        (32 * MIB, "22 000"),
+        (16 * MIB, "11 000"),
+        (8 * MIB, "5 600"),
+        (4 * MIB, "2 800"),
+        (MIB, "700"),
+    ];
+    let sizes: Vec<u64> = choices.iter().map(|&(s, _)| s).collect();
+    let labels: Vec<String> = choices
+        .iter()
+        .map(|&(s, files)| {
+            format!(
+                "{}: about {files} files of 1 MB{}",
+                format_size(s),
+                if s == current { " (current)" } else { "" }
+            )
+        })
+        .collect();
+    let default = sizes.iter().position(|&s| s == current).unwrap_or(0);
+    let i = Select::with_theme(theme)
+        .with_prompt(
+            "New file list region size (the vault is rewritten: needs free space for one copy)",
+        )
+        .items(&labels)
+        .default(default)
+        .interact()?;
+    if sizes[i] == current {
+        println!("  unchanged");
+        return Ok(());
+    }
+    if vfs.container().is_deniable() {
+        println!(
+            "  Resizing a deniable vault moves its data by the size difference (and a smaller\n  \
+             region shrinks the file): anyone who has an older copy of the file (backups, sync\n  \
+             history, disk images) can see that it changed shape."
+        );
+        if !Confirm::with_theme(theme)
+            .with_prompt("Resize it anyway?")
+            .default(false)
+            .interact()?
+        {
+            println!("  unchanged");
+            return Ok(());
+        }
+        vfs.resize_metadata_region_allow_deniable(sizes[i])?;
+    } else {
+        vfs.resize_metadata_region(sizes[i])?;
+    }
+    println!(
+        "OK file list region resized from {} to {}",
+        format_size(current),
+        format_size(sizes[i])
+    );
+    Ok(())
 }
 
 /// When closing a vault: offer to give back the free space at the end of

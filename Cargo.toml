@@ -63,7 +63,7 @@ ghash = { version = "0.5", features = ["zeroize"] }
 polyval = { version = "0.6", features = ["zeroize"] }
 chacha20 = { version = "0.9", features = ["zeroize"] }
 poly1305 = { version = "0.8", features = ["zeroize"] }
-p256 = { version = "0.13", default-features = false, features = ["ecdh"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdh", "getrandom"] }
 serde = { version = "1", features = ["derive"] }
 # Postcard: metadata-blob serializer. Smaller varint encoding than
 # bincode, actively maintained, reads our existing

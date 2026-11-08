@@ -585,6 +585,13 @@ struct RotateSlotInput {
 struct RotateForm {
     entries: Vec<RotateSlotInput>,
     kdf: KdfStrength,
+    /// A deniable vault: one entry (the unlocked slot), typed twice, and
+    /// checked against the encrypted slot before anything changes; the
+    /// KDF strength stays the one it unlocks with.
+    deniable: bool,
+    confirm: Zeroizing<String>,
+    /// "Other slots stop working" read and accepted (deniable only).
+    deniable_ack: bool,
 }
 
 /// Form state for the "+ Add FIDO2 keyslot" modal. Wraps the PIN
@@ -1046,6 +1053,10 @@ enum Pending {
     GetFile {
         rx: Receiver<VaultRet<ops::Extracted>>,
     },
+    /// Rewriting the vault with a new file list region size: `(old, new)`.
+    ResizeMetadata {
+        rx: Receiver<VaultRet<(u64, u64)>>,
+    },
     /// Copying a file or folder from an earlier version of a sync
     /// bundle back into the vault; the version's view comes back too.
     Restore {
@@ -1104,7 +1115,9 @@ enum Pending {
     /// Master-key rotation in flight. The worker owns the moved-out
     /// `OpenedVault` and returns it on Ok; we re-install the vault
     /// into `self.vault` in the poll handler.
-    RotateMvk(Receiver<Result<OpenedVault, String>>),
+    /// Err((Some(vault), why)): refused before anything changed, the
+    /// vault stays open.
+    RotateMvk(Receiver<Result<OpenedVault, (Option<OpenedVault>, String)>>),
 }
 
 impl Pending {
@@ -1158,6 +1171,9 @@ impl Pending {
                 "deriving the envelope key (Argon2id) to identify the keyslot...".to_string()
             }
             Pending::GetFile { .. } => "decrypting...".to_string(),
+            Pending::ResizeMetadata { .. } => {
+                "rewriting the vault with the new file list region...".to_string()
+            }
             Pending::Restore { .. } => "copying it back from the earlier version...".to_string(),
             Pending::EnrollPassphrase { .. } => {
                 "stretching passphrase with Argon2id...".to_string()
@@ -1443,7 +1459,11 @@ pub struct LuksboxApp {
     /// The vault size report the size dialog shows, recomputed at most
     /// every second: `space_report` walks every chunk reference, and the
     /// dialog ran it on every frame.
-    space_report_cache: Option<(std::time::Instant, luksbox_vfs::SpaceReport)>,
+    space_report_cache: Option<(
+        std::time::Instant,
+        luksbox_vfs::SpaceReport,
+        luksbox_vfs::MetadataBudgetStatus,
+    )>,
     /// `draw_recent_item`'s per-path `(checked at, is a bundle, missing)`.
     recent_state_cache: std::collections::HashMap<PathBuf, (std::time::Instant, bool, bool)>,
     /// "Give back free space?" asked before locking a vault (Ask mode).
@@ -1983,14 +2003,14 @@ impl LuksboxApp {
         // Collect everything off `v` first so the mutable borrow on
         // self.vault is released before any toast_warn call (which
         // also borrows &mut self).
-        let (pct, beyond_tested, saved) = {
+        let (pct, beyond_tested, saved, remedy) = {
             let Some(v) = self.vault.as_mut() else {
                 return;
             };
             let saved = v.vfs.flush();
             let pct = v.vfs.metadata_budget_status().used_pct();
             let beyond_tested = v.vfs.is_beyond_tested_size();
-            (pct, beyond_tested, saved)
+            (pct, beyond_tested, saved, v.vfs.file_list_remedy())
         };
         // A failed save was ignored: the success toast of the operation
         // stood while the change was not on disk.
@@ -2001,15 +2021,13 @@ impl LuksboxApp {
             self.metadata_warned_pct = pct;
             self.toast_warn(format!(
                 "This vault's file list is {pct}% full: new files will soon be \
-                 refused. Delete files, or move some to a new vault (a file list \
-                 region cannot be enlarged; 64 MiB, the default, is the maximum)."
+                 refused. To make room: {remedy}."
             ));
         } else if pct >= 75 && self.metadata_warned_pct < 75 {
             self.metadata_warned_pct = pct;
             self.toast_warn(format!(
                 "This vault's file list is {pct}% full. If many more files are \
-                 expected, plan to move some to a new vault (64 MiB, the default \
-                 file list region, is the maximum)."
+                 expected: {remedy}."
             ));
         }
         // Tested-boundary advisory. v0.2.1 was ground-truth tested up
@@ -2811,6 +2829,24 @@ impl LuksboxApp {
                 }
                 Err(_) => self.toast_err("restore task crashed"),
             },
+            Pending::ResizeMetadata { rx } => match rx.try_recv() {
+                Ok((vault, result)) => {
+                    self.vault = Some(vault);
+                    self.space_report_cache = None;
+                    match result {
+                        Ok((old, new)) => self.toast_ok(format!(
+                            "file list region resized from {} to {}",
+                            format_size(old),
+                            format_size(new)
+                        )),
+                        Err(e) => self.toast_err(format!("could not resize the file list: {e}")),
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending = Some(Pending::ResizeMetadata { rx });
+                }
+                Err(_) => self.toast_err("resize task crashed"),
+            },
             Pending::GetFile { rx } => match rx.try_recv() {
                 Ok((vault, result)) => {
                     self.vault = Some(vault);
@@ -3048,7 +3084,14 @@ impl LuksboxApp {
                     self.vault = Some(reopened);
                     self.toast_ok("OK master key rotated");
                 }
-                Ok(Err(e)) => {
+                Ok(Err((Some(unchanged), e))) => {
+                    // Refused before anything changed (a deniable
+                    // passphrase that does not open its slot): the vault
+                    // stays open.
+                    self.vault = Some(unchanged);
+                    self.toast_err(format!("rotation refused: {e}"));
+                }
+                Ok(Err((None, e))) => {
                     // Rotation failed (or was aborted). The worker
                     // moved the vault out; without the OpenedVault
                     // back we have to drop to Welcome, same shape
@@ -4418,10 +4461,8 @@ impl LuksboxApp {
                     } else {
                         path_hints::home("Dropbox/secret.lbxs")
                     };
-                    let resp = ui.add_sized(
-                        [field_w, CONTROL_H],
-                        egui::TextEdit::singleline(&mut self.create.path).hint_text(hint),
-                    );
+                    let resp =
+                        ui.add_sized([field_w, CONTROL_H], path_edit(&mut self.create.path, hint));
                     if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                         submit_via_enter = true;
                     }
@@ -5948,7 +5989,8 @@ impl LuksboxApp {
                     if self.create.use_v3_format {
                         let dir = PathBuf::from(self.create.path.trim());
                         let free = self.cached_free_space(&dir);
-                        let min = new_vault_min_size();
+                        let region = self.create.metadata_mib << 20;
+                        let min = new_vault_min_size(region);
                         let max = free.unwrap_or(0);
                         size_limit_editor(ui, "create-max-size", &mut self.create.max_size, min, max, free);
                         if let Some(f) = free {
@@ -5957,7 +5999,7 @@ impl LuksboxApp {
                                     "Disk free: {}. A {} backup copy of the metadata \
                                      (vault.lbx.meta-bak) is kept next to the vault.",
                                     format_size(f),
-                                    format_size(luksbox_format::DEFAULT_METADATA_REGION_SIZE)
+                                    format_size(region)
                                 ))
                                 .color(theme::FAINT)
                                 .size(12.0),
@@ -6058,10 +6100,10 @@ impl LuksboxApp {
                                         .selected_text(format!("{} MiB", self.create.metadata_mib))
                                         .show_ui(ui, |ui| {
                                             for (mib, what) in [
-                                                (64, "64 MiB (default): about a million files"),
-                                                (16, "16 MiB: about 300 000 files"),
-                                                (4, "4 MiB: about 80 000 files"),
-                                                (1, "1 MiB: about 20 000 files"),
+                                                (64, "64 MiB (default): about 45 000 files of 1 MB"),
+                                                (16, "16 MiB: about 11 000 files of 1 MB"),
+                                                (4, "4 MiB: about 2 800 files of 1 MB"),
+                                                (1, "1 MiB: about 700 files of 1 MB"),
                                             ] {
                                                 ui.selectable_value(
                                                     &mut self.create.metadata_mib,
@@ -6077,9 +6119,12 @@ impl LuksboxApp {
                                      and its .meta-bak mirror), with fresh random padding so two \
                                      copies of the vault never reveal how many files it holds. \
                                      A smaller region makes every save faster on a USB stick or \
-                                     SD card. It caps how many files the vault can hold (counts \
-                                     for short names; long names hold fewer) and cannot be \
-                                     enlarged later.",
+                                     SD card, and caps how many files the vault can hold. What a \
+                                     file takes depends on its size: about 1.5 KB for a 1 MB file \
+                                     (files up to 1 MiB keep their chunk list here), about 150 \
+                                     bytes for a larger one, about 40 bytes for a tiny one. So \
+                                     64 MiB holds about 45 000 files of 1 MB, far more of large or \
+                                     tiny files. Vault size shows how full it is.",
                                 );
                                 if !self.create.use_v3_format {
                                     ui.label(
@@ -7037,9 +7082,7 @@ impl LuksboxApp {
             let (field_w, browse_w) = trailing_button_row_widths(ui, FORM_FIELD_MAX_W, 90.0);
             ui.add_sized(
                 [field_w, CONTROL_H],
-                egui::TextEdit::singleline(&mut self.unlock.path)
-                    .hint_text("path to .lbx (or any vault file)")
-                    .font(egui::TextStyle::Monospace),
+                path_edit(&mut self.unlock.path, "path to .lbx (or any vault file)"),
             );
             if ui
                 .add_sized([browse_w, CONTROL_H], ghost_button("Browse..."))
@@ -10834,12 +10877,19 @@ impl LuksboxApp {
                     .vault
                     .as_ref()
                     .is_some_and(|v| v.vfs.container().is_deniable());
-                let can_rotate_in_gui = has_passphrase
+                // A deniable vault's table above is a placeholder: its
+                // unlocked slot is rotated (passphrase checked first).
+                let deniable_slot = self
+                    .vault
+                    .as_ref()
+                    .and_then(|v| v.vfs.container().deniable_unlocked_slot());
+                let can_rotate_in_gui = (has_passphrase
                     && !has_fido2_wrap
                     && !has_fido2_direct
                     && !has_hybrid
                     && !has_hw_bound
-                    && !is_bundle;
+                    && !is_bundle)
+                    || deniable_slot.is_some();
 
                 if can_rotate_in_gui {
                     if ui
@@ -10856,17 +10906,27 @@ impl LuksboxApp {
                         // Pre-populate the form with one passphrase entry
                         // per populated Passphrase slot.
                         let mut entries: Vec<RotateSlotInput> = Vec::new();
-                        for (i, slot) in header.keyslots.iter().enumerate() {
-                            if slot.kind == SlotKind::Passphrase {
-                                entries.push(RotateSlotInput {
-                                    slot_idx: i,
-                                    passphrase: Zeroizing::default(),
-                                });
+                        if let Some(slot_idx) = deniable_slot {
+                            entries.push(RotateSlotInput {
+                                slot_idx,
+                                passphrase: Zeroizing::default(),
+                            });
+                        } else {
+                            for (i, slot) in header.keyslots.iter().enumerate() {
+                                if slot.kind == SlotKind::Passphrase {
+                                    entries.push(RotateSlotInput {
+                                        slot_idx: i,
+                                        passphrase: Zeroizing::default(),
+                                    });
+                                }
                             }
                         }
                         self.rotate_modal = Some(RotateForm {
                             entries,
                             kdf: KdfStrength::Interactive,
+                            deniable: deniable_slot.is_some(),
+                            confirm: Zeroizing::default(),
+                            deniable_ack: false,
                         });
                     }
                 } else {
@@ -10885,10 +10945,8 @@ impl LuksboxApp {
                     // populated keyslots" (or "use the CLI", which cannot
                     // rotate one either).
                     let reason = if is_deniable {
-                        "A deniable vault's master key cannot be rotated yet: the passphrase \
-                 typed for the new wrap cannot be checked against the encrypted slot \
-                 first, so a typo would lock the vault for good. To change keys, create \
-                 a new deniable vault and copy the files across."
+                        "This deniable vault was opened without a known slot index: \
+                 lock it and open it again to rotate its master key."
                     } else if is_bundle {
                         "A sync bundle cannot rotate its master key yet. Export it to a .lbx \
                  (Versions or `luksbox sync export`), rotate that file, then make a new \
@@ -10989,31 +11047,83 @@ impl LuksboxApp {
                     ui.add_space(6.0);
                 }
 
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new("KDF strength for the new wraps (Argon2id)")
+                if form.deniable {
+                    ui.label(
+                        RichText::new("Same passphrase again")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    let te = egui::TextEdit::singleline(&mut *form.confirm).password(true);
+                    ui.add_sized([capped_width(ui, 420.0), CONTROL_H], te);
+                    let typed = form.entries.first().map(|e| e.passphrase.as_str());
+                    if !form.confirm.is_empty() && typed != Some(form.confirm.as_str()) {
+                        ui.label(
+                            RichText::new("The two entries differ.")
+                                .color(theme::DANGER)
+                                .size(12.0),
+                        );
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(
+                            "Deniable vault: the passphrase is checked against the \
+                             encrypted slot before anything changes (a typo would \
+                             otherwise lock the vault). The KDF strength stays the one \
+                             you unlock with.",
+                        )
                         .color(theme::DIM)
                         .size(12.0),
-                );
-                egui::ComboBox::from_id_salt("rotate-kdf")
-                    .width(capped_width(ui, 420.0))
-                    .selected_text(form.kdf.label())
-                    .show_ui(ui, |ui| {
-                        for kdf in [
-                            KdfStrength::Interactive,
-                            KdfStrength::Moderate,
-                            KdfStrength::Sensitive,
-                        ] {
-                            ui.selectable_value(&mut form.kdf, kdf, kdf.label());
-                        }
-                    });
+                    );
+                    ui.add_space(6.0);
+                    // Rotation keeps only the slots it is given, and the
+                    // others get random bytes (nothing may show which
+                    // slots were used): with one known slot, every other
+                    // credential of this vault stops working.
+                    ui.label(
+                        RichText::new(
+                            "Only the slot you unlocked with is kept. Every other slot \
+                             of this vault (another passphrase, a backup, a security \
+                             key, a second person) stops working and must be enrolled \
+                             again. LUKSbox cannot tell whether such slots exist.",
+                        )
+                        .color(theme::DANGER)
+                        .size(12.0),
+                    );
+                    ui.checkbox(
+                        &mut form.deniable_ack,
+                        "I understand: the other slots of this vault stop working",
+                    );
+                } else {
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("KDF strength for the new wraps (Argon2id)")
+                            .color(theme::DIM)
+                            .size(12.0),
+                    );
+                    egui::ComboBox::from_id_salt("rotate-kdf")
+                        .width(capped_width(ui, 420.0))
+                        .selected_text(form.kdf.label())
+                        .show_ui(ui, |ui| {
+                            for kdf in [
+                                KdfStrength::Interactive,
+                                KdfStrength::Moderate,
+                                KdfStrength::Sensitive,
+                            ] {
+                                ui.selectable_value(&mut form.kdf, kdf, kdf.label());
+                            }
+                        });
+                }
 
                 ui.add_space(14.0);
                 ui.separator();
                 ui.add_space(10.0);
 
-                let can_submit =
-                    form.entries.iter().all(|e| !e.passphrase.is_empty()) && self.pending.is_none();
+                let can_submit = form.entries.iter().all(|e| !e.passphrase.is_empty())
+                    && (!form.deniable
+                        || (form.deniable_ack
+                            && form.entries.first().map(|e| e.passphrase.as_str())
+                                == Some(form.confirm.as_str())))
+                    && self.pending.is_none();
 
                 if ui
                     .add_sized(
@@ -11056,10 +11166,12 @@ impl LuksboxApp {
             // Move the credentials out of the form before spawning so
             // the worker owns its own zeroizing copies.
             let kdf;
+            let deniable;
             let creds: Vec<(usize, zeroize::Zeroizing<String>)>;
             {
                 let f = self.rotate_modal.as_mut().expect("checked above");
                 kdf = f.kdf;
+                deniable = f.deniable;
                 creds = f
                     .entries
                     .iter_mut()
@@ -11077,8 +11189,19 @@ impl LuksboxApp {
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
                 let mut opened = opened;
-                let r =
-                    ops::rotate_mvk_passphrase_only(&mut opened.vfs, creds, kdf).map(|_| opened);
+                let r = if deniable {
+                    let pass = creds.first().map(|(_, p)| p.clone()).unwrap_or_default();
+                    match ops::verify_deniable_rotation_passphrase(&opened.vfs, &pass) {
+                        Err(e) => Err((Some(opened), e)),
+                        Ok(kdf) => ops::rotate_mvk_deniable_verified(&mut opened.vfs, creds, kdf)
+                            .map(|()| opened)
+                            .map_err(|e| (None, e)),
+                    }
+                } else {
+                    ops::rotate_mvk_passphrase_only(&mut opened.vfs, creds, kdf)
+                        .map(|()| opened)
+                        .map_err(|e| (None, e))
+                };
                 let _ = tx.send(r);
             });
             self.pending = Some(Pending::RotateMvk(rx));
@@ -14474,7 +14597,14 @@ impl LuksboxApp {
         } else {
             return;
         }
-        let toasts = self.toasts.clone();
+        // The three newest only, at most 400 px wide. Every toast box is
+        // a widget in a layer above the page, and egui gives a click to
+        // the topmost widget under the pointer (`interactable(false)` on
+        // the area does not change that): a stack of several toasts,
+        // long ones wrapped, climbed to the top of the window and took
+        // the clicks meant for Lock and Unlock for five seconds.
+        let shown = self.toasts.len().saturating_sub(3);
+        let toasts: Vec<Toast> = self.toasts[shown..].to_vec();
         egui::Area::new(egui::Id::new("toasts"))
             .anchor(egui::Align2::RIGHT_BOTTOM, [-20.0, -20.0])
             .order(egui::Order::Tooltip)
@@ -14486,6 +14616,7 @@ impl LuksboxApp {
                 // space available, about 600 x 400 px, and that invisible
                 // area took the clicks meant for the buttons and rows under
                 // it for as long as a toast was shown.
+                ui.set_max_width(400.0);
                 ui.with_layout(Layout::top_down(Align::Min), |ui| {
                     for t in toasts.iter() {
                         let color = match t.kind {
@@ -14552,10 +14683,10 @@ fn size_limit_text(bytes: u64) -> String {
 
 /// Smallest maximum size for a vault created by the GUI: header, default
 /// metadata region and one chunk slot.
-fn new_vault_min_size() -> u64 {
-    luksbox_core::header::HEADER_SIZE as u64
-        + luksbox_format::DEFAULT_METADATA_REGION_SIZE
-        + luksbox_vfs::CHUNK_SLOT_SIZE
+/// Smallest maximum size a new vault with a `metadata_region`-byte
+/// metadata region accepts (the chosen region, not always the default).
+fn new_vault_min_size(metadata_region: u64) -> u64 {
+    luksbox_core::header::HEADER_SIZE as u64 + metadata_region + luksbox_vfs::CHUNK_SLOT_SIZE
 }
 
 /// Slider share kept at the far left for "Unlimited".
@@ -14684,6 +14815,11 @@ fn can_shrink(vfs: &luksbox_vfs::Vfs) -> bool {
 /// State of the "Vault size" dialog.
 struct SizeDialog {
     input: SizeLimitInput,
+    /// The file list region size picked for "Resize", bytes.
+    region: u64,
+    /// Deniable vault: the user ticked "I understand" to resize anyway
+    /// (`Vfs::resize_metadata_region_allow_deniable`).
+    resize_ack: bool,
     /// Deniable vault: the user ticked "I understand" to give back the
     /// free space anyway (`Vfs::shrink_allow_deniable`).
     deniable_ack: bool,
@@ -14710,6 +14846,8 @@ impl LuksboxApp {
         if let Some(v) = &self.vault {
             self.size_dialog = Some(SizeDialog {
                 input: SizeLimitInput::new(v.vfs.max_vault_size()),
+                region: v.vfs.container().header.metadata_size,
+                resize_ack: false,
                 deniable_ack: false,
             });
         }
@@ -14746,17 +14884,20 @@ impl LuksboxApp {
         let Some(v) = self.vault.as_mut() else {
             return;
         };
+        // The file-list gauge serializes the whole tree: computed with
+        // the report, at most once a second, not on every repaint.
         let cached = self
             .space_report_cache
             .as_ref()
-            .filter(|(t, _)| t.elapsed() < Duration::from_secs(1))
-            .map(|(_, r)| *r);
-        let report = match cached {
-            Some(r) => r,
+            .filter(|(t, _, _)| t.elapsed() < Duration::from_secs(1))
+            .map(|(_, r, f)| (*r, *f));
+        let (report, file_list) = match cached {
+            Some(c) => c,
             None => match v.vfs.space_report() {
                 Ok(r) => {
-                    self.space_report_cache = Some((std::time::Instant::now(), r));
-                    r
+                    let f = v.vfs.metadata_budget_status();
+                    self.space_report_cache = Some((std::time::Instant::now(), r, f));
+                    (r, f)
                 }
                 Err(e) => {
                     self.size_dialog = None;
@@ -14767,6 +14908,10 @@ impl LuksboxApp {
         };
         let shrinkable = can_shrink(&v.vfs);
         let deniable = v.vfs.container().is_deniable();
+        let region_now = v.vfs.container().header.metadata_size;
+        let resizable = v.vfs.can_resize_metadata_region();
+        let in_bundle = v.vfs.container().is_external();
+        let mut resize = false;
         let tolerant = !v.vfs.tolerated_inodes().is_empty();
         let min = v.vfs.minimum_vault_size();
         let max = report.file_size.saturating_add(free.unwrap_or(0));
@@ -14800,6 +14945,18 @@ impl LuksboxApp {
                         };
                         row("File size", format_size(report.file_size));
                         row("Metadata (fixed)", format_size(report.fixed_size));
+                        // How full the file list is (names, folders and the
+                        // chunk lists of files up to 1 MiB): it cannot be
+                        // enlarged, so say it before new files are refused.
+                        row(
+                            "File list",
+                            format!(
+                                "{}% full ({} of {})",
+                                file_list.used_pct(),
+                                format_size(file_list.used_bytes as u64),
+                                format_size(file_list.budget_bytes as u64)
+                            ),
+                        );
                         row("Used by files", format_size(report.used));
                         row("Free inside", format_size(report.free_inside));
                         if let Some(f) = free {
@@ -14829,6 +14986,87 @@ impl LuksboxApp {
                     .clicked()
                 {
                     apply = true;
+                }
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.add_space(8.0);
+                ui.label(RichText::new("File list region").strong());
+                if resizable {
+                    let how = if in_bundle {
+                        "Its pages are rewritten in this device's outbox and published as a \
+                         new commit, which other devices merge with their changes."
+                    } else {
+                        "The vault is rewritten next to itself (needs free space for one \
+                         copy); the original stays as it was until the new copy is complete."
+                    };
+                    ui.label(
+                        RichText::new(format!(
+                            "Holds the names, folders and the chunk lists of files up to 1 MB. \
+                             Larger when it is filling up; smaller makes every save cheaper. {how}"
+                        ))
+                        .color(theme::DIM)
+                        .size(12.0),
+                    );
+                    if deniable {
+                        ui.label(
+                            RichText::new(
+                                "Deniable vault: the data moves by the size difference (and a \
+                                 smaller region shrinks the file), so anyone who has an older \
+                                 copy of the file (backups, sync history, disk images) can see \
+                                 that it changed shape.",
+                            )
+                            .color(theme::WARN)
+                            .size(12.0),
+                        );
+                        ui.checkbox(&mut dialog.resize_ack, "I understand, resize it anyway");
+                    }
+                    const MIB: u64 = 1024 * 1024;
+                    ui.horizontal(|ui| {
+                        egui::ComboBox::from_id_salt("resize-file-list")
+                            .selected_text(format_size(dialog.region))
+                            .show_ui(ui, |ui| {
+                                // Same counts as the create form (about
+                                // 700 files of 1 MB per MiB).
+                                for (mib, files) in [
+                                    (64u64, "45 000"),
+                                    (32, "22 000"),
+                                    (16, "11 000"),
+                                    (8, "5 600"),
+                                    (4, "2 800"),
+                                    (1, "700"),
+                                ] {
+                                    let label = format!(
+                                        "{}: about {files} files of 1 MB{}",
+                                        format_size(mib * MIB),
+                                        if mib * MIB == region_now {
+                                            " (current)"
+                                        } else {
+                                            ""
+                                        }
+                                    );
+                                    ui.selectable_value(&mut dialog.region, mib * MIB, label);
+                                }
+                            });
+                        if ui
+                            .add_enabled(
+                                dialog.region != region_now && (!deniable || dialog.resize_ack),
+                                primary_button("Resize"),
+                            )
+                            .clicked()
+                        {
+                            resize = true;
+                        }
+                    });
+                } else {
+                    ui.label(
+                        RichText::new(
+                            "Not resizable while the vault is read-only or opened in recovery \
+                             mode.",
+                        )
+                        .color(theme::DIM)
+                        .size(12.0),
+                    );
                 }
 
                 ui.add_space(12.0);
@@ -14943,6 +15181,7 @@ impl LuksboxApp {
             close = true;
         }
         let new_max = dialog.input.bytes;
+        let new_region = dialog.region;
         if pref_changed {
             preferences::save(&self.prefs);
         }
@@ -14972,6 +15211,28 @@ impl LuksboxApp {
                 Ok(freed) => self.toast_ok(format!("gave back {}", format_size(freed))),
                 Err(e) => self.toast_err(format!("could not give back free space: {e}")),
             }
+        }
+        if resize && self.pending.is_some() {
+            self.toast_err("busy: wait for the current operation to finish, then try again");
+        } else if resize && let Some(v) = self.vault.take() {
+            // On a worker: it copies the whole vault.
+            let (tx, rx) = std::sync::mpsc::channel::<VaultRet<(u64, u64)>>();
+            // The deniable acknowledgment gates the button above.
+            if let Some(d) = self.size_dialog.as_mut() {
+                d.resize_ack = false;
+            }
+            std::thread::spawn(move || {
+                let mut v = v;
+                let old = v.vfs.container().header.metadata_size;
+                let r = if v.vfs.container().is_deniable() {
+                    v.vfs.resize_metadata_region_allow_deniable(new_region)
+                } else {
+                    v.vfs.resize_metadata_region(new_region)
+                };
+                let r = r.map(|()| (old, new_region)).map_err(|e| e.to_string());
+                let _ = tx.send((v, r));
+            });
+            self.pending = Some(Pending::ResizeMetadata { rx });
         }
         if close {
             self.size_dialog = None;
@@ -15156,6 +15417,16 @@ fn swap_vault_extension(path: &str, bundle: bool) -> String {
 const FORM_FIELD_MAX_W: f32 = 600.0;
 const FORM_FIELD_MIN_W: f32 = 120.0;
 const CONTROL_H: f32 = 28.0;
+
+/// A vault path input: the body font (the small monospace one was hard to
+/// read), the text centered in the control height with room around it
+/// (a plain single-line edit draws it against the top edge).
+fn path_edit<'t>(text: &'t mut String, hint: impl Into<egui::WidgetText>) -> egui::TextEdit<'t> {
+    egui::TextEdit::singleline(text)
+        .hint_text(hint)
+        .vertical_align(egui::Align::Center)
+        .margin(egui::Margin::symmetric(8, 4))
+}
 
 /// The cipher a deniable unlock form selects.
 fn deniable_cipher_suite(c: &CipherChoice) -> luksbox_core::CipherSuite {

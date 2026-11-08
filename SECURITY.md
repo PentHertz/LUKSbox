@@ -377,6 +377,13 @@ vulnerability.
 | `registry 1.3` | `winfsp_wrs_sys` (transitive) -> `luksbox-mount` on Windows | RUSTSEC-2025-0026 (unmaintained) | **Windows runtime only.** Required for the `mount` subcommand on Windows via WinFsp. Non-Windows builds (Linux + macOS) do not link this chain. The `registry` crate is archived; the recommended replacement is `windows-registry`. `winfsp_wrs 0.4.1` (Jan 2026) is the latest published version and has not migrated yet (https://github.com/Scille/winfsp_wrs). When it does we drop this ignore. |
 | `paste 1.0.15` | `tss-esapi 8.0.0-alpha.2` (transitive) -> `luksbox-tpm` | RUSTSEC-2024-0436 (unmaintained) | **Compile-time only, no code shipped.** `paste` is a token-paste proc macro used by `tss-esapi`, the TPM 2.0 wrapper for the Linux and Windows TPM keyslots. It runs at build time and emits nothing into the binary, so an unmaintained-crate advisory has no runtime attack surface. No CVE is filed. The dependency is a transitive consequence of pinning `tss-esapi` to the 8.0 alpha line (the only release with Windows TBS support). We drop this ignore when `tss-esapi` cuts a stable 8.0 without `paste`. Non-TPM builds do not link this chain. |
 
+Resolved for real (2026-11-08): **RUSTSEC-2026-0387** (`crypto-bigint`
+0.5.5) and **RUSTSEC-2026-0385** (`ctutils` 0.4.2), timing variability
+in constant-time code. `p256` went to 0.14 (crypto-bigint 0.7), `ctutils`
+to 0.4.8, and `tss-esapi` is built without its default `abstraction`
+feature (RustCrypto key conversions the TPM keyslot never calls), which
+removed its `elliptic-curve` 0.13 chain. No ignore was added.
+
 A near miss worth recording: **quick-xml 0.39** (RUSTSEC-2026-0194 /
 RUSTSEC-2026-0195, DoS pair fixed in >= 0.41.0) is pulled in solely by
 the `wayland-scanner` proc macro, whose latest release pins

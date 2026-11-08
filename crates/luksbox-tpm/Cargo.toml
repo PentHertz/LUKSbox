@@ -68,7 +68,7 @@ sha2 = { workspace = true }
 #
 # Linux gets the pregenerated bindings (x86_64 + aarch64).
 [target.'cfg(target_os = "linux")'.dependencies]
-tss-esapi = { version = "=8.0.0-alpha.2", optional = true }
+tss-esapi = { version = "=8.0.0-alpha.2", optional = true, default-features = false }
 tss-esapi-sys = { version = "=0.6.0-alpha.2", optional = true }
 
 # Windows has NO pregenerated bindings in tss-esapi-sys - its
@@ -81,7 +81,7 @@ tss-esapi-sys = { version = "=0.6.0-alpha.2", optional = true }
 # point TPM2_TSS_PATH at an existing tpm2-tss install tree
 # (include/ + lib/ + VERSION).
 [target.'cfg(target_os = "windows")'.dependencies]
-tss-esapi = { version = "=8.0.0-alpha.2", optional = true, features = ["generate-bindings"] }
+tss-esapi = { version = "=8.0.0-alpha.2", optional = true, default-features = false, features = ["generate-bindings"] }
 tss-esapi-sys = { version = "=0.6.0-alpha.2", optional = true, features = ["generate-bindings"] }
 
 [dev-dependencies]

@@ -110,6 +110,34 @@ ok "shrink" "" -- size v-max.lbx --shrink
 ok "opens after shrink" "" -- ls v-max.lbx /
 rm -f big100.bin
 
+# --- file list (metadata) region resize -------------------------------------
+ok "size shows the file list gauge" "File list:" -- size v-max.lbx
+ok "put before resize" "" -- put v-max.lbx blob.bin /blob.bin
+ok "resize: grow 2M -> 4M" "from 2.0 MB to 4.0 MB" -- size v-max.lbx --metadata-size 4M
+eq "resize: mirror follows the region" "$(stat -c %s v-max.lbx.meta-bak)" $((4*1048576))
+eq "resize: no .rotating left" "$(ls v-max.lbx.rotating 2>/dev/null)" ""
+ok "resize: get after grow" "" -- get v-max.lbx /blob.bin out-rs.bin
+eq "resize: content after grow" "$(sha256sum < out-rs.bin)" "$SUMB"
+ok "resize: shrink with an anchor" "from 64.0 MB to 1.0 MB" -- size v-anc.lbx --anchor v-anc.anchor --metadata-size 1M
+ok "resize: anchor accepts it" "blob.bin" -- ls v-anc.lbx --anchor v-anc.anchor /docs
+ok "resize: get after shrink" "" -- get v-anc.lbx --anchor v-anc.anchor /docs/blob.bin out-rs2.bin
+eq "resize: content after shrink" "$(sha256sum < out-rs2.bin)" "$SUMB"
+ko "resize: invalid size" "in steps of 64 KiB" -- size v-max.lbx --metadata-size 100K
+mkdir many; for i in $(seq 1 1500); do echo $i > many/f-$i.txt; done
+ok "resize: fill a file list" "wrote 1500 file(s)" -- put v-max.lbx many /many
+ko "resize: too small for the file list" "choose a larger region" -- size v-max.lbx --metadata-size 64K
+ok "resize: refused one left the vault as it was" "Metadata:       4.0 MB" -- size v-max.lbx
+touch v-max.lbx.rotating
+ko "resize: leftover .rotating refused" "already exists" -- size v-max.lbx --metadata-size 8M
+ok "resize: vault fine after that" "f-1500.txt" -- ls v-max.lbx /many
+rm -f v-max.lbx.rotating; rm -rf many
+ok "resize: detached header" "from 64.0 MB to 32.0 MB" -- size v-det.lbx --header v-det.hdr --metadata-size 32M
+ok "resize: header sidecar follows" "starts at offset 33554432" -- info v-det.lbx --header v-det.hdr
+eq "resize: no .resizing left" "$(ls v-det.hdr.resizing 2>/dev/null)" ""
+ok "resize: detached get" "" -- get v-det.lbx --header v-det.hdr /docs/blob.bin out-det2.bin
+eq "resize: detached content" "$(sha256sum < out-det2.bin)" "$SUMB"
+ko "deniable-resize needs its acknowledgment" "--data-moves-visibly" -- deniable-resize den.dat --metadata-size 16M
+
 # --- keyslots ---------------------------------------------------------------
 LUKSBOX_NEW_PASSPHRASE=pw-two ok "enroll passphrase" "" -- enroll v-aes-256-gcm.lbx
 LUKSBOX_PASSPHRASE=pw-two ok "open with second" "" -- ls v-aes-256-gcm.lbx /
@@ -153,6 +181,12 @@ ok "sync export" "" -- sync export b.lbxs b-export.lbx
 ok "export opens" "b.txt" -- ls b-export.lbx /
 ok "sync gc dry" "" -- sync gc b.lbxs --dry-run
 ko "rotate refused on bundle" "not available for a sync bundle" -- rotate-mvk b.lbxs
+ok "bundle resize" "from 64.0 MB to 16.0 MB" -- size b.lbxs --metadata-size 16M
+LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "bundle resize seen by the second device" "Metadata:       16.0 MB" -- size b.lbxs
+LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "bundle second device reads after the resize" "hello vault" -- cat b.lbxs /a.txt
+LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "bundle second device writes after the resize" "" -- put b.lbxs b.txt /after-resize.txt
+ok "bundle first device sees it" "after-resize.txt" -- ls b.lbxs /
+ok "sync verify after the resize" "every object verified" -- sync verify b.lbxs
 cp v-ph.lbx m-ours.lbx; cp v-ph.lbx m-theirs.lbx
 ok "merge: ours change" "" -- put m-ours.lbx a.txt /ours.txt
 ok "merge: theirs change" "" -- put m-theirs.lbx b.txt /theirs.txt
