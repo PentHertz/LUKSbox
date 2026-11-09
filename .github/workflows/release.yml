@@ -230,11 +230,11 @@ jobs:
           #     it the .app crashes at launch (dyld kills the process
           #     before main() runs). Documented in the release notes.
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             fuse_backend: fuset
             archive: luksbox-${{ github.ref_name }}-aarch64-macos-fuset.dmg
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
             fuse_backend: macfuse
             archive: luksbox-${{ github.ref_name }}-aarch64-macos-macfuse.dmg
 
