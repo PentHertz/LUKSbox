@@ -372,6 +372,7 @@ pub enum MountError {
          rebuild luksbox-mount with the matching feature flag.\n\
         - Linux: `apt install libfuse3-dev` and the `fuse` feature.\n\
         - macOS (kext-free): `brew tap macos-fuse-t/homebrew-cask && \
+           brew trust --cask macos-fuse-t/cask/fuse-t && \
            brew install --cask fuse-t` and the `fuse-t` feature.\n\
         - macOS (legacy): `brew install --cask macfuse` and the \
            `fuse` feature.\n\

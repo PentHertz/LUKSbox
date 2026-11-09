@@ -515,6 +515,13 @@ export` turns a bundle back into a `.lbx`.
   no longer fails in optimized builds (its double-click landed while the
   import's background work still changed the browser).
 
+- **macOS CI and release builds: FUSE-T install**. Recent Homebrew
+  refuses casks from a third-party tap until they are trusted
+  ("Refusing to load cask macos-fuse-t/cask/fuse-t from untrusted
+  tap"); the workflows now run `brew trust --cask
+  macos-fuse-t/cask/fuse-t` (this one cask, not the whole tap) before
+  installing it. BUILDING.md, the release notes and the "mount support
+  was not compiled in" message give the same step.
 - **GUI: vault path fields** (Unlock vault, the create form's Vault
   path): the text was drawn against the top edge of the field, and the
   unlock screen's path was in a small monospace font. Both now use the

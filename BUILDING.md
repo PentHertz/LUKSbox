@@ -194,6 +194,7 @@ Works on both Intel (`x86_64-apple-darwin`) and Apple Silicon
    **FUSE-T (recommended, kext-free):**
    ```bash
    brew tap macos-fuse-t/homebrew-cask
+   brew trust --cask macos-fuse-t/cask/fuse-t   # Homebrew versions that ask for it
    brew install --cask fuse-t
    ```
    FUSE-T (https://www.fuse-t.org/) uses an NFS-over-loopback
@@ -782,8 +783,12 @@ provider installed system-wide. Pick one:
 **FUSE-T (recommended, kext-free):**
 ```bash
 brew tap macos-fuse-t/homebrew-cask
+brew trust --cask macos-fuse-t/cask/fuse-t   # Homebrew versions that ask for it
 brew install --cask fuse-t
 ```
+Recent Homebrew refuses casks from a third-party tap until you trust
+them ("Refusing to load cask ... from untrusted tap"); the `brew trust`
+line trusts this one cask, not the whole tap.
 No kernel extension, no Privacy & Security prompt, no Apple-Silicon
 Reduced-Security dance. Just install and mount works.
 
@@ -802,7 +807,7 @@ If you built from source, or want the bare CLI on PATH:
 ```bash
 brew install libfido2
 # Pick one:
-brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t   # kext-free
+brew tap macos-fuse-t/homebrew-cask && brew trust --cask macos-fuse-t/cask/fuse-t && brew install --cask fuse-t   # kext-free
 brew install --cask macfuse                                         # kext-based
 ```
 
@@ -863,7 +868,7 @@ The full security-regression matrix runs as 10 named gate suites in
 |---|---|
 | `error: linking with cc failed: cannot find -lfido2` | libfido2 not installed for the build target. Linux: `apt install libfido2-dev`. macOS: `brew install libfido2` + export `PKG_CONFIG_PATH`. Windows: `vcpkg install libfido2:x64-windows-static-md` + set `VCPKG_ROOT`. |
 | `bindgen ... cannot find libclang.so` | Install `clang`/LLVM: Linux `apt install clang`; Windows `winget install LLVM.LLVM` + `LIBCLANG_PATH=C:\Program Files\LLVM\bin`. |
-| `no such file or directory: fuse3.h` | Linux: `apt install libfuse3-dev`. macOS: install a FUSE provider (`brew tap macos-fuse-t/homebrew-cask && brew install --cask fuse-t` for kext-free, or `brew install --cask macfuse` for the legacy kext-based path) - needed at build *and* runtime. |
+| `no such file or directory: fuse3.h` | Linux: `apt install libfuse3-dev`. macOS: install a FUSE provider (`brew tap macos-fuse-t/homebrew-cask && brew trust --cask macos-fuse-t/cask/fuse-t && brew install --cask fuse-t` for kext-free, or `brew install --cask macfuse` for the legacy kext-based path) - needed at build *and* runtime. |
 | `the WinFsp driver is not present` at runtime | Install WinFsp 2.x from <https://winfsp.dev/rel/>. |
 | Cross-build for arm64 errors `pkg-config has not been configured to support cross-compilation` | The build script handles this for you, set `PKG_CONFIG_ALLOW_CROSS=1` if invoking cargo by hand. |
 | osxcross compile fails with `gen_sdk_package.sh` errors | You're missing the SDK tarball under `tarballs/`. Apple license forbids us from shipping it; see the macOS cross section. |

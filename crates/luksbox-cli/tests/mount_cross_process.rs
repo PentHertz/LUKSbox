@@ -499,11 +499,7 @@ fn background_mount_of_a_sync_bundle_publishes_at_umount() {
     // letter goes away.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let out = as_device(
-            &["get", "v.lbxs", "/written.txt", "out.txt"],
-            &st_b,
-            "b",
-        );
+        let out = as_device(&["get", "v.lbxs", "/written.txt", "out.txt"], &st_b, "b");
         if out.status.success() {
             break;
         }

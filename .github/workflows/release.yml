@@ -476,6 +476,9 @@ jobs:
                   if ! brew list --cask fuse-t >/dev/null 2>&1; then
                       # FUSE-T lives in the macos-fuse-t tap, not core.
                       brew tap macos-fuse-t/homebrew-cask
+                      # Third-party tap: Homebrew loads its casks only
+                      # once trusted (this one cask, not the whole tap).
+                      brew trust --cask macos-fuse-t/cask/fuse-t
                       brew install --cask fuse-t
                   fi
                   for cand in /usr/local/lib/pkgconfig /opt/homebrew/lib/pkgconfig; do
@@ -1687,6 +1690,7 @@ jobs:
 
             FUSE-T (recommended, kext-free):
                 brew tap macos-fuse-t/homebrew-cask
+                brew trust --cask macos-fuse-t/cask/fuse-t   (if Homebrew asks)
                 brew install --cask fuse-t
 
               Uses an NFS-over-loopback transport with no kernel
@@ -3081,6 +3085,7 @@ jobs:
                   download: luksbox-${{ github.ref_name }}-aarch64-macos-fuset.dmg
                   install FUSE-T first:
                       brew tap macos-fuse-t/homebrew-cask
+                      brew trust --cask macos-fuse-t/cask/fuse-t   (if Homebrew asks)
                       brew install --cask fuse-t
                   then drag LUKSbox.app onto Applications.
 

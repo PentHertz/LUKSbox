@@ -229,6 +229,10 @@ jobs:
           # FUSE-T: luksbox-fuse-t (a workspace member) needs its headers
           # and fuse-t.pc to build.
           brew tap macos-fuse-t/homebrew-cask
+          # Homebrew refuses casks from third-party taps until they are
+          # trusted ("Refusing to load cask ... from untrusted tap").
+          # Trust this one cask, not the whole tap.
+          brew trust --cask macos-fuse-t/cask/fuse-t
           brew install --cask fuse-t
           FUSE_PC_PATH=""
           for cand in /usr/local/lib/pkgconfig /opt/homebrew/lib/pkgconfig; do
