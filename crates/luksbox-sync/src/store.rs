@@ -110,6 +110,19 @@ pub trait ObjectStore: Send {
     /// existing object with different bytes is `SyncError::Collision`.
     fn create_new(&mut self, area: Area, name: &Name, bytes: &[u8]) -> Result<Created>;
 
+    /// `create_new` of several independent objects of one area (the pages
+    /// of a commit). Fails if any of them fails; on success each is as
+    /// `create_new` left it (an object already there with the same bytes
+    /// is fine). A store may write them concurrently; this default writes
+    /// them in turn. Nothing names these objects until a later manifest,
+    /// written after `sync`, so a partial batch is only unreferenced.
+    fn create_many(&mut self, area: Area, items: &[(Name, &[u8])]) -> Result<()> {
+        for (name, bytes) in items {
+            self.create_new(area, name, bytes)?;
+        }
+        Ok(())
+    }
+
     /// Remove one object by name. `Ok(false)` if it was not there.
     fn remove(&mut self, area: Area, name: &Name) -> Result<bool>;
 

@@ -1042,18 +1042,30 @@ pub fn convert(
     let pages = page_count(image_len, ps);
     let mut entries: Vec<ObjRef> = Vec::with_capacity(pages as usize);
     let mut buf = zeroize::Zeroizing::new(vec![0u8; ps as usize]);
-    for i in 0..pages {
-        let off = i * ps;
-        let n = ps.min(image_len - off) as usize;
-        buf.fill(0);
-        src.read_at(image_start + off, &mut buf[..n])?;
-        let (oid, obj) =
-            crate::codec::seal_new(&keys, Kind::Page, crate::codec::Binding::Index(i), &buf)?;
+    // Sealed in batches of bounded size, each written with `create_many`
+    // (concurrently where the store can).
+    const CONVERT_BATCH_BYTES: u64 = 32 << 20;
+    let per_batch = (CONVERT_BATCH_BYTES / ps).max(1);
+    let mut i = 0;
+    while i < pages {
+        let end = (i + per_batch).min(pages);
+        let mut batch: Vec<(Name, Vec<u8>)> = Vec::with_capacity((end - i) as usize);
+        for j in i..end {
+            let off = j * ps;
+            let n = ps.min(image_len - off) as usize;
+            buf.fill(0);
+            src.read_at(image_start + off, &mut buf[..n])?;
+            let (oid, obj) =
+                crate::codec::seal_new(&keys, Kind::Page, crate::codec::Binding::Index(j), &buf)?;
+            entries.push(ObjRef::of(oid, &obj));
+            batch.push((Name::Object(oid), obj));
+        }
+        let items: Vec<(Name, &[u8])> = batch.iter().map(|(n, o)| (*n, o.as_slice())).collect();
         store
             .lock()
             .expect("store lock")
-            .create_new(Area::Page, &Name::Object(oid), &obj)?;
-        entries.push(ObjRef::of(oid, &obj));
+            .create_many(Area::Page, &items)?;
+        i = end;
     }
     let mut tables = Vec::new();
     for (b, chunk) in entries.chunks(ENTRIES_PER_BLOCK).enumerate() {
@@ -2525,14 +2537,25 @@ impl Session {
         checkpoint_override: Option<BTreeMap<crate::manifest::DeviceId, u64>>,
         prepared: &crate::image::Prepared,
     ) -> Result<Reserved> {
-        for (_, r) in &prepared.pages {
-            let obj = crate::image::outbox_object(&self.local, &r.object_id())?;
-            self.store.lock().expect("store lock").create_new(
-                Area::Page,
-                &Name::Object(r.object_id()),
-                &obj,
-            )?;
-        }
+        // In batches of bounded size, so the store can write a batch
+        // concurrently (`ObjectStore::create_many`).
+        const UPLOAD_BATCH_BYTES: usize = 32 << 20;
+        let page_bytes = (self.head.m.page_size as usize).max(1);
+        let per_batch = (UPLOAD_BATCH_BYTES / page_bytes).max(1);
+        for chunk in prepared.pages.chunks(per_batch) {
+            let oids: Vec<_> = chunk.iter().map(|(_, r)| r.object_id()).collect();
+            let objs = crate::image::outbox_objects(&self.local, &oids)?;
+            let batch: Vec<(Name, Vec<u8>)> = oids
+                .iter()
+                .map(|o| Name::Object(*o))
+                .zip(objs)
+                .collect();
+            let items: Vec<(Name, &[u8])> =
+                batch.iter().map(|(n, o)| (*n, o.as_slice())).collect();
+            self.store
+                .lock()
+                .expect("store lock")
+                .create_many(Area::Page, &items)?;        }
         {
             let mut s = self.store.lock().expect("store lock");
             for (_, r, obj, _) in &prepared.new_tables {

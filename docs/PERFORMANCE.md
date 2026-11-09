@@ -65,6 +65,58 @@ Every vault kind reads and writes at a few hundred MB/s, far above the
 speed of a USB stick or a network, so these are rarely the limit. The
 exceptions are the costs listed under "What still costs".
 
+## Windows 11
+
+Measured 2026-11-08 on Windows 11 Home 26200, AMD Ryzen 9 5900HX (AES
+instructions), NVMe SSD, Microsoft Defender real-time protection on;
+512 MiB of random bytes, times with the unlock (about 0.46 s);
+`scripts/bench_transfer.ps1`, two runs (range shown). "before" is this
+branch before the Windows review (GNU toolchain build), "now" adds its
+fixes (CHANGELOG), MSVC release build (`x86_64-pc-windows-msvc`, static
+CRT, `--no-default-features`), as shipped.
+
+| `luksbox put` / `get`, MB/s | before | now (MSVC) | Linux VM, above |
+|---|---|---|---|
+| AES-256-GCM-SIV (default) | 206 / 306 | 219-225 / 319-329 | 256 / 347 |
+| AES-256-GCM | 222 / 324 | 242-244 / 336-340 | 260 / 351 |
+| ChaCha20-Poly1305 | 220 / 295 | 194-210 / 295 | 238 / 305 |
+| `--hide-sizes` | 93 / 306 | 92-95 / 307-308 | 113 / 314 |
+| `--pad-files` | 127 / 309 | 128-133 / 319-332 | 156 / 341 |
+| Detached header | 217 / 317 | 188-243 / 317-329 | 249 / 346 |
+| Sync bundle, 4 MiB pages (default) | 101 / 183 | 151-160 / 208-213 | 155 / 208 |
+| Sync bundle, 1 MiB pages | 65 / 146 | 118-129 / 205-212 | 141 / 243 |
+| Sync bundle, 16 MiB pages | 114 / 178 | 144-154 / 213-220 | 142 / 218 |
+
+With the default 4 MiB pages and with 16 MiB pages a bundle now moves
+data as fast as on the Linux reference. With 1 MiB pages it is still
+10-15 % behind; a profile of that `put` shows why: the bundle's own
+work (sealing, outbox, upload) costs 1.8 s on top of the vault's, about
+what it costs on Linux (1.6 s), and its two writes of every page run at
+530-700 MB/s, the speed this disk gives flushed 1 MiB files from
+several threads (600 MB/s measured with plain .NET file writes). The
+rest is the Windows file system's per-file cost (flush, Defender scan
+of each new file), which smaller pages pay more often.
+
+Through a WinFsp mount (WinFsp 2.1, `luksbox mount --foreground` on a
+sync bundle with 4 MiB pages, full default-feature MSVC build): 512 MiB
+written and flushed in 4.9 s (105 MB/s), read back in 3.7 s (140 MB/s),
+1 000 files of 1 KiB created in 0.55 s (about 1 800 files/s); the
+unmount publishes in under a second, and a fresh device then reads
+everything back from the bundle (`sync verify`: 1 001 files, every
+object verified). The background mount (`luksbox mount` without
+`--foreground`) of a bundle works the same way.
+
+What made the difference: every page of a bundle is written twice with
+a flush (to the local outbox at the save, to the bundle at the publish),
+and on Windows a flush plus the virus scan of each new file costs about
+3 ms per 1 MiB object on one thread. The pages of a batch are now
+sealed, written and read back concurrently (eight at a time:
+`LocalStore::put_many` / `get_many`, `ObjectStore::create_many`), which
+roughly doubles flushed-write throughput on an SSD (1 MiB objects: 300 ->
+600 MB/s); every object is still flushed before the record or manifest
+that names it. The Windows store also verifies a shard folder once and
+keeps it pinned instead of resolving its path for every object.
+
 ## macOS (Apple Silicon, FUSE-T)
 
 Measured 2026-11-08 on macOS 26.6, Apple M5 Max, internal SSD, FUSE-T

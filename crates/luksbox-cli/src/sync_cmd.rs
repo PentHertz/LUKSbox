@@ -439,6 +439,33 @@ pub(crate) fn open_with_material(
     Ok(container)
 }
 
+/// [`open_with_material`] for a sync bundle whose master key is already
+/// in hand: the Windows background mount helper, which gets the key from
+/// the `luksbox mount` that unlocked the bundle (handoff protocol v3).
+/// Each header is checked against the key; the session is kept in
+/// `SESSION` as for any other open.
+#[cfg(target_os = "windows")]
+pub(crate) fn open_bundle_with_key(
+    path: &Path,
+    mvk: &luksbox_core::MasterVolumeKey,
+) -> Result<Container> {
+    if !is_bundle(path) {
+        return Err(format!("{} is not a sync bundle", path.display()).into());
+    }
+    finish_active_session()?;
+    let opts = OpenOptions {
+        device_label: device_label(),
+        read_only: false,
+    };
+    let root = local_root()?;
+    let (session, container, report) = bundle::fs::open_with_key(path, &root, mvk, &opts)?;
+    print_report(path, &report);
+    if let Ok(mut g) = SESSION.lock() {
+        *g = Some(session);
+    }
+    Ok(container)
+}
+
 /// Let go of the bundle session without publishing or closing its lease:
 /// for the parent of a background mount, whose child process now owns
 /// the session (R16-13). Without this the parent published (possibly a

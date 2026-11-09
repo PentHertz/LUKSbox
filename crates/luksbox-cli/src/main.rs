@@ -1564,6 +1564,9 @@ fn refuse_bundles_where_unsupported(cmd: &Command) -> Result<()> {
         | Command::DeniableUpgradeHeader { path, .. }
         | Command::DeniableResize { path, .. }
         | Command::DeniableRotate { path, .. } => (path, "a deniable vault"),
+        // On Windows the helper holds the background mount, and opens a
+        // sync bundle itself (hand-off protocol v3).
+        #[cfg(not(target_os = "windows"))]
         Command::MountFuseTHelper { vault, .. } => (vault, "the FUSE-T mount helper"),
         Command::Create { path, .. } if path.extension().is_some_and(|e| e == "lbxs") => {
             return Err(cli_err!(
@@ -7908,21 +7911,18 @@ fn cmd_mount(
     // windowless `luksbox` process that this one hands the unlocked
     // vault to.
     #[cfg(target_os = "windows")]
-    if !foreground && vfs.container().is_external() {
-        return Err(cli_err!(
-            "on Windows, mount a sync bundle with --foreground (the background \
-             mount hands the vault to another process, which bundles do not support yet)"
-        ));
-    }
-    #[cfg(target_os = "windows")]
     if !foreground {
         // `--anchor`, or the automatic one of a vault in a cloud folder:
         // the helper process verifies and keeps it current.
         let anchor = vfs.container().anchor_path().map(Path::to_path_buf);
+        // A sync bundle is handed over as a bundle (protocol v3): the
+        // helper opens its own sync session with the key.
+        let bundle = sync_cmd::is_bundle(&path_abs).then(|| path_abs.clone());
         return mount_in_background(
             vfs,
             unlock.header.as_deref(),
             anchor.as_deref(),
+            bundle.as_deref(),
             &mp_abs,
             sync_mode,
             shrink_on_close,
@@ -8193,6 +8193,18 @@ fn cmd_mount_fuse_t_helper(
             )
             .map_err(|e| format!("open deniable container ({}): {e}", vault_abs.display()))?
         }
+        // v3: a sync bundle (Windows background mount). The bundle is
+        // opened with the key: every header is checked against it, and
+        // this process takes its own sync session, which publishes while
+        // mounted and at unmount (`install_mount_hook` below).
+        #[cfg(target_os = "windows")]
+        0x03 => {
+            if header_abs.is_some() || anchor_abs.is_some() {
+                return Err("a sync bundle takes no --header or --anchor".into());
+            }
+            sync_cmd::open_bundle_with_key(&vault_abs, &mvk)
+                .map_err(|e| format!("open sync bundle ({}): {e}", vault_abs.display()))?
+        }
         other => {
             return Err(format!(
                 "unknown helper protocol version 0x{other:02x} from parent (expected 0x01 or 0x02)"
@@ -8200,6 +8212,7 @@ fn cmd_mount_fuse_t_helper(
             .into());
         }
     };
+    let is_bundle_handoff = version_byte[0] == 0x03;
     // The parent verified the anchor before the hand-off, but this
     // process opens the vault file again: verify it again here, so a
     // vault swapped for an older copy in between is still refused, and
@@ -8213,6 +8226,10 @@ fn cmd_mount_fuse_t_helper(
     let mut vfs = Vfs::open(container).map_err(|e| format!("open Vfs: {e}"))?;
     check_vault_anchor(trusted_anchor_gen, &mut vfs)?;
     vfs.set_shrink_on_close(shrink_on_close);
+    if is_bundle_handoff {
+        // Publish now and then while mounted, and everything at unmount.
+        sync_cmd::install_mount_hook();
+    }
     eprintln!("luksbox-mount-helper: Vfs ready, calling mount");
 
     // Run the mount in foreground (no daemonize). The parent process
@@ -8292,7 +8309,11 @@ fn report_ready_and_release_stderr() {
 /// readable there for as long as the vault is mounted. An allowlist, so
 /// forgetting to update it can only lose a setting, never leak a secret.
 #[cfg(target_os = "windows")]
-const BACKGROUND_MOUNT_ENV_ALLOWLIST: [&str; 8] = [
+const BACKGROUND_MOUNT_ENV_ALLOWLIST: [&str; 10] = [
+    // Sync bundles: which device state and identity the helper's session
+    // uses; it must be the same as the `luksbox mount` that started it.
+    "LUKSBOX_SYNC_STATE_DIR",
+    "LUKSBOX_DEVICE_LABEL",
     "LUKSBOX_NO_FOLLOW_SYMLINKS",
     "LUKSBOX_NO_LOCK",
     "LUKSBOX_FORMAT_V2",
@@ -8337,6 +8358,7 @@ fn mount_in_background(
     vfs: Vfs,
     header: Option<&Path>,
     anchor: Option<&Path>,
+    bundle: Option<&Path>,
     mountpoint: &Path,
     sync_mode: bool,
     shrink_on_close: bool,
@@ -8364,7 +8386,10 @@ fn mount_in_background(
         p.canonicalize()
             .map_err(|e| cli_err!("cannot resolve {what} {}: {e}", p.display()))
     };
-    let vault = resolve(vfs.container().vault_path(), "vault")?;
+    let vault = match bundle {
+        Some(b) => resolve(b, "sync bundle")?,
+        None => resolve(vfs.container().vault_path(), "vault")?,
+    };
     let header = header.map(|p| resolve(p, "--header")).transpose()?;
     let anchor = anchor.map(|p| resolve(p, "--anchor")).transpose()?;
 
@@ -8380,6 +8405,12 @@ fn mount_in_background(
     {
         let mvk = vfs.container().mvk_clone();
         match vfs.container().deniable_handoff_state() {
+            // v3: a sync bundle, MVK only; the helper opens the bundle
+            // with it (each header is checked against the key).
+            None if bundle.is_some() => {
+                handoff.push(0x03);
+                handoff.extend_from_slice(mvk.as_bytes());
+            }
             None => {
                 handoff.push(0x01);
                 handoff.extend_from_slice(mvk.as_bytes());
@@ -8397,8 +8428,14 @@ fn mount_in_background(
             }
         }
     }
-    // Flush and close: the helper takes the vault's lock next.
+    // Flush and close: the helper takes the vault's lock next. For a sync
+    // bundle, also end this process's session the way every command does
+    // (publish what the open merged or replayed, remove its lease), which
+    // releases the per-device state lock the helper's session takes next.
     drop(vfs.close()?);
+    if bundle.is_some() {
+        sync_cmd::finish_active_session()?;
+    }
 
     // 2. Start the helper.
     let mut cmd = Command::new(&exe);
@@ -8987,7 +9024,7 @@ fn cmd_deniable_mount(
     #[cfg(target_os = "windows")]
     if !foreground {
         // Deniable vaults never shrink (a shrinking file would reveal deletions).
-        return mount_in_background(vfs, None, anchor, &mp_abs, sync_mode, false);
+        return mount_in_background(vfs, None, anchor, None, &mp_abs, sync_mode, false);
     }
 
     luksbox_mount::mount(vfs, &mp_abs, !foreground, sync_mode)?;

@@ -27,6 +27,80 @@ pub trait LocalStore: Send {
     fn put(&mut self, name: &str, bytes: &[u8]) -> Result<()>;
     fn remove(&mut self, name: &str) -> Result<()>;
     fn list(&mut self) -> Result<Vec<String>>;
+
+    /// `put` of several independent objects (outbox pages), one result
+    /// per item, in order. Each `Ok` item is as durable as after `put`;
+    /// the caller decides what the failed ones mean. A store may write
+    /// them concurrently (the per-object flush dominates a save, and
+    /// flushes overlap well on SSDs); this default writes them in turn
+    /// and stops at the first failure.
+    /// `get` of several objects, one result per name, in order. A store
+    /// may read them concurrently; this default reads them in turn.
+    fn get_many(&mut self, names: &[String]) -> Vec<Result<Option<Vec<u8>>>> {
+        names.iter().map(|n| self.get(n)).collect()
+    }
+
+    fn put_many(&mut self, items: &[(String, &[u8])]) -> Vec<Result<()>> {
+        let mut out = Vec::with_capacity(items.len());
+        let mut failed = false;
+        for (name, bytes) in items {
+            if failed {
+                out.push(Err(not_attempted()));
+                continue;
+            }
+            let r = self.put(name, bytes);
+            failed = r.is_err();
+            out.push(r);
+        }
+        out
+    }
+}
+
+/// Result of a `put_many` item skipped after an earlier failure.
+pub(crate) fn not_attempted() -> SyncError {
+    SyncError::Io(std::io::Error::other(
+        "not written: an earlier write of the same batch failed",
+    ))
+}
+
+/// How many objects a filesystem store writes at once in a batch.
+/// Measured on Windows 11 / NVMe: 1 MiB objects with a flush each go
+/// from ~300 MB/s on one thread to ~600 MB/s on four and a little more
+/// on eight (a 1 MiB-page bundle put: 116 -> ~122 MB/s); 4 MiB objects
+/// are no faster past four.
+pub(crate) const PARALLEL_WRITES: usize = 8;
+
+/// Run `f` on every item, `PARALLEL_WRITES` at a time, one result per
+/// item in order.
+pub(crate) fn run_parallel<T: Sync, R: Send>(
+    items: &[T],
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    if items.len() <= 1 {
+        return items.iter().map(&f).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<R>>> = items.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|s| {
+        for _ in 0..PARALLEL_WRITES.min(items.len()) {
+            s.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    let r = f(item);
+                    *slots[i].lock().expect("slot lock") = Some(r);
+                }
+            });
+        }
+    });
+    slots
+        .into_iter()
+        .map(|m| {
+            m.into_inner()
+                .expect("slot lock")
+                .expect("every item ran")
+        })
+        .collect()
 }
 
 /// Local names: lowercase letters, digits, `-` and `.`, at most 100
@@ -195,6 +269,38 @@ impl LocalStore for FsLocal {
             luksbox_core::file_util::atomic_secure_write(&p, bytes)?;
             Ok(())
         }
+    }
+
+    fn get_many(&mut self, names: &[String]) -> Vec<Result<Option<Vec<u8>>>> {
+        let dir = &self.dir;
+        run_parallel(names, |name| {
+            check_name(name)?;
+            match open_no_follow(&dir.join(name)) {
+                Ok(mut f) => {
+                    use std::io::Read;
+                    let mut v = Vec::new();
+                    f.read_to_end(&mut v)?;
+                    Ok(Some(v))
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.into()),
+            }
+        })
+    }
+
+    /// Outbox pages are independent files, each written atomically and
+    /// flushed (`atomic_secure_write`) before its result is `Ok`: writing
+    /// several at once keeps every guarantee of `put` and overlaps the
+    /// flushes. Apple platforms keep the ordered single-writer path
+    /// (`put_ordered`: one cache flush per record, not per object).
+    #[cfg(not(target_vendor = "apple"))]
+    fn put_many(&mut self, items: &[(String, &[u8])]) -> Vec<Result<()>> {
+        let dir = &self.dir;
+        run_parallel(items, |(name, bytes)| {
+            check_name(name)?;
+            luksbox_core::file_util::atomic_secure_write(&dir.join(name), bytes)?;
+            Ok(())
+        })
     }
 
     fn remove(&mut self, name: &str) -> Result<()> {

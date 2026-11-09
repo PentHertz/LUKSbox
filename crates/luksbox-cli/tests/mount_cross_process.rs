@@ -424,3 +424,98 @@ fn background_mount_returns_and_umount_releases_it() {
         b"written through the background mount"
     );
 }
+
+/// Windows: a sync bundle mounts in the background too. The `mount`
+/// process unlocks it, ends its own sync session, and hands the key to the
+/// hidden process (hand-off protocol v3), which opens its own session
+/// with it, holds the mount and publishes at unmount: another device then
+/// sees what was written through the mount.
+#[cfg(target_os = "windows")]
+#[test]
+fn background_mount_of_a_sync_bundle_publishes_at_umount() {
+    if !mount_backend_or_skip() {
+        return;
+    }
+    let _serial = one_mount_test_at_a_time();
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let state = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let as_device = |args: &[&str], st: &str, label: &str| {
+        Command::new(bin())
+            .args(args)
+            .current_dir(dir)
+            .envs(ENV)
+            .env("LUKSBOX_SYNC_STATE_DIR", st)
+            .env("LUKSBOX_DEVICE_LABEL", label)
+            .output()
+            .expect("spawn binary")
+    };
+    let (st_a, st_b) = (state("state-a"), state("state-b"));
+
+    assert_ok(&run(dir, &["create", "vault.lbx"]), "create");
+    std::fs::write(dir.join("hello.txt"), b"hello from the bundle").unwrap();
+    assert_ok(
+        &run(dir, &["put", "vault.lbx", "hello.txt", "/hello.txt"]),
+        "put",
+    );
+    assert_ok(
+        &as_device(&["sync", "convert", "vault.lbx", "v.lbxs"], &st_a, "a"),
+        "sync convert",
+    );
+
+    let mountpoint = new_mountpoint(dir);
+    let _unmount = UnmountOnDrop(mountpoint.clone());
+    let out = as_device(
+        &["mount", "v.lbxs", &mountpoint.to_string_lossy()],
+        &st_a,
+        "a",
+    );
+    assert_ok(&out, "background luksbox mount of a sync bundle");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("(background, pid "),
+        "expected the background notice, got: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(in_mount(&mountpoint, "hello.txt")).expect("read through the mount"),
+        b"hello from the bundle"
+    );
+    std::fs::write(
+        in_mount(&mountpoint, "written.txt"),
+        b"written through a background bundle mount",
+    )
+    .expect("write through the mount");
+
+    let out = Command::new(bin())
+        .arg("umount")
+        .arg(&mountpoint)
+        .current_dir(dir)
+        .output()
+        .expect("spawn luksbox umount");
+    assert_ok(&out, "luksbox umount of the background bundle mount");
+
+    // Another device (its own state) reads the commit the mount published
+    // at unmount; the publish may still be finishing when the drive
+    // letter goes away.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let out = as_device(
+            &["get", "v.lbxs", "/written.txt", "out.txt"],
+            &st_b,
+            "b",
+        );
+        if out.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "written.txt not in the bundle 30 s after umount:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(
+        std::fs::read(dir.join("out.txt")).unwrap(),
+        b"written through a background bundle mount"
+    );
+}

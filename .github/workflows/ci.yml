@@ -389,6 +389,17 @@ jobs:
         # path, accept 8.3 short names. Needs no WinFsp; lives in this job
         # to reuse its Windows runner.
         run: cargo test --release -p luksbox-core --test windows_extract_junction
+      - name: Run sync bundle tests on Windows (luksbox-sync, CLI sync/merge)
+        shell: pwsh
+        # The Windows bundle store (crates/luksbox-sync/src/fs_store_win.rs)
+        # is compiled only here: its unit tests cover junctions, hard
+        # links, folder pinning, sharing-violation retries, temporary-file
+        # sweeping and real Cloud Files placeholders (OneDrive Files
+        # On-Demand), and the rest of the crate's suite runs through it.
+        # Needs no WinFsp; lives in this job to reuse its Windows runner.
+        run: |
+          cargo test --release -p luksbox-sync
+          cargo test --release -p luksbox-cli --test sync_bundle --test merge_safety
 
   # ---- Security regression spotlight (always-green gate) ------------------
   # Runs JUST the 26 security regression tests added during the audit

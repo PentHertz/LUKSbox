@@ -131,6 +131,38 @@ export` turns a bundle back into a `.lbx`.
 
 ### Security
 
+- **Windows review of 2026-11-08 (sync bundle store).** First run of the
+  sync bundle code on Windows (Windows 11, NVMe, Defender on); the
+  entries below each have a regression test in
+  `crates/luksbox-sync/src/fs_store_win.rs`, and CI now runs
+  `luksbox-sync` and the CLI sync tests on its Windows runner.
+- **A locked object was taken for a damaged one (Windows).** Any error
+  opening an object, a sharing violation from a sync client or virus
+  scanner included, was reported as a refused object, which the bundle
+  counts as damage: a false rollback alarm, and an object refused on
+  this device only could leave another device's commit unreachable and
+  planned for garbage collection. Only the store's own checks (link,
+  junction, wrong kind) now refuse; OS errors are I/O errors, as on
+  Unix, and sharing violations are retried with backoff first.
+- **A folder could be swapped for a junction between its check and a
+  write or deletion (Windows).** The bundle, area and shard folders are
+  now pinned (held open without `FILE_SHARE_DELETE`) while the store
+  works in them, so they cannot be renamed, deleted or replaced; the
+  area folders `h`, `l`, `x` were not checked again at all after open.
+  A folder that differs from ours only in case (`AB` for `ab`) is no
+  longer taken for ours.
+- **OneDrive Files On-Demand folders were refused (Windows).** Cloud
+  placeholders are reparse points; when they show as such, the whole
+  bundle was refused as "a link". Cloud Files reparse tags are now
+  accepted (and the file re-opened normally so it can be downloaded,
+  required to be the same file); every other reparse point stays
+  refused. An online-only object whose provider is not running is an
+  I/O error, not a damaged object. Tested on real placeholders made
+  with the Cloud Files API under a local sync root.
+- **Temporary files of interrupted writes stayed forever (Windows).**
+  Objects are now written as `.tmp-<hex>` and installed with a
+  write-through, no-replace rename; `sweep_tmp` removes leftovers (and
+  the `<name>.tmp.<hex>` files of earlier builds).
 - **macOS review of 2026-11-08 (sync bundles, merge, vault I/O, mounts).**
   The entries below up to the `cargo audit` one come from a security and
   functional review of this branch on macOS 26 (Apple M5 Max, FUSE-T
@@ -328,6 +360,16 @@ export` turns a bundle back into a `.lbx`.
 
 ### Performance
 
+- **Sync bundles write and read their pages concurrently.** A save
+  seals and writes a batch of pages eight at a time to the local outbox,
+  and a publish reads them back and writes them to the bundle the same
+  way (`LocalStore::put_many` / `get_many`, `ObjectStore::create_many`;
+  Apple platforms keep their ordered outbox path). Every object is
+  still flushed before the record or manifest that names it. On
+  Windows 11 (NVMe, Defender on, MSVC release build), 512 MiB put /
+  get: 4 MiB pages 101 / 183 -> 151-160 / 208-213 MB/s, 1 MiB pages
+  65 / 146 -> 118-129 / 205-212 (`docs/PERFORMANCE.md`,
+  `scripts/bench_transfer.ps1`).
 - **Hardware AES on Apple Silicon and Linux arm64.** The `aes` and
   `polyval` crates under AES-256-GCM-SIV (the default) and AES-256-GCM
   ran their software implementation on 64-bit ARM: they need the
@@ -386,6 +428,17 @@ export` turns a bundle back into a `.lbx`.
 
 ### Fixed
 
+- **Windows: `luksbox mount` of a sync bundle in the background.** It
+  needed `--foreground`. The `mount` process unlocks the bundle, ends
+  its own session (publishing what the open merged), and hands the key
+  to the hidden mount process over the existing pipe (hand-off protocol
+  v3: version byte, then the 32-byte key); that process opens its own
+  sync session with the key, every header checked against it, and
+  publishes while mounted and at unmount. Its environment keeps the two
+  non-secret sync settings (`LUKSBOX_SYNC_STATE_DIR`,
+  `LUKSBOX_DEVICE_LABEL`) so it acts as the same device; unlock secrets
+  are still removed. Test:
+  `background_mount_of_a_sync_bundle_publishes_at_umount`.
 - **A vault with a small file list region could stop saving for good.**
   The list of free space is saved in the region, and deleting,
   truncating or overwriting a large file (whose chunk list is not in

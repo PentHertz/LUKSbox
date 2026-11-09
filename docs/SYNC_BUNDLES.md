@@ -314,8 +314,8 @@ accepts it in place of the vault.
   bundle keeps its own rollback state on each device), adding a
   post-quantum keyslot (export, enroll, convert again).
 - Mounting a bundle: not with the macOS FUSE-T GUI helper (use the
-  browser, or `luksbox mount` in a terminal); on Windows only with
-  `--foreground`.
+  browser, or `luksbox mount` in a terminal). On Windows `luksbox mount`
+  works in the background as for a `.lbx` (and with `--foreground`).
 - **Revoking a lost device**: revoking its keyslot stops LuksBox from
   opening the vault with it, but the master key does not change, the
   old keyslot table stays in the folder until `sync gc` and in the

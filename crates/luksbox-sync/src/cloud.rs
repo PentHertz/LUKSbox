@@ -47,7 +47,9 @@ pub fn merge_command(copy: &Path, vault: &Path) -> String {
 /// The sync service a path appears to live under, if any.
 pub fn cloud_service(path: &Path) -> Option<&'static str> {
     let abs = std::path::absolute(path).ok()?;
-    let lower = abs.to_string_lossy().to_lowercase();
+    // Separators normalised so the substring checks below behave the same
+    // whatever the host's separator (`absolute` yields `\` on Windows).
+    let lower = abs.to_string_lossy().to_lowercase().replace('\\', "/");
     let comps: Vec<String> = abs
         .components()
         .map(|c| c.as_os_str().to_string_lossy().to_lowercase())

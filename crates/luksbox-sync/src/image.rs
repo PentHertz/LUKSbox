@@ -505,25 +505,68 @@ impl ImageCore {
     /// Seal every dirty page as a new outbox object. Objects they replace
     /// go to `superseded`, removed at the next save.
     fn seal_dirty(&mut self, local: &mut dyn LocalStore) -> Result<()> {
-        while let Some((idx, page)) = self.dirty.pop_first() {
-            let sealed = codec::seal_new(&self.keys, Kind::Page, Binding::Index(idx), &page)
-                .and_then(|(oid, obj)| {
-                    local.put(&outbox_name(&oid), &obj)?;
-                    Ok((oid, obj))
-                });
-            let (oid, obj) = match sealed {
-                Ok(o) => o,
+        // Pages are sealed and written a batch at a time (bounded memory:
+        // the sealed copies of one batch), so the store can write a batch
+        // concurrently (`LocalStore::put_many`).
+        const BATCH_BYTES: usize = 32 << 20;
+        while !self.dirty.is_empty() {
+            let mut batch: Vec<(u64, Zeroizing<Vec<u8>>)> = Vec::new();
+            let mut bytes = 0usize;
+            while let Some((idx, page)) = self.dirty.pop_first() {
+                bytes += page.len();
+                batch.push((idx, page));
+                if bytes >= BATCH_BYTES {
+                    break;
+                }
+            }
+            // Sealing is independent per page (fresh random object id
+            // each): done concurrently too.
+            let keys = &self.keys;
+            let sealed: Result<Vec<_>> = crate::local::run_parallel(&batch, |(idx, page)| {
+                codec::seal_new(keys, Kind::Page, Binding::Index(*idx), page)
+            })
+            .into_iter()
+            .collect();
+            let sealed = match sealed {
+                Ok(s) => s,
                 Err(e) => {
                     // Still changed: sealed by the next attempt.
-                    self.dirty.insert(idx, page);
+                    for (idx, page) in batch {
+                        self.dirty.insert(idx, page);
+                    }
                     return Err(e);
                 }
             };
-            if let Some(old) = self.staged.insert(idx, ObjRef::of(oid, &obj)) {
-                self.superseded.push(old.object_id());
+            let names: Vec<String> = sealed.iter().map(|(oid, _)| outbox_name(oid)).collect();
+            let items: Vec<(String, &[u8])> = names
+                .into_iter()
+                .zip(sealed.iter().map(|(_, obj)| obj.as_slice()))
+                .collect();
+            let results = local.put_many(&items);
+            drop(items);
+            let mut first_err = None;
+            for (((idx, page), (oid, obj)), r) in batch.into_iter().zip(sealed).zip(results) {
+                match r {
+                    Ok(()) => {
+                        if let Some(old) = self.staged.insert(idx, ObjRef::of(oid, &obj)) {
+                            self.superseded.push(old.object_id());
+                        }
+                        // Sealed: readable from the cache without opening
+                        // the object.
+                        self.cache.put(idx, page);
+                    }
+                    Err(e) => {
+                        // Still changed: sealed by the next attempt.
+                        self.dirty.insert(idx, page);
+                        if first_err.is_none() {
+                            first_err = Some(e);
+                        }
+                    }
+                }
             }
-            // Sealed: readable from the cache without opening the object.
-            self.cache.put(idx, page);
+            if let Some(e) = first_err {
+                return Err(e);
+            }
         }
         Ok(())
     }
@@ -821,16 +864,22 @@ impl ImageCore {
     }
 }
 
-/// A staged page's sealed object, from the local outbox.
-pub(crate) fn outbox_object(local: &SharedLocal, oid: &ObjectId) -> Result<Vec<u8>> {
+/// Several staged pages' sealed objects, from the local outbox (read
+/// concurrently where the store can), in order.
+pub(crate) fn outbox_objects(local: &SharedLocal, oids: &[ObjectId]) -> Result<Vec<Vec<u8>>> {
+    let names: Vec<String> = oids.iter().map(outbox_name).collect();
     local
         .lock()
         .expect("local lock")
-        .get(&outbox_name(oid))?
-        .ok_or_else(|| SyncError::Malformed {
-            name: "local outbox".into(),
-            why: "a staged page is missing from the outbox",
+        .get_many(&names)
+        .into_iter()
+        .map(|r| {
+            r?.ok_or_else(|| SyncError::Malformed {
+                name: "local outbox".into(),
+                why: "a staged page is missing from the outbox",
+            })
         })
+        .collect()
 }
 
 pub(crate) struct Prepared {
@@ -1156,7 +1205,7 @@ mod tests {
         let local = c.lock().unwrap().local.clone().unwrap();
         let mut s = store.lock().unwrap();
         for (_, r) in &prepared.pages {
-            let obj = outbox_object(&local, &r.object_id()).unwrap();
+            let obj = outbox_objects(&local, &[r.object_id()]).unwrap().remove(0);
             s.create_new(Area::Page, &Name::Object(r.object_id()), &obj)
                 .unwrap();
         }

@@ -42,17 +42,21 @@ Where the code departs from the plan below, and why:
   sides are not merged.
 - **Convert** also brings the bundle's header to format v3 (a second
   commit), so devices never each upgrade it independently.
-- **Windows store.** The standard library has no directory-handle-
-  relative opens on Windows: every object is read through a handle
-  opened with `FILE_FLAG_OPEN_REPARSE_POINT` whose resolved path must
-  equal the expected path inside the bundle (the existing junction
-  guard). Writes and deletions go by path after the same check on the
-  folder, so a junction swapped in between the check and the write
-  would redirect it (open item: create relative to the folder handle
-  with `NtCreateFile`). Hard links are not refused on Windows (the
-  link count is not in stable `std`); their content still has to pass
-  the object's AEAD. Compile-checked for Windows and macOS; run-tested
-  on Linux only.
+- **Windows store** (`fs_store_win.rs`). The standard library has no
+  directory-handle-relative opens on Windows: every object is read
+  through a handle opened with `FILE_FLAG_OPEN_REPARSE_POINT` whose
+  resolved path must equal the expected path inside the bundle, last
+  component case included (the existing junction guard). Writes and
+  deletions go by path, inside folders that are pinned: the bundle and
+  area folders for the store's lifetime, each shard folder from its
+  first use, all held open without `FILE_SHARE_DELETE`, so a verified
+  folder cannot be renamed, deleted or swapped for a junction while the
+  store uses it. Hard links are refused (link count from
+  `GetFileInformationByHandle`). Cloud Files placeholders (OneDrive
+  Files On-Demand) are the one reparse point accepted. Sharing
+  violations are retried with backoff, and are I/O errors, never a
+  refused (damaged) object. Run-tested on Windows 11 (see the
+  verification table); compile-checked for macOS.
 - **Leases** pin their base for 90 days; garbage collection is
   explicit (`luksbox sync gc`), never automatic.
 - **Uploads never hold the vault.** A publish takes the last saved
@@ -133,10 +137,11 @@ changes), and `umount` waiting for the daemon's final publish.
 Not done yet: the external witness file (5.4), `forget-device`,
 recipient keyslots and epoch keys (phase 3), MVK rotation, panic and
 post-quantum enrollment on a bundle, bundles with a detached header,
-mounting a bundle through the macOS FUSE-T GUI helper and the Windows
-background mount, native provider APIs, a GUI "resolve conflict
-copy" flow (the GUI names the copies and points at `luksbox merge`),
-and handle-relative writes in the Windows store. A header fork (the
+mounting a bundle through the macOS FUSE-T GUI helper (the Windows
+background mount hands a bundle over with hand-off protocol v3: the
+helper opens its own session with the key), native provider APIs, and a GUI "resolve conflict
+copy" flow (the GUI names the copies and points at `luksbox merge`).
+A header fork (the
 rest of the header changed on both sides; keyslot changes alone are
 merged) has no resolve command: after `convert` brings the header to
 format v3, nothing on a bundle changes those fields (rotation is
@@ -152,7 +157,8 @@ Verification so far:
 | `luksbox-merge` | 11 rule tests and a randomized "no version lost" property |
 | Fuzzing | 5 new targets (object open, manifest decode, names, table decode, commit graph); smoke runs without findings |
 | Existing suites | core, format, vfs (5 new external-storage, rescue and generation tests), CLI (88, five new end-to-end tests: bundle, merge, cloud-folder anchor, sidecar link on convert, read-only verify): all pass |
-| Cross-platform | `luksbox-sync` and `luksbox-merge` compile for Windows (MSVC) and macOS (aarch64); GUI compiles with and without default features; not run there |
+| Cross-platform | `luksbox-sync` and `luksbox-merge` compile for Windows (MSVC) and macOS (aarch64); GUI compiles with and without default features |
+| Windows 11 (2026-11-08) | Whole `luksbox-sync` suite plus CLI `sync_bundle` / `merge_safety` pass, on both the MSVC (release) and GNU toolchains; Windows store tests: junctions, hard links, case-only folder names, pinned folders, sharing-violation retry, temporary-file sweep, and a bundle made of real Cloud Files placeholders (full and online-only) under a local sync root. Run in CI (`windows-mount` job) |
 | Not done | TLA+ model (no Java on the build machine; the simulation covers the protocol), real-provider soak tests, audit round 16 |
 
 ## 0. Security principles
@@ -449,8 +455,10 @@ For an ordinary vault it reveals what `recent.json` already does.
   - Linux: `openat2` with `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`, falling
     back to per-component `O_NOFOLLOW` on kernels older than 5.6.
   - macOS: `O_NOFOLLOW_ANY`.
-  - Windows: `FILE_FLAG_OPEN_REPARSE_POINT`, refusing reparse points,
-    plus the existing final-path comparison used against junctions.
+  - Windows: `FILE_FLAG_OPEN_REPARSE_POINT`, refusing reparse points
+    other than cloud placeholders, plus the existing final-path
+    comparison used against junctions; folders pinned (no
+    `FILE_SHARE_DELETE`) while the store uses them.
 - **Check what was opened:** `fstat` must show a regular file (folders
   for `h p t m l x` and the shards), with the exact expected size and,
   on Unix, a link count of 1. FIFOs, devices, sockets, hard links and
