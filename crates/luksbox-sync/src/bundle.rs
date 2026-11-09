@@ -2545,14 +2545,17 @@ impl Session {
         for chunk in prepared.pages.chunks(per_batch) {
             let oids: Vec<_> = chunk.iter().map(|(_, r)| r.object_id()).collect();
             let objs = crate::image::outbox_objects(&self.local, &oids)?;
-            let batch: Vec<(Name, Vec<u8>)> =
-                oids.iter().map(|o| Name::Object(*o)).zip(objs).collect();
-            let items: Vec<(Name, &[u8])> = batch.iter().map(|(n, o)| (*n, o.as_slice())).collect();
+            let batch: Vec<(Name, Vec<u8>)> = oids
+                .iter()
+                .map(|o| Name::Object(*o))
+                .zip(objs)
+                .collect();
+            let items: Vec<(Name, &[u8])> =
+                batch.iter().map(|(n, o)| (*n, o.as_slice())).collect();
             self.store
                 .lock()
                 .expect("store lock")
-                .create_many(Area::Page, &items)?;
-        }
+                .create_many(Area::Page, &items)?;        }
         {
             let mut s = self.store.lock().expect("store lock");
             for (_, r, obj, _) in &prepared.new_tables {

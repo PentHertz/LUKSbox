@@ -380,9 +380,7 @@ fn is_legacy_tmp_name(area: Area, leaf: &str) -> bool {
         return false;
     };
     rnd.len() == 16
-        && rnd
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && rnd.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
         && Name::parse_in(area, obj).is_some()
 }
 
@@ -481,9 +479,7 @@ impl FsStore {
         match self.pin_shard(area, &shard) {
             Ok(true) => Ok(Some(p)),
             Ok(false) => Ok(None),
-            Err(e) if is_refusal(&e) => {
-                Err(refused(&p, "a shard folder is a link or not a folder"))
-            }
+            Err(e) if is_refusal(&e) => Err(refused(&p, "a shard folder is a link or not a folder")),
             Err(e) => Err(e.into()),
         }
     }
@@ -802,9 +798,7 @@ mod tests {
         s.create_many(Area::Page, &items).unwrap();
         for (n, b) in &objs {
             assert_eq!(
-                &s.read(Area::Page, n, LenRule::Exact(b.len()))
-                    .unwrap()
-                    .unwrap(),
+                &s.read(Area::Page, n, LenRule::Exact(b.len())).unwrap().unwrap(),
                 b
             );
         }
@@ -882,7 +876,10 @@ mod tests {
         std::fs::rename(p.join("l"), &away).unwrap();
         // A junction put in its place is refused at the next open.
         junction(&p.join("l"), &away);
-        assert!(matches!(FsStore::open(&p), Err(SyncError::Refused { .. })));
+        assert!(matches!(
+            FsStore::open(&p),
+            Err(SyncError::Refused { .. })
+        ));
     }
 
     /// A shard folder, once used, is pinned until the store is dropped.
@@ -1041,11 +1038,7 @@ mod tests {
         OpenOptions::new()
             .read(true)
             .write(!dir)
-            .access_mode(if dir {
-                0x0001_0000 | 0x80 | 0x100
-            } else {
-                0xC001_0000
-            })
+            .access_mode(if dir { 0x0001_0000 | 0x80 | 0x100 } else { 0xC001_0000 })
             .share_mode(ANY_SHARE)
             .custom_flags(flags)
             .open(p)
@@ -1100,21 +1093,9 @@ mod tests {
 
         let p = root.join("v.lbxs");
         let objs: Vec<(Area, Name, Vec<u8>)> = vec![
-            (
-                Area::Page,
-                Name::Object(ObjectId([0x71; 32])),
-                b"page one".to_vec(),
-            ),
-            (
-                Area::Manifest,
-                Name::Object(ObjectId([0x72; 32])),
-                b"commit".to_vec(),
-            ),
-            (
-                Area::Lease,
-                Name::Object(ObjectId([0x73; 32])),
-                b"lease".to_vec(),
-            ),
+            (Area::Page, Name::Object(ObjectId([0x71; 32])), b"page one".to_vec()),
+            (Area::Manifest, Name::Object(ObjectId([0x72; 32])), b"commit".to_vec()),
+            (Area::Lease, Name::Object(ObjectId([0x73; 32])), b"lease".to_vec()),
         ];
         {
             let mut s = FsStore::create(&p).unwrap();
@@ -1153,29 +1134,16 @@ mod tests {
                     std::ptr::null_mut(),
                 )
             };
-            assert_eq!(
-                hr,
-                0,
-                "CfConvertToPlaceholder({}) failed: {hr:#x}",
-                e.display()
-            );
+            assert_eq!(hr, 0, "CfConvertToPlaceholder({}) failed: {hr:#x}", e.display());
         }
         // They really are cloud reparse points to this process.
         let (_, n0, _) = &objs[0];
         let obj0 = p.join("p").join(n0.shard().unwrap()).join(n0.leaf());
         for e in [&p, &obj0] {
             let f = open_for_cf(e, e.is_dir());
-            assert_ne!(
-                f.metadata().unwrap().file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT,
-                0
-            );
+            assert_ne!(f.metadata().unwrap().file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT, 0);
             let tag = reparse_tag(&f).unwrap();
-            assert_eq!(
-                tag & IO_REPARSE_TAG_CLOUD_MASK,
-                IO_REPARSE_TAG_CLOUD,
-                "{}",
-                e.display()
-            );
+            assert_eq!(tag & IO_REPARSE_TAG_CLOUD_MASK, IO_REPARSE_TAG_CLOUD, "{}", e.display());
         }
 
         let mut s = FsStore::open(&p).unwrap();
@@ -1245,7 +1213,9 @@ mod tests {
         for (e, dir) in entries.iter().rev() {
             if let Ok(h) = std::panic::catch_unwind(|| open_for_cf(e, *dir)) {
                 // SAFETY: live handle.
-                unsafe { cf::CfRevertPlaceholder(h.as_raw_handle(), 0, std::ptr::null_mut()) };
+                unsafe {
+                    cf::CfRevertPlaceholder(h.as_raw_handle(), 0, std::ptr::null_mut())
+                };
             }
         }
     }

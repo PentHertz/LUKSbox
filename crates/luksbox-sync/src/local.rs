@@ -72,7 +72,10 @@ pub(crate) const PARALLEL_WRITES: usize = 8;
 
 /// Run `f` on every item, `PARALLEL_WRITES` at a time, one result per
 /// item in order.
-pub(crate) fn run_parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+pub(crate) fn run_parallel<T: Sync, R: Send>(
+    items: &[T],
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
     if items.len() <= 1 {
         return items.iter().map(&f).collect();
     }
@@ -92,7 +95,11 @@ pub(crate) fn run_parallel<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + 
     });
     slots
         .into_iter()
-        .map(|m| m.into_inner().expect("slot lock").expect("every item ran"))
+        .map(|m| {
+            m.into_inner()
+                .expect("slot lock")
+                .expect("every item ran")
+        })
         .collect()
 }
 
