@@ -37,7 +37,7 @@ TPM 2.0 keyslots are opt-in on every platform:
 - `--features bundled-tpm` compiles a vendored tpm2-tss during
   `cargo build` instead. Stage the pinned source first: on its own,
   tss-esapi-sys clones its minimum, 4.1.3, which has security advisories
-  fixed in 4.2.0. The release builds do this:
+  fixed in 4.2.0 and 4.2.1. The release builds do this:
 
   ```bash
   export TPM2_TSS_SOURCE_PATH="$(scripts/stage_tpm2_tss.sh /tmp/tpm2-tss-src)"
@@ -61,7 +61,7 @@ TPM 2.0 keyslots are opt-in on every platform:
   of tpm2-tss.)
 
   The vendored libraries are built static-only, so the resulting
-  binary embeds the tss2 core (4.2.0 when staged as above) and has no `libtss2-*.so`
+  binary embeds the tss2 core (4.2.1 when staged as above) and has no `libtss2-*.so`
   runtime dependency; at runtime only the small TCTI module (for
   example `libtss2-tcti-device.so.0` on Linux, from the distro's
   tpm2-tss packages) is loaded when a TPM slot is actually used.
@@ -363,15 +363,15 @@ Linux).
    driver, no admin rights. Three things to stage first:
 
    ```powershell
-   # a. tpm2-tss 4.2.0 source at a SHORT path (deep paths trip
+   # a. tpm2-tss 4.2.1 source at a SHORT path (deep paths trip
    #    MSBuild's file tracker with an inscrutable MSB6003; the
    #    repo snapshot is required - the autotools dist tarball
    #    omits the VS solution). Same version the release builds pin.
-   Invoke-WebRequest -Uri "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/4.2.0.zip" -OutFile "$env:TEMP\t2t.zip"
+   Invoke-WebRequest -Uri "https://github.com/tpm2-software/tpm2-tss/archive/refs/tags/4.2.1.zip" -OutFile "$env:TEMP\t2t.zip"
    Expand-Archive "$env:TEMP\t2t.zip" -DestinationPath "$env:TEMP\t2t"
-   $env:TPM2_TSS_SOURCE_PATH = "$env:TEMP\t2t\tpm2-tss-4.2.0"
+   $env:TPM2_TSS_SOURCE_PATH = "$env:TEMP\t2t\tpm2-tss-4.2.1"
    # The tss-esapi-sys build script runs MSBuild without a platform,
-   # and 4.2.0's solution lists ARM first; make it build x64:
+   # and the 4.2 solutions list ARM first; make it build x64:
    $env:Platform = "x64"
 
    # b. OpenSSL 3 with x64 import libs (tss2-esys links libcrypto.lib

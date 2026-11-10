@@ -22,10 +22,12 @@ set -euo pipefail
 
 # Bump deliberately, together with the hash. 4.2.0: 4.1.3 has eleven
 # security advisories fixed upstream (ten in 4.1.4, one more in 4.2.0).
+# 4.2.1: nine more advisories (GHSA-h664-qxhh-gx3w and eight others),
+# mostly response-length checks in the TCTI, SYS and MU layers.
 # Keep in step with .github/actions/stage-tpm2-tss and
 # scripts/static_fido2_tpm_alpine.sh.
-TPM2_TSS_VERSION="4.2.0"
-TPM2_TSS_TARBALL_SHA256="5f5907d3a3ca1e37c2d6d4027b4ccda5bbad61873751fb78ebecaca5744218a5"
+TPM2_TSS_VERSION="4.2.1"
+TPM2_TSS_TARBALL_SHA256="a93f84ef36a2e7b18058b66727b31c02869cf18ba0a934c3689b200b8212b10c"
 
 [ $# -eq 1 ] || { echo "usage: $0 DEST_DIR" >&2; exit 2; }
 mkdir -p "$1"

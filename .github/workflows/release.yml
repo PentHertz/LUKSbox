@@ -301,7 +301,8 @@ jobs:
           # tss-esapi-sys build script declares no rerun-if-* triggers,
           # so a restored cache would keep linking the old static tpm2-tss
           # into the Linux bundled-tpm lanes despite the new staged source.
-          shared-key: release-v4
+          # Bumped to v5 on 2026-11-10: tpm2-tss 4.2.0 -> 4.2.1, same reason.
+          shared-key: release-v5
 
       - name: Derive LUKSBOX_VERSION
         # On a tag push (`refs/tags/vX.Y.Z`), GITHUB_REF_NAME is the tag
@@ -428,8 +429,10 @@ jobs:
         # `cask_struct_generator.rb`) that crashes `brew install` on
         # certain cask `depends_on` shapes returned by the API. The
         # local-tap path runs the regular Ruby DSL eval and isn't
-        # affected. Set at the step level so both this command AND
-        # the macFUSE cask install below benefit.
+        # affected. `brew update` clones homebrew/core when it is
+        # missing, but not homebrew/cask, which the macOS 15 runner
+        # image does not have: the macFUSE install below therefore
+        # goes through the API first (see there).
         env:
           HOMEBREW_NO_INSTALL_FROM_API: "1"
         run: |
@@ -548,7 +551,18 @@ jobs:
               macfuse)
                   echo "==> Installing macFUSE (kext-based backend)"
                   if ! brew list --cask macfuse >/dev/null 2>&1; then
-                      brew install --cask macfuse
+                      # macfuse is in homebrew/cask. With no local clone
+                      # of that tap, HOMEBREW_NO_INSTALL_FROM_API makes
+                      # brew answer "Cask 'macfuse' is unavailable: No
+                      # Cask with this name exists". Install from the
+                      # cask API instead; only if that fails (the API
+                      # parser regression described at the top of this
+                      # step) clone homebrew/cask and use the local tap.
+                      if ! (unset HOMEBREW_NO_INSTALL_FROM_API; brew install --cask macfuse); then
+                          echo "==> cask API install failed; retrying from a local homebrew/cask tap"
+                          brew tap --force homebrew/cask
+                          brew install --cask macfuse
+                      fi
                   fi
                   for cand in /usr/local/lib/pkgconfig \
                               /opt/homebrew/lib/pkgconfig \

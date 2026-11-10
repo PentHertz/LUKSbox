@@ -37,7 +37,7 @@ set -eu
 UDEV_ZERO_VERSION=1.0.4
 LIBCBOR_VERSION=0.14.0
 LIBFIDO2_VERSION=1.17.0
-TPM2_TSS_VERSION=4.2.0
+TPM2_TSS_VERSION=4.2.1
 
 OUT="$1"
 PREFIX=/opt/luksbox-static
@@ -69,7 +69,7 @@ fetch "https://developers.yubico.com/libfido2/Releases/libfido2-$LIBFIDO2_VERSIO
     c1012c8871d71b65872fd5ff1a9d6b0838a55683a03e85ba97479ce57129c736 \
     "libfido2-$LIBFIDO2_VERSION.tar.gz"
 fetch "https://github.com/tpm2-software/tpm2-tss/releases/download/$TPM2_TSS_VERSION/tpm2-tss-$TPM2_TSS_VERSION.tar.gz" \
-    b53f0c5c8c4ce17f05701a410ca9688f725ca380c9bc4640eacd0eadb1fea124 \
+    d4aadbc1610876385a370494bbfd7d994356f446dff60cd09eea5933befb1471 \
     "tpm2-tss-$TPM2_TSS_VERSION.tar.gz"
 
 export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"

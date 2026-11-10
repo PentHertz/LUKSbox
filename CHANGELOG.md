@@ -309,6 +309,13 @@ export` turns a bundle back into a `.lbx`.
   feature, which the TPM keyslot never used and which pulled
   `elliptic-curve` 0.13 / `ecdsa` / `x509-cert` (on the 0.13 line with
   crypto-bigint 0.5). The `fuzz/` lockfile follows.
+- **tpm2-tss 4.2.0 -> 4.2.1 in every build that bundles it** (the static
+  FIDO2 + TPM CLI, the Linux `bundled-tpm` lanes and Windows). 4.2.1
+  fixes nine advisories (GHSA-h664-qxhh-gx3w and eight more whose CVEs
+  are pending), mostly missing length checks on TPM responses in the
+  TCTI, SYS and MU layers. The release's bundled-library gate refused
+  4.2.0 once 4.2.1 was out. New SHA-256 pins for the three archives;
+  CI and release caches are renamed so no old vendored build is reused.
 
 - **Audit round 16** (sync bundles and a full-workspace sweep; report in
   `docs/SECURITY_AUDIT_ROUND_16.md`). Fixed in this revision:
@@ -522,6 +529,12 @@ export` turns a bundle back into a `.lbx`.
   macos-fuse-t/cask/fuse-t` (this one cask, not the whole tap) before
   installing it. BUILDING.md, the release notes and the "mount support
   was not compiled in" message give the same step.
+- **macOS release build: macFUSE install** ("Cask 'macfuse' is
+  unavailable: No Cask with this name exists" on the macOS 15 runner).
+  The step reads Homebrew metadata from local taps
+  (`HOMEBREW_NO_INSTALL_FROM_API`) and that runner has no local
+  homebrew/cask; macFUSE now installs from Homebrew's cask API and
+  clones the tap only if that fails.
 - **GUI: vault path fields** (Unlock vault, the create form's Vault
   path): the text was drawn against the top edge of the field, and the
   unlock screen's path was in a small monospace font. Both now use the

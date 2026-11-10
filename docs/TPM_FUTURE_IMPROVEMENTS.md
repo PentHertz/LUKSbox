@@ -57,7 +57,7 @@ design constraints already written down.
 >   (which also avoids the build script's git-clone fallback); (c) the
 >   build script runs `msbuild /p:Configuration=Release tpm2-tss.sln`
 >   with no platform, so MSBuild builds the solution's first one, and
->   4.2.0's solution lists ARM first - the stage-tpm2-tss action keeps
+>   the 4.2.x solutions list ARM first - the stage-tpm2-tss action keeps
 >   only the x64 solution configurations (a manual build sets
 >   `$env:Platform = "x64"` instead).
 > - **Runtime DLL closure to ship**: tss2-esys, tss2-sys, tss2-mu,

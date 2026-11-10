@@ -110,10 +110,10 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # `-tss420`: tpm2-tss 4.1.3 -> 4.2.0. tss-esapi-sys declares no
+          # `-tss421`: tpm2-tss 4.2.0 -> 4.2.1. tss-esapi-sys declares no
           # rerun-if-* triggers, so an old cache would keep the old
           # vendored tpm2-tss despite the new staged source.
-          shared-key: ci-test-tss420-${{ matrix.profile }}
+          shared-key: ci-test-tss421-${{ matrix.profile }}
       - name: Linux deps
         uses: ./.github/actions/apt-install
         with:
@@ -560,9 +560,9 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # `-tss420`: see the test job; drops caches holding the old
-          # vendored tpm2-tss 4.1.3.
-          shared-key: ci-build-tss420-${{ matrix.target }}
+          # `-tss421`: see the test job; drops caches holding the old
+          # vendored tpm2-tss 4.2.0.
+          shared-key: ci-build-tss421-${{ matrix.target }}
       - name: Linux deps
         uses: ./.github/actions/apt-install
         with:
