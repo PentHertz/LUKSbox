@@ -56,8 +56,9 @@ drive when you need to use it.
 
 For a vault you use from several computers through a sync service
 (Dropbox, Google Drive, OneDrive, iCloud Drive, Nextcloud, Syncthing),
-convert it to a **sync bundle** (`luksbox sync convert vault.lbx
-~/Dropbox/vault.lbxs`, experimental): only changed parts upload,
+use a **sync bundle**, experimental: create one with `luksbox create
+~/Dropbox/vault.lbxs` (or the wizard / GUI), or convert a vault with
+`luksbox sync convert vault.lbx ~/Dropbox/vault.lbxs`. Only changed parts upload,
 changes from several devices are merged, and rollback by the provider
 is detected. See [`docs/SYNC_BUNDLES.md`](docs/SYNC_BUNDLES.md).
 

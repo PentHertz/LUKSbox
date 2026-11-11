@@ -2426,7 +2426,7 @@ impl eframe::App for LuksboxApp {
             .frame(
                 Frame::default()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .inner_margin(Margin {
                         left: 14,
                         right: 14,
@@ -3282,7 +3282,7 @@ impl LuksboxApp {
             // same hover hint as the old single-device path.
             let resp = Frame::new()
                 .fill(theme::DIM.linear_multiply(0.08))
-                .stroke(Stroke::new(1.0, theme::DIM))
+                .stroke(Stroke::new(1.0_f32, theme::DIM))
                 .corner_radius(CornerRadius::same(8))
                 .inner_margin(Margin::symmetric(8, 5))
                 .show(ui, |ui| {
@@ -3430,7 +3430,7 @@ impl LuksboxApp {
         //      other" bug. Area sidesteps the cursor entirely.
         let frame_resp = Frame::new()
             .fill(theme::PANEL)
-            .stroke(Stroke::new(1.0, Color32::TRANSPARENT))
+            .stroke(Stroke::new(1.0_f32, Color32::TRANSPARENT))
             .corner_radius(CornerRadius::same(6))
             .inner_margin(Margin::symmetric(10, 8))
             .show(ui, |ui| {
@@ -3596,7 +3596,7 @@ impl LuksboxApp {
             ui.painter().rect_stroke(
                 frame_resp.rect,
                 CornerRadius::same(6),
-                Stroke::new(1.0, theme::BORDER),
+                Stroke::new(1.0_f32, theme::BORDER),
                 egui::StrokeKind::Inside,
             );
         }
@@ -4123,7 +4123,7 @@ impl LuksboxApp {
                 };
                 Frame::new()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::ACCENT.linear_multiply(0.4)))
+                    .stroke(Stroke::new(1.0_f32, theme::ACCENT.linear_multiply(0.4)))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(18)
                     .show(ui, |ui| {
@@ -4141,7 +4141,7 @@ impl LuksboxApp {
                 ui.add_space(18.0);
                 Frame::new()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::WARN.linear_multiply(0.5)))
+                    .stroke(Stroke::new(1.0_f32, theme::WARN.linear_multiply(0.5)))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(18)
                     .show(ui, |ui| {
@@ -4212,7 +4212,7 @@ impl LuksboxApp {
                 ui.add_space(18.0);
                 Frame::new()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(18)
                     .show(ui, |ui| {
@@ -4271,7 +4271,7 @@ impl LuksboxApp {
 
         Frame::new()
             .fill(theme::PANEL)
-            .stroke(Stroke::new(1.0, theme::BORDER))
+            .stroke(Stroke::new(1.0_f32, theme::BORDER))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(22)
             .show(ui, |ui| {
@@ -7293,7 +7293,7 @@ impl LuksboxApp {
         };
         let frame = Frame::new()
             .fill(theme::PANEL2)
-            .stroke(Stroke::new(1.0, theme::ACCENT.linear_multiply(0.4)))
+            .stroke(Stroke::new(1.0_f32, theme::ACCENT.linear_multiply(0.4)))
             .corner_radius(CornerRadius::same(10))
             .inner_margin(18);
         frame.show(ui, |ui| {
@@ -9432,7 +9432,7 @@ impl LuksboxApp {
         if luksbox_mount::FUSE_BACKEND == "fuse-t" {
             egui::Frame::NONE
                 .fill(theme::WARN.linear_multiply(0.12))
-                .stroke(egui::Stroke::new(1.0, theme::WARN))
+                .stroke(egui::Stroke::new(1.0_f32, theme::WARN))
                 .corner_radius(6.0)
                 .inner_margin(egui::Margin::symmetric(12, 10))
                 .show(ui, |ui| {
@@ -10234,7 +10234,7 @@ impl LuksboxApp {
                 for (i, slot) in table.iter().enumerate() {
                     Frame::new()
                         .fill(theme::PANEL)
-                        .stroke(Stroke::new(1.0, theme::BORDER))
+                        .stroke(Stroke::new(1.0_f32, theme::BORDER))
                         .corner_radius(CornerRadius::same(8))
                         .inner_margin(14)
                         .show(ui, |ui| {
@@ -11038,7 +11038,7 @@ impl LuksboxApp {
             .frame(
                 Frame::default()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(20),
             )
@@ -11416,7 +11416,7 @@ impl LuksboxApp {
             .frame(
                 Frame::default()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(20),
             )
@@ -11506,7 +11506,7 @@ impl LuksboxApp {
             .frame(
                 Frame::default()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(20),
             )
@@ -11830,7 +11830,7 @@ impl LuksboxApp {
                     panel_rect,
                     CornerRadius::same(12),
                     Stroke::new(
-                        1.0,
+                        1.0_f32,
                         if needs_touch {
                             theme::ACCENT
                         } else {
@@ -13720,7 +13720,7 @@ impl LuksboxApp {
             .frame(
                 Frame::default()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(20),
             )
@@ -14063,7 +14063,7 @@ impl LuksboxApp {
             .frame(
                 Frame::default()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(20),
             )
@@ -14182,7 +14182,7 @@ impl LuksboxApp {
             .frame(
                 Frame::default()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(20),
             )
@@ -14579,7 +14579,7 @@ impl LuksboxApp {
             .frame(
                 Frame::default()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(20),
             )
@@ -14699,7 +14699,7 @@ impl LuksboxApp {
                         };
                         Frame::new()
                             .fill(theme::PANEL)
-                            .stroke(Stroke::new(1.0, color))
+                            .stroke(Stroke::new(1.0_f32, color))
                             .corner_radius(CornerRadius::same(6))
                             .inner_margin(Margin::symmetric(14, 10))
                             .show(ui, |ui| {
@@ -14999,7 +14999,7 @@ impl LuksboxApp {
             .frame(
                 Frame::default()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(20),
             )
@@ -15357,7 +15357,7 @@ impl LuksboxApp {
             .frame(
                 Frame::default()
                     .fill(theme::PANEL)
-                    .stroke(Stroke::new(1.0, theme::BORDER))
+                    .stroke(Stroke::new(1.0_f32, theme::BORDER))
                     .corner_radius(CornerRadius::same(10))
                     .inner_margin(20),
             )
@@ -15897,7 +15897,7 @@ fn strength_meter(ui: &mut egui::Ui, passphrase: &str) {
     ui.painter().rect_stroke(
         rect,
         CornerRadius::same(3),
-        Stroke::new(1.0, theme::BORDER),
+        Stroke::new(1.0_f32, theme::BORDER),
         egui::StrokeKind::Inside,
     );
     ui.add_space(2.0);
@@ -15918,7 +15918,7 @@ fn primary_button(text: impl Into<egui::WidgetText>) -> egui::Button<'static> {
 fn ghost_button(text: impl Into<egui::WidgetText>) -> egui::Button<'static> {
     egui::Button::new(text.into().color(theme::DIM))
         .fill(Color32::TRANSPARENT)
-        .stroke(Stroke::new(1.0, theme::BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::BORDER))
         .min_size(Vec2::new(0.0, 28.0))
 }
 
@@ -15939,7 +15939,7 @@ fn bullet(ui: &mut egui::Ui, title: &str, body: &str) {
 fn section(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
     Frame::new()
         .fill(theme::PANEL)
-        .stroke(Stroke::new(1.0, theme::BORDER))
+        .stroke(Stroke::new(1.0_f32, theme::BORDER))
         .corner_radius(CornerRadius::same(10))
         .inner_margin(18)
         .show(ui, |ui| {

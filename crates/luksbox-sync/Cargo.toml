@@ -31,3 +31,8 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Their mocks stand in for the TPM, the Secure Enclave and a FIDO2 key in
+# tests/bundle_hardware_keyslots.rs (no hardware feature: mocks only).
+luksbox-tpm = { path = "../luksbox-tpm" }
+luksbox-sep = { path = "../luksbox-sep" }
+luksbox-fido2 = { path = "../luksbox-fido2" }

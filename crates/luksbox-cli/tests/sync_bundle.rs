@@ -166,15 +166,310 @@ fn convert_use_and_share_a_bundle() {
         "rotate-mvk",
     );
     fails_with(
-        run(d, &["create", "new.lbxs"]),
-        "sync convert",
-        "create .lbxs",
-    );
-    fails_with(
         run(d, &["ls", "v.lbxs", "--anchor", "x.anchor"]),
         "--anchor is for .lbx files",
         "anchor",
     );
+}
+
+/// Nothing is left in this device's staging folder (`creating/`) once a
+/// `create <folder>.lbxs` ended, however it ended.
+fn no_staging_left(d: &Path, device: &str) {
+    let creating = d.join(format!("state-{device}")).join("creating");
+    let left: Vec<_> = std::fs::read_dir(&creating)
+        .map(|r| r.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "staging folders left behind: {left:?}");
+}
+
+/// `luksbox create <folder>.lbxs` makes a sync bundle in one step, with
+/// each cipher and the size-hiding flags: built in a private staging
+/// folder (removed afterwards) and converted, it opens on this device
+/// and on another one with the same passphrase, and works like any
+/// bundle (every command takes the folder).
+#[test]
+fn create_makes_a_bundle() {
+    let tmp = tempdir().unwrap();
+    let d = tmp.path();
+    let a = file(d, "a.txt", "hello bundle");
+    for (name, extra) in [
+        ("siv.lbxs", &[][..]),
+        ("gcm.lbxs", &["--cipher", "aes-gcm"][..]),
+        ("chacha.lbxs", &["--cipher", "chacha", "--pad-files"][..]),
+        ("hidden.lbxs", &["--hide-sizes"][..]),
+    ] {
+        let mut args = vec!["create", name, "--metadata-size", "2M"];
+        args.extend_from_slice(extra);
+        let o = ok(run(d, &args), name);
+        assert!(
+            out(&o).contains(&format!("created the sync bundle {name}")),
+            "{name}: {}",
+            out(&o)
+        );
+        assert!(d.join(name).join("h").is_dir(), "{name} is a bundle folder");
+        // Header and keyslots without unlocking.
+        let o = ok(run(d, &["info", name]), "info");
+        assert!(out(&o).contains("sync bundle"), "{}", out(&o));
+        // This device writes, another one reads and writes, this one
+        // sees it.
+        ok(run(d, &["put", name, &a, "/a.txt"]), "put");
+        let o = ok(
+            run_as(d, "Desktop", &["cat", name, "/a.txt"]),
+            "cat on a second device",
+        );
+        assert_eq!(out(&o), "hello bundle", "{name}");
+        ok(
+            run_as(d, "Desktop", &["mkdir", name, "/from-desktop"]),
+            "mkdir",
+        );
+        let o = ok(run(d, &["ls", name, "/"]), "ls");
+        assert!(out(&o).contains("from-desktop"), "{name}: {}", out(&o));
+        ok(
+            run(d, &["get", name, "/a.txt", &format!("{name}.out")]),
+            "get",
+        );
+        assert_eq!(
+            std::fs::read_to_string(d.join(format!("{name}.out"))).unwrap(),
+            "hello bundle"
+        );
+        let o = ok(run(d, &["sync", "verify", name]), "verify");
+        assert!(
+            err(&o).contains("every object verified") || out(&o).contains("every object verified")
+        );
+    }
+    no_staging_left(d, "Laptop");
+    // Nothing but the bundle folders: no vault file, mirror or sidecar.
+    let mut names: Vec<String> = std::fs::read_dir(d)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.contains(".lbx"))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        [
+            "chacha.lbxs",
+            "chacha.lbxs.out",
+            "gcm.lbxs",
+            "gcm.lbxs.out",
+            "hidden.lbxs",
+            "hidden.lbxs.out",
+            "siv.lbxs",
+            "siv.lbxs.out"
+        ]
+    );
+}
+
+/// A post-quantum bundle (`--kind hybrid-pq` / `hybrid-pq1024`): the
+/// public Kyber sidecar goes inside the bundle, not next to it, and the
+/// bundle opens on both devices with the seed file, never without it.
+#[test]
+fn create_a_post_quantum_bundle() {
+    let tmp = tempdir().unwrap();
+    let d = tmp.path();
+    let a = file(d, "a.txt", "post-quantum");
+    for (kind, name) in [("hybrid-pq", "pq.lbxs"), ("hybrid-pq1024", "pq1024.lbxs")] {
+        let seed = format!("{name}.kyber");
+        let o = ok(
+            run(
+                d,
+                &[
+                    "create",
+                    name,
+                    "--kind",
+                    kind,
+                    "--pq-hybrid",
+                    &seed,
+                    "--metadata-size",
+                    "2M",
+                ],
+            ),
+            kind,
+        );
+        assert!(err(&o).contains("kept inside the bundle"), "{}", err(&o));
+        assert!(
+            d.join(&seed).is_file(),
+            "the seed file is where it was asked"
+        );
+        assert!(!d.join(format!("{name}.hybrid")).exists());
+        ok(
+            run(d, &["put", name, "--pq-hybrid", &seed, &a, "/a.txt"]),
+            "put with the seed",
+        );
+        let o = ok(
+            run_as(d, "Desktop", &["cat", name, "--pq-hybrid", &seed, "/a.txt"]),
+            "cat on a second device",
+        );
+        assert_eq!(out(&o), "post-quantum");
+        let o = run(d, &["cat", name, "/a.txt"]);
+        assert!(!o.status.success(), "{kind}: opened without the seed file");
+    }
+    no_staging_left(d, "Laptop");
+}
+
+/// The seeded software authenticator of debug builds
+/// (`LUKSBOX_TEST_FIDO2_MOCK`): the same seed is the same security key,
+/// in every process.
+#[cfg(feature = "fido2-hardware")]
+const KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+#[cfg(feature = "fido2-hardware")]
+const OTHER_KEY: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+/// `run_as` with a FIDO2 key "plugged in" (`key`), PIN 1234.
+#[cfg(feature = "fido2-hardware")]
+fn run_with_key(dir: &Path, device: &str, key: &str, args: &[&str]) -> Output {
+    Command::new(bin())
+        .args(args)
+        .current_dir(dir)
+        .env("LUKSBOX_TEST_FAST_KDF", "1")
+        .env("LUKSBOX_PASSPHRASE", "pw")
+        .env("LUKSBOX_NEW_PASSPHRASE", "pw")
+        .env("LUKSBOX_FIDO2_PIN", "1234")
+        .env("LUKSBOX_TEST_FIDO2_MOCK", key)
+        .env(
+            "LUKSBOX_SYNC_STATE_DIR",
+            dir.join(format!("state-{device}")),
+        )
+        .env("LUKSBOX_DEVICE_LABEL", device)
+        .output()
+        .expect("spawn binary")
+}
+
+/// FIDO2 sync bundles through the real commands, with the debug build's
+/// software authenticator standing in for the security key: a FIDO2
+/// (wrap), FIDO2-direct and FIDO2 + ML-KEM-768 bundle made with `create
+/// <folder>.lbxs`, and a FIDO2 vault converted with `sync convert`. Each
+/// opens on a second device with the same key, and not with another key
+/// or without one.
+#[cfg(feature = "fido2-hardware")]
+#[test]
+fn fido2_bundles_with_a_software_key() {
+    let tmp = tempdir().unwrap();
+    let d = tmp.path();
+    let a = file(d, "a.txt", "fido2 bundle");
+    ok(
+        run_with_key(
+            d,
+            "Laptop",
+            KEY,
+            &[
+                "create",
+                "f.lbx",
+                "--kind",
+                "fido2",
+                "--metadata-size",
+                "2M",
+            ],
+        ),
+        "create a FIDO2 vault",
+    );
+    ok(
+        run_with_key(
+            d,
+            "Laptop",
+            KEY,
+            &["sync", "convert", "f.lbx", "conv.lbxs", "--fido2"],
+        ),
+        "convert the FIDO2 vault",
+    );
+    for (kind, name, extra) in [
+        ("fido2", "f.lbxs", &[][..]),
+        ("fido2-direct", "fd.lbxs", &[][..]),
+        (
+            "hybrid-pq-fido2",
+            "fpq.lbxs",
+            &["--pq-hybrid", "fpq.kyber"][..],
+        ),
+        ("converted", "conv.lbxs", &[][..]),
+    ] {
+        if kind != "converted" {
+            let mut args = vec!["create", name, "--kind", kind, "--metadata-size", "2M"];
+            args.extend_from_slice(extra);
+            let o = ok(run_with_key(d, "Laptop", KEY, &args), kind);
+            assert!(
+                out(&o).contains(&format!("created the sync bundle {name}")),
+                "{}",
+                out(&o)
+            );
+        }
+        let o = ok(run(d, &["info", name]), "info");
+        assert!(out(&o).contains("fido2"), "{kind}: {}", out(&o));
+        // `--pq-hybrid` names the seed file for the post-quantum kind.
+        let unlock: Vec<&str> = std::iter::once("--fido2")
+            .chain(extra.iter().copied())
+            .collect();
+        let mut put = vec!["put", name];
+        put.extend_from_slice(&unlock);
+        put.extend_from_slice(&[a.as_str(), "/a.txt"]);
+        ok(run_with_key(d, "Laptop", KEY, &put), "put");
+        let mut cat = vec!["cat", name];
+        cat.extend_from_slice(&unlock);
+        cat.push("/a.txt");
+        let o = ok(
+            run_with_key(d, "Desktop", KEY, &cat),
+            "cat on a second device",
+        );
+        assert_eq!(out(&o), "fido2 bundle", "{kind}");
+        let o = run_with_key(d, "Desktop", OTHER_KEY, &cat);
+        assert!(!o.status.success(), "{kind}: opened with another key");
+        let mut no_key = vec!["cat", name];
+        no_key.extend_from_slice(extra);
+        no_key.push("/a.txt");
+        assert!(
+            !run(d, &no_key).status.success(),
+            "{kind}: opened without the key"
+        );
+    }
+    no_staging_left(d, "Laptop");
+}
+
+/// What `create <folder>.lbxs` refuses, before anything is made or once
+/// the staging folder exists (a kind that cannot be the first slot):
+/// either way no bundle, file or staging folder is left behind.
+#[test]
+fn create_bundle_refusals_leave_nothing() {
+    let tmp = tempdir().unwrap();
+    let d = tmp.path();
+    ok(
+        run(d, &["create", "b.lbxs", "--metadata-size", "2M"]),
+        "create",
+    );
+    fails_with(
+        run(d, &["create", "b.lbxs"]),
+        "already exists",
+        "existing bundle",
+    );
+    std::fs::create_dir(d.join("plain.lbxs")).unwrap();
+    fails_with(
+        run(d, &["create", "plain.lbxs"]),
+        "already exists",
+        "existing folder",
+    );
+    for (args, needle) in [
+        (&["--anchor", "n.anchor"][..], "--anchor"),
+        (&["--header", "n.hdr"][..], "--header"),
+        (&["--max-size", "1G"][..], "--max-size"),
+        (&["--format", "v2"][..], "v2 formats"),
+        (&["--header-v2"][..], "v2 formats"),
+        (&["--kind", "tpm2"][..], "cannot be the first slot"),
+        (&["--kind", "hybrid-pq"][..], "requires --pq-hybrid"),
+    ] {
+        let mut all = vec!["create", "n.lbxs"];
+        all.extend_from_slice(args);
+        fails_with(run(d, &all), needle, needle);
+    }
+    fails_with(
+        run(d, &["create", "missing/n.lbxs"]),
+        "is not a folder",
+        "missing parent folder",
+    );
+    for left in ["n.lbxs", "n.lbx", "n.anchor", "n.hdr", "missing"] {
+        assert!(!d.join(left).exists(), "{left} was left behind");
+    }
+    no_staging_left(d, "Laptop");
+    // The bundle made first still opens.
+    ok(run(d, &["ls", "b.lbxs", "/"]), "ls");
 }
 
 #[test]

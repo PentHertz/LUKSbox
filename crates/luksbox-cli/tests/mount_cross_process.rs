@@ -174,6 +174,12 @@ struct MountProcess {
 
 impl MountProcess {
     fn spawn(dir: &Path, vault: &str, mountpoint: &Path) -> Self {
+        Self::spawn_with(dir, vault, mountpoint, &[])
+    }
+
+    /// [`spawn`](Self::spawn) with extra environment (a sync bundle's
+    /// per-device state folder and label).
+    fn spawn_with(dir: &Path, vault: &str, mountpoint: &Path, env: &[(&str, &str)]) -> Self {
         let log = dir.join("mount.log");
         let out = File::create(&log).expect("create mount log");
         let child = Command::new(bin())
@@ -183,6 +189,7 @@ impl MountProcess {
             .arg(mountpoint)
             .current_dir(dir)
             .envs(ENV)
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(out.try_clone().expect("clone log handle"))
             .stderr(out)
@@ -315,6 +322,106 @@ fn umount_from_another_process_releases_the_mount() {
     assert_eq!(
         std::fs::read(dir.join("out.txt")).unwrap(),
         b"written through the mount"
+    );
+}
+
+/// Linux and macOS: a sync bundle made with `luksbox create
+/// <folder>.lbxs` mounts (foreground), takes a write through the mount,
+/// and publishes it when a second process unmounts: another device (its
+/// own sync state) then reads the file.
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn a_created_bundle_mounts_and_publishes_at_umount() {
+    if !mount_backend_or_skip() {
+        return;
+    }
+    let _serial = one_mount_test_at_a_time();
+    let tmp = tempdir().unwrap();
+    let dir = tmp.path();
+    let state = |name: &str| dir.join(name).to_string_lossy().into_owned();
+    let (st_a, st_b) = (state("state-a"), state("state-b"));
+    let as_device = |args: &[&str], st: &str, label: &str| {
+        Command::new(bin())
+            .args(args)
+            .current_dir(dir)
+            .envs(ENV)
+            .env("LUKSBOX_SYNC_STATE_DIR", st)
+            .env("LUKSBOX_DEVICE_LABEL", label)
+            .output()
+            .expect("spawn binary")
+    };
+
+    assert_ok(
+        &as_device(&["create", "v.lbxs", "--metadata-size", "2M"], &st_a, "a"),
+        "create a sync bundle",
+    );
+    std::fs::write(dir.join("hello.txt"), b"hello from the bundle").unwrap();
+    assert_ok(
+        &as_device(&["put", "v.lbxs", "hello.txt", "/hello.txt"], &st_a, "a"),
+        "put",
+    );
+
+    let mountpoint = new_mountpoint(dir);
+    let mut mount = MountProcess::spawn_with(
+        dir,
+        "v.lbxs",
+        &mountpoint,
+        &[
+            ("LUKSBOX_SYNC_STATE_DIR", &st_a),
+            ("LUKSBOX_DEVICE_LABEL", "a"),
+        ],
+    );
+    let hello = in_mount(&mountpoint, "hello.txt");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(data) = std::fs::read(&hello) {
+            assert_eq!(data, b"hello from the bundle", "read through the mount");
+            break;
+        }
+        if let Some(status) = mount.child.try_wait().expect("try_wait") {
+            panic!("luksbox mount exited early ({status}):\n{}", mount.log());
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} not readable 30 s after starting luksbox mount:\n{}",
+            hello.display(),
+            mount.log()
+        );
+        thread::sleep(Duration::from_millis(200));
+    }
+    std::fs::write(
+        in_mount(&mountpoint, "written.txt"),
+        b"written through a bundle mount",
+    )
+    .expect("write through the mount");
+
+    let out = Command::new(bin())
+        .arg("umount")
+        .arg(&mountpoint)
+        .current_dir(dir)
+        .output()
+        .expect("spawn luksbox umount");
+    assert_ok(&out, "luksbox umount of the bundle mount");
+    let status = mount.wait_exit(Duration::from_secs(30)).unwrap_or_else(|| {
+        panic!(
+            "luksbox mount still running 30 s after luksbox umount:\n{}",
+            mount.log()
+        )
+    });
+    assert!(
+        status.success(),
+        "luksbox mount exited with {status} after umount:\n{}",
+        mount.log()
+    );
+
+    // Published before the mount process exited: another device reads it.
+    assert_ok(
+        &as_device(&["get", "v.lbxs", "/written.txt", "out.txt"], &st_b, "b"),
+        "get on another device",
+    );
+    assert_eq!(
+        std::fs::read(dir.join("out.txt")).unwrap(),
+        b"written through a bundle mount"
     );
 }
 

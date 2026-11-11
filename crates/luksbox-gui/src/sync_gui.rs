@@ -699,38 +699,7 @@ pub fn install_mount_hook() {
 /// that then becomes a sync bundle (New vault > Sync bundle). Folders an
 /// interrupted creation left behind more than a day ago are removed.
 pub fn new_staging_dir() -> std::io::Result<PathBuf> {
-    staging_dir_in(&local_root().map_err(std::io::Error::other)?)
-}
-
-fn staging_dir_in(local_root: &Path) -> std::io::Result<PathBuf> {
-    let root = local_root.join("creating");
-    if let Ok(entries) = std::fs::read_dir(&root) {
-        for e in entries.flatten() {
-            let stale = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age > Duration::from_secs(24 * 3600));
-            if stale {
-                let _ = std::fs::remove_dir_all(e.path());
-            }
-        }
-    }
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let dir = root.join(format!("{}-{nanos}", std::process::id()));
-    let mut b = std::fs::DirBuilder::new();
-    b.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        b.mode(0o700);
-    }
-    b.create(&dir)?;
-    Ok(dir)
+    bundle::fs::new_staging_dir(&local_root().map_err(std::io::Error::other)?)
 }
 
 /// One earlier version of the open bundle (the Versions view).
@@ -1043,7 +1012,7 @@ mod tests {
     fn a_vault_built_in_staging_becomes_a_bundle() {
         let tmp = tempfile::tempdir().unwrap();
         let state = tmp.path().join("state");
-        let staging = staging_dir_in(&state).unwrap();
+        let staging = bundle::fs::new_staging_dir(&state).unwrap();
         assert!(staging.starts_with(state.join("creating")));
         let opts = CreateOpts {
             path: staging.join("v.lbx"),
@@ -1282,25 +1251,5 @@ mod tests {
             folder_icon::file_uri(Path::new("/home/a b/r\u{e9}sum\u{e9}#1.png")),
             "file:///home/a%20b/r%C3%A9sum%C3%A9%231.png"
         );
-    }
-
-    /// A staging folder an interrupted creation left behind is removed
-    /// once it is a day old; a recent one (another creation in progress)
-    /// is kept.
-    #[cfg(unix)]
-    #[test]
-    fn stale_staging_folders_are_removed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let state = tmp.path().join("state");
-        let old = staging_dir_in(&state).unwrap();
-        std::fs::write(old.join("v.lbx"), b"x").unwrap();
-        std::fs::File::open(&old)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 24 * 3600))
-            .unwrap();
-        let recent = staging_dir_in(&state).unwrap();
-        let fresh = staging_dir_in(&state).unwrap();
-        assert!(!old.exists());
-        assert!(recent.is_dir() && fresh.is_dir() && recent != fresh);
     }
 }

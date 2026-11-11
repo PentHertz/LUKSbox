@@ -38,6 +38,18 @@ struct CreateOptions {
     header_v3: bool,
     /// Maximum size of the vault file in bytes, 0 = unlimited.
     max_size: u64,
+    /// `Some(folder)`: the vault is built in a staging folder and becomes
+    /// the sync bundle `folder` at the end (`maybe_mount_now`).
+    bundle: Option<PathBuf>,
+}
+
+/// How the create messages name the vault: for a sync bundle, the
+/// vault in the staging folder is "the vault for" the bundle.
+fn created_name(vault: &Path, opts: &CreateOptions) -> String {
+    match &opts.bundle {
+        Some(dest) => format!("the vault for the sync bundle {}", dest.display()),
+        None => vault.display().to_string(),
+    }
 }
 
 /// Apply the create-time options that need the freshly created vault:
@@ -187,6 +199,9 @@ fn ask_header_v3(theme: &ColorfulTheme, legacy_format: bool) -> Result<bool> {
 /// bridge on Windows), etc.
 #[cfg(feature = "fido2-hardware")]
 pub(crate) fn select_fido2_device(theme: &ColorfulTheme) -> Option<String> {
+    if crate::test_fido2_mock_seed().is_some() {
+        return Some(crate::TEST_FIDO2_MOCK_LABEL.to_string());
+    }
     let devices = match luksbox_fido2::HidAuthenticator::detect_all() {
         Ok(d) => d,
         Err(_) => return None,
@@ -2354,6 +2369,9 @@ fn ask_create_options(
     vault: &Path,
     fido2_direct: bool,
     legacy_format: bool,
+    // A sync bundle: header format v3, no anchor (the bundle detects
+    // rollback itself) and no maximum size, without asking.
+    bundle: bool,
 ) -> Result<CreateOptions> {
     let mut flags = 0u32;
     if !fido2_direct {
@@ -2377,6 +2395,13 @@ fn ask_create_options(
         if hide_sizes {
             flags |= FLAG_HIDE_SIZE_HEADER;
         }
+    }
+    if bundle {
+        return Ok(CreateOptions {
+            flags,
+            header_v3: true,
+            ..CreateOptions::default()
+        });
     }
     let header_v3 = ask_header_v3(theme, legacy_format)?;
     let anchor_path = if Confirm::with_theme(theme)
@@ -2409,6 +2434,7 @@ fn ask_create_options(
         anchor: anchor_path,
         header_v3,
         max_size,
+        bundle: None,
     })
 }
 
@@ -2684,12 +2710,50 @@ fn print_slots(header: &Header, with_kdf: bool) {
 // ---- create wizard ---------------------------------------------------------
 
 fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
-    let pb = ask_path_with_default(theme, "Path for the new vault", "vault.lbx")?;
+    let bundle = Select::with_theme(theme)
+        .with_prompt("Vault type")
+        .items(&[
+            "Vault file (.lbx): one encrypted file, for one computer at a time \
+             (a local disk, an external drive or a USB stick)",
+            "Sync bundle (.lbxs folder), experimental: a folder to keep in Dropbox, Google \
+             Drive, OneDrive, iCloud Drive, Nextcloud or Syncthing; only changed parts \
+             upload, several devices can use it (their changes are merged), rollback by \
+             the provider is detected",
+        ])
+        .default(0)
+        .interact()?
+        == 1;
+    // A sync bundle is built as a vault file in a private staging folder,
+    // then converted (`finish_bundle_create`); the folder goes when this
+    // is dropped, however the creation ends.
+    let staging = if bundle {
+        let dest = ask_path_with_default(
+            theme,
+            "Folder to create for the sync bundle (inside the folder your sync service syncs)",
+            "vault.lbxs",
+        )?;
+        let named = crate::sync_cmd::with_bundle_extension(dest.clone());
+        if named != dest {
+            println!("  -> {}", named.display());
+        }
+        Some(crate::sync_cmd::BundleStaging::new(&named)?)
+    } else {
+        None
+    };
+    let pb = match &staging {
+        Some(s) => s.vault.clone(),
+        None => ask_path_with_default(theme, "Path for the new vault", "vault.lbx")?,
+    };
     if pb.exists() {
         return Err(format!("{} already exists", pb.display()).into());
     }
 
-    let header_path = ask_detached_header(theme, true)?;
+    // A bundle keeps its header in the folder.
+    let header_path = if bundle {
+        None
+    } else {
+        ask_detached_header(theme, true)?
+    };
 
     let cipher = match Select::with_theme(theme)
         .with_prompt("Cipher suite")
@@ -2714,14 +2778,19 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
     // We install the thread-local override here so the create_*
     // helpers below pick it up transparently via `luksbox-vfs`'s
     // first-flush format selection.
-    let format_choice = Select::with_theme(theme)
-        .with_prompt("On-disk metadata format")
-        .items(&[
-            "v3 (default; out-of-line chunk lists, no per-vault ceiling; requires LUKSbox v0.2.0+ to open)",
-            "v2 (compat; inline chunk lists, ~10 GiB practical per-vault ceiling; readable by pre-v0.2.0 LUKSbox)",
-        ])
-        .default(0)
-        .interact()?;
+    // A bundle needs the v3 format.
+    let format_choice = if bundle {
+        0
+    } else {
+        Select::with_theme(theme)
+            .with_prompt("On-disk metadata format")
+            .items(&[
+                "v3 (default; out-of-line chunk lists, no per-vault ceiling; requires LUKSbox v0.2.0+ to open)",
+                "v2 (compat; inline chunk lists, ~10 GiB practical per-vault ceiling; readable by pre-v0.2.0 LUKSbox)",
+            ])
+            .default(0)
+            .interact()?
+    };
     let _format_guard = luksbox_vfs::set_format_v3_override(Some(format_choice == 0));
 
     // Show the selected FIDO2 authenticator above the kind picker so
@@ -2869,12 +2938,14 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
     // and the size-hardening flags don't apply to keyslot wrapping).
     // On macOS the SEP block runs to index 19; on Linux/Windows the
     // TPM block ends at 13.
-    let opts = ask_create_options(
+    let mut opts = ask_create_options(
         theme,
         &pb,
         matches!(kind_choice, 2..=19),
         format_choice == 1,
+        bundle,
     )?;
+    opts.bundle = staging.as_ref().map(|s| s.dest.clone());
 
     match kind_choice {
         0 => create_passphrase(theme, &pb, header_path.as_deref(), cipher, &opts)?,
@@ -3117,6 +3188,9 @@ fn create_wizard(theme: &ColorfulTheme) -> Result<()> {
 /// authenticator call several seconds later.
 #[cfg(feature = "fido2-hardware")]
 fn fido2_preflight() -> Result<()> {
+    if crate::test_fido2_mock_seed().is_some() {
+        return Ok(());
+    }
     let devs = luksbox_fido2::HidAuthenticator::detect_all().unwrap_or_default();
     if devs.is_empty() {
         return Err(
@@ -3211,7 +3285,7 @@ fn create_with_sep_bootstrap(
     cont = finish_create(cont, opts)?;
     println!(
         "OK created {} (bootstrapping with backup passphrase; SEP keyslot will move to slot 0)",
-        vault.display()
+        created_name(vault, opts)
     );
 
     let vp = cont.vault_path().to_path_buf();
@@ -3288,7 +3362,7 @@ fn create_with_sep_bootstrap(
         println!("OK backup passphrase retained in slot 1 (recovery path preserved)");
     }
 
-    maybe_mount_now(theme, cont, vault)
+    maybe_mount_now(theme, cont, vault, opts)
 }
 
 /// Create a vault with a bootstrap passphrase, then immediately add
@@ -3374,7 +3448,7 @@ fn create_with_tpm_bootstrap(
     cont = finish_create(cont, opts)?;
     println!(
         "OK created {} (bootstrapping with backup passphrase; TPM keyslot will move to slot 0)",
-        vault.display()
+        created_name(vault, opts)
     );
 
     let vp = cont.vault_path().to_path_buf();
@@ -3461,7 +3535,7 @@ fn create_with_tpm_bootstrap(
         println!("OK backup passphrase retained in slot 1 (recovery path preserved)");
     }
 
-    maybe_mount_now(theme, cont, vault)
+    maybe_mount_now(theme, cont, vault, opts)
 }
 
 /// Build a TPM-backed vault with a SINGLE keyslot at index 0
@@ -3779,9 +3853,9 @@ fn create_single_slot_tpm_vault(
     }
     println!(
         "OK created {} (single-slot TPM vault; no recovery if any factor is lost)",
-        vault.display()
+        created_name(vault, opts)
     );
-    maybe_mount_now(theme, cont, vault)
+    maybe_mount_now(theme, cont, vault, opts)
 }
 
 #[cfg(not(all(feature = "hardware", any(target_os = "linux", target_os = "windows"))))]
@@ -3814,14 +3888,14 @@ fn create_passphrase(
         pw.as_bytes(),
     )?;
     cont = finish_create(cont, opts)?;
-    println!("OK created {}", vault.display());
+    println!("OK created {}", created_name(vault, opts));
     // No post-creation FIDO2 nag: it fired even with no authenticator plugged
     // in (guaranteeing a confusing FAIL) and is redundant with the keyslot
     // manager. Add FIDO2 or any other keyslot later via
     // "Open an existing vault" -> "Manage keyslots".
     eprintln!("  add more keyslots later via \"Open an existing vault\" -> \"Manage keyslots\"");
 
-    maybe_mount_now(theme, cont, vault)
+    maybe_mount_now(theme, cont, vault, opts)
 }
 
 fn create_fido2_wrap(
@@ -3874,9 +3948,9 @@ fn create_fido2_wrap(
         cont = finish_create(cont, opts)?;
         println!(
             "OK created {} with FIDO2 wrap-style keyslot",
-            vault.display()
+            created_name(vault, opts)
         );
-        maybe_mount_now(theme, cont, vault)
+        maybe_mount_now(theme, cont, vault, opts)
     }
 }
 
@@ -3935,7 +4009,10 @@ fn create_fido2_direct(
             hmac_salt,
         )?;
         cont = finish_create(cont, opts)?;
-        println!("OK created {} (FIDO2-direct, MVK derived)", vault.display());
+        println!(
+            "OK created {} (FIDO2-direct, MVK derived)",
+            created_name(vault, opts)
+        );
 
         if Confirm::with_theme(theme)
             .with_prompt(
@@ -3951,7 +4028,7 @@ fn create_fido2_direct(
             println!("OK passphrase backup enrolled in slot {idx}");
         }
 
-        maybe_mount_now(theme, cont, vault)
+        maybe_mount_now(theme, cont, vault, opts)
     }
 }
 
@@ -4040,17 +4117,24 @@ fn create_hybrid_pq(
     .map_err(|e| format!("write kyber seed: {e}"))?;
 
     cont = finish_create(cont, opts)?;
-    println!("OK created {} (hybrid-pq, {level_label})", vault.display());
-    eprintln!(
-        "  hybrid sidecar (public Kyber blobs): {}",
-        sidecar.display()
+    println!(
+        "OK created {} (hybrid-pq, {level_label})",
+        created_name(vault, opts)
     );
+    if opts.bundle.is_some() {
+        eprintln!("  hybrid sidecar (public Kyber blobs): kept inside the bundle");
+    } else {
+        eprintln!(
+            "  hybrid sidecar (public Kyber blobs): {}",
+            sidecar.display()
+        );
+    }
     eprintln!(
         "  Kyber seed (KEEP THIS SAFE, MOVE TO SEPARATE STORAGE): {}",
         kyber_path.display()
     );
 
-    maybe_mount_now(theme, cont, vault)
+    maybe_mount_now(theme, cont, vault, opts)
 }
 
 #[cfg(feature = "fido2-hardware")]
@@ -4165,15 +4249,19 @@ fn create_hybrid_pq_fido2(
     cont = finish_create(cont, opts)?;
     println!(
         "OK created {} (hybrid-pq-fido2, FIDO2 + {level_label})",
-        vault.display()
+        created_name(vault, opts)
     );
-    eprintln!("  hybrid sidecar: {}", sidecar.display());
+    if opts.bundle.is_some() {
+        eprintln!("  hybrid sidecar: kept inside the bundle");
+    } else {
+        eprintln!("  hybrid sidecar: {}", sidecar.display());
+    }
     eprintln!(
         "  Kyber seed (MOVE TO SEPARATE STORAGE): {}",
         kyber_path.display()
     );
 
-    maybe_mount_now(theme, cont, vault)
+    maybe_mount_now(theme, cont, vault, opts)
 }
 
 #[cfg(not(feature = "fido2-hardware"))]
@@ -4188,7 +4276,15 @@ fn create_hybrid_pq_fido2(
     Err("FIDO2 hardware support not compiled in".into())
 }
 
-fn maybe_mount_now(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Result<()> {
+fn maybe_mount_now(
+    theme: &ColorfulTheme,
+    cont: Container,
+    vault: &Path,
+    opts: &CreateOptions,
+) -> Result<()> {
+    if let Some(dest) = &opts.bundle {
+        return finish_bundle_create(theme, cont, dest);
+    }
     if Confirm::with_theme(theme)
         .with_prompt("Open and mount this vault now?")
         .default(false)
@@ -4196,6 +4292,32 @@ fn maybe_mount_now(theme: &ColorfulTheme, cont: Container, vault: &Path) -> Resu
     {
         let vfs = Vfs::open(cont)?;
         return mount_action(theme, vfs, vault);
+    }
+    Ok(())
+}
+
+/// The last step of creating a sync bundle: the vault built in the
+/// staging folder (every keyslot enrolled) becomes the bundle `dest`,
+/// and can be opened right away with the key in hand. The staging folder
+/// itself is removed by `create_wizard`'s `BundleStaging`.
+fn finish_bundle_create(theme: &ColorfulTheme, cont: Container, dest: &Path) -> Result<()> {
+    let mvk = cont.mvk_clone();
+    let mut vfs = Vfs::open(cont)?;
+    let id = crate::sync_cmd::convert_open_vault(&mut vfs, dest)?;
+    // Close the staging vault before its folder is removed.
+    drop(vfs.close()?);
+    println!("OK created the sync bundle {} (id {id})", dest.display());
+    crate::sync_cmd::print_bundle_next_steps(dest);
+    if Confirm::with_theme(theme)
+        .with_prompt("Open and mount this sync bundle now?")
+        .default(false)
+        .interact()?
+    {
+        // Publishes and releases the lease however the mount ends.
+        let _finish_session = FinishSessionOnExit;
+        let cont = crate::sync_cmd::open_bundle_with_key(dest, &mvk)?;
+        let vfs = Vfs::open(cont)?;
+        return mount_action(theme, vfs, dest);
     }
     Ok(())
 }
@@ -4219,7 +4341,12 @@ impl Drop for FinishSessionOnExit {
 fn open_wizard(theme: &ColorfulTheme) -> Result<()> {
     let _finish_session = FinishSessionOnExit;
     let vault = ask_path(theme, "Path to vault")?;
-    let header_path = ask_detached_header(theme, false)?;
+    // A sync bundle keeps its header in the folder: nothing to ask.
+    let header_path = if crate::sync_cmd::is_bundle(&vault) {
+        None
+    } else {
+        ask_detached_header(theme, false)?
+    };
 
     // A bundle keeps its own rollback state on each device; an anchor
     // file (the .lbx it came from has the same key) would be moved on by
@@ -4689,6 +4816,35 @@ fn info_wizard(theme: &ColorfulTheme) -> Result<()> {
 
 // ---- post-open vault loop --------------------------------------------------
 
+/// "Make a sync bundle from this vault": the open vault (saved first) is
+/// copied into a new sync bundle folder, as `luksbox sync convert` and
+/// the GUI's Make sync bundle... do. The vault file is not changed.
+fn make_bundle_action(theme: &ColorfulTheme, vfs: &mut Vfs, vault: &Path) -> Result<()> {
+    let suggested = crate::sync_cmd::with_bundle_extension(vault.to_path_buf());
+    let dest = ask_path_with_default(
+        theme,
+        "Folder to create for the sync bundle (inside the folder your sync service syncs)",
+        &suggested.display().to_string(),
+    )?;
+    let named = crate::sync_cmd::with_bundle_extension(dest.clone());
+    if named != dest {
+        println!("  -> {}", named.display());
+    }
+    crate::sync_cmd::check_new_bundle_dest(&named)?;
+    let id = crate::sync_cmd::convert_open_vault(vfs, &named)?;
+    println!(
+        "OK created the sync bundle {} (id {id}) from this vault",
+        named.display()
+    );
+    eprintln!(
+        "  {} is unchanged: use the bundle from now on (changes to the file no longer \
+         reach it), and delete the file once you no longer need it",
+        vault.display()
+    );
+    crate::sync_cmd::print_bundle_next_steps(&named);
+    Ok(())
+}
+
 fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
     loop {
         let choice = Select::with_theme(theme)
@@ -4706,6 +4862,7 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
                 "Rotate master volume key",
                 "Upgrade header to format v3 (rollback-detectable keyslot table)",
                 "Vault size (usage, maximum size, give back free space)",
+                "Make a sync bundle from this vault (a copy for Dropbox, Google Drive, ...)",
                 "Mount as a filesystem",
                 "PANIC: irreversibly destroy this vault",
                 "Close vault",
@@ -4765,20 +4922,25 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
             },
             10 => upgrade_header_action(theme, &mut vfs),
             11 => vault_size_action(theme, &mut vfs, vault),
+            12 if crate::sync_cmd::is_bundle(vault) => {
+                Err("this vault is already a sync bundle".into())
+            }
+            12 if in_recovery => Err(RECOVERY_ONLY_COPY.into()),
+            12 => make_bundle_action(theme, &mut vfs, vault),
             // A mistyped mountpoint used to close the vault: ask first.
-            12 => match ask_mount_options(theme, vault) {
+            13 => match ask_mount_options(theme, vault) {
                 Err(e) => Err(e),
                 Ok(opts) => {
                     vfs.flush()?;
                     return mount_with(vfs, vault, opts);
                 }
             },
-            13 if crate::sync_cmd::is_bundle(vault) => Err(
+            14 if crate::sync_cmd::is_bundle(vault) => Err(
                 "panic is not available for a sync bundle yet: delete the bundle folder \
                  (and empty the sync service's trash) instead"
                     .into(),
             ),
-            13 => {
+            14 => {
                 vfs.flush()?;
                 let cont = vfs.close()?;
                 // `panic_action` takes the vault either way (it releases it
@@ -4793,7 +4955,7 @@ fn open_loop(theme: &ColorfulTheme, mut vfs: Vfs, vault: &Path) -> Result<()> {
                 }
                 return Ok(());
             }
-            14 => {
+            15 => {
                 vfs.flush()?;
                 offer_shrink_on_close(theme, &mut vfs)?;
                 return Ok(());

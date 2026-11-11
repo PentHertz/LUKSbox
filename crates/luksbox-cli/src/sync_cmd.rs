@@ -441,10 +441,10 @@ pub(crate) fn open_with_material(
 
 /// [`open_with_material`] for a sync bundle whose master key is already
 /// in hand: the Windows background mount helper, which gets the key from
-/// the `luksbox mount` that unlocked the bundle (handoff protocol v3).
-/// Each header is checked against the key; the session is kept in
-/// `SESSION` as for any other open.
-#[cfg(target_os = "windows")]
+/// the `luksbox mount` that unlocked the bundle (handoff protocol v3),
+/// and the wizard right after it made a bundle. Each header is checked
+/// against the key; the session is kept in `SESSION` as for any other
+/// open.
 pub(crate) fn open_bundle_with_key(
     path: &Path,
     mvk: &luksbox_core::MasterVolumeKey,
@@ -572,6 +572,148 @@ pub(crate) fn install_mount_hook() {
             }
         }
     })));
+}
+
+/// Whether `path` names a sync bundle to create: a folder name ending in
+/// `.lbxs` (`luksbox create ~/Dropbox/vault.lbxs`).
+pub(crate) fn is_bundle_name(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("lbxs"))
+}
+
+/// A vault being created as a sync bundle (`luksbox create
+/// <folder>.lbxs`, the wizard's "Sync bundle"): built as a vault file in
+/// a private staging folder outside any synced folder, then converted
+/// into `dest` with [`convert_into_bundle`], as New vault > Sync bundle
+/// does in the GUI. The staging folder is removed when this is dropped,
+/// however the creation ends.
+pub(crate) struct BundleStaging {
+    pub(crate) dest: PathBuf,
+    /// The vault file to create (inside the staging folder).
+    pub(crate) vault: PathBuf,
+    dir: PathBuf,
+}
+
+/// A new sync bundle's folder, checked before anything is made: it must
+/// not exist yet, and the folder it goes in must.
+pub(crate) fn check_new_bundle_dest(dest: &Path) -> Result<()> {
+    if std::fs::symlink_metadata(dest).is_ok() {
+        return Err(format!(
+            "{} already exists: pick a new folder name for the sync bundle",
+            dest.display()
+        )
+        .into());
+    }
+    if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty())
+        && !parent.is_dir()
+    {
+        return Err(format!("{} is not a folder", parent.display()).into());
+    }
+    Ok(())
+}
+
+/// `path` as a sync bundle folder name: `.lbx` becomes `.lbxs`, and any
+/// other name gets `.lbxs` added (`vault` -> `vault.lbxs`).
+pub(crate) fn with_bundle_extension(path: PathBuf) -> PathBuf {
+    match path.extension() {
+        Some(e) if e.eq_ignore_ascii_case("lbxs") => path,
+        Some(e) if e.eq_ignore_ascii_case("lbx") => path.with_extension("lbxs"),
+        _ => {
+            let mut s = path.into_os_string();
+            s.push(".lbxs");
+            PathBuf::from(s)
+        }
+    }
+}
+
+impl BundleStaging {
+    /// Checks `dest` (see [`check_new_bundle_dest`]) before anything is
+    /// made.
+    pub(crate) fn new(dest: &Path) -> Result<Self> {
+        check_new_bundle_dest(dest)?;
+        let dir = bundle::fs::new_staging_dir(&local_root()?)
+            .map_err(|e| format!("could not create a staging folder: {e}"))?;
+        let stem = dest
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "vault".into());
+        Ok(Self {
+            dest: dest.to_path_buf(),
+            vault: dir.join(format!("{stem}.lbx")),
+            dir,
+        })
+    }
+}
+
+impl Drop for BundleStaging {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// Turn the vault open in `c` into a sync bundle at `dest` (the vault
+/// file is not changed; save it first). A bundle folder this call made
+/// is removed again when the conversion fails halfway (a full disk), so
+/// the next attempt does not find a half bundle that "already exists";
+/// a folder that appeared meanwhile (synced down from another device) is
+/// never touched. Returns the bundle id.
+pub(crate) fn convert_into_bundle(
+    c: &mut Container,
+    dest: &Path,
+    page_size: u32,
+) -> Result<String> {
+    // Read safely and checked against this vault (never a planted link).
+    let hybrid = bundle::fs::hybrid_sidecar_for(c)?;
+    let root = local_root()?;
+    let existed = dest.symlink_metadata().is_ok();
+    let r = bundle::fs::convert(
+        c,
+        dest,
+        &root,
+        &ConvertOptions {
+            page_size,
+            device_label: device_label(),
+            hybrid_sidecar: hybrid,
+        },
+    );
+    match r {
+        Ok(bid) => Ok(bid.to_hex()),
+        Err(e) => {
+            // `FsStore::create` makes the folder exclusively: "already
+            // exists" is its refusal, before anything was written.
+            let created = !existed
+                && !matches!(&e, SyncError::Io(io) if io.kind() == std::io::ErrorKind::AlreadyExists);
+            if created && is_bundle(dest) {
+                let _ = bundle::fs::delete(dest, &root);
+            }
+            let mut msg = format!("could not create the sync bundle: {e}");
+            if created && dest.exists() {
+                msg.push_str(&format!(
+                    " (delete the incomplete folder {} before trying again)",
+                    dest.display()
+                ));
+            }
+            Err(msg.into())
+        }
+    }
+}
+
+/// [`convert_into_bundle`] for the vault open in `vfs`, saved first so
+/// the bundle holds everything.
+pub(crate) fn convert_open_vault(vfs: &mut Vfs, dest: &Path) -> Result<String> {
+    vfs.flush()?;
+    convert_into_bundle(vfs.container_mut(), dest, bundle::DEFAULT_PAGE_SIZE)
+}
+
+/// What to tell the user once a sync bundle exists.
+pub(crate) fn print_bundle_next_steps(dest: &Path) {
+    eprintln!(
+        "  keep it inside the folder your sync service syncs (Dropbox, Google Drive, \
+         OneDrive, iCloud Drive, Nextcloud, Syncthing)\n  \
+         every luksbox command takes the folder in place of a .lbx: `luksbox ls {} /`\n  \
+         on your other devices, open the folder once it has synced there",
+        dest.display()
+    );
 }
 
 pub(crate) fn refuse_bundle(path: &Path, what: &str) -> Result<()> {
@@ -762,24 +904,14 @@ pub(crate) fn cmd_sync(cmd: SyncCommand) -> Result<()> {
             // but the vault is only read, so its anchors are only
             // compared (never created or moved).
             let mut c = open_to_read_checked(&vault, &unlock)?;
-            let hybrid = bundle::fs::hybrid_sidecar_for(&c)?;
-            let bid = bundle::fs::convert(
-                &mut c,
-                &dest,
-                &local_root()?,
-                &ConvertOptions {
-                    page_size: ps,
-                    device_label: device_label(),
-                    hybrid_sidecar: hybrid,
-                },
-            )?;
+            let bid = convert_into_bundle(&mut c, &dest, ps)?;
             eprintln!(
-                "converted {} into the sync bundle {} (id {})\n  the original file is unchanged; \
-                 keep using the bundle from now on",
+                "converted {} into the sync bundle {} (id {bid})\n  the original file is \
+                 unchanged; keep using the bundle from now on",
                 vault.display(),
                 dest.display(),
-                bid.to_hex()
             );
+            print_bundle_next_steps(&dest);
             Ok(())
         }
         SyncCommand::Export {

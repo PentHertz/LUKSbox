@@ -47,22 +47,22 @@ pub fn install(ctx: &egui::Context) {
     v.override_text_color = Some(TEXT);
     v.hyperlink_color = ACCENT;
     v.selection.bg_fill = ACCENT.linear_multiply(0.35);
-    v.selection.stroke = Stroke::new(1.0, ACCENT);
+    v.selection.stroke = Stroke::new(1.0_f32, ACCENT);
     v.widgets.noninteractive.bg_fill = PANEL;
-    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, DIM);
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0_f32, DIM);
     v.widgets.inactive.bg_fill = PANEL2;
-    v.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-    v.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, BORDER);
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.inactive.weak_bg_fill = PANEL2;
     v.widgets.hovered.bg_fill = BORDER;
-    v.widgets.hovered.bg_stroke = Stroke::new(1.0, DIM);
-    v.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, DIM);
+    v.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.active.bg_fill = ACCENT.linear_multiply(0.30);
-    v.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
-    v.widgets.active.fg_stroke = Stroke::new(1.0, TEXT);
+    v.widgets.active.bg_stroke = Stroke::new(1.0_f32, ACCENT);
+    v.widgets.active.fg_stroke = Stroke::new(1.0_f32, TEXT);
     v.widgets.open.bg_fill = PANEL2;
-    v.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT);
+    v.widgets.open.bg_stroke = Stroke::new(1.0_f32, ACCENT);
     let r = CornerRadius::same(6);
     v.widgets.noninteractive.corner_radius = r;
     v.widgets.inactive.corner_radius = r;
@@ -120,7 +120,7 @@ pub fn pill(ui: &mut egui::Ui, text: impl Into<egui::WidgetText>, color: Color32
     let label = egui::Label::new(text.into().color(color));
     egui::Frame::new()
         .fill(color.linear_multiply(0.10))
-        .stroke(Stroke::new(1.0, color))
+        .stroke(Stroke::new(1.0_f32, color))
         .corner_radius(CornerRadius::same(99))
         .inner_margin(egui::Margin::symmetric(8, 2))
         .show(ui, |ui| {

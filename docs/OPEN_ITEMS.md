@@ -2,9 +2,9 @@
 
 What the testing and performance pass of 2026-11-07/08 left to do.
 Everything else it found is fixed and listed in `CHANGELOG.md`
-(v0.7.0-rc.1); how to run each check is in `TESTING.md`; measured
-speeds are in `docs/PERFORMANCE.md`. Nothing is committed yet (branch
-`v0.7.x-sync`).
+(v0.7.0-rc.1, tagged 2026-11-10, and v0.7.1-rc.1 in preparation); how
+to run each check is in `TESTING.md`; measured speeds are in
+`docs/PERFORMANCE.md`.
 
 ## Metadata region resize: done 2026-11-08, every kind of vault
 
@@ -104,6 +104,16 @@ flush) stays durable on return (`docs/MACOS_FUSE_T.md`).
    in practice.)
 
 ## Checks not run
+
+1. **Secure Enclave sync bundles through the CLI and the wizard**
+   (v0.7.1-rc.1): the steps are in `scripts/cli_scenarios.sh` and
+   `scripts/tui_scenarios.sh` but have never run, since they need a Mac
+   with a Secure Enclave (CI's macOS runners have none). Run both
+   scripts there with a `--features hardware,fuse-t` build before the
+   stable release (`LUKSBOX_TEST_TOUCH_ID=1` adds the Touch ID steps); a
+   step whose prompt does not appear prints the screen it waited on.
+   The bundle layer is covered for every Secure Enclave kind with mocks
+   (`luksbox-sync`'s `tests/bundle_hardware_keyslots.rs`).
 
 3. **Optimized GUI timings: done** (2026-11-08, table in
    `docs/PERFORMANCE.md`): 190 to 195 MB/s import, 295 MB/s export.

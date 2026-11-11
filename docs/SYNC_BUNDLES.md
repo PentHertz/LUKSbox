@@ -39,18 +39,43 @@ with an exclusive placeholder and a rename instead.
 
 ## Create one
 
+A new vault as a bundle (v0.7.1-rc.1 and later): give `luksbox create`
+a folder name ending in `.lbxs`, inside the folder your sync service
+syncs.
+
+```bash
+luksbox create ~/Dropbox/vault.lbxs
+luksbox create ~/Dropbox/vault.lbxs --kind hybrid-pq --pq-hybrid /media/usb/vault.kyber
+```
+
+Every create option works except those a bundle has no use for:
+`--header` (the header is in the folder), `--anchor` (the bundle
+detects rollback itself), `--max-size`, and the v2 formats. The vault
+is built in a private staging folder on this computer
+(`<sync state>/creating/`, removed afterwards) and then becomes the
+bundle; nothing is asked twice, and a post-quantum vault's public
+sidecar goes inside the bundle.
+
+An existing vault:
+
 ```bash
 luksbox sync convert vault.lbx ~/Dropbox/vault.lbxs
 ```
 
-The `.lbx` is not changed; from now on use the bundle. In the GUI:
-open the vault, then **Make sync bundle...** and pick the folder.
+The `.lbx` is not changed; from now on use the bundle.
 
-To start a new vault as a bundle in the GUI: **New vault**, choose
-**Sync bundle** at the top of the form, and give a folder name inside
-the folder your sync service syncs (for example
-`~/Dropbox/vault.lbxs`). It opens right away, without asking for the
-credentials again.
+In the wizard (`luksbox` with no arguments, v0.7.1-rc.1 and later):
+**Create a new vault**,
+then **Sync bundle (.lbxs folder)** as the vault type and the folder to
+create (`.lbxs` is added if you leave it out); it offers to mount the
+bundle right away. For an existing vault: **Open an existing vault**,
+then **Make a sync bundle from this vault**.
+
+In the GUI: **New vault**, choose **Sync bundle** at the top of the
+form, and give a folder name inside the folder your sync service syncs
+(for example `~/Dropbox/vault.lbxs`). It opens right away, without
+asking for the credentials again. For an existing vault: open it, then
+**Make sync bundle...** and pick the folder.
 
 ## Use it
 
@@ -63,7 +88,9 @@ luksbox mount ~/Dropbox/vault.lbxs ~/vault
 luksbox enroll ~/Dropbox/vault.lbxs --kind fido2
 ```
 
-In the GUI: **Open... > Sync bundle** in the sidebar, or **Open sync
+In the wizard: **Open an existing vault** and the bundle folder (no
+detached-header or anchor question: a bundle has neither). In the GUI:
+**Open... > Sync bundle** in the sidebar, or **Open sync
 bundle (folder)...** on the welcome screen. The header line shows
 whether changes are uploaded yet. **Versions** lists the earlier
 versions: pick one, browse it, and **Restore** copies a file or folder

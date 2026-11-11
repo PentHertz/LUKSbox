@@ -14,10 +14,59 @@ canonical record.
 
 ---
 
-## [v0.7.0-rc.1] - Unreleased
+## [v0.7.1-rc.1] - Unreleased
 
-First release candidate of the v0.7.0 line (not tagged yet; the date is
-set when it is). The minor bump marks a new storage format, sync
+Second release candidate of the v0.7 line (not tagged yet; the date is
+set when it is): `v0.7.0-rc.1` (its entry below) plus the changes listed
+here. Sync bundles are still experimental: keep a `.lbx` copy of
+anything that matters (`luksbox sync export`).
+
+Upgrading from v0.7.0-rc.1: nothing to do; vaults and sync bundles open
+unchanged and keep their format. From v0.6.x: see the `v0.7.0-rc.1`
+entry.
+
+### Added
+
+- **Create a sync bundle from the command line and the wizard.**
+  `luksbox create <folder>.lbxs` makes one in one step, with any create
+  option except those a bundle has no use for (`--header`, `--anchor`,
+  `--max-size`, the v2 formats, refused up front). In the wizard, Create
+  a new vault asks for the vault type first (file or sync bundle) and
+  offers to mount a new bundle at once, and an open vault has Make a sync
+  bundle from this vault. Like New vault > Sync bundle in the GUI, the
+  vault is built in a private staging folder on this computer (removed
+  afterwards) and converted, so nothing is asked twice, and a
+  post-quantum vault's public sidecar goes inside the bundle.
+  `docs/SYNC_BUNDLES.md` describes every way in.
+- **Tests: sync bundles for every keyslot kind, end to end.** The CLI and
+  TUI scenario scripts create and open bundles of every kind and on two
+  devices: FIDO2 with debug builds' software authenticator
+  (`LUKSBOX_TEST_FIDO2_MOCK=<seed>`, compiled out of release builds like
+  `LUKSBOX_TEST_FAST_KDF`), TPM 2.0 against swtpm (CI and a container
+  recipe in `TESTING.md`), the Secure Enclave on a Mac that has one
+  (Touch ID on request). `luksbox-sync` tests every hardware kind at the
+  bundle layer with mocks, and `luksbox mount` of a bundle is tested on
+  Linux and macOS too.
+
+### Fixed
+
+- **`LUKSBOX_SEED_PASSPHRASE` when a seed file is written**: creating or
+  enrolling a hybrid FIDO2 / TPM / Secure Enclave kind wrote the new
+  `.kyber` seed under `LUKSBOX_NEW_PASSPHRASE`, while unlocking those
+  kinds reads `LUKSBOX_SEED_PASSPHRASE` first: a script that set it could
+  not open what it had just made. A new seed now uses it too when set.
+- Opening a sync bundle in the wizard no longer asks whether it uses a
+  detached header (a bundle keeps its header in the folder), and `luksbox
+  sync convert` removes the bundle folder it made when it fails halfway
+  (a full disk), as the GUI does, so a retry does not find a half bundle.
+- **GUI build: 36 `float_literal_f32_fallback` warnings on newer Rust**
+  (a future-incompatibility lint, set to become an error). Every
+  `Stroke::new(1.0, ...)` now spells its width `1.0_f32`.
+
+## [v0.7.0-rc.1] - 2026-11-10
+
+First release candidate of the v0.7.0 line. The minor bump marks a new
+storage format, sync
 bundles (`.lbxs`): a vault kept as a folder of small encrypted objects
 in a cloud folder, usable from several devices. Bundles are
 experimental: keep a `.lbx` copy of anything that matters (`luksbox

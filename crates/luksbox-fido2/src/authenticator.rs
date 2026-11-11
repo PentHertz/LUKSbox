@@ -232,6 +232,39 @@ pub trait Fido2Authenticator {
     }
 }
 
+/// A boxed authenticator is one: the CLI picks the real device or (debug
+/// builds, end-to-end tests) a seeded mock at run time.
+impl<T: Fido2Authenticator + ?Sized> Fido2Authenticator for Box<T> {
+    fn enroll(
+        &mut self,
+        rp_id: &str,
+        user_handle: &[u8],
+        pin: Option<&str>,
+    ) -> Result<EnrollResult, Error> {
+        (**self).enroll(rp_id, user_handle, pin)
+    }
+
+    fn hmac_secret(
+        &mut self,
+        rp_id: &str,
+        cred_id: &[u8],
+        salt: &[u8; 32],
+        prehash_salt: bool,
+        pin: Option<&str>,
+    ) -> Result<HmacSecret, Error> {
+        (**self).hmac_secret(rp_id, cred_id, salt, prehash_salt, pin)
+    }
+
+    fn hmac_secret_multi(
+        &mut self,
+        rp_id: &str,
+        requests: &[HmacSecretRequest<'_>],
+        pin: Option<&str>,
+    ) -> Result<(usize, HmacSecret), Error> {
+        (**self).hmac_secret_multi(rp_id, requests, pin)
+    }
+}
+
 /// Unlock through whichever of `requests` the presented authenticator
 /// holds, for keyslots that combine FIDO2 with another factor (TPM,
 /// ML-KEM). Every credential goes into one assertion, so on Windows the

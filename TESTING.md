@@ -146,7 +146,10 @@ metadata, deniable refusal) is in `luksbox-vfs`'s unit tests.
 `luksbox mount -f` in one process and `luksbox umount <mountpoint>`
 in another, the way a user does with two terminals (GitHub #37), then
 checks that the mount process exits cleanly and that a file written
-through the mount is in the vault. Linux (FUSE), macOS (macFUSE or
+through the mount is in the vault. On Linux and macOS it does the same
+with a sync bundle made by `luksbox create <folder>.lbxs`, and a second
+device (its own sync state) reads what the mount published at unmount.
+Linux (FUSE), macOS (macFUSE or
 FUSE-T) and Windows (WinFsp); skipped when the host can't mount (see
 `LUKSBOX_REQUIRE_MOUNT_TESTS` below). On Windows it also runs `luksbox
 mount` without `-f` (the background mount: a hidden `luksbox` process
@@ -326,6 +329,15 @@ shipped LUKSbox binary has no effect, so a polluted shell or a
 malicious launcher cannot downgrade Argon2id to brute-forceable
 parameters. The bypass exists only to keep the test suite under a
 few minutes.
+
+`LUKSBOX_TEST_FIDO2_MOCK=<64 hex digits>` (debug builds only, compiled
+out the same way) replaces every FIDO2 device with a software
+authenticator seeded from the value (`MockAuthenticator::seeded`): the
+same seed is the same key in every process, another seed is another
+key. `PIN`s are not checked. The FIDO2 sync bundle tests
+(`tests/sync_bundle.rs`, `tests/tpm_bundle.rs`) and the FIDO2 steps of
+`scripts/tui_scenarios.sh` use it; the binary prints `TEST MODE` on
+stderr whenever it is in effect.
 
 You don't need to set these manually, the test fixture
 `tests/functional.rs::test_env()` does it. But if you want to
@@ -522,8 +534,8 @@ after changes to the CLI, the wizard, the vault I/O path or the mount.
 
 ```bash
 cargo build --release -p luksbox-cli
-scripts/cli_scenarios.sh   target/release/luksbox        # 233 steps, ~3 min
-scripts/tui_scenarios.sh   target/release/luksbox        # 35 steps: wizard + deniable, ~2 min
+scripts/cli_scenarios.sh   target/release/luksbox        # 327 steps, ~3 min
+scripts/tui_scenarios.sh   target/release/luksbox        # 64 steps: wizard + deniable, ~2 min
 scripts/bench_transfer.sh  target/release/luksbox 512    # MB/s per vault kind
 ```
 
@@ -537,7 +549,13 @@ scripts/bench_transfer.sh  target/release/luksbox 512    # MB/s per vault kind
   written by a second device, and the refusals: too small for the file
   list, invalid size, a leftover `.rotating`, `deniable-resize` without
   its acknowledgment), anchor
-  rollback detection, sync bundles on two devices with
+  rollback detection, sync bundles created directly (`create
+  <folder>.lbxs`, plain and post-quantum: every data command on each,
+  a second device reading, the refused options and no staging folder
+  left), every vault kind converted (plain, padded, detached header,
+  anchor, size limit, post-quantum; a rolled-back vault, a bundle and an
+  existing folder refused) and used from a second device, a wrong
+  passphrase, on two devices with
   status / verify / snapshots / export / gc, `merge` (and a refused
   non-ancestor base), `panic`, and the failures that must be refused.
   Exit status is the number of failed steps; failures print the
@@ -548,6 +566,15 @@ scripts/bench_transfer.sh  target/release/luksbox 512    # MB/s per vault kind
   a stopped rotation and a mistyped mountpoint that must keep the vault
   open, a sync bundle's refusals and its publish on close, Ctrl-C on an
   open bundle (the change must survive and publish at the next open),
+  sync bundles made in the wizard (Create > Sync bundle, plain and
+  post-quantum, with none of the prompts a bundle has no use for; an
+  existing folder, a missing parent folder and a create that fails
+  after staging (FIDO2 with no key) leave nothing behind; Make a sync
+  bundle from a passphrase, a post-quantum and a detached-header vault;
+  create and mount at once, a file written through the mount kept) and
+  opened on two devices (every file action, the size view, info without
+  unlocking, a wrong passphrase, a keyslot added on one device used on
+  the other, a mount from the vault menu reaching the other device),
   Vault size > change the file list region (64 -> 32 MiB, checked with
   `size` and `cat` afterwards), an aborted PANIC, `deniable-resize`
   (refused without `--data-moves-visibly`, then 64 -> 16 MiB) and the
@@ -559,6 +586,46 @@ scripts/bench_transfer.sh  target/release/luksbox 512    # MB/s per vault kind
   create / mount / remount. Uses a temporary HOME. Menu
   positions are those of the current wizard: when a menu changes,
   update the matching step.
+- **Sync bundles with hardware keyslots.** Both scripts also cover
+  FIDO2 and TPM 2.0 bundles when there is something to talk to:
+  - FIDO2 (wrap, direct, FIDO2 + ML-KEM, made from a FIDO2 vault, fused
+    with the TPM) with a debug build, where `LUKSBOX_TEST_FIDO2_MOCK`
+    provides a software key: run the TUI script with
+    `LUKSBOX_TEST_FAST_KDF=1 scripts/tui_scenarios.sh target/debug/luksbox`.
+    A release build skips these steps and says so.
+  - TPM 2.0 (plain, PIN, single-slot, hybrid ML-KEM, made from and
+    converted from TPM vaults, a wrong PIN refused) when
+    `TCTI_NAME_CONF` names a TPM and the build has TPM support. swtpm
+    in a container gives both on any Linux machine:
+
+    ```bash
+    docker build -t luksbox-tpm-test - <<'EOF'
+    FROM ubuntu:26.04
+    RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          build-essential pkg-config ca-certificates libfido2-dev libssl-dev libudev-dev zlib1g-dev \
+          libtss2-dev libclang-dev clang libfuse3-dev swtpm libtss2-tcti-swtpm0 python3
+    EOF
+    # build with --features hardware inside it (CARGO_TARGET_DIR=target-tpm),
+    # start `swtpm socket --tpm2 ... --server type=unixio,path=$S` and run
+    # TCTI_NAME_CONF=swtpm:path=$S scripts/cli_scenarios.sh target-tpm/release/luksbox
+    ```
+
+    CI runs `tests/tpm_bundle.rs` (TPM, TPM + PIN, fused TPM + FIDO2,
+    TPM + FIDO2 + ML-KEM, on two devices) this way on Ubuntu 26.04.
+  - Secure Enclave (plain, + passphrase, hybrid ML-KEM, made from and
+    converted from Secure Enclave vaults, a wrong slot passphrase
+    refused; + FIDO2 with a debug build; Touch ID with
+    `LUKSBOX_TEST_TOUCH_ID=1`, touching the sensor when asked) on a Mac
+    with a Secure Enclave and a `--features hardware,fuse-t` build, as in
+    the macOS commands below. Elsewhere these steps are skipped; CI's
+    macOS runners have no Secure Enclave, so run them on a Mac before a
+    release.
+  - `luksbox-sync`'s `tests/bundle_hardware_keyslots.rs` covers every
+    hardware kind (TPM, Secure Enclave and FIDO2 with their PIN, Touch
+    ID, passphrase, fused and post-quantum variants) at the bundle layer
+    with the mock TPM, Secure Enclave and authenticator, on any machine:
+    converted, opened on a second device with the same chip or key,
+    refused by another one.
 - **`bench_transfer.sh`**: `put` / `get` throughput of one file per
   vault kind, with a plain copy as reference. Reading the numbers:
   `docs/PERFORMANCE.md`.
@@ -579,7 +646,8 @@ still need `DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib` (plus
 `$(brew --prefix libfido2)/lib`), as in CI. With FUSE-T, the TUI script
 answers the macOS-only "private mountpoint" question and does not expect
 luksbox's own Ctrl-C message (FUSE-T handles the signal). Checked on
-macOS 26 / FUSE-T 1.2.9: 233 and 35 steps, 0 failures.
+macOS 26 / FUSE-T 1.2.9 with the earlier 233- and 35-step versions
+(before the sync bundle creation steps), 0 failures.
 
 The GUI's opt-in sandbox for its FUSE-T helper has a test that mounts
 through it for real (`sandbox-exec` with the shipped profile, an anchor

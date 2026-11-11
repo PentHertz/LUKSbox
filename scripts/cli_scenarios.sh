@@ -47,32 +47,58 @@ ok "create with max size" "" -- create v-max.lbx --max-size 80M --metadata-size 
 ok "create hybrid-pq" "" -- create v-pq.lbx --kind hybrid-pq --pq-hybrid v-pq.kyber
 ko "create over existing" "exists" -- create v-aes-256-gcm-siv.lbx
 ko "create unknown cipher" "cipher" -- create v-x.lbx --cipher rot13
+# A sync bundle in one step (`create <folder>.lbxs`): built in a staging
+# folder that is removed, refused with the options it has no use for.
+ok "create a sync bundle" "created the sync bundle nb.lbxs" -- create nb.lbxs --metadata-size 2M
+ok "create a post-quantum sync bundle" "kept inside the bundle" -- create npq.lbxs --kind hybrid-pq --pq-hybrid npq.kyber --metadata-size 2M
+ko "create a bundle over an existing one" "already exists" -- create nb.lbxs
+ko "create a bundle with an anchor" "--anchor" -- create nb2.lbxs --anchor nb2.anchor
+ko "create a bundle with a detached header" "--header" -- create nb2.lbxs --header nb2.hdr
+ko "create a bundle with a maximum size" "--max-size" -- create nb2.lbxs --max-size 1G
+ko "create a bundle in the v2 format" "v2 formats" -- create nb2.lbxs --format v2
+if [ -d nb.lbxs/h ] && [ -d npq.lbxs/h ] && [ -f npq.kyber ] && [ ! -e npq.lbxs.hybrid ] && [ ! -e nb2.lbxs ] \
+  && [ -z "$(ls -A state/creating 2>/dev/null)" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); echo "FAIL bundle create: folders, seed, sidecar or staging not as expected"; fi
 
 # --- data commands on each kind -------------------------------------------
-for v in v-aes-256-gcm-siv v-aes-256-gcm v-chacha20-poly1305 v-ph v-det v-anc v-pq; do
-  U=(); case $v in v-det) U=(--header v-det.hdr);; v-anc) U=(--anchor v-anc.anchor);; v-pq) U=(--pq-hybrid v-pq.kyber);; esac
-  ok "$v mkdir" "" -- mkdir $v.lbx ${U[@]+"${U[@]}"} /docs
-  ok "$v put" "wrote 300000 bytes" -- put $v.lbx ${U[@]+"${U[@]}"} blob.bin /docs/blob.bin
-  ok "$v put small" "" -- put $v.lbx ${U[@]+"${U[@]}"} a.txt /a.txt
-  ko "$v put existing" "already exists" -- put $v.lbx ${U[@]+"${U[@]}"} a.txt /a.txt
-  ok "$v ls" "blob.bin" -- ls $v.lbx ${U[@]+"${U[@]}"} /docs
-  ok "$v get" "" -- get $v.lbx ${U[@]+"${U[@]}"} /docs/blob.bin out-$v.bin
+# (nb and npq are the sync bundles made above: every command takes the
+# folder; check / extract / header-dump have no bundle equivalent.)
+for v in v-aes-256-gcm-siv v-aes-256-gcm v-chacha20-poly1305 v-ph v-det v-anc v-pq nb npq; do
+  P=$v.lbx; U=()
+  case $v in v-det) U=(--header v-det.hdr);; v-anc) U=(--anchor v-anc.anchor);; v-pq) U=(--pq-hybrid v-pq.kyber);;
+    nb) P=nb.lbxs;; npq) P=npq.lbxs; U=(--pq-hybrid npq.kyber);; esac
+  ok "$v mkdir" "" -- mkdir $P ${U[@]+"${U[@]}"} /docs
+  ok "$v put" "wrote 300000 bytes" -- put $P ${U[@]+"${U[@]}"} blob.bin /docs/blob.bin
+  ok "$v put small" "" -- put $P ${U[@]+"${U[@]}"} a.txt /a.txt
+  ko "$v put existing" "already exists" -- put $P ${U[@]+"${U[@]}"} a.txt /a.txt
+  ok "$v ls" "blob.bin" -- ls $P ${U[@]+"${U[@]}"} /docs
+  ok "$v get" "" -- get $P ${U[@]+"${U[@]}"} /docs/blob.bin out-$v.bin
   eq "$v get content" "$("${SHA[@]}" < out-$v.bin)" "$SUMB"
-  ok "$v cat" "hello vault" -- cat $v.lbx ${U[@]+"${U[@]}"} /a.txt
-  ok "$v mv" "" -- mv $v.lbx ${U[@]+"${U[@]}"} /a.txt /docs/a2.txt
-  ok "$v ls after mv" "a2.txt" -- ls $v.lbx ${U[@]+"${U[@]}"} /docs
-  ko "$v rmdir non-empty" "" -- rmdir $v.lbx ${U[@]+"${U[@]}"} /docs
-  ok "$v rm" "" -- rm $v.lbx ${U[@]+"${U[@]}"} /docs/a2.txt
-  [ $v = v-det ] || ok "$v info" "" -- info $v.lbx
-  ok "$v check" "" -- check $v.lbx ${U[@]+"${U[@]}"}
-  ok "$v extract" "" -- extract $v.lbx ${U[@]+"${U[@]}"} /docs/blob.bin ex-$v.bin --tolerate-errors
-  eq "$v extract content" "$("${SHA[@]}" < ex-$v.bin)" "$SUMB"
-  ok "$v size" "" -- size $v.lbx ${U[@]+"${U[@]}"}
-  ok "$v header-dump" "" -- header-dump $v.lbx ${U[@]+"${U[@]}"}
+  ok "$v cat" "hello vault" -- cat $P ${U[@]+"${U[@]}"} /a.txt
+  ok "$v mv" "" -- mv $P ${U[@]+"${U[@]}"} /a.txt /docs/a2.txt
+  ok "$v ls after mv" "a2.txt" -- ls $P ${U[@]+"${U[@]}"} /docs
+  ko "$v rmdir non-empty" "" -- rmdir $P ${U[@]+"${U[@]}"} /docs
+  ok "$v rm" "" -- rm $P ${U[@]+"${U[@]}"} /docs/a2.txt
+  [ $v = v-det ] || ok "$v info" "" -- info $P
+  if [ $P = $v.lbxs ]; then
+    ok "$v sync verify" "every object verified" -- sync verify $P ${U[@]+"${U[@]}"}
+    ko "$v check refused" "not available for a sync bundle" -- check $P ${U[@]+"${U[@]}"}
+    ko "$v extract refused" "not available for a sync bundle" -- extract $P ${U[@]+"${U[@]}"} /docs/blob.bin ex-$v.bin --tolerate-errors
+    ko "$v header-dump refused" "not available for a sync bundle" -- header-dump $P
+  else
+    ok "$v check" "" -- check $P ${U[@]+"${U[@]}"}
+    ok "$v extract" "" -- extract $P ${U[@]+"${U[@]}"} /docs/blob.bin ex-$v.bin --tolerate-errors
+    eq "$v extract content" "$("${SHA[@]}" < ex-$v.bin)" "$SUMB"
+    ok "$v header-dump" "" -- header-dump $P ${U[@]+"${U[@]}"}
+  fi
+  ok "$v size" "" -- size $P ${U[@]+"${U[@]}"}
 done
 LUKSBOX_PASSPHRASE=nope ko "wrong passphrase" "" -- ls v-aes-256-gcm.lbx /
 ko "detached vault without --header" "" -- ls v-det.lbx /
 ko "hybrid without seed" "" -- ls v-pq.lbx /
+ko "post-quantum bundle without seed" "" -- ls npq.lbxs /
+LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "new bundle: a second device reads" "blob.bin" -- ls nb.lbxs /docs
+LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "post-quantum bundle: a second device reads" "blob.bin" -- ls npq.lbxs --pq-hybrid npq.kyber /docs
 ko "get missing file" "" -- get v-ph.lbx /nope.txt nope.out
 ko "cat a directory" "not a file" -- cat v-ph.lbx /docs
 ko "mkdir with slash name" "" -- mkdir v-ph.lbx /a/b/c
@@ -174,6 +200,34 @@ ok "list-fido2-devices" "" -- list-fido2-devices
 
 # --- sync bundle round trip and merge --------------------------------------
 ok "sync convert" "" -- sync convert v-chacha20-poly1305.lbx b.lbxs --page-size 1M
+# Every vault kind converts, and the bundle opens with the same
+# credentials (the post-quantum one with its seed, its sidecar inside the
+# bundle); the detached header and the anchor are only needed to convert.
+# (v-anc was rolled back on purpose above: its conversion is refused; a
+# fresh anchored vault converts.)
+ko "convert a rolled-back vault" "ROLLBACK DETECTED" -- sync convert v-anc.lbx c-rb.lbxs --anchor v-anc.anchor
+[ ! -e c-rb.lbxs ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL a refused conversion left a bundle folder"; }
+ok "v-anc2 create" "" -- create v-anc2.lbx --anchor v-anc2.anchor --metadata-size 2M
+ok "v-max mkdir" "" -- mkdir v-max.lbx /docs
+for v in v-max v-anc2; do
+  A=(); [ $v = v-anc2 ] && A=(--anchor v-anc2.anchor)
+  [ $v = v-anc2 ] && ok "$v mkdir" "" -- mkdir $v.lbx ${A[@]+"${A[@]}"} /docs
+  ok "$v put" "" -- put $v.lbx ${A[@]+"${A[@]}"} blob.bin /docs/blob.bin
+done
+for v in v-aes-256-gcm-siv v-ph v-det v-anc2 v-max v-pq; do
+  U=(); O=()
+  case $v in v-det) U=(--header v-det.hdr);; v-anc2) U=(--anchor v-anc2.anchor);; v-pq) U=(--pq-hybrid v-pq.kyber); O=(--pq-hybrid v-pq.kyber);; esac
+  ok "sync convert $v" "converted $v.lbx into the sync bundle c-$v.lbxs" -- sync convert $v.lbx c-$v.lbxs ${U[@]+"${U[@]}"}
+  ok "converted $v lists" "blob.bin" -- ls c-$v.lbxs ${O[@]+"${O[@]}"} /docs
+  ok "converted $v get" "" -- get c-$v.lbxs ${O[@]+"${O[@]}"} /docs/blob.bin out-c-$v.bin
+  eq "converted $v content" "$("${SHA[@]}" < out-c-$v.bin)" "$SUMB"
+  LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "converted $v: a second device writes" "" -- put c-$v.lbxs ${O[@]+"${O[@]}"} a.txt /from-desktop.txt
+  ok "converted $v: the first device reads it" "hello vault" -- cat c-$v.lbxs ${O[@]+"${O[@]}"} /from-desktop.txt
+done
+[ ! -e c-v-pq.lbxs.hybrid ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL a .hybrid file appeared next to the converted bundle"; }
+ko "convert into an existing bundle" "already exists" -- sync convert v-ph.lbx c-v-ph.lbxs
+ko "convert a bundle" "already a sync bundle" -- sync convert c-v-ph.lbxs c2.lbxs
+LUKSBOX_PASSPHRASE=nope ko "bundle: wrong passphrase" "no keyslot accepted" -- ls nb.lbxs /
 ok "bundle put" "published commit" -- put b.lbxs b.txt /b.txt
 LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "bundle second device put" "" -- put b.lbxs a.txt /a.txt
 ok "bundle first device sees it" "a.txt" -- ls b.lbxs /
@@ -197,6 +251,114 @@ ok "merge" "" -- merge m-ours.lbx m-theirs.lbx --base v-ph.lbx -o merged.lbx
 ok "merged has both" "ours.txt" -- ls merged.lbx /
 grep -q theirs.txt out.txt && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL merged lacks theirs.txt"; }
 ko "merge with a newer base refused" "older than the merge base" -- merge v-ph.lbx v-ph.lbx --base merged.lbx -o merged2.lbx
+
+# --- TPM 2.0 sync bundles ---------------------------------------------------
+# Only with a TPM given explicitly through TCTI_NAME_CONF (swtpm in CI or a
+# container: see TESTING.md) and a TPM-enabled build. A bundle made with
+# `create .lbxs` gets TPM and TPM + PIN keyslots and opens with the TPM
+# alone on two devices (a wrong PIN refused); a TPM vault and a hybrid
+# TPM + ML-KEM one convert and open with the TPM. The FIDO2-fused kinds
+# also run when the build takes LUKSBOX_TEST_FIDO2_MOCK (debug builds).
+if [ -n "${TCTI_NAME_CONF:-}" ]; then
+  export LUKSBOX_TPM_PIN=2468
+  ok "tpm: create a bundle" "created the sync bundle tb.lbxs" -- create tb.lbxs --metadata-size 2M
+  ok "tpm: put" "" -- put tb.lbxs a.txt /a.txt
+  ok "tpm: enroll a TPM keyslot on the bundle" "" -- enroll tb.lbxs --kind tpm2
+  ok "tpm: enroll a TPM + PIN keyslot on the bundle" "" -- enroll tb.lbxs --kind tpm2-pin
+  ok "tpm: open with the TPM" "hello vault" -- cat tb.lbxs --tpm2 /a.txt
+  LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "tpm: a second device opens the bundle with the TPM" "hello vault" -- cat tb.lbxs --tpm2 /a.txt
+  ok "tpm: revoke the plain TPM keyslot" "" -- revoke tb.lbxs --slot 1
+  ok "tpm: open with TPM + PIN" "hello vault" -- cat tb.lbxs --tpm2 /a.txt
+  LUKSBOX_TPM_PIN=0000 ko "tpm: a wrong PIN is refused" "" -- cat tb.lbxs --tpm2 /a.txt
+  # A TPM vault and a hybrid TPM + ML-KEM-768 vault, converted.
+  ok "tpm: create a vault" "" -- create tv.lbx --metadata-size 2M
+  ok "tpm: put in the vault" "" -- put tv.lbx a.txt /a.txt
+  ok "tpm: enroll on the vault" "" -- enroll tv.lbx --kind tpm2
+  ok "tpm: convert it with the TPM" "converted tv.lbx into the sync bundle tv.lbxs" -- sync convert tv.lbx tv.lbxs --tpm2
+  LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "tpm: a second device opens the converted TPM bundle" "hello vault" -- cat tv.lbxs --tpm2 /a.txt
+  ok "tpm: create a vault for hybrid TPM" "" -- create tq.lbx --metadata-size 2M
+  ok "tpm: put in it" "" -- put tq.lbx a.txt /a.txt
+  ok "tpm: enroll hybrid TPM + ML-KEM" "" -- enroll tq.lbx --kind hybrid-pq-tpm2 --pq-hybrid tq.kyber
+  ok "tpm: convert the hybrid TPM vault" "converted" -- sync convert tq.lbx tq.lbxs --tpm2 --pq-hybrid tq.kyber
+  [ ! -e tq.lbxs.hybrid ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL tpm: a .hybrid file next to the bundle"; }
+  LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "tpm: a second device opens the hybrid TPM bundle" "hello vault" -- cat tq.lbxs --tpm2 --pq-hybrid tq.kyber /a.txt
+  ko "tpm: the hybrid TPM bundle needs its seed" "" -- cat tq.lbxs --tpm2 /a.txt
+  KEY=$(printf '1%.0s' $(seq 1 64))
+  if LUKSBOX_TEST_FIDO2_MOCK=$KEY "$B" list-fido2-devices </dev/null 2>/dev/null | grep -q "software test authenticator"; then
+    # Fused TPM + FIDO2, and TPM + FIDO2 + ML-KEM, on a bundle and converted.
+    export LUKSBOX_TEST_FIDO2_MOCK=$KEY LUKSBOX_FIDO2_PIN=1234
+    ok "tpm+fido2: enroll on the bundle" "" -- enroll tb.lbxs --kind tpm2-fido2
+    ok "tpm+fido2: open" "hello vault" -- cat tb.lbxs --tpm2-fido2 /a.txt
+    LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "tpm+fido2: a second device opens the bundle" "hello vault" -- cat tb.lbxs --tpm2-fido2 /a.txt
+    LUKSBOX_TEST_FIDO2_MOCK=$(printf '2%.0s' $(seq 1 64)) ko "tpm+fido2: another key is refused" "" -- cat tb.lbxs --tpm2-fido2 /a.txt
+    ok "tpm+fido2+pq: create a vault" "" -- create tf.lbx --metadata-size 2M
+    ok "tpm+fido2+pq: put" "" -- put tf.lbx a.txt /a.txt
+    ok "tpm+fido2+pq: enroll" "" -- enroll tf.lbx --kind hybrid-pq-tpm2-fido2 --pq-hybrid tf.kyber
+    ok "tpm+fido2+pq: convert" "converted" -- sync convert tf.lbx tf.lbxs --tpm2-fido2 --pq-hybrid tf.kyber
+    LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "tpm+fido2+pq: a second device opens the bundle" "hello vault" -- cat tf.lbxs --tpm2-fido2 --pq-hybrid tf.kyber /a.txt
+    unset LUKSBOX_TEST_FIDO2_MOCK LUKSBOX_FIDO2_PIN
+  fi
+  unset LUKSBOX_TPM_PIN
+fi
+
+# --- Secure Enclave sync bundles (macOS) -------------------------------------
+# Only on a Mac with a Secure Enclave and a build with `--features
+# hardware` (probed by enrolling a keyslot). A bundle made with `create
+# .lbxs` gets Secure Enclave and Secure Enclave + passphrase keyslots and
+# opens with them on two devices (a wrong slot passphrase refused); a
+# Secure Enclave vault and a hybrid Secure Enclave + ML-KEM one convert
+# and open the same way. SEP + FIDO2 runs with a debug build's software
+# key; Touch ID only with LUKSBOX_TEST_TOUCH_ID=1 (it needs a finger).
+SEP_OK=0
+if [ "$(uname)" = Darwin ]; then
+  run create sprobe.lbx --metadata-size 2M && run enroll sprobe.lbx --kind sep && SEP_OK=1
+fi
+if [ $SEP_OK = 1 ]; then
+  ok "sep: create a bundle" "created the sync bundle sb.lbxs" -- create sb.lbxs --metadata-size 2M
+  ok "sep: put" "" -- put sb.lbxs a.txt /a.txt
+  ok "sep: enroll a Secure Enclave keyslot on the bundle" "" -- enroll sb.lbxs --kind sep
+  ok "sep: enroll a Secure Enclave + passphrase keyslot" "" -- enroll sb.lbxs --kind sep-passphrase
+  ok "sep: open with the Secure Enclave" "hello vault" -- cat sb.lbxs --sep /a.txt
+  LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "sep: a second device opens the bundle with the Secure Enclave" "hello vault" -- cat sb.lbxs --sep /a.txt
+  ok "sep: revoke the plain Secure Enclave keyslot" "" -- revoke sb.lbxs --slot 1
+  ok "sep: open with Secure Enclave + passphrase" "hello vault" -- cat sb.lbxs --sep /a.txt
+  LUKSBOX_PASSPHRASE=nope ko "sep: a wrong slot passphrase is refused" "" -- cat sb.lbxs --sep /a.txt
+  ok "sep: create a vault" "" -- create sv.lbx --metadata-size 2M
+  ok "sep: put in the vault" "" -- put sv.lbx a.txt /a.txt
+  ok "sep: enroll on the vault" "" -- enroll sv.lbx --kind sep
+  ok "sep: convert it with the Secure Enclave" "converted sv.lbx into the sync bundle sv.lbxs" -- sync convert sv.lbx sv.lbxs --sep
+  LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "sep: a second device opens the converted bundle" "hello vault" -- cat sv.lbxs --sep /a.txt
+  ok "sep: create a vault for hybrid SEP" "" -- create sq.lbx --metadata-size 2M
+  ok "sep: put in it" "" -- put sq.lbx a.txt /a.txt
+  ok "sep: enroll hybrid Secure Enclave + ML-KEM" "" -- enroll sq.lbx --kind hybrid-pq-sep --pq-hybrid sq.kyber
+  ok "sep: convert the hybrid SEP vault" "converted" -- sync convert sq.lbx sq.lbxs --sep --pq-hybrid sq.kyber
+  [ ! -e sq.lbxs.hybrid ] && PASS=$((PASS+1)) || { FAIL=$((FAIL+1)); echo "FAIL sep: a .hybrid file next to the bundle"; }
+  LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "sep: a second device opens the hybrid SEP bundle" "hello vault" -- cat sq.lbxs --sep --pq-hybrid sq.kyber /a.txt
+  ko "sep: the hybrid SEP bundle needs its seed" "" -- cat sq.lbxs --sep /a.txt
+  KEY=$(printf '1%.0s' $(seq 1 64))
+  if LUKSBOX_TEST_FIDO2_MOCK=$KEY "$B" list-fido2-devices </dev/null 2>/dev/null | grep -q "software test authenticator"; then
+    export LUKSBOX_TEST_FIDO2_MOCK=$KEY LUKSBOX_FIDO2_PIN=1234
+    ok "sep+fido2: enroll on the bundle" "" -- enroll sb.lbxs --kind sep-fido2
+    ok "sep+fido2: open" "hello vault" -- cat sb.lbxs --sep --fido2 /a.txt
+    LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "sep+fido2: a second device opens it" "hello vault" -- cat sb.lbxs --sep --fido2 /a.txt
+    ok "sep+fido2+pq: create a vault" "" -- create sf.lbx --metadata-size 2M
+    ok "sep+fido2+pq: put" "" -- put sf.lbx a.txt /a.txt
+    ok "sep+fido2+pq: enroll" "" -- enroll sf.lbx --kind hybrid-pq-sep-fido2 --pq-hybrid sf.kyber
+    ok "sep+fido2+pq: convert" "converted" -- sync convert sf.lbx sf.lbxs --sep --fido2 --pq-hybrid sf.kyber
+    LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "sep+fido2+pq: a second device opens it" "hello vault" -- cat sf.lbxs --sep --fido2 --pq-hybrid sf.kyber /a.txt
+    unset LUKSBOX_TEST_FIDO2_MOCK LUKSBOX_FIDO2_PIN
+  fi
+  if [ "${LUKSBOX_TEST_TOUCH_ID:-}" = 1 ]; then
+    echo "Touch ID steps: touch the sensor when asked"
+    # Its own bundle, so the Touch ID keyslot is the only Secure Enclave one.
+    ok "sep+touch id: create a bundle" "" -- create stid.lbxs --metadata-size 2M
+    ok "sep+touch id: put" "" -- put stid.lbxs a.txt /a.txt
+    ok "sep+touch id: enroll on the bundle" "" -- enroll stid.lbxs --kind sep-biometric
+    LUKSBOX_DEVICE_LABEL=Desktop LUKSBOX_SYNC_STATE_DIR=$W/state2 ok "sep+touch id: a second device opens it" "hello vault" -- cat stid.lbxs --sep /a.txt
+  fi
+else
+  [ "$(uname)" = Darwin ] && echo "note: Secure Enclave bundle steps skipped (no Secure Enclave, or a build without --features hardware)"
+fi
 
 # --- panic ------------------------------------------------------------------
 cp v-aes-256-gcm-siv.lbx p.lbx; cp v-aes-256-gcm-siv.lbx.header-bak p.lbx.header-bak 2>/dev/null

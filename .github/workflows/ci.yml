@@ -185,8 +185,28 @@ jobs:
           packages: |
             pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
             libtss2-dev libclang-dev clang
+            swtpm libtss2-tcti-swtpm0
       - name: Run ${{ matrix.profile }} tests
         run: ${{ matrix.cmd }}
+      # TPM 2.0 sync bundles through the real binary (tests/tpm_bundle.rs)
+      # against swtpm: TCTI_NAME_CONF is set for this step only, so no
+      # other test sees a TPM. FIDO2 is the debug build's software key.
+      - name: TPM sync bundle tests (swtpm)
+        if: matrix.profile == 'workspace-hardware'
+        run: |
+          set -euo pipefail
+          work=$(mktemp -d)
+          mkdir "$work/tpm"
+          swtpm socket --tpm2 --tpmstate dir="$work/tpm" \
+              --server type=unixio,path="$work/tpm.sock" \
+              --ctrl type=unixio,path="$work/tpm.sock.ctrl" \
+              --flags not-need-init,startup-clear --daemon
+          for _ in $(seq 50); do
+              [ -S "$work/tpm.sock" ] && [ -S "$work/tpm.sock.ctrl" ] && break
+              sleep 0.1
+          done
+          TCTI_NAME_CONF="swtpm:path=$work/tpm.sock" \
+              cargo test -p luksbox-cli --features hardware --test tpm_bundle
 
   # ---- macOS (Apple Silicon) ----------------------------------------------
   # The test suite on macOS, which no other job runs. Builds the FUSE-T

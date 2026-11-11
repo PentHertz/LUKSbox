@@ -31,6 +31,10 @@ pub struct MockAuthenticator {
     /// derivation contract and returns attacker-chosen 32-byte values.
     /// `None` = use the legitimate HMAC computation.
     hmac_secret_override: Option<[u8; 32]>,
+    /// [`seeded`](Self::seeded): every credential's secret is derived
+    /// from this seed and its id, so another `MockAuthenticator` with the
+    /// same seed (another process) answers for it.
+    seed: Option<[u8; 32]>,
 }
 
 impl MockAuthenticator {
@@ -40,7 +44,28 @@ impl MockAuthenticator {
             fail_touch: false,
             cred_id_len_override: None,
             hmac_secret_override: None,
+            seed: None,
         }
+    }
+
+    /// A mock whose credentials outlive it: a credential's secret is
+    /// `HMAC-SHA256(seed, "luksbox-mock-credential" || cred_id)`, so a
+    /// mock made later (in another process) with the same seed answers
+    /// for credentials this one enrolled, like the same physical key
+    /// plugged in again. For end-to-end tests that run the real binary
+    /// several times; never for real data.
+    pub fn seeded(seed: [u8; 32]) -> Self {
+        Self {
+            seed: Some(seed),
+            ..Self::new()
+        }
+    }
+
+    fn seeded_secret(seed: &[u8; 32], cred_id: &[u8]) -> [u8; 32] {
+        let mut mac = <Hmac<Sha256>>::new_from_slice(seed).expect("HMAC any-len");
+        mac.update(b"luksbox-mock-credential");
+        mac.update(cred_id);
+        mac.finalize().into_bytes().into()
     }
 
     /// Make subsequent operations return `TouchTimeout`. Test helper.
@@ -86,8 +111,14 @@ impl Fido2Authenticator for MockAuthenticator {
         if id_len > 0 {
             OsRng.fill_bytes(&mut id);
         }
-        let mut secret = [0u8; 32];
-        OsRng.fill_bytes(&mut secret);
+        let secret = match &self.seed {
+            Some(seed) => Self::seeded_secret(seed, &id),
+            None => {
+                let mut s = [0u8; 32];
+                OsRng.fill_bytes(&mut s);
+                s
+            }
+        };
         self.creds.insert(id.clone(), secret);
         Ok(EnrollResult {
             credential: Credential { id },
@@ -110,9 +141,11 @@ impl Fido2Authenticator for MockAuthenticator {
             // attacker-chosen bytes. Models a rogue / MITM device.
             return Ok(HmacSecret(forced));
         }
+        let seeded = self.seed.map(|s| Self::seeded_secret(&s, cred_id));
         let secret = self
             .creds
             .get(cred_id)
+            .or(seeded.as_ref())
             .ok_or_else(|| Error::Other("unknown credential".into()))?;
         // Mirror the real converged wire behaviour: the mock is a
         // CTAP2-level device, so it HMACs whatever bytes reach it. The
@@ -270,5 +303,38 @@ mod tests {
             .hmac_secret("luksbox.local", &r.credential.id, &salt, true, None)
             .unwrap();
         assert_ne!(raw, prehashed);
+    }
+}
+
+#[cfg(test)]
+mod seeded_tests {
+    use super::*;
+    use crate::authenticator::RP_ID;
+
+    /// A seeded mock answers for a credential another mock with the same
+    /// seed enrolled (the same key in another process), and only then.
+    #[test]
+    fn seeded_mocks_share_credentials() {
+        let mut first = MockAuthenticator::seeded([7; 32]);
+        let cred = first.enroll(RP_ID, b"user", None).unwrap().credential.id;
+        let a = first
+            .hmac_secret(RP_ID, &cred, &[1; 32], true, None)
+            .unwrap();
+        let mut again = MockAuthenticator::seeded([7; 32]);
+        let b = again
+            .hmac_secret(RP_ID, &cred, &[1; 32], true, None)
+            .unwrap();
+        assert_eq!(a.0, b.0);
+        let mut other = MockAuthenticator::seeded([8; 32]);
+        let c = other
+            .hmac_secret(RP_ID, &cred, &[1; 32], true, None)
+            .unwrap();
+        assert_ne!(a.0, c.0, "another seed is another key");
+        assert!(
+            MockAuthenticator::new()
+                .hmac_secret(RP_ID, &cred, &[1; 32], true, None)
+                .is_err(),
+            "an unseeded mock knows only its own credentials"
+        );
     }
 }

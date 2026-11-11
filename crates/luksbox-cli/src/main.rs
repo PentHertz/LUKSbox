@@ -441,7 +441,17 @@ enum Command {
     /// Create a new encrypted container. The first keyslot's kind is set by
     /// `--kind` (passphrase by default; pass `--kind fido2` to make slot 0 a
     /// FIDO2 hardware keyslot, requires a connected authenticator).
+    ///
+    /// A path ending in `.lbxs` creates a sync bundle instead: a vault kept
+    /// as a folder in Dropbox, Google Drive, OneDrive, iCloud Drive,
+    /// Nextcloud or Syncthing (only changed parts upload, edits on several
+    /// devices are merged, rollback by the provider is detected), for
+    /// example `luksbox create ~/Dropbox/vault.lbxs`. A bundle takes no
+    /// `--header`, `--anchor`, `--max-size` or v2 format. To turn an
+    /// existing vault into one: `luksbox sync convert`.
     Create {
+        /// The vault file to create, or a folder ending in `.lbxs` to
+        /// create a sync bundle.
         path: PathBuf,
         /// Cipher suite: aes (AES-256-GCM-SIV, default), aes-gcm
         /// (AES-256-GCM) or chacha (ChaCha20-Poly1305).
@@ -1475,13 +1485,56 @@ pub(crate) fn empty_passphrase_warning(prompt: &str) -> &'static str {
     }
 }
 
+/// Debug builds only: `LUKSBOX_TEST_FIDO2_MOCK=<64 hex digits>` replaces
+/// every FIDO2 device with a seeded software authenticator
+/// (`MockAuthenticator::seeded`), so the end-to-end tests and scenario
+/// scripts create and open FIDO2 vaults and sync bundles through the real
+/// commands and the wizard, across processes, with no key to touch.
+/// Compiled out of release binaries, like `LUKSBOX_TEST_FAST_KDF`: the
+/// environment of a shipped binary cannot swap the security key for a
+/// software one. Announced once on stderr whenever it is in effect.
 #[cfg(feature = "fido2-hardware")]
-pub(crate) fn make_fido2_authenticator() -> luksbox_fido2::HidAuthenticator {
+pub(crate) fn test_fido2_mock_seed() -> Option<[u8; 32]> {
+    #[cfg(debug_assertions)]
+    {
+        static NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        let s = std::env::var("LUKSBOX_TEST_FIDO2_MOCK").ok()?;
+        let seed: [u8; 32] = match hex::decode(s.trim()).ok().and_then(|b| b.try_into().ok()) {
+            Some(seed) => seed,
+            None => {
+                eprintln!("warning: LUKSBOX_TEST_FIDO2_MOCK is not 64 hex digits; ignored");
+                return None;
+            }
+        };
+        if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "TEST MODE: software FIDO2 authenticator (LUKSBOX_TEST_FIDO2_MOCK, debug build)"
+            );
+        }
+        Some(seed)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        None
+    }
+}
+
+/// What the software authenticator of [`test_fido2_mock_seed`] is called
+/// where a device list is shown.
+#[cfg(feature = "fido2-hardware")]
+pub(crate) const TEST_FIDO2_MOCK_LABEL: &str =
+    "software test authenticator (LUKSBOX_TEST_FIDO2_MOCK)";
+
+#[cfg(feature = "fido2-hardware")]
+pub(crate) fn make_fido2_authenticator() -> Box<dyn luksbox_fido2::Fido2Authenticator> {
+    if let Some(seed) = test_fido2_mock_seed() {
+        return Box::new(luksbox_fido2::MockAuthenticator::seeded(seed));
+    }
     let path = FIDO2_DEVICE_OVERRIDE.lock().ok().and_then(|g| g.clone());
-    match path {
+    Box::new(match path {
         Some(p) => luksbox_fido2::HidAuthenticator::with_device(p),
         None => luksbox_fido2::HidAuthenticator::new(),
-    }
+    })
 }
 
 fn main() -> ExitCode {
@@ -1568,12 +1621,6 @@ fn refuse_bundles_where_unsupported(cmd: &Command) -> Result<()> {
         // sync bundle itself (hand-off protocol v3).
         #[cfg(not(target_os = "windows"))]
         Command::MountFuseTHelper { vault, .. } => (vault, "the FUSE-T mount helper"),
-        Command::Create { path, .. } if path.extension().is_some_and(|e| e == "lbxs") => {
-            return Err(cli_err!(
-                "create a .lbx first, then `luksbox sync convert vault.lbx {}`",
-                path.display()
-            ));
-        }
         Command::Enroll { path, kind, .. } if format!("{kind:?}").starts_with("HybridPq") => {
             (path, "adding a post-quantum keyslot")
         }
@@ -1609,6 +1656,18 @@ fn dispatch_inner(cli: Cli) -> Result<()> {
             header_v3,
             header_v2,
         } => {
+            // `<folder>.lbxs`: a sync bundle, built as a vault in a private
+            // staging folder and then converted (see `BundleStaging`).
+            let bundle = sync_cmd::is_bundle_name(&path);
+            if bundle {
+                refuse_for_new_bundle(
+                    header.is_some(),
+                    anchor.is_some(),
+                    max_size.is_some(),
+                    format,
+                    header_v2,
+                )?;
+            }
             let header_v3 = resolve_header_v3(header_v3, header_v2, format)?;
             // Round 9G: if --kdf-target-time was supplied, calibrate
             // params on this CPU; otherwise resolve from the static
@@ -1634,8 +1693,17 @@ fn dispatch_inner(cli: Cli) -> Result<()> {
                 Some(s) => check_new_vault_max_size(&path, s, resolved_metadata_size, format)?,
                 None => 0,
             };
+            // Dropped (the staging folder removed) after `cmd_create`,
+            // which closes the staging vault first.
+            let staging = if bundle {
+                Some(sync_cmd::BundleStaging::new(&path)?)
+            } else {
+                None
+            };
             cmd_create(
-                &path,
+                staging
+                    .as_ref()
+                    .map_or(path.as_path(), |s| s.vault.as_path()),
                 &cipher,
                 kind,
                 header.as_deref(),
@@ -1648,6 +1716,7 @@ fn dispatch_inner(cli: Cli) -> Result<()> {
                 max_size,
                 format,
                 header_v3,
+                staging.as_ref().map(|s| s.dest.as_path()),
             )
         }
         Command::Info { path, header } => cmd_info(&path, header.as_deref()),
@@ -2767,6 +2836,10 @@ fn cmd_extract(
 
 #[cfg(feature = "fido2-hardware")]
 fn cmd_list_fido2_devices() -> Result<()> {
+    if test_fido2_mock_seed().is_some() {
+        println!("{TEST_FIDO2_MOCK_LABEL}");
+        return Ok(());
+    }
     let devices = luksbox_fido2::HidAuthenticator::detect_all()
         .map_err(|e| format!("libfido2 enumeration failed: {e}"))?;
     if devices.is_empty() {
@@ -3332,6 +3405,20 @@ fn read_hybrid_seed_passphrase() -> io::Result<Zeroizing<String>> {
     read_passphrase(".kyber seed-file passphrase: ")
 }
 
+/// The passphrase of a NEW `.kyber` seed file (create or enroll of a
+/// hybrid FIDO2 / TPM / Secure Enclave kind): `LUKSBOX_SEED_PASSPHRASE`
+/// when set, the variable the hybrid unlocks read it from, so a script
+/// that sets it can open what it made (it used to write the seed under
+/// `LUKSBOX_NEW_PASSPHRASE` and then fail to read it back); otherwise
+/// asked with confirmation like any new passphrase.
+#[cfg(feature = "fido2-hardware")]
+fn read_new_seed_passphrase(prompt: &str, for_: NewSecretFor) -> io::Result<Zeroizing<String>> {
+    if let Some(p) = secret_env::var("LUKSBOX_SEED_PASSPHRASE") {
+        return Ok(p);
+    }
+    read_passphrase_confirmed(prompt, for_)
+}
+
 /// The `.kyber` seed-file passphrase when it differs from the slot
 /// passphrase. `LUKSBOX_SEED_PASSPHRASE` for scripts, otherwise the
 /// terminal.
@@ -3864,6 +3951,35 @@ fn check_anchor_generation(trusted_anchor_gen: Option<u64>, vfs: &Vfs) -> Result
 /// v2 with `--header-v2` or with the legacy `--format v2` (whose point is
 /// readability by old binaries, which v3 would defeat). An explicit
 /// `--header-v3` with `--format v2` is a contradiction and refused.
+/// The `luksbox create` options a sync bundle has no use for, refused
+/// before anything is asked or made: a bundle keeps its header in the
+/// folder, detects rollback itself (the anchor of a cloud-folder vault),
+/// has no maximum size, and needs the v3 formats.
+fn refuse_for_new_bundle(
+    header: bool,
+    anchor: bool,
+    max_size: bool,
+    format: VaultFormatArg,
+    header_v2: bool,
+) -> Result<()> {
+    let what = if header {
+        "--header (a sync bundle keeps its header in the folder)"
+    } else if anchor {
+        "--anchor (a sync bundle detects rollback itself)"
+    } else if max_size {
+        "--max-size (a sync bundle has no maximum size)"
+    } else if matches!(format, VaultFormatArg::V2) || header_v2 {
+        "the v2 formats (a sync bundle needs format v3 and header format v3)"
+    } else {
+        return Ok(());
+    };
+    Err(format!(
+        "{what} is for .lbx files; leave it out to create a sync bundle, or create a .lbx \
+         and convert it with `luksbox sync convert`"
+    )
+    .into())
+}
+
 fn resolve_header_v3(explicit_v3: bool, explicit_v2: bool, format: VaultFormatArg) -> Result<bool> {
     let legacy = matches!(format, VaultFormatArg::V2);
     if explicit_v3 && legacy {
@@ -5024,6 +5140,9 @@ fn cmd_create(
     max_size: u64,
     format: VaultFormatArg,
     header_v3: bool,
+    // `Some(folder)`: `path` is in a staging folder and the vault becomes
+    // the sync bundle `folder` (`luksbox create <folder>.lbxs`).
+    bundle: Option<&Path>,
 ) -> Result<()> {
     let suite = parse_cipher(cipher)?;
     if path.exists() {
@@ -5227,13 +5346,21 @@ fn cmd_create(
         // to set it.
         let mut vfs = Vfs::open(cont)?;
         vfs.set_max_vault_size(max_size)?;
-        vfs.close()?;
+        cont = vfs.close()?;
         eprintln!(
             "  maximum size {}",
             luksbox_core::size::describe_size(max_size)
         );
     }
-    if let Some(hp) = header_path {
+    if let Some(dest) = bundle {
+        // Saved once (the first save writes the metadata format), then
+        // converted with the key already in hand: nothing is asked again.
+        let mut vfs = Vfs::open(cont)?;
+        let id = crate::sync_cmd::convert_open_vault(&mut vfs, dest)?;
+        vfs.close()?;
+        println!("created the sync bundle {} (id {id})", dest.display());
+        crate::sync_cmd::print_bundle_next_steps(dest);
+    } else if let Some(hp) = header_path {
         println!(
             "created {} + detached header at {}",
             path.display(),
@@ -5249,10 +5376,14 @@ fn cmd_create(
              Without it (or with a wrong passphrase against it) the vault is unrecoverable.",
             kp.display()
         );
-        eprintln!(
-            "  hybrid sidecar (public Kyber blobs) written next to the vault: {}",
-            luksbox_format::hybrid_sidecar::sidecar_path(path).display()
-        );
+        if bundle.is_some() {
+            eprintln!("  hybrid sidecar (public Kyber blobs) kept inside the bundle");
+        } else {
+            eprintln!(
+                "  hybrid sidecar (public Kyber blobs) written next to the vault: {}",
+                luksbox_format::hybrid_sidecar::sidecar_path(path).display()
+            );
+        }
     }
     // One-time tested-boundary advisory. v0.2.1 has been validated
     // end-to-end up to ~30 GiB of stored content with thousands of
@@ -5395,7 +5526,7 @@ fn create_hybrid_pq_fido2_with_params(
     );
     let pin = read_fido2_pin()?;
     eprintln!("Now choose a passphrase that encrypts the .kyber seed file at rest:");
-    let seed_pw = read_passphrase_confirmed("seed-file passphrase: ", NewSecretFor::FreshVault)?;
+    let seed_pw = read_new_seed_passphrase("seed-file passphrase: ", NewSecretFor::FreshVault)?;
 
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
@@ -6342,7 +6473,7 @@ fn cmd_enroll_hybrid_pq_tpm2(path: &Path, unlock: &UnlockArgs, kem_size: u16) ->
 
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
     let seed_pw =
-        read_passphrase_confirmed(".kyber seed-file passphrase: ", NewSecretFor::ExistingVault)?;
+        read_new_seed_passphrase(".kyber seed-file passphrase: ", NewSecretFor::ExistingVault)?;
 
     // TPM half: random KEK + seal.
     let mut tpm_kek = Zeroizing::new([0u8; 32]);
@@ -6485,7 +6616,7 @@ fn cmd_enroll_hybrid_pq_sep(path: &Path, unlock: &UnlockArgs, kem_size: u16) -> 
 
     let mut sealer = SepSealer::new().map_err(|e| format!("{e}"))?;
     let seed_pw =
-        read_passphrase_confirmed(".kyber seed-file passphrase: ", NewSecretFor::ExistingVault)?;
+        read_new_seed_passphrase(".kyber seed-file passphrase: ", NewSecretFor::ExistingVault)?;
 
     // SEP half: the enclave derives the shared secret + opaque blob.
     eprintln!("sealing SEP half under the local Secure Enclave...");
@@ -6689,7 +6820,7 @@ fn cmd_enroll_sep_fused(
     // Collect the passphrase / seed-file passphrase before the SEP /
     // FIDO2 hardware steps so the user isn't left mid-touch.
     let seed_pw = if params.is_some() {
-        Some(read_passphrase_confirmed(
+        Some(read_new_seed_passphrase(
             ".kyber seed-file passphrase: ",
             NewSecretFor::ExistingVault,
         )?)
@@ -6935,7 +7066,7 @@ fn cmd_enroll_hybrid_pq_tpm2_fido2(path: &Path, unlock: &UnlockArgs, kem_size: u
     let mut sealer = Tpm2Sealer::new().map_err(|e| format!("{e}"))?;
     let pin = read_fido2_pin()?;
     let seed_pw =
-        read_passphrase_confirmed(".kyber seed-file passphrase: ", NewSecretFor::ExistingVault)?;
+        read_new_seed_passphrase(".kyber seed-file passphrase: ", NewSecretFor::ExistingVault)?;
     let mut auth = make_fido2_authenticator();
     let user_handle = random_user_handle()?;
 
