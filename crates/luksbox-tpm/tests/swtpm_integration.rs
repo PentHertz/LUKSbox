@@ -90,7 +90,10 @@ fn maybe_spawn_swtpm() -> Option<SwtpmHandle> {
     let state_dir = tempfile::tempdir().expect("tempdir for swtpm state");
     let state_path: PathBuf = state_dir.path().to_path_buf();
     let sock_server = state_path.join("sock-server");
-    let sock_ctrl = state_path.join("sock-ctrl");
+    // The `swtpm:path=<socket>` TCTI looks for the control channel at
+    // `<socket>.ctrl`: anywhere else it cannot set the locality, which
+    // recent tpm2-tss treats as a failed TCTI init (IO failure).
+    let sock_ctrl = state_path.join("sock-server.ctrl");
 
     // Initialise NVRAM + EK certificate. Without this the first
     // command we send returns TPM_RC_INITIALIZE.
@@ -139,7 +142,7 @@ fn maybe_spawn_swtpm() -> Option<SwtpmHandle> {
     // to bind it). Bounded poll so a broken swtpm doesn't hang the
     // test forever.
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !sock_server.exists() {
+    while !(sock_server.exists() && sock_ctrl.exists()) {
         if Instant::now() > deadline {
             eprintln!("[skip] swtpm did not create server socket within 5s");
             return None;
