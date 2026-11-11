@@ -47,6 +47,20 @@ fn maybe_spawn_swtpm() -> Option<SwtpmHandle> {
         eprintln!("[skip] swtpm not on PATH");
         return None;
     }
+    // Packaged apart on Debian / Ubuntu (`swtpm-tools`): swtpm alone used
+    // to panic here instead of skipping.
+    if Command::new("swtpm_setup")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()
+        .map(|s| !s.success())
+        .unwrap_or(true)
+    {
+        eprintln!("[skip] swtpm_setup not on PATH (Debian / Ubuntu: `apt install swtpm-tools`)");
+        return None;
+    }
     let state_dir = tempfile::tempdir().expect("tempdir");
     let state_path: PathBuf = state_dir.path().to_path_buf();
     let sock_server = state_path.join("sock-server");

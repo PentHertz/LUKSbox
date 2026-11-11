@@ -185,7 +185,7 @@ jobs:
           packages: |
             pkg-config libfido2-dev libssl-dev libudev-dev zlib1g-dev
             libtss2-dev libclang-dev clang
-            swtpm libtss2-tcti-swtpm0
+            swtpm swtpm-tools libtss2-tcti-swtpm0
       - name: Run ${{ matrix.profile }} tests
         run: ${{ matrix.cmd }}
       # TPM 2.0 sync bundles through the real binary (tests/tpm_bundle.rs)
