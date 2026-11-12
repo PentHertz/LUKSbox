@@ -310,14 +310,16 @@ fn create_a_post_quantum_bundle() {
 
 /// The seeded software authenticator of debug builds
 /// (`LUKSBOX_TEST_FIDO2_MOCK`): the same seed is the same security key,
-/// in every process.
-#[cfg(feature = "fido2-hardware")]
+/// in every process. Release builds compile it out, so the FIDO2 test
+/// below is for debug builds only (a release test run would wait on the
+/// real FIDO2 prompt, Windows' security key dialog included).
+#[cfg(all(feature = "fido2-hardware", debug_assertions))]
 const KEY: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-#[cfg(feature = "fido2-hardware")]
+#[cfg(all(feature = "fido2-hardware", debug_assertions))]
 const OTHER_KEY: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
 /// `run_as` with a FIDO2 key "plugged in" (`key`), PIN 1234.
-#[cfg(feature = "fido2-hardware")]
+#[cfg(all(feature = "fido2-hardware", debug_assertions))]
 fn run_with_key(dir: &Path, device: &str, key: &str, args: &[&str]) -> Output {
     Command::new(bin())
         .args(args)
@@ -342,7 +344,7 @@ fn run_with_key(dir: &Path, device: &str, key: &str, args: &[&str]) -> Output {
 /// <folder>.lbxs`, and a FIDO2 vault converted with `sync convert`. Each
 /// opens on a second device with the same key, and not with another key
 /// or without one.
-#[cfg(feature = "fido2-hardware")]
+#[cfg(all(feature = "fido2-hardware", debug_assertions))]
 #[test]
 fn fido2_bundles_with_a_software_key() {
     let tmp = tempdir().unwrap();

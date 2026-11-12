@@ -10,7 +10,13 @@
 //! the same TPM); a vault with a TPM + FIDO2 + ML-KEM keyslot converts
 //! and opens the same way. Another key or a wrong PIN is refused.
 
-#![cfg(all(feature = "hardware", any(target_os = "linux", target_os = "windows")))]
+// Debug builds only: the FIDO2 half is the software authenticator,
+// which release builds compile out.
+#![cfg(all(
+    feature = "hardware",
+    debug_assertions,
+    any(target_os = "linux", target_os = "windows")
+))]
 
 use std::path::Path;
 use std::process::{Command, Output};
