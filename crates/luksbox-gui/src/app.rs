@@ -1788,6 +1788,9 @@ enum MountBackend {
         /// flock, a missing libfuse-t.dylib, a mountpoint that's
         /// suddenly unwritable, etc.).
         stderr: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        /// A sync bundle: the helper publishes at unmount and says so on
+        /// its stderr (`bundle_unmount_summary`).
+        bundle: bool,
     },
 }
 
@@ -9215,18 +9218,6 @@ impl LuksboxApp {
     /// The Vfs is moved into the thread; the GUI no longer owns it
     /// while mounted, hence the dedicated "mounted" UI in `draw_mounted`.
     fn start_mount_picker(&mut self, private: bool) {
-        if luksbox_mount::FUSE_BACKEND == "fuse-t"
-            && self
-                .vault
-                .as_ref()
-                .is_some_and(|v| crate::sync_gui::is_bundle(&v.vault_path))
-        {
-            self.toast_err(
-                "Mounting a sync bundle is not available with FUSE-T yet; \
-                 use the browser here, or `luksbox mount` from a terminal",
-            );
-            return;
-        }
         // Fail-fast on Windows when WinFsp isn't installed. The
         // upstream `winfsp_wrs::init()` looks up the DLL via
         // HKLM\SOFTWARE\WOW6432Node\WinFsp\InstallDir and returns
@@ -9354,7 +9345,16 @@ impl LuksboxApp {
             let give_back = shrink_mode == ShrinkOnFinish::GiveBack;
             let sync_mode = std::mem::take(&mut self.mount_sync_mode);
             match start_mount_subprocess(opened, &mountpoint, give_back, sync_mode) {
-                Ok((child, stderr)) => MountBackend::Subprocess { child, stderr },
+                Ok(m) => {
+                    if let Some(note) = m.sync_note {
+                        self.toast_ok(note);
+                    }
+                    MountBackend::Subprocess {
+                        child: m.child,
+                        stderr: m.stderr,
+                        bundle: m.bundle,
+                    }
+                }
                 Err(e) => {
                     self.toast_err(format!("could not start mount helper: {e}"));
                     // OpenedVault was consumed; user must reopen the
@@ -9612,7 +9612,11 @@ impl LuksboxApp {
                     self.toast_err("mount thread terminated unexpectedly");
                 }
             },
-            MountBackend::Subprocess { child, stderr } => match child.try_wait() {
+            MountBackend::Subprocess {
+                child,
+                stderr,
+                bundle,
+            } => match child.try_wait() {
                 Ok(None) => {
                     // Child still running, nothing to do.
                 }
@@ -9625,12 +9629,22 @@ impl LuksboxApp {
                         .ok()
                         .map(|g| String::from_utf8_lossy(&g).into_owned())
                         .unwrap_or_default();
+                    let synced = if *bundle {
+                        bundle_unmount_summary(&stderr_snapshot)
+                    } else {
+                        None
+                    };
                     self.mount_status = None;
                     self.view = View::Welcome;
                     self.cwd = "/".into();
                     self.listing.clear();
                     if exit_status_is_clean_unmount(status) {
                         self.toast_ok("vault unmounted");
+                        match synced {
+                            Some((true, msg)) => self.toast_ok(msg),
+                            Some((false, msg)) => self.toast_err(msg),
+                            None => {}
+                        }
                     } else {
                         // Non-zero exit can mean libfuse-t aborted
                         // itself during teardown (the original FUSE-T
@@ -16073,32 +16087,77 @@ fn start_mount_subprocess(
     mountpoint: &Path,
     shrink_on_close: bool,
     sync_mode: bool,
-) -> Result<
-    (
-        std::process::Child,
-        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
-    ),
-    String,
-> {
-    use std::io::{Read as _, Write as _};
-    use std::process::Stdio;
-    use zeroize::Zeroize as _;
-
+) -> Result<HelperMount, String> {
     let helper = locate_helper_binary().ok_or_else(|| {
         "could not find the `luksbox` CLI binary alongside the GUI \
          (expected at the same directory as the running luksbox-gui \
           executable; on macOS this is LUKSbox.app/Contents/MacOS/)"
             .to_string()
     })?;
+    let profile = helper_sandbox_profile()?;
+    spawn_mount_helper(
+        &helper,
+        profile.as_deref(),
+        opened,
+        mountpoint,
+        shrink_on_close,
+        sync_mode,
+    )
+}
+
+/// What `start_mount_subprocess` started.
+struct HelperMount {
+    child: std::process::Child,
+    stderr: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    /// The vault is a sync bundle: the helper holds its session.
+    bundle: bool,
+    /// What ending the GUI's own session of the bundle did (uploaded the
+    /// last changes, merged), for a toast.
+    sync_note: Option<String>,
+}
+
+/// `start_mount_subprocess` with the helper binary and the sandbox
+/// profile given (`None`: unsandboxed).
+///
+/// A sync bundle is handed over as a bundle (protocol v3, as the Windows
+/// background mount does): its vault is saved, the GUI's session is
+/// finished the way locking finishes it (what was saved is uploaded, the
+/// lease removed, this device's state for the bundle released), and the
+/// helper opens its own session with the key, which publishes while
+/// mounted and at unmount.
+fn spawn_mount_helper(
+    helper: &Path,
+    profile: Option<&Path>,
+    opened: OpenedVault,
+    mountpoint: &Path,
+    shrink_on_close: bool,
+    sync_mode: bool,
+) -> Result<HelperMount, String> {
+    use std::io::{Read as _, Write as _};
+    use std::process::Stdio;
+    use zeroize::Zeroize as _;
 
     // 1. Pull out everything we'll need AFTER the OpenedVault drops.
     let vault_path = opened.vault_path.clone();
     let header_path = opened.header_path.clone();
+    let bundle = crate::sync_gui::is_bundle(&vault_path);
     // The anchor the vault was opened with (`--anchor`, or the automatic
     // one of a vault in a cloud folder), as the CLI hands it on: without
     // it the helper's writes did not move the anchor forward, a gap in
-    // rollback detection.
-    let anchor_path = opened.vfs.container().anchor_path().map(Path::to_path_buf);
+    // rollback detection. A bundle has none (it keeps its rollback state
+    // on each device), nor a detached header.
+    let anchor_path = if bundle {
+        None
+    } else {
+        opened.vfs.container().anchor_path().map(Path::to_path_buf)
+    };
+    // This device's sync state, which the helper's session uses (and its
+    // sandbox must let it write).
+    let sync_dir = if bundle {
+        Some(crate::sync_gui::state_dir()?)
+    } else {
+        None
+    };
     let mvk = opened.vfs.container().mvk_clone();
     // Deniable handoff state (None for standard vaults). Captured
     // before the drop so we still have access to the open container.
@@ -16110,8 +16169,20 @@ fn start_mount_subprocess(
 
     // 2. Drop the OpenedVault now to release the file lock. After
     // this point the .lbx file has no flock holder; the child can
-    // acquire it.
+    // acquire it. A bundle's vault is saved first, as locking does.
+    let mut opened = opened;
+    if bundle {
+        let _ = opened.vfs.flush();
+    }
     drop(opened);
+    // 2a. A bundle: finish this process's session (upload, merge, lease),
+    // which releases this device's state for the bundle: the helper's
+    // own session takes it next.
+    let sync_note = if bundle {
+        crate::sync_gui::finish_active_session()
+    } else {
+        None
+    };
 
     // 2b. Pre-flight: confirm no OTHER process (e.g. a stale
     // mount-fuse-t-helper from a previous failed unmount, or a CLI
@@ -16125,18 +16196,24 @@ fn start_mount_subprocess(
     // dedicated error message so the user immediately knows to
     // hunt for the other process. Detached header (if any) is
     // probed too; child's `lock_handles` locks both.
-    preflight_vault_unlocked(&vault_path, header_path.as_deref())?;
+    // (A bundle is a folder; its exclusivity is this device's state lock,
+    // which the helper's open reports.)
+    if !bundle {
+        preflight_vault_unlocked(&vault_path, header_path.as_deref())?;
+    }
 
     // 3. Spawn the child. Optionally wrap with macOS sandbox-exec
     // for defense-in-depth (opt-in via LUKSBOX_SANDBOX_HELPER=1
     // until validated end-to-end on macOS hosts).
-    let mut cmd = build_helper_command(
-        &helper,
+    let mut cmd = helper_command(
+        helper,
+        profile,
         &vault_path,
         header_path.as_deref(),
         anchor_path.as_deref(),
+        sync_dir.as_deref(),
         mountpoint,
-    )?;
+    );
     if shrink_on_close {
         cmd.arg("--shrink-on-close");
     }
@@ -16177,6 +16254,10 @@ fn start_mount_subprocess(
     let mut mvk_bytes: [u8; 32] = *mvk.as_bytes();
     let write_res = (|| -> std::io::Result<()> {
         match deniable_handoff {
+            None if bundle => {
+                stdin.write_all(&[0x03u8])?;
+                stdin.write_all(&mvk_bytes)?;
+            }
             None => {
                 stdin.write_all(&[0x01u8])?;
                 stdin.write_all(&mvk_bytes)?;
@@ -16238,7 +16319,12 @@ fn start_mount_subprocess(
     // and zeroizes its inner storage. The child now has its own
     // copy, will reconstruct a MasterVolumeKey from it, and zeroize
     // its stdin buffer.
-    Ok((child, stderr_buf))
+    Ok(HelperMount {
+        child,
+        stderr: stderr_buf,
+        bundle,
+        sync_note,
+    })
 }
 
 /// Pre-flight probe to verify that no other process is currently
@@ -16326,6 +16412,43 @@ fn stderr_tail(s: &str, n: usize) -> String {
     }
 }
 
+/// The line the mount helper writes when a bundle's mount ends, before
+/// its last upload (`UNMOUNT_UPLOAD_LINE` in the command line).
+const BUNDLE_UNMOUNT_LINE: &str = "luksbox: unmounted, uploading the last changes";
+
+/// What the mount helper's sync session did at unmount, from the lines
+/// it writes on stderr after `BUNDLE_UNMOUNT_LINE` (`report_finish` in
+/// the command line; the notes it prints at start are before it), for a
+/// toast: `(all went well, message)`, or `None` if it said nothing.
+fn bundle_unmount_summary(stderr: &str) -> Option<(bool, String)> {
+    let (_, after) = stderr.rsplit_once(BUNDLE_UNMOUNT_LINE)?;
+    let mut parts = Vec::new();
+    let mut ok = true;
+    for line in after.lines().map(str::trim) {
+        if let Some(rest) = line.strip_prefix("published commit ") {
+            let seq = rest.split_whitespace().next().unwrap_or("");
+            parts.push(format!("uploaded commit {seq}"));
+        } else if line.starts_with("merged ") {
+            parts.push(line.to_string());
+        } else if let Some(rest) = line.strip_prefix("note: ") {
+            parts.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("warning: ") {
+            ok = false;
+            parts.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix("luksbox: publishing at unmount failed: ") {
+            ok = false;
+            parts.push(format!(
+                "upload at unmount failed ({rest}); the changes are kept on this device \
+                 and uploaded the next time the bundle opens"
+            ));
+        }
+    }
+    if parts.is_empty() {
+        parts.push("nothing new to upload".into());
+    }
+    Some((ok, format!("Sync bundle: {}", parts.join(", "))))
+}
+
 /// True if the helper subprocess's exit status represents a clean
 /// unmount, even if it's not strictly `status.success()`.
 ///
@@ -16396,12 +16519,13 @@ fn add_sized_enabled(
 ///   /Applications/LUKSbox.app/Contents/MacOS/luksbox \
 ///     mount-fuse-t-helper [--header HDR] <vault> <mountpoint>
 ///
-/// When `LUKSBOX_SANDBOX_HELPER=1` is set in the environment, the
-/// invocation is wrapped with macOS `sandbox-exec` using the
+/// With a `profile` (`helper_sandbox_profile`: `LUKSBOX_SANDBOX_HELPER=1`),
+/// the invocation is wrapped with macOS `sandbox-exec` using the
 /// profile shipped at `dist/macos/sandbox/fuse-t-helper.sb`. The
 /// sandbox restricts the helper (and the FUSE-T processes it starts) to:
 /// - File writes in the folders of the vault, its detached header and
-///   its rollback anchor, plus the temporary folders.
+///   its rollback anchor, this device's sync state for a sync bundle,
+///   plus the temporary folders.
 /// - Reads of those, the mountpoint directory itself, system
 ///   libraries, FUSE-T's install and our own .app bundle (and the
 ///   metadata of any path, for path resolution).
@@ -16425,61 +16549,59 @@ fn add_sized_enabled(
 /// On non-macOS targets the sandbox-wrapping branch is dead code
 /// (FUSE-T is macOS-only), but we keep the function platform-portable
 /// so the build compiles unchanged on Linux/Windows.
-fn build_helper_command(
+fn helper_command(
     helper: &Path,
+    profile: Option<&Path>,
     vault: &Path,
     header: Option<&Path>,
     anchor: Option<&Path>,
+    sync_dir: Option<&Path>,
     mountpoint: &Path,
-) -> Result<std::process::Command, String> {
-    use std::process::Command;
-
-    // Sandbox opt-in. Re-read on every spawn so a user can flip the
-    // env var without restarting the GUI.
-    let sandbox_enabled = matches!(
-        std::env::var("LUKSBOX_SANDBOX_HELPER").as_deref(),
-        Ok("1") | Ok("true") | Ok("yes")
-    );
-
-    if cfg!(target_os = "macos") && sandbox_enabled {
-        if let Some(profile_path) = locate_sandbox_profile() {
-            return Ok(sandboxed_helper_command(
-                helper,
-                vault,
-                header,
-                anchor,
-                mountpoint,
-                &profile_path,
-            ));
-        }
-        // Hard-fail when sandboxing was explicitly requested but the
-        // profile is missing. Previously the code logged a warning to
-        // stderr and fell through to an unsandboxed spawn, which on a
-        // packaged .app sends the warning to /dev/null and silently
-        // downgrades a security-conscious user back to no isolation.
-        // The whole point of the opt-in is that the user told us they
-        // want sandboxing; honor that or refuse, never silently
-        // weaken. The error surfaces in the GUI toast.
-        return Err(
-            "LUKSBOX_SANDBOX_HELPER=1 is set but the sandbox profile was \
-             not found in the .app bundle's Resources directory \
-             (expected: <bundle>/Contents/Resources/fuse-t-helper.sb). \
-             Refusing to spawn the helper unsandboxed. Either unset \
-             LUKSBOX_SANDBOX_HELPER (and accept no sandboxing), or \
-             reinstall LUKSbox so the bundle ships the profile."
-                .to_string(),
+) -> std::process::Command {
+    if let Some(profile) = profile {
+        return sandboxed_helper_command(
+            helper, vault, header, anchor, sync_dir, mountpoint, profile,
         );
     }
-
     // Default path: direct invocation of the helper, no sandbox wrap.
-    let mut cmd = Command::new(helper);
+    let mut cmd = std::process::Command::new(helper);
     cmd.arg("mount-fuse-t-helper");
     if let Some(hp) = header {
         cmd.arg("--header").arg(hp);
     }
     cmd.arg(vault).arg(mountpoint);
     strip_secret_env(&mut cmd);
-    Ok(cmd)
+    cmd
+}
+
+/// The sandbox profile to run the helper under: `None` unless
+/// `LUKSBOX_SANDBOX_HELPER=1` (macOS; re-read on every spawn so a user
+/// can flip it without restarting the GUI).
+///
+/// Hard-fails when sandboxing was explicitly requested but the profile
+/// is missing. Previously the code logged a warning to stderr and fell
+/// through to an unsandboxed spawn, which on a packaged .app sends the
+/// warning to /dev/null and silently downgrades a security-conscious
+/// user back to no isolation. The whole point of the opt-in is that the
+/// user told us they want sandboxing; honor that or refuse, never
+/// silently weaken. The error surfaces in the GUI toast.
+fn helper_sandbox_profile() -> Result<Option<PathBuf>, String> {
+    let sandbox_enabled = matches!(
+        std::env::var("LUKSBOX_SANDBOX_HELPER").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    );
+    if !(cfg!(target_os = "macos") && sandbox_enabled) {
+        return Ok(None);
+    }
+    locate_sandbox_profile().map(Some).ok_or_else(|| {
+        "LUKSBOX_SANDBOX_HELPER=1 is set but the sandbox profile was \
+         not found in the .app bundle's Resources directory \
+         (expected: <bundle>/Contents/Resources/fuse-t-helper.sb). \
+         Refusing to spawn the helper unsandboxed. Either unset \
+         LUKSBOX_SANDBOX_HELPER (and accept no sandboxing), or \
+         reinstall LUKSbox so the bundle ships the profile."
+            .to_string()
+    })
 }
 
 /// The helper run under `sandbox-exec` with `profile_path`
@@ -16491,6 +16613,7 @@ fn sandboxed_helper_command(
     vault: &Path,
     header: Option<&Path>,
     anchor: Option<&Path>,
+    sync_dir: Option<&Path>,
     mountpoint: &Path,
     profile_path: &Path,
 ) -> std::process::Command {
@@ -16543,6 +16666,12 @@ fn sandboxed_helper_command(
         .as_ref()
         .and_then(|p| p.parent().map(|q| q.to_path_buf()))
         .unwrap_or_else(|| vault_dir.clone());
+    // A sync bundle: this device's sync state (the session's lock, its
+    // staged changes and identity, the folder registry). The vault
+    // folder otherwise, which adds nothing.
+    let sync_dir = sync_dir
+        .map(|p| p.canonicalize().unwrap_or_else(|_| p.to_path_buf()))
+        .unwrap_or_else(|| vault_dir.clone());
     let bundle_dir = helper_canon
         .parent()
         .map(|q| q.to_path_buf())
@@ -16551,6 +16680,7 @@ fn sandboxed_helper_command(
         ("VAULT_DIR", &vault_dir),
         ("HEADER_DIR", &header_dir),
         ("ANCHOR_DIR", &anchor_dir),
+        ("SYNC_DIR", &sync_dir),
         ("MOUNTPOINT", &mp_canon),
         ("BUNDLE_DIR", &bundle_dir),
         ("HELPER", &helper_canon),
@@ -17520,7 +17650,7 @@ mod helper_command_tests {
     fn sandboxed_helper_command_gives_the_profile_what_it_needs() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
-        for d in ["bin", "v", "h", "a", "mnt"] {
+        for d in ["bin", "v", "h", "a", "mnt", "state"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
         let helper = root.join("bin/luksbox");
@@ -17540,6 +17670,7 @@ mod helper_command_tests {
             &root.join("link/v.lbx"),
             Some(&header),
             Some(&anchor),
+            Some(&root.join("state")),
             &root.join("mnt"),
             &profile,
         );
@@ -17562,6 +17693,10 @@ mod helper_command_tests {
         assert_eq!(
             get("ANCHOR_DIR"),
             Some(root.join("a").display().to_string())
+        );
+        assert_eq!(
+            get("SYNC_DIR"),
+            Some(root.join("state").display().to_string())
         );
         assert_eq!(
             get("MOUNTPOINT"),
@@ -17648,6 +17783,7 @@ mod helper_command_tests {
             &vault,
             None,
             Some(&anchor),
+            None,
             &mnt,
             &shipped_profile(),
         );
@@ -17693,5 +17829,209 @@ mod helper_command_tests {
         ]);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
         assert_eq!(o.stdout, b"sandboxed write");
+    }
+
+    /// A sync bundle mounted the way the GUI mounts one with FUSE-T: the
+    /// GUI's session is finished (what it saved is uploaded), the helper
+    /// opens its own with the key (hand-off v3), and a file written
+    /// through the mount is published at unmount: another device reads
+    /// it. Unsandboxed, then under the shipped profile. Needs FUSE-T and
+    /// `LUKSBOX_TEST_HELPER`; skipped without them (it mounts).
+    #[test]
+    fn a_sync_bundle_mounts_through_the_helper_and_publishes_at_unmount() {
+        let _env = crate::test_env_lock();
+        let Some(helper) = std::env::var_os("LUKSBOX_TEST_HELPER").map(PathBuf::from) else {
+            eprintln!("[skip] set LUKSBOX_TEST_HELPER to a luksbox binary built with fuse-t");
+            return;
+        };
+        if !Path::new("/Library/Application Support/fuse-t").exists() {
+            eprintln!("[skip] FUSE-T is not installed");
+            return;
+        }
+        const PW: &str = "bundle-helper-test-pw";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let (drive, mnt) = (root.join("GoogleSync"), root.join("mnt"));
+        let (st_a, st_b) = (root.join("state-a"), root.join("state-b"));
+        for d in [&drive, &mnt] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let bundle = drive.join("v.lbxs");
+        let cli = |args: &[&std::ffi::OsStr], state: &Path, label: &str| {
+            std::process::Command::new(&helper)
+                .args(args)
+                .env("LUKSBOX_PASSPHRASE", PW)
+                .env("LUKSBOX_NEW_PASSPHRASE", PW)
+                .env("LUKSBOX_ACCEPT_WEAK", "1")
+                .env("LUKSBOX_SYNC_STATE_DIR", state)
+                .env("LUKSBOX_DEVICE_LABEL", label)
+                .stdin(std::process::Stdio::null())
+                .output()
+                .unwrap()
+        };
+        let o = cli(
+            &[
+                "create".as_ref(),
+                bundle.as_os_str(),
+                "--metadata-size".as_ref(),
+                "2M".as_ref(),
+            ],
+            &st_a,
+            "a",
+        );
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        let mounted = || {
+            let out = std::process::Command::new("/sbin/mount").output().unwrap();
+            String::from_utf8_lossy(&out.stdout).contains(&format!(" on {} (", mnt.display()))
+        };
+        // SAFETY: test-only, under `test_env_lock`; the GUI's session and
+        // the helper it starts use this device's state (state-a).
+        unsafe {
+            std::env::set_var("LUKSBOX_SYNC_STATE_DIR", &st_a);
+            std::env::set_var("LUKSBOX_DEVICE_LABEL", "a");
+        }
+        for (round, sandboxed) in [(1, false), (2, true)] {
+            // The GUI's open, and a file saved in its browser.
+            let c = crate::sync_gui::open_with_material(
+                &bundle,
+                None,
+                luksbox_format::container::UnlockMaterial::Passphrase(PW.as_bytes()),
+            )
+            .unwrap();
+            let mut vfs = luksbox_vfs::Vfs::open(c).unwrap();
+            let id = vfs
+                .create(vfs.root_id(), &format!("browser-{round}.txt"))
+                .unwrap();
+            vfs.write(id, 0, b"saved in the browser").unwrap();
+            let opened = OpenedVault {
+                vfs,
+                vault_path: bundle.clone(),
+                header_path: None,
+                anchor_path: None,
+                cipher_label: String::new(),
+                has_fido2: false,
+                has_hybrid_pq: false,
+                has_tpm: false,
+                deniable_fido2_recovery: None,
+                deniable_tpm_blob_path: None,
+                tolerated_inodes: Vec::new(),
+                create_warning: None,
+            };
+            let profile = sandboxed.then(shipped_profile);
+            let mut m = spawn_mount_helper(&helper, profile.as_deref(), opened, &mnt, false, false)
+                .unwrap();
+            assert!(m.bundle);
+            assert!(
+                m.sync_note
+                    .as_deref()
+                    .is_some_and(|n| n.contains("uploaded commit")),
+                "the GUI's session did not upload what it saved: {:?}",
+                m.sync_note
+            );
+            assert!(
+                !crate::sync_gui::session_active(),
+                "the GUI's session is still open"
+            );
+            let stderr =
+                |m: &HelperMount| String::from_utf8_lossy(&m.stderr.lock().unwrap()).into_owned();
+            let start = Instant::now();
+            while !mounted() {
+                if let Ok(Some(status)) = m.child.try_wait() {
+                    std::thread::sleep(Duration::from_millis(200));
+                    panic!(
+                        "round {round}: the helper exited ({status}) without mounting:\n{}",
+                        stderr(&m)
+                    );
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(20),
+                    "round {round}: not mounted after 20 s:\n{}",
+                    stderr(&m)
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let name = format!("mounted-{round}.txt");
+            std::fs::write(mnt.join(&name), b"written through the mount").unwrap();
+            let o = cli(&["umount".as_ref(), mnt.as_os_str()], &st_a, "a");
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            let status = m.child.wait().unwrap();
+            assert!(
+                exit_status_is_clean_unmount(status),
+                "round {round}: helper exit {status}:\n{}",
+                stderr(&m)
+            );
+            // What the GUI toasts (the drain thread may still be on the
+            // last lines for a moment).
+            let start = Instant::now();
+            let summary = loop {
+                if let Some(s) = bundle_unmount_summary(&stderr(&m)) {
+                    break s;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "round {round}: no upload reported at unmount:\n{}",
+                    stderr(&m)
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            assert!(
+                summary.0 && summary.1.contains("uploaded commit"),
+                "{summary:?}"
+            );
+            // Published, not only saved here: another device reads both.
+            for (file, want) in [
+                (
+                    format!("/browser-{round}.txt"),
+                    &b"saved in the browser"[..],
+                ),
+                (format!("/{name}"), &b"written through the mount"[..]),
+            ] {
+                let o = cli(
+                    &["cat".as_ref(), bundle.as_os_str(), file.as_ref()],
+                    &st_b,
+                    "b",
+                );
+                assert!(
+                    o.status.success(),
+                    "round {round}, {file}: {}",
+                    String::from_utf8_lossy(&o.stderr)
+                );
+                assert_eq!(o.stdout, want, "round {round}, {file}");
+            }
+        }
+        // SAFETY: as above.
+        unsafe {
+            std::env::remove_var("LUKSBOX_SYNC_STATE_DIR");
+            std::env::remove_var("LUKSBOX_DEVICE_LABEL");
+        }
+    }
+
+    #[test]
+    fn the_unmount_toast_says_what_the_helper_published() {
+        // Notes from the start of the helper are not about the upload.
+        let start = "note: memory not locked\nwarning: LUKSBOX_SYNC_STATE_DIR is set\n\
+                     luksbox-mount-helper: Vfs ready, calling mount\n";
+        assert_eq!(bundle_unmount_summary(start), None);
+        assert_eq!(
+            bundle_unmount_summary(&format!(
+                "{start}{BUNDLE_UNMOUNT_LINE}\nluksbox-mount-helper: mount returned cleanly\n"
+            )),
+            Some((true, "Sync bundle: nothing new to upload".into()))
+        );
+        assert_eq!(
+            bundle_unmount_summary(&format!(
+                "{start}{BUNDLE_UNMOUNT_LINE}\npublished commit #7 to /x/v.lbxs\n\
+                 merged 1 concurrent commit(s)\n"
+            )),
+            Some((
+                true,
+                "Sync bundle: uploaded commit #7, merged 1 concurrent commit(s)".into()
+            ))
+        );
+        let (ok, msg) = bundle_unmount_summary(&format!(
+            "{start}{BUNDLE_UNMOUNT_LINE}\nluksbox: publishing at unmount failed: io: disk full\n"
+        ))
+        .unwrap();
+        assert!(!ok && msg.contains("disk full") && msg.contains("kept on this device"));
     }
 }

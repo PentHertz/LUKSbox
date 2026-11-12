@@ -744,7 +744,9 @@ fn deleting_a_bundle_never_wipes_another_bundle_s_local_state() {
 
 // ---------------------------------------------------------------------
 // Item 6: a crash between linking an object and removing its temporary
-// name left the object with two links, refused when read, for good.
+// name left the object with two links, refused when read, for good. An
+// object with a second name now reads like any other (see below); the
+// leftover name is still removed.
 // ---------------------------------------------------------------------
 
 #[cfg(unix)]
@@ -774,9 +776,9 @@ fn a_leftover_temporary_link_is_swept_at_the_next_writable_open() {
         .path();
     let tmp = shard.join(".tmp-00112233445566778899aabbccddeeff");
     std::fs::hard_link(&manifest, &tmp).unwrap();
-    // A read-only open does not touch the folder: the manifest is
-    // refused, so the bundle looks incomplete or is refused.
-    let ro = bundle::fs::open(
+    // A read-only open does not touch the folder, and reads the
+    // manifest through its own name.
+    let (_s, _c, r) = bundle::fs::open(
         &path,
         &local_root,
         &mut UnlockMaterial::Passphrase(PASS),
@@ -784,9 +786,10 @@ fn a_leftover_temporary_link_is_swept_at_the_next_writable_open() {
             device_label: "Laptop".into(),
             read_only: true,
         },
-    );
-    assert!(ro.is_err() || ro.as_ref().is_ok_and(|(_, _, r)| r.invalid_manifests > 0));
-    drop(ro);
+    )
+    .unwrap();
+    assert_eq!(r.invalid_manifests, 0);
+    drop((_s, _c));
     assert!(tmp.exists());
     let (_s, _c, r) = bundle::fs::open(
         &path,
@@ -801,4 +804,157 @@ fn a_leftover_temporary_link_is_swept_at_the_next_writable_open() {
     assert!(!tmp.exists());
     assert_eq!(r.invalid_manifests, 0);
     assert!(r.writable, "{:?}", r.notices);
+}
+
+// ---------------------------------------------------------------------
+// A bundle in a Google Drive for desktop folder: while Drive uploads an
+// object it holds a second name for it (`.tmp.driveupload/<n>`, a hard
+// link next to the bundle). Opens refused such objects, so whichever
+// commit or page was uploading at that moment looked withheld: "rollback
+// detected" for a manifest this device had seen, "metadata blob
+// deserialization failed" for a page holding a large file's chunk list,
+// and a retry worked once the upload ended.
+// ---------------------------------------------------------------------
+
+#[cfg(unix)]
+fn every_object(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    for e in std::fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() {
+            every_object(&p, out);
+        } else {
+            out.push(p);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn objects_a_sync_client_is_uploading_still_open() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = TempDir::new().unwrap();
+    let drive = dir.path().join("GoogleSync");
+    std::fs::create_dir(&drive).unwrap();
+    let local_root = dir.path().join("state");
+    let lbx = dir.path().join("v.lbx");
+    let _g = luksbox_format::metadata::set_create_metadata_region_size_override(Some(2 << 20));
+    let c = Container::create_with_passphrase(&lbx, None, CipherSuite::Aes256GcmSiv, KDF, PASS)
+        .unwrap();
+    let mut vfs = Vfs::open(c).unwrap();
+    // Over 1 MiB: its chunk list is kept in data pages, read at open.
+    let big: Vec<u8> = (0..3u32 << 20)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+        .collect();
+    put(&mut vfs, "big.bin", &big);
+    put(&mut vfs, "a.txt", b"first");
+    vfs.flush().unwrap();
+    let mut c = vfs.close().unwrap();
+    let path = drive.join("TEst.lbxs");
+    bundle::fs::convert(
+        &mut c,
+        &path,
+        &local_root,
+        &ConvertOptions {
+            page_size: 1 << 20,
+            device_label: "Laptop".into(),
+            hybrid_sidecar: None,
+        },
+    )
+    .unwrap();
+    drop(c);
+    let opts = |read_only| OpenOptions {
+        device_label: "Laptop".into(),
+        read_only,
+    };
+    // A second commit, so this device has seen more than one.
+    {
+        let (mut s, c, r) = bundle::fs::open(
+            &path,
+            &local_root,
+            &mut UnlockMaterial::Passphrase(PASS),
+            &opts(false),
+        )
+        .unwrap();
+        assert!(r.writable);
+        let mut v = Vfs::open(c).unwrap();
+        put(&mut v, "a.txt", b"second");
+        s.finish(&mut v).unwrap();
+        drop(v);
+        s.close().unwrap();
+    }
+
+    // Drive uploads some objects: one area at a time (a manifest gave
+    // "rollback detected", a page "metadata blob deserialization
+    // failed"), then everything at once while this device publishes.
+    let staging = drive.join(".tmp.driveupload");
+    std::fs::create_dir(&staging).unwrap();
+    let mut next = 1900;
+    let all = ["h", "x", "p", "t", "m", "l"];
+    for areas in [&["m"][..], &["p"], &["t"], &["h"], &all] {
+        let mut staged = Vec::new();
+        let mut objects = Vec::new();
+        for a in areas {
+            every_object(&path.join(a), &mut objects);
+        }
+        assert!(!objects.is_empty(), "{areas:?}");
+        for o in objects {
+            let link = staging.join(next.to_string());
+            next += 1;
+            std::fs::hard_link(&o, &link).unwrap();
+            assert_eq!(std::fs::metadata(&o).unwrap().nlink(), 2);
+            staged.push((o, link));
+        }
+        let publish = areas.len() == all.len();
+        for read_only in [true, false] {
+            let (mut s, c, r) = bundle::fs::open(
+                &path,
+                &local_root,
+                &mut UnlockMaterial::Passphrase(PASS),
+                &opts(read_only),
+            )
+            .unwrap_or_else(|e| panic!("{areas:?} uploading, read_only {read_only}: {e}"));
+            assert_eq!(r.invalid_manifests, 0, "{areas:?}");
+            assert!(r.notices.is_empty(), "{areas:?}: {:?}", r.notices);
+            assert_eq!(r.writable, !read_only);
+            let mut v = if read_only {
+                Vfs::open_read_only(c)
+            } else {
+                Vfs::open(c)
+            }
+            .unwrap_or_else(|e| panic!("{areas:?} uploading, read_only {read_only}: {e}"));
+            let id = v.lookup_path("/big.bin").unwrap();
+            let mut back = vec![0u8; big.len()];
+            assert_eq!(v.read(id, 0, &mut back).unwrap(), big.len());
+            assert!(back == big, "big.bin differs");
+            assert_eq!(get(&mut v, "a.txt").unwrap(), b"second");
+            if publish && !read_only {
+                // Publishing (and collecting) while the upload runs.
+                put(&mut v, "a.txt", b"third");
+                s.finish(&mut v).unwrap();
+            }
+            drop(v);
+            s.close().unwrap();
+        }
+        // Drive's names were never written through or removed.
+        for (o, link) in staged {
+            assert!(link.is_file(), "{link:?} was removed");
+            if o.exists() {
+                assert_eq!(std::fs::read(&link).unwrap(), std::fs::read(&o).unwrap());
+            }
+            std::fs::remove_file(&link).unwrap();
+        }
+    }
+
+    // The upload ended.
+    let (_s, c, r) = bundle::fs::open(
+        &path,
+        &local_root,
+        &mut UnlockMaterial::Passphrase(PASS),
+        &opts(false),
+    )
+    .unwrap();
+    assert!(r.writable && r.notices.is_empty(), "{:?}", r.notices);
+    let mut v = Vfs::open(c).unwrap();
+    assert_eq!(get(&mut v, "a.txt").unwrap(), b"third");
 }

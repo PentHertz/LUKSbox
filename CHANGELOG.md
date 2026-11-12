@@ -27,6 +27,22 @@ entry.
 
 ### Added
 
+- **Mount a sync bundle from the GUI on macOS (FUSE-T).** It said
+  "Mounting a sync bundle is not available with FUSE-T yet". The GUI
+  now hands the bundle to its FUSE-T mount helper as the Windows
+  background mount does (hand-off protocol v3): the vault is saved and
+  the GUI's own sync session finished (what was saved is uploaded), then
+  the helper opens the bundle with the master key and holds the session,
+  uploading every two minutes while mounted and everything (with merges)
+  at unmount, shown as a toast ("Sync bundle: uploaded commit #N", or
+  the error; what did not go up stays staged on this device). The
+  optional sandbox (`LUKSBOX_SANDBOX_HELPER=1`) lets the helper write
+  this device's sync state folder too (`SYNC_DIR`). `luksbox mount`
+  prints `luksbox: unmounted, uploading the last changes` and what it
+  published when a bundle's mount ends. Test:
+  `helper_command_tests::a_sync_bundle_mounts_through_the_helper_and_publishes_at_unmount`
+  (real FUSE-T mount, unsandboxed and sandboxed; a second device reads
+  what was written through the mount).
 - **Create a sync bundle from the command line and the wizard.**
   `luksbox create <folder>.lbxs` makes one in one step, with any create
   option except those a bundle has no use for (`--header`, `--anchor`,
@@ -50,6 +66,23 @@ entry.
 
 ### Fixed
 
+- **Sync bundle in a Google Drive for desktop folder: opens failed at
+  random and worked when retried**, with "rollback detected: this
+  device saw commit N ..., the bundle now shows M" or "metadata blob
+  deserialization failed". While Drive uploads a file it keeps a second
+  name for it (a hard link in `.tmp.driveupload` next to the bundle),
+  and the bundle store refused any object with more than one link, so
+  the commit or page being uploaded at that moment looked withheld or
+  damaged. The link count no longer decides anything (macOS, Linux and
+  Windows): an object is used when it authenticates, which binds it to
+  its name, and symbolic links, FIFOs, devices and wrong sizes are still
+  refused before a byte is read; nothing is ever written through an
+  existing name, and removing an object removes only the bundle's name
+  for it. A hard link planted to a file outside the bundle is read into
+  memory, fails authentication and counts as damaged, as any altered
+  object does. Test: `provider_tampering::
+  objects_a_sync_client_is_uploading_still_open` (every area linked as
+  Drive does, opened read-only and writable, published meanwhile).
 - **`LUKSBOX_SEED_PASSPHRASE` when a seed file is written**: creating or
   enrolling a hybrid FIDO2 / TPM / Secure Enclave kind wrote the new
   `.kyber` seed under `LUKSBOX_NEW_PASSPHRASE`, while unlocking those

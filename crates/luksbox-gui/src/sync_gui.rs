@@ -56,6 +56,13 @@ fn local_root() -> Result<PathBuf, String> {
     Ok(data_dir()?.join("luksbox").join("sync"))
 }
 
+/// This device's sync state folder (shared with the command line): the
+/// FUSE-T mount helper's session for a bundle uses it, and its sandbox
+/// lets it write there.
+pub fn state_dir() -> Result<PathBuf, String> {
+    local_root()
+}
+
 /// This device's automatic rollback anchors for vaults in cloud folders
 /// (shared with the command line).
 fn anchors_dir() -> Result<PathBuf, String> {
@@ -660,7 +667,8 @@ fn finish_taken(mut a: Active) -> Option<String> {
 }
 
 /// For an in-process mount of a bundle: publish while mounted and at
-/// unmount.
+/// unmount. (A FUSE-T mount runs in a helper process with its own
+/// session: this one is finished before it starts.)
 pub fn install_mount_hook() {
     if ACTIVE.lock().map(|g| g.is_none()).unwrap_or(true) {
         return;

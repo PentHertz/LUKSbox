@@ -1617,10 +1617,6 @@ fn refuse_bundles_where_unsupported(cmd: &Command) -> Result<()> {
         | Command::DeniableUpgradeHeader { path, .. }
         | Command::DeniableResize { path, .. }
         | Command::DeniableRotate { path, .. } => (path, "a deniable vault"),
-        // On Windows the helper holds the background mount, and opens a
-        // sync bundle itself (hand-off protocol v3).
-        #[cfg(not(target_os = "windows"))]
-        Command::MountFuseTHelper { vault, .. } => (vault, "the FUSE-T mount helper"),
         Command::Enroll { path, kind, .. } if format!("{kind:?}").starts_with("HybridPq") => {
             (path, "adding a post-quantum keyslot")
         }
@@ -8254,6 +8250,7 @@ fn cmd_mount_fuse_t_helper(
     //   byte 0:        protocol version
     //                    0x01 = standard format, MVK-only payload
     //                    0x02 = deniable format, MVK + state payload
+    //                    0x03 = sync bundle, MVK-only payload
     //   bytes 1..33:   MVK (32 bytes)
     //
     //   v2 deniable additionally appends:
@@ -8286,6 +8283,28 @@ fn cmd_mount_fuse_t_helper(
         "luksbox-mount-helper: MVK received (protocol v{}), opening container",
         version_byte[0]
     );
+    // A bundle folder only through v3, which opens its sync session; the
+    // other hand-offs open a vault file. Checked once the key is read: an
+    // exit before that would show the parent a failed write instead of
+    // this message.
+    if sync_cmd::is_bundle(&vault_abs) != (version_byte[0] == 0x03) {
+        return Err(format!(
+            "{} {} a sync bundle, but the hand-off (protocol v{}) is for {}",
+            vault_abs.display(),
+            if sync_cmd::is_bundle(&vault_abs) {
+                "is"
+            } else {
+                "is not"
+            },
+            version_byte[0],
+            if version_byte[0] == 0x03 {
+                "a sync bundle"
+            } else {
+                "a vault file"
+            },
+        )
+        .into());
+    }
 
     let mut container = match version_byte[0] {
         0x01 => {
@@ -8324,11 +8343,11 @@ fn cmd_mount_fuse_t_helper(
             )
             .map_err(|e| format!("open deniable container ({}): {e}", vault_abs.display()))?
         }
-        // v3: a sync bundle (Windows background mount). The bundle is
-        // opened with the key: every header is checked against it, and
-        // this process takes its own sync session, which publishes while
-        // mounted and at unmount (`install_mount_hook` below).
-        #[cfg(target_os = "windows")]
+        // v3: a sync bundle (the Windows background mount, the macOS
+        // GUI's FUSE-T mount). The bundle is opened with the key: every
+        // header is checked against it, and this process takes its own
+        // sync session (the parent ended its own first), which publishes
+        // while mounted and at unmount (`install_mount_hook` below).
         0x03 => {
             if header_abs.is_some() || anchor_abs.is_some() {
                 return Err("a sync bundle takes no --header or --anchor".into());
@@ -8338,7 +8357,8 @@ fn cmd_mount_fuse_t_helper(
         }
         other => {
             return Err(format!(
-                "unknown helper protocol version 0x{other:02x} from parent (expected 0x01 or 0x02)"
+                "unknown helper protocol version 0x{other:02x} from parent (expected 0x01, 0x02 \
+                 or 0x03)"
             )
             .into());
         }

@@ -234,7 +234,10 @@ kept, and so is the folder if they are there.
 - **"rollback detected"**: the folder shows an older version than this
   computer has already seen, or part of the history it saw is gone.
   Check the sync service (restored version, history rollback). The
-  vault is not opened.
+  vault is not opened. (Before v0.7.1-rc.1, a bundle in a Google Drive
+  for desktop folder could show this, or "metadata blob deserialization
+  failed", while Drive was uploading, and open on a retry: Drive keeps
+  a second name for each file it uploads, which those versions refused.)
 - **"the newest version this device has seen ... is not complete in the
   bundle"**: some of its parts are missing or damaged (the sync is still
   running, or the sync service is withholding or has altered them). The
@@ -340,9 +343,13 @@ accepts it in place of the vault.
   `sync export`), deniable vaults, detached headers, `--anchor` (a
   bundle keeps its own rollback state on each device), adding a
   post-quantum keyslot (export, enroll, convert again).
-- Mounting a bundle: not with the macOS FUSE-T GUI helper (use the
-  browser, or `luksbox mount` in a terminal). On Windows `luksbox mount`
-  works in the background as for a `.lbx` (and with `--foreground`).
+- Mounting a bundle works as for a `.lbx`, from the GUI and with
+  `luksbox mount`, on every platform: changes are uploaded every two
+  minutes while mounted and at unmount. On macOS with FUSE-T (since
+  v0.7.1-rc.1 in the GUI) and on Windows in the background, the mount
+  runs in a separate LuksBox process that takes over the bundle's
+  session. On Windows `luksbox mount` works in the background as for a
+  `.lbx` (and with `--foreground`).
 - **Revoking a lost device**: revoking its keyslot stops LuksBox from
   opening the vault with it, but the master key does not change, the
   old keyslot table stays in the folder until `sync gc` and in the

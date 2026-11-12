@@ -12,10 +12,14 @@
 ;;
 ;; Parameters, passed by the GUI as `sandbox-exec -D NAME=value`
 ;; (canonical absolute paths):
-;;   VAULT_DIR     parent directory of the .lbx file
+;;   VAULT_DIR     parent directory of the .lbx file (or of the .lbxs
+;;                 sync bundle folder)
 ;;   HEADER_DIR    parent directory of the detached header, or VAULT_DIR
 ;;   ANCHOR_DIR    parent directory of the rollback anchor, or VAULT_DIR
 ;;                 (the anchor is read at open and rewritten on saves)
+;;   SYNC_DIR      a sync bundle: this device's sync state folder (the
+;;                 session's lock, staged changes, identity, the folder
+;;                 registry); VAULT_DIR otherwise
 ;;   MOUNTPOINT    the mountpoint directory itself
 ;;   BUNDLE_DIR    the directory holding the luksbox binary
 ;;   HELPER        the luksbox binary itself (the only one exec'd here)
@@ -44,6 +48,7 @@
     (subpath (param "VAULT_DIR"))
     (subpath (param "HEADER_DIR"))
     (subpath (param "ANCHOR_DIR"))
+    (subpath (param "SYNC_DIR"))
     ;; The mountpoint directory: probed, locked until the final save,
     ;; and mounted on. Not its parent.
     (literal (param "MOUNTPOINT"))
@@ -53,12 +58,13 @@
     (literal "/dev/stdin"))
 
 ;; Writes: the vault, its detached header, its anchor (all rewritten on
-;; saves, each with temporary files next to it), and the temporary
-;; folders FUSE-T uses for its sockets.
+;; saves, each with temporary files next to it), a sync bundle's state
+;; on this device, and the temporary folders FUSE-T uses for its sockets.
 (allow file-write*
     (subpath (param "VAULT_DIR"))
     (subpath (param "HEADER_DIR"))
     (subpath (param "ANCHOR_DIR"))
+    (subpath (param "SYNC_DIR"))
     (subpath "/private/tmp")
     (subpath "/private/var/folders")
     (literal "/dev/null")

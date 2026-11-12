@@ -668,7 +668,7 @@ pub(crate) fn header_candidates(
             _ => {}
         }
         // A header object that is not a plain file of the right size (a
-        // link, a FIFO, a hard link, a truncated copy) is skipped like a
+        // symbolic link, a FIFO, a truncated copy) is skipped like a
         // missing one, as manifests are: never read, and never a reason
         // to refuse the whole bundle.
         let bytes = match store.read(Area::Header, &n, LenRule::Exact(HEADER_SIZE)) {

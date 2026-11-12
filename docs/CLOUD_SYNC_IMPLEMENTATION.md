@@ -51,8 +51,8 @@ Where the code departs from the plan below, and why:
   area folders for the store's lifetime, each shard folder from its
   first use, all held open without `FILE_SHARE_DELETE`, so a verified
   folder cannot be renamed, deleted or swapped for a junction while the
-  store uses it. Hard links are refused (link count from
-  `GetFileInformationByHandle`). Cloud Files placeholders (OneDrive
+  store uses it. An object with a second name (a hard link) is read
+  like any other, as on Unix (see section 4). Cloud Files placeholders (OneDrive
   Files On-Demand) are the one reparse point accepted. Sharing
   violations are retried with backoff, and are I/O errors, never a
   refused (damaged) object. Run-tested on Windows 11 (see the
@@ -460,9 +460,17 @@ For an ordinary vault it reveals what `recent.json` already does.
     comparison used against junctions; folders pinned (no
     `FILE_SHARE_DELETE`) while the store uses them.
 - **Check what was opened:** `fstat` must show a regular file (folders
-  for `h p t m l x` and the shards), with the exact expected size and,
-  on Unix, a link count of 1. FIFOs, devices, sockets, hard links and
-  links of any kind are refused before a byte is read.
+  for `h p t m l x` and the shards), with the exact expected size.
+  FIFOs, devices, sockets and symbolic links are refused before a byte
+  is read. The link count is not checked: a sync client holds a second
+  name for a file while it uploads it (Google Drive for desktop links
+  each one into `.tmp.driveupload`), and refusing those made whatever
+  commit or page was uploading look withheld (an open refused as a
+  rollback, then fine on retry). A second name changes nothing the
+  object's authentication checks; a link planted to a file outside the
+  bundle is only read into memory, fails authentication and counts as
+  damaged. Objects are never written through an existing name, and a
+  delete removes the bundle's name only.
 - **Bounded reads:** `read_exact` of the expected size, then an EOF
   check. No `read_to_end`, and no size taken from the file.
 - **Bounded listings:** they stream with hard caps (for example 4
@@ -854,7 +862,7 @@ Each invariant has a mechanism and a test that must fail if it breaks.
 | I4 | The opened state is exactly one verified manifest's image. | Merkle chain manifest -> tables -> pages, plus inner integrity | simulation: random partial, mixed and reordered objects never open as a mix |
 | I5 | No device opens a state older than one it has seen, for any device. | local state and witness checks (5.2.4); the opened head must contain the device's anchor; collected history is never opened | simulation rollback, freeze and delete faults, 100% detected; `provider_tampering` (replayed collected commit, deleted middle manifest, withheld head object) |
 | I6 | Hiding one device's commits from another is detected once any manifest that saw them is visible. | `seen` checks (5.2.5) | simulation fork and withholding faults |
-| I7 | Nothing is overwritten, followed through a link, or opened outside the bundle. | `bundle_dir` (section 4) | hostile-folder suite: symlinks, junctions, FIFOs, hard links, renames during reads |
+| I7 | Nothing is overwritten, followed through a link, or opened outside the bundle. | `bundle_dir` (section 4) | hostile-folder suite: symlinks, junctions, FIFOs, renames during reads; objects with a second name (a sync client's upload link) open and are never written through |
 | I8 | No object reachable from a root is deleted. | two-phase GC with grace (section 8) | model check plus simulation with offline devices |
 | I9 | A saved change is never lost silently: it reaches every later head, or is shown as a conflict copy. | journal, idempotent publish, merge rules | model check; simulation "every write visible" property; merge property tests |
 | I10 | The sync layer writes no plaintext to disk. | it handles inner-container ciphertext only; merge buffers are `Zeroizing` and in memory | test greps outbox, pins and bundle for planted plaintext markers |

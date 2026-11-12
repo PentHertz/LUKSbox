@@ -2694,9 +2694,12 @@ on Linux), else `linkat` plus `unlinkat` of the temporary name, else (no
 hard links either: exFAT) an exclusive create of an empty placeholder
 under the name followed by `renameat` of the complete file over it (an
 empty placeholder can never be an object, so one a crash left is
-reused). A reader refuses anything but a regular file with one link and
-the exact size. A writable open removes `.tmp-` files that still have a
-second link, or are older than an hour. Folder handles kept open for a
+reused). A reader refuses anything but a regular file of the exact size
+(opened without following a link); a second name for the file (a hard
+link: sync clients such as Google Drive for desktop make one while they
+upload it) does not matter, since the object's AEAD binds it to its name.
+A writable open removes `.tmp-` files that still have a second link, or
+are older than an hour. Folder handles kept open for a
 session are checked against the names before use: a moved area folder
 is refused, a moved or re-made shard folder opened again. On Apple
 platforms each object gets `F_BARRIERFSYNC` and each folder sync one

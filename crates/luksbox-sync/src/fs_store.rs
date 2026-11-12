@@ -13,9 +13,16 @@
 //!   handles opened the same way, so a link swapped in anywhere in the
 //!   bundle is never followed and nothing outside it is reached.
 //! - A file is used only if `fstat` on the opened handle shows a regular
-//!   file with one link and the size its kind requires. FIFOs, devices,
-//!   sockets, hard links and links of any kind are refused before a byte
-//!   is read (`O_NONBLOCK` keeps opening a FIFO from blocking).
+//!   file of the size its kind requires. FIFOs, devices, sockets and
+//!   symbolic links are refused before a byte is read (`O_NONBLOCK` keeps
+//!   opening a FIFO from blocking). A second name for the file (a hard
+//!   link) is not a reason to refuse it: sync clients make one while they
+//!   upload the file (Google Drive for desktop links each object it
+//!   uploads into `.tmp.driveupload`), and what makes an object usable is
+//!   its authentication, which binds it to its name, never its link
+//!   count. A link planted to a file outside the bundle is read into
+//!   memory only, fails authentication, and counts as damaged; nothing is
+//!   ever written through an existing name.
 //! - Reads are bounded by the expected size and checked for EOF; nothing
 //!   is read twice by path.
 //! - New objects are written to a `.tmp-<hex>` file, fsync'd, and
@@ -25,7 +32,7 @@
 //!   file system has no exclusive rename. Both fail if the name exists:
 //!   an object is never overwritten (a lease refresh is a new object
 //!   too). A crash between `linkat` and `unlinkat` leaves the object with
-//!   two links (refused when read): `sweep_tmp`, at every writable open,
+//!   a second, temporary name: `sweep_tmp`, at every writable open,
 //!   removes such leftover temporary names, and others older than an
 //!   hour (younger ones may be another device's upload in progress).
 //! - Durability: on Linux and others every object is `fsync`'d before it
@@ -403,12 +410,11 @@ impl FsStore {
                 why: "is not a regular file",
             });
         }
-        if st.st_nlink != 1 {
-            return Err(SyncError::Refused {
-                what: what.to_string(),
-                why: "has more than one link (hard link)",
-            });
-        }
+        // The link count is not checked (module docs): a sync client
+        // uploading the object holds a second name for it, and refusing
+        // it then made the commits it belongs to look withheld (an open
+        // refused as a rollback, or a vault whose file list did not load)
+        // until that upload ended.
         Ok(Some((file, st.st_size as u64)))
     }
 
@@ -869,7 +875,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_links_fifos_and_hard_links() {
+    fn refuses_links_and_fifos_and_reads_through_a_second_name() {
         let (d, p, mut s) = fresh();
         let outside = d.path().join("secret");
         std::fs::write(&outside, b"xyz").unwrap();
@@ -886,10 +892,15 @@ mod tests {
         let shard2 = p.join("p/12");
         std::fs::create_dir_all(&shard2).unwrap();
         std::fs::hard_link(&outside, shard2.join(n2.leaf())).unwrap();
-        assert!(matches!(
-            s.read(Area::Page, &n2, LenRule::Exact(3)),
-            Err(SyncError::Refused { .. })
-        ));
+        // A second name (a sync client's upload link, or one planted to a
+        // file outside): read like any object, and authenticated above
+        // this layer. Removing the object removes its name only.
+        assert_eq!(
+            s.read(Area::Page, &n2, LenRule::Exact(3)).unwrap().unwrap(),
+            b"xyz"
+        );
+        assert!(s.remove(Area::Page, &n2).unwrap());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"xyz");
 
         let n3 = Name::Object(ObjectId([0x13; 32]));
         let shard3 = p.join("p/13");
@@ -1043,14 +1054,16 @@ mod tests {
         s.create_new(Area::Manifest, &n, b"commit").unwrap();
         let shard = p.join("m/6b");
         let obj = shard.join(n.leaf());
-        // A crash between linkat and unlinkat: the object has two links
-        // and is refused when read.
+        // A crash between linkat and unlinkat: the object keeps a second,
+        // temporary name. It reads as before; the sweep removes the name.
         let leftover = shard.join(".tmp-00000000000000000000000000000001");
         std::fs::hard_link(&obj, &leftover).unwrap();
-        assert!(matches!(
-            s.read(Area::Manifest, &n, LenRule::AtMost(100)),
-            Err(SyncError::Refused { .. })
-        ));
+        assert_eq!(
+            s.read(Area::Manifest, &n, LenRule::AtMost(100))
+                .unwrap()
+                .unwrap(),
+            b"commit"
+        );
         // A write in progress (maybe another device's), and a file
         // outside the grammar.
         let young = p.join("h/.tmp-00000000000000000000000000000002");

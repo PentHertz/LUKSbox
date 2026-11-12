@@ -27,9 +27,11 @@
 //!   renamed, deleted or replaced (by a junction) while the store
 //!   creates, lists or removes entries in it by path. This is what the
 //!   Unix store gets from `openat` / `unlinkat` on a folder descriptor.
-//! - Reads are bounded by the expected size and checked for EOF, and an
-//!   object with more than one name (a hard link someone made to a file
-//!   outside the bundle, or into it) is refused, as on Unix.
+//! - Reads are bounded by the expected size and checked for EOF. An
+//!   object with more than one name (a hard link) is read like any other,
+//!   as on Unix: sync clients make one while they upload the file, and
+//!   authentication, which binds an object to its name, is what decides
+//!   whether it is used.
 //! - New objects are written to a `.tmp-<hex>` file in their folder,
 //!   flushed, and installed with `MoveFileExW` without
 //!   `MOVEFILE_REPLACE_EXISTING` (no clobber) and with
@@ -505,14 +507,8 @@ impl FsStore {
             }
             Err(e) => return Err(e.into()),
         };
-        // A second name for the object: a hard link planted to (or from)
-        // a file the provider or another program controls.
-        if number_of_links(&f)? != 1 {
-            return Err(SyncError::Refused {
-                what,
-                why: "has more than one name (a hard link)",
-            });
-        }
+        // A second name for the object (a sync client's upload link) is
+        // not refused: see the Unix store.
         let size = f.metadata()?.len();
         if !len.allows(size) {
             return Err(SyncError::Refused {
@@ -820,7 +816,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_hard_links_and_junctioned_shards() {
+    fn reads_through_a_second_name_and_refuses_junctioned_shards() {
         let (d, p, mut s) = fresh();
         let outside = d.path().join("secret");
         std::fs::write(&outside, b"xyz").unwrap();
@@ -828,10 +824,14 @@ mod tests {
         let shard = p.join("p\\12");
         std::fs::create_dir_all(&shard).unwrap();
         std::fs::hard_link(&outside, shard.join(n.leaf())).unwrap();
-        assert!(matches!(
-            s.read(Area::Page, &n, LenRule::Exact(3)),
-            Err(SyncError::Refused { .. })
-        ));
+        // A second name: read like any object (authenticated above this
+        // layer); removing the object removes its name only.
+        assert_eq!(
+            s.read(Area::Page, &n, LenRule::Exact(3)).unwrap().unwrap(),
+            b"xyz"
+        );
+        assert!(s.remove(Area::Page, &n).unwrap());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"xyz");
 
         let elsewhere = d.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
@@ -1257,14 +1257,17 @@ mod tests {
         s.create_new(Area::Manifest, &n, b"commit").unwrap();
         let shard = p.join("m\\6b");
         let obj = shard.join(n.leaf());
-        // A second name for the object under a temporary name: refused
-        // when read until the sweep removes it, at any age.
+        // A second name for the object under a temporary name: the
+        // object reads as before, and the sweep removes the name at any
+        // age.
         let leftover = shard.join(".tmp-00000000000000000000000000000001");
         std::fs::hard_link(&obj, &leftover).unwrap();
-        assert!(matches!(
-            s.read(Area::Manifest, &n, LenRule::AtMost(100)),
-            Err(SyncError::Refused { .. })
-        ));
+        assert_eq!(
+            s.read(Area::Manifest, &n, LenRule::AtMost(100))
+                .unwrap()
+                .unwrap(),
+            b"commit"
+        );
         // A write in progress (maybe another device's), a temporary file
         // of an earlier Windows build, and a file outside the grammar.
         let young = p.join("h\\.tmp-00000000000000000000000000000002");

@@ -505,6 +505,13 @@ pub(crate) fn finish_active_session() -> Result<()> {
     let taken = take_session_for_finish();
     let Some(mut s) = taken else { return Ok(()) };
     let r = s.finish_detached()?;
+    report_finish(&s, &r);
+    Ok(())
+}
+
+/// What a session's final publish did, on stderr (the macOS GUI shows
+/// these lines from its mount helper).
+fn report_finish(s: &Session, r: &luksbox_sync::bundle::FinishReport) {
     if let Some(c) = r.published {
         eprintln!("published commit #{} to {}", c.seq, s.display().display());
     }
@@ -532,8 +539,12 @@ pub(crate) fn finish_active_session() -> Result<()> {
             r.base_missing
         );
     }
-    Ok(())
 }
+
+/// Printed on stderr when a mount of a bundle ends, before its last
+/// upload and what it did (`report_finish`): the macOS GUI reads the
+/// lines after it from its mount helper (`BUNDLE_UNMOUNT_LINE` there).
+pub(crate) const UNMOUNT_UPLOAD_LINE: &str = "luksbox: unmounted, uploading the last changes";
 
 /// For a mount of a bundle: publish now and then while mounted, and
 /// everything (with merges) at unmount. Survives the fork of a
@@ -565,10 +576,12 @@ pub(crate) fn install_mount_hook() {
         // Waits for an upload in progress, then publishes the rest.
         luksbox_mount::CommitPoint::Unmount => {
             let taken = take_session_for_finish();
-            if let Some(mut s) = taken
-                && let Err(e) = s.finish_detached()
-            {
-                eprintln!("luksbox: publishing at unmount failed: {e}");
+            if let Some(mut s) = taken {
+                eprintln!("{UNMOUNT_UPLOAD_LINE}");
+                match s.finish_detached() {
+                    Ok(r) => report_finish(&s, &r),
+                    Err(e) => eprintln!("luksbox: publishing at unmount failed: {e}"),
+                }
             }
         }
     })));

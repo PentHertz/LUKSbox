@@ -99,6 +99,20 @@ sequenceDiagram
     Note over GUI: view = Welcome,<br/>toast based on status
 ```
 
+**A sync bundle** (`.lbxs`) is handed over as a bundle (hand-off
+protocol v3, the same as the Windows background mount): the GUI saves
+the vault and finishes its own sync session as locking does (what was
+saved is uploaded, concurrent commits merged, the lease removed, this
+device's state for the bundle released), then the helper opens the
+bundle with the master key (each header is checked against it) and
+takes its own session. While mounted it uploads every two minutes;
+at unmount it writes `luksbox: unmounted, uploading the last changes`
+on stderr, publishes everything (with merges), and reports what it
+did on the following lines, which the GUI shows as a toast ("Sync
+bundle: uploaded commit #N"). Changes saved but not uploaded (a failed
+upload, the helper killed) stay staged on this device and go up the
+next time the bundle opens.
+
 **Why this is necessary**: libfuse-t.dylib's mount-teardown path
 calls `_exit()` / `abort()` / sends an uncatchable signal to the
 process during unmount. We diagnosed this with full trace logging
@@ -154,19 +168,23 @@ When enabled, the helper child process (and the FUSE-T NFS server and
 mount tool it starts, which inherit the sandbox) can only:
 - Read system libraries, FUSE-T's install, the folder of the `luksbox`
   binary, the folders of the vault, its detached header and its
-  rollback anchor, and the mountpoint directory itself (plus the
-  metadata of any path, for path resolution).
-- Write in the folders of the vault, its detached header and its
-  anchor (each is rewritten with a temporary file next to it), and in
-  the temporary folders FUSE-T uses for its sockets.
+  rollback anchor, for a sync bundle this device's sync state folder,
+  and the mountpoint directory itself (plus the metadata of any path,
+  for path resolution).
+- Write in the folders of the vault (or of the bundle folder), its
+  detached header and its anchor (each is rewritten with a temporary
+  file next to it), a sync bundle's state on this device (its session
+  lock, staged changes and identity), and in the temporary folders
+  FUSE-T uses for its sockets.
 - Use the network on localhost only (FUSE-T's NFS loopback). NO
   internet egress -- if libfuse-t tried to phone home, this blocks it.
 - Exec the helper itself, FUSE-T's NFS server and `/sbin/mount`,
   `mount_nfs`, `umount`. NO shell.
 
 The GUI passes the paths as `sandbox-exec -D` parameters (`VAULT_DIR`,
-`HEADER_DIR`, `ANCHOR_DIR`, `MOUNTPOINT`, `BUNDLE_DIR`, `HELPER`, all
-canonical). The first version of the profile did not parse on macOS 26
+`HEADER_DIR`, `ANCHOR_DIR`, `SYNC_DIR`, `MOUNTPOINT`, `BUNDLE_DIR`,
+`HELPER`, all canonical; `SYNC_DIR` is the vault folder again for a
+vault file). The first version of the profile did not parse on macOS 26
 (operations that no longer exist stop the whole profile, so every
 sandboxed mount failed) and had no rule for an anchor outside the
 vault folder; the current one was checked on macOS 26 with FUSE-T 1.2.9
@@ -233,10 +251,17 @@ something to exploit).
 **Signature**:
 
 ```
-luksbox mount-fuse-t-helper [--header HDR] [--anchor ANCHOR] [--sync] [--report-ready] <vault.lbx> <mountpoint>
+luksbox mount-fuse-t-helper [--header HDR] [--anchor ANCHOR] [--sync] [--report-ready] <vault.lbx | bundle.lbxs> <mountpoint>
 ```
 
-The GUI passes only `--header`. The background `luksbox mount` /
+Stdin: one protocol byte, then the 32-byte MVK: `0x01` a vault file,
+`0x02` a deniable vault (the salt, slot and inner header follow), `0x03`
+a sync bundle (the helper opens its own sync session; no `--header` or
+`--anchor`). A bundle folder with any other byte, or `0x03` with a
+vault file, is refused.
+
+The GUI passes `--header`, `--anchor`, `--sync` and `--shrink-on-close`
+as the vault was opened. The background `luksbox mount` /
 `deniable-mount` on Windows starts the same helper (WinFsp ties a mount
 to the process holding it) with `--anchor` and `--sync` as given to
 `mount`, plus `--report-ready`: once the volume is live the helper
@@ -254,7 +279,9 @@ its stderr at NUL.
 3. Opens the vault via [`Container::open_with_mvk`](https://github.com/penthertz/LUKSbox/blob/main/crates/luksbox-format/src/container.rs)
    - which verifies the header HMAC against the supplied MVK
    before construction. A wrong MVK fails fast with
-   `Error::Crypto(HeaderAuthFailed)`.
+   `Error::Crypto(HeaderAuthFailed)`. A sync bundle (v3) is opened
+   with the key instead (`bundle::fs::open_with_key`: every header
+   object is checked against it), with this device's sync state.
 4. Builds the Vfs and runs `luksbox_mount::mount(vfs, mp, false)`
    in foreground. Blocks until unmount.
 5. Exits 0 on clean unmount, non-zero on any error (which the
