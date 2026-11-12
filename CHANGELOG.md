@@ -92,6 +92,15 @@ entry.
   detached header (a bundle keeps its header in the folder), and `luksbox
   sync convert` removes the bundle folder it made when it fails halfway
   (a full disk), as the GUI does, so a retry does not find a half bundle.
+- **tpm2-tss 4.2.1 -> 4.2.2 in every build that bundles it** (the static
+  FIDO2 + TPM CLI, the Linux `bundled-tpm` lanes and Windows). 4.2.2,
+  released 2026-11-12, fixes GHSA-89w7-5q38-fgm3 (CVE pending) and
+  bounds and alignment bugs in the MU, ESYS, SAPI and FAPI layers and
+  the swtpm TCTI (undersized responses). The bundled-library gate
+  refused 4.2.1 once 4.2.2 was out. New SHA-256 pins for the three
+  archives (the release tarball's signature checks against the same
+  release key as 4.2.1); CI and release caches are renamed so no old
+  vendored build is reused.
 - **GUI build: 36 `float_literal_f32_fallback` warnings on newer Rust**
   (a future-incompatibility lint, set to become an error). Every
   `Stroke::new(1.0, ...)` now spells its width `1.0_f32`.
